@@ -94,6 +94,10 @@ jobs:
             --test shared_http_wire none_auth_scheme_ -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-sampler/Cargo.toml \
             none_scheme_ -- --nocapture
+          cargo test --manifest-path crates/codegen/xai-grok-sampler/Cargo.toml \
+            hostile_injector -- --nocapture
+          cargo test --manifest-path crates/codegen/xai-grok-sampler/Cargo.toml \
+            omits_xai_identity -- --nocapture
 
       - name: Shell auth + readiness meta
         env:
@@ -111,6 +115,10 @@ jobs:
             read_parent_sampling_config_ -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
             handle_set_session_model_clears_credentials_for_none -- --nocapture
+          cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
+            catalog_key -- --nocapture
+          cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
+            auth_scheme -- --nocapture
 
       - name: Pager model picker / readiness
         env:
@@ -119,4 +127,8 @@ jobs:
           cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
             slash::commands::model:: -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
-            hard_blocks_unready -- --nocapture
+            hard_blocks_ -- --nocapture
+          cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
+            catalog_miss -- --nocapture
+          cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
+            toctou -- --nocapture
