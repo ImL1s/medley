@@ -2040,7 +2040,9 @@ fn dashboard_dispatch_blocks_removed_pending_model_toctou() {
     assert!(app.agents.is_empty(), "no session should be created");
     let dash = app.dashboard.as_ref().unwrap();
     assert!(
-        dash.error_toast.as_ref().is_some_and(|t| t.contains(MODEL_CATALOG_MISS_REASON)),
+        dash.error_toast
+            .as_ref()
+            .is_some_and(|t| t.contains(MODEL_CATALOG_MISS_REASON)),
         "must surface catalog-miss reason on dashboard, got {:?}",
         dash.error_toast,
     );

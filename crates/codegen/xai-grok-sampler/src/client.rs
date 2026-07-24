@@ -2404,8 +2404,10 @@ mod tests {
             "x-grok-deployment-id".to_string(),
             "deploy-must-not-leak".to_string(),
         );
-        cfg.extra_headers
-            .insert("x-grok-user-id".to_string(), "user-must-not-leak".to_string());
+        cfg.extra_headers.insert(
+            "x-grok-user-id".to_string(),
+            "user-must-not-leak".to_string(),
+        );
         let client = SamplingClient::new(cfg).expect("client should build");
         let req = client
             .post("https://api.anthropic.com/v1/messages")

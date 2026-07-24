@@ -965,14 +965,16 @@ async fn read_parent_sampling_config(
             // Prefer the spawn-time in-memory catalog (session-selected models),
             // then disk effective config, then parent spawn baseline. Never
             // silent-default to Bearer on miss when the parent baseline is None.
-            let mut auth_scheme =
-                crate::agent::config::find_model_by_id(&ctx.available_models, ctx.model_id.0.as_ref())
-                    .map(|e| e.info.auth_scheme)
-                    .or_else(|| {
-                        crate::agent::config::try_resolve_model_credentials(&cfg.model, None)
-                            .map(|r| r.auth_scheme)
-                    })
-                    .unwrap_or(ctx.sampling_config.auth_scheme);
+            let mut auth_scheme = crate::agent::config::find_model_by_id(
+                &ctx.available_models,
+                ctx.model_id.0.as_ref(),
+            )
+            .map(|e| e.info.auth_scheme)
+            .or_else(|| {
+                crate::agent::config::try_resolve_model_credentials(&cfg.model, None)
+                    .map(|r| r.auth_scheme)
+            })
+            .unwrap_or(ctx.sampling_config.auth_scheme);
             let api_key = if auth_scheme == xai_grok_sampler::AuthScheme::None {
                 None
             } else {

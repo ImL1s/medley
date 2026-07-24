@@ -1,7 +1,7 @@
 use super::support::*;
 use super::*;
-use agent_client_protocol as acp;
 use crate::auth::{AuthManager, AuthMode, GrokAuth, GrokComConfig};
+use agent_client_protocol as acp;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;

@@ -169,8 +169,10 @@ async fn none_auth_scheme_omits_xai_identity_headers_on_the_wire() {
         "x-grok-deployment-id".to_string(),
         "extra-deploy-must-not-leak".to_string(),
     );
-    cfg.extra_headers
-        .insert("x-grok-user-id".to_string(), "extra-user-must-not-leak".to_string());
+    cfg.extra_headers.insert(
+        "x-grok-user-id".to_string(),
+        "extra-user-must-not-leak".to_string(),
+    );
     let client = SamplingClient::new(cfg).unwrap();
     send_one(&client).await;
     let heads = heads.lock().unwrap();

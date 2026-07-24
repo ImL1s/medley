@@ -5286,9 +5286,7 @@ fn auth_scheme_meta_value(scheme: AuthScheme) -> &'static str {
 const AUTH_SCHEME_ALLOWED: &str = "bearer, x_api_key, or none";
 
 fn invalid_auth_scheme_validation_error(raw: &str) -> String {
-    format!(
-        "invalid auth_scheme {raw:?}: expected {AUTH_SCHEME_ALLOWED}"
-    )
+    format!("invalid auth_scheme {raw:?}: expected {AUTH_SCHEME_ALLOWED}")
 }
 
 /// Credential class for picker UX: keyless, env/BYOK, or xAI session/login.
@@ -5335,11 +5333,7 @@ fn provider_hint_for_url(base_url: &str) -> String {
 /// Picker readiness: keyless and typical xAI catalog stay selectable; BYOK
 /// models that declare `env_key`/`api_key` but lack a resolved value are not.
 pub(crate) fn model_readiness(model: &ModelEntry) -> (bool, Option<String>) {
-    if let Some(reason) = model
-        .config_validation_errors
-        .first()
-        .map(|e| e.as_str())
-    {
+    if let Some(reason) = model.config_validation_errors.first().map(|e| e.as_str()) {
         return (false, Some(reason.to_owned()));
     }
     if model.info.auth_scheme == AuthScheme::None {
