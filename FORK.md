@@ -37,7 +37,7 @@ Relative to `xai-org/grok-build` `main`, this fork's `providers` branch adds:
 | `[model.*] auth_scheme` | Per-model override: `"bearer"` (default), `"x_api_key"` (Anthropic-style), or `"none"`. |
 | Credential isolation | No-auth models never inherit ambient session / `XAI_API_KEY` / env credentials. Invalid `auth_scheme` is unready (fail-closed), not silent Bearer. |
 | ACP `local.none` | Advertised only when the **startup-selected** model is no-auth. |
-| Session safety | Catalog key vs wire slug kept separate; readiness gated in `model_switch::apply` (covers new/load/switch); strip stale `api_key` / no bearer resolver for `None`. |
+| Session safety | Catalog key vs wire slug kept separate; readiness gated in `model_switch::apply` (covers new/load/switch); unready defaults fall back to a bundled sentinel; turn-time `reconstruct_full_config` re-checks `ModelAuthFacts.ready` and strips ambient Bearer / identity for unready or `None` models. |
 | TUI readiness | `/model` and Ctrl+M show `ready` / `missing` / `none` badges; hard-block unready; soft-confirm auth-class changes. |
 | Fork ops | [`FORK.md`](FORK.md), [`scripts/sync-upstream.sh`](scripts/sync-upstream.sh), and providers-only [CI](.github/workflows/ci.yml). |
 
