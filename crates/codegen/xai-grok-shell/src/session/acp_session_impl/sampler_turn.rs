@@ -452,7 +452,8 @@ impl SessionActor {
                 stream_tool_calls: None,
             });
         let creds = self.chat_state_handle.get_credentials().await;
-        let model_facts = self.model_auth_facts(cfg.model.as_str());
+        let catalog_model_id = self.catalog_model_id_str();
+        let model_facts = self.model_auth_facts(&catalog_model_id);
         let auth_method = self.auth_method_id.load();
         let gate = SessionTokenAuthGate::new(
             auth_method.as_deref(),
@@ -892,7 +893,7 @@ impl SessionActor {
             .chat_state_handle
             .get_sampling_config()
             .await
-            .map(|c| (c.model, c.base_url))
+            .map(|c| (self.catalog_model_id_str(), c.base_url))
             .unwrap_or_default();
         let auth_provider =
             if matches!(error.kind, SamplingErrorKind::Auth) || error.status_code == Some(401) {
@@ -1198,13 +1199,14 @@ impl SessionActor {
     pub(crate) async fn refresh_token_if_expired(&self) {
         if let Some(ref am) = self.auth_manager {
             let creds = self.chat_state_handle.get_credentials().await;
-            let (model_id, base_url) = self
+            let catalog_model_id = self.catalog_model_id_str();
+            let base_url = self
                 .chat_state_handle
                 .get_sampling_config()
                 .await
-                .map(|c| (c.model, c.base_url))
+                .map(|c| c.base_url)
                 .unwrap_or_default();
-            if self.auth_gate(&model_id, &base_url).active() {
+            if self.auth_gate(&catalog_model_id, &base_url).active() {
                 match am.get_valid_token().await {
                     Ok(key) => {
                         if creds.api_key.as_deref() != Some(&key) {
@@ -1220,7 +1222,7 @@ impl SessionActor {
                         tracing::warn!(
                             error = %e,
                             hard_expired,
-                            model = %model_id,
+                            model = %catalog_model_id,
                             "auth: preflight get_valid_token failed"
                         );
                         xai_grok_telemetry::unified_log::warn(
@@ -1229,7 +1231,7 @@ impl SessionActor {
                             Some(serde_json::json!({
                                 "error": format!("{e}"),
                                 "hard_expired": hard_expired,
-                                "model": model_id,
+                                "model": catalog_model_id,
                             })),
                         );
                         return;
@@ -1247,12 +1249,7 @@ impl SessionActor {
         const REFRESH_THRESHOLD: chrono::Duration = chrono::Duration::minutes(5);
         let creds = self.chat_state_handle.get_credentials().await;
         let current_key = creds.api_key;
-        let current_model_id = self
-            .chat_state_handle
-            .get_sampling_config()
-            .await
-            .map(|c| c.model)
-            .unwrap_or_default();
+        let current_model_id = self.catalog_model_id_str();
         if let Some(provider) = self.model_auth_provider(&current_model_id) {
             self.refresh_provider_token_pre_turn(
                 &provider,

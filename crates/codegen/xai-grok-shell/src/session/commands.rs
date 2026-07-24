@@ -187,6 +187,8 @@ pub enum SessionCommand {
         responds_to: oneshot::Sender<()>,
     },
     SetSessionModel {
+        /// Catalog key for persistence, auth facts, and readiness — not the wire slug.
+        catalog_model_id: acp::ModelId,
         sampling_config: xai_grok_sampler::SamplerConfig,
         use_concise: bool,
         /// When `false`, skip the system prompt rewrite (concise/default swap).

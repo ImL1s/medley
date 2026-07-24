@@ -645,6 +645,9 @@ pub(crate) struct SessionActor {
     /// `is_telemetry_enabled() && !is_zdr()` — ZDR teams always have this false.
     pub(crate) telemetry_enabled: bool,
     pub(crate) supports_backend_search: std::cell::Cell<bool>,
+    /// Authoritative catalog model id for auth/readiness lookups. Distinct from
+    /// the wire routing slug stored in `chat_state_handle` sampling config.
+    pub(crate) catalog_model_id: std::cell::Cell<String>,
     /// Per-turn override, set at promotion. Not persisted; a reload reverts to the definition seed.
     pub(crate) tool_overrides: std::cell::RefCell<Option<xai_grok_sampling_types::ToolOverrides>>,
     /// Configured cutoff a subagent inherits, read off the `SessionHandle` without an actor round-trip.
@@ -1103,16 +1106,27 @@ impl SessionActor {
     ) {
         self.events.emit_turn_ended(outcome, category, context);
     }
-    /// Current model ID for OTLP span attributes. Reads from chat_state_handle
-    /// so it always reflects the latest model override — no stale cached field.
-    /// Returns "unknown" if no sampling config is set.
+    /// Current catalog model id for OTLP span attributes and auth lookups.
+    /// Prefers the authoritative catalog key; falls back to the wire slug.
+    /// Returns "unknown" if neither is set.
     async fn current_model_id(&self) -> String {
+        let catalog = self.catalog_model_id_str();
+        if !catalog.is_empty() {
+            return catalog;
+        }
         self.chat_state_handle
             .get_sampling_config()
             .await
             .map(|c| c.model)
             .filter(|m| !m.is_empty())
             .unwrap_or_else(|| "unknown".to_string())
+    }
+    /// Read the authoritative catalog model id without mutating session state.
+    pub(super) fn catalog_model_id_str(&self) -> String {
+        let id = self.catalog_model_id.take();
+        let out = id.clone();
+        self.catalog_model_id.set(id);
+        out
     }
     /// Build a hook run context for dispatching hook events.
     fn session_id_string(&self) -> String {

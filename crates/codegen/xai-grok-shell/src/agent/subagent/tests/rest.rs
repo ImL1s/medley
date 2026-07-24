@@ -2863,6 +2863,43 @@ async fn read_parent_sampling_config_strips_api_key_for_auth_scheme_none() {
     );
 }
 #[tokio::test]
+async fn read_parent_sampling_config_prefers_catalog_key_over_shared_wire_slug() {
+    use xai_grok_sampler::AuthScheme;
+    let shared_slug = "shared-routing-slug";
+    let chat_state = spawn_test_parent_chat_state(shared_slug);
+    chat_state.update_credentials(xai_chat_state::Credentials {
+        api_key: Some("stale-session-jwt".to_string()),
+        auth_type: xai_chat_state::AuthType::SessionToken,
+        ..Default::default()
+    });
+    let mut models = indexmap::IndexMap::new();
+    let mut bearer_entry = test_model_entry(shared_slug);
+    bearer_entry.info.auth_scheme = AuthScheme::Bearer;
+    models.insert("builtin-bearer".to_string(), bearer_entry);
+    let mut none_entry = test_model_entry(shared_slug);
+    none_entry.info.auth_scheme = AuthScheme::None;
+    models.insert("none-alias".to_string(), none_entry);
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.model_id = acp::ModelId::new("none-alias");
+    ctx.parent_chat_state = Some(chat_state);
+    ctx.sampling_config.auth_scheme = AuthScheme::None;
+    ctx.available_models = models.clone();
+    ctx.models_manager = crate::agent::models::ModelsManager::new(
+        None,
+        models,
+        acp::ModelId::new("auto"),
+        ctx.auth_manager.clone(),
+        crate::agent::config::Config::default(),
+    );
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(model_id.0.as_ref(), "none-alias");
+    assert_eq!(config.auth_scheme, AuthScheme::None);
+    assert!(
+        config.api_key.is_none(),
+        "catalog None alias must win over the shared-slug Bearer entry"
+    );
+}
+#[tokio::test]
 async fn read_parent_sampling_config_catalog_miss_respects_parent_auth_scheme_none() {
     use xai_grok_sampler::AuthScheme;
     let inference_slug = "not-in-effective-catalog-xyz";

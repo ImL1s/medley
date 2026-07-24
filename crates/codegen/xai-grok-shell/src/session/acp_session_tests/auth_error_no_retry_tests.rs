@@ -1,5 +1,6 @@
 use super::support::*;
 use super::*;
+use agent_client_protocol as acp;
 use crate::auth::{AuthManager, AuthMode, GrokAuth, GrokComConfig};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1090,6 +1091,155 @@ async fn refresh_token_if_expired_skips_session_refresh_for_none_auth_scheme() {
         .await;
 }
 
+/// When a custom `AuthScheme::None` alias shares a wire slug with a built-in
+/// Bearer entry, auth facts must key off the catalog id — not the routing slug.
+#[tokio::test(flavor = "current_thread")]
+async fn reconstruct_full_config_uses_catalog_key_for_none_alias_with_shared_wire_slug() {
+    use crate::agent::auth_method::ModelByok;
+    use crate::agent::config::ModelAuthFacts;
+    use xai_grok_sampler::AuthScheme;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_dir, am) = auth_manager_with_valid_token("session-token");
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                Some(am),
+                "cached_token",
+                xai_chat_state::AuthType::SessionToken,
+                "stale-session-jwt".to_string(),
+            )
+            .await;
+
+            let shared_slug = "shared-routing-slug";
+            let catalog_key = "none-alias";
+            if let Some(mut cfg) = actor.chat_state_handle.get_sampling_config().await {
+                cfg.model = shared_slug.to_string();
+                actor.chat_state_handle.update_sampling_config(cfg);
+            }
+            actor.catalog_model_id.set(catalog_key.to_string());
+            actor
+                .model_auth_memo
+                .replace(Some(crate::session::acp_session::ModelAuthMemo {
+                    model_id: catalog_key.to_string(),
+                    facts: ModelAuthFacts {
+                        byok: ModelByok::NotByok,
+                        auth_scheme: AuthScheme::None,
+                    },
+                    provider: None,
+                }));
+
+            let cfg = actor.reconstruct_full_config().await;
+
+            assert_eq!(
+                cfg.model, shared_slug,
+                "wire routing slug must stay on the sampler payload"
+            );
+            assert!(
+                cfg.bearer_resolver.is_none(),
+                "catalog None alias must not attach session bearer resolver"
+            );
+            assert_eq!(cfg.auth_scheme, AuthScheme::None);
+            assert!(
+                cfg.api_key.is_none(),
+                "AuthScheme::None must strip stale session credentials"
+            );
+        })
+        .await;
+}
+
+/// Switching via `handle_set_session_model` must persist the catalog key even
+/// when the wire slug matches a different catalog entry.
+#[tokio::test(flavor = "current_thread")]
+async fn set_session_model_preserves_catalog_key_for_none_alias_with_shared_wire_slug() {
+    use crate::agent::auth_method::ModelByok;
+    use crate::agent::config::ModelAuthFacts;
+    use xai_grok_sampler::AuthScheme;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_dir, am) = auth_manager_with_valid_token("session-token");
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                Some(am),
+                "cached_token",
+                xai_chat_state::AuthType::SessionToken,
+                "stale-session-jwt".to_string(),
+            )
+            .await;
+
+            let shared_slug = "shared-routing-slug";
+            let catalog_key = "none-alias";
+            actor
+                .model_auth_memo
+                .replace(Some(crate::session::acp_session::ModelAuthMemo {
+                    model_id: "builtin-bearer".to_string(),
+                    facts: ModelAuthFacts {
+                        byok: ModelByok::NotByok,
+                        auth_scheme: AuthScheme::Bearer,
+                    },
+                    provider: None,
+                }));
+
+            let switch_cfg = xai_grok_sampler::SamplerConfig {
+                api_key: Some("stale-session-jwt".to_string()),
+                base_url: "http://127.0.0.1:11434/v1".to_string(),
+                model: shared_slug.to_string(),
+                max_completion_tokens: None,
+                temperature: None,
+                top_p: None,
+                api_backend: crate::sampling::ApiBackend::ChatCompletions,
+                auth_scheme: AuthScheme::None,
+                extra_headers: Default::default(),
+                context_window: 256_000,
+                client_version: None,
+                force_http1: false,
+                max_retries: None,
+                stream_tool_calls: false,
+                idle_timeout_secs: None,
+                client_identifier: None,
+                reasoning_effort: None,
+                deployment_id: None,
+                user_id: None,
+                origin_client: None,
+                attribution_callback: None,
+                bearer_resolver: None,
+                supports_backend_search: false,
+                compactions_remaining: None,
+                compaction_at_tokens: None,
+                doom_loop_recovery: None,
+                header_injector: None,
+            };
+            let returned = actor
+                .handle_set_session_model(
+                    acp::ModelId::new(catalog_key),
+                    switch_cfg,
+                    false,
+                    false,
+                    true,
+                    85,
+                )
+                .await
+                .expect("model switch");
+
+            assert_eq!(returned.0.as_ref(), catalog_key);
+            actor
+                .model_auth_memo
+                .replace(Some(crate::session::acp_session::ModelAuthMemo {
+                    model_id: catalog_key.to_string(),
+                    facts: ModelAuthFacts {
+                        byok: ModelByok::NotByok,
+                        auth_scheme: AuthScheme::None,
+                    },
+                    provider: None,
+                }));
+
+            let cfg = actor.reconstruct_full_config().await;
+            assert_eq!(cfg.model, shared_slug);
+            assert!(cfg.bearer_resolver.is_none());
+            assert_eq!(cfg.auth_scheme, AuthScheme::None);
+        })
+        .await;
+}
+
 /// Switching to `AuthScheme::None` must clear stale session credentials from
 /// chat_state even when the caller passes a non-None `api_key` in the sampling
 /// config (defense-in-depth against credential leakage on the wire).
@@ -1114,6 +1264,7 @@ async fn handle_set_session_model_clears_credentials_for_none() {
                 .await
                 .map(|c| c.model)
                 .unwrap_or_default();
+            let catalog_model = model.clone();
 
             let cfg = xai_grok_sampler::SamplerConfig {
                 api_key: Some("stale-session-jwt".to_string()),
@@ -1145,7 +1296,14 @@ async fn handle_set_session_model_clears_credentials_for_none() {
                 header_injector: None,
             };
             let _ = actor
-                .handle_set_session_model(cfg, false, false, true, 85)
+                .handle_set_session_model(
+                    acp::ModelId::new(catalog_model),
+                    cfg,
+                    false,
+                    false,
+                    true,
+                    85,
+                )
                 .await;
 
             let creds = actor.chat_state_handle.get_credentials().await;
@@ -1232,7 +1390,14 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                 header_injector: None,
             };
             let _ = actor
-                .handle_set_session_model(cfg, false, false, true, 85)
+                .handle_set_session_model(
+                    acp::ModelId::new(model.clone()),
+                    cfg,
+                    false,
+                    false,
+                    true,
+                    85,
+                )
                 .await;
 
             assert!(
@@ -1292,6 +1457,7 @@ async fn switch_to_first_party_model_drops_minted_provider_token() {
                 .await
                 .map(|c| c.model)
                 .unwrap_or_default();
+            let catalog_model = model.clone();
 
             let cfg = xai_grok_sampler::SamplerConfig {
                 api_key: Some("session-jwt".to_string()),
@@ -1323,7 +1489,14 @@ async fn switch_to_first_party_model_drops_minted_provider_token() {
                 header_injector: None,
             };
             let _ = actor
-                .handle_set_session_model(cfg, false, false, true, 85)
+                .handle_set_session_model(
+                    acp::ModelId::new(catalog_model),
+                    cfg,
+                    false,
+                    false,
+                    true,
+                    85,
+                )
                 .await;
 
             let creds = actor.chat_state_handle.get_credentials().await;

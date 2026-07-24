@@ -4,13 +4,15 @@ use xai_chat_state::conversation_util::replace_or_insert_system_head;
 impl SessionActor {
     pub(super) async fn handle_set_session_model(
         &self,
+        catalog_model_id: acp::ModelId,
         sampling_config: xai_grok_sampler::SamplerConfig,
         use_concise: bool,
         apply_prompt_override: bool,
         skip_prompt_rewrite: bool,
         auto_compact_threshold_percent: u8,
     ) -> Result<acp::ModelId, acp::Error> {
-        let model_id = acp::ModelId::new(sampling_config.model.clone());
+        self.catalog_model_id
+            .set(catalog_model_id.0.to_string());
         let new_context_window = self.compaction.context_window_override.unwrap_or_else(|| {
             std::num::NonZeroU64::new(sampling_config.context_window).unwrap_or_else(|| {
                 std::num::NonZeroU64::new(DEFAULT_CONTEXT_WINDOW)
@@ -72,7 +74,7 @@ impl SessionActor {
                 (
                     sampling_config.api_key.clone(),
                     crate::agent::config::resolve_chat_state_auth_type(
-                        sampling_config.model.as_str(),
+                        catalog_model_id.0.as_ref(),
                         session_key.as_deref(),
                         existing.auth_type,
                     ),
@@ -107,13 +109,13 @@ impl SessionActor {
         } else if !apply_prompt_override {
             tracing::info!(
                 session_id = %self.session_info.id.0,
-                model_id = %model_id.0,
+                model_id = %catalog_model_id.0,
                 "handle_set_session_model: skipping prompt override (apply_prompt_override=false)"
             );
         } else {
             tracing::info!(
                 session_id = %self.session_info.id.0,
-                model_id = %model_id.0,
+                model_id = %catalog_model_id.0,
                 "handle_set_session_model: skipping prompt rewrite (just rebuilt harness)"
             );
         }
@@ -122,11 +124,11 @@ impl SessionActor {
             .notifications
             .persistence_tx
             .send(PersistenceMsg::CurrentModel {
-                model_id: model_id.clone(),
+                model_id: catalog_model_id.clone(),
                 agent_name: Some(agent_name),
                 reasoning_effort: Some(sampling_config.reasoning_effort),
             });
-        Ok(model_id)
+        Ok(catalog_model_id)
     }
     /// Handle [`SessionCommand::RebuildAgentForDefinition`].
     ///
