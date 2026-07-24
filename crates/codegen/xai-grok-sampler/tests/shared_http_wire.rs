@@ -156,3 +156,37 @@ async fn none_auth_scheme_strips_auth_headers_after_hostile_injector_on_wire() {
         "wire request must not leak injector credential material: {head}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn none_auth_scheme_omits_xai_identity_headers_on_the_wire() {
+    pin_env();
+    let (base_url, _accepts, heads) = spawn_counting_server().await;
+    let mut cfg = test_config(&base_url, "must-not-leak");
+    cfg.auth_scheme = xai_grok_sampler::AuthScheme::None;
+    cfg.deployment_id = Some("deploy-must-not-leak".to_string());
+    cfg.user_id = Some("user-must-not-leak".to_string());
+    cfg.extra_headers.insert(
+        "x-grok-deployment-id".to_string(),
+        "extra-deploy-must-not-leak".to_string(),
+    );
+    cfg.extra_headers
+        .insert("x-grok-user-id".to_string(), "extra-user-must-not-leak".to_string());
+    let client = SamplingClient::new(cfg).unwrap();
+    send_one(&client).await;
+    let heads = heads.lock().unwrap();
+    assert_eq!(heads.len(), 1);
+    let head = &heads[0];
+    let lower = head.to_ascii_lowercase();
+    assert!(
+        !lower.contains("x-grok-deployment-id:"),
+        "wire request must not include x-grok-deployment-id under AuthScheme::None: {head}"
+    );
+    assert!(
+        !lower.contains("x-grok-user-id:"),
+        "wire request must not include x-grok-user-id under AuthScheme::None: {head}"
+    );
+    assert!(
+        !head.contains("must-not-leak"),
+        "wire request must not leak xAI identity material: {head}"
+    );
+}

@@ -13655,6 +13655,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "xai-grok-env",
  "xai-grok-sampling-types",
  "xai-grok-test-support",
  "xai-grok-version",

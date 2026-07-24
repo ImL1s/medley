@@ -40,6 +40,15 @@ const DEFAULT_CLIENT_IDENTIFIER: &str = "grok-shell";
 const AGENT_PRODUCT: &str = "grok-shell";
 const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 128_000;
 
+fn should_send_xai_identity_headers(auth_scheme: AuthScheme, base_url: &str) -> bool {
+    !matches!(auth_scheme, AuthScheme::None) && crate::util::is_xai_api_url(base_url)
+}
+
+fn strip_xai_identity_headers(headers: &mut HeaderMap) {
+    headers.remove(HeaderName::from_static("x-grok-deployment-id"));
+    headers.remove(HeaderName::from_static("x-grok-user-id"));
+}
+
 /// Per-request `x-grok-*` headers. Optional fields are skipped when empty/`None`.
 struct GrokRequestHeaders<'a> {
     conv_id: &'a str,
@@ -53,7 +62,11 @@ struct GrokRequestHeaders<'a> {
 }
 
 impl GrokRequestHeaders<'_> {
-    fn apply(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    fn apply(
+        &self,
+        builder: reqwest::RequestBuilder,
+        include_identity: bool,
+    ) -> reqwest::RequestBuilder {
         let mut b = builder
             .header("x-grok-conv-id", self.conv_id)
             .header("x-grok-req-id", self.req_id)
@@ -63,11 +76,13 @@ impl GrokRequestHeaders<'_> {
         if let Some(idx) = self.turn_idx {
             b = b.header("x-grok-turn-idx", idx);
         }
-        if let Some(id) = self.deployment_id.filter(|s| !s.is_empty()) {
-            b = b.header("x-grok-deployment-id", id);
-        }
-        if let Some(id) = self.user_id.filter(|s| !s.is_empty()) {
-            b = b.header("x-grok-user-id", id);
+        if include_identity {
+            if let Some(id) = self.deployment_id.filter(|s| !s.is_empty()) {
+                b = b.header("x-grok-deployment-id", id);
+            }
+            if let Some(id) = self.user_id.filter(|s| !s.is_empty()) {
+                b = b.header("x-grok-user-id", id);
+            }
         }
         b
     }
@@ -463,19 +478,23 @@ impl SamplingClient {
             );
         }
 
-        if let Some(deployment_id) = config.deployment_id.as_ref()
-            && let Ok(header_value) = HeaderValue::from_str(deployment_id)
-        {
-            headers.insert(
-                HeaderName::from_static("x-grok-deployment-id"),
-                header_value,
-            );
-        }
+        if should_send_xai_identity_headers(config.auth_scheme, &config.base_url) {
+            if let Some(deployment_id) = config.deployment_id.as_ref()
+                && let Ok(header_value) = HeaderValue::from_str(deployment_id)
+            {
+                headers.insert(
+                    HeaderName::from_static("x-grok-deployment-id"),
+                    header_value,
+                );
+            }
 
-        if let Some(user_id) = config.user_id.as_ref()
-            && let Ok(header_value) = HeaderValue::from_str(user_id)
-        {
-            headers.insert(HeaderName::from_static("x-grok-user-id"), header_value);
+            if let Some(user_id) = config.user_id.as_ref()
+                && let Ok(header_value) = HeaderValue::from_str(user_id)
+            {
+                headers.insert(HeaderName::from_static("x-grok-user-id"), header_value);
+            }
+        } else {
+            strip_xai_identity_headers(&mut headers);
         }
 
         {
@@ -555,6 +574,12 @@ impl SamplingClient {
         self.defaults.api_backend.clone()
     }
 
+    /// Whether xAI account identity headers (`x-grok-user-id`, `x-grok-deployment-id`)
+    /// should ride on outbound requests for this client.
+    fn sends_xai_identity_headers(&self) -> bool {
+        should_send_xai_identity_headers(self.defaults.auth_scheme, &self.base_url)
+    }
+
     /// POST with default headers. Overrides auth from resolver if wired.
     fn post(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
         let mut headers = self.default_headers.clone();
@@ -617,6 +642,9 @@ impl SamplingClient {
         if matches!(self.defaults.auth_scheme, AuthScheme::None) {
             headers.remove(AUTHORIZATION);
             headers.remove(HeaderName::from_static("x-api-key"));
+        }
+        if !self.sends_xai_identity_headers() {
+            strip_xai_identity_headers(&mut headers);
         }
         self.http.post(url).headers(headers)
     }
@@ -825,7 +853,10 @@ impl SamplingClient {
             user_id: payload.x_grok_user_id.as_deref(),
         };
         let http_request = grok_headers
-            .apply(self.post(self.endpoint("chat/completions")))
+            .apply(
+                self.post(self.endpoint("chat/completions")),
+                self.sends_xai_identity_headers(),
+            )
             .json(&payload);
 
         let response = http_request.send().await.map_err(|e| {
@@ -883,7 +914,10 @@ impl SamplingClient {
             user_id: payload.x_grok_user_id.as_deref(),
         };
         let http_request = grok_headers
-            .apply(self.post(self.endpoint("chat/completions")))
+            .apply(
+                self.post(self.endpoint("chat/completions")),
+                self.sends_xai_identity_headers(),
+            )
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
             .json(&streaming_request);
 
@@ -1096,7 +1130,10 @@ impl SamplingClient {
         // old raw_output machinery.
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
         let http_request = grok_headers
-            .apply(self.post(self.endpoint("responses")))
+            .apply(
+                self.post(self.endpoint("responses")),
+                self.sends_xai_identity_headers(),
+            )
             .json(&request_body);
 
         let response = http_request.send().await.map_err(|e| {
@@ -1238,7 +1275,10 @@ impl SamplingClient {
             .doom_loop_recovery
             .map(crate::doom_loop::DoomLoopSignalCollector::new);
         let mut http_request = grok_headers
-            .apply(self.post(self.endpoint("responses")))
+            .apply(
+                self.post(self.endpoint("responses")),
+                self.sends_xai_identity_headers(),
+            )
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
         if doom_loop.is_some() {
             // Presence opts in; the server ignores the value.
@@ -1435,7 +1475,10 @@ impl SamplingClient {
             user_id: request.x_grok_user_id.as_deref(),
         };
         let http_request = grok_headers
-            .apply(self.post(self.endpoint("messages")))
+            .apply(
+                self.post(self.endpoint("messages")),
+                self.sends_xai_identity_headers(),
+            )
             .json(&request.inner);
 
         let response = http_request.send().await.map_err(|e| {
@@ -1542,7 +1585,10 @@ impl SamplingClient {
             user_id: request.x_grok_user_id.as_deref(),
         };
         let http_request = grok_headers
-            .apply(self.post(self.endpoint("messages")))
+            .apply(
+                self.post(self.endpoint("messages")),
+                self.sends_xai_identity_headers(),
+            )
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
             .json(&request.inner);
 
@@ -2238,6 +2284,142 @@ mod tests {
                 .get(HeaderName::from_static("x-api-key"))
                 .is_none(),
             "AuthScheme::None must strip x-api-key even when injected via extra_headers"
+        );
+    }
+
+    #[test]
+    fn none_and_third_party_url_omits_xai_identity_headers() {
+        let cfg = SamplerConfig {
+            auth_scheme: AuthScheme::None,
+            base_url: "https://api.openai.com/v1".to_string(),
+            deployment_id: Some("deploy-must-not-leak".to_string()),
+            user_id: Some("user-must-not-leak".to_string()),
+            ..minimal_config()
+        };
+        let client = SamplingClient::new(cfg).expect("client should build");
+        let req = client
+            .post("https://api.openai.com/v1/chat/completions")
+            .build()
+            .expect("build request");
+        assert!(
+            req.headers()
+                .get(HeaderName::from_static("x-grok-deployment-id"))
+                .is_none(),
+            "None + third-party must omit x-grok-deployment-id"
+        );
+        assert!(
+            req.headers()
+                .get(HeaderName::from_static("x-grok-user-id"))
+                .is_none(),
+            "None + third-party must omit x-grok-user-id"
+        );
+    }
+
+    #[test]
+    fn none_scheme_omits_xai_identity_headers_on_first_party_base_url() {
+        let cfg = SamplerConfig {
+            auth_scheme: AuthScheme::None,
+            base_url: "https://api.x.ai/v1".to_string(),
+            deployment_id: Some("deploy-must-not-leak".to_string()),
+            user_id: Some("user-must-not-leak".to_string()),
+            ..minimal_config()
+        };
+        let client = SamplingClient::new(cfg).expect("client should build");
+        assert!(
+            client
+                .default_headers
+                .get(HeaderName::from_static("x-grok-deployment-id"))
+                .is_none(),
+            "AuthScheme::None must omit x-grok-deployment-id"
+        );
+        assert!(
+            client
+                .default_headers
+                .get(HeaderName::from_static("x-grok-user-id"))
+                .is_none(),
+            "AuthScheme::None must omit x-grok-user-id"
+        );
+        let req = client
+            .post("https://api.x.ai/v1/chat/completions")
+            .build()
+            .expect("build request");
+        assert!(
+            req.headers()
+                .get(HeaderName::from_static("x-grok-deployment-id"))
+                .is_none()
+        );
+        assert!(
+            req.headers()
+                .get(HeaderName::from_static("x-grok-user-id"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn third_party_base_url_omits_xai_identity_headers_even_with_bearer() {
+        let cfg = SamplerConfig {
+            base_url: "https://api.openai.com/v1".to_string(),
+            deployment_id: Some("deploy-must-not-leak".to_string()),
+            user_id: Some("user-must-not-leak".to_string()),
+            ..minimal_config()
+        };
+        let client = SamplingClient::new(cfg).expect("client should build");
+        assert!(
+            client
+                .default_headers
+                .get(HeaderName::from_static("x-grok-deployment-id"))
+                .is_none(),
+            "third-party base_url must omit x-grok-deployment-id"
+        );
+        assert!(
+            client
+                .default_headers
+                .get(HeaderName::from_static("x-grok-user-id"))
+                .is_none(),
+            "third-party base_url must omit x-grok-user-id"
+        );
+        let req = client
+            .post("https://api.openai.com/v1/chat/completions")
+            .build()
+            .expect("build request");
+        assert!(
+            req.headers()
+                .get(HeaderName::from_static("x-grok-deployment-id"))
+                .is_none()
+        );
+        assert!(
+            req.headers()
+                .get(HeaderName::from_static("x-grok-user-id"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn third_party_base_url_strips_identity_headers_from_extra_headers() {
+        let mut cfg = SamplerConfig {
+            base_url: "https://api.anthropic.com/v1".to_string(),
+            ..minimal_config()
+        };
+        cfg.extra_headers.insert(
+            "x-grok-deployment-id".to_string(),
+            "deploy-must-not-leak".to_string(),
+        );
+        cfg.extra_headers
+            .insert("x-grok-user-id".to_string(), "user-must-not-leak".to_string());
+        let client = SamplingClient::new(cfg).expect("client should build");
+        let req = client
+            .post("https://api.anthropic.com/v1/messages")
+            .build()
+            .expect("build request");
+        assert!(
+            req.headers()
+                .get(HeaderName::from_static("x-grok-deployment-id"))
+                .is_none()
+        );
+        assert!(
+            req.headers()
+                .get(HeaderName::from_static("x-grok-user-id"))
+                .is_none()
         );
     }
 
