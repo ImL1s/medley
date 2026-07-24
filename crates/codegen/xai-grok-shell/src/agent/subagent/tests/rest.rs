@@ -2970,6 +2970,83 @@ async fn read_parent_sampling_config_available_models_none_strips_with_bearer_pa
         "stale JWT must strip when available_models resolves AuthScheme::None"
     );
 }
+#[tokio::test]
+async fn read_parent_sampling_config_stale_none_baseline_keeps_bearer_from_catalog() {
+    use xai_grok_sampler::AuthScheme;
+    let inference_slug = "switched-bearer-model";
+    let chat_state = spawn_test_parent_chat_state(inference_slug);
+    chat_state.update_credentials(xai_chat_state::Credentials {
+        api_key: Some("live-session-bearer".to_string()),
+        auth_type: xai_chat_state::AuthType::SessionToken,
+        ..Default::default()
+    });
+    let mut models = indexmap::IndexMap::new();
+    let mut entry = test_model_entry(inference_slug);
+    entry.info.auth_scheme = AuthScheme::Bearer;
+    models.insert("bearer-model".to_string(), entry);
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.model_id = acp::ModelId::new("bearer-model");
+    ctx.parent_chat_state = Some(chat_state);
+    // Stale agent-level snapshot from startup on a None model.
+    ctx.sampling_config.auth_scheme = AuthScheme::None;
+    ctx.available_models = models.clone();
+    ctx.models_manager = crate::agent::models::ModelsManager::new(
+        None,
+        models,
+        acp::ModelId::new("auto"),
+        ctx.auth_manager.clone(),
+        crate::agent::config::Config::default(),
+    );
+    let (config, _model_id) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(
+        config.auth_scheme,
+        AuthScheme::Bearer,
+        "catalog Bearer must win over stale None parent baseline"
+    );
+    assert_eq!(
+        config.api_key.as_deref(),
+        Some("live-session-bearer"),
+        "child must inherit live credentials when catalog resolves Bearer"
+    );
+}
+#[tokio::test]
+async fn read_parent_sampling_config_stale_none_baseline_keeps_x_api_key_from_catalog() {
+    use xai_grok_sampler::AuthScheme;
+    let inference_slug = "switched-x-api-key-model";
+    let chat_state = spawn_test_parent_chat_state(inference_slug);
+    chat_state.update_credentials(xai_chat_state::Credentials {
+        api_key: Some("live-byok-key".to_string()),
+        auth_type: xai_chat_state::AuthType::ApiKey,
+        ..Default::default()
+    });
+    let mut models = indexmap::IndexMap::new();
+    let mut entry = test_model_entry(inference_slug);
+    entry.info.auth_scheme = AuthScheme::XApiKey;
+    models.insert("x-api-key-model".to_string(), entry);
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.model_id = acp::ModelId::new("x-api-key-model");
+    ctx.parent_chat_state = Some(chat_state);
+    ctx.sampling_config.auth_scheme = AuthScheme::None;
+    ctx.available_models = models.clone();
+    ctx.models_manager = crate::agent::models::ModelsManager::new(
+        None,
+        models,
+        acp::ModelId::new("auto"),
+        ctx.auth_manager.clone(),
+        crate::agent::config::Config::default(),
+    );
+    let (config, _model_id) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(
+        config.auth_scheme,
+        AuthScheme::XApiKey,
+        "catalog XApiKey must win over stale None parent baseline"
+    );
+    assert_eq!(
+        config.api_key.as_deref(),
+        Some("live-byok-key"),
+        "child must inherit live credentials when catalog resolves XApiKey"
+    );
+}
 /// Drive the REAL precedence path
 /// (`resolve_effective_model_config`, which `handle_subagent_request`
 /// calls) with BOTH an explicit `runtime_override_model` AND a

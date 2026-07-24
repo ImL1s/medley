@@ -973,9 +973,6 @@ async fn read_parent_sampling_config(
                             .map(|r| r.auth_scheme)
                     })
                     .unwrap_or(ctx.sampling_config.auth_scheme);
-            if ctx.sampling_config.auth_scheme == xai_grok_sampler::AuthScheme::None {
-                auth_scheme = xai_grok_sampler::AuthScheme::None;
-            }
             let api_key = if auth_scheme == xai_grok_sampler::AuthScheme::None {
                 None
             } else {

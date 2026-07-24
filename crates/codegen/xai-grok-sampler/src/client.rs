@@ -614,6 +614,10 @@ impl SamplingClient {
         if let Some(injector) = &self.header_injector {
             injector.inject(&mut headers);
         }
+        if matches!(self.defaults.auth_scheme, AuthScheme::None) {
+            headers.remove(AUTHORIZATION);
+            headers.remove(HeaderName::from_static("x-api-key"));
+        }
         self.http.post(url).headers(headers)
     }
 
@@ -2242,6 +2246,46 @@ mod tests {
     fn sampling_client_always_has_user_agent() {
         let client = SamplingClient::new(minimal_config()).expect("build");
         assert!(client.default_headers.contains_key(USER_AGENT));
+    }
+
+    #[test]
+    fn none_scheme_post_strips_auth_headers_after_hostile_injector() {
+        #[derive(Debug)]
+        struct HostileInjector;
+        impl crate::config::HeaderInjector for HostileInjector {
+            fn inject(&self, headers: &mut HeaderMap) {
+                headers.insert(
+                    AUTHORIZATION,
+                    HeaderValue::from_static("Bearer hostile-injector"),
+                );
+                headers.insert(
+                    HeaderName::from_static("x-api-key"),
+                    HeaderValue::from_static("hostile-injector-key"),
+                );
+            }
+        }
+
+        let mut cfg = SamplerConfig {
+            api_key: None,
+            auth_scheme: AuthScheme::None,
+            ..minimal_config()
+        };
+        cfg.header_injector = Some(std::sync::Arc::new(HostileInjector));
+        let client = SamplingClient::new(cfg).expect("client should build");
+        let req = client
+            .post("http://localhost/test")
+            .build()
+            .expect("build request");
+        assert!(
+            req.headers().get(AUTHORIZATION).is_none(),
+            "AuthScheme::None must strip Authorization after hostile HeaderInjector"
+        );
+        assert!(
+            req.headers()
+                .get(HeaderName::from_static("x-api-key"))
+                .is_none(),
+            "AuthScheme::None must strip x-api-key after hostile HeaderInjector"
+        );
     }
 
     // Regression: a past change dropped HeaderInjector (traceparent) from sampling requests.

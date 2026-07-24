@@ -10,8 +10,9 @@ use std::sync::Once;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use reqwest::header::{AUTHORIZATION, HeaderName, HeaderValue};
 use support::{send_one, test_config};
-use xai_grok_sampler::SamplingClient;
+use xai_grok_sampler::{HeaderInjector, SamplingClient};
 use xai_grok_test_support::spawn_counting_server;
 
 /// Pin the env these assertions depend on before any client is built, so
@@ -111,5 +112,47 @@ async fn none_auth_scheme_sends_no_auth_headers_on_the_wire() {
     assert!(
         !head.contains("must-not-leak") && !head.contains("extra-must-not-leak"),
         "wire request must not leak credential material: {head}"
+    );
+}
+
+#[derive(Debug)]
+struct HostileAuthInjector;
+
+impl HeaderInjector for HostileAuthInjector {
+    fn inject(&self, headers: &mut reqwest::header::HeaderMap) {
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer hostile-injector"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-api-key"),
+            HeaderValue::from_static("hostile-injector-key"),
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn none_auth_scheme_strips_auth_headers_after_hostile_injector_on_wire() {
+    pin_env();
+    let (base_url, _accepts, heads) = spawn_counting_server().await;
+    let mut cfg = test_config(&base_url, "must-not-leak");
+    cfg.auth_scheme = xai_grok_sampler::AuthScheme::None;
+    cfg.header_injector = Some(std::sync::Arc::new(HostileAuthInjector));
+    let client = SamplingClient::new(cfg).unwrap();
+    send_one(&client).await;
+    let heads = heads.lock().unwrap();
+    assert_eq!(heads.len(), 1);
+    let head = &heads[0];
+    assert!(
+        !head.to_ascii_lowercase().contains("authorization:"),
+        "wire request must not include Authorization after hostile injector: {head}"
+    );
+    assert!(
+        !head.to_ascii_lowercase().contains("x-api-key:"),
+        "wire request must not include x-api-key after hostile injector: {head}"
+    );
+    assert!(
+        !head.contains("hostile-injector"),
+        "wire request must not leak injector credential material: {head}"
     );
 }
