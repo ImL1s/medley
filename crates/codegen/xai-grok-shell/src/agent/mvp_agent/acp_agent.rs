@@ -1047,6 +1047,7 @@ impl acp::Agent for MvpAgent {
         let mut model_agent_type: Option<String> = None;
         let mut session_sampling_override: Option<SamplingConfig> = None;
         let mut disallowed_custom: Option<String> = None;
+        let mut unreadiness_custom: Option<(String, String)> = None;
         let session_initial_model = chat_initial_model(is_chat_kind, custom_model_id);
         let build_custom_model_id = if is_chat_kind { None } else { custom_model_id };
         let resolved_custom_model = build_custom_model_id
@@ -1054,6 +1055,17 @@ impl acp::Agent for MvpAgent {
                 .resolve_model_id(&acp::ModelId::new(custom_model))
             {
                 Ok(model) if model.info.user_selectable => {
+                    let (ready, reason) = crate::agent::config::model_readiness(&model);
+                    if !ready {
+                        let reason = reason.unwrap_or_else(|| "model is not ready".to_owned());
+                        tracing::warn!(
+                            requested_model = custom_model,
+                            %reason,
+                            "Requested model is not ready; falling back to current default model"
+                        );
+                        unreadiness_custom = Some((custom_model.to_string(), reason));
+                        return None;
+                    }
                     model_agent_type = Some(model.info().agent_type.clone());
                     let origin_client = self
                         .origin_client_info_from_meta(arguments.meta.as_ref());
@@ -1264,6 +1276,20 @@ impl acp::Agent for MvpAgent {
             let current = self.models_manager.current_model_id();
             let reason = format!(
                 "\"{requested}\" isn't allowed by your allowed_models setting, so this session is using \"{}\".",
+                current.0
+            );
+            self.send_model_auto_switched(
+                    &session_id,
+                    &acp::ModelId::new(requested),
+                    &current,
+                    &reason,
+                )
+                .await;
+        }
+        if let Some((requested, readiness_reason)) = unreadiness_custom {
+            let current = self.models_manager.current_model_id();
+            let reason = format!(
+                "\"{requested}\" isn't ready ({readiness_reason}), so this session is using \"{}\".",
                 current.0
             );
             self.send_model_auto_switched(
@@ -2001,6 +2027,76 @@ impl acp::Agent for MvpAgent {
                 .insert(session_id.0.to_string(), persisted_model.clone());
             fallback
         };
+        // Fail-closed: never apply an unready catalog entry (invalid auth_scheme,
+        // missing BYOK key, etc.) — that would attach ambient Bearer to the session.
+        let model_id = match self.resolve_model_id(&model_id) {
+            Ok(entry) => {
+                let (ready, reason) = crate::agent::config::model_readiness(&entry);
+                if ready {
+                    model_id
+                } else {
+                    let reason = reason.unwrap_or_else(|| "model is not ready".to_owned());
+                    let ready_fallback = available.keys().find(|id| {
+                        self.resolve_model_id(id)
+                            .ok()
+                            .is_some_and(|m| crate::agent::config::model_readiness(&m).0)
+                    }).cloned();
+                    if let Some(fallback) = ready_fallback {
+                        tracing::warn!(
+                            session_id = %session_id.0,
+                            previous = %model_id.0,
+                            new = %fallback.0,
+                            %reason,
+                            "load_session: model not ready; switching to a ready fallback"
+                        );
+                        let msg = format!(
+                            "Model \"{}\" isn't ready ({reason}). Switched to \"{}\".",
+                            model_id.0, fallback.0,
+                        );
+                        self.send_model_auto_switched(
+                                &session_id,
+                                &model_id,
+                                &fallback,
+                                &msg,
+                            )
+                            .await;
+                        fallback
+                    } else {
+                        tracing::warn!(
+                            session_id = %session_id.0,
+                            model_id = %model_id.0,
+                            %reason,
+                            "load_session: model not ready and no ready fallback; blocking prompts"
+                        );
+                        xai_grok_telemetry::unified_log::warn(
+                            "load_session: model not ready, blocking prompts",
+                            Some(session_id.0.as_ref()),
+                            Some(serde_json::json!({
+                                "model_id": model_id.0.as_ref(),
+                                "reason": reason,
+                            })),
+                        );
+                        let msg = format!(
+                            "Model \"{}\" isn't ready ({reason}). Please start a new session or switch models.",
+                            model_id.0,
+                        );
+                        let empty_id = acp::ModelId::new(String::new());
+                        self.send_model_auto_switched(
+                                &session_id,
+                                &model_id,
+                                &empty_id,
+                                &msg,
+                            )
+                            .await;
+                        self.model_unavailable_sessions
+                            .borrow_mut()
+                            .insert(session_id.0.to_string(), model_id.clone());
+                        model_id
+                    }
+                }
+            }
+            Err(_) => model_id,
+        };
         tracing::debug!(
             session_id = %session_id.0,
             final_model_id = %model_id.0,
@@ -2211,6 +2307,25 @@ impl acp::Agent for MvpAgent {
                 )
                 .unwrap_or(unavailable_model.clone());
             if available.contains_key(&restore_model_id) {
+                let restore_ready = self
+                    .resolve_model_id(&restore_model_id)
+                    .ok()
+                    .is_some_and(|m| crate::agent::config::model_readiness(&m).0);
+                if !restore_ready {
+                    tracing::warn!(
+                        session_id = %arguments.session_id.0,
+                        model_id = %restore_model_id.0,
+                        "prompt: previously-unavailable model is back but still not ready; keeping block"
+                    );
+                    self.send_model_auto_switched(
+                            &arguments.session_id,
+                            &acp::ModelId::new(String::new()),
+                            &acp::ModelId::new(String::new()),
+                            "Your previous model is still not ready (missing credentials or invalid auth_scheme).",
+                        )
+                        .await;
+                    return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+                }
                 tracing::info!(
                     session_id = %arguments.session_id.0,
                     model_id = %restore_model_id.0,

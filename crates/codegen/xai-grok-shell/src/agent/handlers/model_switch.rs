@@ -1,6 +1,9 @@
-//! Applies a model switch to a session — the ungated path. `set_session_model`
-//! enforces the `allowed_models` gate before delegating here; internal callers
-//! (`new_session`, `load_session`) call `apply` directly.
+//! Applies a model switch to a session.
+//!
+//! `set_session_model` enforces the `allowed_models` gate before delegating
+//! here. Credential / config readiness is enforced inside `apply` so internal
+//! callers (`new_session`, `load_session`, prompt restore) cannot attach an
+//! unready model (e.g. invalid `auth_scheme` fail-open → ambient Bearer).
 use crate::agent::config;
 use crate::agent::mvp_agent::{
     MvpAgent, agent_name_after_model_switch, harnesses_are_compatible, resolve_required_agent_type,
@@ -9,7 +12,10 @@ use crate::session::SessionCommand;
 use agent_client_protocol::{self as acp};
 use tokio::sync::oneshot;
 use xai_grok_sampling_types::parse_reasoning_effort_meta;
-/// Apply a model switch to a session (no gate — `set_session_model` gates first).
+/// Apply a model switch to a session.
+///
+/// Always fail-closed on `model_readiness`. The ACP `allowed_models` gate still
+/// lives in `set_session_model` only.
 pub(crate) async fn apply(
     agent: &MvpAgent,
     args: acp::SetSessionModelRequest,
@@ -32,6 +38,17 @@ pub(crate) async fn apply(
         .await
         .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))?;
     let model = agent.resolve_model_id(&model_id)?;
+    let (ready, reason) = config::model_readiness(&model);
+    if !ready {
+        tracing::warn!(
+            session_id = %session_id.0,
+            model_id = %model_id.0,
+            reason = ?reason,
+            "model_switch::apply: rejecting unready model (fail-closed)"
+        );
+        return Err(acp::Error::invalid_params()
+            .data(reason.unwrap_or_else(|| "model is not ready".to_owned())));
+    }
     let use_concise = model.info().use_concise;
     let session_default = handle
         .session_default_agent_profile

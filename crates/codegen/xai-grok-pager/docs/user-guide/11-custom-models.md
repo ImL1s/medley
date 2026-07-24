@@ -102,7 +102,7 @@ extra_headers = { "X-Request-Tags" = "team=example" }  # Extra request headers, 
 
 When `auth_scheme` is omitted, Grok uses `"bearer"`.
 
-**Invalid values fail closed.** If `auth_scheme` is misspelled or unsupported (for example `"bearer "` or `"noauth"`), Grok keeps the model entry but marks it **unready** with a validation error. The model picker and `/model` refuse to select it, and no sampling request is sent. Grok does **not** silently fall back to `"bearer"` or `"none"` for bad values.
+**Invalid values fail closed.** If `auth_scheme` is misspelled or unsupported (for example `"bearer "` or `"noauth"`), Grok keeps the model entry but marks it **unready** with a validation error. The model picker and `/model` refuse to select it. New sessions, session restore, and ACP model switches also refuse to attach an unready model (they fall back or block prompts instead of silently using ambient Bearer credentials). No sampling request is sent for an unready selection. Grok does **not** silently fall back to `"bearer"` or `"none"` for bad values.
 
 **Duplicate routing slugs.** The catalog is keyed by each entry's config key (`[model.<key>]`). Two entries may share the same wire `model` slug but must use distinct catalog keys. Always pick models by their catalog key in config and `/model`; slug-only lookups can bind to the wrong entry when duplicates exist.
 

@@ -48,6 +48,10 @@ Non-xAI / None hosts: do not send x-grok-user-id / deployment-id (and minimize c
 
 Update `11-custom-models.md` + `FORK.md`: duplicate slug hazard, invalid auth_scheme, metadata policy.
 
-## Ship
+## Ship follow-up (new_session / load_session readiness)
 
-`cargo fmt`, clippy lib -D warnings, hot-path tests, CI green, OMX re-review APPROVE, tag `v0.0.0+providers.1` (or next N), push tag + providers.
+After the first fix batch, OMX re-review found `model_switch::apply` was still readiness-ungated for `new_session` / `load_session` / prompt restore, while only ACP `set_session_model` checked `model_readiness`. That allowed an unready custom model (e.g. invalid `auth_scheme` → default Bearer) to become the session sampling config at create/restore.
+
+**Fix:** enforce `model_readiness` inside `model_switch::apply`; refuse unready custom models at `new_session` (fallback + notify); fail-closed on `load_session` / prompt restore.
+
+

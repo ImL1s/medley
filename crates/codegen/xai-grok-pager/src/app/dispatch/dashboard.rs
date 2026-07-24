@@ -968,10 +968,10 @@ pub(super) fn dispatch_dashboard_confirm_worktree(
         .map(|d| d.pending_mode)
         .unwrap_or_default();
     if block_dashboard_spawn_on_pending_model(app, pending_model.as_ref()) {
-        if let Some(d) = app.dashboard.as_mut() {
-            if let Some(p) = prompt {
-                d.dispatch.restore(p);
-            }
+        if let Some(d) = app.dashboard.as_mut()
+            && let Some(p) = prompt
+        {
+            d.dispatch.restore(p);
         }
         return vec![];
     }
