@@ -926,6 +926,7 @@ async fn model_auth_memo_serves_cached_status_and_keys_on_model() {
                     facts: ModelAuthFacts {
                         byok: ModelByok::Byok,
                         auth_scheme: Default::default(),
+                        ready: true,
                     },
                     provider: None,
                 }));
@@ -970,6 +971,7 @@ async fn reconstruct_full_config_no_bearer_resolver_for_byok_model_on_session_me
                     facts: ModelAuthFacts {
                         byok: ModelByok::Byok,
                         auth_scheme: Default::default(),
+                        ready: true,
                     },
                     provider: None,
                 }));
@@ -1020,6 +1022,7 @@ async fn reconstruct_full_config_no_bearer_resolver_for_none_auth_scheme_on_sess
                         // is what must suppress the resolver.
                         byok: ModelByok::NotByok,
                         auth_scheme: AuthScheme::None,
+                        ready: true,
                     },
                     provider: None,
                 }));
@@ -1035,6 +1038,58 @@ async fn reconstruct_full_config_no_bearer_resolver_for_none_auth_scheme_on_sess
                 cfg.api_key.is_none(),
                 "AuthScheme::None must strip stale chat-state session credentials"
             );
+        })
+        .await;
+}
+
+/// Unready catalog entries (missing BYOK / invalid auth_scheme) must strip at
+/// turn-time reconstruct even when memo still claims Bearer + NotByok — the
+/// final wire choke point cannot reattach ambient session credentials.
+#[tokio::test(flavor = "current_thread")]
+async fn reconstruct_full_config_strips_credentials_when_model_not_ready() {
+    use crate::agent::auth_method::ModelByok;
+    use crate::agent::config::ModelAuthFacts;
+    use xai_grok_sampler::AuthScheme;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_dir, am) = auth_manager_with_valid_token("session-token");
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                Some(am),
+                "cached_token",
+                xai_chat_state::AuthType::SessionToken,
+                "stale-session-jwt".to_string(),
+            )
+            .await;
+
+            let model = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .map(|c| c.model)
+                .unwrap_or_default();
+            actor
+                .model_auth_memo
+                .replace(Some(crate::session::acp_session::ModelAuthMemo {
+                    model_id: model,
+                    facts: ModelAuthFacts {
+                        byok: ModelByok::NotByok,
+                        auth_scheme: AuthScheme::Bearer,
+                        ready: false,
+                    },
+                    provider: None,
+                }));
+
+            let cfg = actor.reconstruct_full_config().await;
+
+            assert!(
+                cfg.bearer_resolver.is_none(),
+                "unready model must never attach the session bearer resolver"
+            );
+            assert_eq!(cfg.auth_scheme, AuthScheme::None);
+            assert!(cfg.api_key.is_none());
+            assert!(cfg.user_id.is_none());
+            assert!(cfg.deployment_id.is_none());
         })
         .await;
 }
@@ -1071,6 +1126,7 @@ async fn refresh_token_if_expired_skips_session_refresh_for_none_auth_scheme() {
                     facts: ModelAuthFacts {
                         byok: ModelByok::NotByok,
                         auth_scheme: AuthScheme::None,
+                        ready: true,
                     },
                     provider: None,
                 }));
@@ -1124,6 +1180,7 @@ async fn reconstruct_full_config_uses_catalog_key_for_none_alias_with_shared_wir
                     facts: ModelAuthFacts {
                         byok: ModelByok::NotByok,
                         auth_scheme: AuthScheme::None,
+                        ready: true,
                     },
                     provider: None,
                 }));
@@ -1175,6 +1232,7 @@ async fn set_session_model_preserves_catalog_key_for_none_alias_with_shared_wire
                     facts: ModelAuthFacts {
                         byok: ModelByok::NotByok,
                         auth_scheme: AuthScheme::Bearer,
+                        ready: true,
                     },
                     provider: None,
                 }));
@@ -1228,6 +1286,7 @@ async fn set_session_model_preserves_catalog_key_for_none_alias_with_shared_wire
                     facts: ModelAuthFacts {
                         byok: ModelByok::NotByok,
                         auth_scheme: AuthScheme::None,
+                        ready: true,
                     },
                     provider: None,
                 }));
@@ -1354,6 +1413,7 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                     facts: ModelAuthFacts {
                         byok: ModelByok::NotByok,
                         auth_scheme: Default::default(),
+                        ready: true,
                     },
                     provider: None,
                 }));
@@ -1427,6 +1487,7 @@ async fn seed_provider_memo(actor: &Arc<SessionActor>, provider: crate::auth::Au
             facts: crate::agent::config::ModelAuthFacts {
                 byok: crate::agent::auth_method::ModelByok::Byok,
                 auth_scheme: Default::default(),
+                ready: true,
             },
             provider: Some(provider),
         }));

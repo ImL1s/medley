@@ -464,10 +464,21 @@ impl SessionActor {
         // Security boundary: never attach a live session bearer (or rely on
         // gate.active alone) when the active model is keyless — even if the
         // ACP method is still session-based after a model switch.
-        let use_bearer_resolver =
-            gate.active() && model_facts.auth_scheme != xai_grok_sampler::AuthScheme::None;
+        // Unready catalog entries (invalid auth_scheme / missing BYOK) must
+        // also stay credential-free at turn reconstruct — this is the final
+        // wire choke point (chat-state does not persist readiness).
+        let mut auth_scheme = model_facts.auth_scheme;
+        let mut use_bearer_resolver =
+            gate.active() && auth_scheme != xai_grok_sampler::AuthScheme::None;
+        if !model_facts.ready {
+            tracing::warn!(
+                model = %catalog_model_id,
+                "reconstruct_full_config: active model not ready; stripping credentials"
+            );
+            auth_scheme = xai_grok_sampler::AuthScheme::None;
+            use_bearer_resolver = false;
+        }
         self.log_auth_gate_unknown("reconstruct_full_config", gate, &cfg.base_url);
-        let auth_scheme = model_facts.auth_scheme;
         let mut extra_headers = cfg.extra_headers;
         crate::agent::config::inject_url_derived_headers(
             &mut extra_headers,
@@ -498,12 +509,28 @@ impl SessionActor {
                 extra_headers.insert("x-compaction-at".to_string(), value.to_string());
             }
         }
-        // Security boundary: strip chat-state credentials for keyless models so
-        // a stale session JWT cannot survive a model switch onto AuthScheme::None.
+        // Security boundary: strip chat-state credentials for keyless/unready
+        // models so a stale session JWT cannot survive onto a custom endpoint.
         let api_key = if auth_scheme == xai_grok_sampler::AuthScheme::None {
             None
         } else {
             creds.api_key
+        };
+        let deployment_id = if model_facts.ready {
+            crate::managed_config::resolve_deployment_id(
+                crate::managed_config::resolve_deployment_key().as_deref(),
+            )
+        } else {
+            None
+        };
+        let user_id = if model_facts.ready {
+            self.auth_manager
+                .as_ref()
+                .and_then(|am| am.current_or_expired())
+                .filter(|a| a.is_xai_auth())
+                .map(|a| a.user_id)
+        } else {
+            None
         };
         SamplingConfig {
             api_key,
@@ -523,15 +550,8 @@ impl SessionActor {
             stream_tool_calls: cfg.stream_tool_calls.unwrap_or(false),
             idle_timeout_secs: None,
             client_identifier: self.client_identifier.clone(),
-            deployment_id: crate::managed_config::resolve_deployment_id(
-                crate::managed_config::resolve_deployment_key().as_deref(),
-            ),
-            user_id: self
-                .auth_manager
-                .as_ref()
-                .and_then(|am| am.current_or_expired())
-                .filter(|a| a.is_xai_auth())
-                .map(|a| a.user_id),
+            deployment_id,
+            user_id,
             origin_client: self.origin_client.clone(),
             attribution_callback: self.attribution_callback.clone(),
             bearer_resolver: if use_bearer_resolver {

@@ -4839,6 +4839,9 @@ pub fn try_resolve_model_credentials(
 pub struct ModelAuthFacts {
     pub byok: ModelByok,
     pub auth_scheme: AuthScheme,
+    /// `false` when the catalog entry is unready (invalid auth_scheme, missing
+    /// BYOK, …). Turn-time reconstruct must treat this as a hard credential strip.
+    pub ready: bool,
 }
 /// Resolve `model_id` to its auth facts and auth-provider reference from one
 /// effective-config load; both ride the same memo (see
@@ -4854,6 +4857,7 @@ pub fn resolve_model_auth_facts_and_provider(
             ModelAuthFacts {
                 byok: ModelByok::Unknown,
                 auth_scheme: AuthScheme::default(),
+                ready: true,
             },
             None,
         );
@@ -4864,6 +4868,11 @@ pub fn resolve_model_auth_facts_and_provider(
             auth_scheme: match lookup {
                 ModelLookup::Loaded(Some(e)) => e.info().auth_scheme,
                 _ => AuthScheme::default(),
+            },
+            ready: match lookup {
+                ModelLookup::Loaded(Some(e)) => model_readiness(e).0,
+                ModelLookup::Loaded(None) => false,
+                ModelLookup::ConfigUnavailable => true,
             },
         };
         let provider = match lookup {

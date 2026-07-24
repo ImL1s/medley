@@ -1191,7 +1191,7 @@ impl acp::Agent for MvpAgent {
                     cwd.clone(),
                     arguments.meta.as_ref(),
                     model_agent_type.as_deref(),
-                    session_model_id,
+                    session_model_id.clone(),
                     session_yolo_mode,
                 )
             } else {
@@ -1219,7 +1219,7 @@ impl acp::Agent for MvpAgent {
                         session_meta: arguments.meta.as_ref(),
                         managed_mcp_expires_at,
                         model_agent_type: model_agent_type.as_deref(),
-                        session_model_id,
+                        session_model_id: session_model_id.clone(),
                         session_yolo_mode,
                         session_auto_mode: session_auto_mode && !session_yolo_mode,
                         prompt_display_cwd: None,
@@ -1299,6 +1299,21 @@ impl acp::Agent for MvpAgent {
                     &reason,
                 )
                 .await;
+        }
+        // Belt-and-suspenders: if the session still landed on an unready catalog
+        // entry (e.g. current default before resolve_default_model hardening),
+        // latch prompts so turn reconstruct cannot attach ambient Bearer.
+        if let Ok(entry) = self.resolve_model_id(&session_model_id)
+            && !crate::agent::config::model_readiness(&entry).0
+        {
+            tracing::warn!(
+                session_id = %session_id.0,
+                model_id = %session_model_id.0,
+                "new_session: session model not ready; latching prompts"
+            );
+            self.model_unavailable_sessions
+                .borrow_mut()
+                .insert(session_id.0.to_string(), session_model_id.clone());
         }
         let indexed_roots = self.indexed_roots_for(cwd.as_path());
         let (git_root, is_git_repo, discovery_failed) = match xai_grok_workspace::session::git::discover_git_root(

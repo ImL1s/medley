@@ -1701,13 +1701,17 @@ pub(crate) fn resolve_default_model(
         if let Some((key, first)) = visible.first() {
             return (key.clone(), first.clone());
         }
-        if let Some((key, entry)) = catalog.iter().find(|(_, e)| e.info.user_selectable) {
-            tracing::warn!("no auth-visible selectable model; using first selectable entry");
+        if let Some((key, entry)) = catalog.iter().find(|(_, e)| {
+            e.info.user_selectable && crate::agent::config::model_readiness(e).0
+        }) {
+            tracing::warn!("no auth-visible selectable ready model; using first ready selectable entry");
             return (key.clone(), entry.clone());
         }
-        // Pre-catalog/degenerate only: nothing selectable. Set the bundled
+        // Pre-catalog/degenerate only: nothing selectable/ready. Set the bundled
         // default's flag from `allowed_models` so no reader treats it as allowed.
-        tracing::warn!("no selectable models; falling back to bundled default (pre-catalog)");
+        // Bundled fallback has no custom base_url / validation errors — it is the
+        // safe sentinel when the whole catalog is unready.
+        tracing::warn!("no ready selectable models; falling back to bundled default (pre-catalog)");
         let default_id = crate::models::default_model().to_string();
         let mut entry = ModelEntry::fallback(&default_id, &cfg.endpoints);
         entry.info.user_selectable = match ModelGlobSet::compile(cfg.models.allowed_models.as_ref())
@@ -3495,6 +3499,33 @@ mod tests {
 
         let (key, _, _) = resolve_default_model(&cfg, &catalog, true);
         assert_eq!(key, "grok-build", "must match id, not first slug hit");
+    }
+
+    /// When every selectable catalog entry is unready, do not return any of
+    /// them via the empty-visible fallback — use the bundled default sentinel.
+    #[test]
+    fn resolve_default_model_falls_back_when_all_selectable_unready() {
+        let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
+        let mut custom = make_model_entry("custom");
+        custom
+            .config_validation_errors
+            .push("invalid auth_scheme `not-a-scheme`".into());
+        catalog.insert("custom".to_string(), custom);
+
+        let mut cfg = config::Config::default();
+        cfg.models.default = Some("custom".to_string());
+
+        let (key, entry, _) = resolve_default_model(&cfg, &catalog, true);
+        assert_ne!(
+            key, "custom",
+            "must not keep an unready preferred/selectable model"
+        );
+        assert_eq!(key, crate::models::default_model());
+        assert!(
+            entry.config_validation_errors.is_empty(),
+            "bundled sentinel must be validation-clean"
+        );
+        assert!(crate::agent::config::model_readiness(&entry).0);
     }
 
     /// No id field — falls back to slug as key.
