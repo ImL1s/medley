@@ -20,6 +20,39 @@ require_remote() {
   git remote get-url "$name" >/dev/null 2>&1 || die "missing remote '${name}' (expected upstream=xai-org, origin=ImL1s)"
 }
 
+require_remote_repo() {
+  local name="$1"
+  local expected_substring="$2"
+  local url
+  url="$(git remote get-url "$name")"
+  if [[ "$url" != *"$expected_substring"* ]]; then
+    die "remote '${name}' URL '${url}' does not contain expected '${expected_substring}'"
+  fi
+}
+
+align_local_providers_with_origin() {
+  if ! git show-ref --verify --quiet refs/remotes/origin/providers; then
+    return 0
+  fi
+  local origin_tip local_tip
+  origin_tip="$(git rev-parse origin/providers)"
+  if ! git show-ref --verify --quiet refs/heads/providers; then
+    return 0
+  fi
+  local_tip="$(git rev-parse providers)"
+  if [[ "$local_tip" == "$origin_tip" ]]; then
+    echo "==> Local providers matches origin/providers ($(git rev-parse --short providers))"
+    return 0
+  fi
+  if git merge-base --is-ancestor "$local_tip" "$origin_tip"; then
+    echo "==> Fast-forwarding local providers from origin/providers"
+    git checkout providers
+    git merge --ff-only origin/providers
+    return 0
+  fi
+  die "local providers diverged from origin/providers (local=$(git rev-parse --short providers) origin=$(git rev-parse --short origin/providers)); resolve before syncing"
+}
+
 echo "==> Checking working tree (tracked files must be clean; untracked OK)"
 if ! git diff --quiet || ! git diff --cached --quiet; then
   die "tracked working tree is dirty; commit or stash changes before syncing"
@@ -27,10 +60,14 @@ fi
 
 require_remote upstream
 require_remote origin
+require_remote_repo upstream "xai-org/grok-build"
+require_remote_repo origin "ImL1s/grok-build"
 
 echo "==> Fetching upstream and origin"
 git fetch upstream
 git fetch origin
+
+align_local_providers_with_origin
 
 echo "==> Fast-forwarding local main from upstream/main"
 git checkout main
