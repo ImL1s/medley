@@ -278,9 +278,18 @@ fn parse_model_override_table(
             (entry, warnings)
         }
         Err(_) => {
+            let invalid_auth_scheme = table.get("auth_scheme").and_then(|value| {
+                field_parse_error("auth_scheme", value).is_some().then(|| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.to_string())
+                })
+            });
             prune_invalid_fields(model_key, &mut table, &mut warnings);
             match deserialize_with_unknown_fields(table) {
-                Ok((entry, unknown)) => {
+                Ok((mut entry, unknown)) => {
+                    entry.invalid_auth_scheme = invalid_auth_scheme;
                     warnings.extend(unknown_field_warnings(model_key, unknown));
                     (entry, warnings)
                 }
@@ -707,6 +716,7 @@ mod tests {
             compaction_at_tokens: Some(CompactionAtTokens::Fixed(100_000)),
             show_model_fingerprint: Some(true),
             stream_tool_calls: Some(false),
+            invalid_auth_scheme: None,
         }
     }
 
@@ -756,10 +766,38 @@ mod tests {
         let (models, warnings) = parse_single_entry(entry);
         let over = models.get("m").expect("model retained");
         assert_eq!(over.model.as_deref(), Some("kept"));
+        assert_eq!(
+            over.invalid_auth_scheme.as_deref(),
+            Some("not-a-scheme"),
+            "invalid auth_scheme must be stashed before prune"
+        );
         assert!(over.auth_scheme.is_none());
         assert!(warnings.iter().any(|w| {
             w.kind == ConfigWarningKind::InvalidValue && w.field() == Some("auth_scheme")
         }));
+
+        let raw = toml::toml! {
+            [model.m]
+            model = "kept"
+            auth_scheme = "not-a-scheme"
+            base_url = "http://127.0.0.1:11434/v1"
+            context_window = 200000
+        };
+        let cfg = parse_cfg(&raw.to_string());
+        let resolved = crate::agent::config::resolve_model_list(&cfg, None);
+        let model = resolved.get("m").expect("model retained after resolve");
+        assert!(
+            !model.config_validation_errors.is_empty(),
+            "invalid auth_scheme must fail-closed at resolve"
+        );
+        let (ready, reason) = crate::agent::config::model_readiness(model);
+        assert!(!ready, "invalid auth_scheme must be unready");
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|r| r.contains("not-a-scheme") && r.contains("bearer")),
+            "unexpected readiness reason: {reason:?}"
+        );
     }
 
     #[test]

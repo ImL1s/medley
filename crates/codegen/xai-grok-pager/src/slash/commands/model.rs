@@ -659,24 +659,22 @@ mod tests {
     }
 
     #[test]
-    fn run_hard_blocks_unready_model() {
+    fn run_hard_blocks_invalid_auth_scheme_model() {
+        let reason = r#"invalid auth_scheme "not-a-scheme": expected bearer, x_api_key, or none"#;
         let mut state = ModelState::default();
         let (id, info) = model_with_meta(
-            "byok",
-            "BYOK",
+            "bad-auth",
+            "Bad Auth",
             serde_json::Map::from_iter([
                 ("ready".into(), serde_json::json!(false)),
-                (
-                    "readinessReason".into(),
-                    serde_json::json!("missing OPENAI_API_KEY"),
-                ),
+                ("readinessReason".into(), serde_json::json!(reason)),
             ]),
         );
         state.available.insert(id, info);
         let mut ctx = dummy_exec_ctx(&state);
-        let result = ModelCommand.run(&mut ctx, "BYOK");
+        let result = ModelCommand.run(&mut ctx, "Bad Auth");
         match result {
-            CommandResult::Error(msg) => assert_eq!(msg, "missing OPENAI_API_KEY"),
+            CommandResult::Error(msg) => assert_eq!(msg, reason),
             other => panic!("expected Error, got {other:?}"),
         }
     }

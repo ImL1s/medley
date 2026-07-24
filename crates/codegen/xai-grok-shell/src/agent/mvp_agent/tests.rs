@@ -2233,6 +2233,7 @@ fn find_model_by_id_prefers_key_then_falls_back_to_slug() {
         env_key: None,
         auth_provider: None,
         api_base_url: None,
+        config_validation_errors: Vec::new(),
     };
     let mut models = indexmap::IndexMap::new();
     models.insert("a".to_string(), entry("target"));

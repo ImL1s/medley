@@ -3349,6 +3349,12 @@ impl acp::Agent for MvpAgent {
                     .data("This model isn't allowed by your allowed_models setting."),
             );
         }
+        let (ready, reason) = crate::agent::config::model_readiness(&model);
+        if !ready {
+            return Err(acp::Error::invalid_params().data(
+                reason.unwrap_or_else(|| "model is not ready".to_owned()),
+            ));
+        }
         let session_id = args.session_id.clone();
         let res = crate::agent::handlers::model_switch::apply(self, args).await;
         if res.is_ok()

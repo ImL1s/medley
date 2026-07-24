@@ -40,6 +40,7 @@ fn detector_entry(
         env_key: None,
         auth_provider: None,
         api_base_url: None,
+        config_validation_errors: Vec::new(),
     }
 }
 

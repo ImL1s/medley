@@ -182,6 +182,7 @@ async fn build_session_info_sources_show_model_fingerprint_from_catalog() {
                 env_key: None,
                 auth_provider: None,
                 api_base_url: None,
+                config_validation_errors: Vec::new(),
             };
             entry.info.show_model_fingerprint = false;
             actor

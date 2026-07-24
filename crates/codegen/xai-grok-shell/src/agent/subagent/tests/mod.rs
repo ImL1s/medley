@@ -3574,6 +3574,7 @@ fn test_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
         env_key: None,
         auth_provider: None,
         api_base_url: None,
+        config_validation_errors: Vec::new(),
     }
 }
 fn byok_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {

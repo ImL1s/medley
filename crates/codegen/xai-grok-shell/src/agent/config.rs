@@ -3964,6 +3964,10 @@ pub struct ConfigModelOverride {
     pub compaction_at_tokens: Option<CompactionAtTokens>,
     pub show_model_fingerprint: Option<bool>,
     pub stream_tool_calls: Option<bool>,
+    /// Raw `auth_scheme` string when TOML parsing failed. Not persisted; used to
+    /// fail-closed at resolve time instead of defaulting to Bearer.
+    #[serde(skip)]
+    pub(crate) invalid_auth_scheme: Option<String>,
 }
 impl ConfigModelOverride {
     pub(crate) fn apply(
@@ -4071,6 +4075,11 @@ impl ConfigModelOverride {
             && (self.api_key.is_some() || self.env_key.is_some() || self.auth_provider.is_some())
         {
             entry.info.supported_in_api = true;
+        }
+        if let Some(ref raw) = self.invalid_auth_scheme {
+            entry
+                .config_validation_errors
+                .push(invalid_auth_scheme_validation_error(raw));
         }
         entry
     }
@@ -4262,6 +4271,9 @@ pub struct ModelEntry {
     pub auth_provider: Option<crate::auth::AuthProviderRef>,
     /// When set, `base_url` is used for session auth, `api_base_url` for API-key auth.
     pub api_base_url: Option<String>,
+    /// Config validation failures (e.g. invalid `auth_scheme`) that make the model unready.
+    #[serde(default, skip_serializing)]
+    pub config_validation_errors: Vec<String>,
 }
 impl ModelEntry {
     /// Minimal fallback entry for an unknown model slug.
@@ -4274,6 +4286,7 @@ impl ModelEntry {
             env_key: None,
             auth_provider: None,
             api_base_url: None,
+            config_validation_errors: Vec::new(),
         }
     }
     pub fn info(&self) -> &ModelInfo {
@@ -4286,6 +4299,7 @@ impl ModelEntry {
             env_key: entry.env_key.clone(),
             auth_provider: None,
             api_base_url: entry.api_base_url.clone(),
+            config_validation_errors: Vec::new(),
         }
     }
     /// Non-empty `api_key`, else first non-empty resolved `env_key`.
@@ -4969,6 +4983,7 @@ pub fn resolve_aux_model_sampling_config(
             env_key: None,
             auth_provider: None,
             api_base_url: None,
+            config_validation_errors: Vec::new(),
         };
         let credentials = resolve_credentials_enforced(&entry, session_key, disable_api_key_auth);
         let sampler = sampling_config_for_model(
@@ -5201,6 +5216,7 @@ fn resolve_hidden_default_web_search_sampling_config(
         env_key: None,
         auth_provider: None,
         api_base_url: None,
+        config_validation_errors: Vec::new(),
     };
     let credentials = resolve_credentials_enforced(&entry, session_key, disable_api_key_auth);
     sampling_config_for_model(
@@ -5267,6 +5283,14 @@ fn auth_scheme_meta_value(scheme: AuthScheme) -> &'static str {
     }
 }
 
+const AUTH_SCHEME_ALLOWED: &str = "bearer, x_api_key, or none";
+
+fn invalid_auth_scheme_validation_error(raw: &str) -> String {
+    format!(
+        "invalid auth_scheme {raw:?}: expected {AUTH_SCHEME_ALLOWED}"
+    )
+}
+
 /// Credential class for picker UX: keyless, env/BYOK, or xAI session/login.
 fn auth_class_for_entry(model: &ModelEntry) -> &'static str {
     if model.info.auth_scheme == AuthScheme::None {
@@ -5310,7 +5334,14 @@ fn provider_hint_for_url(base_url: &str) -> String {
 
 /// Picker readiness: keyless and typical xAI catalog stay selectable; BYOK
 /// models that declare `env_key`/`api_key` but lack a resolved value are not.
-fn model_readiness(model: &ModelEntry) -> (bool, Option<String>) {
+pub(crate) fn model_readiness(model: &ModelEntry) -> (bool, Option<String>) {
+    if let Some(reason) = model
+        .config_validation_errors
+        .first()
+        .map(|e| e.as_str())
+    {
+        return (false, Some(reason.to_owned()));
+    }
     if model.info.auth_scheme == AuthScheme::None {
         return (true, None);
     }
@@ -6445,6 +6476,7 @@ reasoning_effort = "low"
             env_key: env_key.map(EnvKeys::single),
             auth_provider: None,
             api_base_url: api_base_url.map(|s| s.to_string()),
+            config_validation_errors: Vec::new(),
         }
     }
     /// The effective-model RE-support lookup must use the model ACTUALLY used:
@@ -7904,6 +7936,39 @@ reasoning_effort = "low"
         assert_eq!(meta["ready"], true);
         assert!(meta.get("readinessReason").is_none());
         assert_eq!(meta["providerHint"], "local");
+    }
+    #[test]
+    fn acp_model_meta_invalid_auth_scheme_is_not_ready() {
+        let (_, models) = resolve_models_from_toml(
+            r#"
+            [model.bad-auth]
+            model = "bad-auth"
+            base_url = "http://127.0.0.1:11434/v1"
+            context_window = 200000
+            auth_scheme = "not-a-scheme"
+            "#,
+            None,
+        );
+        let model = models.get("bad-auth").expect("model retained");
+        assert!(
+            !model.config_validation_errors.is_empty(),
+            "invalid auth_scheme must stamp validation error on entry"
+        );
+        let meta = to_acp_model_info(&models)
+            .get(&acp::ModelId::new(Arc::from("bad-auth")))
+            .expect("bad-auth in acp catalog")
+            .meta
+            .clone()
+            .expect("meta present");
+        assert_eq!(meta["ready"], false);
+        assert!(
+            meta["readinessReason"]
+                .as_str()
+                .is_some_and(|r| r.contains("not-a-scheme") && r.contains("bearer")),
+            "unexpected readinessReason: {:?}",
+            meta.get("readinessReason")
+        );
+        assert_eq!(meta["authScheme"], "bearer");
     }
     #[test]
     #[serial]
@@ -11946,6 +12011,7 @@ default = "grok-4.5"
             env_key: None,
             auth_provider: None,
             api_base_url: None,
+            config_validation_errors: Vec::new(),
         }
     }
     #[test]
