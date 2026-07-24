@@ -16,6 +16,15 @@ Remotes:
 | `main`       | **Pristine upstream mirror.** Only fast-forward from `upstream/main`. Never land provider/custom commits here. |
 | `providers`  | **Product line.** Multi-provider credentials, keyless local LLMs, fork docs/UX. Default branch for users and releases. |
 
+### GitHub branch protection (recommended)
+
+Configure these on **[ImL1s/grok-build](https://github.com/ImL1s/grok-build)** so fork workflow stays safe:
+
+| Branch | Rules |
+|--------|-------|
+| `main` | No force-push. No product PRs — only fast-forward mirrors from `upstream/main` (via `scripts/sync-upstream.sh`). |
+| `providers` | Require CI checks to pass before merge. Product features and sync PRs land here. |
+
 Feature topic branches (e.g. `feat/…`) merge into `providers`, not into `main`.
 
 ## What's different from upstream
