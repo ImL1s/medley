@@ -1701,10 +1701,13 @@ pub(crate) fn resolve_default_model(
         if let Some((key, first)) = visible.first() {
             return (key.clone(), first.clone());
         }
-        if let Some((key, entry)) = catalog.iter().find(|(_, e)| {
-            e.info.user_selectable && crate::agent::config::model_readiness(e).0
-        }) {
-            tracing::warn!("no auth-visible selectable ready model; using first ready selectable entry");
+        if let Some((key, entry)) = catalog
+            .iter()
+            .find(|(_, e)| e.info.user_selectable && crate::agent::config::model_readiness(e).0)
+        {
+            tracing::warn!(
+                "no auth-visible selectable ready model; using first ready selectable entry"
+            );
             return (key.clone(), entry.clone());
         }
         // Pre-catalog/degenerate only: nothing selectable/ready. Set the bundled
