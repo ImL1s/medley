@@ -5073,9 +5073,25 @@ pub fn sampling_config_for_model(
     credentials: ResolvedCredentials,
     alpha_test_key: Option<String>,
     client_version: Option<String>,
-    deployment_id: Option<String>,
-    user_id: Option<String>,
+    mut deployment_id: Option<String>,
+    mut user_id: Option<String>,
 ) -> SamplerConfig {
+    let (ready, reason) = model_readiness(model);
+    let mut credentials = credentials;
+    // Fail-closed choke point: every SamplerConfig must go through here.
+    // Unready models (invalid auth_scheme, missing BYOK, …) must never keep
+    // ambient session / env credentials that could leak to a custom base_url.
+    if !ready {
+        tracing::error!(
+            model = %model.info().model,
+            reason = ?reason,
+            "sampling_config_for_model: stripping credentials for unready model"
+        );
+        credentials.api_key = None;
+        credentials.auth_scheme = AuthScheme::None;
+        deployment_id = None;
+        user_id = None;
+    }
     let info = model.info();
     let model_name = info.model.clone();
     let max_completion_tokens = info.max_completion_tokens;
@@ -7964,6 +7980,41 @@ reasoning_effort = "low"
         );
         assert_eq!(meta["authScheme"], "bearer");
     }
+
+    #[test]
+    fn sampling_config_for_unready_model_strips_ambient_credentials() {
+        let (_, models) = resolve_models_from_toml(
+            r#"
+            [model.bad-auth]
+            model = "bad-auth"
+            base_url = "http://127.0.0.1:11434/v1"
+            context_window = 200000
+            auth_scheme = "not-a-scheme"
+            "#,
+            None,
+        );
+        let model = models.get("bad-auth").expect("model retained");
+        assert!(!model_readiness(model).0);
+        let cfg = sampling_config_for_model(
+            model,
+            ResolvedCredentials {
+                api_key: Some("ambient-session-jwt".into()),
+                base_url: "http://127.0.0.1:11434/v1".into(),
+                auth_type: xai_chat_state::AuthType::SessionToken,
+                auth_scheme: AuthScheme::Bearer,
+            },
+            None,
+            None,
+            Some("deploy".into()),
+            Some("user".into()),
+        );
+        assert_eq!(cfg.auth_scheme, AuthScheme::None);
+        assert!(cfg.api_key.is_none());
+        assert!(cfg.user_id.is_none());
+        assert!(cfg.deployment_id.is_none());
+        assert!(cfg.bearer_resolver.is_none());
+    }
+
     #[test]
     #[serial]
     fn acp_model_meta_missing_env_key_is_not_ready() {

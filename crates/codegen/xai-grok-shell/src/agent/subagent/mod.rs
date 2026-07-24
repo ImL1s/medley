@@ -1083,8 +1083,15 @@ fn resolve_model_override_to_config(
     model_id: &str,
     ctx: &SubagentSpawnContext,
 ) -> Option<(xai_grok_sampler::SamplerConfig, acp::ModelId)> {
-    use crate::agent::config::{resolve_credentials, sampling_config_for_model};
+    use crate::agent::config::{model_readiness, resolve_credentials, sampling_config_for_model};
     let entry = crate::agent::config::find_model_by_id(&ctx.available_models, model_id).cloned()?;
+    if !model_readiness(&entry).0 {
+        tracing::warn!(
+            model_id,
+            "subagent model override skipped: model not ready"
+        );
+        return None;
+    }
     let canonical_model_id = if ctx.available_models.contains_key(model_id) {
         acp::ModelId::new(model_id)
     } else {

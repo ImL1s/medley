@@ -1680,7 +1680,11 @@ pub(crate) fn resolve_default_model(
 ) -> (String, ModelEntry, config::ConfigSource) {
     let visible: IndexMap<String, ModelEntry> = catalog
         .iter()
-        .filter(|(_, e)| e.info.visible_for_auth(is_session_auth) && e.info.user_selectable)
+        .filter(|(_, e)| {
+            e.info.visible_for_auth(is_session_auth)
+                && e.info.user_selectable
+                && crate::agent::config::model_readiness(e).0
+        })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 

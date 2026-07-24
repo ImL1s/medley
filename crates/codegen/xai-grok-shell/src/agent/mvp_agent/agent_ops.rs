@@ -1178,7 +1178,17 @@ impl MvpAgent {
         let has_session_key = session.is_some();
         // AuthScheme::None must never inherit session tokens or SessionToken
         // rewrites — local/keyless models stay credential-free.
-        let no_auth = model.info.auth_scheme == xai_grok_sampler::AuthScheme::None;
+        // Unready models (invalid auth_scheme, missing BYOK) are treated the
+        // same at the prepare boundary so ambient creds cannot attach.
+        let (model_ready, readiness_reason) = crate::agent::config::model_readiness(model);
+        let no_auth = model.info.auth_scheme == xai_grok_sampler::AuthScheme::None || !model_ready;
+        if !model_ready {
+            tracing::warn!(
+                model = model.info().model.as_str(),
+                reason = ?readiness_reason,
+                "prepare_sampling_config: model not ready; forcing keyless config"
+            );
+        }
         let session_key = if no_auth {
             None
         } else {
@@ -1290,6 +1300,15 @@ impl MvpAgent {
         let Some((id, model)) = pinned_model else {
             return (default_model_id, default_sampling);
         };
+        let (ready, reason) = crate::agent::config::model_readiness(model);
+        if !ready {
+            tracing::warn!(
+                model = %id.0,
+                reason = ?reason,
+                "agent profile model override skipped: model not ready"
+            );
+            return (default_model_id, default_sampling);
+        }
         let new_config = self.prepare_sampling_config_for_model(model, origin_client);
         tracing::info!(
             model = %id.0,

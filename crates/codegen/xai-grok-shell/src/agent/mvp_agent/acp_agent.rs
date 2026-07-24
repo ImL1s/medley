@@ -1768,6 +1768,82 @@ impl acp::Agent for MvpAgent {
                         .ok()
                         .map(|m| m.info().agent_type.clone())
                 });
+            // Fail-closed before spawn: never build the actor on an unready
+            // persisted model (would attach ambient Bearer via sampling_config).
+            let available = self.models_manager.available();
+            let mut spawn_model_id = summary.current_model_id.clone();
+            let mut latch_persisted_unready = false;
+            match self.resolve_model_id(&spawn_model_id) {
+                Ok(entry) if crate::agent::config::model_readiness(&entry).0 => {}
+                Ok(entry) => {
+                    let reason = crate::agent::config::model_readiness(&entry)
+                        .1
+                        .unwrap_or_else(|| "model is not ready".to_owned());
+                    if let Some(fallback) = available.keys().find(|id| {
+                        self.resolve_model_id(id)
+                            .ok()
+                            .is_some_and(|m| crate::agent::config::model_readiness(&m).0)
+                    }).cloned() {
+                        tracing::warn!(
+                            session_id = %session_id.0,
+                            previous = %spawn_model_id.0,
+                            new = %fallback.0,
+                            %reason,
+                            "load_session: persisted model not ready before spawn; using ready fallback"
+                        );
+                        spawn_model_id = fallback;
+                    } else if let Ok(current) = self
+                        .resolve_model_id(&self.models_manager.current_model_id())
+                        && crate::agent::config::model_readiness(&current).0
+                    {
+                        tracing::warn!(
+                            session_id = %session_id.0,
+                            previous = %spawn_model_id.0,
+                            new = %self.models_manager.current_model_id().0,
+                            %reason,
+                            "load_session: persisted model not ready; spawning on current ready default and latching"
+                        );
+                        latch_persisted_unready = true;
+                        spawn_model_id = self.models_manager.current_model_id();
+                    } else {
+                        tracing::warn!(
+                            session_id = %session_id.0,
+                            previous = %spawn_model_id.0,
+                            %reason,
+                            "load_session: persisted model not ready and no ready fallback; latching prompts"
+                        );
+                        latch_persisted_unready = true;
+                    }
+                }
+                Err(_) if !available.is_empty() => {
+                    if let Some(fallback) = available.keys().find(|id| {
+                        self.resolve_model_id(id)
+                            .ok()
+                            .is_some_and(|m| crate::agent::config::model_readiness(&m).0)
+                    }).cloned() {
+                        tracing::warn!(
+                            session_id = %session_id.0,
+                            previous = %spawn_model_id.0,
+                            new = %fallback.0,
+                            "load_session: persisted model unresolved; spawning on ready fallback"
+                        );
+                        latch_persisted_unready = true;
+                        spawn_model_id = fallback;
+                    } else {
+                        latch_persisted_unready = true;
+                    }
+                }
+                Err(_) => {
+                    // Catalog empty / still loading: latch so prompts cannot run
+                    // on an unverified persisted model with ambient credentials.
+                    tracing::warn!(
+                        session_id = %session_id.0,
+                        persisted = %spawn_model_id.0,
+                        "load_session: catalog empty at spawn; latching until a ready model is confirmed"
+                    );
+                    latch_persisted_unready = true;
+                }
+            }
             self.spawn_and_register_session(
                     init,
                     SessionSpawnOptions {
@@ -1794,13 +1870,18 @@ impl acp::Agent for MvpAgent {
                         session_meta: request_meta.as_ref(),
                         managed_mcp_expires_at,
                         model_agent_type: persisted_agent_name.as_deref(),
-                        session_model_id: summary.current_model_id.clone(),
+                        session_model_id: spawn_model_id,
                         session_yolo_mode,
                         session_auto_mode: session_auto_mode && !session_yolo_mode,
                         prompt_display_cwd,
                     },
                 )
                 .await?;
+            if latch_persisted_unready {
+                self.model_unavailable_sessions
+                    .borrow_mut()
+                    .insert(session_id.0.to_string(), summary.current_model_id.clone());
+            }
             drop(spawn_timer);
         } else if !mcp_servers.is_empty() {
             tracing::info!(
@@ -2114,12 +2195,23 @@ impl acp::Agent for MvpAgent {
                     );
                     map
                 });
-            let _ = crate::agent::handlers::model_switch::apply(
+            let apply_result = crate::agent::handlers::model_switch::apply(
                     self,
-                    acp::SetSessionModelRequest::new(session_id.to_owned(), model_id)
+                    acp::SetSessionModelRequest::new(session_id.to_owned(), model_id.clone())
                         .meta(restore_meta),
                 )
                 .await;
+            if let Err(e) = apply_result {
+                tracing::warn!(
+                    session_id = %session_id.0,
+                    model_id = %model_id.0,
+                    error = ?e,
+                    "load_session: model restore apply failed; latching prompts"
+                );
+                self.model_unavailable_sessions
+                    .borrow_mut()
+                    .insert(session_id.0.to_string(), model_id.clone());
+            }
         }
         let mut response_meta_map = serde_json::Map::new();
         response_meta_map.insert("sessionId".to_string(), serde_json::json!(session_id));
@@ -2340,9 +2432,6 @@ impl acp::Agent for MvpAgent {
                     }),
                     ),
                 );
-                self.model_unavailable_sessions
-                    .borrow_mut()
-                    .remove(arguments.session_id.0.as_ref());
                 if let Err(e) = crate::agent::handlers::model_switch::apply(
                         self,
                         acp::SetSessionModelRequest::new(
@@ -2356,9 +2445,20 @@ impl acp::Agent for MvpAgent {
                         session_id = %arguments.session_id.0,
                         model_id = %restore_model_id.0,
                         error = ?e,
-                        "prompt: failed to restore previously-unavailable model; continuing with the session's current model"
+                        "prompt: failed to restore previously-unavailable model; keeping block"
                     );
+                    self.send_model_auto_switched(
+                            &arguments.session_id,
+                            &acp::ModelId::new(String::new()),
+                            &acp::ModelId::new(String::new()),
+                            "Could not restore your previous model; prompts stay blocked until a successful switch.",
+                        )
+                        .await;
+                    return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
                 }
+                self.model_unavailable_sessions
+                    .borrow_mut()
+                    .remove(arguments.session_id.0.as_ref());
             } else {
                 tracing::warn!(
                     session_id = %arguments.session_id.0,
