@@ -1032,6 +1032,34 @@ fn switch_model_hard_blocks_unready() {
         "must surface the readiness reason as a toast",
     );
 }
+/// Direct `Action::SwitchModel` must hard-block catalog misses.
+#[test]
+fn switch_model_hard_blocks_catalog_miss() {
+    use crate::slash::commands::model::MODEL_CATALOG_MISS_REASON;
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let unknown_id = acp::ModelId::new(std::sync::Arc::from("removed-model"));
+    let effects = dispatch(
+        Action::SwitchModel {
+            model_id: unknown_id,
+            effort: None,
+        },
+        &mut app,
+    );
+    assert!(
+        effects.is_empty(),
+        "catalog-miss SwitchModel must not emit effects, got {effects:?}",
+    );
+    assert!(
+        !app.agents[&id].session.model_switch_pending,
+        "must not set model_switch_pending for blocked switch",
+    );
+    assert_eq!(
+        app.agents[&id].toast.as_ref().map(|(m, _)| m.as_str()),
+        Some(MODEL_CATALOG_MISS_REASON),
+        "must surface catalog-miss reason as a toast",
+    );
+}
 /// Auth-class confirm (`persist_default=false`) re-checks readiness before
 /// emitting `Effect::SwitchModel`.
 #[test]
@@ -1078,6 +1106,32 @@ fn auth_class_switch_answered_hard_blocks_unready() {
         "must surface the readiness reason as a toast",
     );
 }
+/// Auth-class confirm must hard-block catalog misses.
+#[test]
+fn auth_class_switch_answered_hard_blocks_catalog_miss() {
+    use crate::slash::commands::model::MODEL_CATALOG_MISS_REASON;
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let unknown_id = acp::ModelId::new(std::sync::Arc::from("removed-model"));
+    let effects = dispatch(
+        Action::AuthClassSwitchAnswered {
+            proceed: true,
+            model_id: unknown_id,
+            effort: None,
+            persist_default: false,
+        },
+        &mut app,
+    );
+    assert!(
+        effects.is_empty(),
+        "auth-class confirm must hard-block catalog miss, got {effects:?}",
+    );
+    assert_eq!(
+        app.agents[&id].toast.as_ref().map(|(m, _)| m.as_str()),
+        Some(MODEL_CATALOG_MISS_REASON),
+        "must surface catalog-miss reason as a toast",
+    );
+}
 /// Deferred apply (session hydrate) must re-check readiness before emitting a switch.
 #[test]
 fn apply_deferred_switch_outcome_hard_blocks_unready() {
@@ -1112,6 +1166,33 @@ fn apply_deferred_switch_outcome_hard_blocks_unready() {
         agent.toast.as_ref().map(|(m, _)| m.as_str()),
         Some(reason),
         "must surface the readiness reason as a toast",
+    );
+}
+/// Deferred apply must hard-block catalog misses.
+#[test]
+fn apply_deferred_switch_outcome_hard_blocks_catalog_miss() {
+    use crate::app::dispatch::session::lifecycle::{
+        DeferredSwitchOutcome, apply_deferred_switch_outcome,
+    };
+    use crate::slash::commands::model::MODEL_CATALOG_MISS_REASON;
+    let mut app = test_app_with_agent();
+    let unknown_id = acp::ModelId::new(std::sync::Arc::from("removed-model"));
+    let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+    let applied = apply_deferred_switch_outcome(
+        agent,
+        DeferredSwitchOutcome {
+            switch: Some((unknown_id, None)),
+            effort_error: None,
+        },
+    );
+    assert!(
+        applied.is_none(),
+        "deferred apply must hard-block catalog miss"
+    );
+    assert_eq!(
+        agent.toast.as_ref().map(|(m, _)| m.as_str()),
+        Some(MODEL_CATALOG_MISS_REASON),
+        "must surface catalog-miss reason as a toast",
     );
 }
 #[test]

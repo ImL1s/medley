@@ -676,6 +676,9 @@ pub(super) fn dispatch_dashboard_create_new_agent_with_detail(app: &mut AppView)
         return open_dashboard_worktree_dialog(app, None, /* attach */ true);
     }
     let pending_model = app.dashboard.as_ref().and_then(|d| d.pending_model.clone());
+    if block_dashboard_spawn_on_pending_model(app, pending_model.as_ref()) {
+        return vec![];
+    }
     let pending_mode = app
         .dashboard
         .as_ref()
@@ -964,6 +967,14 @@ pub(super) fn dispatch_dashboard_confirm_worktree(
         .as_ref()
         .map(|d| d.pending_mode)
         .unwrap_or_default();
+    if block_dashboard_spawn_on_pending_model(app, pending_model.as_ref()) {
+        if let Some(d) = app.dashboard.as_mut() {
+            if let Some(p) = prompt {
+                d.dispatch.restore(p);
+            }
+        }
+        return vec![];
+    }
     if !app.cwd_has_git_ancestor {
         if let Some(d) = app.dashboard.as_mut() {
             // Restore the typed prompt if the cwd stopped being a repo.
@@ -1179,6 +1190,9 @@ pub(super) fn dispatch_dashboard_dispatch(
         .as_ref()
         .map(|d| d.pending_mode)
         .unwrap_or_default();
+    if block_dashboard_spawn_on_pending_model(app, pending_model.as_ref()) {
+        return vec![];
+    }
     let model_id = pending_model.as_ref().map(|m| m.id.clone());
     let prompt_state = app
         .dashboard
@@ -1560,6 +1574,29 @@ fn stage_dashboard_model(
             display,
         });
     }
+}
+
+/// Re-check staged model readiness against the latest app catalog before spawn.
+/// Returns a user-facing reason when the pending model must not be applied.
+fn pending_model_blocked_reason(
+    app: &AppView,
+    pending_model: Option<&crate::views::dashboard::PendingDispatchModel>,
+) -> Option<String> {
+    let m = pending_model?;
+    crate::slash::commands::model::model_not_ready_reason(&app.models, &m.id)
+}
+
+fn block_dashboard_spawn_on_pending_model(
+    app: &mut AppView,
+    pending_model: Option<&crate::views::dashboard::PendingDispatchModel>,
+) -> bool {
+    let Some(reason) = pending_model_blocked_reason(app, pending_model) else {
+        return false;
+    };
+    if let Some(d) = app.dashboard.as_mut() {
+        d.set_error_toast(&reason);
+    }
+    true
 }
 
 /// Apply the dashboard's staged model effort + plan mode to a freshly

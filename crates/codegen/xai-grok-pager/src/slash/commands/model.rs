@@ -151,8 +151,13 @@ fn parse_model_readiness(
     }
 }
 
+/// User-facing reason when a model id is missing from the catalog or not ready.
+pub(crate) const MODEL_CATALOG_MISS_REASON: &str = "Model no longer available";
+
 pub(crate) fn model_not_ready_reason(models: &ModelState, id: &acp::ModelId) -> Option<String> {
-    let info = models.available.get(id)?;
+    let Some(info) = models.available.get(id) else {
+        return Some(MODEL_CATALOG_MISS_REASON.into());
+    };
     let readiness = parse_model_readiness(info.meta.as_ref());
     if readiness.ready {
         return None;
@@ -507,6 +512,16 @@ mod tests {
             }
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn model_not_ready_reason_catalog_miss_is_fail_closed() {
+        let state = ModelState::default();
+        let missing = acp::ModelId::new(Arc::from("removed-model"));
+        assert_eq!(
+            model_not_ready_reason(&state, &missing).as_deref(),
+            Some(MODEL_CATALOG_MISS_REASON),
+        );
     }
 
     #[test]

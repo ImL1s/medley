@@ -2014,6 +2014,42 @@ fn dashboard_dispatch_applies_pending_model_and_plan() {
     );
     assert_eq!(agent.plan_mode_pending, Some(true));
 }
+/// Staged model removed from catalog between `/model` and dispatch must not spawn.
+#[serial_test::serial(GROK_AGENT_DASHBOARD)]
+#[test]
+fn dashboard_dispatch_blocks_removed_pending_model_toctou() {
+    use crate::slash::commands::model::MODEL_CATALOG_MISS_REASON;
+    let mut app = test_app();
+    seed_model(&mut app, "grok-4.5", "Grok 4.5");
+    open_dashboard(&mut app);
+    let model_id = acp::ModelId::new(std::sync::Arc::from("grok-4.5"));
+    if let Some(d) = app.dashboard.as_mut() {
+        d.pending_model = Some(crate::views::dashboard::PendingDispatchModel {
+            id: model_id,
+            effort: None,
+            display: "Grok 4.5".to_string(),
+        });
+        d.dispatch.set_text("do the thing");
+    }
+    app.models.available.clear();
+    let effects = dispatch_dashboard_dispatch(&mut app, "do the thing".into(), false);
+    assert!(
+        effects.is_empty(),
+        "removed pending model must not spawn a session, got {effects:?}",
+    );
+    assert!(app.agents.is_empty(), "no session should be created");
+    let dash = app.dashboard.as_ref().unwrap();
+    assert!(
+        dash.error_toast.as_ref().is_some_and(|t| t.contains(MODEL_CATALOG_MISS_REASON)),
+        "must surface catalog-miss reason on dashboard, got {:?}",
+        dash.error_toast,
+    );
+    assert_eq!(
+        dash.dispatch.text(),
+        "do the thing",
+        "prompt must remain in the dispatch input",
+    );
+}
 /// The `[+ New Agent]` button path (`DashboardCreateNewAgentWithDetail`,
 /// no queued prompt) applies the same staged model + mode as the dispatch
 /// path: the model id threads into `CreateSession`, the effort is stashed
