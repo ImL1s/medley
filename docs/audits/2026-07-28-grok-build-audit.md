@@ -11,14 +11,15 @@ The repository had GitHub Issues disabled when the first audited issue was submi
 
 This branch contains:
 
-- `.github/audit/2026-07-28-issues.json.gz.b64` — canonical manifest with all 28 complete issue bodies, label definitions, implementation plans, acceptance criteria, tests, and guardrails.
-- `scripts/publish-audit-issues.py` — dependency-free, exact-title-deduplicating publisher.
+- `.github/audit/2026-07-28-issues.json.gz.b64.part-01` through `part-04` — split canonical manifest with all 28 complete issue bodies, label definitions, implementation plans, acceptance criteria, tests, and guardrails.
+- `scripts/publish-audit-issues-from-parts.py` — verifies and decodes the split manifest.
+- `scripts/publish-audit-issues.py` — dependency-free, exact-title-deduplicating core publisher.
 - this review summary.
 
 Review or export the full Markdown backlog:
 
 ```bash
-python3 scripts/publish-audit-issues.py \
+python3 scripts/publish-audit-issues-from-parts.py \
   --dump-markdown /tmp/grok-build-issues.md \
   --skip-labels
 ```
@@ -26,13 +27,13 @@ python3 scripts/publish-audit-issues.py \
 Enable Issues, create/update the label taxonomy, and publish all missing issues:
 
 ```bash
-python3 scripts/publish-audit-issues.py \
+python3 scripts/publish-audit-issues-from-parts.py \
   --repo ImL1s/grok-build \
   --enable-issues \
   --apply
 ```
 
-The script is dry-run by default. It requires an administrator-authenticated `gh` CLI only when `--apply` is used. Exact-title matching makes reruns safe; existing issues are skipped unless `--update-existing` is supplied.
+The wrapper validates contiguous parts plus base64/gzip integrity before invoking the core publisher. The publisher is dry-run by default and requires an administrator-authenticated `gh` CLI only when `--apply` is used. Exact-title matching makes reruns safe; existing issues are skipped unless `--update-existing` is supplied.
 
 ## Result
 
