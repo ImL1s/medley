@@ -724,6 +724,10 @@ struct ListModelsEndpoint {
     url: String,
     auth: EndpointAuth,
 }
+const XAI_MODELS_API_KEY_REQUIRED: &str =
+    "xAI model catalog requires XAI_API_KEY (or GROK_CODE_XAI_API_KEY).";
+const CUSTOM_MODELS_API_KEY_REQUIRED: &str =
+    "Custom model catalog requires XAI_API_KEY (or GROK_CODE_XAI_API_KEY).";
 fn add_models_session_headers_blocking(
     request: reqwest::blocking::RequestBuilder,
     auth: &GrokAuth,
@@ -824,6 +828,29 @@ impl ListModelsEndpoint {
         }
     }
 }
+/// Validate the credential required by the resolved catalog origin before the
+/// best-effort prefetch layer can turn an auth failure into an ordinary cache
+/// miss. This keeps startup configuration errors user-visible while preserving
+/// the intentional offline (`remote_fetch = false`) path.
+pub(crate) fn validate_models_catalog_auth(
+    endpoints: &crate::agent::config::EndpointsConfig,
+    fetch_auth: crate::agent::models::ModelFetchAuth,
+    remote_fetch_enabled: bool,
+) -> Result<(), String> {
+    if !remote_fetch_enabled {
+        return Ok(());
+    }
+
+    let source = ListModelsEndpoint::from_endpoints(endpoints, fetch_auth);
+    let missing_api_key = crate::agent::auth_method::read_xai_api_key_env().is_err();
+    match source.auth {
+        EndpointAuth::ApiKey if missing_api_key => Err(XAI_MODELS_API_KEY_REQUIRED.to_owned()),
+        EndpointAuth::CustomApiKey if missing_api_key => {
+            Err(CUSTOM_MODELS_API_KEY_REQUIRED.to_owned())
+        }
+        EndpointAuth::ApiKey | EndpointAuth::CustomApiKey | EndpointAuth::Session => Ok(()),
+    }
+}
 /// Fetch models from an OpenAI-compatible `/v1/models` endpoint.
 /// Fetch result: model entries + optional etag from response.
 pub struct FetchModelsResult {
@@ -842,15 +869,13 @@ pub(crate) fn fetch_models_blocking(
     let mut request = client.get(&source.url);
     match source.auth {
         EndpointAuth::ApiKey => {
-            let api_key = crate::agent::auth_method::read_xai_api_key_env().map_err(|_| {
-                BackendError::Auth("No API key for xAI models endpoint. Set XAI_API_KEY.".into())
-            })?;
+            let api_key = crate::agent::auth_method::read_xai_api_key_env()
+                .map_err(|_| BackendError::Auth(XAI_MODELS_API_KEY_REQUIRED.to_owned()))?;
             request = request.header("Authorization", format!("Bearer {}", api_key));
         }
         EndpointAuth::CustomApiKey => {
-            let api_key = crate::agent::auth_method::read_xai_api_key_env().map_err(|_| {
-                BackendError::Auth("No API key for custom models endpoint. Set XAI_API_KEY.".into())
-            })?;
+            let api_key = crate::agent::auth_method::read_xai_api_key_env()
+                .map_err(|_| BackendError::Auth(CUSTOM_MODELS_API_KEY_REQUIRED.to_owned()))?;
             request = request.header("Authorization", format!("Bearer {}", api_key));
         }
         EndpointAuth::Session => {

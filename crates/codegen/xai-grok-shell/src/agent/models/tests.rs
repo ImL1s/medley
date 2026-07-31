@@ -1473,6 +1473,72 @@ fn resolve_custom_endpoint_always_wins() {
 
 #[test]
 #[serial]
+fn from_config_surfaces_missing_custom_catalog_key() {
+    let _unset = EnvGuard::unset("XAI_API_KEY");
+    let _unset_legacy = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mut cfg = config::Config::default();
+    cfg.endpoints.models_list_url = Some("https://custom.example.com/v1/models".to_owned());
+
+    let result = ModelsManager::from_config_with_remote_fetch(&cfg, None, auth_manager, true);
+    let Err(message) = result else {
+        panic!("missing custom catalog key must be a configuration error");
+    };
+    assert_eq!(
+        message,
+        "Custom model catalog requires XAI_API_KEY (or GROK_CODE_XAI_API_KEY)."
+    );
+}
+
+#[test]
+#[serial]
+fn from_config_accepts_explicit_custom_catalog_key() {
+    let _key = EnvGuard::set("XAI_API_KEY", "catalog-key");
+    let _unset_legacy = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mut cfg = config::Config::default();
+    cfg.endpoints.models_base_url = Some("https://custom.example.com/v1".to_owned());
+
+    assert!(ModelsManager::from_config_with_remote_fetch(&cfg, None, auth_manager, true).is_ok());
+}
+
+#[test]
+#[serial]
+fn from_config_allows_offline_custom_catalog_without_key() {
+    let _unset = EnvGuard::unset("XAI_API_KEY");
+    let _unset_legacy = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mut cfg = config::Config::default();
+    cfg.endpoints.models_base_url = Some("https://custom.example.com/v1".to_owned());
+
+    assert!(ModelsManager::from_config_with_remote_fetch(&cfg, None, auth_manager, false).is_ok());
+}
+
+#[test]
+#[serial]
+fn from_config_surfaces_missing_key_for_untrusted_proxy_catalog() {
+    let _unset = EnvGuard::unset("XAI_API_KEY");
+    let _unset_legacy = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mut cfg = config::Config::default();
+    cfg.endpoints.cli_chat_proxy_base_url = Some("https://proxy.example.com/v1".to_owned());
+
+    let result = ModelsManager::from_config_with_remote_fetch(&cfg, None, auth_manager, true);
+    let Err(message) = result else {
+        panic!("untrusted proxy catalog without an explicit key must fail closed");
+    };
+    assert_eq!(
+        message,
+        "Custom model catalog requires XAI_API_KEY (or GROK_CODE_XAI_API_KEY)."
+    );
+}
+
+#[test]
+#[serial]
 fn resolve_cached_session_wins_over_api_key() {
     let _key = EnvGuard::set("XAI_API_KEY", "test-key");
     let endpoints = config::EndpointsConfig::default();
