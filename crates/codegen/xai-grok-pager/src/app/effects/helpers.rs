@@ -168,6 +168,25 @@ pub(crate) fn parse_session_load_running_prompt_id(
         .and_then(|v| v.as_str())
         .map(String::from)
 }
+/// CANONICAL wire parser for the `session/new` / `session/load` response
+/// `_meta[SCHEDULER_BACKGROUND_LOOPS_META_KEY]`.
+///
+/// Carries whether THIS session's scheduled fires run as detached background
+/// subagents, as the shell resolved it when the session's actor spawned. The
+/// pager stores it per session and must not re-resolve the setting: a
+/// mid-session flip would then make `/loop`'s wording describe a runtime the
+/// already-spawned session will never use. `None` when the shell predates the
+/// key (or for gateway chat sessions, which have no local fires), leaving the
+/// reader on the startup seed.
+pub(crate) fn parse_session_scheduler_background_loops(
+    resp_meta: Option<&acp::Meta>,
+) -> Option<bool> {
+    resp_meta
+        .and_then(|m| {
+            m.get(xai_grok_shell::session::SCHEDULER_BACKGROUND_LOOPS_META_KEY)
+        })
+        .and_then(|v| v.as_bool())
+}
 /// Whether `raw` is (or wraps) a disk-full / ENOSPC failure.
 fn is_disk_full_error(raw: &str) -> bool {
     raw.contains(xai_fast_worktree::OUT_OF_DISK_CONTEXT)
@@ -260,6 +279,10 @@ pub(crate) struct SessionFlags {
     /// Active auth is API key (not OAuth/session). Drives rate-limit copy in
     /// `format_acp_error`. Default `false` (OAuth copy) for tests.
     pub is_api_key_auth: bool,
+    /// Startup resume target deferred to the worktree handler after missing
+    /// local id/title resolution. Worktree failure messages append the
+    /// no-match hint only when the failing target equals this value.
+    pub resume_local_miss: Option<String>,
 }
 impl SessionFlags {
     /// Resolve the agent profile name from the flags.
@@ -319,12 +342,13 @@ impl SessionFlags {
         if meta.is_empty() { None } else { Some(meta) }
     }
 }
-/// Workspace-bind `_meta` keys forbidden on chat create/load: backend owns
-/// workspace for `kind=chat`; the client must not bind Direct/envId/attach.
+/// Workspace-bind `_meta` keys **always** forbidden on chat create/load.
+///
+/// `x.ai/cloud_existing_workspace` is intentionally omitted: scrub keeps it
+/// iff `x.ai/local_workspace.mode == "attach"`.
 pub(super) const CHAT_FORBIDDEN_WORKSPACE_BIND_KEYS: &[&str] = &[
     "envId",
     "x.ai/cloud_server_id",
-    "x.ai/cloud_existing_workspace",
 ];
 /// Stamp `_meta["x.ai/session"].kind = "chat"` and strip Build `agentProfile` (K12).
 pub(super) fn apply_chat_kind_meta(meta: &mut Option<acp::Meta>) {
@@ -332,13 +356,32 @@ pub(super) fn apply_chat_kind_meta(meta: &mut Option<acp::Meta>) {
     obj.insert("x.ai/session".into(), serde_json::json!({ "kind": "chat" }));
     obj.remove("agentProfile");
 }
+/// Shared chat create/load/worktree meta finalize: kind + local stamp + scrub.
+pub(super) fn finalize_chat_session_meta(
+    meta: &mut Option<acp::Meta>,
+    is_chat_path: bool,
+    #[allow(unused_variables)]
+    session_flags: &SessionFlags,
+) {
+    if !is_chat_path {
+        return;
+    }
+    apply_chat_kind_meta(meta);
+    scrub_chat_workspace_bind_meta(meta);
+}
 /// Remove client workspace-bind keys from chat create/load meta (defense in depth).
+///
+/// Narrow scrub exception: keep `x.ai/cloud_existing_workspace` when local
+/// intent is attach. Never keep `envId` or Direct hub `x.ai/cloud_server_id`.
 pub(super) fn scrub_chat_workspace_bind_meta(meta: &mut Option<acp::Meta>) {
     let Some(obj) = meta.as_mut() else {
         return;
     };
     for key in CHAT_FORBIDDEN_WORKSPACE_BIND_KEYS {
         obj.remove(*key);
+    }
+    {
+        obj.remove("x.ai/cloud_existing_workspace");
     }
 }
 /// Metadata returned from effect execution so the event loop can patch
@@ -1107,6 +1150,14 @@ pub(crate) async fn persist_setting(
                 return Err(kind_mismatch("screen_mode", "Enum", &value));
             };
             xai_grok_shell::util::config::set_screen_mode(s.to_string())
+                .await
+                .map_err(|e| e.to_string())
+        }
+        "voice_keybind_enabled" => {
+            let SettingValue::Bool(b) = value else {
+                return Err(kind_mismatch("voice_keybind_enabled", "Bool", &value));
+            };
+            xai_grok_shell::util::config::set_voice_keybind_enabled(b)
                 .await
                 .map_err(|e| e.to_string())
         }

@@ -223,9 +223,51 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                 false
             } else if is_wake_prompt(&prompt_id) {
                 if agent.session.state.is_busy() {
+                    if agent.session.state.command_in_flight().is_some() {
+                        agent.session.tracker.snapshot_output_epoch();
+                    }
+                    let errored = matches!(stop_reason.as_str(), "error" | "rate_limit");
+                    if errored && agent.failed_wake_marker_for.as_deref() != Some(&*prompt_id) {
+                        agent.failed_wake_marker_for = Some(prompt_id.clone());
+                        agent.push_end_marker_block(
+                            crate::scrollback::blocks::SessionEvent::TurnFailed {
+                                error: agent_result
+                                    .clone()
+                                    .unwrap_or_else(|| "unknown error".to_string()),
+                                elapsed: None,
+                            },
+                            Vec::new(),
+                            Some(prompt_id.clone()),
+                        );
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    let cancel_trigger = session_notif
+                        .meta
+                        .as_ref()
+                        .and_then(|v| v.get("cancelTrigger"))
+                        .and_then(|v| v.as_str());
+                    finish_wake_turn(
+                        agent,
+                        &prompt_id,
+                        &stop_reason,
+                        agent_result.as_deref(),
+                        cancel_trigger,
+                    );
+                    true
+                }
+            } else if is_server_initiated_prompt(&prompt_id)
+                && !is_scheduler_fired_prompt(&prompt_id)
+            {
+                if agent.session.state.is_busy() {
+                    if agent.session.state.command_in_flight().is_some() {
+                        agent.session.tracker.snapshot_output_epoch();
+                    }
                     false
                 } else {
-                    finish_wake_turn(agent);
+                    agent.session.tracker.finish_turn(&mut agent.scrollback);
                     true
                 }
             } else {
@@ -370,6 +412,7 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             child_view.active_pane = crate::views::agent::ActivePane::Scrollback;
             child_view.set_sharing_enabled(agent.sharing_enabled);
             child_view.set_billing_surface_visible(agent.billing_surface_visible);
+            child_view.set_usage_command_visible(agent.usage_command_visible);
             let dashboard_visible = agent
                 .prompt
                 .slash_controller
@@ -455,7 +498,6 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                     info.scrollback_entry_id = Some(entry_id);
                     info.is_background = is_background;
                 }
-                agent.maybe_push_parked_marker();
             } else if let Some(info) = agent.subagent_sessions.get_mut(&child_session_id) {
                 info.is_background = is_background;
             }
@@ -595,9 +637,6 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                 if !resuming {
                     crate::app::subagent::finalize_finished_child_view(child_view, elapsed_dur);
                 }
-            }
-            if !resuming {
-                agent.maybe_push_parked_marker();
             }
             true
         }

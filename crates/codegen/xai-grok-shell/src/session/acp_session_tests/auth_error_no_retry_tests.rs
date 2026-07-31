@@ -326,7 +326,7 @@ async fn pre_flight_refreshes_hard_expired_session_token() {
 }
 
 /// Hard-expired + failed refresh: do not fall through to JWT/config.toml;
-/// leave credentials unchanged so 401 recovery remains the safety net.
+/// strip the chat-state seed so default headers cannot carry a dead AT.
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial(attribution_emit_count)]
 async fn pre_flight_hard_expired_refresh_failure_skips_jwt_fallthrough() {
@@ -364,8 +364,8 @@ async fn pre_flight_hard_expired_refresh_failure_skips_jwt_fallthrough() {
                     .await
                     .api_key
                     .as_deref(),
-                Some("initial-test-key"),
-                "failed hard-expired pre-flight must not invent a JWT/config bearer"
+                None,
+                "hard-expired pre-flight failure must strip the chat-state seed"
             );
             assert!(
                 !am.has_usable_token(),
@@ -374,6 +374,71 @@ async fn pre_flight_hard_expired_refresh_failure_skips_jwt_fallthrough() {
             assert!(
                 am.permanent_failure().is_none(),
                 "transient refresh failure must not poison permanent_failure"
+            );
+        })
+        .await;
+}
+
+/// Soft-expired (early-invalidation buffer) + transient fail: retain the seed
+/// so a still-accepted wire AT can continue until 401 recovery.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(attribution_emit_count)]
+async fn pre_flight_soft_expired_transient_fail_retains_seed() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let refresher: Arc<dyn crate::auth::refresh::TokenRefresher> = Arc::new({
+                struct AlwaysFail(Arc<std::sync::atomic::AtomicU32>);
+                #[async_trait::async_trait]
+                impl crate::auth::refresh::TokenRefresher for AlwaysFail {
+                    async fn refresh(
+                        &self,
+                        _: crate::auth::refresh::RefreshReason,
+                    ) -> crate::auth::refresh::RefreshOutcome {
+                        self.0.fetch_add(1, Ordering::SeqCst);
+                        crate::auth::refresh::RefreshOutcome::transient("refresh failed")
+                    }
+                }
+                AlwaysFail(call_count.clone())
+            });
+            let dir = tempfile::tempdir().expect("tempdir");
+            let am = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+            // Inside the early-invalidation buffer but still hard-valid.
+            am.hot_swap(GrokAuth {
+                key: "buffered-test-key".into(),
+                auth_mode: AuthMode::Oidc,
+                refresh_token: Some("rt".into()),
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::seconds(30)),
+                ..GrokAuth::test_default()
+            });
+            am.set_refresher(refresher);
+            let (actor, _rx) = make_actor_with_auth_and_credentials(
+                Some(am.clone()),
+                xai_chat_state::AuthType::SessionToken,
+                "buffered-test-key".to_string(),
+            )
+            .await;
+
+            actor.refresh_token_if_expired().await;
+
+            assert!(
+                call_count.load(Ordering::SeqCst) >= 1,
+                "soft-expired pre-flight must still attempt refresh"
+            );
+            assert_eq!(
+                actor
+                    .chat_state_handle
+                    .get_credentials()
+                    .await
+                    .api_key
+                    .as_deref(),
+                Some("buffered-test-key"),
+                "buffer-window soft-expired + transient fail must retain seed"
+            );
+            assert!(
+                am.has_usable_token(),
+                "token inside hard-expiry buffer remains usable"
             );
         })
         .await;
@@ -415,8 +480,12 @@ async fn proactive_refresh_makes_per_turn_refresh_a_cache_hit() {
             let cancel = tokio_util::sync::CancellationToken::new();
             am.start_proactive_refresh(cancel.clone());
 
-            // Wait for proactive task to fire.
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // Wait for the proactive task to fire; its first pass runs after
+            // PROACTIVE_MIN_SLEEP, so the window must exceed the floor.
+            tokio::time::sleep(
+                crate::auth::manager::PROACTIVE_MIN_SLEEP + std::time::Duration::from_millis(1000),
+            )
+            .await;
             assert!(
                 call_count.load(Ordering::SeqCst) >= 1,
                 "proactive task must have fired"
@@ -1247,6 +1316,8 @@ async fn set_session_model_preserves_catalog_key_for_none_alias_with_shared_wire
                 api_backend: crate::sampling::ApiBackend::ChatCompletions,
                 auth_scheme: AuthScheme::None,
                 extra_headers: Default::default(),
+                query_params: Default::default(),
+                env_http_headers: Default::default(),
                 context_window: 256_000,
                 client_version: None,
                 force_http1: false,
@@ -1335,6 +1406,8 @@ async fn handle_set_session_model_clears_credentials_for_none() {
                 api_backend: crate::sampling::ApiBackend::ChatCompletions,
                 auth_scheme: AuthScheme::None,
                 extra_headers: Default::default(),
+                query_params: Default::default(),
+                env_http_headers: Default::default(),
                 context_window: 256_000,
                 client_version: None,
                 force_http1: false,
@@ -1430,6 +1503,8 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                 api_backend: crate::sampling::ApiBackend::ChatCompletions,
                 auth_scheme: Default::default(),
                 extra_headers: Default::default(),
+                query_params: Default::default(),
+                env_http_headers: Default::default(),
                 context_window: 256_000,
                 client_version: None,
                 force_http1: false,
@@ -1530,6 +1605,8 @@ async fn switch_to_first_party_model_drops_minted_provider_token() {
                 api_backend: crate::sampling::ApiBackend::ChatCompletions,
                 auth_scheme: Default::default(),
                 extra_headers: Default::default(),
+                query_params: Default::default(),
+                env_http_headers: Default::default(),
                 context_window: 256_000,
                 client_version: None,
                 force_http1: false,

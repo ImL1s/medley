@@ -77,6 +77,9 @@ impl acp::Agent for MvpAgent {
         tracing::debug!(target: "sampling_log", "Received initialize request");
         xai_grok_telemetry::unified_log::info("agent initialized", None, None);
         self.start_subagent_coordinator();
+        if self.cfg.borrow().remote_settings.is_none() {
+            self.spawn_settings_reapply();
+        }
         let (auto_gc_policy, run_auto_gc) = {
             let cfg = self.cfg.borrow();
             let has_remote = cfg.remote_settings.is_some();
@@ -315,7 +318,14 @@ impl acp::Agent for MvpAgent {
         );
         let mut has_cached_token = init_has_current;
         if !init_has_current && init_is_expired {
-            let refreshed = self.auth_manager.auth().await.is_ok();
+            let refreshed = matches!(
+                tokio::time::timeout(
+                    crate::http::STARTUP_AUTH_REFRESH_TIMEOUT,
+                    self.auth_manager.auth(),
+                )
+                .await,
+                Ok(Ok(_))
+            );
             if refreshed {
                 tracing::debug!(
                     auth_type = ?self.auth_type(),
@@ -327,6 +337,14 @@ impl acp::Agent for MvpAgent {
                     Some(
                         serde_json::json!({ "auth_type": format!("{:?}", self.auth_type()) }),
                     ),
+                );
+                has_cached_token = true;
+            } else if !self.auth_manager.requires_manual_reauth() {
+                tracing::info!("auth: silent refresh failed transiently; advertising cached_token");
+                xai_grok_telemetry::unified_log::info(
+                    "auth: initialize() silent refresh failed transiently, keeping cached_token",
+                    None,
+                    None,
                 );
                 has_cached_token = true;
             } else {
@@ -481,6 +499,11 @@ impl acp::Agent for MvpAgent {
         } else {
             self.model_state(None)
         };
+        let session_capabilities = if crate::agent::chat_modes::process_chat_mode_enabled() {
+            acp::SessionCapabilities::new()
+        } else {
+            acp::SessionCapabilities::new().list(acp::SessionListCapabilities::new())
+        };
         Ok(
             acp::InitializeResponse::new(acp::ProtocolVersion::V1)
                 .agent_capabilities(
@@ -508,7 +531,8 @@ impl acp::Agent for MvpAgent {
                         )
                         .mcp_capabilities(
                             acp::McpCapabilities::new().http(true).sse(true),
-                        ),
+                        )
+                        .session_capabilities(session_capabilities),
                 )
                 .auth_methods(auth_methods)
                 .meta({
@@ -729,7 +753,44 @@ impl acp::Agent for MvpAgent {
                         }
                     }
                 }
-                let Some(auth) = self.auth_manager.current() else {
+                if self.auth_manager.current().is_none()
+                    && self.auth_manager.is_expired()
+                {
+                    let am = self.auth_manager.clone();
+                    let refresh = tokio::spawn(async move { am.auth().await });
+                    match tokio::time::timeout(
+                            crate::http::STARTUP_AUTH_REFRESH_TIMEOUT,
+                            refresh,
+                        )
+                        .await
+                    {
+                        Ok(Ok(Ok(_))) => {}
+                        outcome => {
+                            tracing::debug!(
+                            timed_out = outcome.is_err(),
+                            "auth: cached_token pre-check refresh did not produce a token (yet)"
+                        )
+                        }
+                    }
+                }
+                let resolved = self
+                    .auth_manager
+                    .current()
+                    .or_else(|| {
+                        if self.auth_manager.is_expired()
+                            && !self.auth_manager.requires_manual_reauth()
+                        {
+                            xai_grok_telemetry::unified_log::info(
+                                "auth cached_token: accepting expired-but-refreshable session",
+                                None,
+                                None,
+                            );
+                            self.auth_manager.current_or_expired()
+                        } else {
+                            None
+                        }
+                    });
+                let Some(auth) = resolved else {
                     let message = if self.auth_manager.is_expired() {
                         "Session expired, re-authentication required"
                     } else {
@@ -765,10 +826,9 @@ impl acp::Agent for MvpAgent {
                         .authenticate_after_cached_token_unavailable(arguments)
                         .await;
                 }
-                self.refresh_remote_settings(&auth).await;
-                self.emit_settings_update_notification();
                 self.enforce_grok_code_access(&auth).await;
                 self.maybe_sync_bundle_in_background(false);
+                let auth_for_settings = auth.clone();
                 {
                     let mut sampling_config = self.sampling_config.borrow_mut();
                     sampling_config.api_key = Some(auth.key);
@@ -790,7 +850,7 @@ impl acp::Agent for MvpAgent {
                     auth_method: "cached_token".to_string(),
                     user_id: uid,
                 });
-                self.maybe_fetch_post_auth_settings().await;
+                self.spawn_post_auth_settings(auth_for_settings);
                 Ok(self.auth_response_with_meta())
             }
             auth_method::GROK_COM_METHOD_ID | auth_method::OIDC_METHOD_ID => {
@@ -914,8 +974,6 @@ impl acp::Agent for MvpAgent {
                     );
                 }
                 self.auth_manager.hot_swap(auth.clone());
-                self.refresh_remote_settings(&auth).await;
-                self.emit_settings_update_notification();
                 self.enforce_grok_code_access(&auth).await;
                 self.maybe_sync_bundle_in_background(false);
                 tokio::task::spawn_local(
@@ -936,7 +994,7 @@ impl acp::Agent for MvpAgent {
                     auth_method: arguments.method_id.0.as_ref().to_string(),
                     user_id: Some(auth.user_id.clone()),
                 });
-                self.maybe_fetch_post_auth_settings().await;
+                self.spawn_post_auth_settings(auth);
                 Ok(self.auth_response_with_meta())
             }
             _ => {
@@ -956,6 +1014,7 @@ impl acp::Agent for MvpAgent {
         &self,
         arguments: acp::NewSessionRequest,
     ) -> Result<acp::NewSessionResponse, acp::Error> {
+        reject_chat_kind_without_feature(arguments.meta.as_ref())?;
         tracing::debug!(config = ?self.sampling_config, "Received new session request {arguments:?}");
         let init = self
             .initialize_request
@@ -965,9 +1024,7 @@ impl acp::Agent for MvpAgent {
                     .data("initialize must be called before new_session")
             })?;
         self.seed_client_config_auth_if_available();
-        if let Ok(auth) = self.auth_manager.auth().await {
-            self.refresh_settings_and_reapply(&auth).await;
-        }
+        self.spawn_settings_reapply();
         let cwd = AbsPathBuf::new(arguments.cwd.clone())
             .map_err(|e| acp::Error::invalid_params().data(e.to_string()))?;
         let remote_settings = self.cfg.borrow().remote_settings.clone();
@@ -988,9 +1045,9 @@ impl acp::Agent for MvpAgent {
             .and_then(|m| m.get("modelId").and_then(|v| v.as_str()))
             .filter(|s| !s.is_empty());
         #[allow(unused_variables)]
-        let session_computer_sessions = parse_session_computer_sessions(
+        let session_computer_sessions = resolve_session_computer_sessions(
             arguments.meta.as_ref(),
-        );
+        )?;
         let is_chat_kind = is_chat_session_kind(arguments.meta.as_ref());
         let session_yolo_mode = arguments
             .meta
@@ -1050,7 +1107,29 @@ impl acp::Agent for MvpAgent {
         let mut unreadiness_custom: Option<(String, String)> = None;
         let session_initial_model = chat_initial_model(is_chat_kind, custom_model_id);
         let build_custom_model_id = if is_chat_kind { None } else { custom_model_id };
+        let campaign_nudge = if is_chat_kind {
+            None
+        } else {
+            crate::util::config::campaign_driven_models_default()
+                    .filter(|c| {
+                        build_custom_model_id.is_none()
+                            || build_custom_model_id == c.pre_campaign.as_deref()
+                            || build_custom_model_id == Some(c.value.as_str())
+                    })
+        };
+        let campaign_nudged = campaign_nudge.is_some();
+        if let Some(c) = &campaign_nudge {
+            tracing::info!(
+                model = %c.value,
+                requested = ?custom_model_id,
+                "new_session: applying campaign-driven default model"
+            );
+        }
+        let build_custom_model_id: Option<String> = campaign_nudge
+            .map(|c| c.value)
+            .or_else(|| build_custom_model_id.map(str::to_owned));
         let resolved_custom_model = build_custom_model_id
+            .as_deref()
             .and_then(|custom_model| match self
                 .resolve_model_id(&acp::ModelId::new(custom_model))
             {
@@ -1079,7 +1158,9 @@ impl acp::Agent for MvpAgent {
                         requested_model = custom_model,
                         "Requested model not allowed by allowed_models; falling back to current default model"
                     );
-                    disallowed_custom = Some(custom_model.to_string());
+                    if !campaign_nudged {
+                        disallowed_custom = Some(custom_model.to_string());
+                    }
                     None
                 }
                 Err(_) => {
@@ -1160,7 +1241,7 @@ impl acp::Agent for MvpAgent {
                     &session_info,
                     model_id,
                     summary_client,
-                    self.storage_mode,
+                    self.storage_mode.get(),
                     Some(self.auth_manager.clone()),
                     relay_sync,
                     Some(self.gateway.clone()),
@@ -1170,7 +1251,7 @@ impl acp::Agent for MvpAgent {
                 .await
                 .map_err(|e| crate::session::persistence::io_error_to_acp(&e))?
         };
-        self.session_turn_numbers.borrow_mut().insert(session_id.clone(), 0u64);
+        self.set_turn_number(&session_id, 0u64);
         let chat_history = vec![];
         let client_code_nav_enabled = arguments
             .meta
@@ -1223,6 +1304,7 @@ impl acp::Agent for MvpAgent {
                         session_yolo_mode,
                         session_auto_mode: session_auto_mode && !session_yolo_mode,
                         prompt_display_cwd: None,
+                        is_chat_kind: false,
                     }
             };
             self.spawn_and_register_session(init, spawn_opts).await
@@ -1361,8 +1443,6 @@ impl acp::Agent for MvpAgent {
         } else {
             self.model_state(Some(&session_id))
         };
-        let (session_config_value, session_detail_value) = self
-            .session_config_meta(&session_id, cwd.as_str().to_owned(), None, &models);
         let applied_tool_overrides = match self
             .session_handle_waiting_for_load(&session_id)
             .await
@@ -1385,8 +1465,13 @@ impl acp::Agent for MvpAgent {
             "feedbackEnabled": feedback_enabled,
         });
         if let Some(obj) = meta.as_object_mut() {
-            obj.insert("x.ai/sessionConfig".to_string(), session_config_value);
-            obj.insert("x.ai/sessionDetail".to_string(), session_detail_value);
+            self.insert_session_config_meta(
+                obj,
+                &session_id,
+                cwd.as_str().to_owned(),
+                None,
+                &models,
+            );
             insert_applied_tool_overrides(obj, applied_tool_overrides.as_ref());
         }
         Ok(
@@ -1400,6 +1485,7 @@ impl acp::Agent for MvpAgent {
         arguments: acp::LoadSessionRequest,
     ) -> Result<acp::LoadSessionResponse, acp::Error> {
         let _load_guard = self.begin_session_load(&arguments.session_id);
+        reject_chat_kind_without_feature(arguments.meta.as_ref())?;
         self.sweep_dead_sessions();
         self.drain_old_session_thread(&arguments.session_id).await;
         tracing::debug!("Received load session request {arguments:?}");
@@ -1528,7 +1614,7 @@ impl acp::Agent for MvpAgent {
         let (persistence_info, persistence) = crate::session::persistence::load_light(
                 &session_info,
                 summary_client,
-                self.storage_mode,
+                self.storage_mode.get(),
                 Some(self.auth_manager.clone()),
                 backend.as_ref(),
                 relay_sync,
@@ -1583,9 +1669,7 @@ impl acp::Agent for MvpAgent {
         let restored_awaiting_plan_approval = persisted_plan_mode
             .as_ref()
             .is_some_and(|s| s.awaiting_plan_approval);
-        self.session_turn_numbers
-            .borrow_mut()
-            .insert(session_id.clone(), summary.next_trace_turn);
+        self.set_turn_number(&session_id, summary.next_trace_turn);
         tracing::info!(
             session_id = %session_id.0,
             next_trace_turn = summary.next_trace_turn,
@@ -1608,9 +1692,9 @@ impl acp::Agent for MvpAgent {
             session_yolo_mode,
         );
         #[allow(unused_variables)]
-        let session_computer_sessions = parse_session_computer_sessions(
+        let session_computer_sessions = resolve_session_computer_sessions(
             request_meta.as_ref(),
-        );
+        )?;
         let restore_code_requested = request_meta
             .as_ref()
             .and_then(|m| m.get("x.ai/restore_code"))
@@ -1889,6 +1973,7 @@ impl acp::Agent for MvpAgent {
                         session_yolo_mode,
                         session_auto_mode: session_auto_mode && !session_yolo_mode,
                         prompt_display_cwd,
+                        is_chat_kind: false,
                     },
                 )
                 .await?;
@@ -1980,26 +2065,30 @@ impl acp::Agent for MvpAgent {
             cwd.as_path(),
             remote_settings.as_ref(),
         );
-        if let Some((parent_cmd_tx, session_cwd)) = self
-            .sessions
-            .borrow()
-            .get(&session_id)
-            .map(|h| (h.cmd_tx.clone(), h.info.cwd.clone()))
-        {
+        let orphan_parent = {
+            let sessions = self.sessions.borrow();
+            sessions
+                .get(&session_id)
+                .map(|handle| (handle.cmd_tx.clone(), handle.info.cwd.clone()))
+        };
+        if let Some((parent_cmd_tx, session_cwd)) = orphan_parent {
             let session_dir = crate::session::persistence::session_dir(
                 &SessionInfo {
                     id: session_id.clone(),
                     cwd: session_cwd,
                 },
             );
-            crate::agent::subagent::reconcile_orphaned_subagents(
-                &unfinished_subagents,
-                &self.subagent_coordinator.borrow(),
-                &session_dir,
-                session_id.0.as_ref(),
-                &self.gateway,
-                Some(&parent_cmd_tx),
-            );
+            crate::agent::subagent::reconcile_orphaned_subagents_with_backend(
+                    &unfinished_subagents,
+                    &xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::new(
+                        self.subagent_event_tx.clone(),
+                    ),
+                    &session_dir,
+                    session_id.0.as_ref(),
+                    &self.gateway,
+                    Some(&parent_cmd_tx),
+                )
+                .await;
         }
         let persisted_model = summary.current_model_id.clone();
         let models = self.models_manager.models();
@@ -2291,15 +2380,13 @@ impl acp::Agent for MvpAgent {
                 );
         }
         let model_state = self.model_state(Some(&session_id));
-        let (session_config_value, session_detail_value) = self
-            .session_config_meta(
-                &session_id,
-                session_cwd.clone().unwrap_or_default(),
-                summary.display_title_opt(),
-                &model_state,
-            );
-        response_meta_map.insert("x.ai/sessionConfig".to_string(), session_config_value);
-        response_meta_map.insert("x.ai/sessionDetail".to_string(), session_detail_value);
+        self.insert_session_config_meta(
+            &mut response_meta_map,
+            &session_id,
+            session_cwd.clone().unwrap_or_default(),
+            summary.display_title_opt(),
+            &model_state,
+        );
         let applied_tool_overrides = {
             let cmd_tx = self
                 .sessions
@@ -2357,6 +2444,12 @@ impl acp::Agent for MvpAgent {
             });
         }
         Ok(response)
+    }
+    async fn list_sessions(
+        &self,
+        args: acp::ListSessionsRequest,
+    ) -> Result<acp::ListSessionsResponse, acp::Error> {
+        crate::agent::handlers::session::handle_list_sessions(self, args).await
     }
     #[tracing::instrument(
         name = "agent.prompt",
@@ -2674,10 +2767,7 @@ impl acp::Agent for MvpAgent {
             );
         }
         let next_trace_turn = self
-            .session_turn_numbers
-            .borrow()
-            .get(&arguments.session_id)
-            .copied()
+            .session_turn_number(&arguments.session_id)
             .unwrap_or_else(|| turn_number.saturating_add(1));
         let _ = handle
             .cmd_tx
@@ -2892,9 +2982,11 @@ impl acp::Agent for MvpAgent {
                     tool_overrides: _,
                 } = turn_ok;
                 let subagent_refs = self
-                    .subagent_coordinator
-                    .borrow()
-                    .spawned_refs_for_prompt(&prompt_id);
+                    .spawned_subagent_refs_for_prompt(
+                        arguments.session_id.0.as_ref(),
+                        &prompt_id,
+                    )
+                    .await;
                 let permission_events = self
                     .collect_permission_events(&arguments.session_id);
                 let turn_messages: Option<xai_chat_state::TurnCapture> = {
@@ -3321,6 +3413,9 @@ impl acp::Agent for MvpAgent {
                     crate::session::commands::PromptCompletionKind::MaxTurnsReached {
                         ..
                     } => Some("max_turns_reached".to_string()),
+                    crate::session::commands::PromptCompletionKind::StationarityEnded => {
+                        Some("action_stationarity".to_string())
+                    }
                     _ => None,
                 };
                 Ok(
@@ -3345,9 +3440,11 @@ impl acp::Agent for MvpAgent {
             }
             Err(err) => {
                 let subagent_refs = self
-                    .subagent_coordinator
-                    .borrow()
-                    .spawned_refs_for_prompt(&prompt_id);
+                    .spawned_subagent_refs_for_prompt(
+                        arguments.session_id.0.as_ref(),
+                        &prompt_id,
+                    )
+                    .await;
                 let turn_messages: Option<xai_chat_state::TurnCapture> = {
                     let (tx, rx) = oneshot::channel();
                     if handle

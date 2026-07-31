@@ -423,18 +423,6 @@ impl SessionActor {
                 }
             }
         }
-        #[allow(clippy::items_after_statements)]
-        struct AuthManagerBearerResolver(std::sync::Arc<crate::auth::AuthManager>);
-        impl std::fmt::Debug for AuthManagerBearerResolver {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.debug_struct("AuthManagerBearerResolver").finish()
-            }
-        }
-        impl xai_grok_sampler::BearerResolver for AuthManagerBearerResolver {
-            fn current_bearer(&self) -> Option<String> {
-                self.0.current_or_expired().map(|a| a.key)
-            }
-        }
         let cfg = self
             .chat_state_handle
             .get_sampling_config()
@@ -447,6 +435,8 @@ impl SessionActor {
                 top_p: None,
                 api_backend: Default::default(),
                 extra_headers: Default::default(),
+                query_params: Default::default(),
+                env_http_headers: Default::default(),
                 context_window: std::num::NonZeroU64::new(256_000).unwrap(),
                 reasoning_effort: None,
                 stream_tool_calls: None,
@@ -479,6 +469,12 @@ impl SessionActor {
             use_bearer_resolver = false;
         }
         self.log_auth_gate_unknown("reconstruct_full_config", gate, &cfg.base_url);
+        // Refresh before taking the initial bearer snapshot. The dynamic
+        // resolver handles later rotations, while this keeps the first request
+        // from starting with a stale chat-state credential.
+        if use_bearer_resolver && let Some(am) = self.auth_manager.as_ref() {
+            let _ = am.auth().await;
+        }
         let mut extra_headers = cfg.extra_headers;
         crate::agent::config::inject_url_derived_headers(
             &mut extra_headers,
@@ -511,8 +507,14 @@ impl SessionActor {
         }
         // Security boundary: strip chat-state credentials for keyless/unready
         // models so a stale session JWT cannot survive onto a custom endpoint.
+        // For session-token auth, snapshot the freshly refreshed wire-valid
+        // bearer; the resolver below supplies subsequent rotations.
         let api_key = if auth_scheme == xai_grok_sampler::AuthScheme::None {
             None
+        } else if use_bearer_resolver {
+            self.auth_manager
+                .as_ref()
+                .and_then(|am| am.current_wire_valid().map(|a| a.key))
         } else {
             creds.api_key
         };
@@ -542,6 +544,8 @@ impl SessionActor {
             api_backend: cfg.api_backend,
             auth_scheme,
             extra_headers,
+            query_params: cfg.query_params.clone(),
+            env_http_headers: cfg.env_http_headers.clone(),
             context_window: cfg.context_window.get(),
             client_version: creds.client_version,
             reasoning_effort: cfg.reasoning_effort,
@@ -555,11 +559,9 @@ impl SessionActor {
             origin_client: self.origin_client.clone(),
             attribution_callback: self.attribution_callback.clone(),
             bearer_resolver: if use_bearer_resolver {
-                self.auth_manager
-                    .as_ref()
-                    .map(|am| -> xai_grok_sampler::SharedBearerResolver {
-                        std::sync::Arc::new(AuthManagerBearerResolver(am.clone()))
-                    })
+                self.auth_manager.as_ref().map(|am| {
+                    crate::auth::credential_provider::WireValidBearerResolver::shared(am.clone())
+                })
             } else {
                 None
             },
@@ -1124,6 +1126,29 @@ impl SessionActor {
         } else {
             error.kind.as_str()
         };
+        let (error_type, detailed_message) = if error_type == "auth"
+            && self
+                .auth_manager
+                .as_ref()
+                .is_some_and(|am| !am.requires_manual_reauth())
+        {
+            xai_grok_telemetry::unified_log::info(
+                "auth: turn failure downgraded to auth_transient (refreshable credential present)",
+                Some(self.session_info.id.0.as_ref()),
+                Some(serde_json::json!({ "status_code": error.status_code })),
+            );
+            (
+                "auth_transient",
+                format!(
+                    "{detailed_message}\n\nAuthentication is temporarily unavailable \
+                     (often a network blip right after wake). Your session is still \
+                     signed in and will recover automatically — retry in a few seconds; \
+                     no need to run /login."
+                ),
+            )
+        } else {
+            (error_type, detailed_message)
+        };
         self.log_terminal_failure(error_type, error.status_code, &detailed_message);
         self.send_xai_notification(XaiSessionUpdate::RetryState(
             crate::extensions::notification::RetryState::Failed {
@@ -1239,6 +1264,11 @@ impl SessionActor {
                     }
                     Err(e) => {
                         let hard_expired = !am.has_usable_token();
+                        if hard_expired && creds.api_key.is_some() {
+                            let mut cleared = creds;
+                            cleared.api_key = None;
+                            self.chat_state_handle.update_credentials(cleared);
+                        }
                         tracing::warn!(
                             error = %e,
                             hard_expired,

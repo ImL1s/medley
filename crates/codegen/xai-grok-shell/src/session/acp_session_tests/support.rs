@@ -121,6 +121,7 @@ async fn test_agent_from_config(
         session_env: std::sync::Arc::new(std::collections::HashMap::new()),
         notification_handle: ToolNotificationHandle::noop(),
         owner_session_id: None,
+        subagent: None,
         parent_scheduler_handle: None,
         skills: vec![],
         state_path: std::path::PathBuf::from("/tmp/tool_state.json"),
@@ -219,6 +220,8 @@ pub(crate) async fn create_test_actor_ex(
             top_p: None,
             api_backend: Default::default(),
             extra_headers: Default::default(),
+            query_params: Default::default(),
+            env_http_headers: Default::default(),
             context_window: std::num::NonZeroU64::new(context_window)
                 .expect("test context_window must be non-zero"),
             reasoning_effort: None,
@@ -238,6 +241,7 @@ pub(crate) async fn create_test_actor_ex(
         model_auth_memo: std::cell::RefCell::new(None),
         attribution_callback: None,
         auth_manager: None,
+        is_chat_kind: false,
         state,
         notifications: NotificationSender {
             gateway: GatewaySender::new(gateway_tx),

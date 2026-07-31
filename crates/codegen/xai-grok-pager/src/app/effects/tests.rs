@@ -1979,7 +1979,7 @@ fn to_meta_chat_mode_stamps_kind_and_omits_agent_profile() {
         ..Default::default()
     };
     let meta = flags.to_meta().expect("chat_mode must emit meta");
-    assert_eq!(meta["x.ai/session"]["kind"], "chat");
+    assert_eq!(meta["x.ai/session"] ["kind"], "chat");
     assert!(
             meta.get("agentProfile").is_none(),
             "K12: chat mode must omit Build agentProfile"
@@ -2006,7 +2006,7 @@ fn load_meta_chat_kind_alone_stamps_kind_and_strips_profile() {
         scrub_chat_workspace_bind_meta(&mut meta);
     }
     let meta = meta.expect("chat_kind must produce meta");
-    assert_eq!(meta["x.ai/session"]["kind"], "chat");
+    assert_eq!(meta["x.ai/session"] ["kind"], "chat");
     assert!(
             meta.get("agentProfile").is_none(),
             "entry chat_kind must strip Build agentProfile"
@@ -2025,6 +2025,10 @@ fn assert_chat_meta_has_no_workspace_bind_keys(meta: &serde_json::Value) {
                 "chat meta must not include workspace-bind key {key:?}: {meta}"
             );
     }
+    assert!(
+            meta.get("x.ai/cloud_existing_workspace").is_none(),
+            "chat meta without attach must not include existing workspace: {meta}"
+        );
 }
 #[test]
 fn chat_create_meta_never_includes_workspace_bind_keys_when_cloud_fields_set() {
@@ -2036,7 +2040,7 @@ fn chat_create_meta_never_includes_workspace_bind_keys_when_cloud_fields_set() {
     apply_chat_kind_meta(&mut meta);
     scrub_chat_workspace_bind_meta(&mut meta);
     let meta = meta.expect("chat create must emit meta");
-    assert_eq!(meta["x.ai/session"]["kind"], "chat");
+    assert_eq!(meta["x.ai/session"] ["kind"], "chat");
     assert_chat_meta_has_no_workspace_bind_keys(
         &serde_json::Value::Object(meta.clone()),
     );
@@ -2060,7 +2064,7 @@ fn chat_load_meta_never_includes_workspace_bind_keys() {
     }
     scrub_chat_workspace_bind_meta(&mut meta);
     let meta = meta.expect("chat load must emit meta");
-    assert_eq!(meta["x.ai/session"]["kind"], "chat");
+    assert_eq!(meta["x.ai/session"] ["kind"], "chat");
     assert_chat_meta_has_no_workspace_bind_keys(
         &serde_json::Value::Object(meta.clone()),
     );
@@ -2294,6 +2298,27 @@ fn sanitize_user_error_collapses_disk_full() {
             sanitize_user_error("couldn't create worktree: failed to get HEAD commit from source"),
             "couldn't create worktree: failed to get HEAD commit from source"
         );
+}
+/// Production ordering of the deferred worktree resume failure: the
+/// detail is sanitized FIRST, then composed — sanitizing the composed
+/// message would collapse a disk-full chain whole and erase the title
+/// hint for a deferred local-miss target.
+#[test]
+fn worktree_resume_failure_sanitizes_detail_before_hint() {
+    let raw = "failed to copy index: No space left on device (os error 28)";
+    let msg = worktree_resume_failure_message(
+        Some("typo title"),
+        &sanitize_user_error(raw),
+    );
+    assert_eq!(
+            msg,
+            format!(
+                "couldn't resume worktree session: No space left on device; {}",
+                crate::app::session_title_resolve::title_miss_hint("typo title")
+            )
+        );
+    let id_msg = worktree_resume_failure_message(None, &sanitize_user_error(raw));
+    assert_eq!(id_msg, "couldn't resume worktree session: No space left on device");
 }
 /// A resume-picker entry converts to a **dormant** dashboard roster row
 /// (the non-leader idle source) preserving title, cwd, model, worktree

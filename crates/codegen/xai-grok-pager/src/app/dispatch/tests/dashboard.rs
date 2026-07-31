@@ -1688,6 +1688,41 @@ fn dashboard_does_not_advertise_or_dispatch_doctor() {
         assert_eq!(dashboard.error_toast.as_deref(), Some(expected.as_str()));
     }
 }
+/// External-auth hides `/usage` via `visible()`, not session-scope. Typed
+/// `/usage` on the dashboard must refuse with the command's message, not
+/// claim it only works in a session.
+#[serial_test::serial(GROK_AGENT_DASHBOARD)]
+#[test]
+fn dashboard_slash_usage_hidden_for_external_auth() {
+    let mut app = three_agent_app();
+    app.has_external_auth_provider = true;
+    app.apply_auth_meta(&xai_grok_shell::auth::AuthMeta::default());
+    open_dashboard(&mut app);
+    let before = app.agents.len();
+    let effects = dispatch_dashboard_dispatch_slash(&mut app, "/usage".into());
+    assert!(effects.is_empty(), "must not enqueue spawn effects");
+    assert_eq!(app.agents.len(), before, "must not add an agent");
+    assert_eq!(app.dashboard.as_ref().unwrap().dispatch.text(), "");
+    let toast = app
+        .dashboard
+        .as_ref()
+        .unwrap()
+        .error_toast
+        .as_deref()
+        .expect("error toast for gated /usage");
+    assert!(
+        toast.contains("/usage is not available"),
+        "unexpected toast: {toast}"
+    );
+    assert!(
+        !toast.contains("only works in a session"),
+        "must not mis-label /usage as session-scoped: {toast}"
+    );
+    assert!(
+        !toast.contains("SuperGrok"),
+        "must not upsell billing on external auth: {toast}"
+    );
+}
 /// Session-scoped Action builtins must not spawn an agent whose first
 /// prompt is the slash text (registered + not offered → error toast).
 #[serial_test::serial(GROK_AGENT_DASHBOARD)]
@@ -2109,6 +2144,7 @@ fn dashboard_deferred_plan_mode_applied_on_session_created() {
             agent_id: id,
             session_id: session_id.clone(),
             models: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
@@ -2477,10 +2513,7 @@ fn dashboard_attach_subagent_switches_to_parent_with_subagent_focused() {
         &mut scratch,
         None,
         false,
-        0,
-        &[],
-        &std::collections::BTreeSet::new(),
-        None,
+        crate::app::agent_view::BannerSlotParams::none(),
         &crate::app::bundle::BundleState::default(),
         false,
         &mut Vec::new(),
@@ -5275,6 +5308,7 @@ fn dashboard_attach_roster_focuses_existing_local_agent() {
             agent_id: id,
             session_id: "local-owned".into(),
             models: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );

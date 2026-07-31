@@ -40,8 +40,18 @@ pub enum Event {
     },
     ToolCompleted {
         tool_name: String,
+        /// Dispatch wall time; a cancel row reuses the duration measured at dispatch.
         duration_ms: u64,
         outcome: ToolOutcome,
+        /// Model/ACP tool call id; matches the conversation's `tool_result`.
+        /// Omitted on write when empty.
+        #[serde(skip_serializing_if = "String::is_empty")]
+        tool_call_id: String,
+        /// Which emitter wrote this row. Shell (default) is omitted on the wire
+        /// and is what package joins should use; workspace rows time the
+        /// hub/proxy hop for the same call.
+        #[serde(skip_serializing_if = "ToolCompletedSource::is_shell")]
+        source: ToolCompletedSource,
     },
     PermissionRequested {
         tool_name: String,
@@ -457,6 +467,26 @@ pub enum Event {
     },
 }
 
+/// Who emitted a [`Event::ToolCompleted`] row.
+///
+/// Wire: shell is omitted (legacy empty/`source` absent); workspace is
+/// `"workspace"`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCompletedSource {
+    /// Shell dispatch clock — join against these.
+    #[default]
+    Shell,
+    /// Workspace hub/proxy hop clock.
+    Workspace,
+}
+
+impl ToolCompletedSource {
+    pub fn is_shell(&self) -> bool {
+        matches!(self, Self::Shell)
+    }
+}
+
 /// Where a mid-turn interjection originated. Drives the `source` field on
 /// [`Event::Interjected`].
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -609,7 +639,6 @@ pub enum CancellationCategory {
     PermissionRejected,
     PermissionCancelled,
     MidTurnAbort,
-    ActionStationarity,
 }
 
 // Note: `From<&permission::Decision> for PermissionDecision` crosses the
@@ -628,7 +657,6 @@ mod tests {
             CancellationCategory::PermissionRejected,
             CancellationCategory::PermissionCancelled,
             CancellationCategory::MidTurnAbort,
-            CancellationCategory::ActionStationarity,
         ] {
             let value = serde_json::to_value(variant).unwrap();
             let decoded: CancellationCategory = serde_json::from_value(value).unwrap();
@@ -650,14 +678,33 @@ mod tests {
                 "\"permission_cancelled\"",
             ),
             (CancellationCategory::MidTurnAbort, "\"mid_turn_abort\""),
-            (
-                CancellationCategory::ActionStationarity,
-                "\"action_stationarity\"",
-            ),
         ] {
             let json = serde_json::to_string(&variant).unwrap();
             assert_eq!(json, expected, "{variant:?} must serialize to {expected}");
         }
+    }
+
+    #[test]
+    fn tool_completed_source_omits_shell_writes_workspace() {
+        let shell = serde_json::to_value(Event::ToolCompleted {
+            tool_name: "bash".into(),
+            duration_ms: 10,
+            outcome: ToolOutcome::Success,
+            tool_call_id: "c1".into(),
+            source: ToolCompletedSource::Shell,
+        })
+        .unwrap();
+        assert!(shell.get("source").is_none());
+
+        let workspace = serde_json::to_value(Event::ToolCompleted {
+            tool_name: "bash".into(),
+            duration_ms: 10,
+            outcome: ToolOutcome::Success,
+            tool_call_id: "c1".into(),
+            source: ToolCompletedSource::Workspace,
+        })
+        .unwrap();
+        assert_eq!(workspace["source"], "workspace");
     }
 
     #[test]
