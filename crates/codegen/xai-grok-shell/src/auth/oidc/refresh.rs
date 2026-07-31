@@ -132,7 +132,10 @@ pub(crate) async fn oidc_token_exchange(auth: &GrokAuth) -> OidcRefreshResult {
     crate::unified_log::info(
         "oidc try_refresh_pure enter",
         None,
-        Some(serde_json::json!({ "issuer": issuer, "client_id": client_id })),
+        Some(serde_json::json!({
+            "issuer_present": !issuer.is_empty(),
+            "client_id_present": !client_id.is_empty(),
+        })),
     );
 
     // A large mono/wall divergence around the IdP call means the process was
@@ -158,7 +161,7 @@ pub(crate) async fn oidc_token_exchange(auth: &GrokAuth) -> OidcRefreshResult {
                 "oidc try_refresh_pure discovery failed",
                 None,
                 Some(serde_json::json!({
-                    "error": format!("{e:#}"),
+                    "error_kind": "oidc_discovery_failed",
                     "network_unreachable": network_unreachable,
                     "mono_ms": mono_ms,
                     "wall_ms": wall_ms,
@@ -185,11 +188,11 @@ pub(crate) async fn oidc_token_exchange(auth: &GrokAuth) -> OidcRefreshResult {
     {
         Ok(t) => t,
         Err(e) => {
-            if let Some(OidcError::TokenRefreshHttp { body, .. }) = e.downcast_ref::<OidcError>()
-                && let Some(error_code) = serde_json::from_str::<serde_json::Value>(body)
-                    .ok()
-                    .and_then(|v| v.get("error")?.as_str().map(str::to_owned))
-                && let Some(reason) = classify_terminal(&error_code)
+            if let Some(OidcError::TokenRefreshHttp {
+                terminal_error_code: Some(error_code),
+                ..
+            }) = e.downcast_ref::<OidcError>()
+                && let Some(reason) = classify_terminal(error_code)
             {
                 let (mono_ms, wall_ms, suspended_ms, suspected_suspend) = timing();
                 let cred_age_secs = auth.mint_age_seconds();
@@ -198,11 +201,8 @@ pub(crate) async fn oidc_token_exchange(auth: &GrokAuth) -> OidcRefreshResult {
                     None,
                     Some(serde_json::json!({
                         "error_code": error_code,
-                        "client_id": client_id,
-                        "tried_rt_prefix": auth.refresh_token.as_deref().map(crate::auth::token_suffix),
-                        "error_description": serde_json::from_str::<serde_json::Value>(body)
-                            .ok()
-                            .and_then(|v| v.get("error_description").cloned()),
+                        "client_id_present": !client_id.is_empty(),
+                        "refresh_token_present": auth.refresh_token.is_some(),
                         "mono_ms": mono_ms,
                         "wall_ms": wall_ms,
                         "suspended_ms": suspended_ms,
@@ -211,7 +211,7 @@ pub(crate) async fn oidc_token_exchange(auth: &GrokAuth) -> OidcRefreshResult {
                     })),
                 );
                 if suspected_suspend {
-                    emit_suspend_spanned(&error_code, suspended_ms);
+                    emit_suspend_spanned(error_code, suspended_ms);
                 }
                 return OidcRefreshResult::TerminalError { reason };
             }
@@ -225,8 +225,8 @@ pub(crate) async fn oidc_token_exchange(auth: &GrokAuth) -> OidcRefreshResult {
                 "oidc try_refresh_pure token exchange failed",
                 None,
                 Some(serde_json::json!({
-                    "error": e.to_string(),
-                    "client_id": client_id,
+                    "error_kind": "oidc_token_exchange_failed",
+                    "client_id_present": !client_id.is_empty(),
                     "http_status": http_status,
                     "network_unreachable": network_unreachable,
                     "mono_ms": mono_ms,
@@ -236,10 +236,9 @@ pub(crate) async fn oidc_token_exchange(auth: &GrokAuth) -> OidcRefreshResult {
                 })),
             );
             tracing::warn!(
-                error = %e,
                 http_status = ?http_status,
-                client_id = %client_id,
-                issuer = %issuer,
+                client_id_present = !client_id.is_empty(),
+                issuer_present = !issuer.is_empty(),
                 "OIDC: token refresh failed"
             );
             if suspected_suspend {
@@ -278,7 +277,7 @@ pub(crate) async fn oidc_token_exchange(auth: &GrokAuth) -> OidcRefreshResult {
     }
     tracing::debug!(
         idp_rotated,
-        key_prefix = crate::auth::token_suffix(&new_auth.key),
+        access_token_present = !new_auth.key.is_empty(),
         "oidc try_refresh_pure token obtained"
     );
     let (mono_ms, wall_ms, suspended_ms, suspected_suspend) = timing();

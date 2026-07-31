@@ -1657,10 +1657,7 @@ async fn read_skeptic_verdict(
         },
         None => skeptic_failure(
             skeptic_idx,
-            format!(
-                "verdict JSON missing/malformed AND terminal token unrecognised: {}",
-                terminal.chars().take(120).collect::<String>()
-            ),
+            "verdict JSON missing/malformed and terminal token unrecognised".to_string(),
             started.elapsed().as_millis() as u64,
         ),
     }

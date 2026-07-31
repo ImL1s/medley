@@ -81,6 +81,24 @@ fn format_stop_feedback(blocks: &[dispatcher::StopBlock], additional_context: &[
     feedback
 }
 
+fn format_force_stop_annotation(prevent: &dispatcher::StopBlock) -> String {
+    format!(
+        "\u{26a0} Hook `{}` stopped the agent: {}",
+        prevent.hook_name, prevent.reason
+    )
+}
+
+fn format_keep_working_block_annotation(block: &dispatcher::StopBlock) -> String {
+    format!(
+        "\u{21a9} Stop blocked by hook `{}`, continuing: {}",
+        block.hook_name, block.reason
+    )
+}
+
+fn format_keep_working_context_annotation(context: &str) -> String {
+    format!("\u{21a9} Stop hook feedback, continuing: {context}")
+}
+
 /// Downgrade `Blocked` to `Success` for the observe-only session-end fire: the
 /// decision is discarded, so scrollback and telemetry must not report a block.
 pub(super) fn demote_ignored_blocks(
@@ -200,11 +218,8 @@ impl SessionActor {
     }
 
     async fn announce_force_stop(&self, prevent: &dispatcher::StopBlock) {
-        self.send_hook_annotation(&format!(
-            "\u{26a0} Hook `{}` stopped the agent: {}",
-            prevent.hook_name, prevent.reason
-        ))
-        .await;
+        self.send_hook_annotation(&format_force_stop_annotation(prevent))
+            .await;
     }
 
     async fn build_stop_payload(&self, stop_hook_active: bool) -> event::HookPayload {
@@ -343,21 +358,16 @@ impl SessionActor {
         additional_context: &[String],
     ) {
         for block in blocks {
-            self.send_hook_annotation(&format!(
-                "\u{21a9} Stop blocked by hook `{}`, continuing: {}",
-                block.hook_name, block.reason
-            ))
-            .await;
+            self.send_hook_annotation(&format_keep_working_block_annotation(block))
+                .await;
             xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::HookBlocked {
                 hook_name: block.hook_name.clone(),
             });
         }
         if blocks.is_empty() {
             for context in additional_context {
-                self.send_hook_annotation(&format!(
-                    "\u{21a9} Stop hook feedback, continuing: {context}"
-                ))
-                .await;
+                self.send_hook_annotation(&format_keep_working_context_annotation(context))
+                    .await;
             }
         }
     }
@@ -433,22 +443,65 @@ mod stop_gate_snapshot_tests {
 
     #[test]
     fn format_stop_feedback_lists_blocks_then_appends_context() {
-        let block = |reason: &str| dispatcher::StopBlock {
-            hook_name: "h".into(),
-            reason: reason.into(),
-        };
-        assert_eq!(
-            format_stop_feedback(&[block("first"), block("second")], &[]),
-            "Stop hook feedback:\n- first\n- second\n"
+        let mut projected = dispatcher::StopDispatchResult::default();
+        projected.absorb(
+            "h1",
+            dispatcher::StopSignals {
+                block_reason: Some("first".into()),
+                ..Default::default()
+            },
+        );
+        projected.absorb(
+            "h2",
+            dispatcher::StopSignals {
+                block_reason: Some("second".into()),
+                additional_context: Some("note".into()),
+                ..Default::default()
+            },
         );
         assert_eq!(
-            format_stop_feedback(&[block("fix tests")], &["note".to_string()]),
-            "Stop hook feedback:\n- fix tests\n\nnote"
+            format_stop_feedback(&projected.blocks, &projected.additional_context),
+            "Stop hook feedback:\n- stop blocked by hook (reason provided)\n- stop blocked by hook (reason provided)\n\nhook provided additional context (content omitted)"
         );
-        assert_eq!(
-            format_stop_feedback(&[], &["only context".to_string()]),
-            "only context"
+    }
+
+    #[test]
+    fn stop_feedback_and_annotations_omit_provider_text_and_significant_fragments() {
+        const SECRET: &str = "GB002STOPSECRETabcdefgh87654321";
+        let mut projected = dispatcher::StopDispatchResult::default();
+        projected.absorb(
+            "blocker",
+            dispatcher::StopSignals {
+                block_reason: Some(SECRET.into()),
+                additional_context: Some(SECRET.into()),
+                ..Default::default()
+            },
         );
+        projected.absorb(
+            "stopper",
+            dispatcher::StopSignals {
+                stop_reason: Some(SECRET.into()),
+                ..Default::default()
+            },
+        );
+
+        let prevent = projected.prevent_continuation.as_ref().unwrap();
+        let rendered = [
+            format_stop_feedback(&projected.blocks, &projected.additional_context),
+            format_keep_working_block_annotation(&projected.blocks[0]),
+            format_keep_working_context_annotation(&projected.additional_context[0]),
+            format_force_stop_annotation(prevent),
+            format!("{projected:?}"),
+        ]
+        .join("\n");
+        assert!(!rendered.contains(SECRET));
+        for fragment in SECRET.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(fragment).unwrap();
+            assert!(
+                !rendered.contains(fragment),
+                "stop feedback/annotation leaked credential fragment: {fragment}"
+            );
+        }
     }
 
     #[test]

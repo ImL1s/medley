@@ -47,12 +47,21 @@ impl<B> MakeSpan<B> for MakeClientSpan {
         if !crate::dispatcher_active() {
             return Span::none();
         }
+        let uri_scheme = match request.uri().scheme_str() {
+            Some("http") => "http",
+            Some("https") => "https",
+            Some(_) => "other",
+            None => "none",
+        };
+        let uri_authority_present = request.uri().authority().is_some();
+        let uri_query_present = request.uri().query().is_some();
         tracing::info_span!(
             "grpc_request",
             otel.kind = "client",
             method = %request.method(),
-            uri = %request.uri(),
-            version = ?request.version(),
+            uri_scheme,
+            uri_authority_present,
+            uri_query_present,
         )
     }
 }
@@ -120,10 +129,18 @@ impl Injector for MetadataInjector<'_> {
                     self.0.insert(key, value);
                 }
 
-                Err(error) => warn!(value, error = format!("{error:#}"), "parse metadata value"),
+                Err(_) => warn!(
+                    metadata_value_present = !value.is_empty(),
+                    failure_kind = "invalid_metadata_value",
+                    "parse metadata value"
+                ),
             },
 
-            Err(error) => warn!(key, error = format!("{error:#}"), "parse metadata key"),
+            Err(_) => warn!(
+                metadata_key_present = !key.is_empty(),
+                failure_kind = "invalid_metadata_key",
+                "parse metadata key"
+            ),
         }
     }
 }
@@ -134,8 +151,12 @@ impl Extractor for HeaderExtractor<'_> {
     fn get(&self, key: &str) -> Option<&str> {
         self.0.get(key).and_then(|v| {
             let s = v.to_str();
-            if let Err(ref error) = s {
-                warn!(%error, ?v, "cannot convert header value to ASCII")
+            if s.is_err() {
+                warn!(
+                    header_value_present = !v.as_bytes().is_empty(),
+                    failure_kind = "non_ascii_header_value",
+                    "cannot convert header value to ASCII"
+                )
             };
             s.ok()
         })
@@ -152,12 +173,53 @@ mod tests {
     use crate::testing::{OtelTestEnv, otel_span_id_hex, otel_trace_id_hex, parse_traceparent};
     use http_body_util::Empty;
     use std::convert::Infallible;
+    use std::io::Write;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tower_http::classify::GrpcFailureClass;
     use tracing::Instrument;
+    use tracing_subscriber::fmt::MakeWriter;
 
     type EmptyBody = Empty<bytes::Bytes>;
+    const SECRET: &str = "baggage-secret-sentinel-58190427";
+
+    fn assert_secret_absent(text: &str) {
+        assert!(!text.contains(SECRET), "full secret leaked: {text}");
+        for window in SECRET.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).unwrap();
+            assert!(!text.contains(window), "secret window leaked: {window}");
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct CapturedGuard(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedGuard {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedWriter {
+        type Writer = CapturedGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedGuard(Arc::clone(&self.0))
+        }
+    }
+
+    impl CapturedWriter {
+        fn rendered(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
 
     #[derive(Clone)]
     struct CaptureService {
@@ -384,5 +446,60 @@ mod tests {
             .find(|s| s.name == "grpc_request")
             .expect("grpc_request");
         assert_eq!(grpc.span_kind, opentelemetry::trace::SpanKind::Client);
+    }
+
+    #[test]
+    fn make_client_span_otel_attributes_exclude_uri_secrets() {
+        let env = OtelTestEnv::install();
+        {
+            let req = Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "https://observer:{SECRET}@service.invalid/Method?baggage={SECRET}"
+                ))
+                .body(())
+                .unwrap();
+            let span = MakeClientSpan.make_span(&req);
+            let _entered = span.enter();
+        }
+
+        let spans = env.finished_spans();
+        let grpc = spans
+            .iter()
+            .find(|span| span.name == "grpc_request")
+            .expect("grpc_request span");
+        let attributes = format!("{:?}", grpc.attributes);
+        assert_secret_absent(&attributes);
+        assert!(attributes.contains("uri_scheme"));
+        assert!(attributes.contains("uri_authority_present"));
+        assert!(attributes.contains("uri_query_present"));
+    }
+
+    #[test]
+    fn metadata_and_header_parse_warnings_exclude_raw_inputs() {
+        let capture = CapturedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut metadata = MetadataMap::new();
+            MetadataInjector(&mut metadata).set("baggage", format!("{SECRET}\n"));
+            MetadataInjector(&mut metadata).set(&format!("x-{SECRET}\n"), "value".into());
+
+            let mut headers = HeaderMap::new();
+            let mut bytes = SECRET.as_bytes().to_vec();
+            bytes.push(0xff);
+            headers.insert("baggage", http::HeaderValue::from_bytes(&bytes).unwrap());
+            let _ = HeaderExtractor(&headers).get("baggage");
+        });
+
+        let rendered = capture.rendered();
+        assert!(rendered.contains("invalid_metadata_value"));
+        assert!(rendered.contains("invalid_metadata_key"));
+        assert!(rendered.contains("non_ascii_header_value"));
+        assert_secret_absent(&rendered);
     }
 }

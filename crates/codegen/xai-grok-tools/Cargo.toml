@@ -77,6 +77,7 @@ url = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 wildmatch = { workspace = true }
 xai-grok-env = { workspace = true }
+xai-grok-auth = { path = "../xai-grok-auth" }
 serde_yaml = { workspace = true }
 shellexpand = "3.1"
 tempfile = { workspace = true }

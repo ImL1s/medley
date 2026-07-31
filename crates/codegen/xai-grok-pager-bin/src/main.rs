@@ -32,8 +32,8 @@ use std::num::NonZeroUsize;
 use tokio_util::sync::CancellationToken;
 use xai_grok_pager::app::{
     AgentCmd, Command, HeadlessArgs, LeaderMgmtArgs, LeaderMgmtCommand, LeaderMode,
-    LeaderTargetArgs, PagerArgs, join_early_prefetch, resolve_leader_mode, resolve_use_leader,
-    warn_leader_disabled_by_sandbox,
+    LeaderTargetArgs, PagerArgs, ServeArgs, join_early_prefetch, resolve_leader_mode,
+    resolve_use_leader, warn_leader_disabled_by_sandbox,
 };
 use xai_grok_pager::app::{WorkspaceMgmtArgs, WorkspaceMgmtCommand, WorkspaceStartArgs};
 use xai_grok_pager::client_identity::PAGER_CLIENT_VERSION;
@@ -88,25 +88,32 @@ fn resolve_agent_profile_path(path: &std::path::Path) -> std::path::PathBuf {
     }
 }
 /// Print startup information for the serve command.
-fn print_serve_startup_info(bind_addr: SocketAddr, secret: &str) {
+fn print_serve_startup_info(bind_addr: SocketAddr) {
     eprintln!();
     eprintln!("   Grok agent server starting...");
     eprintln!();
     eprintln!("   Address:  {}:{}", bind_addr.ip(), bind_addr.port());
-    eprintln!("   Secret:   {}", secret);
+    eprintln!("   Authentication: configured");
+    eprintln!("   WebSocket endpoint: ws://{bind_addr}/ws");
+    eprintln!("   Supply the server key through the client configuration; it is never printed.");
     eprintln!();
-    eprintln!(
-        "   WebSocket URL: ws://{}/ws?server-key={}",
-        bind_addr, secret
-    );
-    eprintln!();
+}
+const SERVE_SECRET_REQUIRED: &str =
+    "agent serve requires --secret or GROK_AGENT_SECRET; generated secrets are not printed";
+
+fn resolve_serve_secret(args: &ServeArgs) -> Result<String> {
+    args.secret
+        .as_ref()
+        .filter(|secret| !secret.is_empty())
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!(SERVE_SECRET_REQUIRED))
 }
 /// Entrypoint tag for `grok -p`; keys the quiet stderr default in `init_tracing_simple`.
 const HEADLESS_ENTRYPOINT: &str = "headless";
 /// Initialize simple tracing for non-TUI agent modes.
 fn init_tracing_simple(app_entrypoint: &'static str) {
     use tracing_subscriber::{EnvFilter, Layer as _, fmt, layer::SubscriberExt as _};
-    use xai_grok_telemetry::debug_log::RMCP_SSE_NOISE_TARGET;
+    use xai_grok_telemetry::debug_log::{RMCP_AUTH_SENSITIVE_TARGET, RMCP_SSE_NOISE_TARGET};
     let default_filter = if app_entrypoint == HEADLESS_ENTRYPOINT {
         "off"
     } else {
@@ -119,7 +126,12 @@ fn init_tracing_simple(app_entrypoint: &'static str) {
                 .expect("static rmcp directive must parse"),
         ),
         Err(_) => EnvFilter::new(default_filter),
-    };
+    }
+    .add_directive(
+        format!("{RMCP_AUTH_SENSITIVE_TARGET}=off")
+            .parse()
+            .expect("static rmcp auth directive must parse"),
+    );
     let fmt_layer = fmt::layer()
         .with_target(false)
         .with_ansi(true)
@@ -1381,12 +1393,12 @@ async fn run_agent_command(
         Some(AgentCmd::Serve(a)) => {
             let mut agent_config = agent_config.clone();
             apply_headless_args_to_config(&a.headless, &mut agent_config);
-            let secret = a.get_secret();
+            let secret = resolve_serve_secret(&a)?;
             let server_config = xai_grok_shell::agent::ServerConfig {
                 bind_addr: a.bind,
                 secret: secret.clone(),
             };
-            print_serve_startup_info(a.bind, &secret);
+            print_serve_startup_info(a.bind);
             xai_grok_shell::agent::run_agent_server(server_config, agent_config).await
         }
         Some(AgentCmd::Leader(a)) => {
@@ -2564,6 +2576,29 @@ mod tests {
             subcommand.command,
             Some(Command::Version { json: false })
         ));
+    }
+    #[test]
+    fn serve_requires_an_explicit_nonempty_secret() {
+        let mut args = ServeArgs {
+            bind: "127.0.0.1:2419".parse().unwrap(),
+            secret: None,
+            remote: None,
+            headless: HeadlessArgs::default(),
+        };
+        assert_eq!(
+            resolve_serve_secret(&args).unwrap_err().to_string(),
+            SERVE_SECRET_REQUIRED
+        );
+        args.secret = Some(String::new());
+        assert_eq!(
+            resolve_serve_secret(&args).unwrap_err().to_string(),
+            SERVE_SECRET_REQUIRED
+        );
+        args.secret = Some("client-configured-secret".into());
+        assert_eq!(
+            resolve_serve_secret(&args).unwrap(),
+            "client-configured-secret"
+        );
     }
     #[cfg(all(feature = "jemalloc", unix))]
     struct TempHeapDump(std::path::PathBuf);

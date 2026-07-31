@@ -518,15 +518,14 @@ fn clone_repo_to_path(
         cmd.arg("--branch").arg(r);
     }
     cmd.arg("--").arg(url).arg(target);
-    let output = cmd.output().map_err(|e| InstallError::InstallFailed {
-        detail: format!("failed to run git clone: {e}"),
+    let output = cmd.output().map_err(|_| InstallError::InstallFailed {
+        detail: "failed to start git clone".into(),
     })?;
     if !output.status.success() {
         let _ = remove_path_if_exists(target);
-        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(InstallError::InstallFailed {
             detail: format!(
-                "git clone failed (exit {}):\n{stderr}",
+                "git clone failed (exit {})",
                 output.status.code().unwrap_or(-1)
             ),
         });
@@ -575,14 +574,16 @@ fn run_git_in(cwd: &Path, args: &[&str]) -> Result<(), String> {
 fn run_git_in_capture(cwd: &Path, args: &[&str]) -> Result<std::process::Output, String> {
     let mut cmd = xai_tty_utils::git_command();
     cmd.args(args).current_dir(cwd);
-    let output = cmd
-        .output()
-        .map_err(|e| format!("failed to run git {}: {e}", args.first().unwrap_or(&"")))?;
+    let output = cmd.output().map_err(|_| {
+        format!(
+            "failed to start git {}",
+            args.first().unwrap_or(&"operation")
+        )
+    })?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
-            "git {} failed (exit {}):\n{stderr}",
-            args.first().unwrap_or(&""),
+            "git {} failed (exit {})",
+            args.first().unwrap_or(&"operation"),
             output.status.code().unwrap_or(-1)
         ));
     }
@@ -593,6 +594,7 @@ fn read_head_commit(repo_path: &Path) -> Option<String> {
     run_git_in_capture(repo_path, &["rev-parse", "HEAD"])
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|sha| git_install::is_full_commit_sha(sha))
 }
 
 struct StagedPlugin {
@@ -730,6 +732,20 @@ mod tests {
     static TEST_HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    fn assert_sentinel_absent(rendered: &str, sentinel: &str) {
+        assert!(
+            !rendered.contains(sentinel),
+            "full sentinel leaked: {rendered}"
+        );
+        for window in sentinel.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).unwrap();
+            assert!(
+                !rendered.contains(window),
+                "sentinel window {window:?} leaked: {rendered}"
+            );
+        }
+    }
+
     #[test]
     fn transactional_sha_git_args_terminate_options_before_operands() {
         assert_eq!(
@@ -760,6 +776,17 @@ mod tests {
             ));
             assert!(!target.exists());
         }
+    }
+
+    #[test]
+    fn credentialed_remote_url_is_rejected_without_echoing_secret() {
+        let sentinel = "TOKEN-0123456789abcdef";
+        let url = format!("https://user:{sentinel}@host.example/repo.git?auth={sentinel}#frag");
+        let target_root = tempfile::tempdir().unwrap();
+        let err = clone_repo_to_path(&url, None, None, &target_root.path().join("staging"))
+            .unwrap_err()
+            .to_string();
+        assert_sentinel_absent(&err, sentinel);
     }
 
     #[test]

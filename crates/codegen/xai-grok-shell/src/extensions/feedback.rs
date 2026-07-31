@@ -24,6 +24,19 @@ use crate::upload::gcs::WithAuth as _;
 use xai_file_utils::gcs::upload_bytes;
 use xai_grok_telemetry::id::agent_id;
 
+fn feedback_failure_response(
+    _error: &anyhow::Error,
+    action: &'static str,
+    client_message: &'static str,
+) -> acp::Error {
+    tracing::warn!(
+        error_class = "feedback_request_failed",
+        action,
+        "feedback request failed"
+    );
+    acp::Error::internal_error().data(client_message)
+}
+
 #[tracing::instrument(skip_all, fields(method = %args.method))]
 pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     match args.method.as_ref() {
@@ -75,7 +88,7 @@ async fn handle_btw(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         Ok(answer) => super::to_ext_response(Ok(serde_json::json!({
             "answer": answer,
         }))),
-        Err(e) => Err(acp::Error::internal_error().data(e)),
+        Err(_) => Err(acp::Error::internal_error().data("side question failed")),
     }
 }
 
@@ -243,10 +256,12 @@ async fn handle_feedback(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult 
                 crate::session::feedback_manager::SubmitOutcome::LocalOnly => {
                     tracing::warn!("feedback saved locally only (no proxy client)");
                 }
-                crate::session::feedback_manager::SubmitOutcome::Failed(e) => {
-                    tracing::error!(error = %e, "feedback submission to proxy failed");
-                    return Err(acp::Error::internal_error()
-                        .data(format!("Feedback submission failed: {e}")));
+                crate::session::feedback_manager::SubmitOutcome::Failed(error) => {
+                    return Err(feedback_failure_response(
+                        error,
+                        "submit",
+                        "Feedback submission failed",
+                    ));
                 }
             }
 
@@ -310,13 +325,11 @@ async fn handle_feedback(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult 
             let client = agent
                 .feedback_client()
                 .ok_or_else(|| acp::Error::internal_error().data("No credentials for feedback"))?;
-            let feedback_base_url = agent.cfg.borrow().endpoints.resolve_feedback_base_url();
             match client.dismiss_request(&request_id).await {
                 Ok(response) => {
                     tracing::info!(
                         request_id = %response.request_id,
                         status = %response.status,
-                        feedback_url = %feedback_base_url,
                         "Feedback request dismissed"
                     );
                     let value = serde_json::to_value(&response)
@@ -325,16 +338,11 @@ async fn handle_feedback(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult 
                         .expect("to work");
                     Ok(acp::ExtResponse::new(value))
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        request_id = %request_id,
-                        feedback_url = %feedback_base_url,
-                        "Failed to dismiss feedback request"
-                    );
-                    Err(acp::Error::internal_error()
-                        .data(format!("Failed to dismiss feedback request: {e}")))
-                }
+                Err(error) => Err(feedback_failure_response(
+                    &error,
+                    "dismiss",
+                    "Failed to dismiss feedback request",
+                )),
             }
         }
         _ => Err(acp::Error::method_not_found()),
@@ -378,8 +386,9 @@ async fn handle_review(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
                 .build_gcs_config(format!("{}/comments", request.session_id))
                 .await
             {
-                let json_bytes = serde_json::to_vec_pretty(&record)
-                    .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+                let json_bytes = serde_json::to_vec_pretty(&record).map_err(|_| {
+                    acp::Error::internal_error().data("Failed to encode review comment")
+                })?;
                 let gcs_path = format!(
                     "{}/{}.json",
                     gcs_config.gcs_prefix.as_deref().unwrap_or("comments"),
@@ -396,11 +405,14 @@ async fn handle_review(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
                     )
                     .await
                     {
-                        Ok(gcs_url) => {
-                            tracing::info!(gcs_url = %gcs_url, "Comment uploaded to GCS");
+                        Ok(_) => {
+                            tracing::info!("Comment uploaded to GCS");
                         }
-                        Err(e) => {
-                            tracing::warn!(error = %e, gcs_path, "Failed to upload comment to GCS");
+                        Err(_) => {
+                            tracing::warn!(
+                                error_class = "review_comment_upload_failed",
+                                "Failed to upload comment to GCS"
+                            );
                         }
                     }
                 });
@@ -437,8 +449,9 @@ async fn handle_review(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
                 .build_gcs_config(format!("{}/comments", request.session_id))
                 .await
             {
-                let json_bytes = serde_json::to_vec_pretty(&record)
-                    .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+                let json_bytes = serde_json::to_vec_pretty(&record).map_err(|_| {
+                    acp::Error::internal_error().data("Failed to encode review comment deletion")
+                })?;
                 let event_id = uuid::Uuid::now_v7().to_string();
                 let gcs_path = format!(
                     "{}/{}.json",
@@ -456,11 +469,14 @@ async fn handle_review(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
                     )
                     .await
                     {
-                        Ok(gcs_url) => {
-                            tracing::info!(gcs_url = %gcs_url, "Comment delete event uploaded to GCS");
+                        Ok(_) => {
+                            tracing::info!("Comment delete event uploaded to GCS");
                         }
-                        Err(e) => {
-                            tracing::warn!(error = %e, gcs_path, "Failed to upload comment delete event to GCS");
+                        Err(_) => {
+                            tracing::warn!(
+                                error_class = "review_comment_delete_upload_failed",
+                                "Failed to upload comment delete event to GCS"
+                            );
                         }
                     }
                 });
@@ -476,5 +492,82 @@ async fn handle_review(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
             Ok(acp::ExtResponse::new(value))
         }
         _ => Err(acp::Error::method_not_found()),
+    }
+}
+
+#[cfg(test)]
+mod credential_safety_tests {
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<std::sync::Mutex<Vec<String>>>);
+
+    struct EventVisitor<'a>(&'a mut String);
+
+    impl tracing::field::Visit for EventVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            let _ = write!(self.0, "{}={value:?} ", field.name());
+        }
+    }
+
+    impl tracing::Subscriber for LogCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut rendered = String::new();
+            event.record(&mut EventVisitor(&mut rendered));
+            self.0.lock().expect("log capture lock").push(rendered);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    fn assert_sentinel_absent(rendered: &str, sentinel: &str) {
+        assert!(
+            !rendered.contains(sentinel),
+            "leaked full sentinel: {rendered}"
+        );
+        for window in sentinel.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).expect("ASCII sentinel window");
+            assert!(
+                !rendered.contains(window),
+                "leaked sentinel window {window:?}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_feedback_error_is_absent_from_tracing_and_acp() {
+        let sentinel = "cred_SENTINEL_0123456789abcdef";
+        let raw_error = anyhow::anyhow!(
+            "request failed for http://{sentinel}:password@example.test/path?token={sentinel}"
+        );
+        let capture = LogCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+
+        let acp_error =
+            feedback_failure_response(&raw_error, "submit", "Feedback submission failed");
+        let logs = capture.0.lock().expect("log capture lock").join("\n");
+        let rendered = format!(
+            "{acp_error:?} {}",
+            serde_json::to_string(&acp_error).unwrap()
+        );
+
+        assert!(logs.contains("error_class=\"feedback_request_failed\""));
+        assert_sentinel_absent(&logs, sentinel);
+        assert_sentinel_absent(&rendered, sentinel);
     }
 }

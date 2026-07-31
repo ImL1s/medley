@@ -128,6 +128,29 @@ async fn fetch_npm_tag_propagates_npm_failure() {
 
 #[tokio::test]
 #[serial]
+async fn fetch_npm_tag_omits_registry_credentials_and_subprocess_stderr() {
+    let sentinel = "cred_SENTINEL_0123456789abcdef";
+    let g = FakeBinGuard::install_npm();
+    g.set_exit_code(1);
+    g.set_stderr(&format!("registry rejected Bearer {sentinel}"));
+
+    let registry = format!("https://user:{sentinel}@registry.test/?token={sentinel}");
+    let err = fetch_npm_tag_for_test("latest", Some(&registry))
+        .await
+        .unwrap_err();
+    let rendered = format!("{err:#}");
+    assert!(!rendered.contains(sentinel));
+    for window in sentinel.as_bytes().windows(8) {
+        let fragment = std::str::from_utf8(window).unwrap();
+        assert!(
+            !rendered.contains(fragment),
+            "credential fragment {fragment:?} leaked: {rendered}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
 async fn fetch_npm_tag_invalid_json_returns_err() {
     let g = FakeBinGuard::install_npm();
     g.set_stdout("not valid json {");

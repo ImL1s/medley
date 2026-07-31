@@ -132,6 +132,13 @@ pub enum SamplingError {
 }
 
 impl SamplingError {
+    /// Preserve reqwest's typed classification while removing its attached
+    /// request URL. URLs can contain API keys, signed-query credentials, or
+    /// other secrets and reqwest includes them in `Display`/`Debug` by default.
+    pub fn http(value: reqwest::Error) -> Self {
+        Self::Http(value.without_url())
+    }
+
     /// Rebuild a `Serialization` error from a rendered message for non-`Clone`
     /// contexts; it must stay `Serialization` so it remains non-retryable.
     pub fn serialization_message(msg: impl fmt::Display) -> Self {
@@ -293,7 +300,7 @@ impl SamplingError {
 
 impl From<reqwest::Error> for SamplingError {
     fn from(value: reqwest::Error) -> Self {
-        Self::Http(value)
+        Self::http(value)
     }
 }
 
@@ -315,6 +322,8 @@ struct ErrorBody {
     message: Option<String>,
     #[serde(rename = "type")]
     kind: Option<String>,
+    #[serde(default)]
+    code: Option<String>,
 }
 
 /// Flat error from the Grok proxy/gateway: `{"code": "...", "error": "..."}`.
@@ -325,27 +334,125 @@ struct FlatErrorResponse {
     code: Option<String>,
 }
 
-/// Extract `(error_type, message)` from either error format.
-fn try_parse_error(data: &str) -> Option<(String, String)> {
+#[derive(Debug)]
+struct ParsedProviderError {
+    kind: Option<String>,
+    code: Option<String>,
+    message: String,
+}
+
+/// Parse a provider error envelope for in-process classification only.
+///
+/// Every field is provider-controlled and may echo request credentials. Callers
+/// must convert it to [`SafeProviderError`] before logging, returning, or
+/// attaching it to an error.
+fn try_parse_error(data: &str) -> Option<ParsedProviderError> {
     if let Ok(resp) = serde_json::from_str::<ErrorResponse>(data) {
-        return Some((
-            resp.error.kind.unwrap_or_else(|| "unknown".to_string()),
-            resp.error
-                .message
-                .unwrap_or_else(|| "unknown error".to_string()),
-        ));
+        return Some(ParsedProviderError {
+            kind: resp.error.kind,
+            code: resp.error.code,
+            message: resp.error.message.unwrap_or_default(),
+        });
     }
     if let Ok(flat) = serde_json::from_str::<FlatErrorResponse>(data) {
-        return Some((
-            flat.code.unwrap_or_else(|| "server_error".to_string()),
-            flat.error,
-        ));
+        return Some(ParsedProviderError {
+            kind: None,
+            code: flat.code,
+            message: flat.error,
+        });
     }
     None
 }
 
-/// Max chars of a structured (JSON) error message shown to users.
-pub const MAX_USER_ERROR_BODY_CHARS: usize = 280;
+const FREE_USAGE_EXHAUSTED_CODE: &str = "subscription:free-usage-exhausted";
+const SAFE_CONTEXT_LENGTH_MESSAGE: &str = "The prompt is too long for this model.";
+const SAFE_ENCRYPTED_CONTENT_MESSAGE: &str = "encrypted_content from another model family";
+const SAFE_IMAGE_PROCESSING_MESSAGE: &str = "Could not process image";
+const SAFE_CREDIT_BLOCK_MESSAGE: &str = "provider credit balance exhausted";
+const SAFE_STREAM_ERROR_MESSAGE: &str = "upstream stream error";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderErrorClass {
+    FreeUsageExhausted,
+    ContextLength,
+    EncryptedContent,
+    ImageProcessing,
+    CreditBlock,
+    Generic,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SafeProviderError {
+    error_type: &'static str,
+    message: &'static str,
+    class: ProviderErrorClass,
+}
+
+fn allowlisted_error_type(value: &str) -> Option<&'static str> {
+    match value {
+        "authentication_error" => Some("authentication_error"),
+        "context_length_exceeded" => Some("context_length_exceeded"),
+        "invalid_request_error" => Some("invalid_request_error"),
+        "overloaded_error" => Some("overloaded_error"),
+        "rate_limit_error" => Some("rate_limit_error"),
+        "server_error" => Some("server_error"),
+        FREE_USAGE_EXHAUSTED_CODE => Some(FREE_USAGE_EXHAUSTED_CODE),
+        _ => None,
+    }
+}
+
+fn classify_provider_error(parsed: &ParsedProviderError) -> SafeProviderError {
+    let typed_value = parsed.code.as_deref().or(parsed.kind.as_deref());
+
+    if typed_value == Some(FREE_USAGE_EXHAUSTED_CODE) {
+        return SafeProviderError {
+            error_type: FREE_USAGE_EXHAUSTED_CODE,
+            message: FREE_USAGE_EXHAUSTED_CODE,
+            class: ProviderErrorClass::FreeUsageExhausted,
+        };
+    }
+    if typed_value == Some("context_length_exceeded") || is_context_length_error(&parsed.message) {
+        return SafeProviderError {
+            error_type: "context_length_exceeded",
+            message: SAFE_CONTEXT_LENGTH_MESSAGE,
+            class: ProviderErrorClass::ContextLength,
+        };
+    }
+    if parsed.message.contains("encrypted_content") {
+        return SafeProviderError {
+            error_type: "invalid_request_error",
+            message: SAFE_ENCRYPTED_CONTENT_MESSAGE,
+            class: ProviderErrorClass::EncryptedContent,
+        };
+    }
+    if parsed.message.contains("Could not process image") {
+        return SafeProviderError {
+            error_type: "invalid_request_error",
+            message: SAFE_IMAGE_PROCESSING_MESSAGE,
+            class: ProviderErrorClass::ImageProcessing,
+        };
+    }
+    if is_credit_block_message(&parsed.message) {
+        return SafeProviderError {
+            error_type: "credit_balance_exhausted",
+            message: SAFE_CREDIT_BLOCK_MESSAGE,
+            class: ProviderErrorClass::CreditBlock,
+        };
+    }
+
+    SafeProviderError {
+        error_type: typed_value
+            .and_then(allowlisted_error_type)
+            .unwrap_or("unknown"),
+        message: SAFE_STREAM_ERROR_MESSAGE,
+        class: ProviderErrorClass::Generic,
+    }
+}
+
+fn safe_structured_error(bytes: &[u8]) -> Option<SafeProviderError> {
+    let parsed = std::str::from_utf8(bytes).ok().and_then(try_parse_error)?;
+    Some(classify_provider_error(&parsed))
+}
 
 /// Short status-based copy when the body is not a structured JSON error.
 ///
@@ -370,53 +477,55 @@ pub fn status_user_message(status: StatusCode) -> String {
     }
 }
 
-fn truncate_user_error(s: &str) -> String {
-    let s = s.trim();
-    let count = s.chars().count();
-    if count <= MAX_USER_ERROR_BODY_CHARS {
-        return s.to_owned();
-    }
-    let mut out: String = s.chars().take(MAX_USER_ERROR_BODY_CHARS).collect();
-    out.push('\u{2026}');
-    out
-}
-
-/// Format a known JSON error envelope; `None` if the body is not structured.
-fn structured_error_message(bytes: &[u8]) -> Option<String> {
-    let (error_type, message) = std::str::from_utf8(bytes).ok().and_then(try_parse_error)?;
-    let msg = if error_type == "unknown" || error_type == "server_error" {
-        message
-    } else {
-        format!("{error_type}: {message}")
-    };
-    Some(truncate_user_error(&msg))
-}
-
 /// Parse an API error body into a short string.
 ///
-/// Only structured JSON error envelopes are surfaced. Non-JSON bodies
-/// (HTML edge pages, plain text dumps) return a fixed placeholder — never
-/// the raw bytes. Prefer [`user_facing_api_error_message`] when a status
-/// code is available.
+/// Provider-controlled messages and types are never surfaced because they may
+/// echo all or part of a credential. Only fixed semantic markers derived from
+/// narrowly classified conditions are returned.
 pub fn parse_error_bytes(bytes: &[u8]) -> String {
-    structured_error_message(bytes).unwrap_or_else(|| "upstream error".into())
+    safe_structured_error(bytes)
+        .map(|safe| match safe.class {
+            ProviderErrorClass::FreeUsageExhausted
+            | ProviderErrorClass::ContextLength
+            | ProviderErrorClass::EncryptedContent
+            | ProviderErrorClass::ImageProcessing
+            | ProviderErrorClass::CreditBlock => safe.message,
+            ProviderErrorClass::Generic => "upstream error",
+        })
+        .unwrap_or("upstream error")
+        .to_string()
 }
 
 /// User-facing message for a failed API call.
 ///
-/// Structured JSON error envelopes keep their message. Everything else
-/// (including Cloudflare HTML) maps to a status-based string — no body
-/// content matching.
+/// Provider-controlled response text is never returned. A few recovery-critical
+/// conditions map to fixed semantic markers; everything else (including
+/// structured JSON and Cloudflare HTML) maps only from the HTTP status.
 pub fn user_facing_api_error_message(status: StatusCode, bytes: &[u8]) -> String {
-    structured_error_message(bytes).unwrap_or_else(|| status_user_message(status))
+    match safe_structured_error(bytes) {
+        Some(safe)
+            if matches!(
+                safe.class,
+                ProviderErrorClass::FreeUsageExhausted
+                    | ProviderErrorClass::ContextLength
+                    | ProviderErrorClass::EncryptedContent
+                    | ProviderErrorClass::ImageProcessing
+                    | ProviderErrorClass::CreditBlock
+            ) =>
+        {
+            safe.message.to_string()
+        }
+        _ => status_user_message(status),
+    }
 }
 
 pub fn try_parse_stream_error(data: &str) -> Option<SamplingError> {
-    let (error_type, message) = try_parse_error(data)?;
-    tracing::warn!(error_type, message, "Server-side stream error");
+    let parsed = try_parse_error(data)?;
+    let safe = classify_provider_error(&parsed);
+    tracing::warn!(error_type = safe.error_type, "Server-side stream error");
     Some(SamplingError::StreamError {
-        error_type,
-        message,
+        error_type: safe.error_type.to_string(),
+        message: safe.message.to_string(),
     })
 }
 
@@ -430,6 +539,18 @@ pub fn is_context_length_error(message: &str) -> bool {
         || m.contains("maximum prompt length")
         || m.contains("maximum context length")
         || m.contains("context_length_exceeded")
+}
+
+/// Classify provider-controlled credit exhaustion text before it is replaced
+/// by a fixed marker. Only the boolean result crosses the trust boundary.
+fn is_credit_block_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("spending-limit")
+        || message.contains("spending limit")
+        || message.contains("out of credits")
+        || message.contains("run out of credits")
+        || message.contains("usage balance exhausted")
+        || message.contains("usage limit reached")
 }
 
 /// Decide whether a [`reqwest::Error`] is worth retrying.
@@ -555,11 +676,8 @@ mod tests {
                 error_type,
                 message,
             } => {
-                assert_eq!(error_type, "The service is currently unavailable");
-                assert_eq!(
-                    message,
-                    "Service temporarily unavailable. The model did not respond to this request."
-                );
+                assert_eq!(error_type, "unknown");
+                assert_eq!(message, SAFE_STREAM_ERROR_MESSAGE);
             }
             other => panic!("expected StreamError, got {other:?}"),
         }
@@ -579,10 +697,7 @@ mod tests {
         let bytes =
             br#"{"code":"The service is currently unavailable","error":"Service temporarily unavailable."}"#;
         let msg = parse_error_bytes(bytes);
-        assert_eq!(
-            msg,
-            "The service is currently unavailable: Service temporarily unavailable."
-        );
+        assert_eq!(msg, "upstream error");
     }
 
     #[test]
@@ -616,19 +731,68 @@ mod tests {
     }
 
     #[test]
-    fn user_facing_keeps_json_error_message() {
+    fn user_facing_discards_provider_controlled_json_message() {
         let bytes = br#"{"error":{"message":"rate limit exceeded","type":"rate_limit_error"}}"#;
         let msg = user_facing_api_error_message(StatusCode::TOO_MANY_REQUESTS, bytes);
-        assert_eq!(msg, "rate_limit_error: rate limit exceeded");
+        assert_eq!(msg, status_user_message(StatusCode::TOO_MANY_REQUESTS));
     }
 
     #[test]
-    fn structured_error_message_is_length_capped() {
-        let long_msg = "x".repeat(MAX_USER_ERROR_BODY_CHARS + 50);
-        let bytes = format!(r#"{{"error":{{"message":"{long_msg}","type":"server_error"}}}}"#);
-        let msg = parse_error_bytes(bytes.as_bytes());
-        assert!(msg.chars().count() <= MAX_USER_ERROR_BODY_CHARS + 1);
-        assert!(msg.ends_with('\u{2026}'));
+    fn full_and_partial_credential_echoes_never_escape_provider_errors() {
+        const SENTINEL: &str = "GB002-secret-bearer-0123456789abcdef";
+        let bytes = format!(
+            r#"{{"error":{{"message":"Authorization: Bearer {SENTINEL}","type":"{SENTINEL}"}}}}"#
+        );
+
+        let parsed = parse_error_bytes(bytes.as_bytes());
+        let user = user_facing_api_error_message(StatusCode::UNAUTHORIZED, bytes.as_bytes());
+        let stream = try_parse_stream_error(&bytes)
+            .expect("structured envelope")
+            .to_string();
+
+        for output in [&parsed, &user, &stream] {
+            assert!(
+                !output.contains(SENTINEL),
+                "full credential escaped: {output}"
+            );
+            for window in SENTINEL.as_bytes().windows(8) {
+                let fragment = std::str::from_utf8(window).expect("ASCII sentinel");
+                assert!(
+                    !output.contains(fragment),
+                    "credential fragment {fragment:?} escaped: {output}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_critical_classes_use_fixed_safe_markers() {
+        let free_usage = br#"{"code":"subscription:free-usage-exhausted","error":"secret echo"}"#;
+        assert_eq!(parse_error_bytes(free_usage), FREE_USAGE_EXHAUSTED_CODE);
+        assert_eq!(
+            user_facing_api_error_message(StatusCode::TOO_MANY_REQUESTS, free_usage),
+            FREE_USAGE_EXHAUSTED_CODE
+        );
+
+        let context = br#"{"error":{"message":"maximum context length exceeded by secret payload","type":"invalid_request_error"}}"#;
+        assert_eq!(parse_error_bytes(context), SAFE_CONTEXT_LENGTH_MESSAGE);
+
+        let encrypted = br#"{"error":{"message":"Could not decrypt encrypted_content: secret payload","type":"invalid_request_error"}}"#;
+        assert_eq!(parse_error_bytes(encrypted), SAFE_ENCRYPTED_CONTENT_MESSAGE);
+
+        let image = br#"{"error":{"message":"Could not process image secret payload","type":"invalid_request_error"}}"#;
+        assert_eq!(parse_error_bytes(image), SAFE_IMAGE_PROCESSING_MESSAGE);
+
+        const CREDIT_SENTINEL: &str = "GB002-credit-body-secret-0123456789abcdef";
+        let credit = format!(
+            r#"{{"error":{{"message":"usage balance exhausted {CREDIT_SENTINEL}","type":"billing_error"}}}}"#
+        );
+        let rendered = parse_error_bytes(credit.as_bytes());
+        assert_eq!(rendered, SAFE_CREDIT_BLOCK_MESSAGE);
+        assert!(!rendered.contains(CREDIT_SENTINEL));
+        for window in CREDIT_SENTINEL.as_bytes().windows(8) {
+            assert!(!rendered.contains(std::str::from_utf8(window).unwrap()));
+        }
     }
 
     /// Regression test: 403 Forbidden must NOT be classified as an auth

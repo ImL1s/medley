@@ -6,47 +6,36 @@ use std::sync::Arc;
 use reqwest::{Request, Response, StatusCode, header::HeaderValue};
 use reqwest_middleware::{Error, Middleware, Next};
 
-use crate::AuthCredentialProvider;
+use crate::{AuthCredentialProvider, CredentialComparison};
 
-/// Tail fragment (last [`STAMPED_BEARER_SUFFIX_LEN`] chars) of the bearer
-/// this middleware stamped, recorded into the request's `http::Extensions`
-/// at stamp time. 401-attribution sites read it back via
-/// [`execute_with_stamp`] instead of re-resolving at record time, which
-/// races with the refresh the 401 itself triggers. Absent ⇒ nothing was
-/// stamped; a retry overwrites it, so it always describes the attempt whose
-/// response the caller holds. Only the tail crosses this boundary — JWT
-/// heads are a shared constant, and the tail is safe for sinks to log.
-#[derive(Clone, Debug)]
-pub struct StampedBearerSuffix(pub String);
-
-/// Length of [`StampedBearerSuffix`]. Matches `token_suffix` in
-/// xai-grok-shell (the comparison site for 401 attribution).
-const STAMPED_BEARER_SUFFIX_LEN: usize = 12;
-
-/// Last [`STAMPED_BEARER_SUFFIX_LEN`] chars, counting chars from the end
-/// so a non-ASCII credential cannot cause a byte-boundary panic.
-fn bearer_suffix(token: &str) -> &str {
-    match token
-        .char_indices()
-        .rev()
-        .nth(STAMPED_BEARER_SUFFIX_LEN - 1)
-    {
-        Some((i, _)) => &token[i..],
-        None => token,
+/// Remove request URLs (which may contain userinfo or signed-query credentials)
+/// before an HTTP error crosses the auth middleware boundary. Middleware errors
+/// are opaque, so fail closed to a fixed category instead of retaining their
+/// provider-controlled source chain.
+fn sanitize_middleware_error(error: Error) -> Error {
+    match error {
+        Error::Reqwest(error) => Error::Reqwest(error.without_url()),
+        Error::Middleware(_) => Error::middleware(std::io::Error::other("HTTP middleware failure")),
     }
 }
 
-/// Execute `req` on a middleware-wrapped client and return the response
-/// together with the [`StampedBearerSuffix`] the auth middleware recorded
-/// (if it stamped anything). The one blessed way for 401-attribution
-/// call sites to learn what was actually sent on the wire.
-pub async fn execute_with_stamp(
+/// Execute a request and return the response with the secret-free comparison
+/// produced for the final request attempt.
+pub async fn execute_with_auth_relation(
     client: &reqwest_middleware::ClientWithMiddleware,
     req: Request,
-) -> reqwest_middleware::Result<(Response, Option<StampedBearerSuffix>)> {
+) -> reqwest_middleware::Result<(Response, CredentialComparison)> {
     let mut ext = http::Extensions::new();
-    let resp = client.execute_with_extensions(req, &mut ext).await?;
-    Ok((resp, ext.get::<StampedBearerSuffix>().cloned()))
+    let resp = client
+        .execute_with_extensions(req, &mut ext)
+        .await
+        .map_err(sanitize_middleware_error)?;
+    let comparison = ext.get::<CredentialComparison>().copied().ok_or_else(|| {
+        Error::middleware(std::io::Error::other(
+            "credential relation unavailable: auth middleware did not record final attempt",
+        ))
+    })?;
+    Ok((resp, comparison))
 }
 
 pub struct AuthRetryMiddleware {
@@ -63,15 +52,30 @@ impl AuthRetryMiddleware {
     }
 }
 
-fn apply_auth_header(req: &mut Request, token: &str, extensions: &mut http::Extensions) {
+fn apply_auth_headers(
+    req: &mut Request,
+    token: Option<&str>,
+    needs_token_auth_header: bool,
+) -> bool {
+    let token_auth_header = reqwest::header::HeaderName::from_static("x-xai-token-auth");
+    req.headers_mut().remove(reqwest::header::AUTHORIZATION);
+    req.headers_mut().remove(&token_auth_header);
+    let Some(token) = token else {
+        return false;
+    };
     match HeaderValue::from_str(&format!("Bearer {token}")) {
         Ok(val) => {
             req.headers_mut()
                 .insert(reqwest::header::AUTHORIZATION, val);
-            extensions.insert(StampedBearerSuffix(bearer_suffix(token).to_string()));
+            if needs_token_auth_header {
+                req.headers_mut()
+                    .insert(token_auth_header, HeaderValue::from_static("xai-grok-cli"));
+            }
+            true
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "auth retry: failed to build Authorization header");
+        Err(_) => {
+            tracing::warn!("auth retry: failed to build Authorization header");
+            false
         }
     }
 }
@@ -84,12 +88,23 @@ impl Middleware for AuthRetryMiddleware {
         extensions: &mut http::Extensions,
         next: Next<'_>,
     ) -> Result<Response, Error> {
-        if let Some(ref token) = self.credentials.snapshot().token {
-            apply_auth_header(&mut req, token, extensions);
-        }
+        let token = self.credentials.snapshot().token;
+        let applied = apply_auth_headers(
+            &mut req,
+            token.as_deref(),
+            self.credentials.needs_token_auth_header(),
+        );
 
         let backup = req.try_clone();
-        let resp = next.clone().run(req, extensions).await?;
+        let resp = next
+            .clone()
+            .run(req, extensions)
+            .await
+            .map_err(sanitize_middleware_error)?;
+        extensions.insert(
+            self.credentials
+                .compare_sent_credential(applied.then_some(token.as_deref()).flatten()),
+        );
 
         if resp.status() != StatusCode::UNAUTHORIZED || self.max_retries == 0 {
             return Ok(resp);
@@ -103,14 +118,27 @@ impl Middleware for AuthRetryMiddleware {
             if !self.credentials.refresh_after_unauthorized().await {
                 break;
             }
-            let Some(ref token) = self.credentials.snapshot().token else {
-                break;
-            };
             let Some(mut retry) = backup.try_clone() else {
                 break;
             };
-            apply_auth_header(&mut retry, token, extensions);
-            last_resp = next.clone().run(retry, extensions).await?;
+            let token = self.credentials.snapshot().token;
+            if token.is_none() {
+                break;
+            }
+            let applied = apply_auth_headers(
+                &mut retry,
+                token.as_deref(),
+                self.credentials.needs_token_auth_header(),
+            );
+            last_resp = next
+                .clone()
+                .run(retry, extensions)
+                .await
+                .map_err(sanitize_middleware_error)?;
+            extensions.insert(
+                self.credentials
+                    .compare_sent_credential(applied.then_some(token.as_deref()).flatten()),
+            );
             if last_resp.status() != StatusCode::UNAUTHORIZED {
                 return Ok(last_resp);
             }
@@ -126,6 +154,20 @@ mod tests {
     use crate::{CredentialSnapshot, HttpAuth};
     use reqwest_middleware::ClientBuilder;
     use std::sync::Mutex;
+
+    fn assert_sentinel_absent(rendered: &str, sentinel: &str) {
+        assert!(
+            !rendered.contains(sentinel),
+            "leaked full sentinel: {rendered}"
+        );
+        for window in sentinel.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).expect("ASCII sentinel window");
+            assert!(
+                !rendered.contains(window),
+                "leaked sentinel window {window:?}: {rendered}"
+            );
+        }
+    }
 
     struct MockProvider {
         token: Mutex<Option<String>>,
@@ -175,6 +217,63 @@ mod tests {
         ClientBuilder::new(reqwest::Client::new())
             .with(AuthRetryMiddleware::new(provider, max_retries))
             .build()
+    }
+
+    #[tokio::test]
+    async fn execute_without_auth_middleware_fails_closed() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/")
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+        let client = ClientBuilder::new(reqwest::Client::new()).build();
+        let request = reqwest::Client::new()
+            .get(server.url())
+            .build()
+            .expect("request");
+
+        let error = execute_with_auth_relation(&client, request)
+            .await
+            .expect_err("missing auth middleware must not fabricate not_sent");
+        assert!(
+            error
+                .to_string()
+                .contains("credential relation unavailable")
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn transport_errors_strip_userinfo_and_query_credentials() {
+        let sentinel = "cred_SENTINEL_0123456789abcdef";
+        let url = format!("http://{sentinel}:password@127.0.0.1:1/path?token={sentinel}");
+        let provider = Arc::new(MockProvider::new(None, false));
+        let client = build_client(provider, 0).await;
+
+        let error = client
+            .get(url)
+            .send()
+            .await
+            .expect_err("dead loopback port must fail");
+        let rendered = format!("{error} {error:?}");
+
+        assert_sentinel_absent(&rendered, sentinel);
+    }
+
+    #[test]
+    fn opaque_middleware_errors_drop_provider_controlled_sources() {
+        let sentinel = "cred_SENTINEL_0123456789abcdef";
+        let raw = Error::middleware(std::io::Error::other(format!(
+            "failed for http://{sentinel}:password@example.test/path?token={sentinel}"
+        )));
+
+        let error = sanitize_middleware_error(raw);
+        let rendered = format!("{error} {error:?}");
+
+        assert!(rendered.contains("HTTP middleware failure"));
+        assert_sentinel_absent(&rendered, sentinel);
     }
 
     #[tokio::test]
@@ -235,6 +334,44 @@ mod tests {
         }
     }
 
+    /// Models a refresh operation that succeeds as an operation but leaves no
+    /// wire-valid credential (for example, a revoked login removed from disk).
+    struct CredentialRemovedByRefresh {
+        token: Mutex<Option<String>>,
+        refresh_count: Mutex<u32>,
+    }
+
+    impl CredentialRemovedByRefresh {
+        fn new(token: &str) -> Self {
+            Self {
+                token: Mutex::new(Some(token.to_owned())),
+                refresh_count: Mutex::new(0),
+            }
+        }
+    }
+
+    impl HttpAuth for CredentialRemovedByRefresh {
+        fn apply(&self, b: reqwest::RequestBuilder, _: &str) -> reqwest::RequestBuilder {
+            b
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AuthCredentialProvider for CredentialRemovedByRefresh {
+        fn snapshot(&self) -> CredentialSnapshot {
+            CredentialSnapshot {
+                token: self.token.lock().unwrap().clone(),
+                ..Default::default()
+            }
+        }
+
+        async fn refresh_after_unauthorized(&self) -> bool {
+            *self.refresh_count.lock().unwrap() += 1;
+            *self.token.lock().unwrap() = None;
+            true
+        }
+    }
+
     #[tokio::test]
     async fn test_e2e_stale_token_refreshed_and_retried() {
         let mut server = mockito::Server::new_async().await;
@@ -276,6 +413,7 @@ mod tests {
         let mock = server
             .mock("GET", "/api")
             .match_header("authorization", "Bearer my-token")
+            .match_header("x-xai-token-auth", "xai-grok-cli")
             .with_status(200)
             .create_async()
             .await;
@@ -293,11 +431,35 @@ mod tests {
         mock.assert_async().await;
     }
 
+    #[tokio::test]
+    async fn refresh_that_removes_token_keeps_original_response_and_comparison() {
+        let mut server = mockito::Server::new_async().await;
+        let unauthorized = server
+            .mock("GET", "/api")
+            .match_header("authorization", "Bearer stale-token")
+            .match_header("x-xai-token-auth", "xai-grok-cli")
+            .with_status(401)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let provider = Arc::new(CredentialRemovedByRefresh::new("stale-token"));
+        let client = build_client(provider.clone(), 1).await;
+        let request = client.get(format!("{}/api", server.url())).build().unwrap();
+
+        let (response, comparison) = execute_with_auth_relation(&client, request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(comparison, CredentialComparison::same_as_current());
+        assert_eq!(*provider.refresh_count.lock().unwrap(), 1);
+        unauthorized.assert_async().await;
+    }
+
     /// The stamp must describe the bearer of the attempt whose response
     /// the caller holds: after a 401 → refresh → retry, that is the
     /// FRESH token, not the stale one stamped on the first attempt.
     #[tokio::test]
-    async fn execute_with_stamp_reports_last_stamped_bearer() {
+    async fn execute_with_auth_relation_reports_final_attempt() {
         let mut server = mockito::Server::new_async().await;
         let m401 = server
             .mock("GET", "/api")
@@ -319,10 +481,9 @@ mod tests {
         let client = build_client(p, 1).await;
 
         let req = client.get(format!("{}/api", server.url())).build().unwrap();
-        let (resp, stamp) = execute_with_stamp(&client, req).await.unwrap();
+        let (resp, comparison) = execute_with_auth_relation(&client, req).await.unwrap();
         assert_eq!(resp.status(), 200);
-        // ≤ 12 chars → the suffix is the whole token.
-        assert_eq!(stamp.expect("bearer was stamped").0, "fresh-token");
+        assert_eq!(comparison, CredentialComparison::same_as_current());
         m401.assert_async().await;
         m200.assert_async().await;
     }
@@ -330,7 +491,7 @@ mod tests {
     /// No credential ⇒ no stamp: attribution must see "nothing was sent",
     /// not an empty string or a stale record.
     #[tokio::test]
-    async fn execute_with_stamp_is_none_when_nothing_stamped() {
+    async fn execute_with_auth_relation_reports_not_sent() {
         let mut server = mockito::Server::new_async().await;
         let m = server
             .mock("GET", "/")
@@ -342,22 +503,28 @@ mod tests {
         let client = build_client(p, 0).await;
 
         let req = client.get(server.url()).build().unwrap();
-        let (resp, stamp) = execute_with_stamp(&client, req).await.unwrap();
+        let (resp, comparison) = execute_with_auth_relation(&client, req).await.unwrap();
         assert_eq!(resp.status(), 401);
-        assert!(stamp.is_none(), "no credential must mean no stamp");
+        assert_eq!(comparison, CredentialComparison::not_sent(false));
         m.assert_async().await;
     }
 
     #[test]
-    fn bearer_suffix_takes_char_safe_tail() {
-        assert_eq!(
-            bearer_suffix("eyJ0eXAiOiJh.head.tail-distinct"),
-            "ail-distinct"
+    fn invalid_header_is_not_sent_and_removes_existing_authorization() {
+        let mut req = reqwest::Request::new(
+            reqwest::Method::GET,
+            "https://example.test".parse().unwrap(),
         );
-        assert_eq!(bearer_suffix("short"), "short");
-        assert_eq!(bearer_suffix(""), "");
-        // 13 multi-byte chars: a byte-index cut would land mid-char.
-        assert_eq!(bearer_suffix("ééééééééééééé"), "éééééééééééé");
+        req.headers_mut().insert(
+            reqwest::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer stale"),
+        );
+        assert!(!apply_auth_headers(
+            &mut req,
+            Some("invalid\ncredential"),
+            true
+        ));
+        assert!(req.headers().get(reqwest::header::AUTHORIZATION).is_none());
     }
 
     #[tokio::test]

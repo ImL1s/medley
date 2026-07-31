@@ -30,14 +30,14 @@ pub enum WebFetchError {
     #[error("DNS resolution returned no addresses for {0}")]
     DnsEmpty(String),
 
-    #[error("failed to build HTTP client: {0}")]
-    ClientBuildError(reqwest::Error),
+    #[error("failed to build HTTP client")]
+    ClientBuildError,
 
-    #[error("HTTP request failed: {0}")]
-    HttpRequest(#[from] reqwest::Error),
+    #[error("HTTP request failed")]
+    HttpRequest(#[source] reqwest::Error),
 
-    #[error("invalid redirect URL: {0}")]
-    InvalidRedirect(String),
+    #[error("invalid redirect URL")]
+    InvalidRedirect,
 
     #[error("too many redirects (max {max})")]
     TooManyRedirects { max: usize },
@@ -45,17 +45,23 @@ pub enum WebFetchError {
     #[error("response body exceeds maximum size of {max} bytes")]
     ResponseTooLarge { max: usize },
 
-    #[error("invalid proxy configuration: {0}")]
-    ProxyConfigError(String),
+    #[error("invalid proxy configuration")]
+    ProxyConfigError,
 
     #[error("failed to save downloaded file: {0}")]
     IoError(#[from] std::io::Error),
 
-    #[error("unsupported content type {content_type} from {url}")]
-    UnsupportedContentType { content_type: String, url: String },
+    #[error("unsupported content type {content_type}")]
+    UnsupportedContentType { content_type: String },
 
-    #[error("content body does not match claimed content type {content_type} from {url}")]
-    ContentTypeMismatch { content_type: String, url: String },
+    #[error("content body does not match claimed content type {content_type}")]
+    ContentTypeMismatch { content_type: String },
+}
+
+impl From<reqwest::Error> for WebFetchError {
+    fn from(error: reqwest::Error) -> Self {
+        Self::HttpRequest(error.without_url())
+    }
 }
 
 /// Extra recovery guidance appended to an [`WebFetchError::SsrfBlocked`] message.
@@ -90,6 +96,34 @@ fn gh_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_no_secret_fragments(output: &str, secret: &str) {
+        assert!(!output.contains(secret), "full credential leaked: {output}");
+        for window in secret.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).expect("ASCII test sentinel");
+            assert!(
+                !output.contains(fragment),
+                "credential fragment {fragment:?} leaked: {output}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn request_error_omits_url_credentials() {
+        let sentinel = "cred_SENTINEL_0123456789abcdef";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let url = format!("http://user:{sentinel}@127.0.0.1:{port}/resource?token={sentinel}");
+        let raw = reqwest::Client::new()
+            .get(url)
+            .send()
+            .await
+            .expect_err("closed listener must reject request");
+        let error = WebFetchError::from(raw);
+        assert_no_secret_fragments(&error.to_string(), sentinel);
+        assert_no_secret_fragments(&format!("{error:?}"), sentinel);
+    }
 
     #[test]
     fn github_host_detection() {

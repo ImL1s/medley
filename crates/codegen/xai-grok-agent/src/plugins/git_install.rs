@@ -82,6 +82,10 @@ pub fn parse_install_source(input: &str, cwd: &Path) -> InstallSource {
             } else {
                 (main.to_string(), None)
             }
+        } else if http_url_has_userinfo(main) {
+            // Do not mistake credentials in the authority for an `@ref` suffix.
+            // Validation rejects userinfo before this value can reach git.
+            (main.to_string(), None)
         } else {
             // HTTPS URL: https://host/user/repo@ref
             match main.rsplit_once('@') {
@@ -145,7 +149,65 @@ fn validate_git_operand<'a>(value: &'a str, kind: &str) -> Result<&'a str, Strin
 
 /// Validate and trim a Git repository URL or path used as a CLI operand.
 pub fn validate_git_url(url: &str) -> Result<&str, String> {
-    validate_git_operand(url, "URL")
+    let url = validate_git_operand(url, "URL")?;
+    if url.contains("://") && url.contains(https_query_or_fragment_separator) {
+        return Err("git URL must not include a query or fragment".into());
+    }
+    if url_has_credentials(url) {
+        return Err("git URL must not include credentials".into());
+    }
+    Ok(url)
+}
+
+fn https_query_or_fragment_separator(ch: char) -> bool {
+    matches!(ch, '?' | '#')
+}
+
+fn http_url_has_userinfo(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("http") {
+        return false;
+    }
+    let authority = rest
+        .split_once(['/', '?', '#'])
+        .map_or(rest, |(authority, _)| authority);
+    authority.contains('@')
+}
+
+fn url_has_credentials(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    let authority = rest
+        .split_once(['/', '?', '#'])
+        .map_or(rest, |(authority, _)| authority);
+    let Some((userinfo, _)) = authority.rsplit_once('@') else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case("http")
+        || scheme.eq_ignore_ascii_case("https")
+        || userinfo.contains(':')
+}
+
+/// Return a diagnostic-safe representation of a configurable Git URL.
+/// Credentials, query strings, and fragments are never retained.
+pub fn redact_git_url(url: &str) -> String {
+    let url = url.trim();
+    let without_suffix = url.split_once(['?', '#']).map_or(url, |(base, _)| base);
+    let Some((scheme, rest)) = without_suffix.split_once("://") else {
+        return "<git-source>".into();
+    };
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if path.is_empty() {
+        format!("{scheme}://{authority}")
+    } else {
+        format!("{scheme}://{authority}/{path}")
+    }
 }
 
 /// Validate and trim a Git ref used as a CLI operand.
@@ -184,14 +246,10 @@ pub fn ensure_pinned(
     if sha.map(str::trim).is_some_and(is_full_commit_sha) {
         return Ok(());
     }
-    tracing::warn!(
-        plugin,
-        url,
-        "refusing unpinned remote plugin code (require_sha)"
-    );
+    tracing::warn!(plugin, "refusing unpinned remote plugin code (require_sha)");
     Err(InstallError::UnpinnedRemoteRefused {
         plugin: plugin.to_owned(),
-        url: url.to_owned(),
+        url: redact_git_url(url),
     })
 }
 
@@ -266,7 +324,14 @@ pub fn install_from_source_with_label(
 ) -> Result<InstallResult, InstallError> {
     let source = &normalize_install_source(source)?;
     if let InstallSource::Git { url, git_sha, .. } = source {
-        let label = plugin_label.unwrap_or(url.as_str());
+        let safe_label;
+        let label = match plugin_label {
+            Some(label) => label,
+            None => {
+                safe_label = redact_git_url(url);
+                &safe_label
+            }
+        };
         ensure_pinned(require_sha, git_sha.as_deref(), label, url)?;
     }
     let source_id = repo_source_id(source);
@@ -422,19 +487,18 @@ fn clone_repo(
 
     cmd.arg("--").arg(url).arg(target);
 
-    tracing::info!(url, target = %target.display(), "cloning plugin repo");
+    tracing::info!(target = %target.display(), "cloning plugin repo");
 
-    let output = cmd.output().map_err(|e| InstallError::InstallFailed {
-        detail: format!("failed to run git clone: {e}"),
+    let output = cmd.output().map_err(|_| InstallError::InstallFailed {
+        detail: "failed to start git clone".into(),
     })?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
         // Clean up partial clone
         let _ = std::fs::remove_dir_all(target);
         return Err(InstallError::InstallFailed {
             detail: format!(
-                "git clone failed (exit {}):\n{stderr}",
+                "git clone failed (exit {})",
                 output.status.code().unwrap_or(-1)
             ),
         });
@@ -447,7 +511,7 @@ fn clone_repo_at_sha(url: &str, sha: &str, target: &Path) -> Result<(), InstallE
     let url = validate_git_url(url).map_err(|detail| InstallError::InstallFailed { detail })?;
     let sha = validate_git_sha(sha).map_err(|detail| InstallError::InstallFailed { detail })?;
 
-    tracing::info!(url, sha, target = %target.display(), "cloning plugin repo at SHA");
+    tracing::info!(sha, target = %target.display(), "cloning plugin repo at SHA");
 
     std::fs::create_dir_all(target).map_err(|e| InstallError::Io {
         path: target.to_path_buf(),
@@ -490,14 +554,16 @@ fn run_git_in_capture(cwd: &Path, args: &[&str]) -> Result<std::process::Output,
     // Same auth/LFS/SSH suppression as marketplace cache clones.
     let mut cmd = xai_tty_utils::git_command();
     cmd.args(args).current_dir(cwd);
-    let output = cmd
-        .output()
-        .map_err(|e| format!("failed to run git {}: {e}", args.first().unwrap_or(&"")))?;
+    let output = cmd.output().map_err(|_| {
+        format!(
+            "failed to start git {}",
+            args.first().unwrap_or(&"operation")
+        )
+    })?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
-            "git {} failed (exit {}):\n{stderr}",
-            args.first().unwrap_or(&""),
+            "git {} failed (exit {})",
+            args.first().unwrap_or(&"operation"),
             output.status.code().unwrap_or(-1)
         ));
     }
@@ -509,6 +575,7 @@ fn read_head_commit(repo_path: &Path) -> Option<String> {
     run_git_in_capture(repo_path, &["rev-parse", "HEAD"])
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|sha| is_full_commit_sha(sha))
 }
 
 /// Remove a repo path (handles both symlinks and directories).
@@ -751,15 +818,14 @@ pub fn update_repo(
 
             let mut cmd = xai_tty_utils::git_command();
             cmd.args(["pull", "--ff-only"]).current_dir(repo_path);
-            let output = cmd.output().map_err(|e| InstallError::InstallFailed {
-                detail: format!("failed to run git pull: {e}"),
+            let output = cmd.output().map_err(|_| InstallError::InstallFailed {
+                detail: "failed to start git pull".into(),
             })?;
 
             if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
                 return Err(InstallError::InstallFailed {
                     detail: format!(
-                        "git pull failed (exit {}):\n{stderr}",
+                        "git pull failed (exit {})",
                         output.status.code().unwrap_or(-1)
                     ),
                 });
@@ -811,6 +877,20 @@ pub(super) fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_sentinel_absent(rendered: &str, sentinel: &str) {
+        assert!(
+            !rendered.contains(sentinel),
+            "full sentinel leaked: {rendered}"
+        );
+        for window in sentinel.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).unwrap();
+            assert!(
+                !rendered.contains(window),
+                "sentinel window {window:?} leaked: {rendered}"
+            );
+        }
+    }
     use std::process::Command;
 
     #[test]
@@ -1403,6 +1483,20 @@ mod tests {
             assert!(validate_git_url(bad).is_err(), "URL {bad:?} must fail");
             assert!(validate_git_ref(bad).is_err(), "ref {bad:?} must fail");
         }
+    }
+
+    #[test]
+    fn credentialed_git_url_is_rejected_without_echoing_secret() {
+        let sentinel = "TOKEN-0123456789abcdef";
+        let url =
+            format!("https://user:{sentinel}@host.example/repo.git?token={sentinel}#fragment");
+        let err = clone_operands(&url, None, None).unwrap_err().to_string();
+        assert_sentinel_absent(&err, sentinel);
+        assert!(err.contains("must not include"), "{err}");
+
+        let safe = redact_git_url(&url);
+        assert_eq!(safe, "https://host.example/repo.git");
+        assert_sentinel_absent(&safe, sentinel);
     }
 
     #[test]

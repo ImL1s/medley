@@ -20,6 +20,19 @@ pub enum OpenUrlResult {
     BrowserUnavailable,
 }
 
+fn diagnostic_url_scheme(url: &str) -> &'static str {
+    let Ok(parsed) = url::Url::parse(url.trim()) else {
+        return "invalid";
+    };
+    match parsed.scheme() {
+        "http" => "http",
+        "https" => "https",
+        "mailto" => "mailto",
+        "vscode" | "cursor" | "idea" | "zed" => "editor",
+        _ => "other",
+    }
+}
+
 /// Whether the environment looks capable of opening a GUI browser.
 ///
 /// Pure helper for tests. On Linux/BSD, requires a non-empty `DISPLAY` or
@@ -124,15 +137,12 @@ pub fn open_url(url: &str) -> bool {
     match command.spawn() {
         Ok(_) => true,
         Err(e) => {
-            // Redact URL to avoid leaking sensitive query params to logs.
-            let redacted = url::Url::parse(url)
-                .map(|mut u| {
-                    u.set_query(None);
-                    u.set_fragment(None);
-                    u.to_string()
-                })
-                .unwrap_or_else(|_| "<unparseable>".to_string());
-            tracing::warn!(url = %redacted, error = %e, "failed to open URL");
+            tracing::warn!(
+                url_configured = !url.trim().is_empty(),
+                url_scheme = diagnostic_url_scheme(url),
+                error_kind = ?e.kind(),
+                "failed to open URL"
+            );
             false
         }
     }
@@ -291,7 +301,11 @@ pub fn open_url_if_safe(url: &str, filter: SchemeFilter) -> bool {
 /// to show a manual-URL fallback on [`OpenUrlResult::BrowserUnavailable`].
 pub fn try_open_url(url: &str, filter: SchemeFilter) -> OpenUrlResult {
     if !is_safe_to_open(url, filter) {
-        tracing::debug!(url, "URL scheme not permitted");
+        tracing::debug!(
+            url_configured = !url.trim().is_empty(),
+            url_scheme = diagnostic_url_scheme(url),
+            "URL scheme not permitted"
+        );
         return OpenUrlResult::RejectedScheme;
     }
     if open_url(url) {
@@ -346,6 +360,20 @@ mod tests {
             "https://example.com/path?q=1",
             SchemeFilter::Standard
         ));
+    }
+
+    #[test]
+    fn diagnostic_url_scheme_omits_full_and_partial_credentials() {
+        const SENTINEL: &str = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+        let url = format!("https://user:{SENTINEL}@example.test/path?token={SENTINEL}");
+        let rendered = diagnostic_url_scheme(&url);
+
+        assert_eq!(rendered, "https");
+        assert!(!rendered.contains(SENTINEL));
+        for window in SENTINEL.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).unwrap();
+            assert!(!rendered.contains(fragment), "leaked fragment {fragment}");
+        }
     }
 
     #[test]

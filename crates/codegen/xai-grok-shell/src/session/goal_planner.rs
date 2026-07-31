@@ -456,8 +456,11 @@ pub(crate) async fn run_goal_planner(
     let spawn_id = uuid::Uuid::now_v7().to_string();
     let response = match spawner.spawn_planner(&spawn_id, prompt).await {
         Ok(text) => text,
-        Err(SpawnError::Transport(detail)) => {
-            tracing::warn!(error = %detail, "goal planner: transport error; failing closed");
+        Err(SpawnError::Transport(_)) => {
+            tracing::warn!(
+                error_class = "transport",
+                "goal planner: transport error; failing closed"
+            );
             return record_fail_closed(
                 GoalPlannerFailClosedReason::Transport,
                 inputs.attempt,
@@ -465,14 +468,14 @@ pub(crate) async fn run_goal_planner(
                 emit_event,
             );
         }
-        Err(SpawnError::Runtime { message, cancelled }) => {
+        Err(SpawnError::Runtime { cancelled, .. }) => {
             let reason = if cancelled {
                 GoalPlannerFailClosedReason::Aborted
             } else {
                 GoalPlannerFailClosedReason::Runtime
             };
             tracing::warn!(
-                error = %message,
+                error_class = "subagent_runtime",
                 cancelled,
                 "goal planner: subagent runtime error; failing closed",
             );
@@ -489,7 +492,7 @@ pub(crate) async fn run_goal_planner(
         tracing::info!(
             plan_file = %plan_file_str,
             terminal_token_ok = parse_terminal_response(&response),
-            response_snippet = %response.chars().take(120).collect::<String>(),
+            response_len = response.len(),
             "goal planner: plan file missing or empty; failing closed",
         );
         return record_fail_closed(

@@ -27,7 +27,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::bytes::Bytes;
 use tokio_util::io::ReaderStream;
 use xai_circuit_breaker::{BreakerConfig, BreakerOpen, CircuitBreaker, Outcome};
-use xai_grok_auth::AuthCredentialProvider;
+use xai_grok_auth::{AuthCredentialProvider, CredentialComparison, execute_with_auth_relation};
 
 use crate::circuit_breaker_observer::TracingObserver;
 
@@ -47,6 +47,26 @@ fn storage_breaker_config() -> BreakerConfig {
     BreakerConfig::client()
 }
 
+/// Closed set of storage operations that can emit credential-attribution
+/// diagnostics. Keeping this typed prevents request-derived strings from
+/// crossing the observability boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageOperation {
+    GetUploadLimits,
+    CheckExists,
+    BatchCheckExists,
+    BatchUpload,
+    BatchUploadJson,
+    DownloadBlob,
+    Upload,
+    UploadFile,
+    UploadStream,
+    MultipartInit,
+    MultipartComplete,
+    GetSignedUploadUrl,
+    UploadPart,
+}
+
 /// Hook invoked by [`StorageClient`] at every 401 response site so that
 /// the embedding application can record auth-attribution telemetry.
 ///
@@ -55,12 +75,10 @@ fn storage_breaker_config() -> BreakerConfig {
 /// a bridge implementation that wires into
 /// `crate::auth::attribution::record_consumer_401`.
 ///
-/// `sent_bearer_prefix` is the first-N characters of the bearer that was
-/// actually sent on the wire (extracted at the trait boundary so the full
-/// bearer never escapes `StorageClient`). `None` indicates no bearer was
-/// configured (the unauthenticated test/CI path).
+/// The comparison is tied to the middleware's final attempt and contains no
+/// credential bytes.
 pub trait Auth401AttributionCallback: Send + Sync + std::fmt::Debug {
-    fn record_401(&self, operation: &str, sent_bearer_prefix: Option<&str>);
+    fn record_401(&self, operation: StorageOperation, comparison: CredentialComparison);
 }
 
 // ============================================================================
@@ -220,13 +238,12 @@ impl ResponseCheck {
         let status = response.status();
         let status_code = status.as_u16();
         let retry_after = parse_retry_after(&response);
-        let error_body = response.text().await.unwrap_or_default();
 
         Self {
             is_retryable: is_retryable_status(status_code),
             retry_after,
             status_code,
-            message: format!("{}: HTTP {} - {}", operation, status, error_body),
+            message: format!("{operation}: HTTP {status}"),
         }
     }
 
@@ -247,20 +264,14 @@ impl ResponseCheck {
 }
 
 /// Log a network error and sleep for retry.
-async fn wait_for_network_retry(
-    retry_config: &RetryConfig,
-    operation: &str,
-    attempt: u32,
-    error: &(dyn std::fmt::Display + Send + Sync),
-) {
+async fn wait_for_network_retry(retry_config: &RetryConfig, operation: &str, attempt: u32) {
     let delay = retry_config.calculate_delay(attempt);
     tracing::warn!(
-        "{} request failed (attempt {}/{}), retrying in {:?}: {}",
+        "{} request failed (attempt {}/{}), retrying in {:?}: transport error",
         operation,
         attempt + 1,
         retry_config.max_retries,
-        delay,
-        error
+        delay
     );
     tokio::time::sleep(delay).await;
 }
@@ -367,7 +378,7 @@ impl StaticGrokAuth {
     /// Returns the bearer that `apply` will put on the wire (deployment_key
     /// first, else user_token). Used by callers that need to wire the same
     /// bearer into a `StaticAuthCredentialProvider` snapshot for attribution.
-    pub fn wire_bearer(&self) -> Option<String> {
+    pub fn effective_credential(&self) -> Option<String> {
         self.deployment_key
             .clone()
             .or_else(|| self.user_token.clone())
@@ -395,13 +406,441 @@ mod static_grok_auth_tests {
     /// Deployment key must win over the user token (incl. the empty one the
     /// deployment-key path supplies); falls back to the user token otherwise.
     #[test]
-    fn wire_bearer_prefers_deployment_key_then_falls_back_to_user_token() {
+    fn effective_credential_prefers_deployment_key_then_falls_back_to_user_token() {
         let mut deployment = StaticGrokAuth::new(Some(String::new()));
         deployment.deployment_key = Some("deploy-key".to_string());
-        assert_eq!(deployment.wire_bearer().as_deref(), Some("deploy-key"));
+        assert_eq!(
+            deployment.effective_credential().as_deref(),
+            Some("deploy-key")
+        );
 
         let oauth = StaticGrokAuth::new(Some("oauth-token".to_string()));
-        assert_eq!(oauth.wire_bearer().as_deref(), Some("oauth-token"));
+        assert_eq!(oauth.effective_credential().as_deref(), Some("oauth-token"));
+    }
+}
+
+#[cfg(test)]
+mod credential_relation_tests {
+    use super::*;
+    use axum::{Router, http::HeaderMap, response::IntoResponse, routing::get, routing::post};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::net::TcpListener;
+    use xai_grok_auth::{CredentialSnapshot, HttpAuth, SentCredentialRelation};
+
+    const OLD_CREDENTIAL: &str = "credential-old-final-attempt";
+    const NEW_CREDENTIAL: &str = "credential-new-current-snapshot";
+    const OBSERVABILITY_SENTINEL: &str = "GB002-storage-secret-0123456789abcdef";
+
+    #[derive(Debug)]
+    struct SequencedProvider {
+        snapshots: AtomicUsize,
+        refresh_succeeds: bool,
+    }
+
+    impl SequencedProvider {
+        fn new(refresh_succeeds: bool) -> Self {
+            Self {
+                snapshots: AtomicUsize::new(0),
+                refresh_succeeds,
+            }
+        }
+    }
+
+    impl HttpAuth for SequencedProvider {
+        fn apply(
+            &self,
+            builder: reqwest::RequestBuilder,
+            _base_url: &str,
+        ) -> reqwest::RequestBuilder {
+            builder
+        }
+    }
+
+    impl AuthCredentialProvider for SequencedProvider {
+        fn snapshot(&self) -> CredentialSnapshot {
+            let index = self.snapshots.fetch_add(1, Ordering::SeqCst);
+            CredentialSnapshot {
+                token: Some(if index == 0 {
+                    OLD_CREDENTIAL.to_owned()
+                } else {
+                    NEW_CREDENTIAL.to_owned()
+                }),
+                ..CredentialSnapshot::default()
+            }
+        }
+
+        fn refresh_after_unauthorized<'life0, 'async_trait>(
+            &'life0 self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move { self.refresh_succeeds })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct CapturingAttribution {
+        events: Mutex<Vec<(StorageOperation, CredentialComparison)>>,
+    }
+
+    impl Auth401AttributionCallback for CapturingAttribution {
+        fn record_401(&self, operation: StorageOperation, comparison: CredentialComparison) {
+            self.events.lock().unwrap().push((operation, comparison));
+        }
+    }
+
+    async fn start_server(router: Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (addr, handle)
+    }
+
+    fn bearer(headers: &HeaderMap) -> String {
+        headers
+            .get(reqwest::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    fn assert_no_secret_bytes(value: &str, secrets: &[&str]) {
+        for secret in secrets {
+            assert!(!value.contains(secret), "full secret leaked: {value}");
+            for window in secret.as_bytes().windows(8) {
+                let window = std::str::from_utf8(window).expect("ASCII sentinel");
+                assert!(
+                    !value.contains(window),
+                    "secret fragment {window:?} leaked: {value}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn final_401_relation_uses_final_wire_credential_and_post_response_snapshot() {
+        let wire_credentials = Arc::new(Mutex::new(Vec::new()));
+        let captured = wire_credentials.clone();
+        let router = Router::new().route(
+            "/v1/storage",
+            post(move |headers: HeaderMap| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(bearer(&headers));
+                    axum::http::StatusCode::UNAUTHORIZED.into_response()
+                }
+            }),
+        );
+        let (addr, _) = start_server(router).await;
+        let attribution = Arc::new(CapturingAttribution::default());
+        let client = StorageClient::with_provider(
+            &format!("http://{addr}/v1"),
+            reqwest::Client::new(),
+            Arc::new(SequencedProvider::new(true)),
+        )
+        .with_attribution(attribution.clone());
+
+        let err = client
+            .upload("path/file.txt", b"data", "text/plain")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<HttpUploadError>().unwrap().status_code,
+            401
+        );
+
+        assert_eq!(
+            *wire_credentials.lock().unwrap(),
+            vec![
+                format!("Bearer {OLD_CREDENTIAL}"),
+                format!("Bearer {NEW_CREDENTIAL}")
+            ]
+        );
+        let events = attribution.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, StorageOperation::Upload);
+        assert_eq!(events[0].1.relation, SentCredentialRelation::SameAsCurrent);
+    }
+
+    #[tokio::test]
+    async fn forbidden_relation_compares_sent_wire_credential_after_response() {
+        let wire_credential = Arc::new(Mutex::new(String::new()));
+        let captured = wire_credential.clone();
+        let router = Router::new().route(
+            "/v1/storage",
+            post(move |headers: HeaderMap| {
+                let captured = captured.clone();
+                async move {
+                    *captured.lock().unwrap() = bearer(&headers);
+                    axum::http::StatusCode::FORBIDDEN.into_response()
+                }
+            }),
+        );
+        let (addr, _) = start_server(router).await;
+        let attribution = Arc::new(CapturingAttribution::default());
+        let client = StorageClient::with_provider(
+            &format!("http://{addr}/v1"),
+            reqwest::Client::new(),
+            Arc::new(SequencedProvider::new(false)),
+        )
+        .with_attribution(attribution.clone());
+
+        let err = client
+            .upload("path/file.txt", b"data", "text/plain")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<HttpUploadError>().unwrap().status_code,
+            403
+        );
+        assert_eq!(
+            *wire_credential.lock().unwrap(),
+            format!("Bearer {OLD_CREDENTIAL}")
+        );
+
+        let events = attribution.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, StorageOperation::Upload);
+        assert_eq!(
+            events[0].1.relation,
+            SentCredentialRelation::DifferentFromCurrent
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_init_rotation_reports_final_wire_relation() {
+        let wire_credentials = Arc::new(Mutex::new(Vec::new()));
+        let captured = wire_credentials.clone();
+        let router = Router::new().route(
+            "/v1/storage/multipart/init",
+            post(move |headers: HeaderMap| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(bearer(&headers));
+                    axum::http::StatusCode::UNAUTHORIZED.into_response()
+                }
+            }),
+        );
+        let (addr, _) = start_server(router).await;
+        let attribution = Arc::new(CapturingAttribution::default());
+        let client = StorageClient::with_provider(
+            &format!("http://{addr}/v1"),
+            reqwest::Client::new(),
+            Arc::new(SequencedProvider::new(true)),
+        )
+        .with_attribution(attribution.clone());
+
+        let err = client.multipart_init(4).await.unwrap_err();
+
+        assert_eq!(
+            err.downcast_ref::<HttpUploadError>().unwrap().status_code,
+            401
+        );
+        assert_eq!(
+            *wire_credentials.lock().unwrap(),
+            vec![
+                format!("Bearer {OLD_CREDENTIAL}"),
+                format!("Bearer {NEW_CREDENTIAL}")
+            ]
+        );
+        let events = attribution.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, StorageOperation::MultipartInit);
+        assert_eq!(events[0].1.relation, SentCredentialRelation::SameAsCurrent);
+    }
+
+    #[tokio::test]
+    async fn proxy_multipart_part_reports_post_response_relation() {
+        let wire_credentials = Arc::new(Mutex::new(Vec::new()));
+        let captured = wire_credentials.clone();
+        let router = Router::new().route(
+            "/v1/storage/multipart/upload-id/1",
+            post(move |headers: HeaderMap| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(bearer(&headers));
+                    axum::http::StatusCode::FORBIDDEN.into_response()
+                }
+            }),
+        );
+        let (addr, _) = start_server(router).await;
+        let client = crate::with_auth_retry(
+            reqwest::Client::new(),
+            Arc::new(SequencedProvider::new(false)),
+        );
+        let attribution = CapturingAttribution::default();
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), b"part").unwrap();
+        let file = Arc::new(StdFile::open(temp.path()).unwrap());
+
+        let err = upload_part_streaming(
+            &client,
+            &format!("http://{addr}/v1"),
+            "upload-id",
+            1,
+            file,
+            0,
+            4,
+            &RetryConfig::new().with_max_retries(0),
+            Some(&attribution),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            err.downcast_ref::<HttpUploadError>().unwrap().status_code,
+            403
+        );
+        assert_eq!(
+            *wire_credentials.lock().unwrap(),
+            vec![format!("Bearer {OLD_CREDENTIAL}")]
+        );
+        let events = attribution.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, StorageOperation::UploadPart);
+        assert_eq!(
+            events[0].1.relation,
+            SentCredentialRelation::DifferentFromCurrent
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_limits_401_uses_final_attempt_relation_without_secret_observability() {
+        let wire_credentials = Arc::new(Mutex::new(Vec::new()));
+        let captured = wire_credentials.clone();
+        let router = Router::new().route(
+            "/v1/storage/limits",
+            get(move |headers: HeaderMap| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(bearer(&headers));
+                    (axum::http::StatusCode::UNAUTHORIZED, OBSERVABILITY_SENTINEL).into_response()
+                }
+            }),
+        );
+        let (addr, _) = start_server(router).await;
+        let attribution = Arc::new(CapturingAttribution::default());
+        let client = StorageClient::with_provider(
+            &format!("http://{addr}/v1"),
+            reqwest::Client::new(),
+            Arc::new(SequencedProvider::new(true)),
+        )
+        .with_attribution(attribution.clone());
+
+        let err = client.get_upload_limits().await.unwrap_err();
+        assert_no_secret_bytes(
+            &format!("{err}\n{err:?}"),
+            &[OLD_CREDENTIAL, NEW_CREDENTIAL, OBSERVABILITY_SENTINEL],
+        );
+        assert_eq!(
+            *wire_credentials.lock().unwrap(),
+            vec![
+                format!("Bearer {OLD_CREDENTIAL}"),
+                format!("Bearer {NEW_CREDENTIAL}")
+            ]
+        );
+        let events = attribution.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, StorageOperation::GetUploadLimits);
+        assert_eq!(events[0].1.relation, SentCredentialRelation::SameAsCurrent);
+    }
+
+    #[tokio::test]
+    async fn download_proxy_403_attributes_without_echoing_header_or_body_secrets() {
+        let wire_credentials = Arc::new(Mutex::new(Vec::new()));
+        let captured = wire_credentials.clone();
+        let router = Router::new().route(
+            "/v1/storage/download",
+            get(move |headers: HeaderMap| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(bearer(&headers));
+                    (axum::http::StatusCode::FORBIDDEN, OBSERVABILITY_SENTINEL).into_response()
+                }
+            }),
+        );
+        let (addr, _) = start_server(router).await;
+        let attribution = Arc::new(CapturingAttribution::default());
+        let client = StorageClient::with_provider(
+            &format!("http://{addr}/v1"),
+            reqwest::Client::new(),
+            Arc::new(SequencedProvider::new(false)),
+        )
+        .with_attribution(attribution.clone());
+
+        let err = client
+            .download_blob(
+                OBSERVABILITY_SENTINEL,
+                &tempfile::tempdir().unwrap().path().join("out"),
+            )
+            .await
+            .unwrap_err();
+        assert_no_secret_bytes(
+            &format!("{err}\n{err:?}"),
+            &[OLD_CREDENTIAL, NEW_CREDENTIAL, OBSERVABILITY_SENTINEL],
+        );
+        assert_eq!(
+            *wire_credentials.lock().unwrap(),
+            vec![format!("Bearer {OLD_CREDENTIAL}")]
+        );
+        let events = attribution.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, StorageOperation::DownloadBlob);
+        assert_eq!(
+            events[0].1.relation,
+            SentCredentialRelation::DifferentFromCurrent
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_url_proxy_401_attributes_without_echoing_header_or_body_secrets() {
+        let wire_credentials = Arc::new(Mutex::new(Vec::new()));
+        let captured = wire_credentials.clone();
+        let router = Router::new().route(
+            "/v1/storage/signed-upload-url",
+            post(move |headers: HeaderMap| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(bearer(&headers));
+                    (axum::http::StatusCode::UNAUTHORIZED, OBSERVABILITY_SENTINEL).into_response()
+                }
+            }),
+        );
+        let (addr, _) = start_server(router).await;
+        let attribution = Arc::new(CapturingAttribution::default());
+        let client = StorageClient::with_provider(
+            &format!("http://{addr}/v1"),
+            reqwest::Client::new(),
+            Arc::new(SequencedProvider::new(true)),
+        )
+        .with_attribution(attribution.clone());
+
+        let err = client
+            .get_signed_upload_url(OBSERVABILITY_SENTINEL, OBSERVABILITY_SENTINEL)
+            .await
+            .unwrap_err();
+        assert_no_secret_bytes(
+            &format!("{err}\n{err:?}"),
+            &[OLD_CREDENTIAL, NEW_CREDENTIAL, OBSERVABILITY_SENTINEL],
+        );
+        assert_eq!(
+            *wire_credentials.lock().unwrap(),
+            vec![
+                format!("Bearer {OLD_CREDENTIAL}"),
+                format!("Bearer {NEW_CREDENTIAL}")
+            ]
+        );
+        let events = attribution.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, StorageOperation::GetSignedUploadUrl);
+        assert_eq!(events[0].1.relation, SentCredentialRelation::SameAsCurrent);
     }
 }
 
@@ -428,10 +867,6 @@ pub struct StorageClient {
     /// can record auth-attribution telemetry. Shell installs a bridge here;
     /// bins/tests typically leave it `None`.
     attribution: Option<Arc<dyn Auth401AttributionCallback>>,
-    /// Credential provider used to snapshot the bearer prefix at 401 sites
-    /// for attribution telemetry.
-    credentials: Arc<dyn AuthCredentialProvider>,
-
     /// Client identity forwarded to cli-chat-proxy (for logging + metrics).
     /// Set via `with_client_identity` / `with_client_mode`.
     client_version: Option<String>,
@@ -457,7 +892,7 @@ impl StorageClient {
     /// * `user_token` - User's grok.com auth token
     pub fn new(proxy_base_url: &str, user_token: &str) -> Self {
         let creds = StaticGrokAuth::new(Some(user_token.to_owned()));
-        let bearer = creds.wire_bearer();
+        let bearer = creds.effective_credential();
         let provider = Arc::new(xai_grok_auth::StaticAuthCredentialProvider::new(
             Box::new(creds),
             bearer,
@@ -482,7 +917,6 @@ impl StorageClient {
             base_url: proxy_base_url.to_owned(),
             retry_config: RetryConfig::default(),
             attribution: None,
-            credentials,
             client_version: None,
             client_identifier: None,
             client_mode: None,
@@ -599,41 +1033,49 @@ impl StorageClient {
         let url = format!("{}/storage/limits", self.base_url);
         let request = self.add_common_headers(self.http_client.get(&url));
 
-        let response = request.send().await.context("Fetching upload limits")?;
+        let (response, comparison) = self
+            .execute_request(request)
+            .await
+            .map_err(|_| anyhow::anyhow!("Fetching upload limits: transport error"))?;
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            self.fire_401_attribution(StorageOperation::GetUploadLimits, comparison);
+        }
         if !response.status().is_success() {
             let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            anyhow::bail!(
-                "Upload limits fetch failed with status {}: {}",
-                status,
-                body
-            );
+            anyhow::bail!("Upload limits fetch failed with status {status}");
         }
 
-        response
-            .json()
-            .await
-            .context("Failed to parse upload limits response")
+        response.json().await.map_err(|e| {
+            anyhow::Error::new(e.without_url()).context("Failed to parse upload limits response")
+        })
     }
 
     /// Fire the attribution callback if installed.
     ///
-    /// `operation` is the consumer-side op *suffix* (e.g. `"check_exists"`,
-    /// `"batch_check_exists"`, `"upload"`, `"upload_file"`). The
-    /// `StorageClientAttributionBridge` in the shell prepends
-    /// `"StorageClient."` to produce the final consumer string in analytics
-    /// events (e.g. `"StorageClient.check_exists"`).
+    /// `operation` is a closed consumer-side operation. The shell bridge maps
+    /// it to the corresponding finite credential-diagnostic consumer.
     ///
-    /// Reads the bearer from the credential provider's current snapshot
-    /// (not the exact wire bearer — a refresh may have occurred between
-    /// send and 401 response, though in practice this is rare).
-    fn fire_401_attribution(&self, operation: &str) {
+    /// The middleware records the credential actually applied to the final
+    /// request attempt, then compares it with a fresh provider snapshot after
+    /// that response arrives. Only the secret-free relation crosses this seam.
+    async fn execute_request(
+        &self,
+        request: reqwest_middleware::RequestBuilder,
+    ) -> Result<(reqwest::Response, CredentialComparison)> {
+        let request = request
+            .build()
+            .map_err(|_| anyhow::anyhow!("Authenticated proxy request build failed"))?;
+        execute_with_auth_relation(&self.http_client, request)
+            .await
+            .map_err(|_| anyhow::anyhow!("Authenticated proxy request failed: transport error"))
+    }
+
+    fn fire_401_attribution(&self, operation: StorageOperation, comparison: CredentialComparison) {
         if let Some(ref cb) = self.attribution {
-            let bearer_prefix = self.credentials.snapshot().token;
-            cb.record_401(operation, bearer_prefix.as_deref());
+            cb.record_401(operation, comparison);
         }
     }
 
@@ -648,8 +1090,8 @@ impl StorageClient {
             .add_common_headers(self.http_client.get(&url))
             .header("X-Storage-Path", path);
 
-        match request.send().await {
-            Ok(resp) if resp.status().is_success() => {
+        match self.execute_request(request).await {
+            Ok((resp, _)) if resp.status().is_success() => {
                 // Defer the Success record until after the body
                 // parses — a 2xx with an unparseable body returns
                 // `ProbeFailed` to the caller, so counting it as
@@ -660,30 +1102,32 @@ impl StorageClient {
                         self.breaker.record(Outcome::Success);
                         ExistsResult::Found(payload)
                     }
-                    Err(e) => {
-                        tracing::warn!("Failed to parse check_exists response: {e}");
+                    Err(_) => {
+                        tracing::warn!("Failed to parse check_exists response");
                         ExistsResult::ProbeFailed
                     }
                 }
             }
-            Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
-                self.fire_401_attribution("check_exists");
+            Ok((resp, comparison)) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                self.fire_401_attribution(StorageOperation::CheckExists, comparison);
                 self.breaker.record(Outcome::Failure);
                 ExistsResult::Unauthorized
             }
-            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => ExistsResult::NotFound,
+            Ok((resp, _)) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                ExistsResult::NotFound
+            }
             // 403 fires attribution but, per the breaker contract, does
             // NOT count toward the 401 counter.
-            Ok(resp) if resp.status() == reqwest::StatusCode::FORBIDDEN => {
-                self.fire_401_attribution("check_exists");
+            Ok((resp, comparison)) if resp.status() == reqwest::StatusCode::FORBIDDEN => {
+                self.fire_401_attribution(StorageOperation::CheckExists, comparison);
                 ExistsResult::Unauthorized
             }
-            Ok(resp) => {
+            Ok((resp, _)) => {
                 tracing::warn!("check_exists returned {}", resp.status());
                 ExistsResult::ProbeFailed
             }
-            Err(e) => {
-                tracing::warn!("check_exists request failed: {e}");
+            Err(_) => {
+                tracing::warn!("check_exists request failed: transport error");
                 ExistsResult::ProbeFailed
             }
         }
@@ -719,19 +1163,21 @@ impl StorageClient {
             .add_common_headers(self.http_client.post(&url))
             .json(&Request { paths: paths_ref });
 
-        match request.send().await {
-            Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
-                self.fire_401_attribution("batch_check_exists");
+        match self.execute_request(request).await {
+            Ok((resp, comparison)) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                self.fire_401_attribution(StorageOperation::BatchCheckExists, comparison);
                 self.breaker.record(Outcome::Failure);
                 ExistsResult::Unauthorized
             }
-            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => ExistsResult::NotFound,
+            Ok((resp, _)) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                ExistsResult::NotFound
+            }
             // 403 fires attribution; does NOT count toward the breaker.
-            Ok(resp) if resp.status() == reqwest::StatusCode::FORBIDDEN => {
-                self.fire_401_attribution("batch_check_exists");
+            Ok((resp, comparison)) if resp.status() == reqwest::StatusCode::FORBIDDEN => {
+                self.fire_401_attribution(StorageOperation::BatchCheckExists, comparison);
                 ExistsResult::Unauthorized
             }
-            Ok(resp) if resp.status().is_success() => {
+            Ok((resp, _)) if resp.status().is_success() => {
                 // Defer the Success record until after parse — see
                 // the matching comment in `check_exists`. A 2xx
                 // with an unparseable body returns `ProbeFailed`,
@@ -743,18 +1189,18 @@ impl StorageClient {
                         self.breaker.record(Outcome::Success);
                         ExistsResult::Found(r.exists.into_iter().collect())
                     }
-                    Err(e) => {
-                        tracing::warn!("Failed to parse batch_exists response: {e}");
+                    Err(_) => {
+                        tracing::warn!("Failed to parse batch_exists response");
                         ExistsResult::ProbeFailed
                     }
                 }
             }
-            Ok(resp) => {
+            Ok((resp, _)) => {
                 tracing::warn!("batch_exists returned {}", resp.status());
                 ExistsResult::ProbeFailed
             }
-            Err(e) => {
-                tracing::warn!("batch_exists request failed: {e}");
+            Err(_) => {
+                tracing::warn!("batch_exists request failed: transport error");
                 ExistsResult::ProbeFailed
             }
         }
@@ -789,8 +1235,8 @@ impl StorageClient {
                 };
                 let part = match reqwest::multipart::Part::bytes(content.clone()).mime_str(ct) {
                     Ok(part) => part.file_name(path.clone()),
-                    Err(e) => {
-                        tracing::warn!("batch_upload: invalid MIME type '{ct}': {e}");
+                    Err(_) => {
+                        tracing::warn!("batch_upload: invalid MIME type");
                         return None;
                     }
                 };
@@ -801,26 +1247,26 @@ impl StorageClient {
                 .add_common_headers(self.http_client.post(&url))
                 .multipart(form);
 
-            match request.send().await {
-                Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
-                    self.fire_401_attribution("batch_upload");
+            match self.execute_request(request).await {
+                Ok((resp, comparison)) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                    self.fire_401_attribution(StorageOperation::BatchUpload, comparison);
                     self.breaker.record(Outcome::Failure);
                     return None;
                 }
-                Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => return None,
-                Ok(resp) if resp.status() == reqwest::StatusCode::FORBIDDEN => {
+                Ok((resp, _)) if resp.status() == reqwest::StatusCode::NOT_FOUND => return None,
+                Ok((resp, comparison)) if resp.status() == reqwest::StatusCode::FORBIDDEN => {
+                    self.fire_401_attribution(StorageOperation::BatchUpload, comparison);
                     tracing::debug!("batch_upload rejected (403), skipping");
                     return None;
                 }
                 // 422: server detected the body was stripped in transit
                 // (Content-Length: 0). Retry with exponential backoff.
-                Ok(resp) if resp.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY => {
+                Ok((resp, _)) if resp.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY => {
                     if attempt < self.retry_config.max_retries {
                         wait_for_network_retry(
                             &self.retry_config,
                             "batch_upload (body stripped in transit)",
                             attempt,
-                            &"422 Unprocessable Entity",
                         )
                         .await;
                         attempt += 1;
@@ -831,20 +1277,20 @@ impl StorageClient {
                     );
                     return None;
                 }
-                Ok(resp) if resp.status().is_success() => {
+                Ok((resp, _)) if resp.status().is_success() => {
                     self.breaker.record(Outcome::Success);
                     return match resp
                         .json::<prod_mc_cli_chat_proxy_types::BatchUploadResponse>()
                         .await
                     {
                         Ok(r) => Some(r.results),
-                        Err(e) => {
-                            tracing::warn!("Failed to parse batch_upload response: {e}");
+                        Err(_) => {
+                            tracing::warn!("Failed to parse batch_upload response");
                             None
                         }
                     };
                 }
-                Ok(resp) => {
+                Ok((resp, _)) => {
                     let check = ResponseCheck::from_response(resp, operation).await;
                     if check.is_retryable && attempt < self.retry_config.max_retries {
                         check.wait_for_retry(&self.retry_config, attempt).await;
@@ -854,13 +1300,13 @@ impl StorageClient {
                     tracing::warn!("batch_upload failed: {}", check.message);
                     return None;
                 }
-                Err(e) => {
+                Err(_) => {
                     if attempt < self.retry_config.max_retries {
-                        wait_for_network_retry(&self.retry_config, operation, attempt, &e).await;
+                        wait_for_network_retry(&self.retry_config, operation, attempt).await;
                         attempt += 1;
                         continue;
                     }
-                    tracing::warn!("batch_upload request failed after retries: {e}");
+                    tracing::warn!("batch_upload request failed after retries: transport error");
                     return None;
                 }
             }
@@ -947,31 +1393,32 @@ impl StorageClient {
                 // need it intact for retries.
                 .body(compressed.clone());
 
-            match request.send().await {
-                Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
-                    self.fire_401_attribution("batch_upload_json");
+            match self.execute_request(request).await {
+                Ok((resp, comparison)) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                    self.fire_401_attribution(StorageOperation::BatchUploadJson, comparison);
                     self.breaker.record(Outcome::Failure);
                     return None;
                 }
-                Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => return None,
-                Ok(resp) if resp.status() == reqwest::StatusCode::FORBIDDEN => {
+                Ok((resp, _)) if resp.status() == reqwest::StatusCode::NOT_FOUND => return None,
+                Ok((resp, comparison)) if resp.status() == reqwest::StatusCode::FORBIDDEN => {
+                    self.fire_401_attribution(StorageOperation::BatchUploadJson, comparison);
                     tracing::debug!("batch_upload_json rejected (403), skipping");
                     return None;
                 }
-                Ok(resp) if resp.status().is_success() => {
+                Ok((resp, _)) if resp.status().is_success() => {
                     self.breaker.record(Outcome::Success);
                     return match resp
                         .json::<prod_mc_cli_chat_proxy_types::BatchUploadResponse>()
                         .await
                     {
                         Ok(r) => Some(r.results),
-                        Err(e) => {
-                            tracing::warn!("Failed to parse batch_upload_json response: {e}");
+                        Err(_) => {
+                            tracing::warn!("Failed to parse batch_upload_json response");
                             None
                         }
                     };
                 }
-                Ok(resp) => {
+                Ok((resp, _)) => {
                     let check = ResponseCheck::from_response(resp, operation).await;
                     if check.is_retryable && attempt < self.retry_config.max_retries {
                         check.wait_for_retry(&self.retry_config, attempt).await;
@@ -981,13 +1428,15 @@ impl StorageClient {
                     tracing::warn!("batch_upload_json failed: {}", check.message);
                     return None;
                 }
-                Err(e) => {
+                Err(_) => {
                     if attempt < self.retry_config.max_retries {
-                        wait_for_network_retry(&self.retry_config, operation, attempt, &e).await;
+                        wait_for_network_retry(&self.retry_config, operation, attempt).await;
                         attempt += 1;
                         continue;
                     }
-                    tracing::warn!("batch_upload_json request failed after retries: {e}");
+                    tracing::warn!(
+                        "batch_upload_json request failed after retries: transport error"
+                    );
                     return None;
                 }
             }
@@ -1010,28 +1459,30 @@ impl StorageClient {
     pub async fn download_blob(&self, storage_path: &str, dest: &Path) -> Result<()> {
         // Step 1: get a signed GET URL from the proxy.
         let url = format!("{}/storage/download", self.base_url);
-        let resp = self
+        let request = self
             .add_common_headers(self.http_client.get(&url))
-            .header("X-Storage-Path", storage_path)
-            .send()
+            .header("X-Storage-Path", storage_path);
+        let (resp, comparison) = self
+            .execute_request(request)
             .await
-            .context("Failed to contact storage download endpoint")?;
+            .map_err(|_| anyhow::anyhow!("Storage download request failed: transport error"))?;
 
+        if matches!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            self.fire_401_attribution(StorageOperation::DownloadBlob, comparison);
+        }
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            anyhow::bail!("Dedup blob download is not authorized (HTTP 401 Unauthorized)");
+        }
         if resp.status() == reqwest::StatusCode::FORBIDDEN {
-            anyhow::bail!(
-                "Dedup blob download is not authorized for this account \
-                 (server returned 403 for path '{}')",
-                storage_path
-            );
+            anyhow::bail!("Dedup blob download is not authorized (HTTP 403 Forbidden)");
         }
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Storage download endpoint returned {status} for '{}': {body}",
-                storage_path
-            );
+            anyhow::bail!("Storage download endpoint returned {status}");
         }
 
         #[derive(serde::Deserialize)]
@@ -1039,10 +1490,9 @@ impl StorageClient {
             signed_url: String,
         }
 
-        let download_resp: DownloadResponse = resp
-            .json()
-            .await
-            .context("Failed to parse storage download response")?;
+        let download_resp: DownloadResponse = resp.json().await.map_err(|e| {
+            anyhow::Error::new(e.without_url()).context("Failed to parse storage download response")
+        })?;
 
         // Step 2: fetch the object via the signed URL, streaming to dest.
         // Use the raw client — signed URLs carry their own auth and must
@@ -1052,15 +1502,13 @@ impl StorageClient {
             .get(&download_resp.signed_url)
             .send()
             .await
-            .context("Failed to fetch blob from signed URL")?;
+            .map_err(|_| {
+                anyhow::anyhow!("Failed to fetch blob from signed URL: transport error")
+            })?;
 
         if !object_resp.status().is_success() {
             let status = object_resp.status();
-            let body = object_resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Signed URL download failed with {status} for '{}': {body}",
-                storage_path
-            );
+            anyhow::bail!("Signed URL download failed with {status}");
         }
 
         // Create parent directories if needed.
@@ -1078,8 +1526,8 @@ impl StorageClient {
         use futures::StreamExt as _;
         use tokio::io::AsyncWriteExt as _;
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk
-                .with_context(|| format!("Error reading blob stream for '{}'", storage_path))?;
+            let chunk =
+                chunk.map_err(|_| anyhow::anyhow!("Error reading blob stream: transport error"))?;
             file.write_all(&chunk)
                 .await
                 .with_context(|| format!("Failed to write chunk to {}", dest.display()))?;
@@ -1141,7 +1589,7 @@ impl StorageClient {
     ) -> Result<UploadResponse> {
         let url = format!("{}/storage", self.base_url);
         let content = content.to_vec();
-        let operation = format!("Upload to '{}'", path);
+        let operation = "Storage upload";
 
         if let Err(BreakerOpen { retry_after }) = self.breaker.check() {
             return Err(HttpUploadError {
@@ -1182,34 +1630,38 @@ impl StorageClient {
                     .header("X-Storage-Path", path),
             );
 
-            match request.body(content.clone()).send().await {
-                Ok(response) if response.status().is_success() => {
+            match self.execute_request(request.body(content.clone())).await {
+                Ok((response, _)) if response.status().is_success() => {
                     self.breaker.record(Outcome::Success);
-                    return response
-                        .json()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Failed to parse upload response: {}", e));
+                    return response.json().await.map_err(|e| {
+                        anyhow::Error::new(e.without_url())
+                            .context("Failed to parse upload response")
+                    });
                 }
-                Ok(response) if response.status() == reqwest::StatusCode::UNAUTHORIZED => {
-                    self.fire_401_attribution("upload");
+                Ok((response, comparison))
+                    if response.status() == reqwest::StatusCode::UNAUTHORIZED =>
+                {
+                    self.fire_401_attribution(StorageOperation::Upload, comparison);
                     self.breaker.record(Outcome::Failure);
                     return Err(HttpUploadError {
                         status_code: 401,
-                        message: format!("{}: HTTP 401 Unauthorized", operation),
+                        message: format!("{operation}: HTTP 401 Unauthorized"),
                     }
                     .into());
                 }
-                Ok(response) if response.status() == reqwest::StatusCode::FORBIDDEN => {
-                    let body = response.text().await.unwrap_or_default();
-                    tracing::warn!("storage upload rejected (403): {body}");
+                Ok((response, comparison))
+                    if response.status() == reqwest::StatusCode::FORBIDDEN =>
+                {
+                    self.fire_401_attribution(StorageOperation::Upload, comparison);
+                    tracing::warn!("storage upload rejected (403)");
                     return Err(HttpUploadError {
                         status_code: 403,
-                        message: format!("{operation}: HTTP 403 Forbidden - {body}"),
+                        message: format!("{operation}: HTTP 403 Forbidden"),
                     }
                     .into());
                 }
-                Ok(response) => {
-                    let check = ResponseCheck::from_response(response, &operation).await;
+                Ok((response, _)) => {
+                    let check = ResponseCheck::from_response(response, operation).await;
                     if check.is_retryable && attempt < self.retry_config.max_retries {
                         check.wait_for_retry(&self.retry_config, attempt).await;
                         attempt += 1;
@@ -1221,13 +1673,13 @@ impl StorageClient {
                     }
                     .into());
                 }
-                Err(e) => {
+                Err(_) => {
                     if attempt < self.retry_config.max_retries {
-                        wait_for_network_retry(&self.retry_config, &operation, attempt, &e).await;
+                        wait_for_network_retry(&self.retry_config, operation, attempt).await;
                         attempt += 1;
                         continue;
                     }
-                    return Err(anyhow::anyhow!("{} failed: {}", operation, e));
+                    return Err(anyhow::anyhow!("{operation} failed: transport error"));
                 }
             }
         }
@@ -1256,7 +1708,7 @@ impl StorageClient {
         content_type: &str,
     ) -> Result<UploadResponse> {
         let url = format!("{}/storage", self.base_url);
-        let operation = format!("Upload file '{}'", file_path.display());
+        let operation = "Storage file upload";
 
         if let Err(BreakerOpen { retry_after }) = self.breaker.check() {
             return Err(HttpUploadError {
@@ -1306,34 +1758,38 @@ impl StorageClient {
                     .header("X-Storage-Path", dest_path),
             );
 
-            match request.body(body).send().await {
-                Ok(response) if response.status().is_success() => {
+            match self.execute_request(request.body(body)).await {
+                Ok((response, _)) if response.status().is_success() => {
                     self.breaker.record(Outcome::Success);
-                    return response
-                        .json()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Failed to parse upload response: {}", e));
+                    return response.json().await.map_err(|e| {
+                        anyhow::Error::new(e.without_url())
+                            .context("Failed to parse upload response")
+                    });
                 }
-                Ok(response) if response.status() == reqwest::StatusCode::UNAUTHORIZED => {
-                    self.fire_401_attribution("upload_file");
+                Ok((response, comparison))
+                    if response.status() == reqwest::StatusCode::UNAUTHORIZED =>
+                {
+                    self.fire_401_attribution(StorageOperation::UploadFile, comparison);
                     self.breaker.record(Outcome::Failure);
                     return Err(HttpUploadError {
                         status_code: 401,
-                        message: format!("{}: HTTP 401 Unauthorized", operation),
+                        message: format!("{operation}: HTTP 401 Unauthorized"),
                     }
                     .into());
                 }
-                Ok(response) if response.status() == reqwest::StatusCode::FORBIDDEN => {
-                    let body = response.text().await.unwrap_or_default();
-                    tracing::warn!("storage upload_file rejected (403): {body}");
+                Ok((response, comparison))
+                    if response.status() == reqwest::StatusCode::FORBIDDEN =>
+                {
+                    self.fire_401_attribution(StorageOperation::UploadFile, comparison);
+                    tracing::warn!("storage upload_file rejected (403)");
                     return Err(HttpUploadError {
                         status_code: 403,
-                        message: format!("{operation}: HTTP 403 Forbidden - {body}"),
+                        message: format!("{operation}: HTTP 403 Forbidden"),
                     }
                     .into());
                 }
-                Ok(response) => {
-                    let check = ResponseCheck::from_response(response, &operation).await;
+                Ok((response, _)) => {
+                    let check = ResponseCheck::from_response(response, operation).await;
                     if check.is_retryable && attempt < self.retry_config.max_retries {
                         check.wait_for_retry(&self.retry_config, attempt).await;
                         attempt += 1;
@@ -1345,13 +1801,13 @@ impl StorageClient {
                     }
                     .into());
                 }
-                Err(e) => {
+                Err(_) => {
                     if attempt < self.retry_config.max_retries {
-                        wait_for_network_retry(&self.retry_config, &operation, attempt, &e).await;
+                        wait_for_network_retry(&self.retry_config, operation, attempt).await;
                         attempt += 1;
                         continue;
                     }
-                    return Err(anyhow::anyhow!("{} failed: {}", operation, e));
+                    return Err(anyhow::anyhow!("{operation} failed: transport error"));
                 }
             }
         }
@@ -1388,8 +1844,7 @@ impl StorageClient {
             // Mirror the wire-401 shape (`anyhow::bail!` below) so
             // callers see the same `Err` payload on both paths.
             anyhow::bail!(
-                "Failed to upload to '{}': HTTP 401 Unauthorized (circuit breaker open; retry after {:.1}s)",
-                path,
+                "Streaming storage upload: HTTP 401 Unauthorized (circuit breaker open; retry after {:.1}s)",
                 retry_after.as_secs_f64()
             );
         }
@@ -1403,44 +1858,41 @@ impl StorageClient {
             .header("Content-Type", content_type)
             .header("X-Storage-Path", path);
         let request = self.add_common_headers(request);
-        let response = request
-            .body(body)
-            .send()
+        let (response, comparison) = self
+            .execute_request(request.body(body))
             .await
-            .context("Failed to send streaming upload request")?;
+            .map_err(|_| anyhow::anyhow!("Streaming upload request failed: transport error"))?;
 
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            self.fire_401_attribution("upload_stream");
+            self.fire_401_attribution(StorageOperation::UploadStream, comparison);
             self.breaker.record(Outcome::Failure);
-            anyhow::bail!("Failed to upload to '{}': HTTP 401 Unauthorized", path);
+            anyhow::bail!("Streaming storage upload: HTTP 401 Unauthorized");
         }
         if status == reqwest::StatusCode::FORBIDDEN {
-            let body = response.text().await.unwrap_or_default();
-            tracing::warn!("storage upload_stream rejected (403): {body}");
+            self.fire_401_attribution(StorageOperation::UploadStream, comparison);
+            tracing::warn!("storage upload_stream rejected (403)");
             return Err(HttpUploadError {
                 status_code: 403,
-                message: format!("Failed to upload to '{path}': HTTP 403 Forbidden - {body}"),
+                message: "Streaming storage upload: HTTP 403 Forbidden".to_owned(),
             }
             .into());
         }
         if !status.is_success() {
-            let error_body = response.text().await.unwrap_or_default();
             // Structured so the queue worker can classify terminal 400/404 by
             // status code rather than scraping the message string.
             return Err(HttpUploadError {
                 status_code: status.as_u16(),
-                message: format!("Failed to upload to '{path}': HTTP {status} - {error_body}"),
+                message: format!("Streaming storage upload: HTTP {status}"),
             }
             .into());
         }
 
         self.breaker.record(Outcome::Success);
 
-        let upload_response: UploadResponse = response
-            .json()
-            .await
-            .context("Failed to parse upload response")?;
+        let upload_response: UploadResponse = response.json().await.map_err(|e| {
+            anyhow::Error::new(e.without_url()).context("Failed to parse upload response")
+        })?;
 
         Ok(upload_response)
     }
@@ -1651,6 +2103,7 @@ impl StorageClient {
             let base_url = self.base_url.clone();
             let file = shared_file.clone();
             let retry_config = self.retry_config.clone();
+            let attribution = self.attribution.clone();
 
             let task = tokio::spawn(async move {
                 let _permit = permit;
@@ -1670,6 +2123,7 @@ impl StorageClient {
                     offset,
                     length,
                     &retry_config,
+                    attribution.as_deref(),
                 )
                 .await;
                 tracing::debug!(
@@ -1704,12 +2158,12 @@ impl StorageClient {
                     uploaded_parts.push(part_info);
                 }
                 Ok(Err(e)) => {
-                    tracing::error!("Part {} upload failed: {}", part_num, e);
+                    tracing::error!("Part {} upload failed", part_num);
                     upload_errors.push((part_num, e));
                 }
-                Err(e) => {
-                    tracing::error!("Part {} task panicked: {}", part_num, e);
-                    upload_errors.push((part_num, anyhow::anyhow!("Task panicked: {}", e)));
+                Err(_) => {
+                    tracing::error!("Part {} task panicked", part_num);
+                    upload_errors.push((part_num, anyhow::anyhow!("Task panicked")));
                 }
             }
         }
@@ -1742,14 +2196,27 @@ impl StorageClient {
                     .header("Content-Type", "application/json"),
             );
 
-            match request.json(&request_body).send().await {
-                Ok(response) if response.status().is_success() => {
-                    return response
-                        .json()
-                        .await
-                        .context("Failed to parse multipart init response");
+            match self.execute_request(request.json(&request_body)).await {
+                Ok((response, _)) if response.status().is_success() => {
+                    return response.json().await.map_err(|e| {
+                        anyhow::Error::new(e.without_url())
+                            .context("Failed to parse multipart init response")
+                    });
                 }
-                Ok(response) if response.status() == reqwest::StatusCode::FORBIDDEN => {
+                Ok((response, comparison))
+                    if response.status() == reqwest::StatusCode::UNAUTHORIZED =>
+                {
+                    self.fire_401_attribution(StorageOperation::MultipartInit, comparison);
+                    return Err(HttpUploadError {
+                        status_code: 401,
+                        message: "Multipart init: HTTP 401 Unauthorized".to_owned(),
+                    }
+                    .into());
+                }
+                Ok((response, comparison))
+                    if response.status() == reqwest::StatusCode::FORBIDDEN =>
+                {
+                    self.fire_401_attribution(StorageOperation::MultipartInit, comparison);
                     tracing::debug!("storage upload rejected (403), skipping");
                     return Ok(MultipartInitResponse {
                         upload_id: String::new(),
@@ -1759,7 +2226,7 @@ impl StorageClient {
                         expires_at: None,
                     });
                 }
-                Ok(response) => {
+                Ok((response, _)) => {
                     let check = ResponseCheck::from_response(response, operation).await;
                     if check.is_retryable && attempt < self.retry_config.max_retries {
                         check.wait_for_retry(&self.retry_config, attempt).await;
@@ -1772,13 +2239,15 @@ impl StorageClient {
                     }
                     .into());
                 }
-                Err(e) => {
+                Err(_) => {
                     if attempt < self.retry_config.max_retries {
-                        wait_for_network_retry(&self.retry_config, operation, attempt, &e).await;
+                        wait_for_network_retry(&self.retry_config, operation, attempt).await;
                         attempt += 1;
                         continue;
                     }
-                    return Err(e).context("Failed to initialize multipart upload");
+                    return Err(anyhow::anyhow!(
+                        "Failed to initialize multipart upload: transport error"
+                    ));
                 }
             }
         }
@@ -1806,14 +2275,34 @@ impl StorageClient {
                     .header("Content-Type", content_type),
             );
 
-            match request.json(&request_body).send().await {
-                Ok(response) if response.status().is_success() => {
-                    return response
-                        .json()
-                        .await
-                        .context("Failed to parse multipart complete response");
+            match self.execute_request(request.json(&request_body)).await {
+                Ok((response, _)) if response.status().is_success() => {
+                    return response.json().await.map_err(|e| {
+                        anyhow::Error::new(e.without_url())
+                            .context("Failed to parse multipart complete response")
+                    });
                 }
-                Ok(response) => {
+                Ok((response, comparison))
+                    if response.status() == reqwest::StatusCode::UNAUTHORIZED =>
+                {
+                    self.fire_401_attribution(StorageOperation::MultipartComplete, comparison);
+                    return Err(HttpUploadError {
+                        status_code: 401,
+                        message: "Multipart complete: HTTP 401 Unauthorized".to_owned(),
+                    }
+                    .into());
+                }
+                Ok((response, comparison))
+                    if response.status() == reqwest::StatusCode::FORBIDDEN =>
+                {
+                    self.fire_401_attribution(StorageOperation::MultipartComplete, comparison);
+                    return Err(HttpUploadError {
+                        status_code: 403,
+                        message: "Multipart complete: HTTP 403 Forbidden".to_owned(),
+                    }
+                    .into());
+                }
+                Ok((response, _)) => {
                     let check = ResponseCheck::from_response(response, operation).await;
                     if check.is_retryable && attempt < self.retry_config.max_retries {
                         check.wait_for_retry(&self.retry_config, attempt).await;
@@ -1826,13 +2315,15 @@ impl StorageClient {
                     }
                     .into());
                 }
-                Err(e) => {
+                Err(_) => {
                     if attempt < self.retry_config.max_retries {
-                        wait_for_network_retry(&self.retry_config, operation, attempt, &e).await;
+                        wait_for_network_retry(&self.retry_config, operation, attempt).await;
                         attempt += 1;
                         continue;
                     }
-                    return Err(e).context("Failed to complete multipart upload");
+                    return Err(anyhow::anyhow!(
+                        "Failed to complete multipart upload: transport error"
+                    ));
                 }
             }
         }
@@ -1855,18 +2346,23 @@ impl StorageClient {
     ) -> Result<prod_mc_cli_chat_proxy_types::SignedUploadUrlResponse> {
         let url = format!("{}/storage/signed-upload-url", self.base_url);
 
-        let response = self
-            .add_common_headers(
-                self.http_client
-                    .post(&url)
-                    .header("X-Storage-Path", path)
-                    .header("Content-Type", content_type),
-            )
-            .send()
+        let request = self.add_common_headers(
+            self.http_client
+                .post(&url)
+                .header("X-Storage-Path", path)
+                .header("Content-Type", content_type),
+        );
+        let (response, comparison) = self
+            .execute_request(request)
             .await
-            .context("Failed to request signed upload URL")?;
+            .map_err(|_| anyhow::anyhow!("Signed upload URL request failed: transport error"))?;
 
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.fire_401_attribution(StorageOperation::GetSignedUploadUrl, comparison);
+            anyhow::bail!("Signed upload URL request failed: HTTP 401 Unauthorized");
+        }
         if response.status() == reqwest::StatusCode::FORBIDDEN {
+            self.fire_401_attribution(StorageOperation::GetSignedUploadUrl, comparison);
             tracing::debug!("storage upload rejected (403), skipping");
             return Ok(prod_mc_cli_chat_proxy_types::SignedUploadUrlResponse {
                 signed_url: String::new(),
@@ -1878,14 +2374,16 @@ impl StorageClient {
         }
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("Signed upload URL request failed: {status} - {body}");
+            anyhow::bail!("Signed upload URL request failed: HTTP {status}");
         }
 
         response
             .json::<prod_mc_cli_chat_proxy_types::SignedUploadUrlResponse>()
             .await
-            .context("Failed to parse signed upload URL response")
+            .map_err(|e| {
+                anyhow::Error::new(e.without_url())
+                    .context("Failed to parse signed upload URL response")
+            })
     }
 
     /// Upload bytes directly to GCS using a pre-signed PUT URL.
@@ -1905,12 +2403,11 @@ impl StorageClient {
             .body(data.to_vec())
             .send()
             .await
-            .context("Failed to upload via signed URL")?;
+            .map_err(|_| anyhow::anyhow!("Failed to upload via signed URL: transport error"))?;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("Signed URL upload failed: {status} - {body}");
+            anyhow::bail!("Signed URL upload failed: HTTP {status}");
         }
 
         Ok(())
@@ -1954,6 +2451,7 @@ async fn upload_part_streaming(
     offset: u64,
     length: u64,
     retry_config: &RetryConfig,
+    attribution: Option<&dyn Auth401AttributionCallback>,
 ) -> Result<MultipartUploadPartResponse> {
     let url = format!(
         "{}/storage/multipart/{}/{}",
@@ -1973,7 +2471,7 @@ async fn upload_part_streaming(
         );
 
         let send_start = std::time::Instant::now();
-        tracing::debug!("Part {} sending HTTP request to {}", part_number, url);
+        tracing::debug!("Part {} sending authenticated proxy request", part_number);
 
         let mut request = client
             .post(&url)
@@ -1984,8 +2482,12 @@ async fn upload_part_streaming(
             request = request.header(name.clone(), value.clone());
         }
 
-        match request.body(body).send().await {
-            Ok(response) => {
+        let request = request
+            .body(body)
+            .build()
+            .map_err(|_| anyhow::anyhow!("Proxy multipart request build failed"))?;
+        match execute_with_auth_relation(client, request).await {
+            Ok((response, comparison)) => {
                 tracing::debug!(
                     "Part {} HTTP response received in {:?}, status={}",
                     part_number,
@@ -1997,7 +2499,8 @@ async fn upload_part_streaming(
                     let parse_start = std::time::Instant::now();
                     let part_response: MultipartUploadPartResponse =
                         response.json().await.map_err(|e| {
-                            anyhow::anyhow!("Failed to parse part {} response: {}", part_number, e)
+                            anyhow::Error::new(e.without_url())
+                                .context(format!("Failed to parse part {part_number} response"))
                         })?;
                     tracing::debug!(
                         "Part {} response parsed in {:?}",
@@ -2005,6 +2508,14 @@ async fn upload_part_streaming(
                         parse_start.elapsed()
                     );
                     return Ok(part_response);
+                }
+
+                if matches!(
+                    response.status(),
+                    reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+                ) && let Some(callback) = attribution
+                {
+                    callback.record_401(StorageOperation::UploadPart, comparison);
                 }
 
                 let check = ResponseCheck::from_response(response, &operation).await;
@@ -2019,13 +2530,13 @@ async fn upload_part_streaming(
                 }
                 .into());
             }
-            Err(e) => {
+            Err(_) => {
                 if attempt < retry_config.max_retries {
-                    wait_for_network_retry(retry_config, &operation, attempt, &e).await;
+                    wait_for_network_retry(retry_config, &operation, attempt).await;
                     attempt += 1;
                     continue;
                 }
-                return Err(anyhow::anyhow!("{} failed: {}", operation, e));
+                return Err(anyhow::anyhow!("{operation} failed: transport error"));
             }
         }
     }
@@ -2098,13 +2609,15 @@ async fn upload_part_direct(
                 }
                 .into());
             }
-            Err(e) => {
+            Err(_) => {
                 if attempt < retry_config.max_retries {
-                    wait_for_network_retry(retry_config, &operation, attempt, &e).await;
+                    wait_for_network_retry(retry_config, &operation, attempt).await;
                     attempt += 1;
                     continue;
                 }
-                return Err(anyhow::anyhow!("{} failed: {}", operation, e));
+                return Err(anyhow::anyhow!(
+                    "{operation} failed: signed URL transport error"
+                ));
             }
         }
     }
@@ -2248,7 +2761,7 @@ impl MultipartUploadOptions {
 
 /// Response from initializing a multipart upload.
 /// Bucket is passed via X-Storage-Bucket header.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MultipartInitResponse {
     pub upload_id: String,
@@ -2262,8 +2775,20 @@ pub struct MultipartInitResponse {
     pub expires_at: Option<String>,
 }
 
+impl std::fmt::Debug for MultipartInitResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MultipartInitResponse")
+            .field("upload_id_present", &!self.upload_id.is_empty())
+            .field("bucket_present", &!self.bucket.is_empty())
+            .field("max_part_size_bytes", &self.max_part_size_bytes)
+            .field("part_url_count", &self.part_urls.len())
+            .field("expiry_present", &self.expires_at.is_some())
+            .finish()
+    }
+}
+
 /// Pre-signed URL information for uploading a single part directly to GCS.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignedPartUrl {
     /// Part number (1-indexed)
@@ -2272,6 +2797,56 @@ pub struct SignedPartUrl {
     pub url: String,
     /// GCS path where this part will be stored (for tracking)
     pub path: String,
+}
+
+impl std::fmt::Debug for SignedPartUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignedPartUrl")
+            .field("part_number", &self.part_number)
+            .field("url_present", &!self.url.is_empty())
+            .field("path_present", &!self.path.is_empty())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod signed_url_debug_tests {
+    use super::{MultipartInitResponse, SignedPartUrl};
+
+    fn assert_no_secret_windows(rendered: &str, secret: &str) {
+        assert!(
+            !rendered.contains(secret),
+            "leaked full sentinel: {rendered}"
+        );
+        for window in secret.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(
+                !rendered.contains(fragment),
+                "leaked sentinel window {fragment}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn multipart_signed_url_debug_is_presence_only() {
+        const SENTINEL: &str = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+        let response = MultipartInitResponse {
+            upload_id: SENTINEL.into(),
+            bucket: format!("bucket-{SENTINEL}"),
+            max_part_size_bytes: 1024,
+            part_urls: vec![SignedPartUrl {
+                part_number: 1,
+                url: format!("https://storage.example/part?signature={SENTINEL}"),
+                path: format!("private/{SENTINEL}/part"),
+            }],
+            expires_at: Some(SENTINEL.into()),
+        };
+
+        let rendered = format!("{response:?} {:?}", response.part_urls[0]);
+        assert!(rendered.contains("part_url_count: 1"));
+        assert!(rendered.contains("url_present: true"));
+        assert_no_secret_windows(&rendered, SENTINEL);
+    }
 }
 
 /// Request body for initializing a multipart upload with signed URLs.
@@ -2422,6 +2997,118 @@ mod download_blob_tests {
         assert!(
             err.to_string().contains("400"),
             "error must mention 400, got: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod signed_url_transport_tests {
+    use super::*;
+    use axum::{Json, Router, routing::get};
+    use tokio::net::TcpListener;
+
+    const SIGNATURE_SENTINEL: &str = "SIGNED_QUERY_SENTINEL_0123456789";
+
+    async fn closed_signed_url() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!(
+            "http://{addr}/object?X-Goog-Signature={SIGNATURE_SENTINEL}&X-Amz-Signature={SIGNATURE_SENTINEL}&X-Goog-Credential={SIGNATURE_SENTINEL}"
+        )
+    }
+
+    fn assert_signed_query_redacted(value: &str) {
+        for forbidden in [
+            "X-Goog-Signature",
+            "X-Amz-Signature",
+            "X-Goog-Credential",
+            SIGNATURE_SENTINEL,
+        ] {
+            assert!(
+                !value.contains(forbidden),
+                "signed query material leaked: {value}"
+            );
+        }
+        for window in SIGNATURE_SENTINEL.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).unwrap();
+            assert!(
+                !value.contains(fragment),
+                "signed query fragment {fragment:?} leaked: {value}"
+            );
+        }
+    }
+
+    async fn start_server(router: Router) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn signed_upload_transport_error_drops_query_credentials() {
+        let signed_url = closed_signed_url().await;
+        let client = StorageClient::new("http://127.0.0.1:1/v1", "test-token");
+
+        let err = client
+            .upload_via_signed_url(&signed_url, b"data", "application/octet-stream")
+            .await
+            .unwrap_err();
+
+        assert_signed_query_redacted(&err.to_string());
+        assert_eq!(
+            err.to_string(),
+            "Failed to upload via signed URL: transport error"
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_download_transport_error_drops_query_credentials() {
+        let signed_url = closed_signed_url().await;
+        let router = Router::new().route(
+            "/v1/storage/download",
+            get(move || {
+                let signed_url = signed_url.clone();
+                async move { Json(serde_json::json!({ "signed_url": signed_url })) }
+            }),
+        );
+        let addr = start_server(router).await;
+        let client = StorageClient::new(&format!("http://{addr}/v1"), "test-token");
+        let temp = tempfile::TempDir::new().unwrap();
+
+        let err = client
+            .download_blob("safe/storage/path", &temp.path().join("out"))
+            .await
+            .unwrap_err();
+
+        assert_signed_query_redacted(&err.to_string());
+        assert_eq!(
+            err.to_string(),
+            "Failed to fetch blob from signed URL: transport error"
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_signed_transport_retry_drops_query_credentials() {
+        let signed_url = closed_signed_url().await;
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), b"part").unwrap();
+        let file = Arc::new(StdFile::open(temp.path()).unwrap());
+        let retry = RetryConfig::new()
+            .with_initial_delay(Duration::from_millis(1))
+            .with_max_retries(1);
+
+        let err = upload_part_direct(&reqwest::Client::new(), &signed_url, file, 0, 4, 1, &retry)
+            .await
+            .unwrap_err();
+
+        assert_signed_query_redacted(&err.to_string());
+        assert_eq!(
+            err.to_string(),
+            "Part 1 direct upload failed: signed URL transport error"
         );
     }
 }
@@ -3302,6 +3989,8 @@ mod forbidden_tests {
     use std::net::SocketAddr;
     use tokio::net::TcpListener;
 
+    const CREDENTIAL_SENTINEL: &str = "cred-full-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
     async fn start_server(router: Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3316,7 +4005,21 @@ mod forbidden_tests {
     }
 
     fn forbidden_handler() -> impl IntoResponse {
-        (axum::http::StatusCode::FORBIDDEN, "ZDR team")
+        (axum::http::StatusCode::FORBIDDEN, CREDENTIAL_SENTINEL)
+    }
+
+    fn assert_no_credential_bytes(value: &str) {
+        assert!(
+            !value.contains(CREDENTIAL_SENTINEL),
+            "full credential leaked: {value}"
+        );
+        for window in CREDENTIAL_SENTINEL.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).unwrap();
+            assert!(
+                !value.contains(fragment),
+                "credential fragment {fragment:?} leaked: {value}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3332,6 +4035,7 @@ mod forbidden_tests {
             .downcast_ref::<HttpUploadError>()
             .expect("must be HttpUploadError");
         assert_eq!(upload_err.status_code, 403);
+        assert_no_credential_bytes(&err.to_string());
     }
 
     #[tokio::test]
@@ -3350,6 +4054,7 @@ mod forbidden_tests {
             .downcast_ref::<HttpUploadError>()
             .expect("must be HttpUploadError");
         assert_eq!(upload_err.status_code, 403);
+        assert_no_credential_bytes(&err.to_string());
     }
 
     #[tokio::test]
@@ -3366,6 +4071,38 @@ mod forbidden_tests {
             .downcast_ref::<HttpUploadError>()
             .expect("must be HttpUploadError");
         assert_eq!(upload_err.status_code, 403);
+        assert_no_credential_bytes(&err.to_string());
+    }
+
+    #[tokio::test]
+    async fn retryable_provider_body_never_reaches_returned_error() {
+        let router = Router::new().route(
+            "/v1/storage",
+            post(|| async {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    CREDENTIAL_SENTINEL,
+                )
+                    .into_response()
+            }),
+        );
+        let (addr, _) = start_server(router).await;
+        let client = client_for(addr).with_retry_config(RetryConfig::new().with_max_retries(0));
+
+        let err = client
+            .upload("path/file.txt", b"data", "text/plain")
+            .await
+            .unwrap_err();
+
+        assert_no_credential_bytes(&err.to_string());
+        let upload_err = err
+            .downcast_ref::<HttpUploadError>()
+            .expect("must be HttpUploadError");
+        assert_eq!(upload_err.status_code, 500);
+        assert_eq!(
+            upload_err.message,
+            "Storage upload: HTTP 500 Internal Server Error"
+        );
     }
 
     #[tokio::test]

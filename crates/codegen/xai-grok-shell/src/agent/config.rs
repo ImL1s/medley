@@ -141,7 +141,7 @@ impl std::fmt::Display for EnvKeys {
     }
 }
 /// Configuration for API endpoints.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EndpointsConfig {
     /// cli chat proxy base URL. `None` = unset (resolvers apply the default);
@@ -249,6 +249,102 @@ pub struct EndpointsConfig {
     /// Read by `load_gcs_service_account_key_sync()`. Declared for `serde_ignored`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gcs_service_account_key: Option<String>,
+}
+
+impl std::fmt::Debug for EndpointsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EndpointsConfig")
+            .field(
+                "cli_chat_proxy_base_url_present",
+                &self.cli_chat_proxy_base_url.is_some(),
+            )
+            .field(
+                "xai_api_base_url_present",
+                &!self.xai_api_base_url.is_empty(),
+            )
+            .field("alpha_test_key_present", &self.alpha_test_key.is_some())
+            .field("models_base_url_present", &self.models_base_url.is_some())
+            .field("models_list_url_present", &self.models_list_url.is_some())
+            .field(
+                "feedback_base_url_present",
+                &self.feedback_base_url.is_some(),
+            )
+            .field("trace_upload_url_present", &self.trace_upload_url.is_some())
+            .field(
+                "trace_upload_bucket_present",
+                &self.trace_upload_bucket.is_some(),
+            )
+            .field(
+                "trace_upload_region_present",
+                &self.trace_upload_region.is_some(),
+            )
+            .field(
+                "trace_upload_credentials_file_present",
+                &self.trace_upload_credentials_file.is_some(),
+            )
+            .field(
+                "trace_upload_credentials_present",
+                &self.trace_upload_credentials.is_some(),
+            )
+            .field(
+                "trace_upload_endpoint_url_present",
+                &self.trace_upload_endpoint_url.is_some(),
+            )
+            .field("deployment_key_present", &self.deployment_key.is_some())
+            .field(
+                "managed_config_url_present",
+                &self.managed_config_url.is_some(),
+            )
+            .field(
+                "otel_exporter_otlp_endpoint_present",
+                &self.otel_exporter_otlp_endpoint.is_some(),
+            )
+            .field(
+                "otel_exporter_otlp_traces_endpoint_present",
+                &self.otel_exporter_otlp_traces_endpoint.is_some(),
+            )
+            .field(
+                "otel_exporter_otlp_headers_present",
+                &self.otel_exporter_otlp_headers.is_some(),
+            )
+            .field(
+                "grok_internal_otlp_traces_endpoint_present",
+                &self.grok_internal_otlp_traces_endpoint.is_some(),
+            )
+            .field(
+                "grok_internal_otlp_headers_present",
+                &self.grok_internal_otlp_headers.is_some(),
+            )
+            .field(
+                "external_otel_master_switch",
+                &self.external_otel_master_switch,
+            )
+            .field(
+                "otel_traces_exporter_present",
+                &self.otel_traces_exporter.is_some(),
+            )
+            .field(
+                "otel_traces_export_interval",
+                &self.otel_traces_export_interval,
+            )
+            .field(
+                "otel_exporter_otlp_timeout",
+                &self.otel_exporter_otlp_timeout,
+            )
+            .field(
+                "asset_server_url_present",
+                &!self.asset_server_url.is_empty(),
+            )
+            .field(
+                "management_api_key_present",
+                &self.management_api_key.is_some(),
+            )
+            .field(
+                "gcs_service_account_key_present",
+                &self.gcs_service_account_key.is_some(),
+            )
+            .finish()
+    }
 }
 pub(crate) fn default_asset_server_url() -> String {
     std::env::var("GROK_ASSET_SERVER_URL").unwrap_or_else(|_| ASSET_SERVER_URL_DEFAULT.to_owned())
@@ -981,7 +1077,7 @@ pub struct CompactionConfig {
     pub memory_flush: Option<crate::config::MemoryFlushConfig>,
     pub pruning: Option<crate::config::PruningConfig>,
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CliConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1020,13 +1116,47 @@ pub struct CliConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_picker_grouped: Option<bool>,
 }
+
+impl std::fmt::Debug for CliConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // String-valued CLI settings are configuration inputs, and some (most
+        // notably `npm_registry`) may be URLs containing userinfo or secret
+        // query parameters. Keep Debug useful for shape diagnostics without
+        // trusting any configured string value.
+        f.debug_struct("CliConfig")
+            .field("auto_update", &self.auto_update)
+            .field(
+                "dismissed_version_present",
+                &self.dismissed_version.is_some(),
+            )
+            .field("installer_present", &self.installer.is_some())
+            .field("npm_registry_present", &self.npm_registry.is_some())
+            .field("channel_present", &self.channel.is_some())
+            .field("use_leader", &self.use_leader)
+            .field("show_tips", &self.show_tips)
+            .field("worktree_type_present", &self.worktree_type.is_some())
+            .field("session_registry", &self.session_registry)
+            .field("minimum_version_present", &self.minimum_version.is_some())
+            .field("maximum_version_present", &self.maximum_version.is_some())
+            .field(
+                "required_minimum_version_present",
+                &self.required_minimum_version.is_some(),
+            )
+            .field(
+                "required_maximum_version_present",
+                &self.required_maximum_version.is_some(),
+            )
+            .field("session_picker_grouped", &self.session_picker_grouped)
+            .finish()
+    }
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DiagnosticsConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub crash_handler: Option<bool>,
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelsConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1100,6 +1230,56 @@ pub struct ModelsConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_tool_calls: Option<bool>,
 }
+
+impl std::fmt::Debug for ModelsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelsConfig")
+            .field("default_present", &self.default.is_some())
+            .field(
+                "pre_campaign_default_present",
+                &self.pre_campaign_default.is_some(),
+            )
+            .field(
+                "default_is_campaign_driven",
+                &self.default_is_campaign_driven,
+            )
+            .field("default_reasoning_effort", &self.default_reasoning_effort)
+            .field("web_search_present", &self.web_search.is_some())
+            .field("session_summary_present", &self.session_summary.is_some())
+            .field(
+                "image_description_present",
+                &self.image_description.is_some(),
+            )
+            .field(
+                "prompt_suggestion_present",
+                &self.prompt_suggestion.is_some(),
+            )
+            .field(
+                "allowed_models_count",
+                &self.allowed_models.as_ref().map_or(0, Vec::len),
+            )
+            .field(
+                "hidden_models_count",
+                &self.hidden_models.as_ref().map_or(0, Vec::len),
+            )
+            .field(
+                "disabled_models_count",
+                &self.disabled_models.as_ref().map_or(0, Vec::len),
+            )
+            .field("agent_type_present", &self.agent_type.is_some())
+            .field("extra_headers_count", &self.extra_headers.len())
+            .field("temperature", &self.temperature)
+            .field("top_p", &self.top_p)
+            .field("max_completion_tokens", &self.max_completion_tokens)
+            .field("max_retries", &self.max_retries)
+            .field(
+                "inference_idle_timeout_secs",
+                &self.inference_idle_timeout_secs,
+            )
+            .field("stream_tool_calls", &self.stream_tool_calls)
+            .finish()
+    }
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HarnessConfig {
@@ -1117,11 +1297,19 @@ pub struct RelayConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RemoteConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
+}
+
+impl std::fmt::Debug for RemoteConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteConfig")
+            .field("secret_present", &self.secret.is_some())
+            .finish()
+    }
 }
 /// `[hub]` section from config.toml.
 ///
@@ -3544,8 +3732,8 @@ pub fn resolve_model_list(
     let mut resolved: IndexMap<String, ModelEntry> = IndexMap::new();
     if cfg.endpoints.has_custom_endpoint() {
         tracing::info!(
-            models_base_url = ?cfg.endpoints.models_base_url,
-            models_list_url = ?cfg.endpoints.models_list_url,
+            models_base_url_configured = cfg.endpoints.models_base_url.is_some(),
+            models_list_url_configured = cfg.endpoints.models_list_url.is_some(),
             "custom models endpoint active, skipping built-in defaults",
         );
     } else {
@@ -3622,7 +3810,7 @@ pub fn resolve_model_list(
         }
         tracing::debug!(
             model_key = %key,
-            base_url = %entry.info.base_url,
+            base_url_configured = !entry.info.base_url.is_empty(),
             has_api_key = entry.api_key.is_some(),
             env_key = ?entry.env_key,
             auth_provider = entry.auth_provider.as_ref().map(|p| p.name.as_str()),
@@ -3887,7 +4075,7 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
         })
         .collect()
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ModelEntryConfig {
     /// Stable unique identifier for this catalog entry. When present,
     /// used as the catalog map key. Falls back to `model` when absent.
@@ -4006,6 +4194,57 @@ pub struct ModelEntryConfig {
     #[serde(default, skip_serializing_if = "is_default_laziness_detector")]
     pub laziness_detector: LazinessDetectorPerModelConfig,
 }
+
+impl std::fmt::Debug for ModelEntryConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelEntryConfig")
+            .field("id_present", &self.id.is_some())
+            .field("model_present", &!self.model.is_empty())
+            .field("base_url_present", &!self.base_url.is_empty())
+            .field("name_present", &self.name.is_some())
+            .field("description_present", &self.description.is_some())
+            .field("max_completion_tokens", &self.max_completion_tokens)
+            .field("temperature", &self.temperature)
+            .field("top_p", &self.top_p)
+            .field("api_key_present", &self.api_key.is_some())
+            .field("env_key_present", &self.env_key.is_some())
+            .field("api_backend", &self.api_backend)
+            .field("auth_scheme", &self.auth_scheme)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("supports_reasoning_effort", &self.supports_reasoning_effort)
+            .field(
+                "reasoning_efforts_present",
+                &!self.reasoning_efforts.is_empty(),
+            )
+            .field("extra_headers_present", &!self.extra_headers.is_empty())
+            .field("context_window", &self.context_window)
+            .field(
+                "auto_compact_threshold_percent",
+                &self.auto_compact_threshold_percent,
+            )
+            .field(
+                "system_prompt_label_present",
+                &self.system_prompt_label.is_some(),
+            )
+            .field("api_base_url_present", &self.api_base_url.is_some())
+            .field("use_concise", &self.use_concise)
+            .field("agent_type_present", &!self.agent_type.is_empty())
+            .field(
+                "inference_idle_timeout_secs",
+                &self.inference_idle_timeout_secs,
+            )
+            .field("max_retries", &self.max_retries)
+            .field("hidden", &self.hidden)
+            .field("supported_in_api", &self.supported_in_api)
+            .field("supports_backend_search", &self.supports_backend_search)
+            .field("compactions_remaining", &self.compactions_remaining)
+            .field("compaction_at_tokens", &self.compaction_at_tokens)
+            .field("show_model_fingerprint", &self.show_model_fingerprint)
+            .field("stream_tool_calls", &self.stream_tool_calls)
+            .field("laziness_detector", &self.laziness_detector)
+            .finish()
+    }
+}
 /// True when `cfg` equals the all-disabled default. Derives `PartialEq`
 /// on `f32`, which is fine for the current shape because both `f32`
 /// fields default to `None` — there's no parsed-vs-literal `0.7` float
@@ -4021,7 +4260,8 @@ fn is_default_laziness_detector(cfg: &LazinessDetectorPerModelConfig) -> bool {
 /// from defaults/prefetched"; the collection fields (`extra_headers`,
 /// `reasoning_efforts`) merge only when non-empty and so cannot express
 /// "override to empty."
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Deserialize, Default)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(default)]
 pub struct ConfigModelOverride {
     pub model: Option<String>,
@@ -4077,6 +4317,63 @@ pub struct ConfigModelOverride {
     /// fail-closed at resolve time instead of defaulting to Bearer.
     #[serde(skip)]
     pub(crate) invalid_auth_scheme: Option<String>,
+}
+
+impl std::fmt::Debug for ConfigModelOverride {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfigModelOverride")
+            .field("model_present", &self.model.is_some())
+            .field("base_url_present", &self.base_url.is_some())
+            .field("name_present", &self.name.is_some())
+            .field("description_present", &self.description.is_some())
+            .field("api_key_present", &self.api_key.is_some())
+            .field("env_key_present", &self.env_key.is_some())
+            .field("auth_provider_present", &self.auth_provider.is_some())
+            .field("model_provider_present", &self.model_provider.is_some())
+            .field("api_base_url_present", &self.api_base_url.is_some())
+            .field("max_completion_tokens", &self.max_completion_tokens)
+            .field("temperature", &self.temperature)
+            .field("top_p", &self.top_p)
+            .field("api_backend", &self.api_backend)
+            .field("auth_scheme", &self.auth_scheme)
+            .field("extra_headers_present", &!self.extra_headers.is_empty())
+            .field("query_params_present", &!self.query_params.is_empty())
+            .field(
+                "env_http_headers_present",
+                &!self.env_http_headers.is_empty(),
+            )
+            .field("context_window", &self.context_window)
+            .field(
+                "auto_compact_threshold_percent",
+                &self.auto_compact_threshold_percent,
+            )
+            .field(
+                "system_prompt_label_present",
+                &self.system_prompt_label.is_some(),
+            )
+            .field("use_concise", &self.use_concise)
+            .field("agent_type_present", &self.agent_type.is_some())
+            .field(
+                "inference_idle_timeout_secs",
+                &self.inference_idle_timeout_secs,
+            )
+            .field("max_retries", &self.max_retries)
+            .field("hidden", &self.hidden)
+            .field("supported_in_api", &self.supported_in_api)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("supports_reasoning_effort", &self.supports_reasoning_effort)
+            .field("reasoning_efforts", &self.reasoning_efforts)
+            .field("supports_backend_search", &self.supports_backend_search)
+            .field("compactions_remaining", &self.compactions_remaining)
+            .field("compaction_at_tokens", &self.compaction_at_tokens)
+            .field("show_model_fingerprint", &self.show_model_fingerprint)
+            .field("stream_tool_calls", &self.stream_tool_calls)
+            .field(
+                "invalid_auth_scheme_present",
+                &self.invalid_auth_scheme.is_some(),
+            )
+            .finish()
+    }
 }
 impl ConfigModelOverride {
     pub(crate) fn apply(
@@ -4200,7 +4497,7 @@ impl ConfigModelOverride {
     }
 }
 /// Shared model metadata — the common fields across all model sources.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModelInfo {
     /// Stable unique identifier for this catalog entry.
     /// Falls back to `model` when absent.
@@ -4272,6 +4569,54 @@ pub struct ModelInfo {
     /// injecting nudges. See [`LazinessDetectorPerModelConfig`].
     #[serde(default)]
     pub laziness_detector: LazinessDetectorPerModelConfig,
+}
+
+impl std::fmt::Debug for ModelInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelInfo")
+            .field("id_present", &self.id.is_some())
+            .field("model_present", &!self.model.is_empty())
+            .field("base_url_present", &!self.base_url.is_empty())
+            .field("name_present", &self.name.is_some())
+            .field("description_present", &self.description.is_some())
+            .field("max_completion_tokens", &self.max_completion_tokens)
+            .field("temperature", &self.temperature)
+            .field("top_p", &self.top_p)
+            .field("api_backend", &self.api_backend)
+            .field("auth_scheme", &self.auth_scheme)
+            .field("extra_headers_count", &self.extra_headers.len())
+            .field("query_params_count", &self.query_params.len())
+            .field("env_http_headers_count", &self.env_http_headers.len())
+            .field("context_window", &self.context_window)
+            .field(
+                "auto_compact_threshold_percent",
+                &self.auto_compact_threshold_percent,
+            )
+            .field(
+                "system_prompt_label_present",
+                &self.system_prompt_label.is_some(),
+            )
+            .field("use_concise", &self.use_concise)
+            .field("agent_type_present", &!self.agent_type.is_empty())
+            .field(
+                "inference_idle_timeout_secs",
+                &self.inference_idle_timeout_secs,
+            )
+            .field("max_retries", &self.max_retries)
+            .field("hidden", &self.hidden)
+            .field("user_selectable", &self.user_selectable)
+            .field("supported_in_api", &self.supported_in_api)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("supports_reasoning_effort", &self.supports_reasoning_effort)
+            .field("reasoning_efforts_count", &self.reasoning_efforts.len())
+            .field("supports_backend_search", &self.supports_backend_search)
+            .field("compactions_remaining", &self.compactions_remaining)
+            .field("compaction_at_tokens", &self.compaction_at_tokens)
+            .field("show_model_fingerprint", &self.show_model_fingerprint)
+            .field("stream_tool_calls", &self.stream_tool_calls)
+            .field("laziness_detector", &self.laziness_detector)
+            .finish()
+    }
 }
 impl ModelInfo {
     /// Minimal fallback descriptor for an unknown model slug.
@@ -4382,7 +4727,7 @@ impl ModelInfo {
 }
 /// Flat struct so credential and endpoint fields coexist after deep-merge.
 /// Routing reads fields, not provenance.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModelEntry {
     pub info: ModelInfo,
     pub api_key: Option<String>,
@@ -4397,6 +4742,22 @@ pub struct ModelEntry {
     /// Config validation failures (e.g. invalid `auth_scheme`) that make the model unready.
     #[serde(default, skip_serializing)]
     pub config_validation_errors: Vec<String>,
+}
+
+impl std::fmt::Debug for ModelEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelEntry")
+            .field("info", &self.info)
+            .field("api_key_present", &self.api_key.is_some())
+            .field("env_key_present", &self.env_key.is_some())
+            .field("auth_provider_present", &self.auth_provider.is_some())
+            .field("api_base_url_present", &self.api_base_url.is_some())
+            .field(
+                "config_validation_error_count",
+                &self.config_validation_errors.len(),
+            )
+            .finish()
+    }
 }
 impl ModelEntry {
     /// Minimal fallback entry for an unknown model slug.
@@ -4916,7 +5277,7 @@ pub fn enforce_disable_api_key_auth(
             None,
             Some(serde_json::json!({
                 "replaced_with_session": session_key.is_some(),
-                "base_url": creds.base_url,
+                "base_url_configured": !creds.base_url.is_empty(),
             })),
         );
     }
@@ -4933,7 +5294,6 @@ fn resolve_credentials_enforced(
     enforce_disable_api_key_auth(&mut credentials, disable_api_key_auth, session_key);
     credentials
 }
-pub use xai_grok_telemetry::config::deployment_id_from_key;
 /// Try to resolve credentials for a model by loading the effective config.
 /// Returns `None` (with a warning) if config loading, parsing, or model
 /// lookup fails. `session_key` should only be passed when `auth_type` is
@@ -4943,10 +5303,10 @@ pub fn try_resolve_model_credentials(
     session_key: Option<&str>,
 ) -> Option<ResolvedCredentials> {
     let raw = crate::config::load_effective_config()
-        .map_err(|e| tracing::warn!(error = %e, "config load failed for credential resolution"))
+        .map_err(|_| tracing::warn!("config load failed for credential resolution"))
         .ok()?;
     let cfg = Config::new_from_toml_cfg(&raw)
-        .map_err(|e| tracing::warn!(error = %e, "config parse failed for credential resolution"))
+        .map_err(|_| tracing::warn!("config parse failed for credential resolution"))
         .ok()?;
     let models = resolve_model_list(&cfg, None);
     let entry = find_model_by_id(&models, model_id)?;
@@ -5641,6 +6001,143 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use xai_grok_test_support::EnvGuard;
+
+    fn assert_no_secret_windows(rendered: &str, secret: &str) {
+        assert!(!rendered.contains(secret));
+        for window in secret.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(
+                !rendered.contains(window),
+                "leaked sentinel window: {window}"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_and_model_override_debug_are_presence_only() {
+        let secret = "GB002-shell-config-secret-0123456789abcdef";
+        let secret_url = format!("https://user:{secret}@example.test/?token={secret}");
+        let endpoints = EndpointsConfig {
+            cli_chat_proxy_base_url: Some(secret_url.clone()),
+            xai_api_base_url: secret_url.clone(),
+            alpha_test_key: Some(secret.to_owned()),
+            models_base_url: Some(secret_url.clone()),
+            models_list_url: Some(secret_url.clone()),
+            feedback_base_url: Some(secret_url.clone()),
+            trace_upload_url: Some(secret_url.clone()),
+            trace_upload_bucket: Some(secret.to_owned()),
+            trace_upload_region: Some(secret.to_owned()),
+            trace_upload_credentials_file: Some(secret.to_owned()),
+            trace_upload_credentials: Some(secret.to_owned()),
+            trace_upload_endpoint_url: Some(secret_url.clone()),
+            deployment_key: Some(secret.to_owned()),
+            managed_config_url: Some(secret_url.clone()),
+            otel_exporter_otlp_endpoint: Some(secret_url.clone()),
+            otel_exporter_otlp_traces_endpoint: Some(secret_url.clone()),
+            otel_exporter_otlp_headers: Some(secret.to_owned()),
+            grok_internal_otlp_traces_endpoint: Some(secret_url.clone()),
+            grok_internal_otlp_headers: Some(secret.to_owned()),
+            otel_traces_exporter: Some(secret.to_owned()),
+            asset_server_url: secret_url.clone(),
+            management_api_key: Some(secret.to_owned()),
+            gcs_service_account_key: Some(secret.to_owned()),
+            ..EndpointsConfig::default()
+        };
+        assert_no_secret_windows(&format!("{endpoints:?}"), secret);
+
+        let model = ConfigModelOverride {
+            model: Some(secret.to_owned()),
+            base_url: Some(secret_url.clone()),
+            name: Some(secret.to_owned()),
+            description: Some(secret.to_owned()),
+            api_key: Some(secret.to_owned()),
+            env_key: Some(EnvKeys::single(secret)),
+            auth_provider: Some(secret.to_owned()),
+            model_provider: Some(secret.to_owned()),
+            api_base_url: Some(secret_url),
+            extra_headers: IndexMap::from([("Authorization".to_owned(), secret.to_owned())]),
+            query_params: IndexMap::from([("token".to_owned(), secret.to_owned())]),
+            env_http_headers: IndexMap::from([("X-Secret".to_owned(), secret.to_owned())]),
+            system_prompt_label: Some(secret.to_owned()),
+            agent_type: Some(secret.to_owned()),
+            invalid_auth_scheme: Some(secret.to_owned()),
+            ..ConfigModelOverride::default()
+        };
+        assert_no_secret_windows(&format!("{model:?}"), secret);
+        let mut entry = default_models(&EndpointsConfig::default())
+            .into_values()
+            .next()
+            .expect("bundled model entry");
+        entry.id = Some(secret.to_owned());
+        entry.model = secret.to_owned();
+        entry.base_url = format!("https://user:{secret}@example.test/?token={secret}");
+        entry.name = Some(secret.to_owned());
+        entry.description = Some(secret.to_owned());
+        entry.api_key = Some(secret.to_owned());
+        entry.env_key = Some(EnvKeys::single(secret));
+        entry.extra_headers = IndexMap::from([("Authorization".to_owned(), secret.to_owned())]);
+        entry.system_prompt_label = Some(secret.to_owned());
+        entry.api_base_url = Some(format!("https://example.test/?key={secret}"));
+        entry.agent_type = secret.to_owned();
+        assert_no_secret_windows(&format!("{entry:?}"), secret);
+
+        let models = ModelsConfig {
+            default: Some(secret.to_owned()),
+            pre_campaign_default: Some(secret.to_owned()),
+            web_search: Some(secret.to_owned()),
+            session_summary: Some(secret.to_owned()),
+            image_description: Some(secret.to_owned()),
+            prompt_suggestion: Some(secret.to_owned()),
+            allowed_models: Some(vec![secret.to_owned()]),
+            hidden_models: Some(vec![secret.to_owned()]),
+            disabled_models: Some(vec![secret.to_owned()]),
+            agent_type: Some(secret.to_owned()),
+            extra_headers: IndexMap::from([("Authorization".to_owned(), secret.to_owned())]),
+            ..ModelsConfig::default()
+        };
+        assert_no_secret_windows(&format!("{models:?}"), secret);
+
+        let remote = RemoteConfig {
+            secret: Some(secret.to_owned()),
+        };
+        assert_no_secret_windows(&format!("{remote:?}"), secret);
+
+        let mut model_info = ModelInfo::from_config(&entry);
+        model_info.query_params = IndexMap::from([("access_token".to_owned(), secret.to_owned())]);
+        model_info.env_http_headers =
+            IndexMap::from([("X-Environment-Secret".to_owned(), secret.to_owned())]);
+        assert_no_secret_windows(&format!("{model_info:?}"), secret);
+
+        let mut model_entry = ModelEntry::from_config_entry(&entry);
+        model_entry.info = model_info;
+        model_entry.auth_provider =
+            Some(crate::auth::AuthProviderRef::unresolved(secret.to_owned()));
+        model_entry.config_validation_errors = vec![secret.to_owned()];
+        assert_no_secret_windows(&format!("{model_entry:?}"), secret);
+    }
+
+    #[test]
+    fn cli_config_debug_does_not_expose_registry_url_credentials() {
+        const SECRET: &str = "GB002CLI-Q7w5E3r1T9y7Z6x4C2v8";
+        let secret_url = format!("https://user:{SECRET}@registry.example.test/npm?token={SECRET}");
+        let cli = CliConfig {
+            dismissed_version: Some(SECRET.to_owned()),
+            installer: Some(SECRET.to_owned()),
+            npm_registry: Some(secret_url),
+            channel: Some(SECRET.to_owned()),
+            worktree_type: Some(SECRET.to_owned()),
+            minimum_version: Some(SECRET.to_owned()),
+            maximum_version: Some(SECRET.to_owned()),
+            required_minimum_version: Some(SECRET.to_owned()),
+            required_maximum_version: Some(SECRET.to_owned()),
+            ..CliConfig::default()
+        };
+
+        let debug = format!("{cli:?}");
+        assert!(debug.contains("npm_registry_present: true"), "{debug}");
+        assert_no_secret_windows(&debug, SECRET);
+    }
+
     #[test]
     fn main_cli_tools_override_preserves_profile_injection_policy() {
         let overrides = CliAgentOverrides {

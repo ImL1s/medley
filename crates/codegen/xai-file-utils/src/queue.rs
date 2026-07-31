@@ -10,7 +10,7 @@
 //! The circuit breaker pauses dispatch (not in-flight tasks) when too many failures
 //! accumulate without any successes.
 use crate::gcs::{StorageConfig, upload_bytes, upload_file, upload_stream};
-use crate::storage_client::{Auth401AttributionCallback, HttpUploadError};
+use crate::storage_client::{Auth401AttributionCallback, HttpUploadError, StorageOperation};
 use crate::{BlobCompression, TraceExportConfig, UploadMethod};
 use anyhow::Context;
 use async_compression::tokio::bufread::ZstdEncoder;
@@ -25,7 +25,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tracing::Instrument;
 use xai_circuit_breaker::{Disposition, RetryPolicy};
-use xai_grok_auth::AuthCredentialProvider;
+use xai_grok_auth::{AuthCredentialProvider, CredentialComparison};
 /// Resolves current upload credentials at upload time, plus optional
 /// hooks the queue worker uses to wire refresh-aware credentials and
 /// `auth_401_attribution` emission into the per-upload `StorageClient`.
@@ -64,20 +64,17 @@ pub trait TraceExportSource: Send + Sync {
     fn proxy_http_client(&self) -> Option<reqwest::Client> {
         None
     }
-    /// Park-on-401 recovery signal: a future resolving `true` iff credentials
-    /// changed within `timeout`. `failed_bearer` is the token the rejected
-    /// attempt used — implementations must resolve `true` immediately when
-    /// the current credential already differs, or a rotation landing between
-    /// wait slices is missed and retry stalls until the probe interval.
+    /// Park-on-401 recovery signal driven only by the secret-free comparison
+    /// captured from the rejected final request attempt.
     /// `None` (the default) means no recovery is possible — static creds,
     /// S3/direct mode, or IdP-confirmed permanent failure — and the worker
     /// drops the auth-failed item immediately instead of parking it.
     fn wait_for_auth_recovery(
         &self,
-        failed_bearer: Option<&str>,
+        comparison: CredentialComparison,
         timeout: Duration,
     ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>>> {
-        let _ = (failed_bearer, timeout);
+        let _ = (comparison, timeout);
         None
     }
     /// Whether the resolver holds a credential worth a real wire attempt — an
@@ -93,37 +90,47 @@ pub trait TraceExportSource: Send + Sync {
 /// rotation between attempts is reflected on the next try.
 struct ResolvedStorageConfig {
     config: TraceExportConfig,
-    attribution: Option<Arc<dyn Auth401AttributionCallback>>,
+    attribution: Arc<RelationCapture>,
     credentials: Option<Arc<dyn AuthCredentialProvider>>,
     http_client: Option<reqwest::Client>,
 }
+
+struct RelationCapture {
+    comparison: Mutex<Option<CredentialComparison>>,
+    delegate: Option<Arc<dyn Auth401AttributionCallback>>,
+}
+
+impl std::fmt::Debug for RelationCapture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelationCapture").finish_non_exhaustive()
+    }
+}
+
+impl Auth401AttributionCallback for RelationCapture {
+    fn record_401(&self, operation: StorageOperation, comparison: CredentialComparison) {
+        *self.comparison.lock().unwrap() = Some(comparison);
+        if let Some(delegate) = &self.delegate {
+            delegate.record_401(operation, comparison);
+        }
+    }
+}
+
 impl ResolvedStorageConfig {
     /// Resolve config with fresh auth via `resolve_async`.
     async fn from_resolver_async(resolver: &Arc<dyn TraceExportSource>) -> Self {
+        let attribution = Arc::new(RelationCapture {
+            comparison: Mutex::new(None),
+            delegate: resolver.proxy_attribution(),
+        });
         Self {
             config: resolver.resolve_async().await,
-            attribution: resolver.proxy_attribution(),
+            attribution,
             credentials: resolver.proxy_credentials(),
             http_client: resolver.proxy_http_client(),
         }
     }
-    /// Bearer this resolved config puts on the wire — `snapshot()` mirrors
-    /// `HttpAuth::apply` for provider-backed configs; the static fallback
-    /// mirrors `GrokAuthCredentials::apply` precedence (deployment key wins).
-    fn wire_bearer(&self) -> Option<String> {
-        if let Some(ref creds) = self.credentials {
-            return creds.snapshot().token;
-        }
-        match self.config.upload_method() {
-            UploadMethod::Proxy {
-                user_token,
-                deployment_key,
-                ..
-            } => deployment_key
-                .clone()
-                .or_else(|| (!user_token.is_empty()).then(|| user_token.clone())),
-            _ => None,
-        }
+    fn take_auth_comparison(&self) -> Option<CredentialComparison> {
+        self.attribution.comparison.lock().unwrap().take()
     }
 }
 impl StorageConfig for ResolvedStorageConfig {
@@ -134,7 +141,7 @@ impl StorageConfig for ResolvedStorageConfig {
         self.config.upload_method()
     }
     fn proxy_attribution(&self) -> Option<Arc<dyn Auth401AttributionCallback>> {
-        self.attribution.clone()
+        Some(self.attribution.clone())
     }
     fn proxy_credentials(&self) -> Option<Arc<dyn AuthCredentialProvider>> {
         self.credentials.clone()
@@ -2040,12 +2047,12 @@ async fn upload_with_retries(
 ) -> anyhow::Result<(String, BlobCompression, u64)> {
     let should_compress = item.compress && original_size >= COMPRESS_MIN_BYTES;
     let mut auth_retried = false;
+    let mut relation_retried = false;
     let mut parked = false;
     loop {
         item.attempts += 1;
         let wrapped = ResolvedStorageConfig::from_resolver_async(resolver).await;
         let last_wire_attempt = Instant::now();
-        let attempt_bearer = wrapped.wire_bearer();
         let result = if should_compress {
             stream_compress_upload(&wrapped, &item.gcs_path, item.source.path()).await
         } else {
@@ -2058,6 +2065,9 @@ async fn upload_with_retries(
             .await
             .map(|url| (url, BlobCompression::None, original_size))
         };
+        let auth_comparison = wrapped
+            .take_auth_comparison()
+            .unwrap_or_else(|| CredentialComparison::not_sent(false));
         match result {
             Ok(r) => {
                 tracing::debug!(attempt = item.attempts, "Upload queue item succeeded");
@@ -2082,7 +2092,13 @@ async fn upload_with_retries(
                         auth_retried = true;
                         continue;
                     }
-                    let failed_bearer = attempt_bearer;
+                    if auth_comparison.relation
+                        == xai_grok_auth::SentCredentialRelation::DifferentFromCurrent
+                        && !relation_retried
+                    {
+                        relation_retried = true;
+                        continue;
+                    }
                     if let Some(p) = permit.as_deref_mut() {
                         p.release();
                     }
@@ -2107,10 +2123,9 @@ async fn upload_with_retries(
                             }
                             break;
                         }
-                        let Some(wait) = resolver.wait_for_auth_recovery(
-                            failed_bearer.as_deref(),
-                            AUTH_PARK_WAIT_INTERVAL,
-                        ) else {
+                        let Some(wait) = resolver
+                            .wait_for_auth_recovery(auth_comparison, AUTH_PARK_WAIT_INTERVAL)
+                        else {
                             tracing::warn!(
                                 attempt = item.attempts,
                                 parked,
@@ -4229,7 +4244,7 @@ mod tests {
         token_gen: tokio::sync::watch::Sender<u64>,
         hook_enabled: bool,
         wait_slice: Duration,
-        seen_bearers: Mutex<Vec<Option<String>>>,
+        seen_comparisons: Mutex<Vec<CredentialComparison>>,
         usable: std::sync::atomic::AtomicBool,
     }
     impl ParkingResolver {
@@ -4239,7 +4254,7 @@ mod tests {
                 token_gen: tokio::sync::watch::channel(0).0,
                 hook_enabled: true,
                 wait_slice: Duration::from_millis(10),
-                seen_bearers: Mutex::new(Vec::new()),
+                seen_comparisons: Mutex::new(Vec::new()),
                 usable: std::sync::atomic::AtomicBool::new(true),
             }
         }
@@ -4272,14 +4287,11 @@ mod tests {
         }
         fn wait_for_auth_recovery(
             &self,
-            failed_bearer: Option<&str>,
+            comparison: CredentialComparison,
             _timeout: Duration,
         ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>>>
         {
-            self.seen_bearers
-                .lock()
-                .unwrap()
-                .push(failed_bearer.map(str::to_owned));
+            self.seen_comparisons.lock().unwrap().push(comparison);
             if !self.hook_enabled {
                 return None;
             }
@@ -4415,9 +4427,9 @@ mod tests {
         assert!(result.is_ok(), "upload succeeds after recovery: {result:?}");
         assert_eq!(state.request_count.load(Ordering::SeqCst), 3);
         assert_eq!(
-            resolver.seen_bearers.lock().unwrap().first(),
-            Some(&Some("test-token".to_owned())),
-            "hook receives the bearer the rejected attempt used"
+            resolver.seen_comparisons.lock().unwrap().first(),
+            Some(&CredentialComparison::same_as_current()),
+            "hook receives the safe final-attempt comparison"
         );
     }
     /// Recovery detection must be level-triggered: the park loop rebuilds its
@@ -4431,7 +4443,10 @@ mod tests {
         let resolver = ParkingResolver::new(url);
         resolver.signal_recovery();
         let wait = resolver
-            .wait_for_auth_recovery(Some("test-token"), AUTH_PARK_WAIT_INTERVAL)
+            .wait_for_auth_recovery(
+                CredentialComparison::same_as_current(),
+                AUTH_PARK_WAIT_INTERVAL,
+            )
             .expect("hook enabled");
         assert!(
             wait.await,

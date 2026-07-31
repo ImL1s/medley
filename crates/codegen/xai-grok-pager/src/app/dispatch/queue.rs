@@ -309,7 +309,7 @@ pub(super) fn maybe_drain_queue(agent: &mut AgentView) -> QueueDrain {
         remaining = agent.session.pending_prompts.len(),
         shared_queue_len = agent.shared_queue.len(),
         session = session_id.0.as_ref(),
-        text = %queued.text.chars().take(48).collect::<String>(),
+        text_len = queued.text.len(),
         "draining prompt LOCALLY as a new running turn",
     );
 
@@ -776,7 +776,7 @@ pub(crate) fn apply_turn_start_shim(
         skip_entry_top,
         prev_current_prompt_id = agent.session.current_prompt_id.as_deref().unwrap_or(""),
         shared_queue_len = agent.shared_queue.len(),
-        text = %text.as_deref().unwrap_or("").chars().take(48).collect::<String>(),
+        text_len = text.as_deref().map(str::len).unwrap_or(0),
         "adopting server-driven running turn (turn-start shim)",
     );
     agent.start_turn_boundary(Some(&prompt_id));

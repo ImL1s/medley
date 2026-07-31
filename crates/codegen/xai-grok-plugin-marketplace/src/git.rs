@@ -79,8 +79,8 @@ pub fn sync_source_cache_with_mode(
         Ok(()) => {
             tracing::debug!(mode = ?mode, elapsed_ms = start.elapsed().as_millis(), "marketplace cache sync complete")
         }
-        Err(error) => {
-            tracing::warn!(mode = ?mode, elapsed_ms = start.elapsed().as_millis(), error = %error, "marketplace cache sync failed")
+        Err(_) => {
+            tracing::warn!(mode = ?mode, elapsed_ms = start.elapsed().as_millis(), error_class = "git_sync_failed", "marketplace cache sync failed")
         }
     }
     result?;
@@ -105,8 +105,11 @@ fn sync_cache_locked(
         if mode == SyncMode::UseTtl && is_cache_fresh(cache_dir) {
             return Ok(());
         }
-        fetch_reset_cached_repo(cache_dir, branch).or_else(|e| {
-            tracing::warn!(error = %e, "git fetch/reset failed, re-cloning marketplace cache");
+        fetch_reset_cached_repo(cache_dir, branch).or_else(|_| {
+            tracing::warn!(
+                error_class = "git_fetch_reset_failed",
+                "git fetch/reset failed, re-cloning marketplace cache"
+            );
             reclone_repo(url, branch, cache_dir)
         })
     } else {
@@ -298,7 +301,7 @@ fn run_git_timed(cmd: &mut Command, what: &str, timeout: Duration) -> Result<(),
     #[allow(clippy::disallowed_methods)] // git command, killed and reaped on timeout
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("failed to run git {what}: {e}"))?;
+        .map_err(|_| format!("failed to start git {what}"))?;
     match child.wait_timeout(timeout) {
         Ok(Some(status)) => {
             let mut stderr = Vec::new();
@@ -309,7 +312,6 @@ fn run_git_timed(cmd: &mut Command, what: &str, timeout: Duration) -> Result<(),
                 Ok(())
             } else {
                 let stderr = String::from_utf8_lossy(&stderr);
-                tracing::debug!("git {what} stderr: {stderr}");
                 Err(git_failure_message(what, &stderr))
             }
         }
@@ -318,18 +320,15 @@ fn run_git_timed(cmd: &mut Command, what: &str, timeout: Duration) -> Result<(),
             let _ = child.wait();
             Err(format!("git {what} timed out after {}s", timeout.as_secs()))
         }
-        Err(e) => {
+        Err(_) => {
             let _ = child.kill();
             let _ = child.wait();
-            Err(format!("failed to wait for git {what}: {e}"))
+            Err(format!("failed to wait for git {what}"))
         }
     }
 }
 
-/// Condense git stderr into a user-facing failure message. git writes
-/// progress ("Cloning into ...") to stderr alongside real errors, so keep
-/// only `fatal:`/`error:` lines, and translate the prompts-disabled auth
-/// failure (we set GIT_TERMINAL_PROMPT=0 / ssh BatchMode) out of git-speak.
+/// Classify git stderr without returning any subprocess-controlled text.
 fn git_failure_message(what: &str, stderr: &str) -> String {
     const AUTH_PATTERNS: [&str; 3] = [
         "could not read Username",
@@ -341,15 +340,7 @@ fn git_failure_message(what: &str, stderr: &str) -> String {
             "git {what} failed: authentication required or not a git repository (check the URL)"
         );
     }
-    let salient: Vec<&str> = stderr
-        .lines()
-        .filter(|line| line.starts_with("fatal:") || line.starts_with("error:"))
-        .collect();
-    if salient.is_empty() {
-        format!("git {what} failed: {}", stderr.trim())
-    } else {
-        format!("git {what} failed: {}", salient.join("; "))
-    }
+    format!("git {what} failed")
 }
 
 fn fetch_reset_cached_repo(repo_dir: &Path, branch: Option<&str>) -> Result<(), String> {
@@ -378,6 +369,20 @@ fn fetch_reset_cached_repo(repo_dir: &Path, branch: Option<&str>) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_sentinel_absent(rendered: &str, sentinel: &str) {
+        assert!(
+            !rendered.contains(sentinel),
+            "full sentinel leaked: {rendered}"
+        );
+        for window in sentinel.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).unwrap();
+            assert!(
+                !rendered.contains(window),
+                "sentinel window {window:?} leaked: {rendered}"
+            );
+        }
+    }
 
     #[test]
     fn cache_hash_is_deterministic() {
@@ -508,20 +513,20 @@ mod tests {
     }
 
     #[test]
-    fn git_failure_message_keeps_only_fatal_and_error_lines() {
-        let stderr =
-            "Cloning into '/tmp/x'...\nfatal: repository 'https://example.com/x.git/' not found\n";
-        assert_eq!(
-            git_failure_message("clone", stderr),
-            "git clone failed: fatal: repository 'https://example.com/x.git/' not found"
-        );
+    fn git_failure_message_never_echoes_url_or_stderr() {
+        let sentinel = "TOKEN-0123456789abcdef";
+        let url = format!("https://user:{sentinel}@host.example/repo.git");
+        let stderr = format!("fatal: repository '{url}' failed with {sentinel}\n");
+        let message = git_failure_message("clone", &stderr);
+        assert_eq!(message, "git clone failed");
+        assert_sentinel_absent(&message, sentinel);
     }
 
     #[test]
-    fn git_failure_message_falls_back_to_raw_stderr() {
+    fn git_failure_message_uses_fixed_fallback() {
         assert_eq!(
             git_failure_message("fetch", "something unusual\n"),
-            "git fetch failed: something unusual"
+            "git fetch failed"
         );
     }
 

@@ -17,6 +17,7 @@ pub(super) fn ensure_crypto_provider() {
     let _ = jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER.install_default();
 }
 pub(super) fn generate_test_rsa_key() -> (String, String, String) {
+    ensure_crypto_provider();
     use rsa::pkcs8::EncodePrivateKey;
     use rsa::traits::PublicKeyParts;
     let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();

@@ -24,7 +24,7 @@ impl SessionActor {
                 Some(self.session_info.id.0.as_ref()),
                 Some(serde_json::json!({
                     "method": method.map(|id| id.0.as_ref()),
-                    "error": format!("{err}"),
+                    "error_class": "auth_rejected",
                 })),
             );
             return acp::Error::auth_required().data(msg);
@@ -119,10 +119,10 @@ impl SessionActor {
         const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         let (prefix, source) = match tokio::time::timeout(WAIT_TIMEOUT, &mut handle).await {
             Ok(Ok(p)) => (p, "background"),
-            Ok(Err(join_err)) => {
+            Ok(Err(_)) => {
                 tracing::warn!(
                     session_id = %self.session_info.id.0,
-                    error = %join_err,
+                    error_class = "background_task_failed",
                     "ensure_prefix_ready: background task panicked, sync fallback"
                 );
                 (self.build_user_message_prefix().await, "sync_fallback")
@@ -428,16 +428,22 @@ impl SessionActor {
             .timeout(std::time::Duration::from_secs(5));
         let built = match request.build() {
             Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to build idle-refresh models request");
+            Err(_) => {
+                tracing::warn!(
+                    error_class = "request_build_failed",
+                    "Failed to build idle-refresh models request"
+                );
                 return;
             }
         };
-        let (response, stamp) =
-            match xai_grok_auth::execute_with_stamp(&middleware_client, built).await {
+        let (response, comparison) =
+            match xai_grok_auth::execute_with_auth_relation(&middleware_client, built).await {
                 Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to fetch models for idle refresh");
+                Err(_) => {
+                    tracing::warn!(
+                        error_class = "request_transport_failed",
+                        "Failed to fetch models for idle refresh"
+                    );
                     return;
                 }
             };
@@ -445,9 +451,8 @@ impl SessionActor {
             crate::auth::attribution::record_consumer_401(
                 am,
                 None,
-                crate::auth::attribution::ConsumerKind::IdleResumeModelRefresh,
-                "",
-                stamp.as_ref().map(|s| s.0.as_str()),
+                xai_grok_telemetry::unified_log::CredentialDiagnosticConsumer::IdleResumeModelRefresh,
+                comparison,
             );
         }
         let result = if !response.status().is_success() {

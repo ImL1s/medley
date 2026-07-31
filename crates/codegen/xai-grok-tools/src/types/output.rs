@@ -59,7 +59,7 @@ impl From<serde_json::Value> for DynamicOutput {
 /// `image_edit`), so consumers read it directly instead of scraping the prose.
 /// A struct (not a bare `PathBuf`) is required: `ToolOutput` is internally
 /// tagged and only accepts map payloads.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaGenOutput {
     /// Absolute path to the saved media file. Empty for [`Self::uploaded`].
     pub path: PathBuf,
@@ -73,6 +73,16 @@ pub struct MediaGenOutput {
     /// output) and is not available locally; omitted otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uploaded_url: Option<String>,
+}
+impl std::fmt::Debug for MediaGenOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaGenOutput")
+            .field("path_present", &!self.path.as_os_str().is_empty())
+            .field("filename_present", &!self.filename.is_empty())
+            .field("session_folder_present", &!self.session_folder.is_empty())
+            .field("uploaded_url_present", &self.uploaded_url.is_some())
+            .finish()
+    }
 }
 impl MediaGenOutput {
     pub fn new(path: PathBuf) -> Self {
@@ -1463,10 +1473,18 @@ mod tests {
     }
     #[test]
     fn media_gen_output_uploaded() {
-        let url = "https://files.example.com/team/video-abc.mp4";
-        let output = ToolOutput::ImageToVideo(MediaGenOutput::uploaded(url.to_string()));
+        let sentinel = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+        let url = format!("https://files.example.com/team/video-abc.mp4?token={sentinel}");
+        let media = MediaGenOutput::uploaded(url.clone());
+        let debug = format!("{media:?}");
+        assert!(!debug.contains(sentinel));
+        for window in sentinel.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).unwrap();
+            assert!(!debug.contains(fragment));
+        }
+        let output = ToolOutput::ImageToVideo(media);
         let prompt = output.to_prompt_format();
-        assert!(prompt.contains(url), "prompt must include the upload URL");
+        assert!(prompt.contains(&url), "prompt must include the upload URL");
         assert!(
             prompt.contains("not available locally"),
             "prompt must tell the model the file is remote-only"
@@ -1484,7 +1502,7 @@ mod tests {
         let ToolOutput::ImageToVideo(m) = serde_json::from_value(json).unwrap() else {
             panic!("unexpected variant");
         };
-        assert_eq!(m, MediaGenOutput::uploaded(url.to_string()));
+        assert_eq!(m, MediaGenOutput::uploaded(url));
     }
     #[test]
     fn read_file_not_found_json() {

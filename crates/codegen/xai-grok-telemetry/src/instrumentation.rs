@@ -337,15 +337,8 @@ where
 /// invoking the default hook.  Call this once, early in `main`, after the
 /// tracing subscriber has been installed.
 pub fn install_panic_hook() {
-    let default_hook = std::panic::take_hook();
+    let _default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let message = if let Some(s) = info.payload().downcast_ref::<&str>() {
-            s.to_string()
-        } else if let Some(s) = info.payload().downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "unknown panic".to_string()
-        };
         let location = info
             .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
@@ -369,11 +362,16 @@ pub fn install_panic_hook() {
         });
         tracing::error!(
             error_type = "panic",
-            panic.message = %message,
             panic.location = ?location,
             "Process panicked"
         );
-        default_hook(info);
+        // The standard hook renders the arbitrary panic payload. That payload
+        // may contain request bodies, URLs, or credential bytes, so emit only
+        // a fixed class plus the compile-time source location.
+        match location {
+            Some(location) => eprintln!("Process panicked at {location}"),
+            None => eprintln!("Process panicked"),
+        }
     }));
 }
 

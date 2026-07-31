@@ -24,15 +24,23 @@ const GATE_EXIT_CODE: i32 = 2;
 /// the hook still runs.
 fn hook_process_group(child: &tokio::process::Child) -> Option<Arc<ProcessGroup>> {
     let mut group = ProcessGroup::new()
-        .inspect_err(
-            |e| tracing::warn!(pid = child.id(), error = %e, "hook: no process group; not reaped on session close"),
-        )
+        .inspect_err(|_| {
+            tracing::warn!(
+                pid = child.id(),
+                error_class = "process_group",
+                "hook: no process group; not reaped on session close"
+            )
+        })
         .ok()?;
     group
         .attach(child)
-        .inspect_err(
-            |e| tracing::warn!(pid = child.id(), error = %e, "hook: process group attach failed; not reaped on session close"),
-        )
+        .inspect_err(|_| {
+            tracing::warn!(
+                pid = child.id(),
+                error_class = "process_group_attach",
+                "hook: process group attach failed; not reaped on session close"
+            )
+        })
         .ok()?;
     Some(Arc::new(group))
 }
@@ -180,7 +188,7 @@ pub async fn run_command_hook(
         Err(e) => {
             let elapsed = start.elapsed();
             return (
-                HookRunnerResult::Failed(format!("failed to spawn command: {e}")),
+                HookRunnerResult::Failed(format!("failed to spawn hook command ({:?})", e.kind())),
                 elapsed,
             );
         }
@@ -232,7 +240,7 @@ pub async fn run_command_hook(
             elapsed,
         ),
         Ok(Err(e)) => (
-            HookRunnerResult::Failed(format!("command execution failed: {e}")),
+            HookRunnerResult::Failed(format!("hook command execution failed ({:?})", e.kind())),
             elapsed,
         ),
         Ok(Ok(output)) => {
@@ -520,7 +528,8 @@ fn parse_blocking_result(
 ///   `decision: "block"` (+ `reason`), `continue: false` (+ `stopReason`), and
 ///   `hookSpecificOutput.additionalContext`.
 /// * **no JSON + exit 0**: plain allow-stop.
-/// * **no JSON + exit 2**: block, with stderr as the feedback fed to the model.
+/// * **no JSON + exit 2**: block, with stderr retained only until the dispatcher
+///   projects its presence into a closed model-feedback category.
 /// * **no JSON + any other exit code**: failure (callers fail open: the agent
 ///   stops normally).
 fn parse_stop_result(
@@ -539,13 +548,13 @@ fn parse_stop_result(
                     Err(err) => (HookRunnerResult::Failed(err), elapsed),
                 };
             }
-            Err(err) => {
+            Err(_) => {
                 // JSON-looking output that fails to parse is likely a broken
                 // decision; warn and fall back to the exit code.
                 if trimmed.starts_with('{') {
                     tracing::warn!(
                         hook_name,
-                        error = %err,
+                        error_class = "invalid_json",
                         "stop hook stdout looks like JSON but failed to parse; falling back to the exit code"
                     );
                 }

@@ -26,6 +26,20 @@ use dirs;
 
 const MAX_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 
+fn sanitize_url_for_display(raw: &str) -> String {
+    let label = match url::Url::parse(raw) {
+        Ok(parsed) => match parsed.scheme() {
+            "http" => "<configured http URL>",
+            "https" => "<configured https URL>",
+            "ws" => "<configured ws URL>",
+            "wss" => "<configured wss URL>",
+            _ => "<configured URL>",
+        },
+        Err(_) => "<configured URL>",
+    };
+    label.to_string()
+}
+
 use indexmap::IndexMap;
 
 /// Configuration for periodic auto-update checking in leader mode.
@@ -562,6 +576,7 @@ async fn run_headless_inner(
 
     // Capture the grok build URL for the first-connection callback
     let grok_code_url = format!("{}/build", ctx.grok_ws_origin);
+    let safe_url = sanitize_url_for_display(&grok_code_url);
 
     // Create first-connection callback for headless-specific behavior
     let on_first_connect: Box<dyn FnOnce() + Send + 'static> = Box::new(move || {
@@ -570,7 +585,7 @@ async fn run_headless_inner(
             eprintln!();
             eprintln!(
                 "Open Grok Build: {} (press Enter to open in browser)",
-                grok_code_url
+                safe_url
             );
             eprintln!();
             let url_for_open = grok_code_url.clone();
@@ -1883,6 +1898,58 @@ mod tests {
                 })
             }),
         }
+    }
+
+    #[test]
+    fn display_url_is_a_closed_scheme_only_projection() {
+        let sentinel = "gb002secret4c8b1a77";
+        let raw = format!(
+            "wss://user:{sentinel}@{sentinel}.example.com/{sentinel}?access_token={sentinel}#{sentinel}"
+        );
+
+        let rendered = sanitize_url_for_display(&raw);
+
+        assert_eq!(rendered, "<configured wss URL>");
+        assert!(!rendered.contains(sentinel));
+        for window in sentinel.as_bytes().windows(8) {
+            assert!(
+                !rendered
+                    .as_bytes()
+                    .windows(8)
+                    .any(|candidate| candidate == window),
+                "sanitized URL leaked an 8-byte credential fragment"
+            );
+        }
+    }
+
+    #[test]
+    fn display_url_does_not_echo_an_invalid_value() {
+        let sentinel = "invalid-url-secret-sentinel-91A0D63F";
+        assert_eq!(sanitize_url_for_display(sentinel), "<configured URL>");
+    }
+
+    #[test]
+    fn display_url_uses_only_known_scheme_labels() {
+        assert_eq!(
+            sanitize_url_for_display("http://example.com/private"),
+            "<configured http URL>"
+        );
+        assert_eq!(
+            sanitize_url_for_display("https://example.com/private"),
+            "<configured https URL>"
+        );
+        assert_eq!(
+            sanitize_url_for_display("ws://example.com/private"),
+            "<configured ws URL>"
+        );
+        assert_eq!(
+            sanitize_url_for_display("wss://example.com/private"),
+            "<configured wss URL>"
+        );
+        assert_eq!(
+            sanitize_url_for_display("custom://example.com/private"),
+            "<configured URL>"
+        );
     }
 
     // ===== relay shared-manager seeding tests =====

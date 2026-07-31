@@ -344,7 +344,7 @@ pub struct ConnKey {
 impl std::fmt::Debug for ConnKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnKey")
-            .field("url", &self.url)
+            .field("url_configured", &!self.url.is_empty())
             .field("principal", &self.principal)
             .finish()
     }
@@ -451,8 +451,8 @@ pub struct ConnectionConfig {
 impl std::fmt::Debug for ConnectionConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnectionConfig")
-            .field("url", &self.url.as_str())
-            .field("credential", &self.credential)
+            .field("url_configured", &true)
+            .field("credential_configured", &true)
             .field("kind", &self.kind)
             .field("allow_insecure_ws", &self.allow_insecure_ws)
             .field("on_reconnect", &self.on_reconnect.is_some())
@@ -557,11 +557,7 @@ impl HubConnection {
         )
         .await?;
         *connection_id.lock().await = Some(ack.connection_id.clone());
-        info!(
-            url = %config.url,
-            connection_id = %ack.connection_id,
-            "server connection established"
-        );
+        info!(connection_id = %ack.connection_id, "server connection established");
         if let Some(cb) = &config.on_connect {
             cb();
         }
@@ -910,7 +906,7 @@ async fn open_socket(
 ) -> Result<WsStream, ClientError> {
     let is_plaintext_remote = url.scheme() != "wss" && !host_is_loopback(url);
     if is_plaintext_remote && !allow_insecure_ws {
-        return Err(ClientError::InsecureScheme { url: url.clone() });
+        return Err(ClientError::InsecureScheme);
     }
     if is_plaintext_remote {
         warn!(
@@ -1174,7 +1170,7 @@ async fn run_reader_actor(
         {
             ConnectedExit::Stop => break,
             ConnectedExit::TerminalClose(code) => {
-                info!(code, url = %url, "server sent terminal close; not reconnecting");
+                info!(code, "server sent terminal close; not reconnecting");
                 fire_on_disconnect(inner.as_ref());
                 inner.demux.drain_waiters_with(|| {
                     ClientError::Closed(format!("server terminal close (code {code})"))
@@ -1199,10 +1195,9 @@ async fn run_reader_actor(
                     cause,
                 };
                 warn!(
-                    url = %url,
                     cause = outage.cause.label(),
                     close_code = ?outage.cause.close_code(),
-                    error_detail = ?outage.cause.detail(),
+                    error_class = ?outage.cause.detail_class(),
                     connection_id = ?outage.prev_connection_id,
                     prev_connection_duration_ms = outage.prev_connection_duration_ms,
                     detect_ms = outage.detect_ms,
@@ -1223,7 +1218,7 @@ async fn run_reader_actor(
                 loop {
                     attempt = attempt.saturating_add(1);
                     let backoff = backoff_for(attempt, &inner.reconnect_backoff);
-                    info!(?backoff, attempt, url = %url, "reconnecting server connection");
+                    info!(?backoff, attempt, "reconnecting server connection");
                     tokio::select! {
                         _ = stop_rx.recv() => break 'actor,
                         _ = sleep(backoff) => {}
@@ -1472,7 +1467,7 @@ async fn reconnect_and_replay(
         sessions_replayed,
         cause = outage.cause.label(),
         close_code = ?outage.cause.close_code(),
-        error_detail = ?outage.cause.detail(),
+        error_class = ?outage.cause.detail_class(),
         prev_connection_id = ?outage.prev_connection_id,
         connection_id = %ack.connection_id,
         prev_connection_duration_ms = outage.prev_connection_duration_ms,
@@ -1514,6 +1509,53 @@ fn backoff_for(attempt: u32, schedule: &[Duration]) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_no_secret_fragments(rendered: &str, sentinel: &str) {
+        assert!(!rendered.contains(sentinel), "secret leaked: {rendered}");
+        for window in sentinel.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).unwrap();
+            assert!(
+                !rendered.contains(fragment),
+                "secret fragment {fragment:?} leaked: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn connection_debug_is_presence_only_for_url_and_credentials() {
+        let sentinel = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+        let url = Url::parse(&format!(
+            "wss://user:{sentinel}@hub.example/v1/tools?key={sentinel}"
+        ))
+        .unwrap();
+        let credential: Arc<dyn AuthProvider> = Arc::new(AuthCredential::bearer(sentinel));
+        let key = ConnKey {
+            url: url.to_string(),
+            principal: credential.principal_key(),
+        };
+        let config = ConnectionConfig {
+            url,
+            credential,
+            kind: ConnectionKind::Harness,
+            on_reconnect: None,
+            on_disconnect: None,
+            on_connect: None,
+            server_id: None,
+            server_description: None,
+            server_metadata: None,
+            outbound_buffer: None,
+            tuning: ConnectionTuning::default(),
+            alpha_test_key: Some(sentinel.into()),
+            allow_insecure_ws: false,
+            on_fatal: None,
+        };
+
+        assert_no_secret_fragments(&format!("{key:?}"), sentinel);
+        let rendered = format!("{config:?}");
+        assert_no_secret_fragments(&rendered, sentinel);
+        assert!(rendered.contains("credential_configured: true"));
+    }
+
     #[test]
     fn backoff_for_follows_exponential_schedule() {
         let schedule = default_reconnect_backoff();
@@ -1591,11 +1633,20 @@ mod tests {
     }
     #[tokio::test]
     async fn open_socket_refuses_plaintext_ws_to_remote_host() {
-        let url = Url::parse("ws://hub.example.com:8080/v1/tools").expect("valid url");
+        let sentinel = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+        let url = Url::parse(&format!(
+            "ws://user:{sentinel}@hub.example.com:8080/v1/tools?key={sentinel}"
+        ))
+        .expect("valid url");
         let credential = bearer_credential();
         match open_socket(&url, &credential, ConnectionKind::Harness, None, false).await {
-            Err(ClientError::InsecureScheme { url: rejected }) => {
-                assert_eq!(rejected, url);
+            Err(error @ ClientError::InsecureScheme) => {
+                let rendered = format!("{error:?} {error}");
+                assert!(!rendered.contains(sentinel));
+                for window in sentinel.as_bytes().windows(8) {
+                    let fragment = std::str::from_utf8(window).unwrap();
+                    assert!(!rendered.contains(fragment));
+                }
             }
             other => panic!("expected InsecureScheme; got {other:?}"),
         }
@@ -1604,7 +1655,7 @@ mod tests {
     async fn open_socket_allows_plaintext_ws_to_loopback() {
         let url = Url::parse("ws://127.0.0.1:1/").expect("valid url");
         let credential = bearer_credential();
-        if let Err(ClientError::InsecureScheme { .. }) =
+        if let Err(ClientError::InsecureScheme) =
             open_socket(&url, &credential, ConnectionKind::Harness, None, false).await
         {
             panic!("loopback ws:// must not be rejected by the scheme guard")
@@ -1614,7 +1665,7 @@ mod tests {
     async fn open_socket_allows_wss_to_remote_host() {
         let url = Url::parse("wss://hub.example.com/").expect("valid url");
         let credential = bearer_credential();
-        if let Err(ClientError::InsecureScheme { .. }) =
+        if let Err(ClientError::InsecureScheme) =
             open_socket(&url, &credential, ConnectionKind::Harness, None, false).await
         {
             panic!("wss:// must not be rejected by the scheme guard")
@@ -1624,7 +1675,7 @@ mod tests {
     async fn open_socket_allows_plaintext_ws_when_insecure_opt_in() {
         let url = Url::parse("ws://hub.example.com:1/").expect("valid url");
         let credential = bearer_credential();
-        if let Err(ClientError::InsecureScheme { .. }) =
+        if let Err(ClientError::InsecureScheme) =
             open_socket(&url, &credential, ConnectionKind::Harness, None, true).await
         {
             panic!("allow_insecure_ws must bypass the scheme guard")

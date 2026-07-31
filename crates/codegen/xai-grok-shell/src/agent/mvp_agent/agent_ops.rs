@@ -636,7 +636,9 @@ impl MvpAgent {
                 mode,
                 user_id,
                 team_id,
-                cfg.endpoints.deployment_key.clone(),
+                crate::managed_config::resolve_deployment_id(
+                    cfg.endpoints.deployment_key.as_deref(),
+                ),
                 self.origin_client_info_from_meta(None),
                 xai_grok_version::VERSION.to_owned(),
                 subscription_tier,
@@ -1136,7 +1138,7 @@ impl MvpAgent {
             telemetry_mode,
             grok_user_id,
             grok_team_id,
-            deployment_key,
+            deployment_id,
             subscription_tier,
         ) = {
             let cfg = self.cfg.borrow();
@@ -1153,7 +1155,9 @@ impl MvpAgent {
             let grok_user_id = is_xai.then(|| user_id.clone());
             let grok_team_id = is_xai.then(|| team_id.clone()).flatten();
             let telemetry_config = cfg.telemetry.clone();
-            let deployment_key = cfg.endpoints.deployment_key.clone();
+            let deployment_id = crate::managed_config::resolve_deployment_id(
+                cfg.endpoints.deployment_key.as_deref(),
+            );
             let subscription_tier_display = cfg
                 .remote_settings
                 .as_ref()
@@ -1163,7 +1167,7 @@ impl MvpAgent {
                 telemetry_mode.value,
                 grok_user_id,
                 grok_team_id,
-                deployment_key,
+                deployment_id,
                 subscription_tier_display,
             )
         };
@@ -1176,7 +1180,7 @@ impl MvpAgent {
             telemetry_mode,
             grok_user_id,
             grok_team_id,
-            deployment_key,
+            deployment_id,
             self.origin_client_info_from_meta(None),
             xai_grok_version::VERSION.to_owned(),
             subscription_tier,
@@ -2608,10 +2612,7 @@ impl MvpAgent {
         let auth_manager = self.auth_manager.clone();
         let trace_upload_live = self.trace_upload_live.clone();
         Some(
-            std::sync::Arc::new(move |
-                log_bytes: Vec<u8>,
-                auth_token: String,
-                user_id: String|
+            std::sync::Arc::new(move |log_bytes: Vec<u8>, user_id: String|
             {
                 let proxy_base_url = proxy_base_url.clone();
                 let deployment_key = deployment_key.clone();
@@ -2629,7 +2630,9 @@ impl MvpAgent {
                     }
                     let upload_method = crate::session::repo_changes::UploadMethod::Proxy {
                         proxy_base_url,
-                        user_token: auth_token,
+                        // The wrapper used by `upload_to_auth_diagnostics`
+                        // resolves live transport auth from `auth_manager`.
+                        user_token: String::new(),
                         deployment_key,
                         alpha_test_key,
                     };
@@ -3674,7 +3677,7 @@ impl MvpAgent {
         };
         tracing::info!(
             session_id = %session_info.id.0,
-            feedback_url = ?feedback_proxy_url,
+            feedback_url_configured = feedback_proxy_url.is_some(),
             authenticated = feedback_user_token.is_some(),
             "Initializing feedback manager for session"
         );

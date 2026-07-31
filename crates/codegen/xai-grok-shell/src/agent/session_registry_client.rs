@@ -5,9 +5,50 @@
 //! (register/update/finalize) are fire-and-forget safe. Read methods
 //! (search/get/download_file) return typed results.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use reqwest::RequestBuilder;
 use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionRegistryOperation {
+    Register,
+    Update,
+    Finalize,
+    Search,
+    Get,
+    DownloadUrl,
+    Download,
+}
+
+impl SessionRegistryOperation {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Register => "session register",
+            Self::Update => "session update",
+            Self::Finalize => "session finalize",
+            Self::Search => "session search",
+            Self::Get => "session get",
+            Self::DownloadUrl => "session download url",
+            Self::Download => "session download",
+        }
+    }
+
+    const fn diagnostic_consumer(
+        self,
+    ) -> xai_grok_telemetry::unified_log::CredentialDiagnosticConsumer {
+        use xai_grok_telemetry::unified_log::CredentialDiagnosticConsumer;
+
+        match self {
+            Self::Register => CredentialDiagnosticConsumer::SessionRegistryRegister,
+            Self::Update => CredentialDiagnosticConsumer::SessionRegistryUpdate,
+            Self::Finalize => CredentialDiagnosticConsumer::SessionRegistryFinalize,
+            Self::Search => CredentialDiagnosticConsumer::SessionRegistrySearch,
+            Self::Get => CredentialDiagnosticConsumer::SessionRegistryGet,
+            Self::DownloadUrl => CredentialDiagnosticConsumer::SessionRegistryDownloadUrl,
+            Self::Download => CredentialDiagnosticConsumer::SessionRegistryDownload,
+        }
+    }
+}
 
 // ============================================================================
 // Request / response types (local — not in cli-chat-proxy since these
@@ -148,7 +189,7 @@ pub struct SessionRegistryClient {
 impl SessionRegistryClient {
     pub fn new(base_url: impl Into<String>, user_token: impl Into<String>) -> Self {
         let http_client = crate::http::shared_client();
-        Self {
+        let mut client = Self {
             raw_client: http_client.clone(),
             client: reqwest_middleware::ClientBuilder::new(http_client).build(),
             base_url: base_url.into(),
@@ -156,17 +197,43 @@ impl SessionRegistryClient {
                 user_token.into(),
             )),
             session_id: None,
-        }
+        };
+        client.install_static_auth_middleware();
+        client
     }
 
     pub fn with_deployment_key(mut self, key: Option<String>) -> Self {
         self.credentials.deployment_key = key;
+        if self.credentials.auth_manager().is_none() {
+            self.install_static_auth_middleware();
+        }
         self
     }
 
     pub fn with_alpha_test_key(mut self, key: Option<String>) -> Self {
         self.credentials.alpha_test_key = key;
+        if self.credentials.auth_manager().is_none() {
+            self.install_static_auth_middleware();
+        }
         self
+    }
+
+    /// Keep the public static-token constructor functional while still making
+    /// the per-attempt credential relation mandatory. Callers that later add
+    /// an `AuthManager` replace this zero-retry provider in [`Self::with_auth`].
+    fn install_static_auth_middleware(&mut self) {
+        let bearer = self
+            .credentials
+            .deployment_key
+            .clone()
+            .or_else(|| self.credentials.user_token.clone());
+        let provider = std::sync::Arc::new(xai_grok_auth::StaticAuthCredentialProvider::new(
+            Box::new(self.credentials.clone()),
+            bearer,
+        ));
+        self.client = reqwest_middleware::ClientBuilder::new(self.raw_client.clone())
+            .with(xai_grok_auth::AuthRetryMiddleware::new(provider, 0))
+            .build();
     }
 
     pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
@@ -190,25 +257,21 @@ impl SessionRegistryClient {
         self
     }
 
-    /// Execute with auth middleware, returning the response plus the
-    /// bearer suffix the middleware stamped (for truthful 401
-    /// attribution in [`Self::check_response`]).
+    /// Execute with auth middleware, returning the response plus a secret-free
+    /// comparison for truthful final-attempt 401 attribution.
     async fn send_authed(
         &self,
         builder: RequestBuilder,
-        op: &'static str,
-    ) -> Result<(
-        reqwest::Response,
-        Option<xai_grok_auth::StampedBearerSuffix>,
-    )> {
+        operation: SessionRegistryOperation,
+    ) -> Result<(reqwest::Response, xai_grok_auth::CredentialComparison)> {
+        let op = operation.as_str();
         let builder = xai_file_utils::trace_context::inject_trace_context_into_request(builder);
-        let request = builder.build().context(op)?;
-        xai_grok_auth::execute_with_stamp(&self.client, request)
+        let request = builder
+            .build()
+            .map_err(|_| anyhow!("{op}: request build failed"))?;
+        xai_grok_auth::execute_with_auth_relation(&self.client, request)
             .await
-            .map_err(|e| match e {
-                reqwest_middleware::Error::Middleware(e) => e.context(op),
-                reqwest_middleware::Error::Reqwest(e) => anyhow::Error::from(e).context(op),
-            })
+            .map_err(|_| anyhow!("{op}: request transport failed"))
     }
 
     /// Non-auth headers only -- the `Authorization` header lives in
@@ -220,32 +283,30 @@ impl SessionRegistryClient {
     fn check_response(
         &self,
         response: reqwest::Response,
-        stamp: Option<&xai_grok_auth::StampedBearerSuffix>,
-        op: &str,
+        comparison: xai_grok_auth::CredentialComparison,
+        operation: SessionRegistryOperation,
     ) -> anyhow::Error {
+        let op = operation.as_str();
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            self.record_401_attribution(op, stamp);
+            self.record_401_attribution(operation, comparison);
             anyhow::anyhow!("{op}: {}", self.credentials.auth_error_hint())
         } else {
             anyhow::anyhow!("{op} failed: {}", response.status())
         }
     }
 
-    /// Emit a single `auth 401 attribution` log entry tagged with
-    /// `consumer = "SessionRegistryClient.<op>"`. The op string is the
-    /// operation name passed to `check_response` (e.g.,
-    /// `"session register"`).
-    ///
-    /// `stamp` is what the middleware put on the wire (see
-    /// [`xai_grok_auth::StampedBearerSuffix`] for why never a re-resolution).
-    fn record_401_attribution(&self, op: &str, stamp: Option<&xai_grok_auth::StampedBearerSuffix>) {
+    /// Emit one auth attribution event using a closed operation mapping.
+    fn record_401_attribution(
+        &self,
+        operation: SessionRegistryOperation,
+        comparison: xai_grok_auth::CredentialComparison,
+    ) {
         if let Some(manager) = self.credentials.auth_manager() {
             crate::auth::attribution::record_consumer_401(
                 manager.as_ref(),
                 self.session_id.as_deref(),
-                crate::auth::attribution::ConsumerKind::SessionRegistryClient,
-                op,
-                stamp.map(|s| s.0.as_str()),
+                operation.diagnostic_consumer(),
+                comparison,
             );
         }
     }
@@ -261,11 +322,18 @@ impl SessionRegistryClient {
     /// POST /v1/sessions/register (idempotent via ON CONFLICT)
     pub async fn register(&self, req: &RegisterRequest) -> Result<()> {
         let url = format!("{}/sessions/register", self.base_url);
-        let (response, stamp) = self
-            .send_authed(self.post(&url).json(req), "session register")
+        let (response, comparison) = self
+            .send_authed(
+                self.post(&url).json(req),
+                SessionRegistryOperation::Register,
+            )
             .await?;
         if !response.status().is_success() {
-            return Err(self.check_response(response, stamp.as_ref(), "session register"));
+            return Err(self.check_response(
+                response,
+                comparison,
+                SessionRegistryOperation::Register,
+            ));
         }
         Ok(())
     }
@@ -273,11 +341,15 @@ impl SessionRegistryClient {
     /// POST /v1/sessions/{id}/replicas/update
     pub async fn update(&self, session_id: &str, req: &UpdateRequest) -> Result<()> {
         let url = format!("{}/sessions/{}/replicas/update", self.base_url, session_id);
-        let (response, stamp) = self
-            .send_authed(self.post(&url).json(req), "session update")
+        let (response, comparison) = self
+            .send_authed(self.post(&url).json(req), SessionRegistryOperation::Update)
             .await?;
         if !response.status().is_success() {
-            return Err(self.check_response(response, stamp.as_ref(), "session update"));
+            return Err(self.check_response(
+                response,
+                comparison,
+                SessionRegistryOperation::Update,
+            ));
         }
         Ok(())
     }
@@ -288,11 +360,15 @@ impl SessionRegistryClient {
             "{}/sessions/{}/replicas/finalize",
             self.base_url, session_id
         );
-        let (response, stamp) = self
-            .send_authed(self.post(&url), "session finalize")
+        let (response, comparison) = self
+            .send_authed(self.post(&url), SessionRegistryOperation::Finalize)
             .await?;
         if !response.status().is_success() {
-            return Err(self.check_response(response, stamp.as_ref(), "session finalize"));
+            return Err(self.check_response(
+                response,
+                comparison,
+                SessionRegistryOperation::Finalize,
+            ));
         }
         Ok(())
     }
@@ -304,22 +380,36 @@ impl SessionRegistryClient {
         if let Some(q) = query {
             builder = builder.query(&[("query", q)]);
         }
-        let (response, stamp) = self.send_authed(builder, "session search").await?;
+        let (response, comparison) = self
+            .send_authed(builder, SessionRegistryOperation::Search)
+            .await?;
         if !response.status().is_success() {
-            return Err(self.check_response(response, stamp.as_ref(), "session search"));
+            return Err(self.check_response(
+                response,
+                comparison,
+                SessionRegistryOperation::Search,
+            ));
         }
-        let resp: SearchResponse = response.json().await.context("parse search response")?;
+        let resp: SearchResponse = response
+            .json()
+            .await
+            .map_err(|_| anyhow!("session search: invalid response JSON"))?;
         Ok(resp.sessions)
     }
 
     /// GET /v1/sessions/{id}/replicas
     pub async fn get_session(&self, session_id: &str) -> Result<SessionRecord> {
         let url = format!("{}/sessions/{}/replicas", self.base_url, session_id);
-        let (response, stamp) = self.send_authed(self.get(&url), "session get").await?;
+        let (response, comparison) = self
+            .send_authed(self.get(&url), SessionRegistryOperation::Get)
+            .await?;
         if !response.status().is_success() {
-            return Err(self.check_response(response, stamp.as_ref(), "session get"));
+            return Err(self.check_response(response, comparison, SessionRegistryOperation::Get));
         }
-        response.json().await.context("parse session response")
+        response
+            .json()
+            .await
+            .map_err(|_| anyhow!("session get: invalid response JSON"))
     }
 
     /// GET /v1/sessions/{id}/download — returns a signed GCS URL without downloading.
@@ -333,11 +423,20 @@ impl SessionRegistryClient {
         let builder = self
             .get(&url)
             .query(&[("file", file), ("turn", &turn.to_string())]);
-        let (response, stamp) = self.send_authed(builder, "session download url").await?;
+        let (response, comparison) = self
+            .send_authed(builder, SessionRegistryOperation::DownloadUrl)
+            .await?;
         if !response.status().is_success() {
-            return Err(self.check_response(response, stamp.as_ref(), "session download url"));
+            return Err(self.check_response(
+                response,
+                comparison,
+                SessionRegistryOperation::DownloadUrl,
+            ));
         }
-        let resp: DownloadResponse = response.json().await.context("parse download response")?;
+        let resp: DownloadResponse = response
+            .json()
+            .await
+            .map_err(|_| anyhow!("session download url: invalid response JSON"))?;
         Ok(resp.download_url)
     }
 
@@ -353,11 +452,20 @@ impl SessionRegistryClient {
         let builder = self
             .get(&url)
             .query(&[("file", file), ("turn", &turn.to_string())]);
-        let (response, stamp) = self.send_authed(builder, "session download").await?;
+        let (response, comparison) = self
+            .send_authed(builder, SessionRegistryOperation::Download)
+            .await?;
         if !response.status().is_success() {
-            return Err(self.check_response(response, stamp.as_ref(), "session download"));
+            return Err(self.check_response(
+                response,
+                comparison,
+                SessionRegistryOperation::Download,
+            ));
         }
-        let resp: DownloadResponse = response.json().await.context("parse download response")?;
+        let resp: DownloadResponse = response
+            .json()
+            .await
+            .map_err(|_| anyhow!("session download: invalid response JSON"))?;
 
         // Stream from the signed GCS URL directly to disk (archives can be hundreds of MB)
         let mut gcs_response = self
@@ -365,7 +473,7 @@ impl SessionRegistryClient {
             .get(&resp.download_url)
             .send()
             .await
-            .context("download from GCS")?;
+            .map_err(|_| anyhow!("GCS download transport failed"))?;
         if !gcs_response.status().is_success() {
             anyhow::bail!("GCS download failed: {}", gcs_response.status());
         }
@@ -384,7 +492,7 @@ impl SessionRegistryClient {
                         .context("write chunk to disk")?;
                 }
                 Ok(Ok(None)) => break,
-                Ok(Err(e)) => return Err(e).context("read GCS chunk"),
+                Ok(Err(_)) => return Err(anyhow!("GCS download stream failed")),
                 Err(_) => anyhow::bail!(
                     "GCS download stalled: no data received for {chunk_timeout:?} \
                      while downloading {file}"
@@ -398,6 +506,120 @@ impl SessionRegistryClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_registry_operation_mapping_is_complete_and_closed() {
+        let cases = [
+            (
+                SessionRegistryOperation::Register,
+                "SessionRegistryClient.register",
+            ),
+            (
+                SessionRegistryOperation::Update,
+                "SessionRegistryClient.update",
+            ),
+            (
+                SessionRegistryOperation::Finalize,
+                "SessionRegistryClient.finalize",
+            ),
+            (
+                SessionRegistryOperation::Search,
+                "SessionRegistryClient.search",
+            ),
+            (SessionRegistryOperation::Get, "SessionRegistryClient.get"),
+            (
+                SessionRegistryOperation::DownloadUrl,
+                "SessionRegistryClient.download_url",
+            ),
+            (
+                SessionRegistryOperation::Download,
+                "SessionRegistryClient.download",
+            ),
+        ];
+
+        for (operation, expected) in cases {
+            assert_eq!(operation.diagnostic_consumer().as_str(), expected);
+            assert!(!operation.as_str().is_empty());
+        }
+    }
+
+    fn assert_sentinel_absent(rendered: &str, sentinel: &str) {
+        assert!(
+            !rendered.contains(sentinel),
+            "leaked full sentinel: {rendered}"
+        );
+        for window in sentinel.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).expect("ASCII sentinel window");
+            assert!(
+                !rendered.contains(window),
+                "leaked sentinel window {window:?}: {rendered}"
+            );
+        }
+    }
+
+    fn test_client(base_url: String) -> SessionRegistryClient {
+        SessionRegistryClient::new(base_url, "test-token")
+    }
+
+    #[tokio::test]
+    async fn transport_error_hides_userinfo_and_query_credentials() {
+        let sentinel = "cred_SENTINEL_0123456789abcdef";
+        let client = test_client(format!("http://{sentinel}:password@127.0.0.1:1"));
+
+        let error = client
+            .search(Some(sentinel), 1)
+            .await
+            .expect_err("dead loopback port must fail");
+        let rendered = format!("{error} {error:?}");
+
+        assert!(rendered.contains("request transport failed"));
+        assert_sentinel_absent(&rendered, sentinel);
+    }
+
+    #[tokio::test]
+    async fn build_error_hides_userinfo_and_query_credentials() {
+        let sentinel = "cred_SENTINEL_0123456789abcdef";
+        let client = test_client(format!(
+            "http://{sentinel}:password@127.0.0.1:notaport?token={sentinel}"
+        ));
+
+        let error = client
+            .search(Some(sentinel), 1)
+            .await
+            .expect_err("invalid port must fail request construction");
+        let rendered = format!("{error} {error:?}");
+
+        assert!(rendered.contains("request build failed"));
+        assert_sentinel_absent(&rendered, sentinel);
+    }
+
+    #[tokio::test]
+    async fn invalid_json_error_hides_request_url_credentials() {
+        use axum::{Router, routing::get};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/sessions/search", get(|| async { "bad" })),
+            )
+            .await
+            .unwrap();
+        });
+        let sentinel = "cred_SENTINEL_0123456789abcdef";
+        let client = test_client(format!("http://{sentinel}:password@{addr}"));
+
+        let error = client
+            .search(Some(sentinel), 1)
+            .await
+            .expect_err("invalid JSON must fail");
+        let rendered = format!("{error} {error:?}");
+
+        assert_sentinel_absent(&rendered, sentinel);
+        server.abort();
+    }
 
     // ── UpdateRequest wire shapes ────────────────────────────────────────────
     //
@@ -623,6 +845,80 @@ mod tests {
         assert_eq!(
             sent, "Bearer fresh-from-auth-manager",
             "outgoing bearer must come from AuthManager (not the build-time token)"
+        );
+    }
+
+    /// Public static builders must keep their middleware snapshot aligned with
+    /// the final credential state: user tokens remain usable without an
+    /// AuthManager, while deployment keys take precedence and omit the
+    /// user-token routing marker. The alpha-key builder is included in both
+    /// chains so future feature-enabled header injection cannot retain a stale
+    /// provider clone.
+    #[tokio::test]
+    async fn static_builders_send_user_token_and_deployment_key_with_correct_precedence() {
+        use axum::{Router, response::IntoResponse, routing::post};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+
+        #[derive(Debug, Eq, PartialEq)]
+        struct CapturedHeaders {
+            authorization: Option<String>,
+            token_auth: Option<String>,
+        }
+
+        let captured = Arc::new(parking_lot::Mutex::new(Vec::<CapturedHeaders>::new()));
+        let captured_for_handler = captured.clone();
+        let router = Router::new().route(
+            "/sessions/register",
+            post(move |headers: axum::http::HeaderMap, _body: String| {
+                let captured = captured_for_handler.clone();
+                async move {
+                    let text = |name: &str| {
+                        headers
+                            .get(name)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned)
+                    };
+                    captured.lock().push(CapturedHeaders {
+                        authorization: text("authorization"),
+                        token_auth: text("x-xai-token-auth"),
+                    });
+                    (axum::http::StatusCode::OK, "").into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let base_url = format!("http://{addr}");
+        let request = minimal_register_request(None);
+
+        let user_client = SessionRegistryClient::new(&base_url, "static-user-token")
+            .with_alpha_test_key(Some("alpha-snapshot".to_string()));
+        assert_eq!(
+            user_client.credentials.alpha_test_key.as_deref(),
+            Some("alpha-snapshot")
+        );
+        user_client.register(&request).await.unwrap();
+
+        let deployment_client = SessionRegistryClient::new(&base_url, "ignored-user-token")
+            .with_deployment_key(Some("static-deployment-key".to_string()))
+            .with_alpha_test_key(Some("alpha-snapshot".to_string()));
+        deployment_client.register(&request).await.unwrap();
+
+        assert_eq!(
+            *captured.lock(),
+            vec![
+                CapturedHeaders {
+                    authorization: Some("Bearer static-user-token".to_string()),
+                    token_auth: Some("xai-grok-cli".to_string()),
+                },
+                CapturedHeaders {
+                    authorization: Some("Bearer static-deployment-key".to_string()),
+                    token_auth: None,
+                },
+            ]
         );
     }
 

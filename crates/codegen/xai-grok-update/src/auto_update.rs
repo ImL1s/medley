@@ -2088,13 +2088,11 @@ async fn gh_release_download(tag: &str, pattern: &str, dest: &std::path::Path) -
     pb.finish_and_clear();
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
-            "gh release download failed for {} tag {} from {}: {}",
+            "gh release download failed for {} tag {} from {}",
             pattern,
             tag,
-            crate::version::GH_RELEASE_REPO,
-            stderr.trim()
+            crate::version::GH_RELEASE_REPO
         );
     }
     Ok(())

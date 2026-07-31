@@ -4,11 +4,13 @@
 //! token resolution drive HTTP requests.
 
 pub mod auth_provider;
+pub mod credential_diagnostics;
 #[cfg(feature = "middleware")]
 pub mod retry_middleware;
 pub mod visibility;
 
 pub use auth_provider::{AuthCredentialProvider, CredentialSnapshot, StaticAuthCredentialProvider};
+pub use credential_diagnostics::{CredentialComparison, SentCredentialRelation};
 #[cfg(feature = "middleware")]
-pub use retry_middleware::{AuthRetryMiddleware, StampedBearerSuffix, execute_with_stamp};
+pub use retry_middleware::{AuthRetryMiddleware, execute_with_auth_relation};
 pub use visibility::HttpAuth;

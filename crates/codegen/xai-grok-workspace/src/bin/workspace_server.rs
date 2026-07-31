@@ -25,21 +25,13 @@ fn server_id_startup_error(id: &str) -> Option<String> {
         .err()
         .map(|e| format!("{INVALID_SERVER_ID_MARKER} {id:?}: {e}"))
 }
-/// Classify hub-connect Display strings for `/ready` error_class.
-/// Auth needles → `hub_auth`; other hub-connect path failures → `hub_connect`;
-/// pre-hub workspace setup messages → `unknown` (still retryable alongside hub_connect).
-fn classify_hub_connect_failure(err_msg: &str) -> ErrorClass {
-    if err_msg.contains("handshake auth failed") || err_msg.contains("auth error:") {
-        ErrorClass::HubAuth
-    } else if err_msg.contains("failed to create workspace") {
-        ErrorClass::Unknown
-    } else {
-        ErrorClass::HubConnect
+fn classify_hub_connect_failure(err: &WorkspaceError) -> ErrorClass {
+    use xai_grok_workspace::hub::{HubConnectFailureKind, workspace_hub_failure_kind};
+    match workspace_hub_failure_kind(err) {
+        Some(HubConnectFailureKind::Auth) => ErrorClass::HubAuth,
+        Some(HubConnectFailureKind::Connect) => ErrorClass::HubConnect,
+        None => ErrorClass::Unknown,
     }
-}
-/// Drop outer `hub error: ` so `/ready` detail is the inner failure text.
-fn hub_connect_error_detail(err_msg: &str) -> &str {
-    err_msg.strip_prefix("hub error: ").unwrap_or(err_msg)
 }
 fn hub_connect_failure_log_message(class: ErrorClass) -> &'static str {
     match class {
@@ -49,11 +41,20 @@ fn hub_connect_failure_log_message(class: ErrorClass) -> &'static str {
 }
 /// Mark `/ready` failed and dwell so the host can observe state before exit.
 async fn report_hub_connect_failure(diag: &DiagHandle, err: &WorkspaceError) {
-    let err_msg = err.to_string();
-    let class = classify_hub_connect_failure(&err_msg);
-    diag.set_failed(class, hub_connect_error_detail(&err_msg));
-    tracing::error!(error = %err_msg, "{}", hub_connect_failure_log_message(class));
+    let class = classify_hub_connect_failure(err);
+    let safe_message = hub_connect_failure_log_message(class);
+    diag.set_failed(class, safe_message);
+    tracing::error!(error_class = ?class, "{safe_message}");
     dwell_after_hub_connect_failed().await;
+}
+
+fn configured_endpoint_scheme(endpoint: &str) -> &'static str {
+    match Url::parse(endpoint).ok().map(|url| url.scheme().to_owned()) {
+        Some(scheme) if scheme == "https" => "https",
+        Some(scheme) if scheme == "http" => "http",
+        Some(_) => "other",
+        None => "invalid",
+    }
 }
 async fn dwell_after_hub_connect_failed() {
     tokio::time::sleep(HUB_CONNECT_FAILED_DWELL).await;
@@ -269,11 +270,18 @@ async fn run(args: Args, cwd: PathBuf) -> anyhow::Result<()> {
         Ok(endpoint) if !endpoint.is_empty() => {
             match xai_tracing::init_fastrace(endpoint.clone(), SERVICE_NAME.to_owned(), None) {
                 Ok(()) => {
-                    tracing::info!(%endpoint, "trace export enabled (direct OTLP)");
+                    tracing::info!(
+                        endpoint_present = true,
+                        endpoint_scheme = configured_endpoint_scheme(&endpoint),
+                        "trace export enabled (direct OTLP)"
+                    );
                     true
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "direct OTLP trace export init failed");
+                Err(_) => {
+                    tracing::warn!(
+                        error_class = "trace_export_init",
+                        "direct OTLP trace export init failed"
+                    );
                     false
                 }
             }
@@ -326,7 +334,7 @@ async fn run(args: Args, cwd: PathBuf) -> anyhow::Result<()> {
     }
     let auth_provider = xai_grok_workspace::hub_auth::provider(&url, args.auth_config.as_deref())?;
     tracing::info!(
-        hub_url = %url,
+        hub_url_configured = true,
         cwd = %cwd.display(),
         "Starting workspace server"
     );
@@ -511,75 +519,33 @@ mod tests {
         assert_eq!(start.elapsed(), HUB_CONNECT_FAILED_DWELL);
     }
     #[test]
-    fn classify_hub_connect_auth_needles() {
+    fn classify_hub_connect_uses_closed_workspace_error_classification() {
         assert_eq!(
-            classify_hub_connect_failure("hub error: handshake auth failed: HTTP 401"),
+            classify_hub_connect_failure(&WorkspaceError::HubError(
+                "hub authentication failed".into()
+            )),
             ErrorClass::HubAuth
         );
         assert_eq!(
-            classify_hub_connect_failure("handshake auth failed: HTTP 401"),
-            ErrorClass::HubAuth
-        );
-        assert_eq!(
-            classify_hub_connect_failure("hub error: auth error: token rejected"),
-            ErrorClass::HubAuth
-        );
-        assert_eq!(
-            classify_hub_connect_failure("HTTP 401 unauthorized"),
+            classify_hub_connect_failure(&WorkspaceError::HubError(
+                "hub network connection failed".into()
+            )),
             ErrorClass::HubConnect
         );
         assert_eq!(
-            classify_hub_connect_failure("token refresh failed"),
-            ErrorClass::HubConnect
+            classify_hub_connect_failure(&WorkspaceError::SessionNotFound("missing".into())),
+            ErrorClass::Unknown
         );
     }
     #[test]
-    fn classify_from_client_error_display_round_trip() {
-        let handshake = WorkspaceError::HubError(
-            xai_computer_hub_sdk::ClientError::HandshakeAuthFailed { status: 401 }.to_string(),
-        );
-        let handshake_msg = handshake.to_string();
-        assert_eq!(
-            classify_hub_connect_failure(&handshake_msg),
-            ErrorClass::HubAuth
-        );
+    fn hub_failure_log_markers_follow_typed_classification() {
         assert_eq!(
             hub_connect_failure_log_message(ErrorClass::HubAuth),
             WORKSPACE_HUB_AUTH_FAILED_MARKER
         );
-        let auth = WorkspaceError::HubError(
-            xai_computer_hub_sdk::ClientError::AuthError("token rejected".into()).to_string(),
-        );
-        assert_eq!(
-            classify_hub_connect_failure(&auth.to_string()),
-            ErrorClass::HubAuth
-        );
-        let network = WorkspaceError::HubError(
-            xai_computer_hub_sdk::ClientError::NetworkError("connection refused".into())
-                .to_string(),
-        );
-        assert_eq!(
-            classify_hub_connect_failure(&network.to_string()),
-            ErrorClass::HubConnect
-        );
         assert_ne!(
             hub_connect_failure_log_message(ErrorClass::HubConnect),
             WORKSPACE_HUB_AUTH_FAILED_MARKER
-        );
-    }
-    #[test]
-    fn classify_hub_connect_non_auth_is_hub_connect() {
-        assert_eq!(
-            classify_hub_connect_failure("hub error: network error: connection refused"),
-            ErrorClass::HubConnect
-        );
-        assert_eq!(
-            classify_hub_connect_failure("hub error: protocol error: bad hello"),
-            ErrorClass::HubConnect
-        );
-        assert_eq!(
-            classify_hub_connect_failure("failed to create workspace: disk full"),
-            ErrorClass::Unknown
         );
     }
     #[test]
@@ -590,17 +556,16 @@ mod tests {
         );
     }
     #[test]
-    fn hub_connect_error_detail_strips_hub_error_prefix() {
-        let err = WorkspaceError::HubError("handshake auth failed: HTTP 401".into());
-        assert_eq!(
-            hub_connect_error_detail(&err.to_string()),
-            "handshake auth failed: HTTP 401"
-        );
-        let other = WorkspaceError::HubError("network error: timeout".into());
-        assert_eq!(
-            hub_connect_error_detail(&other.to_string()),
-            "network error: timeout"
-        );
+    fn endpoint_scheme_diagnostic_omits_userinfo_and_query_credentials() {
+        const SENTINEL: &str = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+        let endpoint = format!("https://user:{SENTINEL}@otel.example/?token={SENTINEL}");
+        let rendered = configured_endpoint_scheme(&endpoint);
+        assert_eq!(rendered, "https");
+        assert!(!rendered.contains(SENTINEL));
+        for window in SENTINEL.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(!rendered.contains(fragment), "leaked fragment {fragment}");
+        }
     }
     /// Install a capturing tracing subscriber for the duration of an async
     /// report; returns emitted event messages.
@@ -675,7 +640,7 @@ mod tests {
         let body: serde_json::Value = response.json().await.expect("json");
         assert_eq!(body["state"], "failed");
         assert_eq!(body["error_class"], "hub_auth");
-        assert_eq!(body["error_detail"], "handshake auth failed: HTTP 401");
+        assert_eq!(body["error_detail"], WORKSPACE_HUB_AUTH_FAILED_MARKER);
         assert_eq!(body["launch_id"], "nonce-auth");
     }
     #[tokio::test(start_paused = true)]
@@ -707,7 +672,7 @@ mod tests {
         let body: serde_json::Value = response.json().await.expect("json");
         assert_eq!(body["state"], "failed");
         assert_eq!(body["error_class"], "hub_connect");
-        assert_eq!(body["error_detail"], "network error: connection refused");
+        assert_eq!(body["error_detail"], "failed to connect workspace to hub");
     }
     #[test]
     fn capabilities_flag_parses_and_defaults_off() {

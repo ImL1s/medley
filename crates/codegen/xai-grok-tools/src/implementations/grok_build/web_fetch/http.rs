@@ -71,12 +71,12 @@ impl HttpClient {
 
         // Route all traffic through the egress proxy when configured.
         if let Some(ref endpoint) = params.proxy_endpoint {
-            let proxy = reqwest::Proxy::all(endpoint)
-                .map_err(|e| WebFetchError::ProxyConfigError(e.to_string()))?;
+            let proxy =
+                reqwest::Proxy::all(endpoint).map_err(|_| WebFetchError::ProxyConfigError)?;
             builder = builder.proxy(proxy);
         }
 
-        builder.build().map_err(WebFetchError::ClientBuildError)
+        builder.build().map_err(|_| WebFetchError::ClientBuildError)
     }
 }
 

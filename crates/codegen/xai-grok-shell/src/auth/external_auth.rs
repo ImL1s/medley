@@ -46,7 +46,11 @@ const EXTERNAL_AUTH_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 /// interactive sign-in takes a separate path (`flow::run_external_auth_provider`,
 /// which bridges the provider's stderr link), so this handles refresh only.
 pub(crate) async fn run_external_refresh(command: &str) -> Option<GrokAuth> {
-    tracing::info!(cmd = %command, timeout_secs = EXTERNAL_AUTH_REFRESH_TIMEOUT.as_secs(), "auth: running external auth provider (headless refresh)");
+    tracing::info!(
+        command_present = !command.trim().is_empty(),
+        timeout_secs = EXTERNAL_AUTH_REFRESH_TIMEOUT.as_secs(),
+        "auth: running external auth provider (headless refresh)"
+    );
 
     let mut cmd = shell_c(command);
     cmd.env("GROK_AUTH_EXPIRED", "1");
@@ -57,7 +61,7 @@ pub(crate) async fn run_external_refresh(command: &str) -> Option<GrokAuth> {
         EXTERNAL_AUTH_REFRESH_TIMEOUT,
         RunOptions {
             label: "external auth provider",
-            command_log: CommandLog::Shown(command),
+            command_log: CommandLog::Redacted,
         },
     )
     .await
@@ -71,7 +75,7 @@ pub(crate) async fn run_external_refresh(command: &str) -> Option<GrokAuth> {
                 RunError::SpawnFailed => "failed to start",
                 RunError::WaitFailed => "errored while running",
             };
-            tracing::warn!(cmd = %command, "auth: external auth provider {reason}");
+            tracing::warn!("auth: external auth provider {reason}");
             return None;
         }
     };
@@ -81,8 +85,8 @@ pub(crate) async fn run_external_refresh(command: &str) -> Option<GrokAuth> {
             tracing::info!("auth: external auth provider returned fresh token");
             Some(auth)
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "auth: external auth provider failed");
+        Err(_error) => {
+            tracing::warn!("auth: external auth provider output rejected");
             None
         }
     }

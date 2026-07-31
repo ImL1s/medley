@@ -8,6 +8,7 @@
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+use xai_grok_auth::CredentialComparison;
 use xai_grok_sampling_types::{
     ApiBackend, CompactionAtTokens, CompactionsRemaining, DoomLoopRecoveryPolicy, ReasoningEffort,
 };
@@ -46,7 +47,7 @@ pub enum AuthScheme {
 /// `SamplerConfig` is handed to the actor. Auth is selected separately
 /// via `auth_scheme`, while `api_backend` controls only the request/response
 /// protocol shape.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SamplerConfig {
     pub api_key: Option<String>,
     pub base_url: String,
@@ -88,11 +89,9 @@ pub struct SamplerConfig {
     pub client_version: Option<String>,
 
     /// Optional hook invoked at every UNAUTHORIZED (401) response
-    /// site. The sampler passes the bearer that was actually sent on
-    /// the wire to the callback; the implementation is free to do
-    /// whatever it wants with it (typically: join it with a live
-    /// credential source and emit an attribution event for diagnosis
-    /// of stale-token vs. server-rejected-live-token 401s). `None`
+    /// site. The sampler passes only the secret-free relationship between
+    /// the credential actually sent on the final attempt and the current
+    /// credential. `None`
     /// (default) is a no-op -- the 401 arm returns the same
     /// `SamplingError::Auth` it always did.
     ///
@@ -132,6 +131,44 @@ pub struct SamplerConfig {
     /// Per-request header injector (e.g. OTel traceparent). Called in `post()`.
     #[serde(skip)]
     pub header_injector: Option<SharedHeaderInjector>,
+}
+
+impl std::fmt::Debug for SamplerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SamplerConfig")
+            .field("api_key_configured", &self.api_key.is_some())
+            .field("base_url_configured", &!self.base_url.is_empty())
+            .field("model", &self.model)
+            .field("auth_scheme", &self.auth_scheme)
+            .field("extra_header_count", &self.extra_headers.len())
+            .field("query_param_count", &self.query_params.len())
+            .field("env_http_header_count", &self.env_http_headers.len())
+            .field("context_window", &self.context_window)
+            .field("force_http1", &self.force_http1)
+            .field("max_retries", &self.max_retries)
+            .field("stream_tool_calls", &self.stream_tool_calls)
+            .field("idle_timeout_secs", &self.idle_timeout_secs)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("origin_client", &self.origin_client)
+            .field("client_identifier", &self.client_identifier)
+            .field("deployment_id", &self.deployment_id)
+            .field("user_id", &self.user_id)
+            .field("client_version", &self.client_version)
+            .field(
+                "attribution_callback_configured",
+                &self.attribution_callback.is_some(),
+            )
+            .field(
+                "bearer_resolver_configured",
+                &self.bearer_resolver.is_some(),
+            )
+            .field(
+                "header_injector_configured",
+                &self.header_injector.is_some(),
+            )
+            .field("supports_backend_search", &self.supports_backend_search)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for SamplerConfig {
@@ -175,6 +212,11 @@ impl Default for SamplerConfig {
 /// Cheap sync read of the current bearer for [`SamplerConfig::bearer_resolver`].
 pub trait BearerResolver: Send + Sync + std::fmt::Debug {
     fn current_bearer(&self) -> Option<String>;
+
+    fn compare_sent_credential(&self, sent: Option<&str>) -> CredentialComparison {
+        let current = self.current_bearer();
+        CredentialComparison::compare(sent, current.as_deref())
+    }
 }
 
 pub type SharedBearerResolver = std::sync::Arc<dyn BearerResolver>;
@@ -229,6 +271,34 @@ mod tests {
             policy.rate_limit_retry_threshold,
             RATE_LIMIT_RETRY_THRESHOLD
         );
+    }
+
+    #[test]
+    fn sampler_config_debug_redacts_all_credential_carriers() {
+        let sentinel = "cred_SENTINEL_0123456789abcdef";
+        let mut config = SamplerConfig {
+            api_key: Some(sentinel.to_owned()),
+            base_url: format!("https://example.test/?access_token={sentinel}"),
+            ..SamplerConfig::default()
+        };
+        config
+            .extra_headers
+            .insert("authorization".to_owned(), format!("Bearer {sentinel}"));
+        config
+            .query_params
+            .insert("api_key".to_owned(), sentinel.to_owned());
+
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("api_key_configured: true"));
+        assert!(rendered.contains("extra_header_count: 1"));
+        assert!(!rendered.contains(sentinel));
+        for window in sentinel.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).unwrap();
+            assert!(
+                !rendered.contains(window),
+                "leaked sentinel window: {window}"
+            );
+        }
     }
 
     /// Configs serialized before the field existed must keep deserializing.

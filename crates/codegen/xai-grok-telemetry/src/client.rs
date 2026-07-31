@@ -12,7 +12,7 @@ use chrono::{Local, SecondsFormat};
 use serde_json::json;
 use xai_mixpanel::Mixpanel;
 
-use crate::config::{TelemetryConfig, TelemetryMode, deployment_id_from_key};
+use crate::config::{TelemetryConfig, TelemetryMode};
 use crate::http::OriginClientInfo;
 use crate::session_ctx::EmitterOrigin;
 
@@ -63,12 +63,9 @@ pub struct TelemetryClient {
 impl std::fmt::Debug for TelemetryClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TelemetryClient")
-            .field("events_url", &self.events_url)
-            .field(
-                "events_api_key",
-                &self.events_api_key.as_ref().map(|_| "***"),
-            )
-            .field("mixpanel", &self.mixpanel.as_ref().map(|_| "configured"))
+            .field("events_url_configured", &self.events_url.is_some())
+            .field("events_api_key_present", &self.events_api_key.is_some())
+            .field("mixpanel_configured", &self.mixpanel.is_some())
             .finish()
     }
 }
@@ -79,7 +76,7 @@ impl TelemetryClient {
         mode: TelemetryMode,
         user_id: Option<String>,
         team_id: Option<String>,
-        deployment_key: Option<String>,
+        deployment_id: Option<String>,
         origin_client: Option<OriginClientInfo>,
         shell_version: String,
         subscription_tier: Option<String>,
@@ -93,9 +90,10 @@ impl TelemetryClient {
         } else {
             None
         };
-        let deployment_id = deployment_key
-            .filter(|s| !s.is_empty())
-            .map(|k| deployment_id_from_key(&k));
+        // Only accept the provider-issued deployment identifier. Credential-
+        // derived stable identifiers can be correlated like credential material
+        // and must never enter telemetry.
+        let deployment_id = deployment_id.filter(|s| !s.trim().is_empty());
         let (client_type, client_version) = match origin_client {
             Some(o) => (Some(o.product), o.version),
             None => (None, None),
@@ -333,7 +331,7 @@ pub fn init(
     mode: TelemetryMode,
     user_id: Option<String>,
     team_id: Option<String>,
-    deployment_key: Option<String>,
+    deployment_id: Option<String>,
     origin_client: Option<OriginClientInfo>,
     shell_version: String,
     subscription_tier: Option<String>,
@@ -349,7 +347,7 @@ pub fn init(
             mode,
             user_id,
             team_id,
-            deployment_key,
+            deployment_id,
             origin_client,
             shell_version,
             subscription_tier,
@@ -368,7 +366,7 @@ pub fn init_if_needed(
     mode: TelemetryMode,
     user_id: Option<String>,
     team_id: Option<String>,
-    deployment_key: Option<String>,
+    deployment_id: Option<String>,
     origin_client: Option<OriginClientInfo>,
     shell_version: String,
     subscription_tier: Option<String>,
@@ -385,7 +383,7 @@ pub fn init_if_needed(
             mode,
             user_id,
             team_id,
-            deployment_key,
+            deployment_id,
             origin_client,
             shell_version,
             subscription_tier,
@@ -399,6 +397,44 @@ pub fn init_if_needed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_no_secret_fragments(rendered: &str, sentinel: &str) {
+        assert!(!rendered.contains(sentinel), "secret leaked: {rendered}");
+        for window in sentinel.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).expect("ASCII test sentinel");
+            assert!(
+                !rendered.contains(fragment),
+                "secret fragment {fragment:?} leaked: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn telemetry_client_debug_is_presence_only_for_endpoint_and_api_key() {
+        let sentinel = "GB002T-Q7w5E3r1T9y7Z6x4C2v8";
+        let client = TelemetryClient {
+            mode: TelemetryMode::Enabled,
+            events_url: Some(format!(
+                "https://user:{sentinel}@events.example.test/v1?token={sentinel}"
+            )),
+            events_api_key: Some(sentinel.to_owned()),
+            mixpanel: None,
+            user_id: None,
+            team_id: None,
+            deployment_id: None,
+            shell_version: "test".to_owned(),
+            client_type: None,
+            client_version: None,
+            subscription_tier: None,
+            http_client: reqwest::Client::new(),
+        };
+
+        let rendered = format!("{client:?}");
+        assert_no_secret_fragments(&rendered, sentinel);
+        assert!(rendered.contains("events_url_configured: true"));
+        assert!(rendered.contains("events_api_key_present: true"));
+        assert!(rendered.contains("mixpanel_configured: false"));
+    }
 
     /// Shell events must still strip to their bare suffix, byte-for-byte
     /// identical to the previous `strip_prefix("grok-shell-")` behavior.

@@ -183,8 +183,8 @@ impl<C: StreamableHttpClient + Sync> StreamableHttpClient for McpHttpClient<C> {
             match plan.log {
                 ReconnectLog::Warn => {
                     tracing::warn!(
-                        server = %self.server_name,
-                        uri = %uri,
+                        server_configured = !self.server_name.is_empty(),
+                        uri_configured = !uri.is_empty(),
                         attempt = plan.attempt,
                         delay_ms = plan.delay.as_millis() as u64,
                         max_delay_ms = MAX_DELAY.as_millis() as u64,
@@ -195,8 +195,8 @@ impl<C: StreamableHttpClient + Sync> StreamableHttpClient for McpHttpClient<C> {
                 }
                 ReconnectLog::SuppressedWarn | ReconnectLog::Debug => {
                     tracing::debug!(
-                        server = %self.server_name,
-                        uri = %uri,
+                        server_configured = !self.server_name.is_empty(),
+                        uri_configured = !uri.is_empty(),
                         attempt = plan.attempt,
                         delay_ms = plan.delay.as_millis() as u64,
                         suppressed_warn = plan.log == ReconnectLog::SuppressedWarn,
@@ -404,6 +404,7 @@ mod tests {
     struct LogCapture {
         warns: Arc<std::sync::atomic::AtomicUsize>,
         debug_suppressed_flags: Arc<parking_lot::Mutex<Vec<Option<bool>>>>,
+        rendered_events: Arc<parking_lot::Mutex<Vec<String>>>,
     }
 
     struct SuppressedFlag(Option<bool>);
@@ -437,9 +438,22 @@ mod tests {
                 event.record(&mut flag);
                 self.debug_suppressed_flags.lock().push(flag.0);
             }
+            let mut rendered = RenderedFields::default();
+            event.record(&mut rendered);
+            self.rendered_events.lock().push(rendered.0);
         }
         fn enter(&self, _: &tracing::span::Id) {}
         fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[derive(Default)]
+    struct RenderedFields(String);
+
+    impl tracing::field::Visit for RenderedFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            let _ = write!(&mut self.0, "{}={value:?};", field.name());
+        }
     }
 
     async fn drive_once(client: &McpHttpClient<MockInner>) {
@@ -493,5 +507,35 @@ mod tests {
             vec![Some(false), Some(true)],
             "suppressed entry logs at debug with suppressed_warn set"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_logs_omit_server_and_uri_secret_fragments() {
+        const SENTINEL: &str = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+
+        let capture = LogCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let client = McpHttpClient::new(
+            MockInner,
+            format!("server-{SENTINEL}"),
+            WarnBudget::default(),
+        );
+        let uri: Arc<str> =
+            format!("https://user:{SENTINEL}@example.test/sse?token={SENTINEL}").into();
+
+        for _ in 0..4 {
+            let stream = client
+                .get_stream(uri.clone(), "session".into(), None, None, HashMap::new())
+                .await
+                .expect("mock stream");
+            drop(stream);
+        }
+
+        let rendered = capture.rendered_events.lock().join("\n");
+        assert!(!rendered.contains(SENTINEL));
+        for window in SENTINEL.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).unwrap();
+            assert!(!rendered.contains(fragment), "leaked fragment {fragment}");
+        }
     }
 }

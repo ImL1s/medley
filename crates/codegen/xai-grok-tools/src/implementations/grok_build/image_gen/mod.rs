@@ -136,10 +136,8 @@ impl ImageGenClient {
                 .default_headers(headers),
         )
         .build()
-        .map_err(|e| {
-            xai_tool_runtime::ToolError::invalid_arguments(format!(
-                "Failed to build HTTP client: {e}"
-            ))
+        .map_err(|_| {
+            xai_tool_runtime::ToolError::invalid_arguments("Failed to build HTTP client.")
         })?;
 
         Ok(Self {
@@ -176,8 +174,23 @@ impl ImageGenClient {
         crate::types::api_key_provider::resolve_bearer(self.api_key_provider.as_ref()).await
     }
 
-    pub(crate) fn record_401_attribution(&self, consumer: ToolConsumer, sent_bearer: Option<&str>) {
-        crate::attribution::emit_401(self.attribution_callback.as_ref(), consumer, sent_bearer);
+    pub(crate) async fn compare_sent_credential(
+        &self,
+        sent_bearer: Option<&str>,
+    ) -> xai_grok_auth::CredentialComparison {
+        crate::types::api_key_provider::compare_sent_bearer(
+            self.api_key_provider.as_ref(),
+            sent_bearer,
+        )
+        .await
+    }
+
+    pub(crate) fn record_401_attribution(
+        &self,
+        consumer: ToolConsumer,
+        comparison: xai_grok_auth::CredentialComparison,
+    ) {
+        crate::attribution::emit_401(self.attribution_callback.as_ref(), consumer, comparison);
     }
 
     pub(crate) fn base_url(&self) -> &str {
@@ -212,48 +225,46 @@ impl ImageGenClient {
             "response_format": "b64_json",
         });
 
-        // Capture the bearer once so the request and the 401-attribution
-        // emit see the same value (even if the provider rotates between
-        // the send and the response handling).
         let sent_bearer = self.current_bearer().await;
         let mut req = self.http.post(&url).json(&payload);
         if let Some(ref key) = sent_bearer {
             req = req.header(AUTHORIZATION, format!("Bearer {key}"));
         }
-
-        let response = req.send().await.map_err(|e| {
-            xai_tool_runtime::ToolError::invalid_arguments(format!(
-                "Image generation API request failed: {e}"
-            ))
+        let request = req.build().map_err(|_| {
+            xai_tool_runtime::ToolError::invalid_arguments(
+                "Failed to build image generation request.",
+            )
+        })?;
+        let sent_bearer = crate::types::api_key_provider::request_credential(&request);
+        let response = self.http.execute(request).await.map_err(|_| {
+            xai_tool_runtime::ToolError::invalid_arguments("Image generation API transport failed.")
         })?;
 
         let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            self.record_401_attribution(ToolConsumer::ImageGen, sent_bearer.as_deref());
+        if crate::types::api_key_provider::is_auth_failure(status) {
+            let comparison = self.compare_sent_credential(sent_bearer.as_deref()).await;
+            self.record_401_attribution(ToolConsumer::ImageGen, comparison);
         }
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            let truncated: String = body.chars().take(200).collect();
-            tracing::warn!(http_status = %status, "Imagine API error: {truncated}");
+            tracing::warn!(http_status = %status, "Imagine API request failed");
             return Err(xai_tool_runtime::ToolError::new(
                 xai_tool_runtime::ToolErrorKind::Custom,
-                format!("Image generation failed with HTTP {status}: {truncated}"),
+                format!("Image generation failed (HTTP {status})."),
             )
             .with_details(serde_json::json!({"code": "http_failure", "status": status.as_u16()})));
         }
 
-        let body = response.text().await.map_err(|e| {
-            xai_tool_runtime::ToolError::invalid_arguments(format!(
-                "Failed to read image generation response body: {e}"
-            ))
+        let body = response.text().await.map_err(|_| {
+            xai_tool_runtime::ToolError::invalid_arguments(
+                "Failed to read image generation response.",
+            )
         })?;
 
-        let resp_json: ImageGenResponse = serde_json::from_str(&body).map_err(|e| {
-            let preview: String = body.chars().take(500).collect();
-            tracing::warn!("Imagine API returned unparseable body: {preview}");
-            xai_tool_runtime::ToolError::invalid_arguments(format!(
-                "Failed to parse image generation response: {e} — body preview: {preview}"
-            ))
+        let resp_json: ImageGenResponse = serde_json::from_str(&body).map_err(|_| {
+            tracing::warn!("Imagine API returned an invalid response");
+            xai_tool_runtime::ToolError::invalid_arguments(
+                "Image generation API returned an invalid response.",
+            )
         })?;
 
         let b64_data = resp_json.b64_data().unwrap_or("");
@@ -275,7 +286,7 @@ impl ImageGenClient {
 }
 
 /// `Enabled` means credentials are present; each tool has its own gate.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub enum ImageGenConfig {
     #[default]
     Disabled,
@@ -299,6 +310,37 @@ pub enum ImageGenConfig {
         /// API-key / workspace callers.
         tier_restricted: bool,
     },
+}
+
+impl std::fmt::Debug for ImageGenConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled => f.write_str("ImageGenConfig::Disabled"),
+            Self::Enabled {
+                api_key,
+                base_url,
+                extra_headers,
+                image_gen_enabled,
+                image_edit_enabled,
+                model_override,
+                edit_model_override,
+                tier_restricted,
+            } => f
+                .debug_struct("ImageGenConfig::Enabled")
+                .field("api_key_present", &!api_key.is_empty())
+                .field("base_url_present", &!base_url.is_empty())
+                .field("extra_headers_present", &!extra_headers.is_empty())
+                .field("image_gen_enabled", image_gen_enabled)
+                .field("image_edit_enabled", image_edit_enabled)
+                .field("model_override_present", &model_override.is_some())
+                .field(
+                    "edit_model_override_present",
+                    &edit_model_override.is_some(),
+                )
+                .field("tier_restricted", tier_restricted)
+                .finish(),
+        }
+    }
 }
 
 /// Session-id header attached to imagine API requests; matches the header
@@ -485,6 +527,36 @@ impl xai_tool_runtime::Tool for ImageGenTool {
 mod tests {
     use super::*;
     use crate::types::tool_metadata::test_ctx_with_call_id;
+
+    fn assert_no_secret_windows(rendered: &str, secret: &str) {
+        assert!(!rendered.contains(secret));
+        for window in secret.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(
+                !rendered.contains(window),
+                "leaked sentinel window: {window}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_debug_is_presence_only() {
+        let secret = "GB002-image-config-secret-0123456789abcdef";
+        let config = ImageGenConfig::Enabled {
+            api_key: secret.to_owned(),
+            base_url: format!("https://user:{secret}@example.test/?token={secret}"),
+            extra_headers: indexmap::IndexMap::from([(
+                "Authorization".to_owned(),
+                secret.to_owned(),
+            )]),
+            image_gen_enabled: true,
+            image_edit_enabled: true,
+            model_override: Some(secret.to_owned()),
+            edit_model_override: Some(secret.to_owned()),
+            tier_restricted: false,
+        };
+        assert_no_secret_windows(&format!("{config:?}"), secret);
+    }
 
     #[test]
     fn tool_name_and_description() {
@@ -676,6 +748,39 @@ mod tests {
                 assert!(t.text.contains("supergrok?referrer=grok-build"));
             }
             other => panic!("expected Text upsell, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_error_body_never_reaches_image_generation_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let secret = "image-secret-0123456789";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/images/generations"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string(format!("provider echoed {secret} and {}", &secret[4..16])),
+            )
+            .mount(&server)
+            .await;
+        let cfg = ImageGenConfig::Enabled {
+            api_key: secret.into(),
+            base_url: server.uri(),
+            extra_headers: indexmap::IndexMap::new(),
+            image_gen_enabled: true,
+            image_edit_enabled: true,
+            model_override: None,
+            edit_model_override: None,
+            tier_restricted: false,
+        };
+        let client = ImageGenClient::new(&cfg, None).unwrap();
+        let error = client.generate("cat", "1:1").await.unwrap_err().to_string();
+        assert!(!error.contains(secret));
+        for window in secret.as_bytes().windows(8) {
+            assert!(!error.contains(std::str::from_utf8(window).unwrap()));
         }
     }
 }

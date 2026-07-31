@@ -440,9 +440,8 @@ pub enum Event {
     /// which is a per-tool-call transport failure.
     McpTransportDecodeError {
         server_name: String,
+        /// Fixed diagnostic category only; never a parser error or provider bytes.
         error: String,
-        /// Truncated copy of the offending line, for diagnosis.
-        sample: String,
     },
     McpTransportReconnect {
         server_name: String,

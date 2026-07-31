@@ -252,18 +252,6 @@ fn add_directory_to_tar<W: std::io::Write>(
 // Upload method diagnostics
 // ---------------------------------------------------------------------------
 
-/// Show first and last `n` chars with `***` in between. Char-safe (no byte-boundary panics).
-/// Returns the full string if it's short enough that redacting would be pointless.
-fn redact_middle(s: &str, n: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= n * 2 + 3 {
-        return s.to_owned();
-    }
-    let prefix: String = chars[..n].iter().collect();
-    let suffix: String = chars[chars.len() - n..].iter().collect();
-    format!("{prefix}***{suffix}")
-}
-
 pub struct UploadMethodDisplay<'a> {
     pub method: &'a UploadMethod,
     pub bucket_url: &'a str,
@@ -281,7 +269,7 @@ impl std::fmt::Display for UploadMethodDisplay<'_> {
                     "ambient credentials"
                 };
                 writeln!(f, "  Method:   Direct GCS")?;
-                writeln!(f, "  Bucket:   {}", self.bucket_url)?;
+                writeln!(f, "  Bucket:   configured={}", !self.bucket_url.is_empty())?;
                 write!(f, "  Auth:     {auth}")
             }
             UploadMethod::Proxy {
@@ -289,13 +277,9 @@ impl std::fmt::Display for UploadMethodDisplay<'_> {
                 deployment_key,
                 ..
             } => {
-                let deploy = deployment_key
-                    .as_deref()
-                    .map(|k| redact_middle(k, 4))
-                    .unwrap_or_else(|| "none".to_string());
                 writeln!(f, "  Method:   Proxy")?;
-                writeln!(f, "  Proxy:    {proxy_base_url}")?;
-                write!(f, "  Deploy:   {deploy}")
+                writeln!(f, "  Proxy:    configured={}", !proxy_base_url.is_empty())?;
+                write!(f, "  Deploy:   configured={}", deployment_key.is_some())
             }
             UploadMethod::S3 {
                 bucket,
@@ -305,7 +289,6 @@ impl std::fmt::Display for UploadMethodDisplay<'_> {
                 credentials_file,
                 ..
             } => {
-                let endpoint = endpoint_url.as_deref().unwrap_or("(default AWS)");
                 let creds = if credentials_content.is_some() {
                     "inline credentials"
                 } else if credentials_file.is_some() {
@@ -314,9 +297,9 @@ impl std::fmt::Display for UploadMethodDisplay<'_> {
                     "ambient credentials"
                 };
                 writeln!(f, "  Method:   S3")?;
-                writeln!(f, "  Bucket:   {bucket}")?;
-                writeln!(f, "  Region:   {region}")?;
-                writeln!(f, "  Endpoint: {endpoint}")?;
+                writeln!(f, "  Bucket:   configured={}", !bucket.is_empty())?;
+                writeln!(f, "  Region:   configured={}", !region.is_empty())?;
+                writeln!(f, "  Endpoint: configured={}", endpoint_url.is_some())?;
                 write!(f, "  Auth:     {creds}")
             }
         }
@@ -480,7 +463,7 @@ async fn run_upload(
         session_id = %session_id,
         object_path = %object_path,
         archive_bytes = archive_size,
-        bucket_url = bucket_display,
+        bucket_configured = bucket_url.is_some(),
         "trace_cmd: starting upload"
     );
     if !json {
@@ -491,7 +474,7 @@ async fn run_upload(
 
     match upload_with_retries(&upload_config, &object_path, &archive).await {
         Ok(url) => {
-            tracing::info!(session_id = %session_id, url = %url, "trace_cmd: upload succeeded");
+            tracing::info!(session_id = %session_id, "trace_cmd: upload succeeded");
             if json {
                 let result = TraceResult {
                     session_id: session_id.to_owned(),
@@ -516,7 +499,6 @@ async fn run_upload(
                 output,
                 method_desc: &method_desc,
                 object_path: &object_path,
-                bucket_url: bucket_display,
                 json,
             };
             Err(attempt.handle_failure(&e))
@@ -530,13 +512,12 @@ pub struct UploadAttempt<'a> {
     pub output: Option<&'a Path>,
     pub method_desc: &'a str,
     pub object_path: &'a str,
-    pub bucket_url: &'a str,
     pub json: bool,
 }
 
 impl UploadAttempt<'_> {
     /// Saves local bundle + debug log, prints diagnostics.
-    pub fn handle_failure(&self, error: &anyhow::Error) -> anyhow::Error {
+    fn handle_failure(&self, error: &SafeUploadFailure) -> anyhow::Error {
         let export_dir = trace_exports_dir();
         std::fs::create_dir_all(&export_dir).ok();
 
@@ -547,6 +528,7 @@ impl UploadAttempt<'_> {
             });
 
         let log_path = self.write_debug_log(error, &export_dir);
+        let safe_error = error.to_string();
 
         if self.json {
             let result = TraceResult {
@@ -554,12 +536,12 @@ impl UploadAttempt<'_> {
                 status: "failed",
                 url: None,
                 local_path: Some(export_path.display().to_string()),
-                error: Some(format!("{error}")),
+                error: Some(safe_error.clone()),
             };
             println!("{}", serde_json::to_string(&result).unwrap_or_default());
         } else {
             eprintln!();
-            eprintln!("Trace upload failed: {error}");
+            eprintln!("Trace upload failed: {safe_error}");
             eprintln!("  Bundle: {}", export_path.display());
             eprintln!("  Log:    {}", log_path.display());
             eprintln!("  Retry:  grok trace {}", self.session_id);
@@ -569,7 +551,7 @@ impl UploadAttempt<'_> {
         anyhow::anyhow!("Trace upload failed for session {}", self.session_id)
     }
 
-    fn write_debug_log(&self, error: &anyhow::Error, output_dir: &Path) -> PathBuf {
+    fn write_debug_log(&self, error: &SafeUploadFailure, output_dir: &Path) -> PathBuf {
         use std::fmt::Write;
 
         let log_path = output_dir.join(format!("{}.upload.log", self.session_id));
@@ -592,13 +574,45 @@ impl UploadAttempt<'_> {
         let _ = writeln!(log, "{}", self.method_desc);
         let _ = writeln!(log);
         let _ = writeln!(log, "Error:\n  {error}");
-        let _ = writeln!(log);
-        let _ = writeln!(log, "Full error chain:\n  {error:?}");
 
         if let Err(e) = std::fs::write(&log_path, &log) {
             eprintln!("  Warning: failed to write debug log: {e}");
         }
         log_path
+    }
+}
+
+/// Closed upload-failure projection used by the CLI, JSON response, and
+/// support artifact. Raw backend errors can contain request URLs, signed
+/// queries, echoed credentials, or response bodies, so they are classified at
+/// the upload boundary and immediately discarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SafeUploadFailure {
+    TimedOut,
+    HttpStatus(u16),
+    TransportOrBackend,
+}
+
+impl SafeUploadFailure {
+    fn from_backend(error: &anyhow::Error) -> Self {
+        error
+            .chain()
+            .find_map(|cause| {
+                cause
+                    .downcast_ref::<xai_file_utils::storage_client::HttpUploadError>()
+                    .map(|http| Self::HttpStatus(http.status_code))
+            })
+            .unwrap_or(Self::TransportOrBackend)
+    }
+}
+
+impl std::fmt::Display for SafeUploadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TimedOut => f.write_str("upload request timed out"),
+            Self::HttpStatus(status) => write!(f, "upload request failed with HTTP {status}"),
+            Self::TransportOrBackend => f.write_str("upload transport or backend failed"),
+        }
     }
 }
 
@@ -612,7 +626,7 @@ async fn upload_with_retries(
     config: &xai_grok_shell::session::repo_changes::TraceExportConfig,
     object_path: &str,
     archive: &[u8],
-) -> anyhow::Result<String> {
+) -> Result<String, SafeUploadFailure> {
     use backon::{ExponentialBuilder, Retryable};
 
     let backoff = ExponentialBuilder::default()
@@ -621,16 +635,20 @@ async fn upload_with_retries(
         .with_max_times(3);
 
     (|| async {
-        tokio::time::timeout(
+        match tokio::time::timeout(
             UPLOAD_TIMEOUT,
             xai_file_utils::gcs::upload_bytes(config, object_path, archive, "application/gzip"),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("Upload timed out after {}s", UPLOAD_TIMEOUT.as_secs()))?
+        {
+            Ok(Ok(url)) => Ok(url),
+            Ok(Err(error)) => Err(SafeUploadFailure::from_backend(&error)),
+            Err(_) => Err(SafeUploadFailure::TimedOut),
+        }
     })
     .retry(backoff)
-    .notify(|err, dur| {
-        tracing::warn!(error = %err, retry_in = ?dur, "trace_cmd: upload attempt failed, retrying");
+    .notify(|_, dur| {
+        tracing::warn!(retry_in = ?dur, "trace_cmd: upload attempt failed, retrying");
         eprintln!("  Upload failed, retrying in {}s...", dur.as_secs());
     })
     .await
@@ -648,9 +666,7 @@ pub async fn resolve_upload_method(agent_config: &AgentConfig) -> Option<UploadM
         Some("Authentication required for trace upload."),
     )
     .await
-    .inspect_err(
-        |e| tracing::info!(error = %e, "trace_cmd: auth failed, trying ambient credentials"),
-    )
+    .inspect_err(|_| tracing::info!("trace_cmd: auth failed, trying ambient credentials"))
     .ok()
     .flatten()
     .map(|auth| auth.key);
@@ -660,4 +676,101 @@ pub async fn resolve_upload_method(agent_config: &AgentConfig) -> Option<UploadM
         tracing::warn!("trace_cmd: no upload method available");
     }
     method
+}
+
+#[cfg(test)]
+mod credential_diagnostics_tests {
+    use super::*;
+
+    const SENTINEL: &str = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+
+    fn assert_no_secret_fragments(rendered: &str) {
+        assert!(!rendered.contains(SENTINEL), "secret leaked: {rendered}");
+        for window in SENTINEL.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).unwrap();
+            assert!(
+                !rendered.contains(fragment),
+                "secret fragment {fragment:?} leaked: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn upload_method_display_is_presence_only() {
+        let methods = [
+            UploadMethod::Direct {
+                service_account_key: Some(SENTINEL.into()),
+            },
+            UploadMethod::Proxy {
+                proxy_base_url: format!("https://user:{SENTINEL}@proxy.example/?key={SENTINEL}"),
+                user_token: SENTINEL.into(),
+                deployment_key: Some(SENTINEL.into()),
+                alpha_test_key: Some(SENTINEL.into()),
+            },
+            UploadMethod::S3 {
+                bucket: SENTINEL.into(),
+                region: SENTINEL.into(),
+                credentials_file: Some(format!("/tmp/{SENTINEL}")),
+                credentials_content: Some(SENTINEL.into()),
+                endpoint_url: Some(format!("https://{SENTINEL}@s3.example/?key={SENTINEL}")),
+            },
+        ];
+
+        for method in &methods {
+            let rendered = UploadMethodDisplay {
+                method,
+                bucket_url: SENTINEL,
+            }
+            .to_string();
+            assert_no_secret_fragments(&rendered);
+        }
+    }
+
+    #[test]
+    fn upload_failure_support_log_omits_error_and_config_secrets() {
+        let method = UploadMethod::Proxy {
+            proxy_base_url: format!("https://user:{SENTINEL}@proxy.example/?key={SENTINEL}"),
+            user_token: SENTINEL.into(),
+            deployment_key: Some(SENTINEL.into()),
+            alpha_test_key: Some(SENTINEL.into()),
+        };
+        let method_desc = UploadMethodDisplay {
+            method: &method,
+            bucket_url: SENTINEL,
+        }
+        .to_string();
+        let attempt = UploadAttempt {
+            session_id: "safe-session",
+            archive: b"archive",
+            output: None,
+            method_desc: &method_desc,
+            object_path: "safe-session/trace_export.tar.gz",
+            json: false,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let raw_error = anyhow::Error::new(xai_file_utils::storage_client::HttpUploadError {
+            status_code: 403,
+            message: format!("provider echoed {SENTINEL}"),
+        });
+        let safe_error = SafeUploadFailure::from_backend(&raw_error);
+        let log_path = attempt.write_debug_log(&safe_error, dir.path());
+        let log = std::fs::read_to_string(log_path).unwrap();
+
+        assert_no_secret_fragments(&log);
+        assert_no_secret_fragments(&safe_error.to_string());
+        assert!(log.contains("upload request failed with HTTP 403"));
+        assert_eq!(safe_error, SafeUploadFailure::HttpStatus(403));
+    }
+
+    #[test]
+    fn upload_failure_classification_keeps_closed_operational_facts() {
+        assert_eq!(
+            SafeUploadFailure::TimedOut.to_string(),
+            "upload request timed out"
+        );
+        assert_eq!(
+            SafeUploadFailure::TransportOrBackend.to_string(),
+            "upload transport or backend failed"
+        );
+    }
 }

@@ -118,7 +118,7 @@ pub struct ExternalClientInfo {
 /// There is deliberately **no `headers` key** (user decision, RQ4): collector
 /// auth is supplied via the `OTEL_EXPORTER_OTLP_HEADERS` env var only, so
 /// collector tokens are never stored on disk.
-#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct ExternalOtelFileConfig {
     /// `= GROK_EXTERNAL_OTEL` (env wins).
@@ -137,11 +137,25 @@ pub struct ExternalOtelFileConfig {
     pub log_tool_details: Option<bool>,
 }
 
+impl std::fmt::Debug for ExternalOtelFileConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalOtelFileConfig")
+            .field("enabled", &self.enabled)
+            .field("metrics_exporter_present", &self.metrics_exporter.is_some())
+            .field("logs_exporter_present", &self.logs_exporter.is_some())
+            .field("endpoint_present", &self.endpoint.is_some())
+            .field("protocol_present", &self.protocol.is_some())
+            .field("log_user_prompts", &self.log_user_prompts)
+            .field("log_tool_details", &self.log_tool_details)
+            .finish()
+    }
+}
+
 /// Fully resolved configuration for the external stream. Returned by
 /// [`ExternalOtelConfig::resolve`] only when the double opt-in is satisfied;
 /// `None` means the module is never constructed (zero allocation, zero
 /// threads, zero sockets).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ExternalOtelConfig {
     pub metrics_exporter: ExporterSelection,
     pub logs_exporter: ExporterSelection,
@@ -185,6 +199,41 @@ pub struct ExternalOtelConfig {
     /// internal adoption meta-event. `remote` is not a possible startup
     /// source (init reads env + local config only).
     pub enabled_source: &'static str,
+}
+
+impl std::fmt::Debug for ExternalOtelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalOtelConfig")
+            .field("metrics_exporter", &self.metrics_exporter)
+            .field("logs_exporter", &self.logs_exporter)
+            .field("transport", &self.transport)
+            .field("logs_endpoint_present", &!self.logs_endpoint.is_empty())
+            .field(
+                "metrics_endpoint_present",
+                &!self.metrics_endpoint.is_empty(),
+            )
+            .field("logs_header_count", &self.logs_headers.len())
+            .field("metrics_header_count", &self.metrics_headers.len())
+            .field("timeout", &self.timeout)
+            .field("metric_export_interval", &self.metric_export_interval)
+            .field("logs_export_interval", &self.logs_export_interval)
+            .field("gates", &self.gates)
+            .field("temporality", &self.temporality)
+            .field(
+                "include_session_id_on_metrics",
+                &self.include_session_id_on_metrics,
+            )
+            .field(
+                "include_version_on_metrics",
+                &self.include_version_on_metrics,
+            )
+            .field(
+                "internal_pipeline_consumed_otel_vars",
+                &self.internal_pipeline_consumed_otel_vars,
+            )
+            .field("enabled_source", &self.enabled_source)
+            .finish()
+    }
 }
 
 fn env_bool(raw: &str) -> Option<bool> {
@@ -412,6 +461,53 @@ impl ExternalOtelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_no_secret_windows(rendered: &str, secret: &str) {
+        assert!(
+            !rendered.contains(secret),
+            "leaked full sentinel: {rendered}"
+        );
+        for window in secret.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(
+                !rendered.contains(fragment),
+                "leaked sentinel window {fragment}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_otel_debug_is_presence_only_for_endpoints_and_headers() {
+        const SENTINEL: &str = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+        let endpoint = format!("https://user:{SENTINEL}@otel.example/?token={SENTINEL}");
+        let file = ExternalOtelFileConfig {
+            enabled: Some(true),
+            metrics_exporter: Some(SENTINEL.into()),
+            logs_exporter: Some(SENTINEL.into()),
+            endpoint: Some(endpoint.clone()),
+            protocol: Some(SENTINEL.into()),
+            log_user_prompts: Some(false),
+            log_tool_details: Some(false),
+        };
+        let config = ExternalOtelConfig::resolve_with(
+            env(&[
+                ("GROK_EXTERNAL_OTEL", "1"),
+                ("OTEL_LOGS_EXPORTER", "otlp"),
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint),
+                (
+                    "OTEL_EXPORTER_OTLP_HEADERS",
+                    &format!("authorization=Bearer {SENTINEL}"),
+                ),
+            ]),
+            None,
+        )
+        .expect("external OTLP enabled");
+
+        let rendered = format!("{file:?}\n{config:?}");
+        assert!(rendered.contains("endpoint_present: true"));
+        assert!(rendered.contains("logs_header_count: 1"));
+        assert_no_secret_windows(&rendered, SENTINEL);
+    }
     use std::collections::HashMap;
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {

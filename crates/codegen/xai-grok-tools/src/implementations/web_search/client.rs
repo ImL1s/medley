@@ -68,10 +68,10 @@ impl WebSearchClient {
             reqwest::Client::builder().default_headers(headers),
         )
         .build()
-        .map_err(|e| {
+        .map_err(|_| {
             xai_tool_runtime::ToolError::execution(
                 xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                format!("Failed to build HTTP client: {e}"),
+                "Failed to build HTTP client.".to_string(),
             )
         })?;
         Ok(Self {
@@ -94,11 +94,21 @@ impl WebSearchClient {
     async fn current_bearer(&self) -> Option<String> {
         crate::types::api_key_provider::resolve_bearer(self.api_key_provider.as_ref()).await
     }
-    fn record_401_attribution(&self, sent_bearer: Option<&str>) {
+    async fn compare_sent_credential(
+        &self,
+        sent_bearer: Option<&str>,
+    ) -> xai_grok_auth::CredentialComparison {
+        crate::types::api_key_provider::compare_sent_bearer(
+            self.api_key_provider.as_ref(),
+            sent_bearer,
+        )
+        .await
+    }
+    fn record_401_attribution(&self, comparison: xai_grok_auth::CredentialComparison) {
         crate::attribution::emit_401(
             self.attribution_callback.as_ref(),
             ToolConsumer::WebSearch,
-            sent_bearer,
+            comparison,
         );
     }
     /// Perform a web search query using the Responses API.
@@ -140,47 +150,47 @@ impl WebSearchClient {
         if let Some(ref key) = sent_bearer {
             req = req.header(AUTHORIZATION, format!("Bearer {key}"));
         }
-        let response = req.send().await.map_err(|e| {
+        let request = req.build().map_err(|_| {
             xai_tool_runtime::ToolError::execution(
                 xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                format!("HTTP request failed: {e}"),
+                "Failed to build HTTP request.".to_string(),
+            )
+        })?;
+        let sent_bearer = crate::types::api_key_provider::request_credential(&request);
+        let response = self.http.execute(request).await.map_err(|_| {
+            xai_tool_runtime::ToolError::execution(
+                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+                "Responses API transport failed.".to_string(),
             )
         })?;
         let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            self.record_401_attribution(sent_bearer.as_deref());
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Failed to read error body".to_string());
+        if crate::types::api_key_provider::is_auth_failure(status) {
+            let comparison = self.compare_sent_credential(sent_bearer.as_deref()).await;
+            self.record_401_attribution(comparison);
             return Err(xai_tool_runtime::ToolError::unauthorized(format!(
-                "Responses API returned 401 Unauthorized: {body}"
+                "Responses API authentication failed (HTTP {status})."
             ))
             .with_details(serde_json::json!({
                 "tool_id": "web_search",
-                "status": 401,
+                "status": status.as_u16(),
             })));
         }
         if !status.is_success() {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Failed to read error body".to_string());
             return Err(xai_tool_runtime::ToolError::execution(
                 xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                format!("Responses API returned {status}: {body}"),
+                format!("Responses API request failed (HTTP {status})."),
             ));
         }
-        let bytes = response.bytes().await.map_err(|e| {
+        let bytes = response.bytes().await.map_err(|_| {
             xai_tool_runtime::ToolError::execution(
                 xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                format!("Failed to read response body: {e}"),
+                "Failed to read Responses API response.".to_string(),
             )
         })?;
-        let response_obj: rs::Response = serde_json::from_slice(&bytes).map_err(|e| {
+        let response_obj: rs::Response = serde_json::from_slice(&bytes).map_err(|_| {
             xai_tool_runtime::ToolError::execution(
                 xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                format!("Failed to parse response: {e}"),
+                "Responses API returned an invalid response.".to_string(),
             )
         })?;
         let content = response_obj
@@ -231,47 +241,47 @@ impl WebSearchClient {
         if let Some(ref key) = sent_bearer {
             req = req.header(AUTHORIZATION, format!("Bearer {key}"));
         }
-        let response = req.send().await.map_err(|e| {
+        let request = req.build().map_err(|_| {
             xai_tool_runtime::ToolError::execution(
                 xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                format!("HTTP request failed: {e}"),
+                "Failed to build HTTP request.".to_string(),
+            )
+        })?;
+        let sent_bearer = crate::types::api_key_provider::request_credential(&request);
+        let response = self.http.execute(request).await.map_err(|_| {
+            xai_tool_runtime::ToolError::execution(
+                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+                "Responses API transport failed.".to_string(),
             )
         })?;
         let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            self.record_401_attribution(sent_bearer.as_deref());
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Failed to read error body".to_string());
+        if crate::types::api_key_provider::is_auth_failure(status) {
+            let comparison = self.compare_sent_credential(sent_bearer.as_deref()).await;
+            self.record_401_attribution(comparison);
             return Err(xai_tool_runtime::ToolError::unauthorized(format!(
-                "Responses API returned 401 Unauthorized: {body}"
+                "Responses API authentication failed (HTTP {status})."
             ))
             .with_details(serde_json::json!({
                 "tool_id": "web_search",
-                "status": 401,
+                "status": status.as_u16(),
             })));
         }
         if !status.is_success() {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Failed to read error body".to_string());
             return Err(xai_tool_runtime::ToolError::execution(
                 xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                format!("Responses API returned {status}: {body}"),
+                format!("Responses API request failed (HTTP {status})."),
             ));
         }
-        let bytes = response.bytes().await.map_err(|e| {
+        let bytes = response.bytes().await.map_err(|_| {
             xai_tool_runtime::ToolError::execution(
                 xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                format!("Failed to read response body: {e}"),
+                "Failed to read Responses API response.".to_string(),
             )
         })?;
-        let response_obj: rs::Response = serde_json::from_slice(&bytes).map_err(|e| {
+        let response_obj: rs::Response = serde_json::from_slice(&bytes).map_err(|_| {
             xai_tool_runtime::ToolError::execution(
                 xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                format!("Failed to parse response: {e}"),
+                "Responses API returned an invalid response.".to_string(),
             )
         })?;
         let content = response_obj
@@ -364,21 +374,25 @@ mod tests {
     /// Counts attribution callback invocations for the test below.
     #[derive(Default, Debug)]
     struct CountingCallback {
-        invocations: std::sync::Mutex<Vec<(ToolConsumer, Option<String>)>>,
+        invocations: std::sync::Mutex<Vec<(ToolConsumer, xai_grok_auth::CredentialComparison)>>,
     }
     impl crate::attribution::Auth401AttributionCallback for CountingCallback {
-        fn record_401(&self, consumer: ToolConsumer, sent_bearer_prefix: Option<&str>) {
+        fn record_401(
+            &self,
+            consumer: ToolConsumer,
+            comparison: xai_grok_auth::CredentialComparison,
+        ) {
             self.invocations
                 .lock()
                 .unwrap()
-                .push((consumer, sent_bearer_prefix.map(|s| s.to_string())));
+                .push((consumer, comparison));
         }
     }
     /// `record_401_attribution` invokes the wired callback with
-    /// `ToolConsumer::WebSearch` and the truncated bearer prefix.
-    /// The full bearer never crosses the trait boundary.
+    /// `ToolConsumer::WebSearch` and a safe credential relation.
+    /// No credential value crosses the trait boundary.
     #[test]
-    fn record_401_attribution_passes_truncated_prefix_to_callback() {
+    fn record_401_attribution_passes_safe_relation_to_callback() {
         let cb = std::sync::Arc::new(CountingCallback::default());
         let cb_dyn: crate::attribution::SharedAttributionCallback = cb.clone();
         let config = WebSearchConfig::Enabled {
@@ -391,14 +405,14 @@ mod tests {
         let client = WebSearchClient::new(&config, None)
             .expect("client should build")
             .with_attribution_callback(Some(cb_dyn));
-        client.record_401_attribution(Some("bearer-with-long-tail-aaaadistinct"));
+        client
+            .record_401_attribution(xai_grok_auth::CredentialComparison::different_from_current());
         let calls = cb.invocations.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, ToolConsumer::WebSearch);
-        assert_eq!(calls[0].1.as_deref(), Some("aaaadistinct"));
         assert_eq!(
-            calls[0].1.as_deref().map(str::len),
-            Some(crate::attribution::SENT_BEARER_PREFIX_LEN),
+            calls[0].1,
+            xai_grok_auth::CredentialComparison::different_from_current(),
         );
     }
     /// `record_401_attribution` is a no-op when no callback is wired
@@ -413,8 +427,8 @@ mod tests {
             alpha_test_key: None,
         };
         let client = WebSearchClient::new(&config, None).expect("client should build");
-        client.record_401_attribution(Some("any-bearer"));
-        client.record_401_attribution(None);
+        client.record_401_attribution(xai_grok_auth::CredentialComparison::same_as_current());
+        client.record_401_attribution(xai_grok_auth::CredentialComparison::not_sent(false));
     }
     #[test]
     fn test_extract_citations_empty_response() {
@@ -722,6 +736,87 @@ mod tests {
             .await
             .expect("search must succeed with provider key");
         assert_eq!(content, "fresh result");
+    }
+
+    #[derive(Debug)]
+    struct RotatingProvider {
+        values: std::sync::Mutex<std::collections::VecDeque<Option<String>>>,
+    }
+    impl crate::types::ApiKeyProvider for RotatingProvider {
+        fn current_api_key(&self) -> Option<String> {
+            self.values.lock().unwrap().pop_front().flatten()
+        }
+    }
+
+    fn assert_secret_absent(text: &str, secret: &str) {
+        assert!(!text.contains(secret), "full credential leaked: {text}");
+        for window in secret.as_bytes().windows(8) {
+            let part = std::str::from_utf8(window).unwrap();
+            assert!(!text.contains(part), "credential fragment leaked: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_failure_uses_final_wire_credential_and_redacts_provider_body() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let sent = "sent-credential-0123456789";
+        let current = "rotated-credential-9876543210";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("Authorization", format!("Bearer {sent}")))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_string(format!("provider echoed {sent} and {}", &sent[5..17])),
+            )
+            .mount(&server)
+            .await;
+
+        let provider: SharedApiKeyProvider = std::sync::Arc::new(RotatingProvider {
+            values: std::sync::Mutex::new(std::collections::VecDeque::from([
+                Some(sent.to_string()),
+                Some(current.to_string()),
+            ])),
+        });
+        let callback = std::sync::Arc::new(CountingCallback::default());
+        let config = WebSearchConfig::Enabled {
+            api_key: "static-fallback".into(),
+            base_url: server.uri(),
+            model: "test-model".into(),
+            extra_headers: IndexMap::new(),
+            alpha_test_key: None,
+        };
+        let client = WebSearchClient::new(&config, Some(provider))
+            .unwrap()
+            .with_attribution_callback(Some(callback.clone()));
+
+        let error = client.search("query", None).await.unwrap_err().to_string();
+        assert_secret_absent(&error, sent);
+        let calls = callback.invocations.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, ToolConsumer::WebSearch);
+        assert_eq!(
+            calls[0].1,
+            xai_grok_auth::CredentialComparison::different_from_current()
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_failure_never_exposes_credential_bearing_url() {
+        let secret = "ZXCVBNMASDFGHJKL0123456789";
+        let config = WebSearchConfig::Enabled {
+            api_key: "api-key".into(),
+            base_url: format!("http://127.0.0.1:0/path/{secret}?token={secret}"),
+            model: "test-model".into(),
+            extra_headers: IndexMap::new(),
+            alpha_test_key: None,
+        };
+        let client = WebSearchClient::new(&config, None).unwrap();
+        let error = client.search("query", None).await.unwrap_err().to_string();
+        assert_secret_absent(&error, secret);
+        assert!(error.contains("transport failed"), "got: {error}");
     }
     #[test]
     fn test_extract_citations_no_annotations() {

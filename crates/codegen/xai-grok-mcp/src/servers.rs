@@ -33,7 +33,7 @@ use rmcp::{
 use crate::oauth_config::McpOAuthConfig;
 
 use xai_grok_tools::types::{
-    output::{MCPOutput, MCPOutputDetails, ToolOutput},
+    output::{MCPOutput, ToolOutput},
     tool::{ToolKind, ToolNamespace},
     tool_metadata::ToolMetadata,
 };
@@ -49,8 +49,8 @@ fn with_extra_root_certificates(mut builder: reqwest::ClientBuilder) -> reqwest:
     for der in xai_grok_extra_ca::extra_root_ders() {
         match reqwest::Certificate::from_der(der) {
             Ok(cert) => builder = builder.add_root_certificate(cert),
-            Err(e) => tracing::warn!(
-                error = %e,
+            Err(_) => tracing::warn!(
+                error_class = "certificate_rejected",
                 "GROK_EXTRA_CA_BUNDLE: validated DER rejected by reqwest 0.13; skipping cert"
             ),
         }
@@ -599,8 +599,12 @@ impl McpState {
             .iter()
             .filter_map(|c| match serde_json::to_string(c) {
                 Ok(json) => Some((mcp_server_name(c), json)),
-                Err(e) => {
-                    tracing::warn!(server = mcp_server_name(c), error = %e, "Failed to serialize MCP server config for diff");
+                Err(_) => {
+                    tracing::warn!(
+                        server = mcp_server_name(c),
+                        error_class = "serialization_failed",
+                        "Failed to serialize MCP server config for diff"
+                    );
                     None
                 }
             })
@@ -610,8 +614,12 @@ impl McpState {
             .iter()
             .filter_map(|c| match serde_json::to_string(c) {
                 Ok(json) => Some((mcp_server_name(c), json)),
-                Err(e) => {
-                    tracing::warn!(server = mcp_server_name(c), error = %e, "Failed to serialize MCP server config for diff");
+                Err(_) => {
+                    tracing::warn!(
+                        server = mcp_server_name(c),
+                        error_class = "serialization_failed",
+                        "Failed to serialize MCP server config for diff"
+                    );
                     None
                 }
             })
@@ -1085,34 +1093,68 @@ pub fn parse_mcp_tool_name(name: &str) -> Option<(String, String)> {
     parse_mcp_qualified_name(name).map(|(_, server, tool)| (server.to_owned(), tool.to_owned()))
 }
 
-#[derive(Debug, thiserror::Error)]
 pub enum McpError {
-    #[error("MCP client error: {0}")]
     ClientError(String),
 
-    #[error("MCP server '{server}' timed out after {timeout_secs}s")]
-    Timeout { server: String, timeout_secs: u64 },
+    Timeout {
+        server: String,
+        timeout_secs: u64,
+    },
 
-    #[error("Failed to spawn MCP server '{server}': {source}")]
     SpawnFailed {
         server: String,
         source: std::io::Error,
     },
 
-    #[error("MCP server '{server}' handshake failed: {source}")]
     HandshakeFailed {
         server: String,
         source: Box<ClientInitializeError>,
     },
 
     /// Pre-spawn gate: server needs OAuth but this session cannot complete interactive auth.
-    #[error(
-        "MCP server '{server}': Auth required (non-interactive session; authenticate in TUI or set Authorization header)"
-    )]
-    AuthRequired { server: String },
+    AuthRequired {
+        server: String,
+    },
 
-    #[error("MCP service error: {0}")]
-    ServiceError(#[from] ServiceError),
+    ServiceError(ServiceError),
+}
+
+impl std::fmt::Display for McpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ClientError(_) => f.write_str("MCP client error"),
+            Self::Timeout {
+                server,
+                timeout_secs,
+            } => write!(f, "MCP server '{server}' timed out after {timeout_secs}s"),
+            Self::SpawnFailed { server, .. } => write!(f, "Failed to spawn MCP server '{server}'"),
+            Self::HandshakeFailed { server, .. } => {
+                write!(f, "MCP server '{server}' handshake failed")
+            }
+            Self::AuthRequired { server } => write!(
+                f,
+                "MCP server '{server}': Auth required (non-interactive session; authenticate in TUI or set Authorization header)"
+            ),
+            Self::ServiceError(_) => f.write_str("MCP service error"),
+        }
+    }
+}
+
+impl std::error::Error for McpError {}
+
+impl From<ServiceError> for McpError {
+    fn from(error: ServiceError) -> Self {
+        Self::ServiceError(error)
+    }
+}
+
+impl std::fmt::Debug for McpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpError")
+            .field("category", &self.error_category_label())
+            .field("server", &self.server_name())
+            .finish()
+    }
 }
 
 impl McpError {
@@ -1135,6 +1177,16 @@ impl McpError {
             Self::HandshakeFailed { .. } => McpErrorCategory::HandshakeFailed,
             Self::AuthRequired { .. } => McpErrorCategory::AuthRequired,
             Self::ClientError(_) | Self::ServiceError(_) => McpErrorCategory::ClientError,
+        }
+    }
+
+    fn error_category_label(&self) -> &'static str {
+        match self {
+            Self::SpawnFailed { .. } => "spawn_failed",
+            Self::Timeout { .. } => "timeout",
+            Self::HandshakeFailed { .. } => "handshake_failed",
+            Self::AuthRequired { .. } => "auth_required",
+            Self::ClientError(_) | Self::ServiceError(_) => "client_error",
         }
     }
 
@@ -1467,16 +1519,11 @@ impl xai_tool_runtime::Tool for McpErasedTool {
 
         let is_error = call_result.is_error.unwrap_or(false);
         let mut output = if is_error {
-            let error_msg = call_result
-                .content
-                .iter()
-                .filter_map(|c| match c {
-                    rmcp::model::ContentBlock::Text(t) => Some(t.text.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            ToolOutput::MCP(MCPOutput::errored(tool.clone(), server.clone(), error_msg))
+            ToolOutput::MCP(MCPOutput::errored(
+                tool.clone(),
+                server.clone(),
+                safe_mcp_tool_error_message(&call_result).to_owned(),
+            ))
         } else {
             let expose_base64 = client.expose_image_base64();
             let parts: Vec<String> = call_result
@@ -1517,13 +1564,7 @@ impl xai_tool_runtime::Tool for McpErasedTool {
         let success = !is_error;
         let duration_ms = mcp_call_start.elapsed().as_millis() as u64;
         let error_text = if is_error {
-            match &output {
-                ToolOutput::MCP(mcp) => match mcp.output() {
-                    MCPOutputDetails::Error(e) => Some(e.clone()),
-                    _ => None,
-                },
-                _ => None,
-            }
+            Some(MCP_TOOL_REPORTED_ERROR_CATEGORY.to_owned())
         } else {
             None
         };
@@ -1546,6 +1587,58 @@ impl xai_tool_runtime::Tool for McpErasedTool {
             duration_ms,
         });
         Ok(output)
+    }
+}
+
+const MCP_TOOL_REPORTED_ERROR_MESSAGE: &str = "MCP tool reported an error";
+const MCP_TOOL_AUTH_REQUIRED_MESSAGE: &str = "MCP tool requires authentication";
+const MCP_TOOL_INVALID_ARGUMENTS_MESSAGE: &str = "MCP tool rejected invalid arguments";
+const MCP_TOOL_RATE_LIMITED_MESSAGE: &str = "MCP tool was rate limited";
+const MCP_TOOL_REPORTED_ERROR_CATEGORY: &str = "tool_reported_error";
+
+/// MCP tool results are provider-controlled and may echo request credentials.
+/// Classify them in-process into a closed recovery hint, but never project the
+/// original text into model/TUI output or support events.
+fn safe_mcp_tool_error_message(result: &rmcp::model::CallToolResult) -> &'static str {
+    let mut auth_required = false;
+    let mut invalid_arguments = false;
+    let mut rate_limited = false;
+
+    for text in result.content.iter().filter_map(|content| match content {
+        rmcp::model::ContentBlock::Text(text) => Some(text.text.to_ascii_lowercase()),
+        _ => None,
+    }) {
+        auth_required |= [
+            "authentication required",
+            "authorization required",
+            "unauthorized",
+            "not authenticated",
+            "login required",
+        ]
+        .iter()
+        .any(|needle| text.contains(needle));
+        invalid_arguments |= [
+            "invalid argument",
+            "invalid parameter",
+            "invalid params",
+            "missing field",
+            "required field",
+        ]
+        .iter()
+        .any(|needle| text.contains(needle));
+        rate_limited |= ["rate limit", "too many requests"]
+            .iter()
+            .any(|needle| text.contains(needle));
+    }
+
+    if auth_required {
+        MCP_TOOL_AUTH_REQUIRED_MESSAGE
+    } else if invalid_arguments {
+        MCP_TOOL_INVALID_ARGUMENTS_MESSAGE
+    } else if rate_limited {
+        MCP_TOOL_RATE_LIMITED_MESSAGE
+    } else {
+        MCP_TOOL_REPORTED_ERROR_MESSAGE
     }
 }
 
@@ -1648,9 +1741,9 @@ impl McpErasedTool {
                 )
                 .await
             }
-            Ok(Err(e)) => Err(xai_tool_runtime::ToolError::custom(
+            Ok(Err(_)) => Err(xai_tool_runtime::ToolError::custom(
                 "process_manager",
-                e.to_string(),
+                "MCP tool call failed",
             )),
             Err(_) => {
                 *is_timeout = true;
@@ -1670,8 +1763,8 @@ impl McpErasedTool {
         }
     }
 
-    /// On `recover()` failure surface the original error, else the retry error
-    /// (preserves the auth signal managed re-auth reads from the string).
+    /// Recover once while keeping provider-controlled transport failures out of
+    /// logs, support events, and returned error strings.
     #[allow(clippy::too_many_arguments)]
     async fn recover_and_retry(
         &self,
@@ -1679,7 +1772,7 @@ impl McpErasedTool {
         params: CallToolRequestParams,
         timeout_duration: std::time::Duration,
         tool_timeout: u64,
-        original_err: ServiceError,
+        _original_err: ServiceError,
         reconnect_attempted: &mut bool,
         is_timeout: &mut bool,
         ew: &xai_file_utils::events::EventWriter,
@@ -1688,13 +1781,13 @@ impl McpErasedTool {
         tracing::warn!(
             server = self.tool.server_name.as_str(),
             tool = self.tool.name.as_str(),
-            error = %original_err,
+            error_class = "transport_error",
             "MCP transport error, attempting reconnect"
         );
         ew.emit(xai_file_utils::events::Event::McpTransportError {
             server_name: self.tool.server_name.clone(),
             tool_name: self.tool.name.clone(),
-            error: original_err.to_string(),
+            error: "transport_error".to_string(),
         });
         let mcp_service = match client.recover().await {
             Ok(service) => {
@@ -1705,23 +1798,23 @@ impl McpErasedTool {
                 });
                 service
             }
-            Err(e) => {
+            Err(_) => {
                 ew.emit(xai_file_utils::events::Event::McpTransportReconnect {
                     server_name: self.tool.server_name.clone(),
                     success: false,
-                    error: Some(e.to_string()),
+                    error: Some("reconnect_failed".to_string()),
                 });
                 return Err(xai_tool_runtime::ToolError::custom(
                     "process_manager",
-                    original_err.to_string(),
+                    "MCP transport recovery failed",
                 ));
             }
         };
         match tokio::time::timeout(timeout_duration, mcp_service.call_tool(params)).await {
             Ok(Ok(call_result)) => Ok(call_result),
-            Ok(Err(retry_err)) => Err(xai_tool_runtime::ToolError::custom(
+            Ok(Err(_)) => Err(xai_tool_runtime::ToolError::custom(
                 "process_manager",
-                retry_err.to_string(),
+                "MCP tool call failed after reconnect",
             )),
             Err(_) => {
                 *is_timeout = true;
@@ -1808,7 +1901,11 @@ async fn discover_and_prepare_auth(
     let mut manager = match rmcp::transport::auth::AuthorizationManager::new(server_url).await {
         Ok(m) => m,
         Err(e) => {
-            tracing::warn!(server = server_name, %e, "Failed to create OAuth manager");
+            tracing::warn!(
+                server = server_name,
+                oauth_error_class = crate::oauth::oauth_error_class(&e),
+                "Failed to create OAuth manager"
+            );
             // Non-interactive: fail closed — unauthenticated HTTP may still fatal in rmcp.
             return HttpOauthPrep::on_probe_failure(mode);
         }
@@ -1824,7 +1921,7 @@ async fn discover_and_prepare_auth(
         {
             tracing::warn!(
                 server = server_name,
-                error = %e,
+                oauth_error_class = crate::oauth::oauth_error_class(&e),
                 "Skipping OAuth MCP in non-interactive mode (stored credentials unusable); re-authenticate in TUI"
             );
             return HttpOauthPrep::NeedsInteractiveLogin;
@@ -1854,7 +1951,11 @@ async fn discover_and_prepare_auth(
             HttpOauthPrep::NoOauthSupport
         }
         Err(e) => {
-            tracing::warn!(server = server_name, %e, "OAuth discovery failed");
+            tracing::warn!(
+                server = server_name,
+                oauth_error_class = crate::oauth::oauth_error_class(&e),
+                "OAuth discovery failed"
+            );
             HttpOauthPrep::on_probe_failure(mode)
         }
     }
@@ -1874,9 +1975,9 @@ pub struct HttpConfig {
 /// - **Wire silence:** a bad line is skipped without replying, whereas rmcp
 ///   answers shape-mismatched JSON with a -32600 error — a reply an off-spec
 ///   server could echo back as more invalid input.
-/// - **Telemetry:** each skip emits an `McpTransportDecodeError` event (with a
-///   truncated sample of the offending line) so the failure is visible in the
-///   session trace — rmcp's own tracing is not captured there.
+/// - **Telemetry:** each skip emits an `McpTransportDecodeError` event with a
+///   fixed category; the log additionally records byte length, so provider
+///   stdout never enters logs or support artifacts.
 ///
 /// We read lines ourselves (rather than via `FramedRead` + rmcp's codec) so
 /// reading continues after a bad line; only a genuine end-of-stream returns
@@ -1900,9 +2001,6 @@ where
     server_name: String,
     event_writer: xai_file_utils::events::EventWriter,
 }
-
-/// Max bytes of an offending line copied into the decode-error event.
-const DECODE_ERROR_SAMPLE_LEN: usize = 200;
 
 /// A line that failed to deserialize but is a JSON *notification* (an object
 /// with a `method` and no `id`) is benign — many servers emit non-MCP / unknown
@@ -1934,26 +2032,19 @@ where
         }
     }
 
-    /// Record a skipped, undecodable stdout line: a `warn!` log plus an
-    /// `McpTransportDecodeError` event carrying the serde error and a truncated
-    /// sample of the raw line (the diagnostic the untagged-enum serde error
-    /// alone lacks).
-    fn record_decode_error(&self, line: &[u8], err: &serde_json::Error) {
-        let sample: String = String::from_utf8_lossy(line)
-            .chars()
-            .take(DECODE_ERROR_SAMPLE_LEN)
-            .collect();
+    /// Record a skipped, undecodable stdout line without retaining any raw
+    /// provider-controlled bytes or parser text.
+    fn record_decode_error(&self, line: &[u8]) {
         tracing::warn!(
             server = %self.server_name,
-            error = %err,
-            sample = %sample,
+            error_class = "invalid_json_rpc",
+            line_bytes = line.len(),
             "Skipping undecodable MCP stdout line; keeping transport alive",
         );
         self.event_writer
             .emit(xai_file_utils::events::Event::McpTransportDecodeError {
                 server_name: self.server_name.clone(),
-                error: err.to_string(),
-                sample,
+                error: "invalid_json_rpc".to_string(),
             });
     }
 }
@@ -1993,10 +2084,10 @@ where
             match self.read.read_until(b'\n', &mut line).await {
                 Ok(0) => return None, // genuine end-of-stream
                 Ok(_) => {}
-                Err(e) => {
+                Err(_) => {
                     tracing::debug!(
                         server = %self.server_name,
-                        error = %e,
+                        error_class = "io_error",
                         "MCP stdio read error; closing transport",
                     );
                     return None;
@@ -2016,14 +2107,14 @@ where
                 Ok(msg) => return Some(msg),
                 // The whole point: a single undecodable line must not
                 // collapse the transport — skip it and keep reading.
-                Err(err) => {
+                Err(_) => {
                     if is_ignorable_notification(&line) {
                         tracing::trace!(
                             server = %self.server_name,
                             "Ignoring unrecognized MCP notification",
                         );
                     } else {
-                        self.record_decode_error(&line, &err);
+                        self.record_decode_error(&line);
                     }
                     continue;
                 }
@@ -2085,13 +2176,19 @@ impl SafeTokioChildProcess {
         let process_group = match ProcessGroup::new() {
             Ok(mut group) => match group.attach(&child) {
                 Ok(()) => Some(Arc::new(group)),
-                Err(e) => {
-                    tracing::warn!("Failed to attach MCP child to process group: {e}");
+                Err(_) => {
+                    tracing::warn!(
+                        error_class = "process_group_attach_failed",
+                        "Failed to attach MCP child to process group"
+                    );
                     None
                 }
             },
-            Err(e) => {
-                tracing::warn!("Failed to create MCP child process group: {e}");
+            Err(_) => {
+                tracing::warn!(
+                    error_class = "process_group_create_failed",
+                    "Failed to create MCP child process group"
+                );
                 None
             }
         };
@@ -2112,8 +2209,11 @@ impl SafeTokioChildProcess {
                 handle.spawn(async move {
                     let _ = child.kill().await;
                 });
-            } else if let Err(e) = child.start_kill() {
-                tracing::warn!("Error signaling MCP child killed by closed scope: {e}");
+            } else if child.start_kill().is_err() {
+                tracing::warn!(
+                    error_class = "child_signal_failed",
+                    "Error signaling MCP child killed by closed scope"
+                );
             }
             return Err(std::io::Error::other(
                 "session is closing (process scope already reclaimed); MCP server not started",
@@ -2138,9 +2238,12 @@ impl SafeTokioChildProcess {
     /// it's safe from `Drop`; the leader still needs reaping afterwards.
     fn kill_process_group(&self) {
         if let Some(group) = &self.process_group
-            && let Err(e) = group.kill()
+            && group.kill().is_err()
         {
-            tracing::warn!("Error killing MCP child process group: {e}");
+            tracing::warn!(
+                error_class = "process_group_kill_failed",
+                "Error killing MCP child process group"
+            );
         }
     }
 
@@ -2155,9 +2258,9 @@ impl SafeTokioChildProcess {
                 self.kill_process_group();
                 match child.kill().await {
                     Ok(()) => Ok(()),
-                    Err(e) => {
-                        tracing::warn!("Error killing MCP child: {e}");
-                        Err(e)
+                    Err(error) => {
+                        tracing::warn!(error_class = "child_kill_failed", "Error killing MCP child");
+                        Err(error)
                     }
                 }
             }
@@ -2167,12 +2270,16 @@ impl SafeTokioChildProcess {
                 self.kill_process_group();
                 match res {
                     Ok(status) => {
-                        tracing::info!("MCP child exited gracefully {status}");
+                        tracing::info!(
+                            exit_success = status.success(),
+                            exit_code = status.code(),
+                            "MCP child exited gracefully"
+                        );
                         Ok(())
                     }
-                    Err(e) => {
-                        tracing::warn!("Error waiting for MCP child: {e}");
-                        Err(e)
+                    Err(error) => {
+                        tracing::warn!(error_class = "child_wait_failed", "Error waiting for MCP child");
+                        Err(error)
                     }
                 }
             }
@@ -2195,11 +2302,14 @@ impl Drop for SafeTokioChildProcess {
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                if let Err(e) = child.kill().await {
-                    tracing::warn!("Error killing MCP child process: {e}");
+                if child.kill().await.is_err() {
+                    tracing::warn!(
+                        error_class = "child_kill_failed",
+                        "Error killing MCP child process"
+                    );
                 }
             });
-        } else if let Err(e) = std::thread::Builder::new()
+        } else if std::thread::Builder::new()
             .name("mcp-stdio-child-cleanup".to_string())
             .spawn(move || {
                 let rt = match tokio::runtime::Builder::new_current_thread()
@@ -2207,23 +2317,36 @@ impl Drop for SafeTokioChildProcess {
                     .build()
                 {
                     Ok(rt) => rt,
-                    Err(e) => {
-                        tracing::warn!("Error creating runtime to clean up MCP child process: {e}");
-                        if let Err(e) = child.start_kill() {
-                            tracing::warn!("Error signaling MCP child process during drop: {e}");
+                    Err(_) => {
+                        tracing::warn!(
+                            error_class = "cleanup_runtime_failed",
+                            "Error creating runtime to clean up MCP child process"
+                        );
+                        if child.start_kill().is_err() {
+                            tracing::warn!(
+                                error_class = "child_signal_failed",
+                                "Error signaling MCP child process during drop"
+                            );
                         }
                         return;
                     }
                 };
 
                 rt.block_on(async move {
-                    if let Err(e) = child.kill().await {
-                        tracing::warn!("Error killing MCP child process: {e}");
+                    if child.kill().await.is_err() {
+                        tracing::warn!(
+                            error_class = "child_kill_failed",
+                            "Error killing MCP child process"
+                        );
                     }
                 });
             })
+            .is_err()
         {
-            tracing::warn!("Error spawning MCP child cleanup thread: {e}");
+            tracing::warn!(
+                error_class = "cleanup_thread_failed",
+                "Error spawning MCP child cleanup thread"
+            );
         }
     }
 }
@@ -2367,9 +2490,8 @@ pub enum McpClientEvent {
         /// closing `McpClient`, so the id is always known.
         client_id: u64,
     },
-    /// `ensure_initialized` returned `Err(_)`; `reason` is the full
-    /// stringified error, surfaced verbatim to the client (no
-    /// sanitization) so failures are easy to debug.
+    /// `ensure_initialized` returned `Err(_)`; `reason` is a fixed category,
+    /// never the provider-controlled handshake error.
     HandshakeFailed {
         server: McpServerName,
         reason: String,
@@ -2924,7 +3046,7 @@ impl McpClient {
             Err(ref e) if !force && mcp_refresh_failure_is_transient(e) => {
                 tracing::warn!(
                     server = self.server_name.as_str(),
-                    error = %e,
+                    oauth_error_class = crate::oauth::oauth_error_class(e),
                     "Token refresh failed transiently (network); skipping browser escalation"
                 );
                 return false;
@@ -2932,7 +3054,7 @@ impl McpClient {
             Err(e) => {
                 tracing::info!(
                     server = self.server_name.as_str(),
-                    error = %e,
+                    oauth_error_class = crate::oauth::oauth_error_class(&e),
                     "Token refresh failed terminally; falling back to browser auth"
                 );
             }
@@ -2944,7 +3066,7 @@ impl McpClient {
                 server = self.server_name.as_str(),
                 "Falling back to browser auth"
             );
-            if let Err(e) = crate::oauth::authenticate_mcp_server_dedup(
+            if crate::oauth::authenticate_mcp_server_dedup(
                 &self.server_name,
                 &config.url,
                 auth_mgr,
@@ -2952,10 +3074,10 @@ impl McpClient {
                 force,
             )
             .await
+            .is_err()
             {
                 tracing::warn!(
                     server = self.server_name.as_str(),
-                    %e,
                     "Full re-authentication failed"
                 );
                 return false;
@@ -3392,7 +3514,7 @@ impl McpClient {
                     };
                     tracing::warn!(
                         server = %self.server_name,
-                        error = %e,
+                        error_category = ?e.error_category(),
                         "MCP server init failed"
                     );
                     Err(e)
@@ -3419,7 +3541,7 @@ impl McpClient {
                 Err(e) => {
                     let _ = tx.send(McpClientEvent::HandshakeFailed {
                         server: self.server_name.clone(),
-                        reason: e.to_string(),
+                        reason: e.error_category_label().to_string(),
                     });
                 }
             }
@@ -3479,15 +3601,15 @@ impl McpClient {
                     reqwest::Client::builder().default_headers(headers),
                 )
                 .build()
-                .map_err(|e| McpError::ClientError(format!("Failed to build HTTP client: {e}")))?;
+                .map_err(|_| McpError::ClientError("Failed to build HTTP client".to_string()))?;
                 // `AuthClient::new` wants an owned manager, but ours is shared
                 // (`Arc`) with the OAuth flow; the struct is non_exhaustive, so
                 // build with a throwaway manager and swap in the shared one.
                 let placeholder_manager =
                     rmcp::transport::auth::AuthorizationManager::new(config.url.as_str())
                         .await
-                        .map_err(|e| {
-                            McpError::ClientError(format!("Failed to build OAuth client: {e}"))
+                        .map_err(|_| {
+                            McpError::ClientError("Failed to build OAuth client".to_string())
                         })?;
                 let mut auth_client =
                     rmcp::transport::auth::AuthClient::new(http_client, placeholder_manager);
@@ -3687,7 +3809,7 @@ impl McpClient {
         let client =
             with_extra_root_certificates(reqwest::Client::builder().default_headers(headers))
                 .build()
-                .map_err(|e| McpError::ClientError(format!("Failed to build HTTP client: {e}")))?;
+                .map_err(|_| McpError::ClientError("Failed to build HTTP client".to_string()))?;
         let mcp_http_client =
             crate::mcp_http_client::McpHttpClient::new(client, server_name, warn_budget);
         let transport_config = StreamableHttpClientTransportConfig::with_uri(config.url.as_str());
@@ -3807,9 +3929,8 @@ impl McpClient {
                         format!("{}.json", sanitize_descriptor_segment(tool.name.as_ref())),
                         bytes,
                     )),
-                    Err(e) => tracing::warn!(
-                        tool = %tool.name.as_ref(),
-                        error = %e,
+                    Err(_) => tracing::warn!(
+                        error_class = "serialization_failed",
                         "failed to serialize MCP tool descriptor",
                     ),
                 }
@@ -3825,12 +3946,8 @@ impl McpClient {
         // without a lock.
         let tools_dir = server_dir.join("tools");
         tokio::task::spawn_blocking(move || -> Result<usize, McpError> {
-            std::fs::create_dir_all(&tools_dir).map_err(|e| {
-                McpError::ClientError(format!(
-                    "failed to create MCP tools descriptor dir {}: {e}",
-                    tools_dir.display()
-                ))
-            })?;
+            std::fs::create_dir_all(&tools_dir)
+                .map_err(|_| McpError::ClientError("descriptor_dir_failed".to_string()))?;
             let mut written = 0usize;
             for (file_name, bytes) in files {
                 let path = tools_dir.join(&file_name);
@@ -3841,9 +3958,8 @@ impl McpClient {
                     });
                 match write_result {
                     Ok(_) => written += 1,
-                    Err(e) => tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
+                    Err(_) => tracing::warn!(
+                        error_class = "descriptor_write_failed",
                         "failed to write MCP tool descriptor",
                     ),
                 }
@@ -3851,7 +3967,7 @@ impl McpClient {
             Ok(written)
         })
         .await
-        .map_err(|e| McpError::ClientError(format!("descriptor write task panicked: {e}")))?
+        .map_err(|_| McpError::ClientError("descriptor_task_failed".to_string()))?
     }
 
     /// Read the server's `instructions` from the MCP initialize handshake.
@@ -3985,59 +4101,29 @@ fn contains_session_placeholder(value: &str) -> bool {
     value.contains("{{session_id}}") || value.contains("${session_id}")
 }
 
-/// Sanitize an MCP server name into a safe filename component.
-fn sanitize_mcp_log_filename(name: &str) -> String {
-    let sanitized: String = name
-        .chars()
-        .take(96)
-        .map(|c| match c {
-            c if c.is_ascii_alphanumeric() => c,
-            '.' | '_' | '-' => c,
-            _ => '_',
-        })
-        .collect();
-    if sanitized.is_empty() {
-        "server".into()
-    } else {
-        sanitized
-    }
-}
-
-/// Copy an MCP server's stderr to `~/.grok/logs/mcp/<server>.stderr.log`
-/// in a background task. Truncated per spawn.
-fn drain_mcp_stderr_to_log(server_name: &str, mut stderr: tokio::process::ChildStderr) {
-    let log_dir = xai_grok_config::grok_home().join("logs").join("mcp");
-    if let Err(e) = std::fs::create_dir_all(&log_dir) {
-        tracing::warn!("MCP stderr drain: failed to create log dir: {e}");
-        return;
-    }
-    let log_path = log_dir.join(format!(
-        "{}.stderr.log",
-        sanitize_mcp_log_filename(server_name)
-    ));
-
-    let file = match std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&log_path)
-    {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!(
-                "MCP stderr drain: failed to open {}: {e}",
-                log_path.display()
-            );
-            return;
-        }
-    };
-    let mut file = tokio::fs::File::from_std(file);
+/// Drain an MCP server's stderr without retaining or logging provider bytes.
+/// Keeping the pipe drained prevents child-process backpressure; only a fixed
+/// completion category and byte count are observable.
+fn drain_mcp_stderr(server_name: &str, mut stderr: tokio::process::ChildStderr) {
     let server_name = server_name.to_string();
     tokio::spawn(async move {
-        if let Err(e) = tokio::io::copy(&mut stderr, &mut file).await {
-            tracing::warn!("MCP stderr drain '{server_name}': {e}");
-        }
+        drain_mcp_stderr_reader(&server_name, &mut stderr).await;
     });
+}
+
+async fn drain_mcp_stderr_reader<R: AsyncRead + Unpin>(server_name: &str, stderr: &mut R) {
+    match tokio::io::copy(stderr, &mut tokio::io::sink()).await {
+        Ok(bytes_drained) => tracing::debug!(
+            server = %server_name,
+            bytes_drained,
+            "MCP stderr drain completed"
+        ),
+        Err(_) => tracing::warn!(
+            server = %server_name,
+            error_class = "io_error",
+            "MCP stderr drain failed"
+        ),
+    }
 }
 
 fn expand_session_id_headers(
@@ -4177,8 +4263,8 @@ pub async fn start_mcp_server(
             env,
             ..
         }) => {
-            if let Some(mc) = meta_config {
-                tracing::info!(server = %name, ?mc, "MCP stdio: meta config override");
+            if meta_config.is_some() {
+                tracing::info!(server = %name, "MCP stdio: meta config override present");
             }
 
             let (startup_timeout, _, _) = McpClient::load_timeouts(overrides, meta_config);
@@ -4208,8 +4294,12 @@ pub async fn start_mcp_server(
                 name.clone(),
                 ctx.event_writer.clone(),
             )
-            .map_err(|e| {
-                tracing::error!("Failed to spawn MCP server '{}': {}", name, e);
+            .map_err(|error| {
+                tracing::error!(
+                    server = %name,
+                    error_class = "spawn_failed",
+                    "Failed to spawn MCP server"
+                );
                 xai_grok_telemetry::session_ctx::log_event(
                     xai_grok_telemetry::events::McpServerFailed {
                         server_name: name.clone(),
@@ -4220,14 +4310,18 @@ pub async fn start_mcp_server(
                 );
                 McpError::SpawnFailed {
                     server: name.clone(),
-                    source: e,
+                    source: std::io::Error::new(error.kind(), "MCP stdio process spawn failed"),
                 }
             })?;
 
-            tracing::debug!("MCP server '{}' spawned: PID={:?}", name, transport.id());
+            tracing::debug!(
+                server = %name,
+                pid_present = transport.id().is_some(),
+                "MCP server spawned"
+            );
 
             if let Some(stderr) = stderr_handle {
-                drain_mcp_stderr_to_log(&name, stderr);
+                drain_mcp_stderr(&name, stderr);
             }
 
             Ok(McpClient::new_stdio(
@@ -4243,8 +4337,8 @@ pub async fn start_mcp_server(
         | acp::McpServer::Sse(acp::McpServerSse {
             name, url, headers, ..
         }) => {
-            if let Some(mc) = meta_config {
-                tracing::info!(server = %name, %url, ?mc, "MCP http: meta config override");
+            if meta_config.is_some() {
+                tracing::info!(server = %name, "MCP http: meta config override present");
             }
 
             let headers = expand_session_id_headers(headers, ctx.session_id);
@@ -4277,7 +4371,6 @@ pub async fn start_mcp_server(
                     Err(_) => {
                         tracing::warn!(
                             server = %name,
-                            url = %url,
                             mode = ?ctx.mode,
                             timeout_secs = OAUTH_DISCOVERY_TIMEOUT.as_secs(),
                             "OAuth discovery timed out"
@@ -4285,7 +4378,7 @@ pub async fn start_mcp_server(
                         ctx.event_writer.emit(
                             xai_file_utils::events::Event::McpOAuthDiscoveryTimeout {
                                 server_name: name.clone(),
-                                url: url.clone(),
+                                url: String::new(),
                             },
                         );
                         HttpOauthPrep::on_probe_failure(ctx.mode)
@@ -4314,9 +4407,7 @@ pub async fn start_mcp_server(
             }
         }
         // TODO(acp-0.10): `McpServer` is #[non_exhaustive]; reject unknown transports.
-        other => Err(McpError::ClientError(format!(
-            "unsupported MCP server transport: {other:?}"
-        ))),
+        _ => Err(McpError::ClientError("unsupported_transport".to_string())),
     }
 }
 
@@ -4373,16 +4464,12 @@ pub fn mcp_transport_str(server: &acp::McpServer) -> &'static str {
 
 pub fn mcp_target_str(server: &acp::McpServer) -> String {
     match server {
-        acp::McpServer::Stdio(acp::McpServerStdio { command, args, .. }) => {
-            let cmd = command.to_string_lossy();
-            if args.is_empty() {
-                cmd.to_string()
-            } else {
-                format!("{} {}", cmd, args.join(" "))
-            }
-        }
-        acp::McpServer::Http(acp::McpServerHttp { url, .. })
-        | acp::McpServer::Sse(acp::McpServerSse { url, .. }) => url.clone(),
+        acp::McpServer::Stdio(acp::McpServerStdio { command, .. }) => command
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("configured")
+            .to_owned(),
+        acp::McpServer::Http(_) | acp::McpServer::Sse(_) => "configured".to_owned(),
         // TODO(acp-0.10): `McpServer` is #[non_exhaustive].
         _ => String::new(),
     }
@@ -4515,6 +4602,70 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    const CREDENTIAL_SENTINELS: &[&str] = &[
+        "ACCESS_TOKEN_A1b2C3d4E5f6G7h8",
+        "REFRESH_TOKEN_R8s7T6u5V4w3X2y1",
+        "DEPLOYMENT_KEY_D9e8P7l6O5y4",
+        "Bearer b3A4r5E6r7T8o9K0e1N2",
+        "x-api-key=K3y4V5a6L7u8E9",
+        "https://mcp.example.test/discover?access_token=Q1w2E3r4T5y6&tenant=prod",
+    ];
+
+    fn assert_no_credential_fragments(output: &str) {
+        for sentinel in CREDENTIAL_SENTINELS {
+            assert!(
+                !output.contains(sentinel),
+                "credential {sentinel:?} leaked in {output:?}"
+            );
+            for window in sentinel.as_bytes().windows(8) {
+                let fragment = std::str::from_utf8(window).expect("ASCII sentinel");
+                assert!(
+                    !output.contains(fragment),
+                    "credential fragment {fragment:?} leaked in {output:?}"
+                );
+            }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<parking_lot::Mutex<String>>);
+
+    struct LogVisitor<'a>(&'a mut String);
+
+    impl tracing::field::Visit for LogVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, "{}={value:?};", field.name());
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, "{}={value};", field.name());
+        }
+    }
+
+    impl tracing::Subscriber for LogCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target().starts_with("xai_grok_mcp::servers")
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            event.record(&mut LogVisitor(&mut self.0.lock()));
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
     /// A single undecodable line on an MCP stdio server's stdout must NOT
     /// collapse the transport: if the decode error surfaced as `None`, the
     /// service would read it as EOF → "Transport closed" → `tools/list` fails
@@ -4556,6 +4707,167 @@ mod tests {
             transport.receive().await.is_none(),
             "only a genuine end-of-stream yields None"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_stdout_and_stderr_never_enter_logs_events_or_files() {
+        let capture = LogCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let tmp = tempfile::tempdir().expect("temp event dir");
+        let event_writer = xai_file_utils::events::EventWriter::open(tmp.path());
+        let (mut server_out, client_in) = tokio::io::duplex(64 * 1024);
+        let mut transport = ResilientRwTransport::new(
+            client_in,
+            tokio::io::sink(),
+            "sentinel-server".to_string(),
+            event_writer,
+        );
+        let provider_bytes = CREDENTIAL_SENTINELS.join(" | ");
+        server_out
+            .write_all(format!("{provider_bytes}\n").as_bytes())
+            .await
+            .expect("write provider stdout");
+        drop(server_out);
+        assert!(transport.receive().await.is_none());
+
+        let mut stderr = std::io::Cursor::new(provider_bytes.as_bytes());
+        drain_mcp_stderr_reader("sentinel-server", &mut stderr).await;
+
+        let logs = capture.0.lock().clone();
+        assert_no_credential_fragments(&logs);
+        let events = std::fs::read_to_string(tmp.path().join("events.jsonl"))
+            .expect("decode event should be persisted");
+        assert!(events.contains("invalid_json_rpc"));
+        assert!(!events.contains("\"sample\""));
+        assert_no_credential_fragments(&events);
+        let files = std::fs::read_dir(tmp.path())
+            .expect("read event dir")
+            .map(|entry| entry.expect("dir entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(files, vec![std::ffi::OsString::from("events.jsonl")]);
+    }
+
+    #[test]
+    fn mcp_failure_display_debug_and_reason_are_fixed_categories() {
+        let provider_error = CREDENTIAL_SENTINELS.join(" | ");
+        let errors = [
+            McpError::ClientError(provider_error.clone()),
+            McpError::SpawnFailed {
+                server: "sentinel-server".to_string(),
+                source: std::io::Error::other(provider_error.clone()),
+            },
+            McpError::HandshakeFailed {
+                server: "sentinel-server".to_string(),
+                source: Box::new(ClientInitializeError::ConnectionClosed(provider_error)),
+            },
+        ];
+        for error in errors {
+            assert_no_credential_fragments(&error.to_string());
+            assert_no_credential_fragments(&format!("{error:?}"));
+            assert_no_credential_fragments(error.error_category_label());
+        }
+        assert_eq!(errors_category_label_for_test(), "handshake_failed");
+    }
+
+    #[test]
+    fn provider_tool_error_content_never_reaches_output_or_support_event() {
+        let mut provider_result = rmcp::model::CallToolResult::default();
+        provider_result.content = vec![rmcp::model::ContentBlock::text(
+            CREDENTIAL_SENTINELS.join(" | "),
+        )];
+        provider_result.is_error = Some(true);
+
+        let projected = safe_mcp_tool_error_message(&provider_result);
+        let output = MCPOutput::errored(
+            "sentinel-tool".to_owned(),
+            "sentinel-server".to_owned(),
+            projected.to_owned(),
+        );
+        let event = xai_file_utils::events::Event::McpToolCallCompleted {
+            server_name: "sentinel-server".to_owned(),
+            tool_name: "sentinel-tool".to_owned(),
+            call_id: "sentinel-call".to_owned(),
+            duration_ms: 1,
+            success: false,
+            is_timeout: false,
+            error: Some(MCP_TOOL_REPORTED_ERROR_CATEGORY.to_owned()),
+            reconnect_attempted: false,
+            auth_retry_attempted: false,
+        };
+        let rendered = format!(
+            "{output:?}\n{}",
+            serde_json::to_string(&event).expect("serialize support event")
+        );
+        assert!(rendered.contains(MCP_TOOL_REPORTED_ERROR_MESSAGE));
+        assert!(rendered.contains(MCP_TOOL_REPORTED_ERROR_CATEGORY));
+        assert_no_credential_fragments(&rendered);
+    }
+
+    #[test]
+    fn provider_tool_error_keeps_only_closed_recovery_hints() {
+        let cases = [
+            (
+                "authentication required; echoed ",
+                MCP_TOOL_AUTH_REQUIRED_MESSAGE,
+            ),
+            (
+                "invalid arguments: missing field; echoed ",
+                MCP_TOOL_INVALID_ARGUMENTS_MESSAGE,
+            ),
+            (
+                "rate limit exceeded; echoed ",
+                MCP_TOOL_RATE_LIMITED_MESSAGE,
+            ),
+            (
+                "opaque provider failure; echoed ",
+                MCP_TOOL_REPORTED_ERROR_MESSAGE,
+            ),
+        ];
+
+        for (prefix, expected) in cases {
+            let mut provider_result = rmcp::model::CallToolResult::default();
+            provider_result.content = vec![rmcp::model::ContentBlock::text(format!(
+                "{prefix}{}",
+                CREDENTIAL_SENTINELS.join(" | ")
+            ))];
+            provider_result.is_error = Some(true);
+            let projected = safe_mcp_tool_error_message(&provider_result);
+            assert_eq!(projected, expected);
+            assert_no_credential_fragments(projected);
+        }
+    }
+
+    #[test]
+    fn mcp_support_targets_omit_stdio_args_and_remote_urls() {
+        let mut stdio = make_stdio_server("stdio", "/usr/local/bin/mcp-server");
+        if let acp::McpServer::Stdio(config) = &mut stdio {
+            config.args = vec!["--token".to_owned(), CREDENTIAL_SENTINELS.join(" | ")];
+        } else {
+            unreachable!("stdio fixture");
+        }
+        let remote = make_http_server(
+            "remote",
+            &format!(
+                "https://user:{}@mcp.example.test/path?token={}",
+                CREDENTIAL_SENTINELS[0],
+                CREDENTIAL_SENTINELS.join(" | ")
+            ),
+        );
+
+        let rendered = format!("{}\n{}", mcp_target_str(&stdio), mcp_target_str(&remote));
+        assert_eq!(mcp_target_str(&stdio), "mcp-server");
+        assert_eq!(mcp_target_str(&remote), "configured");
+        assert_no_credential_fragments(&rendered);
+    }
+
+    fn errors_category_label_for_test() -> &'static str {
+        McpError::HandshakeFailed {
+            server: "sentinel-server".to_string(),
+            source: Box::new(ClientInitializeError::ConnectionClosed(
+                CREDENTIAL_SENTINELS.join(" | "),
+            )),
+        }
+        .error_category_label()
     }
 
     fn make_stdio_server(name: &str, command: &str) -> acp::McpServer {
@@ -6156,7 +6468,6 @@ mod tests {
         };
 
         let original = mcp_service_err(-32603);
-        let expected = original.to_string();
         let params = CallToolRequestParams::new("do_thing");
 
         let mut reconnect_attempted = false;
@@ -6177,7 +6488,7 @@ mod tests {
             .await
             .expect_err("recover must fail against an unreachable host");
 
-        assert_eq!(err.to_string(), expected, "original error must be surfaced");
+        assert_eq!(err.to_string(), "MCP transport recovery failed");
         assert!(reconnect_attempted, "reconnect attempt must be flagged");
         assert!(!is_timeout, "a recover failure is not a tool timeout");
     }
@@ -6395,7 +6706,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn try_call_tool_http_retry_failure_surfaces_retry_error() {
+    async fn try_call_tool_http_retry_failure_surfaces_fixed_error() {
         let (url, _inits, calls) =
             spawn_fake_mcp(CallToolBehavior::AlwaysError { code: -32603 }).await;
         let client = fake_http_client(&url, 5);
@@ -6411,11 +6722,7 @@ mod tests {
             .expect_err("both attempts fail");
 
         let msg = err.to_string();
-        assert!(msg.contains("attempt 2"), "want retry error, got: {msg}");
-        assert!(
-            !msg.contains("attempt 1"),
-            "must not surface the original error: {msg}"
-        );
+        assert_eq!(msg, "MCP tool call failed after reconnect");
         assert!(reconnect);
         assert!(!is_timeout);
         assert_eq!(
@@ -6439,9 +6746,9 @@ mod tests {
         let err = tool
             .try_call_tool(&client, &raw, &mut reconnect, &mut is_timeout, &ew)
             .await
-            .expect_err("invalid params surfaced as-is");
+            .expect_err("invalid params should fail");
 
-        assert!(err.to_string().contains("attempt 1"), "got: {err}");
+        assert_eq!(err.to_string(), "MCP tool call failed");
         assert!(!reconnect, "invalid-params must not trigger recovery");
         assert!(!is_timeout);
         assert_eq!(calls.load(Ordering::Relaxed), 1, "no retry POST");
@@ -7193,8 +7500,8 @@ mod tests {
     // suite for the "MCP client already initializing" doom-loop).
     // ------------------------------------------------------------------
 
-    /// `ensure_initialized` on a stub (no transport) must surface a
-    /// clear, actionable configuration error — never the legacy
+    /// `ensure_initialized` on a stub (no transport) must surface a fixed
+    /// client-error category — never the legacy
     /// "already initializing" sentinel which leaked into model-visible
     /// tool results and triggered retry loops that exhausted the
     /// per-tick prompt budget.
@@ -7205,10 +7512,7 @@ mod tests {
         let err = client.ensure_initialized().await.unwrap_err();
         let msg = err.to_string();
 
-        assert!(
-            msg.contains("no transport configured"),
-            "expected clear 'no transport configured' error, got: {msg}"
-        );
+        assert_eq!(msg, "MCP client error");
         assert!(
             !msg.contains("already initializing"),
             "regression: legacy fast-fail sentinel surfaced: {msg}"
@@ -7366,10 +7670,7 @@ mod tests {
 
         let err = client.ensure_initialized().await.unwrap_err();
         let msg = err.to_string();
-        assert!(
-            msg.contains("init still in progress"),
-            "expected wait-timeout error, got: {msg}"
-        );
+        assert_eq!(msg, "MCP client error");
         assert!(
             !msg.contains("already initializing"),
             "regression: legacy fast-fail sentinel: {msg}"

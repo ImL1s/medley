@@ -64,6 +64,30 @@ mod tests {
         assert_eq!(req.snapshot_bucket, None);
     }
 
+    #[test]
+    fn forked_session_debug_reports_jwt_presence_without_exposing_fragments() {
+        const SECRET: &str = "GB002JWT-Z9x7C5v3B1n8M6k4J2h0";
+        let session = SandboxForkedSession {
+            sandbox_id: "sandbox-123".to_owned(),
+            websocket_url: format!(
+                "wss://user:{SECRET}@sandbox.example/session?access_token={SECRET}"
+            ),
+            jwt_token: SECRET.to_owned(),
+        };
+
+        let debug = format!("{session:?}");
+        assert!(debug.contains("jwt_token_present: true"), "{debug}");
+        assert!(debug.contains("websocket_url_configured: true"), "{debug}");
+        assert!(!debug.contains(SECRET), "{debug}");
+        for window in SECRET.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(
+                !debug.contains(fragment),
+                "leaked fragment {fragment:?}: {debug}"
+            );
+        }
+    }
+
     // ====================================================================
     // SandboxMode enum serde
     // ====================================================================
@@ -239,7 +263,7 @@ mod tests {
 }
 
 /// Information about a single forked session.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SandboxForkedSession {
     /// The provider sandbox ID
@@ -248,6 +272,16 @@ pub struct SandboxForkedSession {
     pub websocket_url: String,
     /// JWT token for authenticating the WebSocket connection
     pub jwt_token: String,
+}
+
+impl std::fmt::Debug for SandboxForkedSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SandboxForkedSession")
+            .field("sandbox_id", &self.sandbox_id)
+            .field("websocket_url_configured", &!self.websocket_url.is_empty())
+            .field("jwt_token_present", &!self.jwt_token.is_empty())
+            .finish()
+    }
 }
 
 /// Response from forking a sandbox session.

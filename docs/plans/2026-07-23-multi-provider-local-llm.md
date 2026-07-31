@@ -111,7 +111,7 @@ fn none_scheme_emits_no_auth_headers_even_with_api_key() {
 }
 
 #[test]
-fn none_scheme_auth_info_reports_none_without_prefix() {
+fn none_scheme_auth_info_reports_absence_without_fragment() {
     let cfg = SamplerConfig {
         api_key: Some("should-not-leak".to_string()),
         auth_scheme: AuthScheme::None,
@@ -120,7 +120,7 @@ fn none_scheme_auth_info_reports_none_without_prefix() {
     let client = SamplingClient::new(cfg).expect("client should build");
     let info = client.auth_info();
     assert_eq!(info.auth_type, "none");
-    assert!(info.auth_prefix.is_none());
+    assert!(!info.auth_present);
 }
 
 #[test]
@@ -204,15 +204,18 @@ AuthScheme::None => None,
 In `auth_info`:
 
 ```rust
-let auth_type = match (&self.defaults.auth_scheme, &auth_prefix) {
+let auth_present = self.current_credential_present();
+let auth_type = match (&self.defaults.auth_scheme, auth_present) {
     (AuthScheme::None, _) => "none",
-    (AuthScheme::XApiKey, Some(_)) => "x-api-key",
-    (AuthScheme::Bearer, Some(_)) => "bearer",
-    (_, None) => "none",
+    (AuthScheme::XApiKey, true) => "x-api-key",
+    (AuthScheme::Bearer, true) => "bearer",
+    (_, false) => "none",
 };
 ```
 
-Keep existing Bearer / XApiKey behavior unchanged.
+Record only `auth_present` and the closed `auth_type` value. Never derive or
+log a credential prefix, suffix, or other substring. Keep existing Bearer /
+XApiKey request behavior unchanged.
 
 **Step 4: Re-run tests**
 

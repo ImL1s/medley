@@ -1,7 +1,7 @@
 //! Wire e2e + pure tests for user-facing API error sanitization.
 //!
 //! Edge proxies return non-JSON bodies (HTML). Those must never reach TUI
-//! scrollback; only structured JSON error envelopes and status-based copy.
+//! scrollback; provider-controlled JSON messages are discarded too.
 
 use std::sync::Arc;
 
@@ -74,12 +74,12 @@ async fn stream_503_html_uses_unavailable_copy() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stream_json_error_envelope_is_preserved() {
+async fn stream_json_error_envelope_discards_provider_message() {
     let body = r#"{"error":{"message":"rate limit exceeded","type":"rate_limit_error"}}"#;
     let err = stream_err(429, body).await;
     let s = err.to_string();
-    assert!(s.contains("rate limit exceeded"));
-    assert!(!s.contains("temporarily unavailable"));
+    assert!(!s.contains("rate limit exceeded"));
+    assert!(s.contains("HTTP 429"));
 }
 
 #[test]
@@ -113,8 +113,12 @@ fn non_json_empty_body_falls_back_to_status() {
 }
 
 #[test]
-fn structured_json_is_not_replaced_by_status_copy() {
+fn structured_json_provider_message_is_replaced_by_status_copy() {
     let bytes = br#"{"error":{"message":"credits exhausted","type":"server_error"}}"#;
     let msg = user_facing_api_error_message(reqwest::StatusCode::PAYMENT_REQUIRED, bytes);
-    assert_eq!(msg, "credits exhausted");
+    assert!(!msg.contains("credits exhausted"));
+    assert_eq!(
+        msg,
+        status_user_message(reqwest::StatusCode::PAYMENT_REQUIRED)
+    );
 }

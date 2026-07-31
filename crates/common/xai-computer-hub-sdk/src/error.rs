@@ -6,7 +6,6 @@
 //! re-deriving the numeric/string code mapping.
 
 use thiserror::Error;
-use url::Url;
 use xai_tool_protocol::{IdError, JsonRpcError, ToolCallId, ToolErrorWire};
 
 /// Errors surfaced by the client SDK.
@@ -68,10 +67,8 @@ pub enum ClientError {
     /// `localhost`) is the only exception; every other host MUST be
     /// reached over `wss://` so the bearer token never crosses the
     /// network in plaintext.
-    #[error(
-        "insecure scheme: refusing to send credentials over plaintext ws:// to non-loopback host {url}"
-    )]
-    InsecureScheme { url: Url },
+    #[error("insecure scheme: refusing to send credentials over plaintext ws://")]
+    InsecureScheme,
 
     /// Caller passed a `ToolCallId` that already keys an in-flight
     /// dispatch on the same connection. The prior call's progress
@@ -165,7 +162,23 @@ impl From<url::ParseError> for ClientError {
 
 impl From<tokio_tungstenite::tungstenite::Error> for ClientError {
     fn from(err: tokio_tungstenite::tungstenite::Error) -> Self {
-        Self::NetworkError(err.to_string())
+        Self::NetworkError(safe_websocket_error(&err))
+    }
+}
+
+fn safe_websocket_error(err: &tokio_tungstenite::tungstenite::Error) -> String {
+    use tokio_tungstenite::tungstenite::Error;
+
+    match err {
+        Error::Http(response) => {
+            format!("websocket handshake failed: HTTP {}", response.status())
+        }
+        Error::Io(io_error) if io_error.kind() == std::io::ErrorKind::TimedOut => {
+            "websocket network timeout".to_owned()
+        }
+        Error::Io(_) => "websocket network I/O failure".to_owned(),
+        Error::ConnectionClosed | Error::AlreadyClosed => "websocket connection closed".to_owned(),
+        _ => "websocket transport failed".to_owned(),
     }
 }
 
@@ -237,10 +250,33 @@ mod tests {
     fn handshake_non_auth_status_stays_network_error() {
         for status in [500u16, 502, 429] {
             match ClientError::from_handshake_error(http_upgrade_error(status)) {
-                ClientError::NetworkError(_) => {}
+                ClientError::NetworkError(message) => {
+                    assert_eq!(
+                        message,
+                        format!("websocket handshake failed: HTTP {status}")
+                    );
+                }
                 other => panic!("expected NetworkError for {status}; got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn websocket_transport_error_never_renders_raw_error_detail() {
+        let sentinel = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+        let source = std::io::Error::other(format!("provider echoed {sentinel}"));
+        let error = ClientError::from(tokio_tungstenite::tungstenite::Error::Io(source));
+        let rendered = format!("{error:?} {error}");
+
+        assert!(!rendered.contains(sentinel));
+        for window in sentinel.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).unwrap();
+            assert!(
+                !rendered.contains(fragment),
+                "secret fragment {fragment:?} leaked: {rendered}"
+            );
+        }
+        assert!(rendered.contains("websocket network I/O failure"));
     }
 
     #[test]

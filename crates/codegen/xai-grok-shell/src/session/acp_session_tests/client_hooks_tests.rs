@@ -435,14 +435,16 @@ async fn post_tool_use_and_failure_never_double_fire() {
         .await;
 }
 
-/// A `pre_tool_use` deny must NOT cancel the turn: `execute_tool_calls` feeds the deny
-/// reason back as the blocked tool's `tool_result` and returns `ToolLoop::Continue`, so
-/// the model re-samples with the reason in context.
+/// A `pre_tool_use` deny must NOT cancel the turn: `execute_tool_calls` feeds a
+/// closed, credential-safe denial marker back as the blocked tool's
+/// `tool_result` and returns `ToolLoop::Continue`, so the model can re-sample
+/// without observing provider-controlled text.
 ///
 /// Regression guard: the deny once surfaced as `ToolLoop::HookDenied`, which
 /// `execute_tool_calls` treated as a terminal result, cancelling the whole turn.
 #[tokio::test(flavor = "current_thread")]
 async fn pre_tool_use_deny_feeds_reason_back_and_continues_turn() {
+    const SECRET: &str = "GB002HOOKSECRETabcdefgh87654321";
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -460,7 +462,7 @@ async fn pre_tool_use_deny_feeds_reason_back_and_continues_turn() {
                 xai_grok_hooks::event::HookEventName::PreToolUse,
                 &["cb_0"],
             );
-            spawn_deny_responder(gateway_rx, "use read_file instead");
+            spawn_deny_responder(gateway_rx, SECRET);
 
             let call = ToolCallResponse {
                 id: "call_1".to_string(),
@@ -485,11 +487,23 @@ async fn pre_tool_use_deny_feeds_reason_back_and_continues_turn() {
             );
 
             let conv = actor.chat_state_handle.get_conversation().await;
+            let rendered = conv
+                .iter()
+                .map(|c| c.text_content())
+                .collect::<Vec<_>>()
+                .join("\n");
             assert!(
-                conv.iter()
-                    .any(|c| c.text_content().contains("use read_file instead")),
-                "the deny reason must be fed back as the tool_result"
+                rendered.contains("hook denied (reason provided)"),
+                "the model must receive the closed denial category: {rendered}"
             );
+            assert!(!rendered.contains(SECRET));
+            for fragment in SECRET.as_bytes().windows(8) {
+                let fragment = std::str::from_utf8(fragment).unwrap();
+                assert!(
+                    !rendered.contains(fragment),
+                    "denied-tool feedback leaked credential fragment: {fragment}"
+                );
+            }
         })
         .await;
 }
@@ -560,7 +574,10 @@ async fn stop_client_gate_collects_denies() {
 
             assert_eq!(result.blocks.len(), 1, "only the denying callback blocks");
             assert_eq!(result.blocks[0].hook_name, "client:cb_block");
-            assert_eq!(result.blocks[0].reason, "finish the tests first");
+            assert_eq!(
+                result.blocks[0].reason,
+                "stop blocked by hook (reason provided)"
+            );
             assert!(result.prevent_continuation.is_none());
             assert!(result.additional_context.is_empty());
         })
@@ -634,8 +651,14 @@ async fn stop_client_gate_carries_continue_false_and_context() {
                 .prevent_continuation
                 .expect("continue:false captured");
             assert_eq!(prevent.hook_name, "client:cb_stop");
-            assert_eq!(prevent.reason, "budget");
-            assert_eq!(result.additional_context, ["run the linter"]);
+            assert_eq!(
+                prevent.reason,
+                "continuation prevented by hook (reason provided)"
+            );
+            assert_eq!(
+                result.additional_context,
+                ["hook provided additional context (content omitted)"]
+            );
         })
         .await;
 }
@@ -644,6 +667,7 @@ async fn stop_client_gate_carries_continue_false_and_context() {
 /// allows the stop, and the consecutive-block cap overrides the gate.
 #[tokio::test(flavor = "current_thread")]
 async fn run_stop_gate_keep_working_and_cap() {
+    const SECRET: &str = "GB002STOPCLIENTSECRETabcdefgh87654321";
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -662,7 +686,7 @@ async fn run_stop_gate_keep_working_and_cap() {
                 &["cb_0"],
             );
 
-            spawn_deny_responder(gateway_rx, "keep working");
+            spawn_deny_responder(gateway_rx, SECRET);
 
             let decision = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
@@ -674,9 +698,17 @@ async fn run_stop_gate_keep_working_and_cap() {
                 StopGateDecision::KeepWorking { feedback } => {
                     assert!(
                         feedback.contains("Stop hook feedback:")
-                            && feedback.contains("keep working"),
-                        "feedback must carry the deny message, got: {feedback}"
+                            && feedback.contains("stop blocked by hook (reason provided)"),
+                        "feedback must carry only the closed deny category, got: {feedback}"
                     );
+                    assert!(!feedback.contains(SECRET));
+                    for fragment in SECRET.as_bytes().windows(8) {
+                        let fragment = std::str::from_utf8(fragment).unwrap();
+                        assert!(
+                            !feedback.contains(fragment),
+                            "stop model feedback leaked credential fragment: {fragment}"
+                        );
+                    }
                 }
                 _ => panic!("a client deny must keep the agent working"),
             }
@@ -869,7 +901,10 @@ async fn client_force_stop_attribution_is_registration_ordered() {
                 prevent.hook_name, "client:cb_first",
                 "attribution must follow registration order, not completion order"
             );
-            assert_eq!(prevent.reason, "from-first");
+            assert_eq!(
+                prevent.reason,
+                "continuation prevented by hook (reason provided)"
+            );
         })
         .await;
 }
@@ -878,6 +913,7 @@ async fn client_force_stop_attribution_is_registration_ordered() {
 /// payload.
 #[tokio::test(flavor = "current_thread")]
 async fn subagent_session_gates_on_subagent_stop() {
+    const SECRET: &str = "GB002SUBSTOP-Q7w5E3r1T9y7Z6x4C2v8";
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -892,7 +928,7 @@ async fn subagent_session_gates_on_subagent_stop() {
             *actor.hook_registry.borrow_mut() =
                 Some(std::sync::Arc::new(file_registry_with_stop_spec(
                     xai_grok_hooks::event::HookEventName::SubagentStop,
-                    r#"echo '{"decision":"block","reason":"verify the summary"}'"#,
+                    &format!(r#"echo '{{"decision":"block","reason":"{SECRET}"}}'"#),
                 )));
 
             tokio::task::spawn_local(async move {
@@ -911,10 +947,17 @@ async fn subagent_session_gates_on_subagent_stop() {
             .expect("the subagent stop gate must not hang");
             match decision {
                 StopGateDecision::KeepWorking { feedback } => {
-                    assert!(
-                        feedback.contains("verify the summary"),
-                        "the SubagentStop block reason must become feedback, got: {feedback}"
+                    assert_eq!(
+                        feedback,
+                        "Stop hook feedback:\n- stop blocked by hook (reason provided)\n"
                     );
+                    assert!(!feedback.contains(SECRET));
+                    for window in SECRET.as_bytes().windows(8) {
+                        assert!(
+                            !feedback.contains(std::str::from_utf8(window).unwrap()),
+                            "SubagentStop feedback leaked a secret window: {feedback}"
+                        );
+                    }
                 }
                 other => {
                     panic!("a SubagentStop block must keep the subagent working, got {other:?}")

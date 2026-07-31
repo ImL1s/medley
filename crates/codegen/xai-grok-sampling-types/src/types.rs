@@ -1030,7 +1030,7 @@ impl ApiBackend {
 }
 
 /// Sampling client configuration (API key excluded — that stays in the client).
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct SamplingConfig {
     pub base_url: String,
     pub model: String,
@@ -1059,6 +1059,25 @@ pub struct SamplingConfig {
     /// API request body so the upstream emits per-chunk argument deltas.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_tool_calls: Option<bool>,
+}
+
+impl std::fmt::Debug for SamplingConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SamplingConfig")
+            .field("base_url_configured", &!self.base_url.is_empty())
+            .field("model", &self.model)
+            .field("max_completion_tokens", &self.max_completion_tokens)
+            .field("temperature", &self.temperature)
+            .field("top_p", &self.top_p)
+            .field("api_backend", &self.api_backend)
+            .field("extra_header_count", &self.extra_headers.len())
+            .field("query_param_count", &self.query_params.len())
+            .field("env_http_header_count", &self.env_http_headers.len())
+            .field("context_window", &self.context_window)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("stream_tool_calls", &self.stream_tool_calls)
+            .finish()
+    }
 }
 
 // ============ Responses API wrapper ============
@@ -1204,6 +1223,38 @@ impl From<crate::messages::MessagesRequest> for MessagesRequestWrapper {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn sampling_config_debug_never_exposes_request_credentials() {
+        let secret = "GB002-sampling-config-Q7w5E3r1T9y7";
+        let config = SamplingConfig {
+            base_url: format!("https://user:{secret}@example.test/?token={secret}"),
+            model: "test-model".to_owned(),
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            api_backend: ApiBackend::default(),
+            extra_headers: indexmap::IndexMap::from([(
+                "authorization".to_owned(),
+                format!("Bearer {secret}"),
+            )]),
+            query_params: indexmap::IndexMap::from([("api_key".to_owned(), secret.to_owned())]),
+            env_http_headers: indexmap::IndexMap::new(),
+            context_window: NonZeroU64::new(128_000).unwrap(),
+            reasoning_effort: None,
+            stream_tool_calls: None,
+        };
+
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("base_url_configured: true"));
+        assert!(rendered.contains("extra_header_count: 1"));
+        assert!(rendered.contains("query_param_count: 1"));
+        assert!(!rendered.contains(secret));
+        for window in secret.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).unwrap();
+            assert!(!rendered.contains(window), "leaked secret window: {window}");
+        }
+    }
 
     #[test]
     fn reasoning_effort_serde_lowercase_round_trip() {

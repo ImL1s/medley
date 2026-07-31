@@ -56,13 +56,26 @@ type RelayDest = Rc<RefCell<Option<mpsc::UnboundedSender<AcpClientMessage>>>>;
 const MAX_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const KEEPALIVE_INTERVAL_SECS: u64 = 15;
 
+fn close_reason_diagnostic(reason: &str) -> (bool, usize) {
+    (!reason.is_empty(), reason.len())
+}
+
 /// Configuration for the agent WebSocket server.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ServerConfig {
     /// Address to bind the server to
     pub bind_addr: SocketAddr,
     /// Secret token for client authentication (required)
     pub secret: String,
+}
+
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("bind_addr", &self.bind_addr)
+            .field("secret_present", &!self.secret.is_empty())
+            .finish()
+    }
 }
 
 /// Shared state for the WebSocket server.
@@ -82,10 +95,18 @@ struct NewConnectionChannels {
 }
 
 /// Query parameters for WebSocket connection.
-#[derive(Debug, serde::Deserialize, Default)]
+#[derive(serde::Deserialize, Default)]
 pub struct WsQueryParams {
     #[serde(rename = "server-key")]
     pub server_key: Option<String>,
+}
+
+impl std::fmt::Debug for WsQueryParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsQueryParams")
+            .field("server_key_present", &self.server_key.is_some())
+            .finish()
+    }
 }
 
 /// Validate the bearer token from request headers or query parameters.
@@ -237,16 +258,20 @@ async fn handle_connection(ws: WebSocket, state: Arc<ServerState>, peer_addr: So
                 }
                 Ok(Message::Close(frame)) => {
                     if let Some(f) = frame {
+                        let (reason_present, reason_len) = close_reason_diagnostic(&f.reason);
                         info!(
-                            "WebSocket close from {}: {} {}",
-                            peer_addr, f.code, f.reason
+                            peer = %peer_addr,
+                            code = f.code,
+                            reason_present,
+                            reason_len,
+                            "WebSocket close received"
                         );
                     }
                     break;
                 }
                 Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
-                Err(e) => {
-                    warn!("WebSocket read error from {}: {:?}", peer_addr, e);
+                Err(_) => {
+                    warn!(peer = %peer_addr, error_class = "websocket_read", "WebSocket read error");
                     break;
                 }
             }
@@ -488,4 +513,42 @@ pub async fn run_agent_server(
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_auth_debug_is_presence_only() {
+        let secret = "GB002-server-auth-Q7w5E3r1T9y7";
+        let config = ServerConfig {
+            bind_addr: "127.0.0.1:9000".parse().unwrap(),
+            secret: secret.to_owned(),
+        };
+        let query = WsQueryParams {
+            server_key: Some(secret.to_owned()),
+        };
+        let rendered = format!("{config:?}\n{query:?}");
+        assert!(rendered.contains("secret_present: true"));
+        assert!(rendered.contains("server_key_present: true"));
+        assert!(!rendered.contains(secret));
+        for window in secret.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).unwrap();
+            assert!(!rendered.contains(window), "leaked secret window: {window}");
+        }
+    }
+
+    #[test]
+    fn websocket_close_diagnostic_omits_peer_reason_fragments() {
+        const SENTINEL: &str = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+        let (present, len) = close_reason_diagnostic(SENTINEL);
+        let rendered = format!("reason_present={present};reason_len={len}");
+        assert!(present);
+        assert!(!rendered.contains(SENTINEL));
+        for window in SENTINEL.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(!rendered.contains(fragment), "leaked fragment {fragment}");
+        }
+    }
 }

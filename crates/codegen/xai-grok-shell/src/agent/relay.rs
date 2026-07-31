@@ -161,6 +161,70 @@ fn is_handshake_unauthorized(err: &anyhow::Error) -> bool {
         })
         .unwrap_or(false)
 }
+
+fn relay_error_class(err: &anyhow::Error) -> &'static str {
+    use tokio_tungstenite::tungstenite::Error as WsError;
+
+    match err.downcast_ref::<WsError>() {
+        Some(WsError::Http(response)) if response.status().is_client_error() => {
+            "handshake_client_error"
+        }
+        Some(WsError::Http(_)) => "handshake_server_error",
+        Some(WsError::Io(io_error)) if io_error.kind() == std::io::ErrorKind::TimedOut => "timeout",
+        Some(WsError::Io(_)) => "network_io",
+        Some(_) => "websocket_transport",
+        None => "relay_connection",
+    }
+}
+
+fn websocket_error_class(err: &tokio_tungstenite::tungstenite::Error) -> &'static str {
+    use tokio_tungstenite::tungstenite::Error as WsError;
+
+    match err {
+        WsError::ConnectionClosed => "connection_closed",
+        WsError::AlreadyClosed => "already_closed",
+        WsError::Io(io_error) if io_error.kind() == std::io::ErrorKind::TimedOut => "timeout",
+        WsError::Io(_) => "network_io",
+        WsError::Tls(_) => "tls",
+        WsError::Capacity(_) => "capacity",
+        WsError::Protocol(_) => "protocol",
+        WsError::WriteBufferFull(_) => "write_buffer_full",
+        WsError::Utf8(_) => "utf8",
+        WsError::AttackAttempt => "attack_attempt",
+        WsError::Url(_) => "url",
+        WsError::Http(response) if response.status().is_client_error() => "handshake_client_error",
+        WsError::Http(_) => "handshake_server_error",
+        WsError::HttpFormat(_) => "http_format",
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct OutboundMessageDiagnostic {
+    kind: &'static str,
+    params_present: bool,
+    message_bytes: usize,
+}
+
+fn outbound_message_diagnostic(message: &str) -> OutboundMessageDiagnostic {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(message) else {
+        return OutboundMessageDiagnostic {
+            kind: "malformed",
+            params_present: false,
+            message_bytes: message.len(),
+        };
+    };
+
+    let kind = match json.get("method").and_then(|method| method.as_str()) {
+        Some("session/update") => "session_update",
+        Some(_) => "request",
+        None => "response",
+    };
+    OutboundMessageDiagnostic {
+        kind,
+        params_present: json.get("params").is_some_and(|params| !params.is_null()),
+        message_bytes: message.len(),
+    }
+}
 /// Attempt auth recovery after a 401. Returns `true` to reconnect
 /// immediately, `false` to exit or fall through to backoff.
 async fn attempt_auth_recovery(
@@ -209,7 +273,8 @@ async fn attempt_auth_recovery(
                 None,
                 Some(serde_json::json!({
                     "context": context,
-                    "key_prefix": crate::auth::token_suffix(&new_auth.key),
+                    "access_token_present": !new_auth.key.is_empty(),
+                    "access_token_changed": false,
                 })),
             );
             false
@@ -221,28 +286,29 @@ async fn attempt_auth_recovery(
                 None,
                 Some(serde_json::json!({
                     "context": context,
-                    "new_key_prefix": crate::auth::token_suffix(&new_auth.key),
+                    "access_token_present": !new_auth.key.is_empty(),
+                    "access_token_changed": true,
                 })),
             );
             config.auth = new_auth;
             true
         }
         Err(e) if crate::auth::recovery::relay_should_cancel(&e) => {
-            teprintln!("{e}");
+            teprintln!("Authentication recovery failed; run `grok login` to continue.");
             xai_grok_telemetry::unified_log::warn(
                 "auth recovery: relay giving up (terminal)",
                 None,
-                Some(serde_json::json!({ "context": context, "error": format!("{e}") })),
+                Some(serde_json::json!({ "context": context, "terminal": true })),
             );
             cancel.cancel();
             false
         }
-        Err(e) => {
-            warn!(error = %e, "auth recovery: relay {context}, refresh failed");
+        Err(_) => {
+            warn!("auth recovery: relay {context}, refresh failed");
             xai_grok_telemetry::unified_log::debug(
                 "auth recovery: relay refresh failed",
                 None,
-                Some(serde_json::json!({ "context": context, "error": format!("{e}") })),
+                Some(serde_json::json!({ "context": context, "terminal": false })),
             );
             false
         }
@@ -265,10 +331,10 @@ async fn run_relay_loop(
     let proxy_url = target_host
         .as_deref()
         .and_then(proxy::resolve_proxy_for_host);
-    if let Some(ref url) = proxy_url {
+    if proxy_url.is_some() {
         info!(
-            proxy = %url,
-            target = target_host.as_deref().unwrap_or("unknown"),
+            proxy_configured = true,
+            target_host_configured = target_host.is_some(),
             "Using HTTP CONNECT proxy for relay connections"
         );
     }
@@ -280,7 +346,7 @@ async fn run_relay_loop(
         tracing::info!(
             target: crate::instrumentation::TARGET,
             event = "relay_connecting",
-            ws_url = %config.ws_url,
+            ws_url_configured = !config.ws_url.is_empty(),
             attempt = reconnect_attempts,
         );
         match connect_to_relay(&config, proxy_url.as_deref(), &cancel).await {
@@ -288,7 +354,7 @@ async fn run_relay_loop(
                 tracing::info!(
                     target: crate::instrumentation::TARGET,
                     event = "relay_connected",
-                    ws_url = %config.ws_url,
+                    ws_url_configured = !config.ws_url.is_empty(),
                 );
                 reconnect_attempts = 0;
                 delay_secs = BASE_DELAY_SECS;
@@ -309,8 +375,11 @@ async fn run_relay_loop(
                             continue;
                         }
                     }
-                    Err(e) => {
-                        warn!(error = ?e, "WebSocket session ended with error");
+                    Err(_) => {
+                        warn!(
+                            error_class = "websocket_session",
+                            "WebSocket session ended with error"
+                        );
                     }
                 }
                 if cancel.is_cancelled() {
@@ -319,7 +388,7 @@ async fn run_relay_loop(
                 tracing::info!(
                     target: crate::instrumentation::TARGET,
                     event = "relay_disconnected",
-                    ws_url = %config.ws_url,
+                    ws_url_configured = !config.ws_url.is_empty(),
                 );
                 tprintln!("Disconnected from Grok WebSocket server");
                 info!("WebSocket disconnected, will reconnect");
@@ -329,8 +398,8 @@ async fn run_relay_loop(
                 tracing::info!(
                     target: crate::instrumentation::TARGET,
                     event = "relay_connection_failed",
-                    ws_url = %config.ws_url,
-                    error = %e,
+                    ws_url_configured = !config.ws_url.is_empty(),
+                    error_class = relay_error_class(&e),
                     handshake_401,
                 );
                 if handshake_401 {
@@ -338,7 +407,10 @@ async fn run_relay_loop(
                         continue;
                     }
                 } else {
-                    warn!(error = %e, "Failed to connect to WebSocket server");
+                    warn!(
+                        error_class = relay_error_class(&e),
+                        "Failed to connect to WebSocket server"
+                    );
                 }
             }
         }
@@ -565,7 +637,12 @@ where
                         Ok(Message::Close(frame_opt)) => {
                             tprintln!("ws_inbound::close");
                             if let Some(frame) = frame_opt {
-                                info!(code = ?frame.code, reason = %frame.reason, "WS close received");
+                                info!(
+                                    code = ?frame.code,
+                                    reason_present = !frame.reason.is_empty(),
+                                    reason_len = frame.reason.len(),
+                                    "WS close received"
+                                );
                             } else {
                                 info!("WS close received (no frame)");
                             }
@@ -583,8 +660,9 @@ where
                             tprintln!("ws_inbound::frame");
                         }
                         Err(e) => {
-                            tprintln!("ws_inbound::error::{:?}", &e);
-                            warn!(error = ?e, "WS read error");
+                            let error_class = websocket_error_class(&e);
+                            tprintln!("ws_inbound::error::{error_class}");
+                            warn!(error_class, "WS read error");
                             break;
                         }
                     }
@@ -609,30 +687,19 @@ where
                             // dashboard-heavy machines. Skip the parse entirely
                             // unless debug logging is enabled.
                             if tracing::enabled!(tracing::Level::DEBUG) {
-                                if let Ok(json_val) =
-                                    serde_json::from_str::<serde_json::Value>(&msg)
-                                {
-                                    let method = json_val.get("method").and_then(|m| m.as_str());
-                                    let line_to_print = match method {
-                                        Some("session/update") => {
-                                            let params = json_val
-                                                .get("params")
-                                                .unwrap_or(&serde_json::Value::Null);
-                                            format!("acp_outbound::session/update::{params}")
-                                        }
-                                        Some(m) => format!("acp_outbound::{m}"),
-                                        None => "acp_outbound::response".to_string(),
-                                    };
-                                    debug!("{line_to_print}");
-                                } else {
-                                    debug!("acp_outbound::response");
-                                }
+                                let diagnostic = outbound_message_diagnostic(&msg);
+                                debug!(
+                                    kind = diagnostic.kind,
+                                    params_present = diagnostic.params_present,
+                                    message_bytes = diagnostic.message_bytes,
+                                    "ACP outbound message"
+                                );
                             }
 
                             if !msg.is_empty()
                                 && let Err(e) = ws_outbound.send(Message::Text(Utf8Bytes::from(msg))).await
                             {
-                                warn!(error = ?e, "failed to send to WS");
+                                warn!(error_class = websocket_error_class(&e), "failed to send to WS");
                                 break;
                             }
                         }
@@ -645,7 +712,7 @@ where
                 _ = keepalive.tick() => {
                     tprintln!("ws::keep_alive_tick");
                     if let Err(e) = ws_outbound.send(Message::Ping(Vec::new().into())).await {
-                        tprintln!("ws::keep_alive::error::{:?}", &e);
+                        tprintln!("ws::keep_alive::error::{}", websocket_error_class(&e));
                         break;
                     }
                 }
@@ -710,6 +777,54 @@ mod tests {
         assert!(!is_handshake_unauthorized(&err));
         let err = anyhow::anyhow!("some random error");
         assert!(!is_handshake_unauthorized(&err));
+    }
+
+    #[test]
+    fn relay_error_class_never_renders_transport_details() {
+        use tokio_tungstenite::tungstenite::Error as WsError;
+
+        const SENTINEL: &str = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+        let err = anyhow::Error::from(WsError::Io(std::io::Error::other(format!(
+            "relay failed with bearer {SENTINEL}"
+        ))));
+        let rendered = relay_error_class(&err);
+
+        assert_eq!(rendered, "network_io");
+        assert!(!rendered.contains(SENTINEL));
+        for window in SENTINEL.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).unwrap();
+            assert!(!rendered.contains(fragment), "leaked fragment {fragment}");
+        }
+    }
+
+    #[test]
+    fn websocket_and_outbound_diagnostics_omit_provider_controlled_secrets() {
+        use tokio_tungstenite::tungstenite::Error as WsError;
+
+        const SENTINEL: &str = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+        let error = WsError::Io(std::io::Error::other(format!(
+            "relay closed with bearer {SENTINEL}"
+        )));
+        let error_diagnostic = websocket_error_class(&error);
+        assert_eq!(error_diagnostic, "network_io");
+
+        let message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": format!("session/{SENTINEL}"),
+            "params": { "authorization": format!("Bearer {SENTINEL}") }
+        })
+        .to_string();
+        let outbound_diagnostic = format!("{:?}", outbound_message_diagnostic(&message));
+        assert!(outbound_diagnostic.contains("kind: \"request\""));
+        assert!(outbound_diagnostic.contains("params_present: true"));
+
+        for rendered in [error_diagnostic, outbound_diagnostic.as_str()] {
+            assert!(!rendered.contains(SENTINEL));
+            for window in SENTINEL.as_bytes().windows(8) {
+                let fragment = std::str::from_utf8(window).unwrap();
+                assert!(!rendered.contains(fragment), "leaked fragment {fragment}");
+            }
+        }
     }
     #[tokio::test]
     async fn test_ws_session_auth_error_returns_auth_error() {

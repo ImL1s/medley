@@ -383,7 +383,7 @@ async fn fetch_managed_config_once(
         // A body-read failure is an in-flight transport interruption, so it is retryable.
         Err(e) => {
             return Err(ManagedConfigError::ConnectionInterrupted(
-                crate::http::error_cause_chain(&e),
+                crate::http::TransportFailure::classify(&e).detail,
             ));
         }
     };
@@ -442,12 +442,12 @@ pub fn spawn_sync(cancel: tokio_util::sync::CancellationToken) {
 /// Deployment id reported for `deployment_key` on chat requests, credential
 /// snapshots, and OTel: the **server** GrokBuildDeployment UUID (the id
 /// server-side dashboards filter on) when the managed-config sync marker was
-/// written by this same key (fingerprint match), else UUIDv5 of the key.
-/// `None` key (team/OAuth) → `None`, never a stale marker value.
+/// written by this same key (fingerprint match). If no matching provider-issued
+/// id exists, returns `None`; it never derives a stable identifier from the key.
+/// `None` key (team/OAuth) also returns `None`, never a stale marker value.
 pub fn resolve_deployment_id(deployment_key: Option<&str>) -> Option<String> {
     let key = deployment_key.filter(|k| !k.is_empty())?;
     crate::config::managed_deployment_id(&deployment_key_fingerprint(key))
-        .or_else(|| Some(crate::agent::config::deployment_id_from_key(key)))
 }
 
 /// Resolve deployment key from `GROK_DEPLOYMENT_KEY` env var, then config files.

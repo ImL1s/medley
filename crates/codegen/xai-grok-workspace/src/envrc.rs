@@ -75,9 +75,13 @@ fn try_direnv_export(dir: &Path) -> Option<HashMap<String, String>> {
 
     if !output.status.success() {
         // direnv not allowed, or other error
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.contains("not allowed") {
-            tracing::debug!(?dir, %stderr, "direnv export failed");
+        if should_log_direnv_failure(&output.stderr) {
+            tracing::debug!(
+                dir_configured = !dir.as_os_str().is_empty(),
+                status_code = output.status.code(),
+                error_class = "command_failed",
+                "direnv export failed"
+            );
         }
         return None;
     }
@@ -115,6 +119,10 @@ fn try_direnv_export(dir: &Path) -> Option<HashMap<String, String>> {
             None
         }
     }
+}
+
+fn should_log_direnv_failure(stderr: &[u8]) -> bool {
+    !String::from_utf8_lossy(stderr).contains("not allowed")
 }
 
 /// Load environment by running .envrc in a bash subshell.
@@ -228,6 +236,22 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn direnv_failure_diagnostics_never_render_stderr_credentials() {
+        const SENTINEL: &str = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+        let stderr = format!("provider failed and echoed API_TOKEN={SENTINEL}");
+        let rendered = format!(
+            "dir_configured=true status_code=1 error_class=command_failed should_log={}",
+            should_log_direnv_failure(stderr.as_bytes())
+        );
+
+        assert!(!rendered.contains(SENTINEL));
+        for window in SENTINEL.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).unwrap();
+            assert!(!rendered.contains(fragment), "leaked fragment {fragment}");
+        }
+    }
 
     #[test]
     fn test_simple_export() {

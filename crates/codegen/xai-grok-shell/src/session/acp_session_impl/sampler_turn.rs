@@ -389,7 +389,6 @@ impl SessionActor {
             "is_session_based": gate.is_session_based,
             "endpoint_is_first_party": gate.endpoint_is_first_party,
             "refresh_active": refresh_active,
-            "base_url": base_url,
         });
         let sid = Some(self.session_info.id.0.as_ref());
         if refresh_active {
@@ -806,7 +805,8 @@ impl SessionActor {
                 "status_code": status_code,
                 "reauthable": reauthable,
                 "auth_mode": auth.as_ref().map(|a| format!("{:?}", a.auth_mode)),
-                "key_prefix": auth.as_ref().map(|a| crate::auth::token_suffix(&a.key).to_owned()),
+                "access_token_present": auth.as_ref().is_some_and(|a| !a.key.is_empty()),
+                "refresh_token_present": auth.as_ref().is_some_and(|a| a.refresh_token.is_some()),
                 "expires_at": auth
                     .as_ref()
                     .and_then(|a| a.expires_at.map(|e| e.to_rfc3339())),
@@ -819,11 +819,15 @@ impl SessionActor {
         error: xai_grok_sampler::SamplingErrorInfo,
     ) -> Result<SamplerFailureRecovery, acp::Error> {
         use xai_grok_sampler::SamplingErrorKind;
+        let safe_provider_failure = || match error.status_code {
+            Some(status) => format!("Provider request failed (HTTP {status})."),
+            None => format!("Provider request failed ({}).", error.kind.as_str()),
+        };
         if self.tool_context.task_output_token_budget.is_some() {
             self.tool_context.fail_task_output_usage_closed();
             let message = format!(
-                "budgeted workflow child model request failed; output grant exhausted: {}",
-                error.message
+                "Budgeted workflow child model request failed; output grant exhausted. {}",
+                safe_provider_failure()
             );
             self.log_terminal_failure("output_budget_usage_unknown", error.status_code, &message);
             return Err(acp::Error::internal_error().data(message));
@@ -834,8 +838,8 @@ impl SessionActor {
                 let _ = handle.mark_usage_incomplete(true, true).await;
             });
             let message = format!(
-                "workflow child model request failed; usage may understate real spend: {}",
-                error.message
+                "Workflow child model request failed; usage may understate real spend. {}",
+                safe_provider_failure()
             );
             self.log_terminal_failure(
                 "workflow_child_sampling_failed",
@@ -874,7 +878,9 @@ impl SessionActor {
                 return Ok(SamplerFailureRecovery::CompactAndResubmit);
             }
         }
-        let detailed_message = error.message.clone();
+        let is_model_404 =
+            error.status_code == Some(404) && error.message.contains("does not exist");
+        let detailed_message = safe_provider_failure();
         if matches!(error.kind, SamplingErrorKind::Api)
             && error.status_code == Some(400)
             && error.message.contains("encrypted_content")
@@ -980,16 +986,12 @@ impl SessionActor {
                     self.prepare_sampler_for_turn().await;
                     return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit);
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        session_id = %self.session_info.id.0,
-                        error = %e,
-                        "auth recovery: sampler 401, devbox re-mint failed"
-                    );
+                Err(_) => {
+                    tracing::warn!(session_id = %self.session_info.id.0, "auth recovery: sampler 401, devbox re-mint failed");
                     xai_grok_telemetry::unified_log::warn(
                         "auth recovery: sampler 401, devbox re-mint failed",
                         Some(self.session_info.id.0.as_ref()),
-                        Some(serde_json::json!({ "error": format!("{e}") })),
+                        Some(serde_json::json!({ "error_kind": "devbox_remint_failed" })),
                     );
                 }
             }
@@ -1076,8 +1078,6 @@ impl SessionActor {
             .await;
             return Err(acp::Error::internal_error().data(msg));
         }
-        let is_model_404 =
-            error.status_code == Some(404) && detailed_message.contains("does not exist");
         let is_auth_401 =
             error.status_code == Some(401) || matches!(error.kind, SamplingErrorKind::Auth);
         let detailed_message = if is_model_404 || is_auth_401 {

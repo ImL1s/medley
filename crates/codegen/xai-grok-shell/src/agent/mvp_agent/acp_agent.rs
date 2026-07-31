@@ -55,6 +55,28 @@ fn insert_applied_tool_overrides(
         );
     }
 }
+
+pub(super) fn auth_init_disk_refresh_context(
+    pre: Option<&crate::auth::GrokAuth>,
+    post: Option<&crate::auth::GrokAuth>,
+) -> serde_json::Value {
+    let access_relation = crate::auth::refresh::TriedDiskRelation::compare(
+        pre.map(|auth| auth.key.as_str()),
+        post.map(|auth| auth.key.as_str()),
+    );
+    let refresh_relation = crate::auth::refresh::TriedDiskRelation::compare(
+        pre.and_then(|auth| auth.refresh_token.as_deref()),
+        post.and_then(|auth| auth.refresh_token.as_deref()),
+    );
+    serde_json::json!({
+        "access_relation": access_relation.as_str(),
+        "access_pre_present": access_relation.tried_present(),
+        "access_post_present": access_relation.disk_present(),
+        "refresh_relation": refresh_relation.as_str(),
+        "refresh_pre_present": refresh_relation.tried_present(),
+        "refresh_post_present": refresh_relation.disk_present(),
+    })
+}
 #[async_trait::async_trait(?Send)]
 impl acp::Agent for MvpAgent {
     /// In the meta, we provide
@@ -132,10 +154,10 @@ impl acp::Agent for MvpAgent {
                 None,
                 Some(
                     serde_json::json!({
-                    "user_id": user_id,
+                    "user_id_present": !user_id.is_empty(),
                     "needs_user_info": needs_user_info,
-                    "key_prefix": crate::auth::token_suffix(&auth.key),
-                    "rt_prefix": auth.refresh_token.as_deref().map(crate::auth::token_suffix),
+                    "access_token_present": !auth.key.is_empty(),
+                    "refresh_token_present": auth.refresh_token.is_some(),
                 }),
                 ),
             );
@@ -219,39 +241,13 @@ impl acp::Agent for MvpAgent {
         if self.initialize_request.set(arguments).is_err() {
             tracing::info!("Initialize called on reconnect (already initialized)");
         }
-        let pre = self
-            .auth_manager
-            .current()
-            .map(|a| (
-                crate::auth::token_suffix(&a.key).to_owned(),
-                a
-                    .refresh_token
-                    .as_deref()
-                    .map(|t| crate::auth::token_suffix(t).to_owned()),
-            ));
+        let pre = self.auth_manager.current();
         self.auth_manager.force_reload_from_disk();
-        let post = self
-            .auth_manager
-            .current()
-            .map(|a| (
-                crate::auth::token_suffix(&a.key).to_owned(),
-                a
-                    .refresh_token
-                    .as_deref()
-                    .map(|t| crate::auth::token_suffix(t).to_owned()),
-            ));
+        let post = self.auth_manager.current();
         xai_grok_telemetry::unified_log::info(
             "auth init disk refresh",
             None,
-            Some(
-                serde_json::json!({
-                "pre_key": pre.as_ref().map(|p| &p.0),
-                "pre_rt": pre.as_ref().and_then(|p| p.1.as_deref()),
-                "post_key": post.as_ref().map(|p| &p.0),
-                "post_rt": post.as_ref().and_then(|p| p.1.as_deref()),
-                "changed": pre.as_ref().map(|p| &p.0) != post.as_ref().map(|p| &p.0),
-            }),
-            ),
+            Some(auth_init_disk_refresh_context(pre.as_ref(), post.as_ref())),
         );
         xai_grok_telemetry::unified_log::info(
             "auth: initialize() refreshed auth state from disk",
@@ -379,14 +375,11 @@ impl acp::Agent for MvpAgent {
                 .expect(
                     "enterprise_oidc_issuer must be Some when has_enterprise_oidc is true",
                 );
-            tracing::info!(
-                issuer = %issuer,
-                "auth: advertising enterprise OIDC auth method",
-            );
+            tracing::info!(issuer_present = !issuer.is_empty(), "auth: advertising enterprise OIDC auth method");
             xai_grok_telemetry::unified_log::info(
                 "auth: advertising enterprise OIDC auth method",
                 None,
-                Some(serde_json::json!({ "issuer": issuer })),
+                Some(serde_json::json!({ "issuer_present": !issuer.is_empty() })),
             );
         } else {
             tracing::info!(
@@ -1015,7 +1008,11 @@ impl acp::Agent for MvpAgent {
         arguments: acp::NewSessionRequest,
     ) -> Result<acp::NewSessionResponse, acp::Error> {
         reject_chat_kind_without_feature(arguments.meta.as_ref())?;
-        tracing::debug!(config = ?self.sampling_config, "Received new session request {arguments:?}");
+        tracing::debug!(
+            mcp_server_count = arguments.mcp_servers.len(),
+            meta_present = arguments.meta.is_some(),
+            "received new session request"
+        );
         let init = self
             .initialize_request
             .get()

@@ -41,7 +41,7 @@ fn sanitize_tool_arguments(id: &str, name: &str, arguments: Arc<str>) -> Arc<str
         tracing::warn!(
             tool_call_id = id,
             tool_name = name,
-            args_preview = truncate_bytes(&arguments, 200),
+            args_len = arguments.len(),
             "Tool call has invalid JSON arguments; replacing with {{}} to prevent provider 400"
         );
         Arc::<str>::from("{}")
@@ -2367,6 +2367,60 @@ mod tests {
     use super::*;
     use crate::tool_overrides::*;
     use assert_matches::assert_matches;
+    use std::sync::{Arc as StdArc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct LogCapture(StdArc<Mutex<Vec<String>>>);
+
+    #[derive(Default)]
+    struct RenderedFields(String);
+
+    impl tracing::field::Visit for RenderedFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            let _ = write!(&mut self.0, "{}={value:?};", field.name());
+        }
+    }
+
+    impl tracing::Subscriber for LogCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut rendered = RenderedFields::default();
+            event.record(&mut rendered);
+            self.0.lock().expect("log capture mutex").push(rendered.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn malformed_tool_argument_log_omits_full_and_partial_credentials() {
+        const SENTINEL: &str = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+        let capture = LogCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let malformed = format!(r#"{{"Authorization":"Bearer {SENTINEL}""#);
+
+        let sanitized = sanitize_tool_arguments(
+            "call-safe-id",
+            "run_terminal_cmd",
+            Arc::<str>::from(malformed),
+        );
+
+        assert_eq!(&*sanitized, "{}");
+        let rendered = capture.0.lock().expect("log capture mutex").join("\n");
+        assert!(!rendered.contains(SENTINEL));
+        for window in SENTINEL.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).unwrap();
+            assert!(!rendered.contains(fragment), "leaked fragment {fragment}");
+        }
+    }
 
     #[test]
     fn prior_turn_interrupt_serde_round_trip_and_unknown_fallback() {

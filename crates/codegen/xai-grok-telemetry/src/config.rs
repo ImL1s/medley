@@ -88,7 +88,7 @@ pub fn env_telemetry_mode(name: &str) -> Option<TelemetryMode> {
     let value = std::env::var(name).ok()?;
     TelemetryMode::parse(&value)
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TelemetryConfig {
     /// Declared for `serde_ignored`. Actual toggle is `[features] telemetry`.
@@ -115,6 +115,32 @@ pub struct TelemetryConfig {
     pub otel_log_user_prompts: Option<bool>,
     /// External OTEL content gate (admins can pin to `false` via requirements).
     pub otel_log_tool_details: Option<bool>,
+}
+
+impl std::fmt::Debug for TelemetryConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelemetryConfig")
+            .field("enabled", &self.enabled)
+            .field("events_url_present", &self.events_url.is_some())
+            .field("events_api_key_present", &self.events_api_key.is_some())
+            .field("mixpanel_token_present", &self.mixpanel_token.is_some())
+            .field("mixpanel_enabled", &self.mixpanel_enabled)
+            .field("trace_upload", &self.trace_upload)
+            .field("otel_enabled", &self.otel_enabled)
+            .field(
+                "otel_metrics_exporter_present",
+                &self.otel_metrics_exporter.is_some(),
+            )
+            .field(
+                "otel_logs_exporter_present",
+                &self.otel_logs_exporter.is_some(),
+            )
+            .field("otel_endpoint_present", &self.otel_endpoint.is_some())
+            .field("otel_protocol_present", &self.otel_protocol.is_some())
+            .field("otel_log_user_prompts", &self.otel_log_user_prompts)
+            .field("otel_log_tool_details", &self.otel_log_tool_details)
+            .finish()
+    }
 }
 fn internal_defaults() -> (Option<String>, Option<String>, Option<String>, bool) {
     (None, None, None, false)
@@ -209,13 +235,21 @@ fn env_bool(name: &str) -> Option<bool> {
         _ => None,
     }
 }
-/// Derive a stable deployment ID (UUIDv5) from the deployment key.
-pub fn deployment_id_from_key(key: &str) -> String {
-    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, key.as_bytes()).to_string()
-}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_no_secret_fragments(output: &str, sentinel: &str) {
+        assert!(!output.contains(sentinel));
+        for window in sentinel.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(
+                !output.contains(fragment),
+                "credential fragment {fragment:?} leaked in {output:?}"
+            );
+        }
+    }
+
     #[test]
     fn build_env_default_normalizes() {
         assert_eq!(build_env_default(None), None);
@@ -233,5 +267,27 @@ mod tests {
         assert_eq!(cfg.events_url, url);
         assert_eq!(cfg.events_api_key, key);
         assert_eq!(cfg.mixpanel_token, token);
+    }
+
+    #[test]
+    fn telemetry_config_debug_is_presence_only() {
+        const EVENTS_KEY: &str = "GB002EVENTS-Q7w5E3r1T9y7Z6x4C2v8";
+        const MIXPANEL_TOKEN: &str = "GB002MIXPANEL-A7s5D3f1G9h7J6k4L2m8";
+        const EVENTS_URL: &str = "https://user:password@example.test/events";
+
+        let config = TelemetryConfig {
+            events_url: Some(EVENTS_URL.to_owned()),
+            events_api_key: Some(EVENTS_KEY.to_owned()),
+            mixpanel_token: Some(MIXPANEL_TOKEN.to_owned()),
+            ..TelemetryConfig::default()
+        };
+        let output = format!("{config:?}");
+
+        for sentinel in [EVENTS_KEY, MIXPANEL_TOKEN, EVENTS_URL] {
+            assert_no_secret_fragments(&output, sentinel);
+        }
+        assert!(output.contains("events_url_present: true"));
+        assert!(output.contains("events_api_key_present: true"));
+        assert!(output.contains("mixpanel_token_present: true"));
     }
 }

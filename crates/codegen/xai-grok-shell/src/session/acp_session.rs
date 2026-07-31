@@ -417,8 +417,17 @@ fn managed_gateway_error_to_tool_error(
     caller: &str,
 ) -> xai_tool_runtime::ToolError {
     match error {
-        crate::session::managed_mcp::ManagedMcpFetchError::Status { status, message } => {
-            let detail = format!("Managed MCP gateway tool call failed: {message}");
+        crate::session::managed_mcp::ManagedMcpFetchError::Status {
+            status,
+            gateway_code,
+        } => {
+            let detail = match gateway_code {
+                Some(code) => format!(
+                    "Managed MCP gateway tool call failed with HTTP {status}: {}",
+                    code.recovery_hint()
+                ),
+                None => format!("Managed MCP gateway tool call failed with HTTP {status}"),
+            };
             let mut err = if status == reqwest::StatusCode::UNAUTHORIZED {
                 xai_tool_runtime::ToolError::unauthorized(detail)
             } else if status == reqwest::StatusCode::FORBIDDEN {
@@ -434,20 +443,34 @@ fn managed_gateway_error_to_tool_error(
                         HTTP_STATUS_DETAILS_KEY.to_string(),
                         serde_json::json!(status.as_u16()),
                     );
+                    if let Some(code) = gateway_code {
+                        map.insert(
+                            "gateway_error_code".to_string(),
+                            serde_json::json!(code.as_str()),
+                        );
+                    }
                 }
                 _ => {
                     err.details = Some(serde_json::json!({
                         HTTP_STATUS_DETAILS_KEY: status.as_u16(),
+                        "gateway_error_code": gateway_code.map(|code| code.as_str()),
                     }));
                 }
             }
             err
         }
-        crate::session::managed_mcp::ManagedMcpFetchError::Transport(e) => {
+        crate::session::managed_mcp::ManagedMcpFetchError::Transport { kind } => {
             xai_tool_runtime::ToolError::network_error(format!(
-                "Managed MCP gateway tool call failed: {}",
-                e.without_url()
+                "Managed MCP gateway tool call failed: transport {kind}"
             ))
+        }
+        crate::session::managed_mcp::ManagedMcpFetchError::InvalidResponse => {
+            let tool_id = xai_tool_protocol::ToolId::new(caller)
+                .unwrap_or_else(|_| xai_tool_protocol::ToolId::new("use_tool").expect("valid"));
+            xai_tool_runtime::ToolError::execution(
+                tool_id,
+                "Managed MCP gateway returned an invalid response",
+            )
         }
         crate::session::managed_mcp::ManagedMcpFetchError::NoAuth => {
             xai_tool_runtime::ToolError::unauthorized("no auth token available")
@@ -457,17 +480,57 @@ fn managed_gateway_error_to_tool_error(
 #[cfg(test)]
 mod managed_gateway_error_tests {
     use super::*;
-    fn status_error(code: u16, message: &str) -> crate::session::managed_mcp::ManagedMcpFetchError {
+
+    fn assert_no_secret_windows(rendered: &str, secret: &str) {
+        assert!(
+            !rendered.contains(secret),
+            "leaked full sentinel: {rendered}"
+        );
+        for window in secret.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(
+                !rendered.contains(window),
+                "leaked sentinel window {window}: {rendered}"
+            );
+        }
+    }
+
+    fn status_error(code: u16) -> crate::session::managed_mcp::ManagedMcpFetchError {
         crate::session::managed_mcp::ManagedMcpFetchError::Status {
             status: reqwest::StatusCode::from_u16(code).unwrap(),
-            message: message.to_string(),
+            gateway_code: None,
         }
+    }
+
+    #[test]
+    fn allowlisted_gateway_code_provides_fixed_recovery_hint() {
+        let err = managed_gateway_error_to_tool_error(
+            crate::session::managed_mcp::ManagedMcpFetchError::Status {
+                status: reqwest::StatusCode::BAD_REQUEST,
+                gateway_code: Some(
+                    crate::session::managed_mcp::ManagedMcpGatewayErrorCode::InvalidArguments,
+                ),
+            },
+            "use_tool",
+        );
+
+        assert_eq!(err.kind, xai_tool_runtime::ToolErrorKind::Execution);
+        assert!(err.detail.contains("review the connector tool schema"));
+        assert_eq!(
+            err.details
+                .as_ref()
+                .and_then(|details| details.get("gateway_error_code")),
+            Some(&serde_json::json!("invalid_arguments"))
+        );
     }
     #[test]
     fn unauthorized_status_maps_to_unauthorized_and_carries_status() {
-        let err = managed_gateway_error_to_tool_error(status_error(401, "expired"), "use_tool");
+        let err = managed_gateway_error_to_tool_error(status_error(401), "use_tool");
         assert_eq!(err.kind, xai_tool_runtime::ToolErrorKind::Unauthorized);
-        assert!(err.detail.contains("expired"));
+        assert_eq!(
+            err.detail,
+            "Managed MCP gateway tool call failed with HTTP 401 Unauthorized"
+        );
         let details = err.details.as_ref().unwrap();
         assert_eq!(
             details.get(HTTP_STATUS_DETAILS_KEY),
@@ -476,7 +539,7 @@ mod managed_gateway_error_tests {
     }
     #[test]
     fn forbidden_status_maps_to_permission_denied_and_carries_status() {
-        let err = managed_gateway_error_to_tool_error(status_error(403, "denied"), "use_tool");
+        let err = managed_gateway_error_to_tool_error(status_error(403), "use_tool");
         assert_eq!(err.kind, xai_tool_runtime::ToolErrorKind::PermissionDenied);
         let details = err.details.as_ref().unwrap();
         assert_eq!(
@@ -486,7 +549,7 @@ mod managed_gateway_error_tests {
     }
     #[test]
     fn general_status_maps_to_execution_with_caller_tool_id() {
-        let err = managed_gateway_error_to_tool_error(status_error(500, "boom"), "CallMcpTool");
+        let err = managed_gateway_error_to_tool_error(status_error(500), "CallMcpTool");
         assert_eq!(err.kind, xai_tool_runtime::ToolErrorKind::Execution);
         let details = err.details.as_ref().unwrap();
         assert_eq!(
@@ -500,7 +563,7 @@ mod managed_gateway_error_tests {
     }
     #[test]
     fn general_status_falls_back_to_use_tool_for_unknown_caller() {
-        let err = managed_gateway_error_to_tool_error(status_error(500, "boom"), "not a tool id");
+        let err = managed_gateway_error_to_tool_error(status_error(500), "not a tool id");
         assert_eq!(err.kind, xai_tool_runtime::ToolErrorKind::Execution);
         let details = err.details.as_ref().unwrap();
         assert_eq!(details.get("tool_id"), Some(&serde_json::json!("use_tool")));
@@ -513,24 +576,93 @@ mod managed_gateway_error_tests {
         );
         assert_eq!(err.kind, xai_tool_runtime::ToolErrorKind::Unauthorized);
     }
-    #[tokio::test]
-    async fn transport_error_maps_to_network_error_without_url() {
-        let transport = reqwest::Client::new()
-            .post("http://127.0.0.1:1/mcp/tools/call")
-            .send()
-            .await
-            .expect_err("connection to a dead port should fail");
+    #[test]
+    fn transport_error_maps_to_fixed_network_error() {
         let err = managed_gateway_error_to_tool_error(
-            crate::session::managed_mcp::ManagedMcpFetchError::Transport(transport),
+            crate::session::managed_mcp::ManagedMcpFetchError::Transport {
+                kind: crate::session::managed_mcp::ManagedMcpTransportKind::Connect,
+            },
             "use_tool",
         );
         assert_eq!(err.kind, xai_tool_runtime::ToolErrorKind::NetworkError);
-        assert!(err.detail.contains("Managed MCP gateway tool call failed"));
-        assert!(
-            !err.detail.contains("http://"),
-            "transport detail must not leak the proxy URL: {}",
-            err.detail
+        assert_eq!(
+            err.detail,
+            "Managed MCP gateway tool call failed: transport connect"
         );
+    }
+
+    #[test]
+    fn invalid_response_maps_to_fixed_execution_error() {
+        let err = managed_gateway_error_to_tool_error(
+            crate::session::managed_mcp::ManagedMcpFetchError::InvalidResponse,
+            "use_tool",
+        );
+        assert_eq!(err.kind, xai_tool_runtime::ToolErrorKind::Execution);
+        assert_eq!(
+            err.detail,
+            "Managed MCP gateway returned an invalid response"
+        );
+    }
+
+    #[tokio::test]
+    async fn reflected_provider_body_never_reaches_tool_error() {
+        use axum::Router;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        let secret = "GB002-managed-tool-body-secret-0123456789abcdef";
+        let reflected = secret.to_owned();
+        let app = Router::new().route(
+            "/mcp/tools/call",
+            post(move || {
+                let reflected = reflected.clone();
+                async move {
+                    (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        axum::Json(serde_json::json!({"error": reflected})),
+                    )
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let fetch_error = crate::session::managed_mcp::call_gateway_tool(
+            &format!("http://{addr}"),
+            secret,
+            "managed_test_call",
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap_err();
+        let error = managed_gateway_error_to_tool_error(fetch_error, "use_tool");
+
+        assert_no_secret_windows(&error.detail, secret);
+        assert_no_secret_windows(&format!("{error:?}"), secret);
+    }
+
+    #[tokio::test]
+    async fn url_userinfo_and_query_never_reach_tool_error() {
+        use tokio::net::TcpListener;
+
+        let secret = "GB002-managed-tool-url-secret-0123456789abcdef";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let proxy_url = format!("http://user:{secret}@{addr}?access_token={secret}");
+        let fetch_error = crate::session::managed_mcp::call_gateway_tool(
+            &proxy_url,
+            secret,
+            "managed_test_call",
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap_err();
+        let error = managed_gateway_error_to_tool_error(fetch_error, "use_tool");
+
+        assert_no_secret_windows(&error.detail, secret);
+        assert_no_secret_windows(&format!("{error:?}"), secret);
     }
 }
 /// Data carried from prepare_tool_call → dispatch_tool → finalize.
@@ -599,13 +731,11 @@ pub(crate) struct SessionActor {
     /// `x.ai/internal/reload_models` / `reload_models_cache` — must clear
     /// this memo (`replace(None)`).
     pub(crate) model_auth_memo: std::cell::RefCell<Option<ModelAuthMemo>>,
-    /// 401-attribution callback. Joined with the bearer the
-    /// sampler sends on the wire to emit an `auth 401 attribution`
-    /// event at each of the six `OaiCompatClient` 401 arms in
-    /// `xai-grok-sampler`. Threaded into every `SamplerConfig`
-    /// reconstructed by `reconstruct_full_config`. `None` when the
-    /// session was spawned without an `AuthManager` (BYOK direct
-    /// mode, test fixtures).
+    /// 401-attribution callback. Receives the sampler's secret-free
+    /// final-attempt credential comparison at each `OaiCompatClient` 401 arm.
+    /// Threaded into every `SamplerConfig` reconstructed by
+    /// `reconstruct_full_config`. `None` when the session was spawned without
+    /// an `AuthManager` (BYOK direct mode, test fixtures).
     pub(crate) attribution_callback: Option<xai_grok_sampler::SharedAttributionCallback>,
     /// Auth manager. Owns the token refresher internally (via
     /// `configure_refresher()`) and is also used for non-sampler

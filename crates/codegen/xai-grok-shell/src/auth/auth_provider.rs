@@ -18,7 +18,7 @@ use super::token_output::{expiry_after_seconds, parse_token_output};
 /// One named `[auth_provider.<name>]` table, honored only from the trusted
 /// config layers (`parse_auth_providers`). A new field here needs a
 /// `parse_auth_providers` warning decision.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(default)]
 pub struct AuthProviderConfig {
     /// Command to run; without `args` it uses the platform shell, with `args` it execs directly.
@@ -31,6 +31,21 @@ pub struct AuthProviderConfig {
     pub timeout_secs: Option<u64>,
     /// Working directory for the command; a leading `~` expands to home.
     pub cwd: Option<String>,
+}
+
+impl std::fmt::Debug for AuthProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthProviderConfig")
+            .field("command_present", &(!self.command.trim().is_empty()))
+            .field("args_count", &self.args.as_ref().map(Vec::len))
+            .field("token_ttl_secs", &self.token_ttl_secs)
+            .field("timeout_secs", &self.timeout_secs)
+            .field(
+                "cwd_present",
+                &self.cwd.as_ref().is_some_and(|cwd| !cwd.trim().is_empty()),
+            )
+            .finish()
+    }
 }
 
 impl AuthProviderConfig {
@@ -196,11 +211,9 @@ const DEFAULT_PROVIDER_TIMEOUT_SECS: u64 = 30;
 /// outside the range is honored up to the bound and draws a parse warning,
 /// since a turn waits on the mint.
 pub(crate) const PROVIDER_TIMEOUT_CEILING_SECS: u64 = 600;
-/// Caps on the helper's captured output so a runaway command can't exhaust
-/// memory before the timeout fires. A bearer (even a large JWT) is far under
-/// the stdout cap; stderr only ever appears truncated in the failure log.
+/// Cap on the helper's captured stdout so a runaway command can't exhaust
+/// memory before the timeout fires. Stderr is drained without being retained.
 const PROVIDER_STDOUT_CAP_BYTES: u64 = 1 << 20; // 1 MiB
-const PROVIDER_STDERR_CAP_BYTES: u64 = 64 << 10; // 64 KiB
 
 /// The table fields that shape the minted token; a cached token minted under a
 /// different set reads as stale, so a config edit re-mints. Destructured so a
@@ -268,7 +281,7 @@ fn scrub_first_party_credentials(cmd: &mut tokio::process::Command) {
     }
 }
 
-/// Spawn `cmd`, capture stdout/stderr with a byte cap (reading both
+/// Spawn `cmd`, capture stdout with a byte cap and discard stderr (reading both
 /// concurrently so a full pipe on one can't deadlock the other; a runaway helper
 /// is drained to a sink past the cap so it can't wedge the wait), and bound the
 /// whole run by `timeout`. Exceeding the stdout cap is an error.
@@ -297,18 +310,19 @@ async fn run_capped(
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
     let mut out_buf = Vec::new();
-    let mut err_buf = Vec::new();
 
     // One extra stdout byte so an over-cap write is detectable, not truncated.
-    // The stderr read is advisory (it only feeds the failure log), so only
-    // stdout governs the mint.
+    // Stderr is provider-controlled and may contain credentials, so it is
+    // drained only to prevent a full pipe from blocking the helper.
     let capture = async {
+        let mut stderr = tokio::io::BufReader::new(stderr);
+        let mut stderr_sink = tokio::io::sink();
         let (out_res, err_res) = tokio::join!(
             read_capped(stdout, PROVIDER_STDOUT_CAP_BYTES + 1, &mut out_buf),
-            read_capped(stderr, PROVIDER_STDERR_CAP_BYTES, &mut err_buf),
+            tokio::io::copy(&mut stderr, &mut stderr_sink),
         );
-        if let Err(e) = err_res {
-            tracing::debug!(error = %e, "auth provider: stderr capture failed (advisory)");
+        if err_res.is_err() {
+            tracing::debug!("auth provider: stderr drain failed");
         }
         out_res.map_err(|e| anyhow::anyhow!("reading command stdout: {e}"))?;
         child
@@ -330,7 +344,7 @@ async fn run_capped(
     Ok(std::process::Output {
         status,
         stdout: out_buf,
-        stderr: err_buf,
+        stderr: Vec::new(),
     })
 }
 
@@ -417,16 +431,7 @@ async fn mint_provider_token(
 
     let output = run_capped(&mut cmd, std::time::Duration::from_secs(timeout_secs)).await?;
 
-    let parsed = match parse_token_output(&output) {
-        Ok(parsed) => parsed,
-        Err(e) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!(
-                "{e} (stderr: {})",
-                crate::util::truncate(stderr.trim(), 300)
-            );
-        }
-    };
+    let parsed = parse_token_output(&output)?;
     let expires_at = parsed
         .expires_at
         .or_else(|| config.token_ttl_secs.and_then(expiry_after_seconds))

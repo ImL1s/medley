@@ -13,10 +13,9 @@ use crate::event::HookEventEnvelope;
 use crate::result::{HookDecision, HttpInfo, StopHookOutcome};
 
 use super::{
-    GateKind, HookRunOutput, HookRunnerResult, RunContext, StopHookJson, stop_json_to_outcome,
+    GateKind, HookFailureClass, HookRunOutput, HookRunnerResult, RunContext, StopHookJson,
+    stop_json_to_outcome,
 };
-
-const RESPONSE_PREVIEW_MAX: usize = 200;
 
 /// CWE-918: `true` if `ip` is in a private, link-local, or cloud metadata range
 /// that must be blocked to prevent SSRF. Loopback (`127.x`/`::1`) is allowed for
@@ -73,23 +72,22 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
 /// CWE-918: prevent SSRF. Only HTTPS is allowed and resolved IPs must not be
 /// private/link-local/metadata. Known gap: the request re-resolves the host, so
 /// a rebinding DNS server can still swap in a blocked IP after this check.
-async fn validate_hook_url(url: &str) -> Result<(), String> {
-    let parsed = Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+async fn validate_hook_url(url: &str) -> Result<(), HookFailureClass> {
+    let parsed = Url::parse(url).map_err(|_| HookFailureClass::InvalidUrl)?;
 
     if parsed.scheme() != "https" {
-        return Err(format!(
-            "only https:// URLs are allowed for HTTP hooks, got {}://",
-            parsed.scheme()
-        ));
+        return Err(HookFailureClass::InsecureScheme);
     }
 
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| "URL has no host".to_string())?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(HookFailureClass::UserinfoRejected);
+    }
+
+    let host = parsed.host_str().ok_or(HookFailureClass::InvalidUrl)?;
 
     if let Ok(ip) = host.parse::<IpAddr>() {
         if is_blocked_ip(&ip) {
-            return Err(format!("URL resolves to blocked private/internal IP: {ip}"));
+            return Err(HookFailureClass::SsrfBlocked);
         }
         return Ok(());
     }
@@ -98,19 +96,16 @@ async fn validate_hook_url(url: &str) -> Result<(), String> {
     let addr_str = format!("{host}:{port}");
     let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&addr_str)
         .await
-        .map_err(|e| format!("DNS resolution failed for {host}: {e}"))?
+        .map_err(|_| HookFailureClass::Dns)?
         .collect();
 
     if addrs.is_empty() {
-        return Err(format!("DNS resolved no addresses for {host}"));
+        return Err(HookFailureClass::Dns);
     }
 
     for addr in &addrs {
         if is_blocked_ip(&addr.ip()) {
-            return Err(format!(
-                "URL host {host} resolves to blocked private/internal IP: {}",
-                addr.ip()
-            ));
+            return Err(HookFailureClass::SsrfBlocked);
         }
     }
 
@@ -141,7 +136,7 @@ pub async fn run_http_hook(
 
     let Some(ref raw_url) = spec.url else {
         return (
-            HookRunnerResult::Failed("http hook has no 'url' field".into()),
+            HookRunnerResult::FailedClassified(HookFailureClass::MissingConfiguration),
             start.elapsed(),
             None,
         );
@@ -153,17 +148,12 @@ pub async fn run_http_hook(
     // rejects them rather than smuggling a literal `${VAR}` past validation.
     let expanded_url = crate::env_expand::expand_env_vars_with_extra(raw_url, &spec.extra_env);
     let url: &str = &expanded_url;
-    // Prefer the pre-expansion source for logs so resolved `env` secrets don't
-    // reach `~/.grok/logs`; threaded into the reqwest error format below so
-    // reqwest's default `Display` (which appends the URL) can't bypass it.
-    let log_url: &str = spec.url_raw.as_deref().unwrap_or(url);
-
-    let make_info = |status: Option<u16>, preview: Option<String>| -> HttpInfo {
+    let make_info = |status: Option<u16>| -> HttpInfo {
         HttpInfo {
-            url: url.to_owned(),
-            raw_url: spec.url_raw.clone(),
+            url: observable_hook_url(url),
+            raw_url: None,
             status,
-            response_preview: preview,
+            response_preview: None,
         }
     };
 
@@ -174,33 +164,27 @@ pub async fn run_http_hook(
         validate_hook_url(url),
     )
     .await
-    .unwrap_or_else(|_| {
-        Err(format!(
-            "URL validation timed out after {}ms",
-            spec.timeout_ms
-        ))
-    });
-    if let Err(reason) = validation {
+    .unwrap_or(Err(HookFailureClass::Timeout));
+    if let Err(class) = validation {
         tracing::warn!(
             hook_name = %spec.name,
-            url = %log_url,
-            %reason,
+            failure_class = class.as_str(),
             "SSRF protection: blocked HTTP hook URL"
         );
         return (
-            HookRunnerResult::Failed(format!("blocked by SSRF protection: {reason}")),
+            HookRunnerResult::FailedClassified(class),
             start.elapsed(),
-            Some(make_info(None, None)),
+            Some(make_info(None)),
         );
     }
 
     let body = match serde_json::to_string(envelope) {
         Ok(j) => j,
-        Err(e) => {
+        Err(_) => {
             return (
-                HookRunnerResult::Failed(format!("failed to serialize envelope: {e}")),
+                HookRunnerResult::FailedClassified(HookFailureClass::Serialization),
                 start.elapsed(),
-                Some(make_info(None, None)),
+                Some(make_info(None)),
             );
         }
     };
@@ -217,19 +201,15 @@ pub async fn run_http_hook(
         Ok(r) => r,
         Err(e) => {
             let elapsed = start.elapsed();
-            // SECURITY: `reqwest::Error::Display` appends the request URL, which
-            // may embed an `env`-map secret and leak into `Failed.error` and
-            // pager scrollback. `e.without_url()` strips it so we substitute
-            // `log_url` (the raw source form).
-            let error = if e.is_timeout() {
-                format!("timed out after {}ms", spec.timeout_ms)
+            let class = if e.is_timeout() {
+                HookFailureClass::Timeout
             } else {
-                format!("HTTP request failed for {}: {}", log_url, e.without_url())
+                HookFailureClass::HttpTransport
             };
             return (
-                HookRunnerResult::Failed(error),
+                HookRunnerResult::FailedClassified(class),
                 elapsed,
-                Some(make_info(None, None)),
+                Some(make_info(None)),
             );
         }
     };
@@ -240,14 +220,14 @@ pub async fn run_http_hook(
 
     tracing::debug!(
         hook_name = %spec.name,
-        url = %log_url,
+        url_configured = true,
         status = status_code,
         elapsed_ms = elapsed.as_millis() as u64,
         "http hook completed"
     );
 
     if mode == GateKind::Observe {
-        let http_info = Some(make_info(Some(status_code), None));
+        let http_info = Some(make_info(Some(status_code)));
         if status.is_success() {
             return (HookRunnerResult::Success, elapsed, http_info);
         }
@@ -260,27 +240,16 @@ pub async fn run_http_hook(
 
     let response_text = match response.text().await {
         Ok(t) => t,
-        Err(e) => {
-            // SECURITY: scrub the URL as in the send-failure branch above.
+        Err(_) => {
             return (
-                HookRunnerResult::Failed(format!(
-                    "failed to read response body for {}: {}",
-                    log_url,
-                    e.without_url()
-                )),
+                HookRunnerResult::Failed("failed to read HTTP hook response body".to_owned()),
                 elapsed,
-                Some(make_info(Some(status_code), None)),
+                Some(make_info(Some(status_code))),
             );
         }
     };
 
-    let response_preview = if response_text.trim().is_empty() {
-        None
-    } else {
-        Some(truncate_preview(&response_text))
-    };
-
-    let http_info = Some(make_info(Some(status_code), response_preview.clone()));
+    let http_info = Some(make_info(Some(status_code)));
 
     let result = match mode {
         GateKind::Tool => parse_http_blocking_result(&response_text, status, &spec.name),
@@ -358,23 +327,10 @@ fn parse_http_blocking_result(
     }
 }
 
-/// Truncate a response body for preview, cutting on a UTF-8 char boundary so
-/// multi-byte characters never panic.
-fn truncate_preview(s: &str) -> String {
-    let trimmed = s.trim();
-    if trimmed.len() <= RESPONSE_PREVIEW_MAX {
-        trimmed.to_string()
-    } else {
-        let boundary = trimmed
-            .char_indices()
-            .take_while(|&(i, _)| i <= RESPONSE_PREVIEW_MAX)
-            .last()
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        let mut preview = trimmed[..boundary].to_string();
-        preview.push_str("...");
-        preview
-    }
+fn observable_hook_url(url: &str) -> String {
+    Url::parse(url)
+        .map(|parsed| format!("{}://<configured>", parsed.scheme()))
+        .unwrap_or_else(|_| "<invalid-url>".to_owned())
 }
 
 #[cfg(test)]
@@ -584,7 +540,7 @@ mod tests {
     async fn ssrf_rejects_non_https_schemes() {
         for url in ["http://example.com/hook", "ftp://example.com/hook"] {
             let err = validate_hook_url(url).await.expect_err("must reject");
-            assert!(err.contains("https://"));
+            assert_eq!(err, HookFailureClass::InsecureScheme);
         }
     }
 
@@ -595,7 +551,7 @@ mod tests {
             "https://169.254.169.254/latest/meta-data/",
         ] {
             let err = validate_hook_url(url).await.expect_err("must reject");
-            assert!(err.contains("blocked"));
+            assert_eq!(err, HookFailureClass::SsrfBlocked);
         }
     }
 
@@ -608,8 +564,28 @@ mod tests {
     #[tokio::test]
     async fn ssrf_rejects_invalid_url() {
         let result = validate_hook_url("not a url").await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("invalid URL"));
+        assert_eq!(result, Err(HookFailureClass::InvalidUrl));
+    }
+
+    #[tokio::test]
+    async fn hook_url_userinfo_is_rejected_without_rendering_credentials() {
+        let sentinel = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+        let url = format!("https://user:{sentinel}@example.invalid/hook?key={sentinel}");
+        let error = validate_hook_url(&url)
+            .await
+            .expect_err("URL userinfo must be rejected");
+
+        let rendered = format!("{error:?}");
+        assert!(!rendered.contains(sentinel));
+        for window in sentinel.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).unwrap();
+            assert!(!rendered.contains(fragment));
+        }
+        assert_eq!(error, HookFailureClass::UserinfoRejected);
+        assert_eq!(
+            format!("hook failed ({})", error.as_str()),
+            "hook failed (userinfo_rejected)"
+        );
     }
 
     /// A host that never resolves fails validation (covers the DNS branch that
@@ -619,16 +595,15 @@ mod tests {
         let err = validate_hook_url("https://nonexistent.invalid/hook")
             .await
             .expect_err("unresolvable host must fail validation");
-        assert!(err.contains("DNS resolution failed"), "got: {err}");
+        assert_eq!(err, HookFailureClass::Dns);
     }
 
     use crate::config::HookSpec;
     use crate::event::{HookEventEnvelope, HookEventName, HookPayload};
     use crate::test_support::with_env_var;
 
-    /// SSRF validation in `run_http_hook` must operate on the post-expansion URL,
-    /// and `HttpInfo` must carry the resolved form while `raw_url` mirrors the
-    /// source.
+    /// SSRF validation must operate on the post-expansion URL without retaining
+    /// that secret-bearing target in diagnostics.
     #[tokio::test]
     async fn run_http_hook_uses_post_expansion_url_for_ssrf() {
         let mut extra_env = std::collections::HashMap::new();
@@ -678,25 +653,15 @@ mod tests {
         let (result, _, info) = run_http_hook(&spec, &envelope, &ctx, GateKind::Tool).await;
 
         match result {
-            crate::runner::HookRunnerResult::Failed(reason) => {
-                assert!(
-                    reason.contains("blocked") || reason.contains("SSRF"),
-                    "expected SSRF block message, got: {reason}"
-                );
-            }
+            crate::runner::HookRunnerResult::FailedClassified(
+                crate::runner::HookFailureClass::SsrfBlocked,
+            ) => {}
             other => panic!("expected SSRF Failed, got {other:?}"),
         }
 
         let info = info.expect("HttpInfo should be present for SSRF block path");
-        assert_eq!(
-            info.url, "https://10.0.0.1/hook",
-            "HttpInfo.url must reflect the post-expansion URL (the actual target SSRF blocked)"
-        );
-        assert_eq!(
-            info.raw_url.as_deref(),
-            Some("https://${INTERNAL_HOST_SSRF}/hook"),
-            "HttpInfo.raw_url must mirror HookSpec::url_raw"
-        );
+        assert_eq!(info.url, "https://<configured>");
+        assert!(info.raw_url.is_none());
     }
 
     /// `reqwest::Error::Display` appends the request URL, so a `${TOKEN}` secret
@@ -761,6 +726,9 @@ mod tests {
         // embedding the raw URL via `format!("...{e}")`.
         let error_text = match result {
             crate::runner::HookRunnerResult::Failed(reason) => reason,
+            crate::runner::HookRunnerResult::FailedClassified(class) => {
+                format!("hook failed ({})", class.as_str())
+            }
             other => panic!("expected Failed, got {other:?}"),
         };
 
@@ -769,23 +737,15 @@ mod tests {
             "secret leaked into error text: {error_text}"
         );
 
-        // The connection-error branch must reference the raw URL form (so users
-        // see which hook failed), never the resolved secret-bearing form.
-        if !error_text.contains("timed out") {
-            assert!(
-                error_text.contains("${RUNTIME_HOST}") || error_text.contains("${MY_TOKEN}"),
-                "expected error to reference the raw URL form, got: {error_text}"
-            );
-        }
-
-        // HttpInfo.url stays post-expansion for SSRF debugging; consumers prefer
-        // raw_url for display (see the HttpInfo rustdoc).
         let info = info.expect("HttpInfo should be present for connection failures too");
-        assert_eq!(
-            info.url,
-            "https://192.0.2.1/check?token=ghp_VERY_REAL_SECRET_TOKEN_42"
-        );
-        assert_eq!(info.raw_url.as_deref(), Some(raw));
+        assert_eq!(info.url, "https://<configured>");
+        assert!(info.raw_url.is_none());
+        assert!(info.response_preview.is_none());
+        let rendered = format!("{info:?} {error_text}");
+        for window in secret.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).unwrap();
+            assert!(!rendered.contains(fragment));
+        }
     }
 
     /// The hook client must not follow redirects: `validate_hook_url` only vets

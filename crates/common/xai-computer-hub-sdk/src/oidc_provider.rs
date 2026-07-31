@@ -13,11 +13,27 @@ use crate::auth::{AuthCredential, AuthIdentity, AuthProvider};
 
 pub type OnRefreshCallback = Arc<dyn Fn(&RefreshEvent) + Send + Sync>;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RefreshEvent {
     pub access_token: String,
     pub new_refresh_token: Option<String>,
     pub expires_at: Option<DateTime<Utc>>,
+}
+
+impl std::fmt::Debug for RefreshEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshEvent")
+            .field("access_token_present", &!self.access_token.is_empty())
+            .field(
+                "new_refresh_token_present",
+                &self
+                    .new_refresh_token
+                    .as_ref()
+                    .is_some_and(|token| !token.is_empty()),
+            )
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 struct TokenState {
@@ -41,9 +57,41 @@ const REFRESH_MARGIN: Duration = Duration::from_secs(60);
 impl std::fmt::Debug for OidcAuthProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OidcAuthProvider")
-            .field("issuer", &self.issuer)
-            .field("client_id", &self.client_id)
+            .field("issuer_configured", &!self.issuer.is_empty())
+            .field("client_id_configured", &!self.client_id.is_empty())
             .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum OidcRefreshError {
+    #[error("OIDC runtime initialization failed")]
+    RuntimeInitialization,
+    #[error("OIDC discovery request failed")]
+    DiscoveryRequest,
+    #[error("OIDC discovery endpoint rejected the request")]
+    DiscoveryStatus,
+    #[error("OIDC discovery response was invalid")]
+    DiscoveryResponse,
+    #[error("OIDC token request failed")]
+    TokenRequest,
+    #[error("OIDC token endpoint rejected the request")]
+    TokenStatus,
+    #[error("OIDC token response was invalid")]
+    TokenResponse,
+}
+
+impl OidcRefreshError {
+    const fn class(&self) -> &'static str {
+        match self {
+            Self::RuntimeInitialization => "runtime_initialization",
+            Self::DiscoveryRequest => "discovery_request",
+            Self::DiscoveryStatus => "discovery_status",
+            Self::DiscoveryResponse => "discovery_response",
+            Self::TokenRequest => "token_request",
+            Self::TokenStatus => "token_status",
+            Self::TokenResponse => "token_response",
+        }
     }
 }
 
@@ -149,7 +197,7 @@ impl AuthProvider for OidcAuthProvider {
                     let secs = started.elapsed().as_secs_f64();
                     oidc_refresh_observe(OidcRefreshOutcome::FailedUsedStale, Some(secs));
                     tracing::warn!(
-                        error = %e,
+                        error_class = e.class(),
                         duration_secs = secs,
                         outcome = "failed_used_stale",
                         "OIDC refresh failed, using stale token"
@@ -184,19 +232,23 @@ impl AuthProvider for OidcAuthProvider {
 }
 
 impl OidcAuthProvider {
-    fn try_refresh(&self) -> Result<(), Box<dyn std::error::Error>> {
-        tracing::info!(issuer = %self.issuer, "refreshing OIDC token");
+    fn try_refresh(&self) -> Result<(), OidcRefreshError> {
+        tracing::info!(
+            issuer_configured = !self.issuer.is_empty(),
+            "refreshing OIDC token"
+        );
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             tokio::task::block_in_place(|| handle.block_on(self.do_refresh()))
         } else {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
-                .build()?
+                .build()
+                .map_err(|_| OidcRefreshError::RuntimeInitialization)?
                 .block_on(self.do_refresh())
         }
     }
 
-    async fn do_refresh(&self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn do_refresh(&self) -> Result<(), OidcRefreshError> {
         let refresh_token = self.state.lock().refresh_token.clone();
         let issuer = self.issuer.trim_end_matches('/');
         let client = reqwest::Client::new();
@@ -210,10 +262,13 @@ impl OidcAuthProvider {
             .get(format!("{issuer}/.well-known/openid-configuration"))
             .timeout(Duration::from_secs(10))
             .send()
-            .await?
-            .error_for_status()?
+            .await
+            .map_err(|_| OidcRefreshError::DiscoveryRequest)?
+            .error_for_status()
+            .map_err(|_| OidcRefreshError::DiscoveryStatus)?
             .json()
-            .await?;
+            .await
+            .map_err(|_| OidcRefreshError::DiscoveryResponse)?;
 
         let mut params = vec![
             ("grant_type", "refresh_token"),
@@ -243,10 +298,13 @@ impl OidcAuthProvider {
             .form(&params)
             .timeout(Duration::from_secs(15))
             .send()
-            .await?
-            .error_for_status()?
+            .await
+            .map_err(|_| OidcRefreshError::TokenRequest)?
+            .error_for_status()
+            .map_err(|_| OidcRefreshError::TokenStatus)?
             .json()
-            .await?;
+            .await
+            .map_err(|_| OidcRefreshError::TokenResponse)?;
 
         let expires_at = tokens
             .expires_in
@@ -272,7 +330,56 @@ impl OidcAuthProvider {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use tracing_subscriber::fmt::MakeWriter;
+
     use super::*;
+
+    const SECRET_SENTINEL: &str = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+
+    fn assert_no_secret_fragments(rendered: &str, secret: &str) {
+        assert!(!rendered.contains(secret), "secret leaked: {rendered}");
+        for window in secret.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(
+                !rendered.contains(fragment),
+                "secret fragment {fragment:?} leaked: {rendered}"
+            );
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct CapturedGuard(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedGuard {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedWriter {
+        type Writer = CapturedGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedGuard(Arc::clone(&self.0))
+        }
+    }
+
+    impl CapturedWriter {
+        fn rendered(&self) -> String {
+            String::from_utf8(self.0.lock().expect("capture lock").clone())
+                .expect("tracing output is UTF-8")
+        }
+    }
 
     #[test]
     fn current_returns_token_when_not_expired() {
@@ -513,17 +620,92 @@ mod tests {
     }
 
     #[test]
-    fn debug_does_not_leak_tokens() {
+    fn debug_does_not_leak_oidc_configuration_or_tokens() {
         let provider = OidcAuthProviderBuilder::new(
-            "secret-access-token",
-            "secret-refresh-token",
-            "https://auth.example.com",
-            "client1",
+            SECRET_SENTINEL,
+            SECRET_SENTINEL,
+            format!("https://auth.example.com/{SECRET_SENTINEL}"),
+            SECRET_SENTINEL,
         )
         .build();
 
         let debug = format!("{provider:?}");
-        assert!(!debug.contains("secret-access-token"));
-        assert!(!debug.contains("secret-refresh-token"));
+        assert_no_secret_fragments(&debug, SECRET_SENTINEL);
+        assert!(debug.contains("issuer_configured: true"));
+        assert!(debug.contains("client_id_configured: true"));
+    }
+
+    #[test]
+    fn refresh_event_debug_is_presence_only() {
+        let event = RefreshEvent {
+            access_token: SECRET_SENTINEL.to_owned(),
+            new_refresh_token: Some(SECRET_SENTINEL.to_owned()),
+            expires_at: None,
+        };
+
+        let debug = format!("{event:?}");
+        assert_no_secret_fragments(&debug, SECRET_SENTINEL);
+        assert!(debug.contains("access_token_present: true"));
+        assert!(debug.contains("new_refresh_token_present: true"));
+    }
+
+    #[test]
+    fn refresh_logs_and_error_display_omit_issuer_and_reqwest_details() {
+        let provider = OidcAuthProviderBuilder::new(
+            "stale-access",
+            SECRET_SENTINEL,
+            format!("http://127.0.0.1:1/{SECRET_SENTINEL}"),
+            SECRET_SENTINEL,
+        )
+        .build();
+        let capture = CapturedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .finish();
+
+        let error = tracing::subscriber::with_default(subscriber, || {
+            provider.try_refresh().expect_err("issuer is unreachable")
+        });
+        let rendered = format!("{error}");
+        assert_eq!(rendered, "OIDC discovery request failed");
+        assert_no_secret_fragments(&rendered, SECRET_SENTINEL);
+        assert_no_secret_fragments(&capture.rendered(), SECRET_SENTINEL);
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_reqwest_error_display_omits_url_and_credentials() {
+        use axum::Router;
+        use axum::routing::get;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock issuer");
+        let token_endpoint = format!("http://127.0.0.1:1/token?key={SECRET_SENTINEL}");
+        let app = Router::new().route(
+            "/.well-known/openid-configuration",
+            get(move || {
+                let token_endpoint = token_endpoint.clone();
+                async move { axum::Json(serde_json::json!({ "token_endpoint": token_endpoint })) }
+            }),
+        );
+        let issuer = format!("http://{}", listener.local_addr().expect("local address"));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve mock issuer");
+        });
+        let provider =
+            OidcAuthProviderBuilder::new("stale-access", SECRET_SENTINEL, issuer, SECRET_SENTINEL)
+                .build();
+
+        let error = provider
+            .do_refresh()
+            .await
+            .expect_err("token endpoint is unreachable");
+        server.abort();
+
+        let rendered = format!("{error}");
+        assert_eq!(rendered, "OIDC token request failed");
+        assert_no_secret_fragments(&rendered, SECRET_SENTINEL);
     }
 }

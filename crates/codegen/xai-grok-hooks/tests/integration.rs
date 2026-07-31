@@ -80,7 +80,7 @@ async fn hook_deny_via_exit_code_only() {
             .await;
     match pre_result.decision {
         HookDecision::Deny { reason, .. } => {
-            assert!(reason.contains("exit code 2") || reason.contains("denied by hook"));
+            assert_eq!(reason, "hook denied (reason provided)");
         }
         other => panic!("expected Deny, got {other:?}"),
     }
@@ -248,7 +248,7 @@ async fn first_deny_stops_chain() {
     .await;
     match pre_result.decision {
         HookDecision::Deny { reason, .. } => {
-            assert_eq!(reason, "first-deny");
+            assert_eq!(reason, "hook denied (reason provided)");
         }
         other => panic!("expected Deny, got {other:?}"),
     }
@@ -735,18 +735,9 @@ async fn http_hook_url_env_expansion_end_to_end() {
         }
         other => panic!("expected Failed run result, got {other:?}"),
     };
-    assert_eq!(
-        info.url, "https://10.0.0.1/check",
-        "HttpInfo.url must reflect the post-expansion URL"
-    );
-    // raw_url mirrors the source string so wire-DTO
-    // consumers can prefer it over the post-expansion `url` for any
-    // user-facing display.
-    assert_eq!(
-        info.raw_url.as_deref(),
-        Some("https://${INTERNAL}/check"),
-        "HttpInfo.raw_url must mirror HookSpec::url_raw"
-    );
+    assert_eq!(info.url, "https://<configured>");
+    assert!(info.raw_url.is_none());
+    assert!(info.response_preview.is_none());
 }
 
 /// Mixed known + unknown events: known ones load and dispatch, unknown ones are skipped.

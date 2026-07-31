@@ -316,7 +316,7 @@ async fn handle_notification(
             tracing::debug!(
                 tool_call_id = %bg.base.tool_call_id,
                 task_id = %bg.task_id,
-                command = %bg.base.command,
+                command_configured = !bg.base.command.is_empty(),
                 output_file = %bg.output_file.display(),
                 "Bash execution backgrounded notification received — forwarding to TUI"
             );

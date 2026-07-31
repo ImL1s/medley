@@ -1129,7 +1129,6 @@ mod tests {
         let err: anyhow::Error = FeedbackApiError {
             status: reqwest::StatusCode::UNAUTHORIZED,
             context: "Signals update",
-            body: "Invalid or expired credentials".to_string(),
         }
         .into();
         assert!(is_auth_error(&err));
@@ -1141,7 +1140,6 @@ mod tests {
         let err_500: anyhow::Error = FeedbackApiError {
             status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
             context: "Signals update",
-            body: "oops".to_string(),
         }
         .into();
         assert!(!is_auth_error(&err_500));
@@ -1149,7 +1147,6 @@ mod tests {
         let err_403: anyhow::Error = FeedbackApiError {
             status: reqwest::StatusCode::FORBIDDEN,
             context: "Signals update",
-            body: "ZDR team".to_string(),
         }
         .into();
         assert!(!is_auth_error(&err_403));
@@ -1167,7 +1164,6 @@ mod tests {
         let err: anyhow::Error = FeedbackApiError {
             status: reqwest::StatusCode::FORBIDDEN,
             context: "Signals update",
-            body: "Access denied: session does not belong to this user".to_string(),
         }
         .into();
         assert!(is_forbidden_error(&err));
@@ -1179,7 +1175,6 @@ mod tests {
         let err_401: anyhow::Error = FeedbackApiError {
             status: reqwest::StatusCode::UNAUTHORIZED,
             context: "Signals update",
-            body: "Invalid credentials".to_string(),
         }
         .into();
         assert!(!is_forbidden_error(&err_401));
@@ -1194,7 +1189,6 @@ mod tests {
         let api_err = FeedbackApiError {
             status: reqwest::StatusCode::UNAUTHORIZED,
             context: "Signals update",
-            body: "token expired".to_string(),
         };
         let anyhow_err: anyhow::Error = api_err.into();
         assert!(is_auth_error(&anyhow_err));

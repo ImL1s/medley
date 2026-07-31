@@ -69,20 +69,21 @@ pub(crate) fn parse_token_output(
             anyhow::bail!("produced JSON with an empty access_token");
         }
         reject_control_chars(&access_token)?;
+        let issuer = parsed
+            .issuer
+            .map(|issuer| issuer.trim().to_owned())
+            .filter(|issuer| !issuer.is_empty());
         tracing::debug!(
             has_refresh_token = parsed.refresh_token.is_some(),
             expires_in = ?parsed.expires_in,
-            issuer = ?parsed.issuer,
+            issuer_present = issuer.is_some(),
             "auth: parsed external provider output as JSON"
         );
         return Ok(ParsedTokenOutput {
             access_token,
             refresh_token: parsed.refresh_token,
             expires_at: parsed.expires_in.and_then(expiry_after_seconds),
-            issuer: parsed
-                .issuer
-                .map(|i| i.trim().to_owned())
-                .filter(|i| !i.is_empty()),
+            issuer,
         });
     }
 
@@ -101,7 +102,43 @@ pub(crate) fn parse_token_output(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+    use tracing::Subscriber;
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+    use tracing_subscriber::registry::LookupSpan;
+
+    struct EventCollector(Arc<Mutex<Vec<String>>>);
+
+    impl<S> Layer<S> for EventCollector
+    where
+        S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            let mut visitor = EventVisitor::default();
+            event.record(&mut visitor);
+            self.0.lock().unwrap().push(visitor.rendered);
+        }
+    }
+
+    #[derive(Default)]
+    struct EventVisitor {
+        rendered: String,
+    }
+
+    impl Visit for EventVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            let _ = write!(&mut self.rendered, "{}={value:?};", field.name());
+        }
+
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            use std::fmt::Write;
+            let _ = write!(&mut self.rendered, "{}={value};", field.name());
+        }
+    }
 
     #[test]
     fn expiry_after_seconds_returns_none_on_overflow() {
@@ -151,5 +188,33 @@ mod tests {
         // malformed token can never reach an HTTP header.
         assert!(parse_token_output(&ok("{\"access_token\":\"tok\\ninjected\"}")).is_err());
         assert!(parse_token_output(&ok("tok\ninjected")).is_err());
+    }
+
+    #[test]
+    fn parse_token_output_debug_reports_only_issuer_presence() {
+        const ISSUER_SENTINEL: &str = "GB002ISSUER-Q7w5E3r1T9y7Z6x4C2v8";
+        let output = std::process::Output {
+            status: std::process::Command::new("true").status().unwrap(),
+            stdout: format!(r#"{{"access_token":"a","issuer":"{ISSUER_SENTINEL}"}}"#).into_bytes(),
+            stderr: vec![],
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(EventCollector(events.clone()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let parsed = parse_token_output(&output).unwrap();
+            assert_eq!(parsed.issuer.as_deref(), Some(ISSUER_SENTINEL));
+        });
+
+        let rendered = events.lock().unwrap().join("\n");
+        assert!(rendered.contains("issuer_present=true"), "{rendered}");
+        assert!(!rendered.contains(ISSUER_SENTINEL), "{rendered}");
+        for window in ISSUER_SENTINEL.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).unwrap();
+            assert!(
+                !rendered.contains(window),
+                "issuer window {window:?} leaked in {rendered}"
+            );
+        }
     }
 }

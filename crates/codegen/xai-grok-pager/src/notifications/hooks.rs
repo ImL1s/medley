@@ -43,7 +43,7 @@ fn execute_hook(
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            tracing::debug!(error = %e, command, "hook spawn failed");
+            tracing::debug!(error_kind = ?e.kind(), hook_configured = true, "hook spawn failed");
             return;
         }
     };
@@ -71,7 +71,9 @@ fn execute_hook(
     match waited {
         Ok(Some(_)) => {}
         Ok(None) => tracing::warn!("hook timed out"),
-        Err(e) => tracing::debug!(error = %e, command, "hook wait failed"),
+        Err(e) => {
+            tracing::debug!(error_kind = ?e.kind(), hook_configured = true, "hook wait failed")
+        }
     }
 }
 
@@ -308,5 +310,27 @@ mod tests {
         assert!(content.contains("GROK_EVENT=Turn complete"));
         assert!(content.contains("GROK_MESSAGE=test body payload"));
         assert!(content.contains("GROK_SESSION_ID=test-session-123"));
+    }
+
+    #[test]
+    fn notification_hook_debug_omits_command_and_secret_fragments() {
+        let sentinel = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+        let hook = NotificationHook {
+            command: format!("API_KEY={sentinel} curl https://example.invalid"),
+            events: vec![NotificationEventKind::AgentError],
+            only_unfocused: false,
+            timeout_secs: 5,
+        };
+        let rendered = format!("{hook:?}");
+
+        assert!(!rendered.contains(sentinel));
+        for window in sentinel.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).unwrap();
+            assert!(
+                !rendered.contains(fragment),
+                "secret fragment {fragment:?} leaked: {rendered}"
+            );
+        }
+        assert!(rendered.contains("command_configured: true"));
     }
 }

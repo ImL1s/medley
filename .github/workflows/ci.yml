@@ -32,6 +32,9 @@ jobs:
       - name: Run publisher unit tests
         run: python3 -B -m unittest discover -s tests -p 'test_audit_issue_publishers.py' -v
 
+      - name: Enforce credential-safe observability
+        run: python3 -B -m unittest tests.test_credential_observability_guard -v
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
@@ -111,6 +114,42 @@ jobs:
           cargo test --manifest-path crates/codegen/xai-grok-sampler/Cargo.toml \
             omits_xai_identity -- --nocapture
 
+      - name: Credential relation and telemetry export guards
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
+              echo "test filter matched zero tests: $*" >&2
+              rm -f "$output"
+              return 1
+            }
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-auth --features middleware --lib credential -- --nocapture
+          run_nonzero -p xai-grok-telemetry --lib unified_log -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            final_relation_observes_hostile_injector_replacement_and_removal -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            post_capture_is_immune_to_resolver_rotation_after_build -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            sampler_request_logs_never_emit_credential_bytes -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            transport_failure_never_emits_query_credential_bytes -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            provider_controlled_stream_error_is_secret_free_for_all_stream_apis -- --nocapture
+          run_nonzero -p xai-grok-mcp --lib \
+            callback_errors_never_echo_provider_controlled_credentials -- --nocapture
+          run_nonzero -p xai-grok-mcp --lib \
+            callback_payload_debug_never_emits_code_state_or_issuer -- --nocapture
+          run_nonzero -p xai-file-utils --lib \
+            final_401_relation_uses_final_wire_credential_and_post_response_snapshot -- --nocapture
+          run_nonzero -p xai-file-utils --lib \
+            upload_config_debug_redacts_all_secret_carriers -- --nocapture
+
       - name: Shell auth + readiness meta
         env:
           PROTOC: protoc
@@ -135,6 +174,12 @@ jobs:
             sampling_config_for_unready -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
             invalid_auth_scheme -- --nocapture
+          cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
+            relation_matrix_is_secret_free -- --nocapture
+          cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
+            callback_errors_never_echo_provider_controlled_values -- --nocapture
+          cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
+            snapshot_never_derives_stable_ids_from_credentials -- --nocapture
 
       - name: Pager model picker / readiness
         env:

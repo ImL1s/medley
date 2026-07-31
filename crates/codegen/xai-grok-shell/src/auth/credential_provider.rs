@@ -5,12 +5,6 @@ use std::sync::Arc;
 use xai_grok_auth::{
     AuthCredentialProvider, CredentialSnapshot, HttpAuth, StaticAuthCredentialProvider,
 };
-/// `api_key.id` for the active credential: hash the stable API key, never the
-/// OIDC bearer (which rotates). `None` for non-API-key auth.
-fn api_key_id_for(auth: Option<&crate::auth::GrokAuth>) -> Option<String> {
-    auth.filter(|a| matches!(a.auth_mode, crate::auth::AuthMode::ApiKey))
-        .map(|a| xai_grok_telemetry::config::deployment_id_from_key(&a.key))
-}
 /// Sampler [`BearerResolver`](xai_grok_sampler::BearerResolver) over a live
 /// [`AuthManager`]: wire-valid only — never stamps a hard-expired access
 /// token (the client auth contract). Shared by the session sampler and
@@ -71,6 +65,10 @@ impl HttpAuth for ShellAuthCredentialProvider {
         }
         creds.apply(builder, base_url)
     }
+
+    fn needs_token_auth_header(&self) -> bool {
+        self.static_credentials.deployment_key.is_none()
+    }
 }
 #[async_trait::async_trait]
 impl AuthCredentialProvider for ShellAuthCredentialProvider {
@@ -86,17 +84,16 @@ impl AuthCredentialProvider for ShellAuthCredentialProvider {
         let user_id = identity.as_ref().map(|a| a.user_id.clone());
         let team_id = identity.as_ref().and_then(|a| a.team_id.clone());
         let organization_id = identity.as_ref().and_then(|a| a.organization_id.clone());
-        let api_key_id = api_key_id_for(identity.as_ref());
         let token = self.auth_manager.current_wire_valid().map(|a| a.key);
         CredentialSnapshot {
             token,
             user_id,
             team_id,
             deployment_id: None,
-            api_key_id,
             organization_id,
         }
     }
+
     async fn refresh_after_unauthorized(&self) -> bool {
         if self.static_credentials.deployment_key.is_some() {
             return false;
@@ -104,9 +101,6 @@ impl AuthCredentialProvider for ShellAuthCredentialProvider {
         self.auth_manager
             .try_recover_unauthorized(crate::auth::recovery::RecoverySource::Background)
             .await
-    }
-    fn needs_token_auth_header(&self) -> bool {
-        self.static_credentials.deployment_key.is_none()
     }
 }
 /// Resolves the embedding credentials for `embed_base_url`, attaching the xAI
@@ -188,12 +182,12 @@ pub fn build_storage_client_for_proxy(
         let mut creds = GrokAuthCredentials::new(user_token);
         creds.deployment_key = deployment_key;
         creds.alpha_test_key = alpha_test_key;
-        let wire_bearer = creds
+        let selected_credential = creds
             .deployment_key
             .clone()
             .or_else(|| creds.user_token.clone());
         let provider: Arc<dyn AuthCredentialProvider> = Arc::new(
-            StaticAuthCredentialProvider::new(Box::new(creds), wire_bearer),
+            StaticAuthCredentialProvider::new(Box::new(creds), selected_credential),
         );
         xai_file_utils::storage_client::StorageClient::with_provider(
             proxy_base_url,
@@ -226,14 +220,45 @@ impl StorageClientAttributionBridge {
         }
     }
 }
+
+fn storage_diagnostic_consumer(
+    operation: xai_file_utils::storage_client::StorageOperation,
+) -> xai_grok_telemetry::unified_log::CredentialDiagnosticConsumer {
+    use xai_file_utils::storage_client::StorageOperation;
+    use xai_grok_telemetry::unified_log::CredentialDiagnosticConsumer;
+
+    match operation {
+        StorageOperation::GetUploadLimits => CredentialDiagnosticConsumer::StorageGetUploadLimits,
+        StorageOperation::CheckExists => CredentialDiagnosticConsumer::StorageCheckExists,
+        StorageOperation::BatchCheckExists => CredentialDiagnosticConsumer::StorageBatchCheckExists,
+        StorageOperation::BatchUpload => CredentialDiagnosticConsumer::StorageBatchUpload,
+        StorageOperation::BatchUploadJson => CredentialDiagnosticConsumer::StorageBatchUploadJson,
+        StorageOperation::DownloadBlob => CredentialDiagnosticConsumer::StorageDownloadBlob,
+        StorageOperation::Upload => CredentialDiagnosticConsumer::StorageUpload,
+        StorageOperation::UploadFile => CredentialDiagnosticConsumer::StorageUploadFile,
+        StorageOperation::UploadStream => CredentialDiagnosticConsumer::StorageUploadStream,
+        StorageOperation::MultipartInit => CredentialDiagnosticConsumer::StorageMultipartInit,
+        StorageOperation::MultipartComplete => {
+            CredentialDiagnosticConsumer::StorageMultipartComplete
+        }
+        StorageOperation::GetSignedUploadUrl => {
+            CredentialDiagnosticConsumer::StorageGetSignedUploadUrl
+        }
+        StorageOperation::UploadPart => CredentialDiagnosticConsumer::StorageUploadPart,
+    }
+}
+
 impl xai_file_utils::storage_client::Auth401AttributionCallback for StorageClientAttributionBridge {
-    fn record_401(&self, operation: &str, sent_bearer_prefix: Option<&str>) {
+    fn record_401(
+        &self,
+        operation: xai_file_utils::storage_client::StorageOperation,
+        comparison: xai_grok_auth::CredentialComparison,
+    ) {
         crate::auth::attribution::record_consumer_401(
             self.auth_manager.as_ref(),
             self.session_id.as_deref(),
-            crate::auth::attribution::ConsumerKind::StorageClient,
-            operation,
-            sent_bearer_prefix,
+            storage_diagnostic_consumer(operation),
+            comparison,
         );
     }
 }
@@ -305,6 +330,10 @@ impl HttpAuth for OtelAuthCredentialProvider {
         }
         creds.apply(builder, base_url)
     }
+
+    fn needs_token_auth_header(&self) -> bool {
+        self.deployment_key.load().is_none()
+    }
 }
 impl OtelAuthCredentialProvider {
     fn snapshot_inner(&self) -> CredentialSnapshot {
@@ -323,14 +352,12 @@ impl OtelAuthCredentialProvider {
         let user_id = auth.as_ref().map(|a| a.user_id.clone());
         let team_id = auth.as_ref().and_then(|a| a.team_id.clone());
         let organization_id = auth.as_ref().and_then(|a| a.organization_id.clone());
-        let api_key_id = api_key_id_for(auth.as_ref());
         let token = auth.map(|a| a.key);
         CredentialSnapshot {
             token,
             user_id,
             team_id,
             deployment_id: None,
-            api_key_id,
             organization_id,
         }
     }
@@ -353,9 +380,6 @@ impl AuthCredentialProvider for OtelAuthCredentialProvider {
         }
         am.try_recover_unauthorized(crate::auth::recovery::RecoverySource::Background)
             .await
-    }
-    fn needs_token_auth_header(&self) -> bool {
-        self.deployment_key.load().is_none()
     }
 }
 /// Process-wide OTel credential provider handle.
@@ -449,6 +473,105 @@ mod tests {
     /// Serializes tests that pin `GROK_AUTH_EARLY_INVALIDATION_SECS`, since
     /// env vars are process-global and parallel tests would race.
     static EARLY_INVALIDATION_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn storage_operations_map_to_exact_typed_diagnostic_consumers() {
+        use xai_file_utils::storage_client::StorageOperation;
+        use xai_grok_telemetry::unified_log::CredentialDiagnosticConsumer;
+
+        let cases = [
+            (
+                StorageOperation::GetUploadLimits,
+                CredentialDiagnosticConsumer::StorageGetUploadLimits,
+            ),
+            (
+                StorageOperation::CheckExists,
+                CredentialDiagnosticConsumer::StorageCheckExists,
+            ),
+            (
+                StorageOperation::BatchCheckExists,
+                CredentialDiagnosticConsumer::StorageBatchCheckExists,
+            ),
+            (
+                StorageOperation::BatchUpload,
+                CredentialDiagnosticConsumer::StorageBatchUpload,
+            ),
+            (
+                StorageOperation::BatchUploadJson,
+                CredentialDiagnosticConsumer::StorageBatchUploadJson,
+            ),
+            (
+                StorageOperation::DownloadBlob,
+                CredentialDiagnosticConsumer::StorageDownloadBlob,
+            ),
+            (
+                StorageOperation::Upload,
+                CredentialDiagnosticConsumer::StorageUpload,
+            ),
+            (
+                StorageOperation::UploadFile,
+                CredentialDiagnosticConsumer::StorageUploadFile,
+            ),
+            (
+                StorageOperation::UploadStream,
+                CredentialDiagnosticConsumer::StorageUploadStream,
+            ),
+            (
+                StorageOperation::MultipartInit,
+                CredentialDiagnosticConsumer::StorageMultipartInit,
+            ),
+            (
+                StorageOperation::MultipartComplete,
+                CredentialDiagnosticConsumer::StorageMultipartComplete,
+            ),
+            (
+                StorageOperation::GetSignedUploadUrl,
+                CredentialDiagnosticConsumer::StorageGetSignedUploadUrl,
+            ),
+            (
+                StorageOperation::UploadPart,
+                CredentialDiagnosticConsumer::StorageUploadPart,
+            ),
+        ];
+
+        for (operation, expected) in cases {
+            assert_eq!(storage_diagnostic_consumer(operation), expected);
+        }
+    }
+
+    #[test]
+    fn storage_operation_diagnostics_cannot_contain_credential_bytes() {
+        use xai_file_utils::storage_client::StorageOperation;
+
+        const SENTINEL: &str = "GB002-storage-operation-secret-0123456789abcdef";
+        let operations = [
+            StorageOperation::GetUploadLimits,
+            StorageOperation::CheckExists,
+            StorageOperation::BatchCheckExists,
+            StorageOperation::BatchUpload,
+            StorageOperation::BatchUploadJson,
+            StorageOperation::DownloadBlob,
+            StorageOperation::Upload,
+            StorageOperation::UploadFile,
+            StorageOperation::UploadStream,
+            StorageOperation::MultipartInit,
+            StorageOperation::MultipartComplete,
+            StorageOperation::GetSignedUploadUrl,
+            StorageOperation::UploadPart,
+        ];
+
+        for operation in operations {
+            let rendered = format!(
+                "{operation:?} {}",
+                storage_diagnostic_consumer(operation).as_str()
+            );
+            assert!(!rendered.contains(SENTINEL));
+            for window in SENTINEL.as_bytes().windows(8) {
+                let window = std::str::from_utf8(window).expect("ASCII sentinel");
+                assert!(!rendered.contains(window));
+            }
+        }
+    }
     /// RAII guard: pins `GROK_AUTH_EARLY_INVALIDATION_SECS` to the production
     /// default (300s) while held, restoring the previous value on drop.
     /// Acquires `EARLY_INVALIDATION_LOCK` so concurrent test runners can't
@@ -588,6 +711,7 @@ mod tests {
         );
         assert!(snap.user_id.is_none());
     }
+
     /// 401 recovery routes through `unauthorized_recovery` (pre-fix
     /// it no-oped because the refresher arg was hardcoded `None`).
     #[tokio::test]
@@ -678,8 +802,7 @@ mod tests {
         assert!(!provider.refresh_after_unauthorized().await);
     }
     #[test]
-    fn snapshot_populates_tenant_id_per_auth_mode() {
-        use xai_grok_telemetry::config::deployment_id_from_key;
+    fn snapshot_never_derives_stable_ids_from_credentials() {
         let _guard = EarlyInvalidationGuard::pin_to_default();
         let dir = tempfile::tempdir().unwrap();
         let dep = ShellAuthCredentialProvider::new(
@@ -688,11 +811,7 @@ mod tests {
             None,
         )
         .snapshot();
-        assert_eq!(
-            dep.deployment_id.as_deref(),
-            Some(deployment_id_from_key("xai-token-EX").as_str())
-        );
-        assert!(dep.api_key_id.is_none());
+        assert!(dep.deployment_id.is_none());
         let api_auth = GrokAuth {
             key: "sk-apikey-xyz".into(),
             auth_mode: crate::auth::AuthMode::ApiKey,
@@ -701,10 +820,6 @@ mod tests {
         };
         let api = ShellAuthCredentialProvider::new(make_manager(&dir, Some(api_auth)), None, None)
             .snapshot();
-        assert_eq!(
-            api.api_key_id.as_deref(),
-            Some(deployment_id_from_key("sk-apikey-xyz").as_str())
-        );
         assert!(api.deployment_id.is_none());
         let oidc = ShellAuthCredentialProvider::new(
             make_manager(
@@ -715,7 +830,7 @@ mod tests {
             None,
         )
         .snapshot();
-        assert!(oidc.deployment_id.is_none() && oidc.api_key_id.is_none());
+        assert!(oidc.deployment_id.is_none());
     }
     /// Bootstrap mode: `snapshot()` re-reads disk so sibling-rotated
     /// tokens are picked up without a live AuthManager.
@@ -922,7 +1037,7 @@ mod tests {
     /// A configured `deployment_key` always wins over the AuthManager-resolved
     /// user token, matching the precedence in `GrokAuthCredentials::apply`.
     /// The snapshot must report the deployment key (not the user token) so
-    /// the 401-attribution prefix matches the wire bytes.
+    /// closed credential-relation diagnostics describe the value sent on wire.
     #[test]
     fn deployment_key_wins_over_resolved_user_token() {
         let _guard = EarlyInvalidationGuard::pin_to_default();

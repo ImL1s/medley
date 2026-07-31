@@ -70,6 +70,32 @@ fn auth_with_mode(mode: crate::auth::AuthMode, key: &str) -> crate::auth::GrokAu
     }
 }
 #[test]
+fn auth_init_before_and_after_disk_reload_diagnostics_are_secret_free() {
+    let access_before = "GB002-access-before-Q7w5E3r1T9y7";
+    let refresh_before = "GB002-refresh-before-A7s5D3f1G9h7";
+    let access_after = "GB002-access-after-Z9x7C5v3B1n9";
+    let refresh_after = "GB002-refresh-after-M8k6J4h2G0f8";
+    let mut pre = auth_with_mode(crate::auth::AuthMode::Oidc, access_before);
+    pre.refresh_token = Some(refresh_before.to_string());
+    let mut post = auth_with_mode(crate::auth::AuthMode::Oidc, access_after);
+    post.refresh_token = Some(refresh_after.to_string());
+
+    let context = acp_agent::auth_init_disk_refresh_context(Some(&pre), Some(&post));
+    assert_eq!(context["access_relation"], "different");
+    assert_eq!(context["refresh_relation"], "different");
+    assert_eq!(context["access_pre_present"], true);
+    assert_eq!(context["access_post_present"], true);
+    assert_eq!(context["refresh_pre_present"], true);
+    assert_eq!(context["refresh_post_present"], true);
+    let rendered = context.to_string();
+    for secret in [access_before, refresh_before, access_after, refresh_after] {
+        assert!(!rendered.contains(secret));
+        for window in secret.as_bytes().windows(8) {
+            assert!(!rendered.contains(std::str::from_utf8(window).unwrap()));
+        }
+    }
+}
+#[test]
 fn resolve_subscription_tier_prefers_display_then_api_key_then_jwt() {
     assert_eq!(
         resolve_subscription_tier_for_telemetry(Some("Free".into()), None).as_deref(),
@@ -2973,7 +2999,7 @@ async fn diagnostic_upload_skipped_for_opted_out_user() {
     let uploader = agent
         .diagnostic_upload_config()
         .expect("uploader is wired whenever trace upload config is on");
-    uploader(b"log".to_vec(), "tok".into(), "user-id-1".into()).await;
+    uploader(b"log".to_vec(), "user-id-1".into()).await;
     assert_eq!(
         count.load(std::sync::atomic::Ordering::SeqCst),
         0,
@@ -2989,7 +3015,7 @@ async fn diagnostic_upload_sent_for_normal_user() {
     let uploader = agent
         .diagnostic_upload_config()
         .expect("uploader is wired whenever trace upload config is on");
-    uploader(b"log".to_vec(), "tok".into(), "user-id-1".into()).await;
+    uploader(b"log".to_vec(), "user-id-1".into()).await;
     assert!(
         count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
         "positive control: diagnostics upload reaches the proxy for a \
@@ -3008,7 +3034,7 @@ async fn diagnostic_upload_skipped_without_credentials() {
     let uploader = agent
         .diagnostic_upload_config()
         .expect("uploader is wired whenever trace upload config is on");
-    uploader(b"log".to_vec(), "tok".into(), "user-id-1".into()).await;
+    uploader(b"log".to_vec(), "user-id-1".into()).await;
     assert_eq!(
         count.load(std::sync::atomic::Ordering::SeqCst),
         0,
@@ -3034,7 +3060,7 @@ async fn diagnostic_upload_skipped_after_mid_session_trace_upload_kill_switch() 
         cfg.telemetry.trace_upload = Some(false);
     }
     agent.sync_collection_config_gate();
-    uploader(b"log".to_vec(), "tok".into(), "user-id-1".into()).await;
+    uploader(b"log".to_vec(), "user-id-1".into()).await;
     assert_eq!(
         count.load(std::sync::atomic::Ordering::SeqCst),
         0,
@@ -3991,6 +4017,11 @@ fn post_auth_settings_not_coalesced_by_in_flight_reapply() {
 }
 /// Agent with pre-loaded auth, a gateway receiver (to assert emitted
 /// notifications), and the proxy URL pointed at a mock `/v1/settings`.
+///
+/// Bootstrap must stay self-contained: a custom proxy URL also changes model
+/// catalog credential selection, which is unrelated to these settings tests.
+/// Seed an empty settings snapshot through bootstrap, then restore the exact
+/// post-auth state (no settings yet + mock proxy URL) on the constructed agent.
 fn build_agent_with_auth_and_proxy(
     auth: crate::auth::GrokAuth,
     proxy_url: String,
@@ -4011,8 +4042,18 @@ fn build_agent_with_auth_and_proxy(
         mode,
         ..Default::default()
     };
-    cfg.endpoints.cli_chat_proxy_base_url = Some(proxy_url);
+    // Keep these tests independent from developer-local catalog endpoint env
+    // overrides. They exercise the authenticated proxy settings path, not a
+    // custom API-key model catalog.
+    cfg.endpoints.models_base_url = None;
+    cfg.endpoints.models_list_url = None;
+    cfg.remote_settings = Some(Default::default());
     let agent = MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config");
+    {
+        let mut cfg = agent.cfg.borrow_mut();
+        cfg.remote_settings = None;
+        cfg.endpoints.cli_chat_proxy_base_url = Some(proxy_url);
+    }
     (agent, rx)
 }
 /// Drain the gateway, returning `true` if any `x.ai/settings/update`

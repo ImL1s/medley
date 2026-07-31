@@ -37,7 +37,7 @@ fn build_proxy_client_with_fallback(
     let provider = credentials.unwrap_or_else(|| {
         let mut creds = StaticGrokAuth::new(Some(user_token.to_owned()));
         creds.deployment_key = deployment_key;
-        let bearer = creds.wire_bearer();
+        let bearer = creds.effective_credential();
         Arc::new(StaticAuthCredentialProvider::new(Box::new(creds), bearer))
     });
     let http_client = http_client.unwrap_or_default();
@@ -141,8 +141,6 @@ pub async fn upload_bytes<C: StorageConfig>(
         } => {
             // For proxy mode, bucket is determined by proxy from user ACLs
             tracing::debug!(
-                proxy_base_url = %proxy_base_url,
-                object_path = %object_path,
                 "Uploading bytes to GCS via proxy (bucket determined by proxy from ACLs)"
             );
             upload_bytes_via_proxy(
@@ -207,8 +205,6 @@ pub async fn upload_bytes_signed<C: StorageConfig>(
             alpha_test_key: _,
         } => {
             tracing::debug!(
-                proxy_base_url = %proxy_base_url,
-                object_path = %object_path,
                 bytes = content.len(),
                 "Uploading bytes to GCS via signed URL (bypasses proxy body limits)"
             );
@@ -366,7 +362,7 @@ where
             let response = storage_client
                 .upload_stream(object_path, reader, content_type)
                 .await
-                .with_context(|| format!("Streaming upload failed for {}", object_path))?;
+                .context("Streaming storage proxy upload failed")?;
             Ok(format!("gs://{}/{}", response.bucket, response.path))
         }
         UploadMethod::S3 {
@@ -467,7 +463,7 @@ async fn upload_file_via_proxy(
         let response = storage_client
             .upload_multipart(object_path, file_path, content_type, Some(options))
             .await
-            .with_context(|| format!("Multipart upload failed for {}", object_path))?;
+            .context("Multipart storage proxy upload failed")?;
         Ok(response.gcs_url)
     } else {
         // Small file: stream through proxy (no memory copy)
@@ -480,7 +476,7 @@ async fn upload_file_via_proxy(
         let response = storage_client
             .upload_file(object_path, file_path, content_type)
             .await
-            .with_context(|| format!("Streaming upload failed for {}", object_path))?;
+            .context("Streaming storage proxy upload failed")?;
         Ok(format!("gs://{}/{}", response.bucket, response.path))
     }
 }
@@ -604,12 +600,7 @@ async fn upload_bytes_via_proxy(
     let response = storage_client
         .upload(object_path, content, content_type)
         .await
-        .with_context(|| {
-            format!(
-                "Failed to upload to storage proxy: {} (path: {})",
-                proxy_base_url, object_path
-            )
-        })?;
+        .context("Failed to upload to storage proxy")?;
 
     // Return the full GCS URL
     Ok(format!("gs://{}/{}", response.bucket, response.path))
@@ -647,12 +638,7 @@ pub async fn upload_bytes_via_signed_url(
     let signed = storage_client
         .upload_bytes_signed(object_path, content, content_type)
         .await
-        .with_context(|| {
-            format!(
-                "Failed to upload via signed URL: {} (path: {})",
-                proxy_base_url, object_path
-            )
-        })?;
+        .context("Failed to upload via signed URL")?;
 
     Ok(format!("gs://{}/{}", signed.bucket, signed.path))
 }
@@ -665,6 +651,22 @@ pub async fn upload_bytes_via_signed_url(
 mod tests {
     use super::*;
     use crate::{TraceExportConfig, UploadMethod};
+
+    const OBSERVABILITY_SENTINEL: &str = "GB002-gcs-secret-0123456789abcdef";
+
+    fn assert_no_secret_bytes(value: &str) {
+        assert!(
+            !value.contains(OBSERVABILITY_SENTINEL),
+            "full secret leaked: {value}"
+        );
+        for window in OBSERVABILITY_SENTINEL.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(
+                !value.contains(window),
+                "secret fragment {window:?} leaked: {value}"
+            );
+        }
+    }
 
     fn proxy_config() -> TraceExportConfig {
         proxy_config_with_url("https://proxy.example.com/v1".to_string())
@@ -772,6 +774,30 @@ mod tests {
             result.unwrap_err().to_string().contains("gs"),
             "Error should mention expected scheme"
         );
+    }
+
+    #[tokio::test]
+    async fn signed_proxy_failure_drops_configurable_url_header_and_token_secrets() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let proxy_base_url = format!("http://{addr}/v1?access_token={OBSERVABILITY_SENTINEL}");
+
+        let err = upload_bytes_via_signed_url(
+            &proxy_base_url,
+            OBSERVABILITY_SENTINEL,
+            None,
+            OBSERVABILITY_SENTINEL,
+            OBSERVABILITY_SENTINEL.as_bytes(),
+            OBSERVABILITY_SENTINEL,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert_no_secret_bytes(&format!("{err}\n{err:?}"));
     }
 
     /// Shared state for the dispatch test server, tracking which endpoints were hit.

@@ -180,7 +180,7 @@ impl HubConnectionPool {
     ) -> Result<Arc<HubConnection>, ClientError> {
         if url.scheme() != "wss" && !crate::connection::host_is_loopback(&url) && !allow_insecure_ws
         {
-            return Err(ClientError::InsecureScheme { url });
+            return Err(ClientError::InsecureScheme);
         }
         let key = ConnKey {
             url: url.as_str().to_owned(),
@@ -192,8 +192,7 @@ impl HubConnectionPool {
             drop(existing);
             if conn.kind() != kind {
                 return Err(ClientError::InvalidConfig(format!(
-                    "pool entry for {} bound to {:?}; rebuild requested {:?}",
-                    key.url,
+                    "pool entry bound to {:?}; rebuild requested {:?}",
                     conn.kind(),
                     kind
                 )));
@@ -228,8 +227,7 @@ impl HubConnectionPool {
                 drop(conn);
                 if winner.kind() != kind {
                     return Err(ClientError::InvalidConfig(format!(
-                        "pool entry for {} bound to {:?}; rebuild requested {:?}",
-                        key.url,
+                        "pool entry bound to {:?}; rebuild requested {:?}",
                         winner.kind(),
                         kind
                     )));

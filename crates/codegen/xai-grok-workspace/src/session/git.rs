@@ -58,7 +58,9 @@ pub struct DiffSizeExceededFile {
 /// Cache for git status results to avoid redundant expensive computations.
 /// Cache is invalidated after TTL or when commit hash changes.
 pub const GIT_STATUS_CACHE_TTL: Duration = Duration::from_secs(2);
-/// Run a git CLI command and return stdout on success, or error with stderr.
+/// Run a git CLI command and return stdout on success, or a fixed-category
+/// error on failure. Git stderr is untrusted: remotes can echo credentialed
+/// URLs, so it must never cross this boundary.
 ///
 /// All invocations use `--no-optional-locks` to prevent background stat-cache
 /// refreshes from creating `index.lock`.  This flag only suppresses *optional*
@@ -66,7 +68,7 @@ pub const GIT_STATUS_CACHE_TTL: Duration = Duration::from_secs(2);
 /// *required* for the requested operation (e.g. `git add`, `git commit`) are
 /// unaffected.  See `git(1)` and `GIT_OPTIONAL_LOCKS`.
 pub async fn git_cli(cwd: &Path, args: &[&str]) -> Result<String> {
-    tracing::debug!(cwd = %cwd.display(), args = ?args, "git_cli");
+    tracing::debug!(cwd = %cwd.display(), arg_count = args.len(), "git_cli");
     let mut cmd = Command::new("git");
     cmd.current_dir(cwd).arg("--no-optional-locks");
     for &(key, val) in xai_tty_utils::GIT_AUTH_SUPPRESSION_ENVS.iter() {
@@ -79,12 +81,14 @@ pub async fn git_cli(cwd: &Path, args: &[&str]) -> Result<String> {
         Ok(o) => o,
         Err(e) => {
             tracing::error!(
-                error = %e,
                 error_kind = ?e.kind(),
                 cwd = %cwd.display(),
                 "git_cli: Command::output() FAILED (spawn error)"
             );
-            return Err(e.into());
+            return Err(anyhow::anyhow!(
+                "git command could not start ({:?})",
+                e.kind()
+            ));
         }
     };
     if output.status.success() {
@@ -92,16 +96,16 @@ pub async fn git_cli(cwd: &Path, args: &[&str]) -> Result<String> {
         tracing::debug!(exit_code = 0, stdout_len = stdout.len(), "git_cli success");
         Ok(stdout)
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let code = output.status.code();
-        tracing::debug!(exit_code = ?code, stderr = %stderr, "git_cli failed");
+        tracing::debug!(
+            exit_code = ?code,
+            stderr_present = !output.stderr.is_empty(),
+            stderr_len = output.stderr.len(),
+            "git_cli failed"
+        );
         Err(anyhow::anyhow!(
-            "{}",
-            if stderr.is_empty() {
-                "git command failed"
-            } else {
-                &stderr
-            }
+            "git command failed (exit status {:?})",
+            code
         ))
     }
 }
@@ -122,7 +126,7 @@ pub async fn jj_cli_mut(cwd: &Path, args: &[&str]) -> Result<String> {
     jj_cli_inner(cwd, args, false).await
 }
 async fn jj_cli_inner(cwd: &Path, args: &[&str], ignore_wc: bool) -> Result<String> {
-    tracing::debug!(cwd = %cwd.display(), args = ?args, ignore_wc, "jj_cli");
+    tracing::debug!(cwd = %cwd.display(), arg_count = args.len(), ignore_wc, "jj_cli");
     let mut cmd = Command::new("jj");
     cmd.current_dir(cwd)
         .stderr(std::process::Stdio::piped())
@@ -135,12 +139,14 @@ async fn jj_cli_inner(cwd: &Path, args: &[&str], ignore_wc: bool) -> Result<Stri
         Ok(o) => o,
         Err(e) => {
             tracing::error!(
-                error = %e,
                 error_kind = ?e.kind(),
                 cwd = %cwd.display(),
                 "jj_cli_inner: Command::output() FAILED (spawn error)"
             );
-            return Err(e.into());
+            return Err(anyhow::anyhow!(
+                "jj command could not start ({:?})",
+                e.kind()
+            ));
         }
     };
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -162,12 +168,8 @@ async fn jj_cli_inner(cwd: &Path, args: &[&str], ignore_wc: bool) -> Result<Stri
             "jj_cli FAILED"
         );
         Err(anyhow::anyhow!(
-            "{}",
-            if stderr.is_empty() {
-                "jj command failed"
-            } else {
-                &stderr
-            }
+            "jj command failed (exit status {:?})",
+            code
         ))
     }
 }
@@ -228,9 +230,17 @@ pub(crate) fn strip_url_credentials(url_str: &str) -> String {
     if let Ok(mut parsed) = Url::parse(url_str) {
         let _ = parsed.set_username("");
         let _ = parsed.set_password(None);
+        parsed.set_query(None);
+        parsed.set_fragment(None);
         return parsed.to_string();
     }
-    url_str.to_string()
+    if !url_str.contains("://")
+        && let Some((_, host_and_path)) = url_str.split_once('@')
+        && host_and_path.contains(':')
+    {
+        return host_and_path.to_string();
+    }
+    "<configured>".to_string()
 }
 /// Normalize a git remote URL to a transport-agnostic canonical form.
 ///
@@ -545,7 +555,10 @@ async fn get_upstream(cwd: &Path) -> Option<String> {
         .ok()
 }
 async fn get_remote_url(cwd: &Path) -> Option<String> {
-    git_cli(cwd, &["remote", "get-url", "origin"]).await.ok()
+    git_cli(cwd, &["remote", "get-url", "origin"])
+        .await
+        .ok()
+        .map(|url| strip_url_credentials(&url))
 }
 /// Compute how many commits the local branch is ahead/behind its upstream.
 /// Returns (ahead, behind) or None if there's no upstream or an error occurs.
@@ -2288,7 +2301,7 @@ pub async fn restage_git_paths(cwd: &Path, git_ref: &GitStateRef, session_id: &s
 /// callers can classify output (e.g. non-fast-forward push rejections) by
 /// string-match. Errors only on spawn failure.
 async fn git_cli_raw(cwd: &Path, args: &[&str]) -> Result<(bool, String)> {
-    tracing::debug!(cwd = %cwd.display(), args = ?args, "git_cli_raw");
+    tracing::debug!(cwd = %cwd.display(), arg_count = args.len(), "git_cli_raw");
     let mut cmd = Command::new("git");
     cmd.current_dir(cwd).arg("--no-optional-locks");
     for &(key, val) in xai_tty_utils::GIT_AUTH_SUPPRESSION_ENVS.iter() {
@@ -2379,7 +2392,7 @@ async fn seed_default_excludes(git_root: &Path) -> Result<()> {
 async fn push_classified(git_root: &Path) -> Result<(PushStatus, String)> {
     let (ok, out) = git_cli_raw(git_root, &["push", "-u", "origin", "HEAD"]).await?;
     if ok {
-        return Ok((PushStatus::Ok, out));
+        return Ok((PushStatus::Ok, "Push completed.".to_owned()));
     }
     let lower = out.to_lowercase();
     let status = if lower.contains("non-fast-forward") || lower.contains("fetch first") {
@@ -2387,7 +2400,11 @@ async fn push_classified(git_root: &Path) -> Result<(PushStatus, String)> {
     } else {
         PushStatus::Failed
     };
-    Ok((status, out))
+    let safe_message = match status {
+        PushStatus::Conflict => "Push rejected because the remote contains newer changes.",
+        _ => "Push failed.",
+    };
+    Ok((status, safe_message.to_owned()))
 }
 /// Refuse unless the workspace is on exactly `expected`. Detached HEAD
 /// reports "HEAD" and so never matches.
@@ -2442,9 +2459,9 @@ pub async fn commit(git_root: &Path, req: &GitCommitReq) -> Result<CommitResult>
     let mut push_status = PushStatus::NotRequested;
     if req.sync {
         match git_cli(git_root, &["pull", "--rebase"]).await {
-            Ok(pull_out) => {
+            Ok(_) => {
                 combined_output.push_str("\n--- Pull ---\n");
-                combined_output.push_str(&pull_out);
+                combined_output.push_str("Pulled latest changes.");
                 commit_hash = git_cli(git_root, &["rev-parse", "HEAD"]).await.ok();
             }
             Err(e) => {
@@ -2508,11 +2525,8 @@ pub async fn sync_base(
         )
     }
     if abort {
-        let (_ok, out) = git_cli_raw(git_root, &["merge", "--abort"]).await?;
-        anyhow::ensure!(
-            !merge_in_progress(git_root).await?,
-            "merge --abort failed: {out}"
-        );
+        let (_ok, _out) = git_cli_raw(git_root, &["merge", "--abort"]).await?;
+        anyhow::ensure!(!merge_in_progress(git_root).await?, "merge --abort failed");
         return Ok(GitSyncBaseResult {
             outcome: GitSyncBaseOutcome::Aborted,
         });
@@ -2528,8 +2542,8 @@ pub async fn sync_base(
         "working tree is not clean; commit or discard changes before syncing the base"
     );
     let base = base_ref.unwrap_or("HEAD");
-    let (fetched, fetch_out) = git_cli_raw(git_root, &["fetch", "origin", base]).await?;
-    anyhow::ensure!(fetched, "fetch of base ref '{base}' failed: {fetch_out}");
+    let (fetched, _fetch_out) = git_cli_raw(git_root, &["fetch", "origin", base]).await?;
+    anyhow::ensure!(fetched, "fetch of base ref failed");
     if git_cli_raw(
         git_root,
         &["merge-base", "--is-ancestor", "FETCH_HEAD", "HEAD"],
@@ -2541,7 +2555,7 @@ pub async fn sync_base(
             outcome: GitSyncBaseOutcome::UpToDate,
         });
     }
-    let (merged, merge_out) = git_cli_raw(git_root, &["merge", "--no-edit", "FETCH_HEAD"]).await?;
+    let (merged, _merge_out) = git_cli_raw(git_root, &["merge", "--no-edit", "FETCH_HEAD"]).await?;
     if merged {
         let sha = git_cli(git_root, &["rev-parse", "HEAD"]).await?;
         return Ok(GitSyncBaseResult {
@@ -2558,7 +2572,7 @@ pub async fn sync_base(
             outcome: GitSyncBaseOutcome::Conflicts { files },
         });
     }
-    anyhow::bail!("merge of base ref '{base}' failed: {merge_out}")
+    anyhow::bail!("merge of base ref failed")
 }
 pub async fn stage_content(git_root: &Path, path: &str, content: &str) -> Result<()> {
     let git_root = git_root.to_path_buf();
@@ -2764,14 +2778,69 @@ mod tests {
         );
     }
     #[test]
+    fn strip_url_credentials_removes_userinfo_query_and_fragment() {
+        let sentinel = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+        let unsafe_url = format!(
+            "https://user:{sentinel}@github.example/org/repo.git?access_token={sentinel}#{sentinel}"
+        );
+        let sanitized = strip_url_credentials(&unsafe_url);
+
+        assert_eq!(sanitized, "https://github.example/org/repo.git");
+        assert!(!sanitized.contains(sentinel));
+        for window in sentinel.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).unwrap();
+            assert!(!sanitized.contains(fragment));
+        }
+    }
+    #[test]
     fn strip_url_credentials_preserves_clean_https_url() {
         let clean_url = "https://github.com/xai-org/example.git";
         assert_eq!(strip_url_credentials(clean_url), clean_url);
     }
     #[test]
-    fn strip_url_credentials_preserves_ssh_url() {
+    fn strip_url_credentials_drops_scp_username() {
         let ssh_url = "git@github.com:xai-org/example.git";
-        assert_eq!(strip_url_credentials(ssh_url), ssh_url);
+        assert_eq!(
+            strip_url_credentials(ssh_url),
+            "github.com:xai-org/example.git"
+        );
+    }
+    #[test]
+    fn strip_url_credentials_drops_credential_like_scp_username() {
+        let sentinel = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+        let sanitized =
+            strip_url_credentials(&format!("{sentinel}@github.com:xai-org/example.git"));
+        assert_eq!(sanitized, "github.com:xai-org/example.git");
+        for window in sentinel.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).unwrap();
+            assert!(!sanitized.contains(fragment));
+        }
+    }
+    #[tokio::test]
+    async fn git_remote_failures_never_return_credential_stderr() {
+        let sentinel = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(tmp.path()).unwrap();
+        repo.remote(
+            "origin",
+            &format!("https://127.0.0.1:1/repo.git?access_token={sentinel}"),
+        )
+        .unwrap();
+        drop(repo);
+
+        let error = git_cli(tmp.path(), &["fetch", "origin"])
+            .await
+            .expect_err("unreachable remote must fail")
+            .to_string();
+        let (_, push_message) = push_classified(tmp.path()).await.unwrap();
+
+        for rendered in [&error, &push_message] {
+            assert!(!rendered.contains(sentinel));
+            for window in sentinel.as_bytes().windows(8) {
+                let fragment = std::str::from_utf8(window).unwrap();
+                assert!(!rendered.contains(fragment), "leaked fragment {fragment}");
+            }
+        }
     }
     #[test]
     fn strip_url_credentials_removes_username_password() {

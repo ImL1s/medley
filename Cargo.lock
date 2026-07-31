@@ -12872,6 +12872,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -13697,6 +13698,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "xai-grok-auth",
  "xai-grok-env",
  "xai-grok-extra-ca",
  "xai-grok-sampling-types",
@@ -14137,6 +14139,7 @@ dependencies = [
  "xai-computer-hub-core",
  "xai-computer-hub-sdk",
  "xai-file-utils",
+ "xai-grok-auth",
  "xai-grok-config",
  "xai-grok-env",
  "xai-grok-extra-ca",

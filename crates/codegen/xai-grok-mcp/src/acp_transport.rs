@@ -164,10 +164,7 @@ async fn read_requests(
         // rather than spawning a doomed round-trip. Safe only because the SDK `Server` is
         // lenient about never receiving `initialized` (a documented v1 limit).
         let Some(id) = message.get("id").filter(|id| !id.is_null()).cloned() else {
-            tracing::debug!(
-                %message,
-                "acp mcp bridge: discarding id-less notification (half-duplex v1)"
-            );
+            log_discarded_notification(&message);
             continue;
         };
         let invoker = invoker.clone();
@@ -188,6 +185,17 @@ async fn read_requests(
             }
         });
     }
+}
+
+/// Record only a closed, non-secret fact for an arbitrary id-less JSON-RPC
+/// notification. Notification params are controlled by the MCP peer and can
+/// contain tool arguments, authorization headers, or other credential-bearing
+/// values, so the JSON value itself must never cross an observability boundary.
+fn log_discarded_notification(message: &Value) {
+    tracing::debug!(
+        notification_method_present = message.get("method").is_some(),
+        "acp mcp bridge: discarding id-less notification (half-duplex v1)"
+    );
 }
 
 /// Serialize every server→client response onto the duplex through a single writer.
@@ -238,6 +246,54 @@ fn json_rpc_error(id: Value, code: i64, message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<parking_lot::Mutex<String>>);
+
+    #[derive(Default)]
+    struct RenderedFields(String);
+
+    impl tracing::field::Visit for RenderedFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            let _ = write!(&mut self.0, "{}={value:?};", field.name());
+        }
+    }
+
+    impl tracing::Subscriber for LogCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target().starts_with("xai_grok_mcp::acp_transport")
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut rendered = RenderedFields::default();
+            event.record(&mut rendered);
+            self.0.lock().push_str(&rendered.0);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    fn assert_no_secret_windows(rendered: &str, secret: &str) {
+        assert!(!rendered.contains(secret), "full secret leaked: {rendered}");
+        for window in secret.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(
+                !rendered.contains(fragment),
+                "secret fragment {fragment:?} leaked: {rendered}"
+            );
+        }
+    }
 
     /// Invoker that echoes the request's method back as the result, or fails for a
     /// method named "boom".
@@ -301,6 +357,29 @@ mod tests {
         let response = read_line(&mut reader).await;
         assert_eq!(response["id"], 1);
         assert_eq!(response["result"]["method"], "tools/list");
+    }
+
+    #[test]
+    fn idless_notification_log_omits_arbitrary_json_credentials() {
+        const HEADER_SECRET: &str = "Bearer-N7qM4vL9xT2cR8pK6sD1";
+        const ARGUMENT_SECRET: &str = "ToolArg-Z3fH8jW5bQ1nY7uC4mP9";
+        let message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/sentinel",
+            "params": {
+                "headers": { "Authorization": HEADER_SECRET },
+                "arguments": { "token": ARGUMENT_SECRET }
+            }
+        });
+        let capture = LogCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+
+        log_discarded_notification(&message);
+
+        let rendered = capture.0.lock().clone();
+        assert!(rendered.contains("notification_method_present=true"));
+        assert_no_secret_windows(&rendered, HEADER_SECRET);
+        assert_no_secret_windows(&rendered, ARGUMENT_SECRET);
     }
 
     /// A slow request must not block a later fast one: the fast response comes back

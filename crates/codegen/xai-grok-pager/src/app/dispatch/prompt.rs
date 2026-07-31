@@ -814,7 +814,7 @@ pub(super) fn dispatch_send_prompt_inner(
             current_prompt_id = agent.session.current_prompt_id.as_deref().unwrap_or(""),
             session = agent.session.session_id.as_ref().map(|s| s.0.as_ref()).unwrap_or(""),
             images = agent.prompt.images.len(),
-            text = %text.chars().take(48).collect::<String>(),
+            text_len = text.len(),
             "plain prompt send routing decision",
         );
 
@@ -1011,7 +1011,7 @@ pub(super) fn dispatch_send_bash_command(app: &mut AppView, command: String) -> 
         pending_len = agent.session.pending_prompts.len(),
         current_prompt_id = agent.session.current_prompt_id.as_deref().unwrap_or(""),
         session = agent.session.session_id.as_ref().map(|s| s.0.as_ref()).unwrap_or(""),
-        text = %command.chars().take(48).collect::<String>(),
+        text_len = command.len(),
         "bash command send routing decision",
     );
     if bash_immediate {

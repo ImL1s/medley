@@ -121,7 +121,7 @@ impl NotificationEventKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Deserialize, Serialize)]
 pub struct NotificationHook {
     pub command: String,
     #[serde(default)]
@@ -130,6 +130,17 @@ pub struct NotificationHook {
     pub only_unfocused: bool,
     #[serde(default = "default_hook_timeout")]
     pub timeout_secs: u64,
+}
+
+impl std::fmt::Debug for NotificationHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NotificationHook")
+            .field("command_configured", &!self.command.is_empty())
+            .field("event_count", &self.events.len())
+            .field("only_unfocused", &self.only_unfocused)
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
 }
 
 fn default_only_unfocused() -> bool {

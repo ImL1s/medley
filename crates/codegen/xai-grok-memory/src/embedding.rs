@@ -144,21 +144,24 @@ impl EmbeddingProvider for ApiEmbeddingProvider {
 
                 let req = match request.build() {
                     Ok(r) => r,
-                    Err(e) => {
-                        return Err(format!("failed to build embedding request: {e}").into());
+                    Err(_) => {
+                        return Err("failed to build embedding request".into());
                     }
                 };
                 let response = match self.client.execute(req).await {
                     Ok(r) => r,
-                    Err(e) => {
-                        last_err = format!("request failed: {e}");
+                    Err(_) => {
+                        last_err = "embedding request failed".to_string();
                         continue;
                     }
                 };
 
                 let status = response.status();
                 if status.is_success() {
-                    let body: serde_json::Value = response.json().await?;
+                    let body: serde_json::Value = response
+                        .json()
+                        .await
+                        .map_err(|_| "embedding response was invalid")?;
                     let data = body
                         .get("data")
                         .and_then(|d| d.as_array())
@@ -180,16 +183,12 @@ impl EmbeddingProvider for ApiEmbeddingProvider {
 
                 // Retry on 429 (rate limit) or 5xx (server error)
                 if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-                    last_err = format!(
-                        "HTTP {status}: {}",
-                        response.text().await.unwrap_or_default()
-                    );
+                    last_err = format!("embedding service returned HTTP {status}");
                     continue;
                 }
 
                 // Non-retryable error (4xx other than 429)
-                let body = response.text().await.unwrap_or_default();
-                return Err(format!("embedding API error {status}: {body}").into());
+                return Err(format!("embedding API error {status}").into());
             }
 
             if !success {
@@ -250,6 +249,59 @@ impl EmbeddingProvider for MockEmbeddingProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_no_secret_fragments(output: &str, secret: &str) {
+        assert!(!output.contains(secret), "full credential leaked: {output}");
+        for window in secret.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).expect("ASCII test sentinel");
+            assert!(
+                !output.contains(fragment),
+                "credential fragment {fragment:?} leaked: {output}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn embedding_errors_omit_configured_url_and_reflected_body_credentials() {
+        use std::io::{Read, Write};
+
+        let sentinel = "cred_SENTINEL_0123456789abcdef";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let reflected = format!("Bearer {sentinel}");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                reflected.len(),
+                reflected
+            )
+            .unwrap();
+        });
+        let provider = ApiEmbeddingProvider::new(
+            format!("http://{address}"),
+            "test-model".into(),
+            3,
+            build_static_middleware_client(Some(sentinel.into())),
+        );
+        let error = provider.embed_batch(&["hello"]).await.unwrap_err();
+        server.join().unwrap();
+        assert_no_secret_fragments(&error.to_string(), sentinel);
+        assert_no_secret_fragments(&format!("{error:?}"), sentinel);
+
+        let invalid_provider = ApiEmbeddingProvider::new(
+            format!("http://[/{sentinel}"),
+            "test-model".into(),
+            3,
+            build_static_middleware_client(Some(sentinel.into())),
+        );
+        let error = invalid_provider.embed_batch(&["hello"]).await.unwrap_err();
+        assert_no_secret_fragments(&error.to_string(), sentinel);
+        assert_no_secret_fragments(&format!("{error:?}"), sentinel);
+    }
 
     #[tokio::test]
     async fn test_mock_embedding_deterministic() {

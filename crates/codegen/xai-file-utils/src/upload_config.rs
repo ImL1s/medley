@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 /// Method for uploading to object storage.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum UploadMethod {
     Direct {
         service_account_key: Option<String>,
@@ -26,8 +26,49 @@ pub enum UploadMethod {
     },
 }
 
+impl std::fmt::Debug for UploadMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Direct {
+                service_account_key,
+            } => f
+                .debug_struct("Direct")
+                .field(
+                    "service_account_key_present",
+                    &service_account_key.is_some(),
+                )
+                .finish(),
+            Self::Proxy {
+                user_token,
+                deployment_key,
+                alpha_test_key,
+                ..
+            } => f
+                .debug_struct("Proxy")
+                .field("user_token_present", &!user_token.is_empty())
+                .field("deployment_key_present", &deployment_key.is_some())
+                .field("alpha_test_key_present", &alpha_test_key.is_some())
+                .finish(),
+            Self::S3 {
+                credentials_file,
+                credentials_content,
+                endpoint_url,
+                ..
+            } => f
+                .debug_struct("S3")
+                .field("credentials_file_present", &credentials_file.is_some())
+                .field(
+                    "credentials_content_present",
+                    &credentials_content.is_some(),
+                )
+                .field("endpoint_url_present", &endpoint_url.is_some())
+                .finish(),
+        }
+    }
+}
+
 /// Configuration for object-storage export.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TraceExportConfig {
     pub bucket_url: Option<String>,
     pub service_account_key: Option<String>,
@@ -36,6 +77,68 @@ pub struct TraceExportConfig {
     pub gcs_prefix: Option<String>,
     pub absolute_paths: bool,
     pub archive_name_override: Option<String>,
+}
+
+impl std::fmt::Debug for TraceExportConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TraceExportConfig")
+            .field("bucket_url_present", &self.bucket_url.is_some())
+            .field(
+                "service_account_key_present",
+                &self.service_account_key.is_some(),
+            )
+            .field("upload_method", &self.upload_method)
+            .field("prefix_dir_present", &self.prefix_dir.is_some())
+            .field("gcs_prefix_present", &self.gcs_prefix.is_some())
+            .field("absolute_paths", &self.absolute_paths)
+            .field(
+                "archive_name_override_present",
+                &self.archive_name_override.is_some(),
+            )
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod credential_debug_tests {
+    use super::*;
+
+    #[test]
+    fn upload_config_debug_redacts_all_secret_carriers() {
+        let sentinels = [
+            "bucket-SENTINEL",
+            "service-SENTINEL",
+            "token-SENTINEL",
+            "deployment-SENTINEL",
+            "alpha-SENTINEL",
+            "prefix-SENTINEL",
+        ];
+        let config = TraceExportConfig {
+            bucket_url: Some(sentinels[0].into()),
+            service_account_key: Some(sentinels[1].into()),
+            upload_method: UploadMethod::Proxy {
+                proxy_base_url: "https://proxy.example/secret?key=SENTINEL".into(),
+                user_token: sentinels[2].into(),
+                deployment_key: Some(sentinels[3].into()),
+                alpha_test_key: Some(sentinels[4].into()),
+            },
+            prefix_dir: Some(sentinels[5].into()),
+            gcs_prefix: Some("gcs-SENTINEL".into()),
+            absolute_paths: false,
+            archive_name_override: Some("archive-SENTINEL".into()),
+        };
+        let debug = format!("{config:?}");
+        for sentinel in
+            sentinels
+                .into_iter()
+                .chain(["proxy.example", "gcs-SENTINEL", "archive-SENTINEL"])
+        {
+            assert!(
+                !debug.contains(sentinel),
+                "debug leaked {sentinel:?}: {debug}"
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

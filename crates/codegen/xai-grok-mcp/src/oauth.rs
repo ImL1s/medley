@@ -36,6 +36,37 @@ const CREDENTIAL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// every other session blocked indefinitely on the same server's auth.
 const BROWSER_AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// Convert rmcp's potentially provider-controlled OAuth errors into a fixed
+/// diagnostic category. Several variants contain response bodies, callback
+/// descriptions, issuer URLs, or reqwest errors with attached URLs.
+pub(crate) fn oauth_error_class(error: &crate::rmcp::transport::auth::AuthError) -> &'static str {
+    use crate::rmcp::transport::auth::AuthError;
+
+    match error {
+        AuthError::AuthorizationRequired => "authorization_required",
+        AuthError::AuthorizationFailed(_) => "authorization_failed",
+        AuthError::TokenExchangeFailed(_) => "token_exchange_failed",
+        AuthError::TokenRefreshFailed(_) => "token_refresh_failed",
+        AuthError::HttpError(err) if err.is_timeout() => "http_timeout",
+        AuthError::HttpError(err) if err.is_connect() => "http_connect",
+        AuthError::HttpError(_) => "http_error",
+        AuthError::OAuthError(_) => "oauth_error",
+        AuthError::MetadataError(_) => "metadata_error",
+        AuthError::UrlError(_) => "url_error",
+        AuthError::NoAuthorizationSupport => "no_authorization_support",
+        AuthError::InternalError(_) => "internal_error",
+        AuthError::InvalidTokenType(_) => "invalid_token_type",
+        AuthError::TokenExpired => "token_expired",
+        AuthError::InvalidScope(_) => "invalid_scope",
+        AuthError::RegistrationFailed(_) => "registration_failed",
+        AuthError::InsufficientScope { .. } => "insufficient_scope",
+        AuthError::AuthorizationServerMismatch { .. } => "issuer_mismatch",
+        AuthError::AuthorizationServerMissingIssuer { .. } => "issuer_missing",
+        AuthError::ClientCredentialsError(_) => "client_credentials_error",
+        _ => "oauth_error",
+    }
+}
+
 /// How long a follower waits for the cross-process auth lock before giving up
 /// on dedup and proceeding with its own flow. Slightly above
 /// [`BROWSER_AUTH_TIMEOUT`] so a legitimately-slow leader (user reading the
@@ -195,8 +226,11 @@ async fn authenticate_with_fs_lock(
         .open(&lock_path)
     {
         Ok(f) => f,
-        Err(e) => {
-            tracing::warn!(%e, "Failed to create auth lock file; proceeding without cross-process dedup");
+        Err(_) => {
+            tracing::warn!(
+                error_class = "io_error",
+                "Failed to create auth lock file; proceeding without cross-process dedup"
+            );
             return run_browser_auth_flow(server_name, server_url, auth_manager, byo_config).await;
         }
     };
@@ -307,7 +341,7 @@ async fn run_browser_auth_flow(
             Err(e) => {
                 tracing::info!(
                     server = server_name,
-                    %e,
+                    oauth_error_class = oauth_error_class(&e),
                     "Token refresh failed, falling through to browser auth"
                 );
             }
@@ -319,10 +353,10 @@ async fn run_browser_auth_flow(
     let listener =
         tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], requested_port)))
             .await
-            .map_err(|e| format!("Failed to bind loopback port {requested_port}: {e}"))?;
+            .map_err(|_| "Failed to bind OAuth loopback listener".to_string())?;
     let port = listener
         .local_addr()
-        .map_err(|e| format!("Failed to get loopback port: {e}"))?
+        .map_err(|_| "Failed to inspect OAuth loopback listener".to_string())?
         .port();
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
 
@@ -348,7 +382,7 @@ async fn run_browser_auth_flow(
                 OAuthClientConfig::new(client_id, redirect_uri.clone()).with_scopes(scopes.clone());
             config.client_secret = byo.client_secret.clone();
             mgr.configure_client(config)
-                .map_err(|e| format!("Failed to configure BYO client: {e}"))?;
+                .map_err(|_| "Failed to configure BYO OAuth client".to_string())?;
         } else {
             scopes = if byo_scopes.is_empty() {
                 mgr.select_scopes(None, &[])
@@ -358,13 +392,13 @@ async fn run_browser_auth_flow(
             let scope_refs: Vec<&str> = scopes.iter().map(|s| s.as_str()).collect();
             mgr.register_client(MCP_OAUTH_CLIENT_NAME, &redirect_uri, &scope_refs)
                 .await
-                .map_err(|e| format!("Dynamic client registration failed: {e}"))?;
+                .map_err(|_| "Dynamic OAuth client registration failed".to_string())?;
         }
         let scopes: Vec<&str> = scopes.iter().map(|s| s.as_str()).collect();
 
         mgr.get_authorization_url(&scopes)
             .await
-            .map_err(|e| format!("Failed to get authorization URL: {e}"))?
+            .map_err(|_| "Failed to create OAuth authorization URL".to_string())?
     };
     // Lock released — browser flow can take minutes.
 
@@ -384,10 +418,13 @@ async fn run_browser_auth_flow(
 
     // 4. Open browser for user consent.
     tracing::info!(server = server_name, "Opening browser for OAuth consent");
-    if let Err(e) = webbrowser::open(&auth_url) {
+    if webbrowser::open(&auth_url).is_err() {
         // eprintln! corrupts the TUI alternate screen (in-process, fd 2).
-        // TODO: surface auth URL via ACP notification instead.
-        tracing::warn!(%e, url = %auth_url, "Failed to open browser for MCP OAuth; user must visit URL manually");
+        // Do not surface the authorization URL: it contains OAuth state and
+        // other security-sensitive query parameters.
+        tracing::warn!(
+            "Failed to open browser for MCP OAuth; restart authentication with a supported browser"
+        );
     }
 
     // 5. Wait for the OAuth callback OR for tokens to appear on disk.
@@ -405,11 +442,10 @@ async fn run_browser_auth_flow(
     //    config and the server would reject with `invalid_grant: Invalid redirect_uri`.
     let parsed_server_url = match url::Url::parse(server_url) {
         Ok(u) => Some(u),
-        Err(e) => {
+        Err(_) => {
             tracing::warn!(
                 server = server_name,
-                url = server_url,
-                error = %e,
+                server_url_present = !server_url.is_empty(),
                 "could not parse server URL for credential-store poll; falling back to callback-only auth-completion detection"
             );
             None
@@ -448,7 +484,7 @@ async fn run_browser_auth_flow(
             callback_server.abort();
             let callback = result
                 .map_err(|_| "Callback channel dropped".to_string())?
-                .map_err(|e| format!("OAuth callback failed: {e}"))?;
+                .map_err(|_| "OAuth callback failed".to_string())?;
 
             // 6. Exchange code for tokens (auto-persists via CredentialStore).
             // Pass RFC 9207 `iss` when present (required if the AS advertises it).
@@ -459,7 +495,7 @@ async fn run_browser_auth_flow(
                 callback.issuer.as_deref(),
             )
             .await
-            .map_err(|e| format!("Token exchange failed: {e}"))?;
+            .map_err(|_| "OAuth token exchange failed".to_string())?;
 
             tracing::info!(server = server_name, "MCP OAuth authentication successful");
         }
@@ -499,7 +535,7 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct OAuthCallbackPayload {
     code: String,
     state: String,
@@ -507,15 +543,24 @@ struct OAuthCallbackPayload {
     issuer: Option<String>,
 }
 
+impl std::fmt::Debug for OAuthCallbackPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthCallbackPayload")
+            .field("code_present", &!self.code.is_empty())
+            .field("state_present", &!self.state.is_empty())
+            .field("issuer_present", &self.issuer.is_some())
+            .finish()
+    }
+}
+
 fn parse_oauth_callback_params(
     params: &HashMap<String, String>,
 ) -> Result<OAuthCallbackPayload, String> {
     if let Some(error) = params.get("error") {
-        let desc = params
-            .get("error_description")
-            .cloned()
-            .unwrap_or_else(|| "Unknown error".to_string());
-        return Err(format!("OAuth error: {error} - {desc}"));
+        return Err(format!(
+            "OAuth authorization failed ({})",
+            safe_oauth_callback_error_code(error)
+        ));
     }
     let code = params
         .get("code")
@@ -533,6 +578,26 @@ fn parse_oauth_callback_params(
         state,
         issuer,
     })
+}
+
+/// OAuth callback parameters are provider-controlled and may echo credentials.
+/// Retain only standardized error categories; never render descriptions or
+/// unknown values into the browser, terminal, logs, or propagated errors.
+fn safe_oauth_callback_error_code(value: &str) -> &'static str {
+    match value {
+        "access_denied" => "access_denied",
+        "account_selection_required" => "account_selection_required",
+        "consent_required" => "consent_required",
+        "interaction_required" => "interaction_required",
+        "invalid_request" => "invalid_request",
+        "invalid_scope" => "invalid_scope",
+        "login_required" => "login_required",
+        "server_error" => "server_error",
+        "temporarily_unavailable" => "temporarily_unavailable",
+        "unauthorized_client" => "unauthorized_client",
+        "unsupported_response_type" => "unsupported_response_type",
+        _ => "unknown",
+    }
 }
 
 /// Loopback OAuth callback server. Returns (server task, oneshot for payload).
@@ -612,6 +677,32 @@ mod tests {
             .collect()
     }
 
+    fn assert_no_secret_fragments(output: &str, sentinel: &str) {
+        assert!(!output.contains(sentinel));
+        for window in sentinel.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(
+                !output.contains(fragment),
+                "credential fragment {fragment:?} leaked in {output:?}"
+            );
+        }
+    }
+
+    const CREDENTIAL_SENTINELS: &[&str] = &[
+        "ACCESS_TOKEN_A1b2C3d4E5f6G7h8",
+        "REFRESH_TOKEN_R8s7T6u5V4w3X2y1",
+        "DEPLOYMENT_KEY_D9e8P7l6O5y4",
+        "Bearer b3A4r5E6r7T8o9K0e1N2",
+        "x-api-key=K3y4V5a6L7u8E9",
+        "https://mcp.example.test/oauth/callback?code=Q1w2E3r4T5y6&state=S7t8A9t0E1",
+    ];
+
+    fn assert_no_credentials(output: &str) {
+        for sentinel in CREDENTIAL_SENTINELS {
+            assert_no_secret_fragments(output, sentinel);
+        }
+    }
+
     #[test]
     fn callback_parses_code_state_and_rfc9207_iss() {
         let p = params(&[
@@ -633,20 +724,62 @@ mod tests {
     }
 
     #[test]
+    fn callback_payload_debug_never_emits_code_state_or_issuer() {
+        let sentinel = "R7t5Y3u1I9o7P5a3S1d9F7g5";
+        let got = parse_oauth_callback_params(&params(&[
+            ("code", sentinel),
+            ("state", sentinel),
+            ("iss", sentinel),
+        ]))
+        .expect("callback should parse");
+        assert_no_secret_fragments(&format!("{got:?}"), sentinel);
+    }
+
+    #[test]
     fn callback_requires_code_and_state() {
         assert!(parse_oauth_callback_params(&params(&[("state", "s")])).is_err());
         assert!(parse_oauth_callback_params(&params(&[("code", "c")])).is_err());
     }
 
     #[test]
-    fn callback_surfaces_oauth_error() {
+    fn callback_classifies_oauth_error_without_description() {
         let p = params(&[
             ("error", "access_denied"),
             ("error_description", "user said no"),
         ]);
         let err = parse_oauth_callback_params(&p).unwrap_err();
         assert!(err.contains("access_denied"));
-        assert!(err.contains("user said no"));
+        assert!(!err.contains("user said no"));
+    }
+
+    #[test]
+    fn callback_errors_never_echo_provider_controlled_credentials() {
+        let sentinel = "M8n6B4v2C0x8Z6l4K2j0H8g6";
+        let p = params(&[("error", sentinel), ("error_description", sentinel)]);
+        let err = parse_oauth_callback_params(&p).unwrap_err();
+        assert_eq!(err, "OAuth authorization failed (unknown)");
+        assert_no_secret_fragments(&err, sentinel);
+    }
+
+    #[test]
+    fn callback_debug_and_failures_hide_all_credential_shapes_and_url_queries() {
+        let joined = CREDENTIAL_SENTINELS.join(" | ");
+        let payload = parse_oauth_callback_params(&params(&[
+            ("code", &joined),
+            ("state", &joined),
+            ("iss", &joined),
+        ]))
+        .expect("callback should parse");
+        assert_no_credentials(&format!("{payload:?}"));
+
+        let error = parse_oauth_callback_params(&params(&[
+            ("error", &joined),
+            ("error_description", &joined),
+            ("error_uri", &joined),
+        ]))
+        .expect_err("provider error should fail");
+        assert_eq!(error, "OAuth authorization failed (unknown)");
+        assert_no_credentials(&error);
     }
 
     fn require_iss_metadata(token_endpoint: String) -> AuthorizationMetadata {
