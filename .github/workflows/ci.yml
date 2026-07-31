@@ -20,6 +20,18 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  audit-publisher:
+    name: Audit publisher tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Validate checked-in audit manifest
+        run: python3 -B scripts/publish-audit-issues.py --validate-only
+
+      - name: Run publisher unit tests
+        run: python3 -B -m unittest discover -s tests -p 'test_audit_issue_publishers.py' -v
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
