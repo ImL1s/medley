@@ -1939,7 +1939,7 @@ grok
 
 Grok fetches the model list from `{GROK_MODELS_BASE_URL}/models` on startup and sends inference requests to `GROK_MODELS_BASE_URL`. This follows the standard OpenAI-compatible convention used by OpenAI, Anthropic, OpenRouter, Groq, Together.ai, and others.
 
-If your model list endpoint differs from `{base_url}/models`, set `GROK_MODELS_LIST_URL` explicitly.
+If your model list endpoint differs from `{base_url}/models`, set `GROK_MODELS_LIST_URL` explicitly to the final URL. Catalog redirects are rejected so the API key cannot be forwarded to a redirect target.
 
 **Combining with `[endpoints]` config:** You can also set endpoints in `~/.grok/config.toml`:
 
@@ -1954,7 +1954,9 @@ api_key = "my-api-key"
 
 When using `[endpoints]` with partial model overrides, the `base_url` is inherited from the endpoints config — you don't need to specify it in each `[model.*]` section.
 
-**Auth behavior:** When `models_base_url` is set, Grok uses API key auth (`Authorization: Bearer`) instead of session auth. `grok login` is not required — only the API key.
+The per-model `api_key` above authenticates inference requests only. Catalog discovery still requires `XAI_API_KEY` (or the legacy `GROK_CODE_XAI_API_KEY`) in the environment.
+
+**Auth behavior:** When `models_base_url` or `models_list_url` is set, Grok uses the explicit `XAI_API_KEY` (`Authorization: Bearer`) instead of session auth. A `grok login` credential never authenticates a custom catalog, so the API key must be set separately.
 
 ---
 

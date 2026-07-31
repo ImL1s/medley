@@ -380,7 +380,7 @@ impl SessionActor {
         };
         let current_model = &current_config.model;
         let base_url = &current_config.base_url;
-        if !crate::util::is_cli_chat_proxy_url(base_url) {
+        if !crate::util::is_xai_api_bearer_url(base_url) {
             return;
         }
         tracing::info!(
@@ -400,8 +400,10 @@ impl SessionActor {
                 None,
             ),
         );
-        let middleware_client =
-            crate::http::with_auth_retry(crate::http::shared_client(), provider);
+        let middleware_client = crate::http::with_auth_retry(
+            crate::remote::client::models_catalog_async_client(),
+            provider,
+        );
         let url = format!("{}/models-v2", base_url);
         let parse_models_response =
             |json: serde_json::Value| -> Option<(std::num::NonZeroU64, Option<u32>)> {
