@@ -28,7 +28,9 @@ pub use client::{
     BackendClient, BackendError, FetchModelsResult, FetchedBundle, SettingsFetch, fetch_bundle,
     fetch_login_device_flow, fetch_settings_blocking, fetch_subagent_bundle, share_url,
 };
-pub(crate) use client::{DEFAULT_CONTEXT_WINDOW, fetch_models_blocking, models_list_url};
+pub(crate) use client::{
+    DEFAULT_CONTEXT_WINDOW, fetch_models_blocking, models_list_url, validate_models_catalog_auth,
+};
 pub use conversations_client::{
     ConvError, ConvQuery, Conversation, ConversationsClient, ListConversationsPage,
     UpdateConversationBody,

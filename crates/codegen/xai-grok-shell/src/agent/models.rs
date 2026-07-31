@@ -257,11 +257,30 @@ impl ModelsManager {
         prefetched_models: Option<IndexMap<String, ModelEntry>>,
         auth_manager: Arc<AuthManager>,
     ) -> Result<Self, String> {
+        Self::from_config_with_remote_fetch(
+            cfg,
+            prefetched_models,
+            auth_manager,
+            crate::util::config::resolve_remote_fetch_enabled(),
+        )
+    }
+
+    fn from_config_with_remote_fetch(
+        cfg: &config::Config,
+        prefetched_models: Option<IndexMap<String, ModelEntry>>,
+        auth_manager: Arc<AuthManager>,
+        remote_fetch_enabled: bool,
+    ) -> Result<Self, String> {
         let has_session = auth_manager.current_or_expired().is_some();
         let is_session_auth = auth_manager
             .current_or_expired()
             .is_some_and(|a| a.is_session_auth());
         let fetch_auth = ModelFetchAuth::resolve(&cfg.endpoints, has_session);
+        crate::remote::validate_models_catalog_auth(
+            &cfg.endpoints,
+            fetch_auth,
+            remote_fetch_enabled,
+        )?;
         let prefetched_models = prefetched_models.or_else(|| {
             let cache = ModelsCacheManager::new();
             cache

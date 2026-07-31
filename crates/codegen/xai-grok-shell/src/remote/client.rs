@@ -717,11 +717,77 @@ struct ModelsResponse {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EndpointAuth {
     ApiKey,
+    CustomApiKey,
     Session,
 }
 struct ListModelsEndpoint {
     url: String,
     auth: EndpointAuth,
+}
+const XAI_MODELS_API_KEY_REQUIRED: &str =
+    "xAI model catalog requires XAI_API_KEY (or GROK_CODE_XAI_API_KEY).";
+const CUSTOM_MODELS_API_KEY_REQUIRED: &str =
+    "Custom model catalog requires XAI_API_KEY (or GROK_CODE_XAI_API_KEY).";
+fn add_models_session_headers_blocking(
+    request: reqwest::blocking::RequestBuilder,
+    auth: &GrokAuth,
+) -> reqwest::blocking::RequestBuilder {
+    let mut request = request
+        .header("Authorization", format!("Bearer {}", &auth.key))
+        .header("X-XAI-Token-Auth", "xai-grok-cli")
+        .header("x-userid", &auth.user_id)
+        .header("x-grok-client-version", xai_grok_version::VERSION)
+        .header(
+            crate::http::CLIENT_MODE_HEADER,
+            crate::http::process_client_mode(),
+        );
+    if let Some(email) = &auth.email {
+        request = request.header("x-email", email);
+    }
+    request
+}
+/// Catalog requests carry credentials and therefore use a redirect-denying
+/// client. Keeping this policy catalog-local avoids changing unrelated startup
+/// requests while ensuring credentials cannot be replayed to another origin.
+fn models_catalog_blocking_client() -> reqwest::blocking::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            xai_grok_extra_ca::with_extra_root_certificates_blocking(
+                reqwest::blocking::Client::builder()
+                    .connect_timeout(crate::http::STARTUP_FETCH_TIMEOUT)
+                    .timeout(crate::http::STARTUP_FETCH_TIMEOUT)
+                    .user_agent(crate::http::process_user_agent_string())
+                    .pool_idle_timeout(Duration::from_secs(30))
+                    .tcp_keepalive(Duration::from_secs(30))
+                    .redirect(reqwest::redirect::Policy::none()),
+            )
+            .build()
+            .expect("failed to build model catalog HTTP client")
+        })
+        .clone()
+}
+/// Async counterpart used by resume-time catalog metadata refreshes. Catalog
+/// credentials must never be replayed to a redirect target.
+pub(crate) fn models_catalog_async_client() -> reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            xai_grok_extra_ca::with_extra_root_certificates(
+                reqwest::Client::builder()
+                    .connect_timeout(Duration::from_secs(30))
+                    .user_agent(crate::http::process_user_agent_string())
+                    .pool_idle_timeout(Duration::from_secs(30))
+                    .http2_keep_alive_interval(Duration::from_secs(20))
+                    .http2_keep_alive_timeout(Duration::from_secs(10))
+                    .http2_keep_alive_while_idle(true)
+                    .tcp_keepalive(Duration::from_secs(30))
+                    .redirect(reqwest::redirect::Policy::none()),
+            )
+            .build()
+            .expect("failed to build async model catalog HTTP client")
+        })
+        .clone()
 }
 /// The `/v1/models` URL [`fetch_models_blocking`] hits for this
 /// endpoints/auth shape. Doubles as the models disk-cache origin key: cached
@@ -742,7 +808,7 @@ impl ListModelsEndpoint {
         if endpoints.has_custom_endpoint() {
             Self {
                 url: endpoints.resolve_models_list_url(),
-                auth: EndpointAuth::ApiKey,
+                auth: EndpointAuth::CustomApiKey,
             }
         } else if fetch_auth == crate::agent::models::ModelFetchAuth::ApiKey {
             Self {
@@ -750,11 +816,39 @@ impl ListModelsEndpoint {
                 auth: EndpointAuth::ApiKey,
             }
         } else {
+            let url = endpoints.resolve_models_list_url();
             Self {
-                url: endpoints.resolve_models_list_url(),
-                auth: EndpointAuth::Session,
+                auth: if crate::util::is_xai_api_bearer_url(&url) {
+                    EndpointAuth::Session
+                } else {
+                    EndpointAuth::CustomApiKey
+                },
+                url,
             }
         }
+    }
+}
+/// Validate the credential required by the resolved catalog origin before the
+/// best-effort prefetch layer can turn an auth failure into an ordinary cache
+/// miss. This keeps startup configuration errors user-visible while preserving
+/// the intentional offline (`remote_fetch = false`) path.
+pub(crate) fn validate_models_catalog_auth(
+    endpoints: &crate::agent::config::EndpointsConfig,
+    fetch_auth: crate::agent::models::ModelFetchAuth,
+    remote_fetch_enabled: bool,
+) -> Result<(), String> {
+    if !remote_fetch_enabled {
+        return Ok(());
+    }
+
+    let source = ListModelsEndpoint::from_endpoints(endpoints, fetch_auth);
+    let missing_api_key = crate::agent::auth_method::read_xai_api_key_env().is_err();
+    match source.auth {
+        EndpointAuth::ApiKey if missing_api_key => Err(XAI_MODELS_API_KEY_REQUIRED.to_owned()),
+        EndpointAuth::CustomApiKey if missing_api_key => {
+            Err(CUSTOM_MODELS_API_KEY_REQUIRED.to_owned())
+        }
+        EndpointAuth::ApiKey | EndpointAuth::CustomApiKey | EndpointAuth::Session => Ok(()),
     }
 }
 /// Fetch models from an OpenAI-compatible `/v1/models` endpoint.
@@ -768,7 +862,7 @@ pub(crate) fn fetch_models_blocking(
     auth: Option<&GrokAuth>,
     fetch_auth: crate::agent::models::ModelFetchAuth,
 ) -> Result<FetchModelsResult, BackendError> {
-    let client = crate::http::shared_startup_blocking_client();
+    let client = models_catalog_blocking_client();
     let source = ListModelsEndpoint::from_endpoints(endpoints, fetch_auth);
     let inference_base_url = endpoints.resolve_inference_base_url();
     tracing::info!("Fetching models from {}", source.url);
@@ -776,40 +870,28 @@ pub(crate) fn fetch_models_blocking(
     match source.auth {
         EndpointAuth::ApiKey => {
             let api_key = crate::agent::auth_method::read_xai_api_key_env()
-                .or_else(|_| {
-                    auth.map(|a| a.key.clone())
-                        .ok_or(std::env::VarError::NotPresent)
-                })
-                .map_err(|_| {
-                    BackendError::Auth(
-                        "No API key for custom models endpoint. Set XAI_API_KEY.".into(),
-                    )
-                })?;
+                .map_err(|_| BackendError::Auth(XAI_MODELS_API_KEY_REQUIRED.to_owned()))?;
+            request = request.header("Authorization", format!("Bearer {}", api_key));
+        }
+        EndpointAuth::CustomApiKey => {
+            let api_key = crate::agent::auth_method::read_xai_api_key_env()
+                .map_err(|_| BackendError::Auth(CUSTOM_MODELS_API_KEY_REQUIRED.to_owned()))?;
             request = request.header("Authorization", format!("Bearer {}", api_key));
         }
         EndpointAuth::Session => {
             let auth = auth.ok_or_else(|| {
                 BackendError::Auth("No auth credentials for cli-chat-proxy".into())
             })?;
-            request = request
-                .header("Authorization", format!("Bearer {}", &auth.key))
-                .header("X-XAI-Token-Auth", "xai-grok-cli")
-                .header("x-userid", &auth.user_id)
-                .header("x-grok-client-version", xai_grok_version::VERSION)
-                .header(
-                    crate::http::CLIENT_MODE_HEADER,
-                    crate::http::process_client_mode(),
-                );
-            if let Some(email) = &auth.email {
-                request = request.header("x-email", email);
-            }
+            request = add_models_session_headers_blocking(request, auth);
         }
     }
     let response = request.send()?;
     if !response.status().is_success() {
         let status = response.status().as_u16();
-        let body = response.text().unwrap_or_default();
-        tracing::warn!("Failed to fetch models: {} - {}", status, body);
+        // Catalog error bodies are untrusted and can reflect the request's
+        // bearer credential. Never return or log them.
+        let body = "catalog response body omitted".to_string();
+        tracing::warn!(status, "Failed to fetch models");
         return Err(BackendError::RequestFailed { status, body });
     }
     let etag = response
@@ -1078,7 +1160,10 @@ mod tests {
         http::{HeaderMap, StatusCode},
         routing::get,
     };
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
     #[test]
     fn login_config_response_parses_tristate() {
         let parse = |s: &str| {
@@ -1952,28 +2037,16 @@ mod tests {
         );
     }
     /// INVARIANT: the `/models` fetch URL + auth scheme match the auth mode —
-    /// Session/Deployment → cli-chat-proxy (Session auth), never the inference host;
+    /// Session/Deployment → trusted xAI proxy (Session auth), while an untrusted
+    /// proxy override requires an explicit API key and can never receive GrokAuth;
     /// ApiKey → `xai_api_base_url` (ApiKey, public default when unset); a custom
     /// models endpoint → that URL verbatim.
     #[test]
     #[serial_test::serial]
-    fn models_fetch_endpoint_matches_auth_mode() {
-        use crate::agent::config::EndpointsConfig;
+    fn catalog_security_endpoint_matches_auth_mode() {
         use crate::agent::models::ModelFetchAuth;
-        for k in [
-            "GROK_CLI_CHAT_PROXY_BASE_URL",
-            "GROK_XAI_API_BASE_URL",
-            "GROK_MODELS_LIST_URL",
-        ] {
-            unsafe { std::env::remove_var(k) };
-        }
-        let cfg = EndpointsConfig::from_config_value(
-            &toml::from_str(
-                r#"[endpoints]
-                xai_api_base_url = "https://inference.acme-corp.example/xai/v1""#,
-            )
-            .unwrap(),
-        );
+        let mut cfg = deterministic_catalog_endpoints();
+        cfg.xai_api_base_url = "https://inference.acme-corp.example/xai/v1".into();
         let session = ListModelsEndpoint::from_endpoints(&cfg, ModelFetchAuth::Session);
         assert_eq!(session.url, "https://cli-chat-proxy.grok.com/v1/models");
         assert_eq!(session.auth, EndpointAuth::Session);
@@ -1983,21 +2056,356 @@ mod tests {
         let api = ListModelsEndpoint::from_endpoints(&cfg, ModelFetchAuth::ApiKey);
         assert_eq!(api.url, "https://inference.acme-corp.example/xai/v1/models");
         assert_eq!(api.auth, EndpointAuth::ApiKey);
-        let default = EndpointsConfig::from_config_value(&toml::Value::Table(Default::default()));
+        let default = deterministic_catalog_endpoints();
         assert_eq!(
             ListModelsEndpoint::from_endpoints(&default, ModelFetchAuth::ApiKey).url,
             "https://api.x.ai/v1/models"
         );
-        let custom = EndpointsConfig::from_config_value(
-            &toml::from_str(
-                r#"[endpoints]
-                models_base_url = "https://models.acme.com/v1""#,
-            )
-            .unwrap(),
-        );
+        let mut custom = deterministic_catalog_endpoints();
+        custom.models_base_url = Some("https://models.acme.com/v1".into());
         let ep = ListModelsEndpoint::from_endpoints(&custom, ModelFetchAuth::Session);
         assert_eq!(ep.url, "https://models.acme.com/v1/models");
-        assert_eq!(ep.auth, EndpointAuth::ApiKey);
+        assert_eq!(ep.auth, EndpointAuth::CustomApiKey);
+        let mut untrusted_proxy = deterministic_catalog_endpoints();
+        untrusted_proxy.cli_chat_proxy_base_url = Some("https://proxy.example.com/v1".into());
+        let ep = ListModelsEndpoint::from_endpoints(&untrusted_proxy, ModelFetchAuth::Session);
+        assert_eq!(ep.url, "https://proxy.example.com/v1/models");
+        assert_eq!(ep.auth, EndpointAuth::CustomApiKey);
+    }
+    fn deterministic_catalog_endpoints() -> crate::agent::config::EndpointsConfig {
+        let mut endpoints = crate::agent::config::EndpointsConfig::default();
+        endpoints.cli_chat_proxy_base_url = None;
+        endpoints.xai_api_base_url = "https://api.x.ai/v1".into();
+        endpoints.models_base_url = None;
+        endpoints.models_list_url = None;
+        endpoints
+    }
+    fn custom_catalog_endpoints(models_list_url: String) -> crate::agent::config::EndpointsConfig {
+        let mut endpoints = deterministic_catalog_endpoints();
+        endpoints.models_list_url = Some(models_list_url);
+        endpoints
+    }
+    struct LegacyApiKeyGuard(Option<String>);
+    impl LegacyApiKeyGuard {
+        fn remove() -> Self {
+            let key = crate::agent::auth_method::LEGACY_XAI_API_KEY_ENV_VAR;
+            let previous = std::env::var(key).ok();
+            // SAFETY: callers hold the test environment lock via EnvVarGuard
+            // and are annotated with serial_test because env mutation is global.
+            unsafe { std::env::remove_var(key) };
+            Self(previous)
+        }
+    }
+    impl Drop for LegacyApiKeyGuard {
+        fn drop(&mut self) {
+            let key = crate::agent::auth_method::LEGACY_XAI_API_KEY_ENV_VAR;
+            match self.0.take() {
+                // SAFETY: the matching EnvVarGuard still holds the test env lock.
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                // SAFETY: the matching EnvVarGuard still holds the test env lock.
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+    }
+    async fn start_catalog_server(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, handle)
+    }
+    /// A custom catalog is a separate trust boundary: an interactive grok.com
+    /// session token must never be used as its credential fallback.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn catalog_security_requires_explicit_xai_api_key() {
+        let _api_key = crate::env::EnvVarGuard::remove("XAI_API_KEY");
+        let _legacy_api_key = LegacyApiKeyGuard::remove();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        let app = Router::new().route(
+            "/models",
+            get(move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+                async { axum::Json(serde_json::json!({ "data": [] })) }
+            }),
+        );
+        let (base, server) = start_catalog_server(app).await;
+        let endpoints = custom_catalog_endpoints(format!("{base}/models"));
+        let auth = GrokAuth {
+            key: "grok-session-secret".into(),
+            ..GrokAuth::test_default()
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            fetch_models_blocking(
+                &endpoints,
+                Some(&auth),
+                crate::agent::models::ModelFetchAuth::Session,
+            )
+        })
+        .await
+        .unwrap();
+        server.abort();
+        let Err(BackendError::Auth(message)) = result else {
+            panic!("expected custom catalog auth error");
+        };
+        assert!(!message.contains("grok-session-secret"));
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+    }
+    /// A proxy override is not an authorization grant. Non-xAI proxy URLs use
+    /// the custom-catalog credential boundary even when models_* are unset.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn catalog_security_rejects_session_for_non_xai_proxy_override() {
+        let _api_key = crate::env::EnvVarGuard::remove("XAI_API_KEY");
+        let _legacy_api_key = LegacyApiKeyGuard::remove();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        let app = Router::new().route(
+            "/v1/models",
+            get(move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+                async { axum::Json(serde_json::json!({ "data": [] })) }
+            }),
+        );
+        let (base, server) = start_catalog_server(app).await;
+        let mut endpoints = deterministic_catalog_endpoints();
+        endpoints.cli_chat_proxy_base_url = Some(format!("{base}/v1"));
+        let auth = GrokAuth {
+            key: "grok-session-secret".into(),
+            ..GrokAuth::test_default()
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            fetch_models_blocking(
+                &endpoints,
+                Some(&auth),
+                crate::agent::models::ModelFetchAuth::Session,
+            )
+        })
+        .await
+        .unwrap();
+        server.abort();
+        let Err(BackendError::Auth(message)) = result else {
+            panic!("expected non-xAI proxy auth error");
+        };
+        assert!(!message.contains("grok-session-secret"));
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+    }
+    /// API-key mode also rejects ambient session credentials, including when
+    /// xai_api_base_url points at a non-xAI host.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn catalog_security_api_key_mode_never_falls_back_to_session() {
+        let _api_key = crate::env::EnvVarGuard::remove("XAI_API_KEY");
+        let _legacy_api_key = LegacyApiKeyGuard::remove();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        let app = Router::new().route(
+            "/v1/models",
+            get(move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+                async { axum::Json(serde_json::json!({ "data": [] })) }
+            }),
+        );
+        let (base, server) = start_catalog_server(app).await;
+        let mut endpoints = deterministic_catalog_endpoints();
+        endpoints.xai_api_base_url = format!("{base}/v1");
+        let auth = GrokAuth {
+            key: "grok-session-secret".into(),
+            ..GrokAuth::test_default()
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            fetch_models_blocking(
+                &endpoints,
+                Some(&auth),
+                crate::agent::models::ModelFetchAuth::ApiKey,
+            )
+        })
+        .await
+        .unwrap();
+        server.abort();
+        let Err(BackendError::Auth(message)) = result else {
+            panic!("expected API-key catalog auth error");
+        };
+        assert!(!message.contains("grok-session-secret"));
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+    }
+    /// The trusted default proxy keeps the established session identity
+    /// headers; this inspects the constructed request without sending it.
+    #[test]
+    fn catalog_security_preserves_official_session_headers() {
+        let auth = GrokAuth {
+            key: "official-session-token".into(),
+            user_id: "official-user".into(),
+            email: Some("official@example.com".into()),
+            ..GrokAuth::test_default()
+        };
+        let request = add_models_session_headers_blocking(
+            reqwest::blocking::Client::new().get("https://cli-chat-proxy.grok.com/v1/models"),
+            &auth,
+        )
+        .build()
+        .unwrap();
+        let headers = request.headers();
+        assert_eq!(
+            header_str(headers, "authorization").as_deref(),
+            Some("Bearer official-session-token")
+        );
+        assert_eq!(
+            header_str(headers, "x-xai-token-auth").as_deref(),
+            Some("xai-grok-cli")
+        );
+        assert_eq!(
+            header_str(headers, "x-userid").as_deref(),
+            Some("official-user")
+        );
+        assert_eq!(
+            header_str(headers, "x-email").as_deref(),
+            Some("official@example.com")
+        );
+        assert_eq!(
+            header_str(headers, "x-grok-client-version").as_deref(),
+            Some(xai_grok_version::VERSION)
+        );
+        assert_eq!(
+            header_str(headers, crate::http::CLIENT_MODE_HEADER).as_deref(),
+            Some(crate::http::process_client_mode())
+        );
+    }
+    /// Explicit API-key catalog fetches send only their bearer credential, not
+    /// grok.com session identity metadata.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn catalog_security_sends_api_key_without_session_identity_headers() {
+        let _api_key = crate::env::EnvVarGuard::set("XAI_API_KEY", "catalog-api-key");
+        let _legacy_api_key = LegacyApiKeyGuard::remove();
+        let seen = Arc::new(Mutex::new(Vec::<HeaderMap>::new()));
+        let recorded = seen.clone();
+        let app = Router::new().route(
+            "/models",
+            get(move |headers: HeaderMap| {
+                recorded.lock().unwrap().push(headers);
+                async { axum::Json(serde_json::json!({ "data": [] })) }
+            }),
+        );
+        let (base, server) = start_catalog_server(app).await;
+        let endpoints = custom_catalog_endpoints(format!("{base}/models"));
+        let auth = GrokAuth {
+            key: "grok-session-secret".into(),
+            user_id: "session-user".into(),
+            email: Some("session@example.com".into()),
+            ..GrokAuth::test_default()
+        };
+        tokio::task::spawn_blocking(move || {
+            fetch_models_blocking(
+                &endpoints,
+                Some(&auth),
+                crate::agent::models::ModelFetchAuth::Session,
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        server.abort();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let headers = &seen[0];
+        assert_eq!(
+            header_str(headers, "authorization").as_deref(),
+            Some("Bearer catalog-api-key")
+        );
+        for name in ["x-xai-token-auth", "x-userid", "x-email"] {
+            assert_eq!(header_str(headers, name), None, "unexpected {name}");
+        }
+    }
+    /// Untrusted catalog error bodies can reflect bearer credentials and be
+    /// arbitrarily large; neither property reaches BackendError.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn catalog_security_omits_reflected_oversized_error_body() {
+        let _api_key = crate::env::EnvVarGuard::set("XAI_API_KEY", "catalog-api-key");
+        let _legacy_api_key = LegacyApiKeyGuard::remove();
+        let auth = GrokAuth {
+            key: "resume-session-sentinel".into(),
+            ..GrokAuth::test_default()
+        };
+        let reflected = format!(
+            "catalog-api-key Bearer catalog-api-key bearer catalog-api-key resume-session-sentinel {}",
+            "x".repeat(16_384)
+        );
+        let app = Router::new().route(
+            "/models",
+            get(move || {
+                let reflected = reflected.clone();
+                async move { (StatusCode::UNAUTHORIZED, reflected) }
+            }),
+        );
+        let (base, server) = start_catalog_server(app).await;
+        let endpoints = custom_catalog_endpoints(format!("{base}/models"));
+        let result = tokio::task::spawn_blocking(move || {
+            fetch_models_blocking(
+                &endpoints,
+                Some(&auth),
+                crate::agent::models::ModelFetchAuth::CustomEndpoint,
+            )
+        })
+        .await
+        .unwrap();
+        server.abort();
+        let Err(BackendError::RequestFailed { status, body }) = result else {
+            panic!("expected catalog request failure");
+        };
+        assert_eq!(status, 401);
+        assert!(body.len() <= 64, "catalog error must stay bounded");
+        assert!(!body.contains("catalog-api-key"));
+        assert!(!body.contains("resume-session-sentinel"));
+        assert!(!body.to_ascii_lowercase().contains("bearer"));
+    }
+    /// Catalog credentials must not be replayed to a redirect target.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn catalog_security_does_not_follow_redirects() {
+        let _api_key = crate::env::EnvVarGuard::set("XAI_API_KEY", "catalog-api-key");
+        let _legacy_api_key = LegacyApiKeyGuard::remove();
+        let target_requests = Arc::new(AtomicUsize::new(0));
+        let target_seen = target_requests.clone();
+        let target_app = Router::new().route(
+            "/stolen",
+            get(move || {
+                target_seen.fetch_add(1, Ordering::SeqCst);
+                async { axum::Json(serde_json::json!({ "data": [] })) }
+            }),
+        );
+        let (target_base, target_server) = start_catalog_server(target_app).await;
+        let source_requests = Arc::new(AtomicUsize::new(0));
+        let source_seen = source_requests.clone();
+        let location = format!("{target_base}/stolen");
+        let source_app = Router::new().route(
+            "/models",
+            get(move || {
+                source_seen.fetch_add(1, Ordering::SeqCst);
+                let location = location.clone();
+                async move { (StatusCode::FOUND, [("location", location)]) }
+            }),
+        );
+        let (source_base, source_server) = start_catalog_server(source_app).await;
+        let endpoints = custom_catalog_endpoints(format!("{source_base}/models"));
+        let result = tokio::task::spawn_blocking(move || {
+            fetch_models_blocking(
+                &endpoints,
+                None,
+                crate::agent::models::ModelFetchAuth::ApiKey,
+            )
+        })
+        .await
+        .unwrap();
+        source_server.abort();
+        target_server.abort();
+        assert!(matches!(
+            result,
+            Err(BackendError::RequestFailed { status: 302, .. })
+        ));
+        assert_eq!(source_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(target_requests.load(Ordering::SeqCst), 0);
     }
     /// REGRESSION: `grok setup` must send the deployment key to
     /// the proxy, never the inference endpoint.
