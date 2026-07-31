@@ -232,7 +232,9 @@ export GROK_AUTH_TOKEN_TTL=3600               # optional
 
 If your binary outputs a bare token string (not JSON with `expires_in`), set `auth_token_ttl` to the token's expected lifetime in seconds. Without it, Grok cannot detect expiry proactively and will only refresh after a 401.
 
-The command is run via `sh -c`, so it can be a binary path, a shell script, or a pipeline.
+The command runs through the platform shell — `sh -c` on macOS/Linux, `cmd /C` on Windows — so it can be a binary path, a script, or a pipeline.
+
+> **Windows:** write the path as a TOML *literal* string (single quotes) so backslashes survive: `auth_provider_command = 'C:\corp\grok-auth.exe'`. Inside a double-quoted TOML string `\t`, `\n`, `\r`, `\b` and `\f` are escape sequences, so `"C:\temp\auth.exe"` parses into a path containing a tab character and the provider fails to start — after which Grok falls back to browser login as if the setting were ignored.
 
 When `auth_provider_label` is set, the TUI welcome screen shows **"Login with Acme Corp"** instead of "Login with grok.com". In headless mode (`grok -p`), the label has no effect — stderr from your binary is printed directly to the terminal.
 
@@ -559,7 +561,7 @@ grok -p "Your prompt here"
 | `-p, --single <PROMPT>` | The prompt to send (required)                         |
 | `-m, --model <MODEL>`   | Model to use (e.g., `grok-build`)               |
 | `-s, --session-id <ID>` | Create or resume a headless session with this ID      |
-| `-r, --resume <ID>`     | Resume an existing session (errors if not found)      |
+| `-r, --resume <ID_OR_TITLE>` | Resume an existing session by ID, or by title for the current directory, ignoring letter case (a sole explicitly renamed title wins among duplicates; remaining duplicates error with their IDs; UUID-shaped values are always treated as IDs) |
 | `-c, --continue`        | Continue the most recent session in current directory |
 | `--cwd <PATH>`          | Working directory                                     |
 | `--output-format <FMT>` | Output format: `plain`, `json`, `streaming-json`      |
@@ -1321,8 +1323,8 @@ Each feature section below documents its own config. This section covers the gen
 auto_update = true                     # check for updates on launch
 
 [models]
-default = "grok-build"           # model used for new sessions
-web_search = "grok-4.20-multi-agent"   # model used by the web_search tool
+default = "grok-4.5"                   # model used for new sessions
+web_search = "grok-4.5"                # model used by the web_search tool
 
 [ui]
 max_thoughts_width = 120               # max column width for reasoning display
@@ -1446,10 +1448,45 @@ If LSP tools are enabled but no usable server config is found, Grok emits a non-
 | `initializationOptions` | JSON passed during LSP initialize. |
 | `settings` | Configuration sent via workspace settings updates. |
 | `workspaceFolder` | Override workspace folder path sent to the server. |
+| `workspaceOpen` | Solution or projects to load, for servers that need to be told explicitly (see below). |
 | `startupTimeout` | Max startup wait in milliseconds before startup is considered failed. |
 | `shutdownTimeout` | Max graceful shutdown wait in milliseconds. |
 | `restartOnCrash` | Whether to restart the server after a crash. |
 | `maxRestarts` | Maximum restart attempts before giving up. |
+
+#### Telling a server which solution to load (`workspaceOpen`)
+
+Most servers work out what to analyze from the workspace folder. A few do not,
+and instead load their workspace through a protocol extension. The C# server
+(`Microsoft.CodeAnalysis.LanguageServer`, "Roslyn") is the notable one: on its
+own it treats every file as a loose "miscellaneous file" and reports no
+project-level diagnostics at all, until it is told to open a solution or a set
+of projects.
+
+```json
+{
+  "csharp": {
+    "command": "dotnet",
+    "args": [
+      "/path/to/Microsoft.CodeAnalysis.LanguageServer.dll",
+      "--stdio",
+      "--logLevel", "Warning",
+      "--extensionLogDirectory", "/tmp/roslyn-logs"
+    ],
+    "extensionToLanguage": { ".cs": "csharp" },
+    "workspaceOpen": { "solution": "MyApp.sln" },
+    "startupTimeout": 60000
+  }
+}
+```
+
+Use `"projects": ["src/App/App.csproj", "src/Lib/Lib.csproj"]` instead of
+`"solution"` when there is no solution file. Paths may be absolute or relative
+to the workspace root. Wrappers such as `roslyn-language-server` already send
+these notifications themselves, in which case `workspaceOpen` can be omitted.
+
+Note that `--logLevel` is required by that server, and that anything more
+verbose than `Warning` makes it stream every internal log line to the client.
 
 #### Installing language servers
 
@@ -1726,6 +1763,32 @@ Grok discovers hooks from `.grok/hooks/` in the project directory. Manage them w
 /hooks-trust             # trust this project for hook execution
 /hooks-add <path>        # add a custom hook file or directory
 ```
+
+### Hooks in config files
+
+Hooks can also be defined directly in the config layers, so they can be
+distributed with your other configuration instead of as separate JSON files. Add
+a `[[hooks.<Event>]]` table to `config.toml` (your own), `managed_config.toml`, or
+`requirements.toml`:
+
+```toml
+[[hooks.PreToolUse]]
+matcher = "Bash|Write|Edit"
+  [[hooks.PreToolUse.hooks]]
+  type = "command"
+  command = "/opt/guard/pretooluse.sh"   # use an absolute path
+  timeout = 10
+```
+
+The schema matches the JSON `hooks` object used in hook files. Hooks are read from
+every layer and combined additively: a lower-priority layer can add hooks but
+never removes or replaces another layer's block. Each hook's `/hooks-list` name is
+prefixed with the layer it came from (for example `managed:` or
+`requirements/user:`).
+
+Config-layer hooks are convenience distribution, not an enforcement boundary: on
+an unmanaged device a user can still edit these files. Tamper-resistant,
+admin-enforced hooks are tracked separately.
 
 ---
 

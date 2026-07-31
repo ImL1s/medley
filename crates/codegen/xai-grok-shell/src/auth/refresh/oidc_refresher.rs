@@ -13,8 +13,9 @@ use crate::auth::manager::AuthManager;
 /// Escalate to `PermanentFailure` after this many consecutive transient
 /// failures (then `PERMANENT_FAILURE_TTL` allows recovery). OIDC tolerates more
 /// blips than `ExternalBinaryRefresher` (1) since network refreshes flake more
-/// than a local binary.
-const MAX_CONSECUTIVE_TRANSIENT_FAILURES: u32 = 3;
+/// than a local binary. Kept above `try_recover_unauthorized`'s per-recovery
+/// attempt budget so one 401 recovery cannot alone escalate.
+const MAX_CONSECUTIVE_TRANSIENT_FAILURES: u32 = 5;
 
 /// Consecutive transient-failure budget, scoped to the credential it accrued
 /// against. Held under one lock so the credential check, reset, and increment
@@ -60,7 +61,15 @@ impl OidcRefresher {
         &self,
         message: String,
         tried_key: Option<String>,
+        network_unreachable: bool,
     ) -> RefreshOutcome {
+        // Never reached the IdP → proves nothing about the credential: don't
+        // consume the escalation budget (and don't reset it — only real
+        // refresh progress does). See `OidcRefreshResult::Failed`.
+        if network_unreachable {
+            tracing::debug!(%message, "auth: transient refresh failure (network unreachable), not counted toward escalation");
+            return RefreshOutcome::transient(message);
+        }
         let escalate = {
             let mut budget = self.transient_budget.lock();
             // Re-arm when the credential changes so a fresh token never inherits
@@ -146,12 +155,9 @@ impl OidcRefresher {
                     None,
                     Some(serde_json::json!({ "reason": format!("{reason:?}") })),
                 );
-                Some(RefreshOutcome::permanent(
-                    reason,
-                    Some(disk_now.key.clone()),
-                ))
+                Some(RefreshOutcome::permanent_for(reason, &disk_now))
             }
-            OidcRefreshResult::Failed => {
+            OidcRefreshResult::Failed { .. } => {
                 Some(RefreshOutcome::transient("OIDC disk-retry refresh failed"))
             }
         }
@@ -244,13 +250,16 @@ impl TokenRefresher for OidcRefresher {
                         &self.upload_in_flight,
                     );
                 }
-                RefreshOutcome::permanent(reason, Some(auth.key.clone()))
+                RefreshOutcome::permanent_for(reason, &auth)
             }
-            OidcRefreshResult::Failed => {
+            OidcRefreshResult::Failed {
+                network_unreachable,
+            } => {
                 tracing::warn!(
                     refresh_reason = ?reason,
                     user_id = %auth.user_id,
                     has_refresh_token = auth.refresh_token.is_some(),
+                    network_unreachable,
                     issuer = ?auth.oidc_issuer,
                     client_id = ?auth.oidc_client_id,
                     expires_at = ?auth.expires_at,
@@ -262,6 +271,7 @@ impl TokenRefresher for OidcRefresher {
                     Some(serde_json::json!({
                         "has_refresh_token": auth.refresh_token.is_some(),
                         "auth_mode": format!("{:?}", auth.auth_mode),
+                        "network_unreachable": network_unreachable,
                         "issuer": auth.oidc_issuer,
                         "client_id": auth.oidc_client_id,
                         "expires_at": auth.expires_at.map(|e| e.to_rfc3339()),
@@ -278,6 +288,7 @@ impl TokenRefresher for OidcRefresher {
                 self.record_transient_failure(
                     "OIDC token refresh failed".into(),
                     Some(auth.key.clone()),
+                    network_unreachable,
                 )
             }
         }

@@ -25,6 +25,8 @@ fn test_config_with_window(context_window: u64) -> SamplingConfig {
         top_p: None,
         api_backend: Default::default(),
         extra_headers: Default::default(),
+        query_params: Default::default(),
+        env_http_headers: Default::default(),
         context_window: NonZeroU64::new(context_window)
             .expect("test context_window must be non-zero"),
         reasoning_effort: None,
@@ -466,6 +468,7 @@ async fn record_last_turn_usage_round_trip() {
         total_tokens: 1290,
         reasoning_tokens: 0,
         cached_prompt_tokens: 800,
+        cache_creation_prompt_tokens: 0,
     };
     h.handle.record_last_turn_usage(usage.clone());
 
@@ -481,6 +484,7 @@ async fn record_last_turn_usage_round_trip() {
         total_tokens: 10000,
         reasoning_tokens: 0,
         cached_prompt_tokens: 0,
+        cache_creation_prompt_tokens: 0,
     };
     h.handle.record_last_turn_usage(next);
     let got2 = h
@@ -502,6 +506,7 @@ async fn prompt_usage_ledger_via_handle_resets_and_clears() {
         total_tokens: 12,
         reasoning_tokens: 0,
         cached_prompt_tokens: 0,
+        cache_creation_prompt_tokens: 0,
     };
 
     let h = TestHarness::new();
@@ -1170,6 +1175,8 @@ async fn update_sampling_config_is_queryable() {
         top_p: None,
         api_backend: Default::default(),
         extra_headers: Default::default(),
+        query_params: Default::default(),
+        env_http_headers: Default::default(),
         context_window: NonZeroU64::new(200_000).unwrap(),
         reasoning_effort: None,
         stream_tool_calls: None,
@@ -1555,6 +1562,8 @@ async fn build_request_uses_sampling_config() {
         top_p: Some(0.9),
         api_backend: Default::default(),
         extra_headers: Default::default(),
+        query_params: Default::default(),
+        env_http_headers: Default::default(),
         context_window: NonZeroU64::new(128_000).unwrap(),
         reasoning_effort: None,
         stream_tool_calls: None,
@@ -3696,6 +3705,8 @@ async fn sampling_config_survives_compaction_replacement() {
         top_p: Some(0.95),
         api_backend: ApiBackend::Responses,
         extra_headers: Default::default(),
+        query_params: Default::default(),
+        env_http_headers: Default::default(),
         context_window: NonZeroU64::new(500_000).unwrap(),
         reasoning_effort: None,
         stream_tool_calls: None,
@@ -3779,6 +3790,8 @@ async fn model_metadata_lost_after_compaction_then_recovered_on_next_turn() {
         top_p: Some(0.95),
         api_backend: Default::default(),
         extra_headers: Default::default(),
+        query_params: Default::default(),
+        env_http_headers: Default::default(),
         context_window: NonZeroU64::new(500_000).unwrap(),
         reasoning_effort: None,
         stream_tool_calls: None,
@@ -3867,6 +3880,8 @@ async fn context_window_downgrade_triggers_auto_compact() {
         top_p: Some(0.95),
         api_backend: ApiBackend::Responses,
         extra_headers: Default::default(),
+        query_params: Default::default(),
+        env_http_headers: Default::default(),
         context_window: NonZeroU64::new(500_000).unwrap(),
         reasoning_effort: None,
         stream_tool_calls: None,

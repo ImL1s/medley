@@ -217,6 +217,16 @@ impl AgentView {
     /// `QueueEvent::EditSelected` (called from `handle_queue_key`).
     pub(super) fn enter_queue_edit(&mut self, id: u64, is_server: bool, row: Option<QueueRowRef>) {
         use crate::app::agent::QueueEntryKind;
+        // Still an optimistic echo: its `session/prompt` RPC is in flight, so
+        // the shell has no row to hold yet — the `hold_edit` would no-op and
+        // the later-confirmed row could be absorbed while the composer edits
+        // it. Ignore until the confirming `x.ai/queue/changed` lands (mirrors
+        // the send-now park gate in `force_interject_queue_row`).
+        if let Some(sid) = row.as_ref().and_then(|r| r.server_id.as_deref())
+            && self.optimistic_queue_ids.contains(sid)
+        {
+            return;
+        }
         type QueueEditEntryData = (
             String,
             QueueEntryKind,
@@ -1313,7 +1323,7 @@ mod tests {
         agent.active_modal = Some(ActiveModal::CommandPalette {
             entries: crate::views::modal::default_palette_entries(
                 agent.sharing_enabled,
-                agent.prompt.slash_controller.screen_mode(),
+                &agent.prompt.slash_controller,
             ),
             state: crate::views::picker::PickerState::input_active(),
             window: crate::views::modal_window::ModalWindowState::new(),
