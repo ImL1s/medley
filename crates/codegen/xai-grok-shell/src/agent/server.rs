@@ -12,8 +12,12 @@
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     Router,
@@ -44,6 +48,7 @@ use crate::agent::models::{ModelFetchAuth, prefetch_models_blocking};
 use crate::agent::mvp_agent::MvpAgent;
 
 use indexmap::IndexMap;
+use sha2::{Digest as _, Sha256};
 
 /// Swappable destination for the relay task.
 ///
@@ -55,6 +60,9 @@ type RelayDest = Rc<RefCell<Option<mpsc::UnboundedSender<AcpClientMessage>>>>;
 
 const MAX_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const KEEPALIVE_INTERVAL_SECS: u64 = 15;
+const AUTH_FAILURE_WARN_INTERVAL_SECS: u64 = 30;
+pub const MIN_REMOTE_SECRET_BYTES: usize = 32;
+type SecretDigest = [u8; 32];
 
 fn close_reason_diagnostic(reason: &str) -> (bool, usize) {
     (!reason.is_empty(), reason.len())
@@ -67,6 +75,8 @@ pub struct ServerConfig {
     pub bind_addr: SocketAddr,
     /// Secret token for client authentication (required)
     pub secret: String,
+    /// Explicit acknowledgement required when binding beyond loopback.
+    pub allow_remote: bool,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -74,6 +84,7 @@ impl std::fmt::Debug for ServerConfig {
         f.debug_struct("ServerConfig")
             .field("bind_addr", &self.bind_addr)
             .field("secret_present", &!self.secret.is_empty())
+            .field("allow_remote", &self.allow_remote)
             .finish()
     }
 }
@@ -81,7 +92,9 @@ impl std::fmt::Debug for ServerConfig {
 /// Shared state for the WebSocket server.
 struct ServerState {
     agent_config: AgentConfig,
-    secret: String,
+    secret_digest: SecretDigest,
+    allow_legacy_query_auth: bool,
+    last_auth_failure_warning: AtomicU64,
     /// Channel to send new WebSocket connections to the persistent agent thread.
     /// Lazily initialised on first connection; protected by a tokio Mutex so the
     /// axum handler (which is `Send`) can acquire it.
@@ -109,23 +122,82 @@ impl std::fmt::Debug for WsQueryParams {
     }
 }
 
-/// Validate the bearer token from request headers or query parameters.
-fn validate_auth(headers: &HeaderMap, query: &WsQueryParams, expected_secret: &str) -> bool {
-    // Try Authorization header
-    if let Some(token) = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthSource {
+    Bearer,
+    LegacyQuery,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthDecision {
+    Authenticated(AuthSource),
+    Rejected,
+}
+
+fn digest_secret(secret: &str) -> SecretDigest {
+    Sha256::digest(secret.as_bytes()).into()
+}
+
+fn secrets_match(candidate: &str, expected_digest: &SecretDigest) -> bool {
+    let candidate_digest = digest_secret(candidate);
+    constant_time_eq::constant_time_eq_32(&candidate_digest, expected_digest)
+}
+
+fn should_warn_auth_failure(last_warning: &AtomicU64, now: u64) -> bool {
+    let mut previous = last_warning.load(Ordering::Relaxed);
+    loop {
+        if now.saturating_sub(previous) < AUTH_FAILURE_WARN_INTERVAL_SECS {
+            return false;
+        }
+        match last_warning.compare_exchange_weak(
+            previous,
+            now,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => previous = observed,
+        }
+    }
+}
+
+/// Authenticate a request without allowing malformed headers to downgrade to
+/// the legacy query-string mechanism.
+fn validate_auth(
+    headers: &HeaderMap,
+    query: &WsQueryParams,
+    expected_secret: &SecretDigest,
+    allow_legacy_query_auth: bool,
+) -> AuthDecision {
+    let authorization_values = headers.get_all(axum::http::header::AUTHORIZATION);
+    let mut values = authorization_values.iter();
+    if let Some(value) = values.next() {
+        // Multiple Authorization fields are ambiguous and must be rejected.
+        if values.next().is_some() {
+            return AuthDecision::Rejected;
+        }
+        let Ok(value) = value.to_str() else {
+            return AuthDecision::Rejected;
+        };
+        let Some(token) = value.strip_prefix("Bearer ") else {
+            return AuthDecision::Rejected;
+        };
+        return if !token.is_empty() && secrets_match(token, expected_secret) {
+            AuthDecision::Authenticated(AuthSource::Bearer)
+        } else {
+            AuthDecision::Rejected
+        };
+    }
+
+    if allow_legacy_query_auth
+        && let Some(key) = query.server_key.as_deref()
+        && !key.is_empty()
+        && secrets_match(key, expected_secret)
     {
-        return token == expected_secret;
+        return AuthDecision::Authenticated(AuthSource::LegacyQuery);
     }
 
-    // Fall back to query parameter for browser connections
-    if let Some(ref key) = query.server_key {
-        return key == expected_secret;
-    }
-
-    false
+    AuthDecision::Rejected
 }
 
 /// WebSocket upgrade handler with authentication.
@@ -137,13 +209,33 @@ async fn ws_handler(
     Query(query): Query<WsQueryParams>,
 ) -> Response {
     // Validate secret token from header or query param
-    if !validate_auth(&headers, &query, &state.secret) {
-        warn!("Unauthorized connection attempt from {}", addr);
-        return (
-            StatusCode::UNAUTHORIZED,
-            "Invalid or missing authorization token",
-        )
-            .into_response();
+    match validate_auth(
+        &headers,
+        &query,
+        &state.secret_digest,
+        state.allow_legacy_query_auth,
+    ) {
+        AuthDecision::Authenticated(AuthSource::Bearer) => {}
+        AuthDecision::Authenticated(AuthSource::LegacyQuery) => {
+            warn!(
+                peer = %addr,
+                "Authenticated via deprecated server-key query parameter; use an Authorization Bearer header"
+            );
+        }
+        AuthDecision::Rejected => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or_default();
+            if should_warn_auth_failure(&state.last_auth_failure_warning, now) {
+                warn!(peer = %addr, "Unauthorized connection attempt");
+            }
+            return (
+                StatusCode::UNAUTHORIZED,
+                "Invalid or missing authorization token",
+            )
+                .into_response();
+        }
     }
 
     info!("Authenticated WebSocket connection from {}", addr);
@@ -480,17 +572,44 @@ fn setup_acp_connection(
 /// ```ignore
 /// let server_config = ServerConfig {
 ///     bind_addr: "0.0.0.0:9000".parse().unwrap(),
-///     secret: "my-secret-token".to_string(),
+///     secret: std::env::var("GROK_AGENT_SECRET")
+///         .expect("set a cryptographically random 256-bit token"),
+///     allow_remote: true,
 /// };
 /// run_agent_server(server_config, agent_config).await?;
 /// ```
+fn validate_server_config(config: &ServerConfig) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !config.secret.is_empty(),
+        "agent server requires a non-empty authentication secret"
+    );
+    anyhow::ensure!(
+        config.bind_addr.ip().is_loopback() || config.allow_remote,
+        "non-loopback agent server binding requires explicit remote acknowledgement"
+    );
+    anyhow::ensure!(
+        config.bind_addr.ip().is_loopback() || config.secret.len() >= MIN_REMOTE_SECRET_BYTES,
+        "non-loopback agent server requires an explicit secret of at least {MIN_REMOTE_SECRET_BYTES} bytes"
+    );
+    Ok(())
+}
+
 pub async fn run_agent_server(
     config: ServerConfig,
     agent_config: AgentConfig,
 ) -> anyhow::Result<()> {
+    // This synchronous validation must remain before state construction, task
+    // creation, and listener binding so rejected configurations have no side
+    // effects.
+    validate_server_config(&config)?;
+    let allow_legacy_query_auth = config.bind_addr.ip().is_loopback();
+    let secret_digest = digest_secret(&config.secret);
+
     let state = Arc::new(ServerState {
         agent_config,
-        secret: config.secret,
+        secret_digest,
+        allow_legacy_query_auth,
+        last_auth_failure_warning: AtomicU64::new(0),
         agent_conn_tx: tokio::sync::Mutex::new(None),
     });
 
@@ -518,25 +637,324 @@ pub async fn run_agent_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::{HeaderValue, header::AUTHORIZATION};
+
+    const SECRET: &str = "GB002-server-auth-Q7w5E3r1T9y7Z6x4C2v8";
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    fn query_with(key: &str) -> WsQueryParams {
+        WsQueryParams {
+            server_key: Some(key.to_owned()),
+        }
+    }
+
+    fn validate_test_auth(
+        headers: &HeaderMap,
+        query: &WsQueryParams,
+        allow_legacy_query_auth: bool,
+    ) -> AuthDecision {
+        validate_auth(
+            headers,
+            query,
+            &digest_secret(SECRET),
+            allow_legacy_query_auth,
+        )
+    }
 
     #[test]
-    fn server_auth_debug_is_presence_only() {
-        let secret = "GB002-server-auth-Q7w5E3r1T9y7";
+    fn issue8_agent_serve_security_auth_debug_is_presence_only() {
         let config = ServerConfig {
             bind_addr: "127.0.0.1:9000".parse().unwrap(),
-            secret: secret.to_owned(),
+            secret: SECRET.to_owned(),
+            allow_remote: false,
         };
         let query = WsQueryParams {
-            server_key: Some(secret.to_owned()),
+            server_key: Some(SECRET.to_owned()),
         };
         let rendered = format!("{config:?}\n{query:?}");
         assert!(rendered.contains("secret_present: true"));
         assert!(rendered.contains("server_key_present: true"));
-        assert!(!rendered.contains(secret));
-        for window in secret.as_bytes().windows(8) {
+        assert!(rendered.contains("allow_remote: false"));
+        assert!(!rendered.contains(SECRET));
+        for window in SECRET.as_bytes().windows(8) {
             let window = std::str::from_utf8(window).unwrap();
             assert!(!rendered.contains(window), "leaked secret window: {window}");
         }
+    }
+
+    #[test]
+    fn issue8_agent_serve_security_valid_bearer_authenticates() {
+        assert_eq!(
+            validate_test_auth(&bearer_headers(SECRET), &WsQueryParams::default(), false),
+            AuthDecision::Authenticated(AuthSource::Bearer)
+        );
+    }
+
+    #[test]
+    fn issue8_agent_serve_security_bearer_mismatches_are_rejected() {
+        let candidates = [
+            "XB002-server-auth-Q7w5E3r1T9y7",
+            "GB002-server-auth-X7w5E3r1T9y7",
+            "GB002-server-auth-Q7w5E3r1T9yX",
+            "GB002-server-auth-Q7w5E3r1T9y",
+            "GB002-server-auth-Q7w5E3r1T9y7-extra",
+        ];
+        for candidate in candidates {
+            assert_eq!(
+                validate_test_auth(&bearer_headers(candidate), &WsQueryParams::default(), false),
+                AuthDecision::Rejected,
+                "unexpected match for {candidate}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue8_agent_serve_security_authorization_header_never_downgrades_to_query_auth() {
+        let query = query_with(SECRET);
+
+        let malformed_values = [
+            "Basic credentials",
+            "bearer not-case-insensitive",
+            "Bearer ",
+        ];
+        for value in malformed_values {
+            let mut headers = HeaderMap::new();
+            headers.insert(AUTHORIZATION, HeaderValue::from_str(value).unwrap());
+            assert_eq!(
+                validate_test_auth(&headers, &query, true),
+                AuthDecision::Rejected
+            );
+        }
+
+        let mut invalid_utf8 = HeaderMap::new();
+        invalid_utf8.insert(
+            AUTHORIZATION,
+            HeaderValue::from_bytes(b"Bearer \xff").unwrap(),
+        );
+        assert_eq!(
+            validate_test_auth(&invalid_utf8, &query, true),
+            AuthDecision::Rejected
+        );
+
+        assert_eq!(
+            validate_test_auth(&bearer_headers("wrong"), &query, true),
+            AuthDecision::Rejected
+        );
+
+        let mut multiple = bearer_headers(SECRET);
+        multiple.append(AUTHORIZATION, HeaderValue::from_static("Bearer wrong"));
+        assert_eq!(
+            validate_test_auth(&multiple, &query, true),
+            AuthDecision::Rejected
+        );
+    }
+
+    #[test]
+    fn issue8_agent_serve_security_query_auth_is_loopback_compatibility_only() {
+        assert_eq!(
+            validate_test_auth(&HeaderMap::new(), &query_with(SECRET), true),
+            AuthDecision::Authenticated(AuthSource::LegacyQuery)
+        );
+        assert_eq!(
+            validate_test_auth(&HeaderMap::new(), &query_with(SECRET), false),
+            AuthDecision::Rejected
+        );
+        assert_eq!(
+            validate_test_auth(&HeaderMap::new(), &query_with("wrong"), true),
+            AuthDecision::Rejected
+        );
+        assert_eq!(
+            validate_test_auth(&HeaderMap::new(), &WsQueryParams::default(), true),
+            AuthDecision::Rejected
+        );
+    }
+
+    #[test]
+    fn issue8_agent_serve_security_server_config_preflight_is_fail_closed() {
+        for address in ["127.0.0.1:2419", "127.31.22.9:2419", "[::1]:2419"] {
+            let config = ServerConfig {
+                bind_addr: address.parse().unwrap(),
+                secret: SECRET.to_owned(),
+                allow_remote: false,
+            };
+            assert!(validate_server_config(&config).is_ok(), "{address}");
+        }
+
+        for address in [
+            "0.0.0.0:2419",
+            "192.168.1.4:2419",
+            "10.0.0.8:2419",
+            "203.0.113.10:2419",
+            "[::]:2419",
+        ] {
+            let mut config = ServerConfig {
+                bind_addr: address.parse().unwrap(),
+                secret: SECRET.to_owned(),
+                allow_remote: false,
+            };
+            assert!(validate_server_config(&config).is_err(), "{address}");
+            config.allow_remote = true;
+            assert!(validate_server_config(&config).is_ok(), "{address}");
+        }
+
+        let empty_secret = ServerConfig {
+            bind_addr: "127.0.0.1:2419".parse().unwrap(),
+            secret: String::new(),
+            allow_remote: false,
+        };
+        assert!(validate_server_config(&empty_secret).is_err());
+
+        let weak_remote_secret = ServerConfig {
+            bind_addr: "0.0.0.0:2419".parse().unwrap(),
+            secret: "too-short".to_owned(),
+            allow_remote: true,
+        };
+        assert_eq!(
+            validate_server_config(&weak_remote_secret)
+                .expect_err("weak remote secret must fail")
+                .to_string(),
+            format!(
+                "non-loopback agent server requires an explicit secret of at least {MIN_REMOTE_SECRET_BYTES} bytes"
+            )
+        );
+    }
+
+    #[test]
+    fn issue8_agent_serve_security_auth_failure_warnings_are_rate_limited() {
+        let last_warning = AtomicU64::new(0);
+        assert!(should_warn_auth_failure(&last_warning, 100));
+        assert!(!should_warn_auth_failure(&last_warning, 101));
+        assert!(!should_warn_auth_failure(&last_warning, 129));
+        assert!(should_warn_auth_failure(&last_warning, 130));
+        assert_eq!(last_warning.load(Ordering::Relaxed), 130);
+    }
+
+    async fn unused_loopback_addr() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve loopback port");
+        let addr = listener.local_addr().expect("reserved loopback address");
+        drop(listener);
+        addr
+    }
+
+    async fn wait_for_loopback_listener(addr: SocketAddr) {
+        for _ in 0..100 {
+            if let Ok(stream) = tokio::net::TcpStream::connect(addr).await {
+                drop(stream);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("agent server did not listen on {addr}");
+    }
+
+    fn assert_unauthorized_handshake(error: tokio_tungstenite::tungstenite::Error) {
+        let tokio_tungstenite::tungstenite::Error::Http(response) = error else {
+            panic!("expected an HTTP authentication rejection, got {error:?}");
+        };
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = response
+            .body()
+            .as_deref()
+            .map(String::from_utf8_lossy)
+            .unwrap_or_default();
+        assert_eq!(body, "Invalid or missing authorization token");
+        assert!(!body.contains(SECRET));
+    }
+
+    #[tokio::test]
+    async fn issue8_agent_serve_security_loopback_server_startup_and_authentication_smoke() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+        let addr = unused_loopback_addr().await;
+        let server = tokio::spawn(run_agent_server(
+            ServerConfig {
+                bind_addr: addr,
+                secret: SECRET.to_owned(),
+                allow_remote: false,
+            },
+            AgentConfig::default(),
+        ));
+        wait_for_loopback_listener(addr).await;
+
+        let wrong_query =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/ws?server-key=wrong"))
+                .await
+                .expect_err("wrong query secret must be rejected");
+        assert_unauthorized_handshake(wrong_query);
+
+        let mut no_downgrade = format!("ws://{addr}/ws?server-key={SECRET}")
+            .into_client_request()
+            .expect("websocket request");
+        no_downgrade.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic invalid-credentials"),
+        );
+        let no_downgrade = tokio_tungstenite::connect_async(no_downgrade)
+            .await
+            .expect_err("malformed Authorization must not downgrade to query auth");
+        assert_unauthorized_handshake(no_downgrade);
+
+        let mut bearer = format!("ws://{addr}/ws")
+            .into_client_request()
+            .expect("websocket request");
+        bearer.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {SECRET}")).unwrap(),
+        );
+        let (mut bearer_ws, bearer_response) = tokio_tungstenite::connect_async(bearer)
+            .await
+            .expect("Bearer authentication should upgrade");
+        assert_eq!(bearer_response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        bearer_ws.close(None).await.expect("close Bearer websocket");
+
+        let (mut query_ws, query_response) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/ws?server-key={SECRET}"))
+                .await
+                .expect("loopback legacy query authentication should upgrade");
+        assert_eq!(query_response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        query_ws.close(None).await.expect("close query websocket");
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn issue8_agent_serve_security_remote_rejection_precedes_listener_binding() {
+        let addr = unused_loopback_addr().await;
+        let remote_addr = SocketAddr::from(([0, 0, 0, 0], addr.port()));
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_agent_server(
+                ServerConfig {
+                    bind_addr: remote_addr,
+                    secret: SECRET.to_owned(),
+                    allow_remote: false,
+                },
+                AgentConfig::default(),
+            ),
+        )
+        .await
+        .expect("remote preflight must return before listening")
+        .expect_err("remote bind without acknowledgement must fail");
+        assert_eq!(
+            result.to_string(),
+            "non-loopback agent server binding requires explicit remote acknowledgement"
+        );
+
+        let listener = TcpListener::bind(addr)
+            .await
+            .expect("rejected server must not consume the port");
+        drop(listener);
     }
 
     #[test]

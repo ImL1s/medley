@@ -29,6 +29,7 @@ blake3 = { workspace = true }
 bm25 = "2.3"
 bytes = { workspace = true }
 chrono = { workspace = true }
+constant_time_eq = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
 ignore = { workspace = true }
 jsonschema = { workspace = true }

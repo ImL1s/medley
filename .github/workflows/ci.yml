@@ -196,6 +196,29 @@ jobs:
           run_nonzero -p xai-grok-workspace --lib \
             drop_cleanup_clears_old_generation_resources_written_in_flight -- --nocapture
 
+      - name: Agent serve exposure and authentication
+        env:
+          PROTOC: protoc
+        run: |
+          set -o pipefail
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
+              echo "test filter matched zero tests: $*" >&2
+              rm -f "$output"
+              return 1
+            }
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib \
+            issue8_agent_serve_security_ -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            issue8_agent_serve_security_ -- --nocapture
+          run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
+            issue8_agent_serve_security_ -- --nocapture
+
       - name: Shell auth + readiness meta
         env:
           PROTOC: protoc

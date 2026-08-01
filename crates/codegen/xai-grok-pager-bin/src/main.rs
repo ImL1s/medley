@@ -27,6 +27,7 @@ mod jemalloc_malloc_conf {
 }
 use anyhow::Result;
 use std::env;
+use std::io::{IsTerminal as _, Write as _};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use tokio_util::sync::CancellationToken;
@@ -87,26 +88,83 @@ fn resolve_agent_profile_path(path: &std::path::Path) -> std::path::PathBuf {
         }
     }
 }
-/// Print startup information for the serve command.
-fn print_serve_startup_info(bind_addr: SocketAddr) {
-    eprintln!();
-    eprintln!("   Grok agent server starting...");
-    eprintln!();
-    eprintln!("   Address:  {}:{}", bind_addr.ip(), bind_addr.port());
-    eprintln!("   Authentication: configured");
-    eprintln!("   WebSocket endpoint: ws://{bind_addr}/ws");
-    eprintln!("   Supply the server key through the client configuration; it is never printed.");
-    eprintln!();
+/// Write secret-free startup information for the serve command.
+fn write_serve_startup_info(writer: &mut impl std::io::Write, bind_addr: SocketAddr) -> Result<()> {
+    writeln!(writer)?;
+    writeln!(writer, "   Grok agent server starting...")?;
+    writeln!(writer)?;
+    writeln!(
+        writer,
+        "   Address:  {}:{}",
+        bind_addr.ip(),
+        bind_addr.port()
+    )?;
+    writeln!(writer, "   Authentication: configured")?;
+    writeln!(writer, "   WebSocket endpoint: ws://{bind_addr}/ws")?;
+    if !bind_addr.ip().is_loopback() {
+        writeln!(
+            writer,
+            "   WARNING: do not expose plaintext ws:// directly; use a TLS reverse proxy, or keep the listener on loopback and use an SSH tunnel."
+        )?;
+    }
+    writeln!(writer)?;
+    writer.flush()?;
+    Ok(())
 }
 const SERVE_SECRET_REQUIRED: &str =
-    "agent serve requires --secret or GROK_AGENT_SECRET; generated secrets are not printed";
+    "agent serve requires --secret or GROK_AGENT_SECRET when stderr is not an interactive terminal";
+const SERVE_REMOTE_ACK_REQUIRED: &str =
+    "non-loopback agent serve requires --allow-remote before the listener is opened";
+const SERVE_REMOTE_SECRET_REQUIRED: &str = "non-loopback agent serve requires an explicit --secret or GROK_AGENT_SECRET of at least 32 bytes";
 
-fn resolve_serve_secret(args: &ServeArgs) -> Result<String> {
-    args.secret
+struct PreparedServe {
+    secret: String,
+    generated_secret: bool,
+}
+
+fn prepare_serve(args: &ServeArgs, stderr_is_terminal: bool) -> Result<PreparedServe> {
+    let explicit_secret = args
+        .secret
         .as_ref()
         .filter(|secret| !secret.is_empty())
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!(SERVE_SECRET_REQUIRED))
+        .cloned();
+
+    if !args.bind.ip().is_loopback() {
+        if !args.allow_remote {
+            anyhow::bail!(SERVE_REMOTE_ACK_REQUIRED);
+        }
+        let secret =
+            explicit_secret.ok_or_else(|| anyhow::anyhow!(SERVE_REMOTE_SECRET_REQUIRED))?;
+        if secret.len() < xai_grok_shell::agent::MIN_REMOTE_SECRET_BYTES {
+            anyhow::bail!(SERVE_REMOTE_SECRET_REQUIRED);
+        }
+        return Ok(PreparedServe {
+            secret,
+            generated_secret: false,
+        });
+    }
+
+    if let Some(secret) = explicit_secret {
+        return Ok(PreparedServe {
+            secret,
+            generated_secret: false,
+        });
+    }
+    if !stderr_is_terminal {
+        anyhow::bail!(SERVE_SECRET_REQUIRED);
+    }
+    Ok(PreparedServe {
+        secret: ServeArgs::generate_secret()?,
+        generated_secret: true,
+    })
+}
+
+fn write_generated_serve_secret(writer: &mut impl std::io::Write, secret: &str) -> Result<()> {
+    writer.write_all(b"   Generated server secret (shown once): ")?;
+    writer.write_all(secret.as_bytes())?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
 }
 /// Entrypoint tag for `grok -p`; keys the quiet stderr default in `init_tracing_simple`.
 const HEADLESS_ENTRYPOINT: &str = "headless";
@@ -1393,12 +1451,20 @@ async fn run_agent_command(
         Some(AgentCmd::Serve(a)) => {
             let mut agent_config = agent_config.clone();
             apply_headless_args_to_config(&a.headless, &mut agent_config);
-            let secret = resolve_serve_secret(&a)?;
+            let prepared = prepare_serve(&a, std::io::stderr().is_terminal())?;
+            {
+                let stderr = std::io::stderr();
+                let mut stderr = stderr.lock();
+                if prepared.generated_secret {
+                    write_generated_serve_secret(&mut stderr, &prepared.secret)?;
+                }
+                write_serve_startup_info(&mut stderr, a.bind)?;
+            }
             let server_config = xai_grok_shell::agent::ServerConfig {
                 bind_addr: a.bind,
-                secret: secret.clone(),
+                secret: prepared.secret,
+                allow_remote: a.allow_remote,
             };
-            print_serve_startup_info(a.bind);
             xai_grok_shell::agent::run_agent_server(server_config, agent_config).await
         }
         Some(AgentCmd::Leader(a)) => {
@@ -2764,27 +2830,148 @@ mod tests {
             Some(Command::Version { json: false })
         ));
     }
+    fn serve_args(bind: &str, secret: Option<&str>, allow_remote: bool) -> ServeArgs {
+        ServeArgs {
+            bind: bind.parse().unwrap(),
+            secret: secret.map(str::to_owned),
+            allow_remote,
+            remote: None,
+            headless: HeadlessArgs::default(),
+        }
+    }
+
+    fn assert_prepared(prepared: PreparedServe, expected_secret: &str, expected_generated: bool) {
+        assert_eq!(prepared.secret, expected_secret);
+        assert_eq!(prepared.generated_secret, expected_generated);
+    }
+
     #[test]
-    fn serve_requires_an_explicit_nonempty_secret() {
+    fn issue8_agent_serve_security_loopback_secret_policy_is_tty_gated() {
+        for bind in ["127.0.0.1:2419", "127.42.0.9:2419", "[::1]:2419"] {
+            let explicit = serve_args(bind, Some("client-configured-secret"), false);
+            assert_prepared(
+                prepare_serve(&explicit, false).unwrap(),
+                "client-configured-secret",
+                false,
+            );
+
+            let missing = serve_args(bind, None, false);
+            assert_eq!(
+                prepare_serve(&missing, false)
+                    .err()
+                    .expect("missing secret must fail")
+                    .to_string(),
+                SERVE_SECRET_REQUIRED
+            );
+            let generated = prepare_serve(&missing, true).unwrap();
+            assert!(generated.generated_secret);
+            assert_eq!(generated.secret.len(), 43);
+        }
+    }
+
+    #[test]
+    fn issue8_agent_serve_security_empty_secret_is_missing() {
+        let args = serve_args("127.0.0.1:2419", Some(""), false);
+        assert_eq!(
+            prepare_serve(&args, false)
+                .err()
+                .expect("empty secret must fail")
+                .to_string(),
+            SERVE_SECRET_REQUIRED
+        );
+    }
+
+    #[test]
+    fn issue8_agent_serve_security_remote_bind_requires_acknowledgement_and_explicit_secret() {
+        const STRONG_SECRET: &str = "client-configured-secret-Q7w5E3r1T9y7";
+        for bind in ["0.0.0.0:2419", "192.168.1.20:2419", "203.0.113.4:2419"] {
+            let unacknowledged = serve_args(bind, Some(STRONG_SECRET), false);
+            assert_eq!(
+                prepare_serve(&unacknowledged, true)
+                    .err()
+                    .expect("remote bind without acknowledgement must fail")
+                    .to_string(),
+                SERVE_REMOTE_ACK_REQUIRED
+            );
+
+            for secret in [None, Some(""), Some("too-short")] {
+                let missing = serve_args(bind, secret, true);
+                assert_eq!(
+                    prepare_serve(&missing, true)
+                        .err()
+                        .expect("remote bind without explicit secret must fail")
+                        .to_string(),
+                    SERVE_REMOTE_SECRET_REQUIRED
+                );
+            }
+
+            let allowed = serve_args(bind, Some(STRONG_SECRET), true);
+            assert_prepared(
+                prepare_serve(&allowed, false).unwrap(),
+                STRONG_SECRET,
+                false,
+            );
+        }
+    }
+
+    #[test]
+    fn issue8_agent_serve_security_generated_secret_is_written_only_to_the_explicit_sink() {
+        const SENTINEL: &str = "issue8-generated-secret-Q7w5E3r1T9y7Z6x4";
+        let mut output = Vec::new();
+        write_generated_serve_secret(&mut output, SENTINEL).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            format!("   Generated server secret (shown once): {SENTINEL}\n")
+        );
+
+        let mut startup = Vec::new();
+        write_serve_startup_info(&mut startup, "127.0.0.1:2419".parse().unwrap()).unwrap();
+        let startup = String::from_utf8(startup).unwrap();
+        assert!(!startup.contains(SENTINEL));
+        assert!(!startup.contains("server-key="));
+        assert!(startup.contains("WebSocket endpoint: ws://127.0.0.1:2419/ws"));
+    }
+
+    #[test]
+    fn issue8_agent_serve_security_noninteractive_missing_secret_emits_no_secret() {
+        let args = serve_args("127.0.0.1:2419", None, false);
+        let error = prepare_serve(&args, false)
+            .err()
+            .expect("missing noninteractive secret must fail")
+            .to_string();
+        assert_eq!(error, SERVE_SECRET_REQUIRED);
+        assert!(!error.contains("server-key="));
+        assert!(!error.contains("ws://"));
+    }
+
+    #[test]
+    fn issue8_agent_serve_security_requires_an_explicit_nonempty_secret_in_noninteractive_mode() {
         let mut args = ServeArgs {
             bind: "127.0.0.1:2419".parse().unwrap(),
             secret: None,
+            allow_remote: false,
             remote: None,
             headless: HeadlessArgs::default(),
         };
         assert_eq!(
-            resolve_serve_secret(&args).unwrap_err().to_string(),
+            prepare_serve(&args, false)
+                .err()
+                .expect("missing secret must fail")
+                .to_string(),
             SERVE_SECRET_REQUIRED
         );
         args.secret = Some(String::new());
         assert_eq!(
-            resolve_serve_secret(&args).unwrap_err().to_string(),
+            prepare_serve(&args, false)
+                .err()
+                .expect("empty secret must fail")
+                .to_string(),
             SERVE_SECRET_REQUIRED
         );
         args.secret = Some("client-configured-secret".into());
         assert_eq!(
-            resolve_serve_secret(&args).unwrap(),
-            "client-configured-secret"
+            prepare_serve(&args, false).unwrap().secret,
+            "client-configured-secret".to_owned()
         );
     }
     #[cfg(all(feature = "jemalloc", unix))]

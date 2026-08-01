@@ -1,7 +1,9 @@
 //! CLI argument parsing for the pager.
 pub use crate::headless::OutputFormat;
+use base64::Engine as _;
 use clap::{ArgAction, Parser, Subcommand, ValueEnum, ValueHint};
 use clap_complete::Shell;
+use rand::TryRngCore as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 /// Top-level commands for the pager binary.
@@ -500,9 +502,12 @@ pub struct ServeArgs {
     /// Address for the server to listen on
     #[arg(long, default_value = "127.0.0.1:2419")]
     pub bind: SocketAddr,
-    /// Secret token for client authentication (auto-generated if not provided)
-    #[arg(long, env = "GROK_AGENT_SECRET")]
+    /// Secret token for client authentication
+    #[arg(long, env = "GROK_AGENT_SECRET", hide_env_values = true)]
     pub secret: Option<String>,
+    /// Acknowledge binding the plaintext WebSocket listener beyond loopback
+    #[arg(long)]
+    pub allow_remote: bool,
     /// Remote agent URL for proxy mode
     #[arg(long)]
     pub remote: Option<String>,
@@ -516,6 +521,7 @@ impl std::fmt::Debug for ServeArgs {
         f.debug_struct("ServeArgs")
             .field("bind", &self.bind)
             .field("secret_present", &self.secret.is_some())
+            .field("allow_remote", &self.allow_remote)
             .field("remote_present", &self.remote.is_some())
             .field(
                 "grok_ws_origin_present",
@@ -527,17 +533,18 @@ impl std::fmt::Debug for ServeArgs {
 }
 
 impl ServeArgs {
-    /// Get the secret, generating a random one if not provided.
-    pub fn get_secret(&self) -> String {
-        self.secret
-            .clone()
-            .unwrap_or_else(|| generate_random_key(12))
+    /// Generate a 256-bit URL-safe server secret from the operating system RNG.
+    pub fn generate_secret() -> anyhow::Result<String> {
+        let mut bytes = [0_u8; 32];
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut bytes)
+            .map_err(|error| anyhow::anyhow!("failed to generate agent server secret: {error}"))?;
+        Ok(encode_secret(&bytes))
     }
 }
-/// Generate a random alphanumeric key of the given length.
-fn generate_random_key(len: usize) -> String {
-    let raw = uuid::Uuid::new_v4().to_string().replace('-', "");
-    raw.chars().cycle().take(len).collect()
+
+fn encode_secret(bytes: &[u8; 32]) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 /// Arguments for the `agent leader` subcommand.
 #[derive(clap::Args, Clone)]
@@ -1225,6 +1232,7 @@ mod tests {
         let serve = ServeArgs {
             bind: "127.0.0.1:2419".parse().expect("valid socket address"),
             secret: Some(SENTINEL.to_owned()),
+            allow_remote: true,
             remote: Some(url("https", "remote")),
             headless: headless.clone(),
         };
@@ -1286,9 +1294,73 @@ mod tests {
         }
         let serve_output = format!("{serve:?}");
         assert!(serve_output.contains("secret_present: true"));
+        assert!(serve_output.contains("allow_remote: true"));
         assert!(serve_output.contains("remote_present: true"));
         assert!(serve_output.contains("grok_ws_origin_present: true"));
         assert!(serve_output.contains("grok_ws_url_present: true"));
+    }
+
+    #[test]
+    fn issue8_agent_serve_security_allow_remote_is_explicit_and_defaults_closed() {
+        let default = PagerArgs::try_parse_from(["grok", "agent", "serve"]).unwrap();
+        let Some(Command::Agent(agent)) = default.command else {
+            panic!("expected agent command");
+        };
+        let Some(AgentCmd::Serve(serve)) = agent.mode else {
+            panic!("expected serve mode");
+        };
+        assert!(!serve.allow_remote);
+
+        let enabled =
+            PagerArgs::try_parse_from(["grok", "agent", "serve", "--allow-remote"]).unwrap();
+        let Some(Command::Agent(agent)) = enabled.command else {
+            panic!("expected agent command");
+        };
+        let Some(AgentCmd::Serve(serve)) = agent.mode else {
+            panic!("expected serve mode");
+        };
+        assert!(serve.allow_remote);
+    }
+
+    #[test]
+    fn issue8_agent_serve_security_generated_secret_is_256_bit_url_safe_without_padding() {
+        let secret = ServeArgs::generate_secret().expect("OS RNG should be available");
+        assert_eq!(secret.len(), 43);
+        assert!(!secret.contains('='));
+        assert!(
+            secret
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        );
+    }
+
+    #[test]
+    fn issue8_agent_serve_security_secret_encoder_uses_all_32_bytes() {
+        let baseline = encode_secret(&[0_u8; 32]);
+        assert_eq!(baseline.len(), 43);
+        for index in 0..32 {
+            let mut bytes = [0_u8; 32];
+            bytes[index] = 1;
+            assert_ne!(encode_secret(&bytes), baseline, "byte {index} was ignored");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(GROK_AGENT_SECRET)]
+    fn issue8_agent_serve_security_help_hides_environment_secret_value() {
+        use clap::CommandFactory as _;
+
+        const SENTINEL: &str = "issue8-help-secret-Q7w5E3r1T9y7Z6x4";
+        let _guard = crate::test_util::EnvVarGuard::set("GROK_AGENT_SECRET", SENTINEL);
+        let mut command = PagerArgs::command();
+        let serve = command
+            .find_subcommand_mut("agent")
+            .and_then(|agent| agent.find_subcommand_mut("serve"))
+            .expect("agent serve subcommand");
+        let help = serve.render_long_help().to_string();
+
+        assert!(help.contains("GROK_AGENT_SECRET"));
+        assert_no_secret_fragments(&help, SENTINEL);
     }
 
     #[test]
