@@ -407,7 +407,7 @@ pub struct GatewayToolCallResponse {
     pub connectors_needing_reauth: Vec<String>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct GatewayToolCatalog {
     #[serde(default)]
     pub tools: Vec<GatewayTool>,
@@ -417,7 +417,7 @@ pub struct GatewayToolCatalog {
     pub connectors_needing_reauth: Vec<String>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct GatewayTool {
     pub connector_id: String,
     pub connector_name: String,

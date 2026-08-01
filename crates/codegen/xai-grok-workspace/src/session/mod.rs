@@ -83,6 +83,11 @@ pub struct WorkspaceSession {
     inner: RwLock<WorkspaceSessionInner>,
     /// Per-session lock that serialises `update_tool_config` calls.
     pub(crate) update_lock: tokio::sync::Mutex<()>,
+    /// Serializes the full MCP configure/teardown transaction for this exact
+    /// session generation. Drop cleanup waits on it after revoking the session
+    /// map entry, so an in-flight configure cannot repopulate resources after
+    /// teardown has completed.
+    pub(crate) mcp_configure_lock: tokio::sync::Mutex<()>,
     /// Per-session MCP state (owned clients, etc.).
     pub(crate) mcp_state: Arc<tokio::sync::Mutex<McpState>>,
     /// MCP bridges kept alive for the session lifetime.
@@ -197,6 +202,7 @@ impl WorkspaceSession {
             }),
             terminal_backend,
             update_lock: tokio::sync::Mutex::new(()),
+            mcp_configure_lock: tokio::sync::Mutex::new(()),
             bind_tool_config_fingerprint: std::sync::Mutex::new(None),
             stale_resolve: std::sync::atomic::AtomicBool::new(false),
             mcp_state: Arc::new(tokio::sync::Mutex::new(McpState::new(vec![]))),

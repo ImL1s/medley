@@ -143,7 +143,7 @@ pub fn load_trusted_tool_capabilities(
     .into_iter()
     .flatten()
     {
-        merge_source(
+        merge_authoritative_source(
             requirements,
             ConfigSource::Managed { path: None },
             &mut resolved,
@@ -214,10 +214,31 @@ fn merge_source(
     source: ConfigSource,
     resolved: &mut ResolvedTrustedToolCapabilities,
 ) {
+    merge_source_with_authority(value, source, resolved, false);
+}
+
+fn merge_authoritative_source(
+    value: &toml::Value,
+    source: ConfigSource,
+    resolved: &mut ResolvedTrustedToolCapabilities,
+) {
+    merge_source_with_authority(value, source, resolved, true);
+}
+
+fn merge_source_with_authority(
+    value: &toml::Value,
+    source: ConfigSource,
+    resolved: &mut ResolvedTrustedToolCapabilities,
+    authoritative: bool,
+) {
     let Some(subagents) = value.get("subagents") else {
         return;
     };
     let Some(subagents) = subagents.as_table() else {
+        if authoritative {
+            resolved.trusted.classifications.clear();
+            resolved.trusted.unclassified_overrides.clear();
+        }
         resolved.diagnostics.push(invalid(
             "subagents",
             &source,
@@ -225,6 +246,34 @@ fn merge_source(
         ));
         return;
     };
+
+    // Requirements are the final administrative authority. If one of their
+    // capability containers is malformed, its unknown contents cannot safely
+    // be merged by exact ID; revoke every lower-precedence allow/override
+    // rather than silently preserving project grants.
+    if authoritative {
+        let malformed_sections = ["tool_capabilities", "unclassified_tool_overrides"]
+            .into_iter()
+            .filter_map(|name| {
+                subagents
+                    .get(name)
+                    .filter(|section| !section.is_table())
+                    .map(|section| (name, section.type_str()))
+            })
+            .collect::<Vec<_>>();
+        if !malformed_sections.is_empty() {
+            resolved.trusted.classifications.clear();
+            resolved.trusted.unclassified_overrides.clear();
+            for (name, actual_type) in malformed_sections {
+                resolved.diagnostics.push(invalid(
+                    format!("subagents.{name}"),
+                    &source,
+                    format!("expected a table, got {actual_type}"),
+                ));
+            }
+            return;
+        }
+    }
 
     if let Some(section) = subagents.get("tool_capabilities") {
         match section.as_table() {
@@ -646,7 +695,7 @@ mod tests {
         let mut resolved = ResolvedTrustedToolCapabilities::default();
         merge_source(&project, project_source(), &mut resolved);
         // Production loads requirements after trusted project layers.
-        merge_source(&requirements, admin_source(), &mut resolved);
+        merge_authoritative_source(&requirements, admin_source(), &mut resolved);
 
         let classified = &resolved.trusted.classifications["admin__classified"];
         assert_eq!(
@@ -701,6 +750,41 @@ mod tests {
         );
         assert!(resolved.diagnostics.iter().any(|diagnostic| {
             diagnostic.path.contains("admin__invalid")
+                && diagnostic.kind == ToolCapabilityConfigDiagnosticKind::InvalidEntry
+        }));
+    }
+
+    #[test]
+    fn malformed_authoritative_container_revokes_lower_trusted_grants() {
+        let project = parse(
+            r#"
+            [subagents.tool_capabilities."mcp__danger"]
+            classification = "classified"
+            effects = ["external-mutation"]
+
+            [subagents.unclassified_tool_overrides."mcp__legacy"]
+            modes = ["execute"]
+            reason = "trusted project exception"
+            "#,
+        );
+        let requirements = parse(
+            r#"
+            [subagents]
+            tool_capabilities = "invalid"
+            "#,
+        );
+
+        let mut resolved = ResolvedTrustedToolCapabilities::default();
+        merge_source(&project, project_source(), &mut resolved);
+        assert_eq!(resolved.trusted.classifications.len(), 1);
+        assert_eq!(resolved.trusted.unclassified_overrides.len(), 1);
+
+        merge_authoritative_source(&requirements, admin_source(), &mut resolved);
+
+        assert!(resolved.trusted.classifications.is_empty());
+        assert!(resolved.trusted.unclassified_overrides.is_empty());
+        assert!(resolved.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path == "subagents.tool_capabilities"
                 && diagnostic.kind == ToolCapabilityConfigDiagnosticKind::InvalidEntry
         }));
     }

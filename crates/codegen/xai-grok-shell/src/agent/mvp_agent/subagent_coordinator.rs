@@ -580,15 +580,27 @@ impl MvpAgent {
         crate::agent::subagent::SubagentSpawnContext,
         crate::session::handle::SessionHandle,
     )> {
-        let mut ctx = self.try_build_subagent_spawn_context(lifecycle_parent_session_id)?;
+        // Operational and security context belongs to the session that
+        // actually emitted this nested spawn. The coordinator may reparent
+        // lifecycle ownership to the root, but inheriting cwd/fs/terminal,
+        // permission state, YOLO, hooks, or workspace operations from that
+        // root would let a worktree-isolated child escape back into the main
+        // checkout by spawning a grandchild.
+        let mut ctx = self.try_build_subagent_spawn_context(spawn_parent_session_id)?;
+        let lifecycle_ctx = self.try_build_subagent_spawn_context(lifecycle_parent_session_id)?;
         let spawn_parent_sid = acp::SessionId::new(spawn_parent_session_id);
         let handle = self.sessions.borrow().get(&spawn_parent_sid).cloned()?;
-        ctx.parent_capability_mode = handle.capability_mode;
-        ctx.parent_depth = handle.tool_context.subagent_depth;
-        ctx.inherited_tool_overrides = handle
-            .resolved_tool_overrides
-            .load_full()
-            .map(|overrides| (*overrides).clone());
+
+        // Keep only coordinator-owned lifecycle routing rooted at the
+        // reparented session. Conversation, persistence source, tool/runtime
+        // handles, and every permission-bearing field remain immediate-parent
+        // scoped above.
+        ctx.parent_session_id = lifecycle_ctx.parent_session_id;
+        ctx.parent_cmd_tx = lifecycle_ctx.parent_cmd_tx;
+        ctx.process_scope = lifecycle_ctx.process_scope;
+        ctx.parent_terminal_backend = lifecycle_ctx.parent_terminal_backend;
+        ctx.parent_notification_handle = lifecycle_ctx.parent_notification_handle;
+        ctx.parent_scheduler_handle = lifecycle_ctx.parent_scheduler_handle;
         Some((ctx, handle))
     }
 }

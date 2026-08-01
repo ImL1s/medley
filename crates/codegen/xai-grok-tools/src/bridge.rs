@@ -201,6 +201,10 @@ impl ToolBridge {
         self.registry.disable_managed_gateway_admission();
     }
 
+    pub fn external_tool_is_permitted(&self, canonical_id: &str) -> bool {
+        self.registry.external_tool_is_permitted(canonical_id)
+    }
+
     /// Access the underlying `FinalizedToolset`.
     ///
     /// Used by `WorkspaceOps::bind_local_session` to install the agent's
@@ -705,6 +709,14 @@ impl ToolBridge {
     /// (`finalize()` spawns background tasks via `tokio::spawn`.)
     pub fn for_test() -> Self {
         let toolset = FinalizedToolset::empty_for_test();
+        Self {
+            registry: Arc::new(toolset),
+            terminal: None,
+        }
+    }
+
+    pub fn for_test_with_capability_policy(policy: crate::capability::CapabilityPolicy) -> Self {
+        let toolset = FinalizedToolset::empty_for_test_with_capability_policy(policy);
         Self {
             registry: Arc::new(toolset),
             terminal: None,

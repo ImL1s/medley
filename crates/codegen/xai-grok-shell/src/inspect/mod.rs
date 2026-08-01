@@ -1260,6 +1260,18 @@ fn render_config_warnings(
     out
 }
 
+fn terminal_safe(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_control() {
+            escaped.extend(ch.escape_default());
+        } else {
+            escaped.push(ch);
+        }
+    }
+    escaped
+}
+
 fn render_tool_capabilities(
     capabilities: &crate::config::tool_capabilities::ResolvedTrustedToolCapabilities,
 ) -> String {
@@ -1307,6 +1319,7 @@ fn render_tool_capabilities(
                     .join(", ")
             })
             .unwrap_or_else(|| "unclassified".to_owned());
+        let tool_id = terminal_safe(tool_id);
         let _ = writeln!(out, "    {TREE} {tool_id}: {effects}");
     }
     let mut overrides = capabilities
@@ -1322,11 +1335,12 @@ fn render_tool_capabilities(
             .map(xai_tool_types::SubagentCapabilityMode::as_str)
             .collect::<Vec<_>>()
             .join(", ");
+        let tool_id = terminal_safe(tool_id);
+        let reason = terminal_safe(&override_entry.reason);
+        let source = terminal_safe(&override_entry.source.display_short());
         let _ = writeln!(
             out,
-            "    {TREE} WARNING override {tool_id} [{modes}] — {} ({})",
-            override_entry.reason,
-            override_entry.source.display_short()
+            "    {TREE} WARNING override {tool_id} [{modes}] — {reason} ({source})",
         );
     }
     for diagnostic in &capabilities.diagnostics {
@@ -1336,13 +1350,10 @@ fn render_tool_capabilities(
         ) {
             continue;
         }
-        let _ = writeln!(
-            out,
-            "    {TREE} WARNING [{}] {} — {}",
-            diagnostic.source.display_short(),
-            diagnostic.path,
-            diagnostic.reason
-        );
+        let source = terminal_safe(&diagnostic.source.display_short());
+        let path = terminal_safe(&diagnostic.path);
+        let reason = terminal_safe(&diagnostic.reason);
+        let _ = writeln!(out, "    {TREE} WARNING [{source}] {path} — {reason}");
     }
     out
 }
@@ -2067,6 +2078,30 @@ mod tests {
     }
 
     // ── skill source mapping (skill_entry_source) ─────────────────────────
+
+    #[test]
+    fn tool_capability_human_rendering_escapes_terminal_controls() {
+        let capabilities =
+            crate::config::tool_capabilities::ResolvedTrustedToolCapabilities {
+                diagnostics: vec![
+                    crate::config::tool_capabilities::ToolCapabilityConfigDiagnostic {
+                        kind: crate::config::tool_capabilities::ToolCapabilityConfigDiagnosticKind::InvalidEntry,
+                        path: "subagents.\u{1b}[2J".to_owned(),
+                        reason: "bad\nline".to_owned(),
+                        source: ConfigSource::Project {
+                            path: "/tmp/\u{1b}[2J/config.toml".into(),
+                        },
+                    },
+                ],
+                ..Default::default()
+            };
+
+        let human = render_tool_capabilities(&capabilities);
+        assert!(!human.contains('\u{1b}'), "{human:?}");
+        assert!(human.contains(r"\u{1b}[2J"), "{human:?}");
+        assert!(human.contains(r"bad\nline"), "{human:?}");
+        assert!(!human.contains("bad\nline\n"), "{human:?}");
+    }
 
     fn skill_fixture(name: &str, path: &str, scope: SkillScope) -> SkillInfo {
         SkillInfo {

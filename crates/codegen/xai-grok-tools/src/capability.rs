@@ -81,6 +81,9 @@ impl TrustedToolCapabilities {
         if override_entry.reason.trim().is_empty() {
             return Err("unclassified override reason must not be empty".into());
         }
+        if override_entry.reason.chars().any(char::is_control) {
+            return Err("unclassified override reason must not contain control characters".into());
+        }
         self.unclassified_overrides
             .insert(exact_tool_id, override_entry);
         Ok(())
@@ -98,6 +101,9 @@ pub fn validate_exact_tool_id(id: &str) -> Result<(), String> {
         return Err(
             "tool capability key must be an exact ID; glob patterns are not allowed".into(),
         );
+    }
+    if id.chars().any(char::is_control) {
+        return Err("tool capability key must not contain control characters".into());
     }
     Ok(())
 }
@@ -451,9 +457,10 @@ mod tests {
     }
 
     #[test]
-    fn exact_id_validation_rejects_globs_and_empty_override_reason() {
+    fn exact_id_and_override_reason_reject_terminal_control_input() {
         assert!(validate_exact_tool_id("github__get_issue").is_ok());
         assert!(validate_exact_tool_id("github__*").is_err());
+        assert!(validate_exact_tool_id("github__\u{1b}[2J").is_err());
         let mut trusted = TrustedToolCapabilities::default();
         assert!(
             trusted
@@ -462,6 +469,18 @@ mod tests {
                     UnclassifiedToolOverride {
                         modes: vec![SubagentCapabilityMode::ReadOnly],
                         reason: " ".into(),
+                        source: ConfigSource::Builtin,
+                    }
+                )
+                .is_err()
+        );
+        assert!(
+            trusted
+                .insert_unclassified_override(
+                    "legacy__tool",
+                    UnclassifiedToolOverride {
+                        modes: vec![SubagentCapabilityMode::ReadOnly],
+                        reason: "audited\nspoofed".into(),
                         source: ConfigSource::Builtin,
                     }
                 )

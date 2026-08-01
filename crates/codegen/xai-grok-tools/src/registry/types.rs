@@ -1471,6 +1471,9 @@ impl FinalizedToolset {
     ///
     /// Safe to call from sync `#[test]` — does not require a tokio runtime.
     pub fn empty_for_test() -> Self {
+        Self::empty_for_test_with_capability_policy(CapabilityPolicy::unrestricted())
+    }
+    pub fn empty_for_test_with_capability_policy(policy: CapabilityPolicy) -> Self {
         Self {
             tools: parking_lot::RwLock::new(vec![]),
             reminders: vec![],
@@ -1486,7 +1489,7 @@ impl FinalizedToolset {
             )),
             system_reminder_tag: "system-reminder",
             workspace_viewer_ctx: None,
-            capability_policy: CapabilityPolicy::unrestricted(),
+            capability_policy: policy,
             external_tool_identities: ManagedGatewayIdentityAuthorizer::default(),
         }
     }
@@ -1496,6 +1499,16 @@ impl FinalizedToolset {
     }
     pub fn capability_policy(&self) -> &CapabilityPolicy {
         &self.capability_policy
+    }
+
+    /// Whether this session's capability policy permits an exact external
+    /// MCP/custom identity to be exposed. Remote metadata is intentionally
+    /// ignored; only the locally trusted exact-ID catalog participates.
+    pub fn external_tool_is_permitted(&self, canonical_id: &str) -> bool {
+        let capability = self.capability_policy.resolve_external(canonical_id);
+        self.capability_policy
+            .evaluate(canonical_id, &capability)
+            .is_kept()
     }
 
     pub fn begin_managed_gateway_admission(&self) {
@@ -1636,15 +1649,13 @@ impl FinalizedToolset {
             .accepted
             .retain(|name| !result.rejected.contains(name));
         if !remove_local.is_empty() {
-            let registry_ids: Vec<_> = tools
-                .iter()
-                .filter(|tool| remove_local.contains(&tool.client_name))
-                .filter_map(|tool| xai_tool_protocol::ToolId::new(&tool.registry_id).ok())
-                .collect();
             tools.retain(|tool| !remove_local.contains(&tool.client_name));
-            for registry_id in registry_ids {
-                self.local_registry.unregister(&registry_id);
-            }
+            // `LocalRegistry` may be shared by multiple finalized session
+            // toolsets. Removing the handle here would let one session's
+            // remote gateway catalog break sibling sessions whose independent
+            // metadata still authorizes the local tool. Revoking this
+            // toolset's metadata and poisoning its identity is sufficient to
+            // fail its direct/wrapped dispatch closed.
         }
         self.external_tool_identities.complete_admission();
         result
@@ -3494,6 +3505,14 @@ mod tests {
         id: String,
         description: String,
     }
+    impl Default for FakeMcpTool {
+        fn default() -> Self {
+            Self {
+                id: "server__tool".to_owned(),
+                description: "shared local MCP fixture".to_owned(),
+            }
+        }
+    }
     impl crate::types::tool_metadata::ToolMetadata for FakeMcpTool {
         fn kind(&self) -> ToolKind {
             ToolKind::Other
@@ -3507,7 +3526,7 @@ mod tests {
     }
     impl xai_tool_runtime::Tool for FakeMcpTool {
         type Args = serde_json::Value;
-        type Output = String;
+        type Output = ToolOutput;
         fn id(&self) -> xai_tool_protocol::ToolId {
             xai_tool_protocol::ToolId::new(&self.id).expect("valid")
         }
@@ -3521,8 +3540,8 @@ mod tests {
             &self,
             _ctx: xai_tool_runtime::ToolCallContext,
             _input: serde_json::Value,
-        ) -> Result<String, xai_tool_runtime::ToolError> {
-            Ok("ok".into())
+        ) -> Result<ToolOutput, xai_tool_runtime::ToolError> {
+            Ok(ToolOutput::Text("ok".into()))
         }
     }
 
@@ -3871,7 +3890,8 @@ mod tests {
             toolset
                 .local_registry()
                 .find(&xai_tool_protocol::ToolId::new("server__tool").unwrap())
-                .is_none()
+                .is_some(),
+            "session-scoped revocation must not unregister a potentially shared handle"
         );
 
         let direct = toolset
@@ -3921,6 +3941,52 @@ mod tests {
                 .detail
                 .contains("reserved or conflicted")
         );
+    }
+
+    #[tokio::test]
+    async fn managed_gateway_collision_does_not_revoke_shared_registry_sibling() {
+        fn build_toolset(
+            tmp: &TempDir,
+            registry: xai_computer_hub_sdk::LocalRegistry,
+        ) -> Arc<FinalizedToolset> {
+            let mut builder = ToolRegistryBuilder::new();
+            builder.register::<FakeMcpTool>();
+            Arc::new(
+                builder
+                    .with_local_registry(registry)
+                    .finalize(
+                        ToolServerConfig {
+                            tools: vec![ToolConfig::from_id("MCP:server__tool")],
+                            behavior_preset: None,
+                        },
+                        test_session_context(tmp),
+                    )
+                    .expect("shared MCP fixture should finalize"),
+            )
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let registry = xai_computer_hub_sdk::LocalRegistry::new();
+        let session_a = build_toolset(&tmp, registry.clone());
+        let session_b = build_toolset(&tmp, registry.clone());
+        session_b
+            .call("server__tool", serde_json::json!({}), "before", None)
+            .await
+            .expect("sibling precondition: shared local handle dispatches");
+
+        let reconciliation = session_a.reconcile_managed_gateway_identities(&[(
+            "server__tool".to_owned(),
+            "gateway.collision".to_owned(),
+        )]);
+        assert!(reconciliation.rejected.contains("server__tool"));
+        session_a
+            .call("server__tool", serde_json::json!({}), "revoked", None)
+            .await
+            .expect_err("the colliding session must revoke its own metadata");
+        session_b
+            .call("server__tool", serde_json::json!({}), "after", None)
+            .await
+            .expect("one session's gateway collision must not break a sibling toolset");
     }
 
     #[tokio::test]

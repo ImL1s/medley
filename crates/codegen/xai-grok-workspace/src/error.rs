@@ -24,6 +24,14 @@ pub enum WorkspaceError {
         parent: CapabilityMode,
         child: CapabilityMode,
     },
+    #[error(
+        "operation {operation:?} is not permitted for session {session:?} in {mode:?} capability mode"
+    )]
+    CapabilityDenied {
+        session: String,
+        operation: &'static str,
+        mode: CapabilityMode,
+    },
     #[error("session {caller:?} is not authorised to operate on session {target:?}")]
     Unauthorized { caller: String, target: String },
     /// A toolset mutation was rejected because the target session has an
@@ -75,6 +83,7 @@ impl WorkspaceError {
             Self::CannotDropMainSession => "cannot_drop_main_session",
             Self::Finalize(_) => "finalize",
             Self::CapabilityWidening { .. } => "capability_widening",
+            Self::CapabilityDenied { .. } => "capability_denied",
             Self::Unauthorized { .. } => "unauthorized",
             Self::TurnActive(_) => "turn_active",
             Self::MaxDepthExceeded { .. } => "max_depth_exceeded",
