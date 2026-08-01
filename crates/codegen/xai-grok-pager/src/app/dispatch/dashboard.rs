@@ -1971,6 +1971,10 @@ pub(super) fn dispatch_dashboard_stop(app: &mut AppView) -> Vec<Effect> {
             let Some(agent) = app.agents.get_mut(&id) else {
                 return vec![];
             };
+            if agent.chat_kind {
+                app.show_toast("Deleting chat conversations isn't supported yet");
+                return vec![];
+            }
             if !crate::views::dashboard::classify_top_level(agent).allows_delete() {
                 // Busy row: stop what keeps it out of Idle — a running turn,
                 // background work (bg tasks, monitors, scheduled `/loop`s),
@@ -2154,6 +2158,10 @@ fn delete_dashboard_row(
             let Some(agent) = app.agents.get(&id) else {
                 return vec![];
             };
+            if agent.chat_kind {
+                app.show_toast("Deleting chat conversations isn't supported yet");
+                return vec![];
+            }
             // Defensive re-check via the SAME predicate the renderer and
             // arm path use: state can change between arming and confirming
             // (a new turn, `/loop`, queued prompt, replay, needs-input, or

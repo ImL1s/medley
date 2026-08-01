@@ -368,10 +368,10 @@ fn append_roster_rows(
 /// works: a row in `AgentState::CommandRunning { Compact, .. }` is
 /// "Working" and the activity label reads `Compacting`. A turn-idle
 /// agent still classifies as `Working` while it has live background work
-/// (`has_background_work`): a running background task / `monitor` or an
-/// active scheduled `/loop`. Each is ongoing, user-dispatched work — and
-/// monitors / loops can wake the agent for a fresh turn — so the agent
-/// isn't meaningfully idle while any are running.
+/// (`has_background_work`): a running background task / `monitor`, a
+/// background subagent, or an active scheduled `/loop`. Each is ongoing,
+/// user-dispatched work — and can wake the agent for a fresh turn — so the
+/// agent isn't meaningfully idle while any are running.
 pub fn classify_top_level(agent: &AgentView) -> RowState {
     if !agent.permission_queue.is_empty() || agent.question_view.is_some() {
         return RowState::NeedsInput;
@@ -393,17 +393,20 @@ pub fn classify_top_level(agent: &AgentView) -> RowState {
 /// Whether `agent` has live background work that keeps it out of the
 /// `Idle` group even when its turn is idle: a running background task
 /// (`run_terminal_command` with `background=true`), a running `monitor`
-/// (a background task with `is_monitor`), or an active scheduled `/loop`.
-/// Mirrors the agent view's idle "watching" cue
-/// (`crate::views::turn_status::Watchers`, minus subagents — the dashboard
-/// lists those as their own rows) — any in-flight background work the user
-/// dispatched should read as "Working" on the dashboard.
+/// (a background task with `is_monitor`), a background subagent, or an
+/// active scheduled `/loop`. Mirrors the agent view's idle "watching" cue;
+/// any in-flight background work the user dispatched should read as
+/// "Working" on the dashboard.
 pub fn has_background_work(agent: &AgentView) -> bool {
     agent
         .session
         .bg_tasks
         .values()
         .any(|t| t.status == crate::app::agent::BgTaskStatus::Running)
+        || agent
+            .subagent_sessions
+            .values()
+            .any(|s| s.is_running() && s.is_background)
         || !agent.session.scheduled_tasks.is_empty()
 }
 /// Compact `"… still running"` label summarising a turn-idle agent's live
@@ -421,6 +424,7 @@ fn background_work_label(agent: &AgentView) -> Option<String> {
         (w.monitors, "monitor"),
         (w.loops, "loop"),
         (w.commands, "task"),
+        (w.subagents, "subagent"),
     ])
 }
 /// Classify a subagent.

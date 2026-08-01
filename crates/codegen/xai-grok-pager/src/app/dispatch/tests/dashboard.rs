@@ -4721,6 +4721,45 @@ fn dashboard_stop_bg_work_row_stops_without_arming() {
     assert!(d.delete_confirm.is_none(), "must not arm delete");
     assert!(d.error_toast.is_none(), "stopped work, so no toast");
 }
+/// A running background subagent keeps its idle parent non-deletable even
+/// though the live dashboard does not render a separate subagent row.
+#[serial_test::serial(GROK_AGENT_DASHBOARD)]
+#[test]
+fn dashboard_stop_background_subagent_row_never_arms_delete() {
+    let mut app = test_app();
+    let _ = dispatch_new_session_inner(&mut app, None);
+    let _ = dispatch_new_session_inner(&mut app, None);
+    let target = *app.agents.keys().next().unwrap();
+    {
+        let agent = app.agents.get_mut(&target).unwrap();
+        agent.session.session_id = Some(acp::SessionId::new("bg-subagent"));
+        agent.session.state = AgentState::Idle;
+        let mut child = make_test_subagent("child-bg", "sa-bg");
+        child.is_background = true;
+        agent.subagent_sessions.insert("child-bg".into(), child);
+    }
+    open_dashboard(&mut app);
+    if let Some(d) = app.dashboard.as_mut() {
+        d.selected = Some(crate::views::dashboard::DashboardRowId::TopLevel(target));
+    }
+    let effects = dispatch_dashboard_stop(&mut app);
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::DeleteSession { .. })),
+        "running background subagent must block parent deletion: {effects:?}",
+    );
+    let d = app.dashboard.as_ref().unwrap();
+    assert!(
+        d.delete_confirm.is_none(),
+        "busy parent must not arm delete"
+    );
+    assert_eq!(
+        d.error_toast.as_deref(),
+        Some("Stop the session before deleting"),
+    );
+    assert!(app.agents.contains_key(&target));
+}
 /// A row that's `Working` only because of a queued (unsent) prompt: Ctrl+X
 /// drops the queue (local, no effect) rather than toasting, and never arms
 /// — so the row settles to idle and can then be deleted.
@@ -4811,6 +4850,40 @@ fn dashboard_stop_conversation_row_does_not_arm() {
         d.error_toast.as_deref(),
         Some("Deleting chat conversations isn't supported yet"),
     );
+}
+/// A locally attached Chat agent follows the same no-delete policy as a
+/// conversation roster row and must never enter the Build deletion lane.
+#[serial_test::serial(GROK_AGENT_DASHBOARD)]
+#[test]
+fn dashboard_stop_local_chat_row_does_not_arm_or_delete() {
+    let mut app = test_app();
+    let _ = dispatch_new_session_inner(&mut app, None);
+    let _ = dispatch_new_session_inner(&mut app, None);
+    let target = *app.agents.keys().next().unwrap();
+    {
+        let agent = app.agents.get_mut(&target).unwrap();
+        agent.session.session_id = Some(acp::SessionId::new("chat-local"));
+        agent.session.state = AgentState::Idle;
+        agent.chat_kind = true;
+    }
+    open_dashboard(&mut app);
+    if let Some(d) = app.dashboard.as_mut() {
+        d.selected = Some(crate::views::dashboard::DashboardRowId::TopLevel(target));
+    }
+    let effects = dispatch_dashboard_stop(&mut app);
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::DeleteSession { .. })),
+        "local Chat row must not enter Build deletion: {effects:?}",
+    );
+    let d = app.dashboard.as_ref().unwrap();
+    assert!(d.delete_confirm.is_none(), "Chat row must not arm delete");
+    assert_eq!(
+        d.error_toast.as_deref(),
+        Some("Deleting chat conversations isn't supported yet"),
+    );
+    assert!(app.agents.contains_key(&target));
 }
 /// A row with no session id toasts instead of emitting a delete.
 #[serial_test::serial(GROK_AGENT_DASHBOARD)]
