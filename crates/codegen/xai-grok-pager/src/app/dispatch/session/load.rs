@@ -71,9 +71,9 @@ pub(in crate::app::dispatch) fn clear_stale_session_id(
 }
 /// If a local agent already owns this id **and** matches kind, focus it.
 ///
-/// - Kind: compare against the stamped form `chat_kind || app.chat_mode` (agents
-///   store that; the LoadSession arg is conversation-entry only). Conversation
-///   vs Build still differs when sticky `--chat` is off.
+/// - Kind: compare against the effective loaded-session kind. The LoadSession
+///   arg is conversation-entry only; sticky `--chat` applies unless the welcome
+///   history picker explicitly classified this load as Build.
 /// - Eager `session_id` + leftover load placeholder after `SessionLoadFailed`
 ///   is not "open" — reissue load instead of focusing.
 /// - Overlay: retarget when on the dashboard list, already in overlay (attached
@@ -86,7 +86,7 @@ pub(in crate::app::dispatch) fn focus_if_session_already_open(
 ) -> Option<AgentId> {
     use crate::app::app_view::ActiveView;
     use crate::views::dashboard::DashboardRowId;
-    let expected_kind = chat_kind || app.chat_mode;
+    let expected_kind = effective_loaded_session_chat_kind(app, chat_kind);
     let existing_id = app.agents.iter().find_map(|(id, a)| {
         let sid_ok = a
             .session
@@ -117,6 +117,16 @@ pub(in crate::app::dispatch) fn focus_if_session_already_open(
     }
     switch_to_agent(app, existing_id, SwitchCause::Load);
     Some(existing_id)
+}
+fn effective_loaded_session_chat_kind(app: &AppView, conversation_entry: bool) -> bool {
+    #[cfg(feature = "local-workspace")]
+    {
+        conversation_entry || (app.chat_mode && !app.welcome_history_load_as_build)
+    }
+    #[cfg(not(feature = "local-workspace"))]
+    {
+        conversation_entry || app.chat_mode
+    }
 }
 fn dispatch_load_session_ungated(
     app: &mut AppView,
@@ -202,6 +212,7 @@ fn dispatch_load_session_ungated(
         scrollback,
     );
     app.agents.insert(agent_id, agent);
+    let effective_chat_kind = effective_loaded_session_chat_kind(app, chat_kind);
     let agent_mut = app.agents.get_mut(&agent_id).unwrap();
     agent_mut.attached_as_viewer = true;
     agent_mut.begin_replay_window();
@@ -230,7 +241,7 @@ fn dispatch_load_session_ungated(
         &app.active_announcements,
         &app.tier_restricted_commands,
     );
-    agent_mut.chat_kind = chat_kind || app.chat_mode;
+    agent_mut.chat_kind = effective_chat_kind;
     #[cfg(feature = "local-workspace")]
     {
         let history_build = app.welcome_history_load_as_build;
@@ -969,6 +980,7 @@ pub(in crate::app::dispatch) fn dispatch_load_session_with_restore(
         scrollback,
     );
     app.agents.insert(agent_id, agent);
+    let effective_chat_kind = effective_loaded_session_chat_kind(app, false);
     {
         let agent = app.agents.get_mut(&agent_id).unwrap();
         agent.attached_as_viewer = true;
@@ -990,7 +1002,7 @@ pub(in crate::app::dispatch) fn dispatch_load_session_with_restore(
             &app.active_announcements,
             &app.tier_restricted_commands,
         );
-        agent.chat_kind = app.chat_mode;
+        agent.chat_kind = effective_chat_kind;
         #[cfg(feature = "local-workspace")]
         {
             let history_build = app.welcome_history_load_as_build;
@@ -1299,10 +1311,11 @@ pub(in crate::app::dispatch) fn handle_session_restored(
         return vec![];
     }
     let sid = clear_stale_session_id(app, &local_session_id);
+    let effective_chat_kind = effective_loaded_session_chat_kind(app, false);
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         supersede_open_reload_window(agent, agent_id, "SessionRestored");
         agent.bind_session_id(sid);
-        agent.chat_kind = app.chat_mode;
+        agent.chat_kind = effective_chat_kind;
         #[cfg(feature = "local-workspace")]
         {
             let history_build = app.welcome_history_load_as_build;

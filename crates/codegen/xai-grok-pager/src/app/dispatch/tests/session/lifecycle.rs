@@ -2597,6 +2597,7 @@ mod welcome_workspace_mode {
         app.chat_mode = true;
         app.active_view = ActiveView::Welcome;
         app.welcome_workspace_mode = WelcomeWorkspaceMode::LocalWorkspace;
+        app.credit_balance = Some(test_bal(25.0));
         app.session_picker_entries = Some(vec![crate::app::app_view::SessionPickerEntry {
             id: "conv-1".into(),
             summary: "hello".into(),
@@ -2630,6 +2631,23 @@ mod welcome_workspace_mode {
             "conversation must load as chat: {effects:?}"
         );
         assert!(!app.welcome_history_load_as_build);
+        assert!(
+            app.agents
+                .values()
+                .next()
+                .expect("placeholder agent")
+                .chat_kind,
+            "conversation history must remain classified as chat"
+        );
+        assert!(
+            app.agents
+                .values()
+                .next()
+                .expect("placeholder agent")
+                .credit_balance
+                .is_none(),
+            "conversation history must discard Build credit state"
+        );
         set_active_local_workspace(None).unwrap();
     }
     #[test]
@@ -2641,6 +2659,7 @@ mod welcome_workspace_mode {
         app.active_view = ActiveView::Welcome;
         app.cwd = tmp.path().to_path_buf();
         app.welcome_workspace_mode = WelcomeWorkspaceMode::Sandbox;
+        app.credit_balance = Some(test_bal(25.0));
         let sess_dir = super::super::super::plant_local_build_session(tmp.path(), "build-1");
         app.session_picker_entries = Some(vec![crate::app::app_view::SessionPickerEntry {
             id: "build-1".into(),
@@ -2680,8 +2699,12 @@ mod welcome_workspace_mode {
         );
         let agent = app.agents.values().next().expect("placeholder agent");
         assert!(
-            agent.chat_kind,
-            "sticky --chat keeps agent.chat_kind for already-open focus matching"
+            !agent.chat_kind,
+            "explicit Build history classification must override sticky --chat"
+        );
+        assert!(
+            agent.credit_balance.is_some(),
+            "Build history must retain Build credit state"
         );
         assert_eq!(
             agent.workspace_mode,
@@ -3017,6 +3040,7 @@ mod welcome_workspace_mode {
         app.chat_mode = true;
         app.active_view = ActiveView::Welcome;
         app.welcome_workspace_mode = WelcomeWorkspaceMode::Sandbox;
+        app.credit_balance = Some(test_bal(25.0));
         app.session_picker_entries = Some(vec![crate::app::app_view::SessionPickerEntry {
             id: "remote-1".into(),
             summary: "remote row".into(),
@@ -3045,6 +3069,14 @@ mod welcome_workspace_mode {
             "bypass kept until follow-up LoadSession"
         );
         let agent = app.agents.values().next().expect("restore placeholder");
+        assert!(
+            !agent.chat_kind,
+            "restored Build history must remain classified as Build"
+        );
+        assert!(
+            agent.credit_balance.is_some(),
+            "restored Build history must retain Build credit state"
+        );
         assert_eq!(
             agent.workspace_mode,
             WelcomeWorkspaceMode::LocalWorkspace,
