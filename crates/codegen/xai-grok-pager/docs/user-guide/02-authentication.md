@@ -37,7 +37,39 @@ Running `grok login` starts the sign-in flow again, replacing your cached sessio
 | `--oauth` | Sign in through SpaceXAI OAuth at `auth.x.ai`. This is the default, so the flag is optional. |
 | `--device-auth` (alias `--device-code`) | Sign in with the device-code flow for headless or remote environments. |
 
-To sign out, run `grok logout`. It takes no flags and clears your cached credentials.
+To sign out of xAI, run `grok logout` (equivalent to
+`grok logout --provider xai`).
+
+---
+
+## OpenAI Codex (ChatGPT OAuth)
+
+OpenAI Codex authentication is a separate provider-scoped login. It does not
+reuse or replace your xAI session, and it is distinct from `OPENAI_API_KEY`
+models that use the OpenAI Platform API.
+
+```bash
+grok login --provider openai-codex
+grok auth status --provider openai-codex
+grok auth status --provider openai-codex --json
+grok logout --provider openai-codex
+```
+
+Login uses the official Codex-compatible browser OAuth flow with PKCE. Grok
+prints the authorization URL even when opening a browser fails, so the same
+command works over SSH by opening that URL in another browser. The loopback
+callback must be reachable on `localhost` port 1455 or 1457.
+
+The credential is stored under its own `openai::codex` scope in
+`~/.grok/auth.json`. Access-token refresh and refresh-token rotation happen
+before a Codex request, and a rejected request is refreshed/retried at most
+once. If the refreshed credential is rejected, run the login command again.
+Signing out removes only Grok's `openai::codex` entry; it leaves the xAI login
+and any credential owned by the official Codex CLI untouched.
+
+Codex-backed models appear ready only when this scoped credential is usable or
+refreshable. Account entitlements, workspace policy, rate limits, and model
+availability are still enforced by OpenAI.
 
 ---
 

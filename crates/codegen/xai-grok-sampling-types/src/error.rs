@@ -88,6 +88,17 @@ pub struct ResponseModelMetadata {
 pub enum SentCredential {
     /// The request carried a credential; the server rejected it.
     Sent,
+    /// The request carried the provider's current credential at the instant
+    /// the 401 response was classified. This is the credential that must be
+    /// refreshed as server-rejected rather than merely re-adopted from cache.
+    SameAsCurrent,
+    /// The request carried a credential, but the provider had already rotated
+    /// to a different current credential. Recovery may adopt that cached
+    /// credential without forcing another refresh.
+    DifferentFromCurrent,
+    /// The request carried a credential, but the provider had no current
+    /// credential when the 401 response was classified.
+    CurrentUnavailable,
     /// The request went out with no credential header at all.
     Missing,
     /// Provenance unknown (synthesized or legacy errors). Retry policies
@@ -107,6 +118,9 @@ impl<'de> Deserialize<'de> for SentCredential {
         Ok(
             match std::borrow::Cow::<str>::deserialize(deserializer)?.as_ref() {
                 "sent" => Self::Sent,
+                "same_as_current" => Self::SameAsCurrent,
+                "different_from_current" => Self::DifferentFromCurrent,
+                "current_unavailable" => Self::CurrentUnavailable,
                 "missing" => Self::Missing,
                 _ => Self::Unknown,
             },
@@ -127,6 +141,17 @@ impl SentCredential {
 
     pub fn is_missing(self) -> bool {
         matches!(self, Self::Missing)
+    }
+
+    /// Whether metadata proves a credential was present on the wire.
+    pub fn is_sent(self) -> bool {
+        matches!(
+            self,
+            Self::Sent
+                | Self::SameAsCurrent
+                | Self::DifferentFromCurrent
+                | Self::CurrentUnavailable
+        )
     }
 
     /// By reference so it can serve as a serde `skip_serializing_if`.
@@ -1157,6 +1182,15 @@ mod tests {
     fn sent_credential_wire_compat() {
         for (json, expected) in [
             ("\"sent\"", SentCredential::Sent),
+            ("\"same_as_current\"", SentCredential::SameAsCurrent),
+            (
+                "\"different_from_current\"",
+                SentCredential::DifferentFromCurrent,
+            ),
+            (
+                "\"current_unavailable\"",
+                SentCredential::CurrentUnavailable,
+            ),
             ("\"missing\"", SentCredential::Missing),
             ("\"unknown\"", SentCredential::Unknown),
             ("\"some-future-variant\"", SentCredential::Unknown),
@@ -1170,6 +1204,11 @@ mod tests {
             serde_json::to_string(&SentCredential::Missing).unwrap(),
             "\"missing\""
         );
+        assert!(SentCredential::SameAsCurrent.is_sent());
+        assert!(SentCredential::DifferentFromCurrent.is_sent());
+        assert!(SentCredential::CurrentUnavailable.is_sent());
+        assert!(!SentCredential::Missing.is_sent());
+        assert!(!SentCredential::Unknown.is_sent());
     }
 
     #[test]

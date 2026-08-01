@@ -57,12 +57,14 @@ default = "grok-4.5"
 
 ## Supported API Backends
 
-Grok supports three API backends. Set `api_backend` in your `[model.*]` config to choose which protocol the model uses:
+Grok supports the following API backends. Set `api_backend` in your
+`[model.*]` config to choose which protocol the model uses:
 
 | Value | API | Default |
 |-------|-----|---------|
 | `"chat_completions"` | OpenAI Chat Completions (`/v1/chat/completions`) | Yes |
 | `"responses"` | OpenAI Responses (`/v1/responses`) | |
+| `"codex_responses"` | ChatGPT Codex Responses (`/backend-api/codex/responses`) | Built-in provider only |
 | `"messages"` | Anthropic Messages (`/v1/messages`) | |
 
 When you omit `api_backend`, Grok uses `chat_completions`.
@@ -253,6 +255,31 @@ name = "GPT-4o (Responses)"
 api_backend = "responses"
 env_key = "OPENAI_API_KEY"
 ```
+
+### OpenAI Codex (ChatGPT subscription)
+
+Sign in to the dedicated provider, then point a model declaration at the
+reserved built-in profile:
+
+```bash
+grok login --provider openai-codex
+```
+
+```toml
+[model.my-codex-model]
+model = "<supported-codex-model-id>"
+model_provider = "openai-codex"
+name = "OpenAI Codex"
+context_window = 200000 # example only; use metadata accurate for the model
+```
+
+The `openai-codex` provider fixes the transport to
+`https://chatgpt.com/backend-api/codex/responses` and supplies the live bearer
+and ChatGPT account ID from one provider-scoped credential snapshot. It rejects
+custom origins, query parameters, and attempts to override the reserved
+provider. Do not add `api_key`, `env_key`, `base_url`, `extra_headers`, or
+`api_backend` to a Codex-backed model; use `OPENAI_API_KEY` with the normal
+OpenAI examples above for Platform API traffic.
 
 ### Gemini (OpenAI-compatible)
 

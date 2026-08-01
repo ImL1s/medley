@@ -90,14 +90,8 @@ pub fn read_auth_json(auth_file: &Path) -> std::io::Result<AuthStore> {
 /// so the caller can decide whether to skip the write (to avoid clobbering
 /// sibling scopes).
 ///
-/// Kept for the test-only `persist_and_swap` and as a strict reader.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used from tests only; remove expect when wired in production"
-    )
-)]
+/// Used by strict mutations where a missing file is an empty store but corrupt
+/// or unreadable data must be surfaced.
 pub(crate) fn read_auth_json_or_empty(auth_file: &Path) -> std::io::Result<AuthStore> {
     match read_auth_json(auth_file) {
         Ok(map) => Ok(map),
@@ -217,6 +211,17 @@ pub(super) fn write_auth_json(auth_file: &Path, auth_store: &AuthStore) -> std::
     write_auth_json_with(auth_file, auth_store, write_auth_json_atomic)
 }
 
+/// Crash-safe writer for rotating provider credentials. Unlike the legacy
+/// session writer, this never falls back to a truncating in-place rewrite on
+/// ENOSPC: a rotated refresh token is not published unless atomic persistence
+/// completed successfully.
+pub(super) fn write_auth_json_strict(
+    auth_file: &Path,
+    auth_store: &AuthStore,
+) -> std::io::Result<()> {
+    write_auth_json_atomic(auth_file, auth_store)
+}
+
 /// Dispatch helper: run `atomic`, and on `StorageFull` fall back to an
 /// in-place write. Split out (with `atomic` injectable) so the disk-full
 /// fallback is unit-testable without an actually-full filesystem.
@@ -289,10 +294,22 @@ fn write_store_to(path: &Path, auth_store: &AuthStore) -> std::io::Result<()> {
 /// tests in the same process do not sabotage each other.
 #[cfg(test)]
 pub(super) static WRITE_FAULT_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(super) static WRITE_STORAGE_FULL_FAULT_PATH: std::sync::Mutex<Option<PathBuf>> =
+    std::sync::Mutex::new(None);
 
 /// Atomic write: tmp + rename. Unix `rename(2)` replaces atomically;
 /// Windows `rename` requires removing the target first.
 fn write_auth_json_atomic(auth_file: &Path, auth_store: &AuthStore) -> std::io::Result<()> {
+    #[cfg(test)]
+    if WRITE_STORAGE_FULL_FAULT_PATH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_deref()
+        == Some(auth_file)
+    {
+        return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+    }
     #[cfg(test)]
     if WRITE_FAULT_PATH
         .lock()

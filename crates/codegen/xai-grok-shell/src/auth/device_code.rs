@@ -502,6 +502,8 @@ async fn build_auth(
         expires_at: tokens.expires_in.map(|s| now + Duration::seconds(s)),
         oidc_issuer: Some(issuer.to_owned()),
         oidc_client_id: Some(client_id.to_owned()),
+        id_token: None,
+        account_id: None,
     };
 
     auth_manager.enrich_auth_inline(&mut auth).await;

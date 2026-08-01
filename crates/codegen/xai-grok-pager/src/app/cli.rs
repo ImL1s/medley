@@ -1,6 +1,6 @@
 //! CLI argument parsing for the pager.
 pub use crate::headless::OutputFormat;
-use clap::{ArgAction, Parser, Subcommand, ValueHint};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum, ValueHint};
 use clap_complete::Shell;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -20,9 +20,16 @@ pub enum Command {
     /// Manage running leader processes
     Leader(LeaderMgmtArgs),
     /// Sign out and clear cached credentials
-    Logout,
+    Logout {
+        /// Credential provider to sign out from.
+        #[arg(long, value_enum, default_value = "xai")]
+        provider: LoginProvider,
+    },
     /// Sign in to Grok
     Login {
+        /// Credential provider to sign in to.
+        #[arg(long, value_enum, default_value = "xai")]
+        provider: LoginProvider,
         /// Ignored (kept for backwards compatibility). OAuth2 is now the only auth method.
         #[arg(long, hide = true)]
         legacy: bool,
@@ -44,6 +51,8 @@ pub enum Command {
         #[arg(skip)]
         devbox: bool,
     },
+    /// Inspect provider-scoped authentication state.
+    Auth(AuthArgs),
     /// Manage MCP server configurations
     Mcp(crate::mcp_cmd::McpArgs),
     /// Manage plugins and marketplace sources
@@ -140,6 +149,62 @@ See ~/.grok/README.md for more information.
     /// `~/.grok/config.toml` or when the `GROK_AGENT_DASHBOARD=0` env
     /// var is set.
     Dashboard,
+}
+
+/// Authentication provider selected by login/logout/status commands.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum LoginProvider {
+    /// The normal Grok/xAI account session.
+    #[default]
+    Xai,
+    /// ChatGPT Codex OAuth, stored separately from the Grok session.
+    OpenaiCodex,
+}
+
+impl LoginProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Xai => "xai",
+            Self::OpenaiCodex => "openai-codex",
+        }
+    }
+
+    /// Provider-aware validation kept separate from clap because these legacy
+    /// flags remain valid for the default xAI login but must never alter the
+    /// fixed Codex OAuth flow.
+    pub fn validate_login_flags(
+        self,
+        legacy: bool,
+        oauth: bool,
+        device_auth: bool,
+        devbox: bool,
+    ) -> Result<(), &'static str> {
+        if self == Self::OpenaiCodex && (legacy || oauth || device_auth || devbox) {
+            return Err(
+                "--oauth, --device-auth, --devbox, and --legacy are xAI-only; omit them when \
+                 using --provider openai-codex",
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct AuthArgs {
+    #[command(subcommand)]
+    pub command: AuthCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum AuthCommand {
+    /// Show non-secret authentication readiness for a provider.
+    Status {
+        #[arg(long, value_enum)]
+        provider: LoginProvider,
+        /// Emit machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+    },
 }
 /// Arguments for the `wrap` subcommand: the command to run, then its args.
 #[derive(Debug, clap::Args, Clone)]
@@ -1583,8 +1648,87 @@ mod tests {
     #[test]
     fn subcommand_takes_precedence_over_positional_prompt() {
         let args = PagerArgs::try_parse_from(["grok", "logout"]).expect("subcommand parses");
-        assert!(matches!(args.command, Some(Command::Logout)));
+        assert!(matches!(
+            args.command,
+            Some(Command::Logout {
+                provider: LoginProvider::Xai
+            })
+        ));
         assert!(args.prompt.is_none());
+    }
+
+    #[test]
+    fn provider_scoped_auth_commands_parse_without_changing_xai_defaults() {
+        let login = PagerArgs::try_parse_from(["grok", "login"]).expect("default login parses");
+        assert!(matches!(
+            login.command,
+            Some(Command::Login {
+                provider: LoginProvider::Xai,
+                ..
+            })
+        ));
+
+        let codex_login =
+            PagerArgs::try_parse_from(["grok", "login", "--provider", "openai-codex"])
+                .expect("Codex login parses");
+        assert!(matches!(
+            codex_login.command,
+            Some(Command::Login {
+                provider: LoginProvider::OpenaiCodex,
+                oauth: false,
+                device_auth: false,
+                devbox: false,
+                ..
+            })
+        ));
+
+        let codex_with_xai_flag =
+            PagerArgs::try_parse_from(["grok", "login", "--provider", "openai-codex", "--oauth"])
+                .expect("clap preserves the backwards-compatible flag surface");
+        let Some(Command::Login {
+            provider,
+            legacy,
+            oauth,
+            device_auth,
+            devbox,
+        }) = codex_with_xai_flag.command
+        else {
+            panic!("expected login command")
+        };
+        assert!(
+            provider
+                .validate_login_flags(legacy, oauth, device_auth, devbox)
+                .is_err(),
+            "Codex selection rejects xAI-only login flags"
+        );
+
+        let status = PagerArgs::try_parse_from([
+            "grok",
+            "auth",
+            "status",
+            "--provider",
+            "openai-codex",
+            "--json",
+        ])
+        .expect("Codex status parses");
+        assert!(matches!(
+            status.command,
+            Some(Command::Auth(AuthArgs {
+                command: AuthCommand::Status {
+                    provider: LoginProvider::OpenaiCodex,
+                    json: true,
+                }
+            }))
+        ));
+
+        let logout = PagerArgs::try_parse_from(["grok", "logout", "--provider", "openai-codex"])
+            .expect("Codex logout parses");
+        assert!(matches!(
+            logout.command,
+            Some(Command::Logout {
+                provider: LoginProvider::OpenaiCodex
+            })
+        ));
     }
     #[test]
     fn positional_prompt_conflicts_with_headless_single() {

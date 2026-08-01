@@ -499,7 +499,7 @@ async fn run_one_attempt(
             )
             .await
         }
-        ApiBackend::Responses => {
+        ApiBackend::Responses | ApiBackend::CodexResponses => {
             let (raw, metadata, doom_loop) =
                 match client.conversation_stream_responses(request).await {
                     Ok(parts) => parts,

@@ -92,6 +92,9 @@ fn is_network_unreachable(err: &anyhow::Error) -> bool {
 /// `AuthManager` mutations; the caller (`OidcRefresher`) routes the result
 /// through `refresh_chain`.
 pub(crate) async fn oidc_token_exchange(auth: &GrokAuth) -> OidcRefreshResult {
+    if auth.auth_mode == crate::auth::AuthMode::OpenAiCodex {
+        return crate::auth::openai_codex::refresh_auth(auth).await;
+    }
     let has_rt = auth.refresh_token.is_some();
     let has_issuer = auth.oidc_issuer.is_some();
     let has_client_id = auth.oidc_client_id.is_some();

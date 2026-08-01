@@ -213,9 +213,42 @@ impl Default for SamplerConfig {
 pub trait BearerResolver: Send + Sync + std::fmt::Debug {
     fn current_bearer(&self) -> Option<String>;
 
+    /// Capture all provider-scoped request credentials in one read. The
+    /// default preserves compatibility with existing bearer-only resolvers.
+    fn current_credential(&self) -> Option<ProviderCredentialSnapshot> {
+        self.current_bearer()
+            .map(ProviderCredentialSnapshot::bearer_only)
+    }
+
     fn compare_sent_credential(&self, sent: Option<&str>) -> CredentialComparison {
         let current = self.current_bearer();
         CredentialComparison::compare(sent, current.as_deref())
+    }
+}
+
+/// One request's provider credential. Secret bytes intentionally have a
+/// redacted `Debug` representation and are never serialized.
+#[derive(Clone)]
+pub struct ProviderCredentialSnapshot {
+    pub access_token: String,
+    pub account_id: Option<String>,
+}
+
+impl ProviderCredentialSnapshot {
+    pub fn bearer_only(access_token: String) -> Self {
+        Self {
+            access_token,
+            account_id: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for ProviderCredentialSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderCredentialSnapshot")
+            .field("access_token_configured", &!self.access_token.is_empty())
+            .field("account_id_configured", &self.account_id.is_some())
+            .finish()
     }
 }
 
@@ -299,6 +332,20 @@ mod tests {
                 "leaked sentinel window: {window}"
             );
         }
+    }
+
+    #[test]
+    fn provider_credential_snapshot_debug_redacts_values() {
+        let snapshot = ProviderCredentialSnapshot {
+            access_token: "access-secret-sentinel".to_owned(),
+            account_id: Some("account-secret-sentinel".to_owned()),
+        };
+
+        let rendered = format!("{snapshot:?}");
+        assert!(rendered.contains("access_token_configured: true"));
+        assert!(rendered.contains("account_id_configured: true"));
+        assert!(!rendered.contains("access-secret-sentinel"));
+        assert!(!rendered.contains("account-secret-sentinel"));
     }
 
     /// Configs serialized before the field existed must keep deserializing.

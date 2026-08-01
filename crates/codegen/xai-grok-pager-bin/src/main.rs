@@ -31,9 +31,9 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use tokio_util::sync::CancellationToken;
 use xai_grok_pager::app::{
-    AgentCmd, Command, HeadlessArgs, LeaderMgmtArgs, LeaderMgmtCommand, LeaderMode,
-    LeaderTargetArgs, PagerArgs, ServeArgs, join_early_prefetch, resolve_leader_mode,
-    resolve_use_leader, warn_leader_disabled_by_sandbox,
+    AgentCmd, AuthCommand, Command, HeadlessArgs, LeaderMgmtArgs, LeaderMgmtCommand, LeaderMode,
+    LeaderTargetArgs, LoginProvider, PagerArgs, ServeArgs, join_early_prefetch,
+    resolve_leader_mode, resolve_use_leader, warn_leader_disabled_by_sandbox,
 };
 use xai_grok_pager::app::{WorkspaceMgmtArgs, WorkspaceMgmtCommand, WorkspaceStartArgs};
 use xai_grok_pager::client_identity::PAGER_CLIENT_VERSION;
@@ -1637,6 +1637,32 @@ fn run_and_shutdown<F: std::future::Future>(
     runtime.shutdown_timeout(grace);
     output
 }
+
+async fn run_login_with_cancel_signal<T, E, Login, LoginFuture, Signal>(
+    login: Login,
+    signal: Signal,
+) -> Result<T, E>
+where
+    Login: FnOnce(CancellationToken) -> LoginFuture,
+    LoginFuture: std::future::Future<Output = Result<T, E>>,
+    Signal: std::future::Future<Output = std::io::Result<()>>,
+{
+    let cancellation = CancellationToken::new();
+    let login = login(cancellation.clone());
+    tokio::pin!(login);
+    tokio::pin!(signal);
+
+    tokio::select! {
+        result = &mut login => result,
+        signal_result = &mut signal => {
+            if let Err(error) = signal_result {
+                tracing::warn!(%error, "failed to listen for login cancellation signal");
+            }
+            cancellation.cancel();
+            login.await
+        }
+    }
+}
 /// Return freed-but-retained jemalloc pages to the OS.
 ///
 /// `arena.<MALLCTL_ARENAS_ALL>.purge` madvises away all dirty/muzzy pages in
@@ -2093,28 +2119,125 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                 .await;
             }
             Command::Login {
-                legacy: _,
+                provider,
+                legacy,
                 oauth,
                 device_auth,
                 devbox,
             } => {
                 init_tracing_simple("cli");
                 let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
-                let config = xai_grok_shell::config::load_effective_config_disk_only()
-                    .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
-                let config = AgentConfig::new_from_toml_cfg(&config)
-                    .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
-                xai_grok_shell::auth::run_cli_login(&config, oauth, device_auth, devbox).await?;
+                match provider {
+                    LoginProvider::Xai => {
+                        let config = xai_grok_shell::config::load_effective_config_disk_only()
+                            .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
+                        let config = AgentConfig::new_from_toml_cfg(&config)
+                            .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
+                        xai_grok_shell::auth::run_cli_login(&config, oauth, device_auth, devbox)
+                            .await?;
+                    }
+                    LoginProvider::OpenaiCodex => {
+                        provider
+                            .validate_login_flags(legacy, oauth, device_auth, devbox)
+                            .map_err(anyhow::Error::msg)?;
+                        let manager = xai_grok_shell::auth::openai_codex::manager(
+                            &xai_grok_shell::util::grok_home::grok_home(),
+                        );
+                        eprintln!("Starting OpenAI Codex OAuth login...");
+                        run_login_with_cancel_signal(
+                            |cancellation| {
+                                xai_grok_shell::auth::openai_codex::login_with_manager(
+                                    &manager,
+                                    cancellation,
+                                    true,
+                                    |url| {
+                                        eprintln!("If the browser did not open, visit:\n{url}");
+                                    },
+                                )
+                            },
+                            tokio::signal::ctrl_c(),
+                        )
+                        .await?;
+                        eprintln!("Signed in to OpenAI Codex.");
+                    }
+                }
                 println!();
                 xai_grok_shell::instrumentation::finalize_and_exit(0);
             }
-            Command::Logout => {
+            Command::Logout { provider } => {
                 init_tracing_simple("cli");
-                let config = xai_grok_shell::config::load_effective_config_disk_only()
-                    .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
-                let config = AgentConfig::new_from_toml_cfg(&config)
-                    .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
-                xai_grok_shell::auth::run_cli_logout(&config)?;
+                match provider {
+                    LoginProvider::Xai => {
+                        let config = xai_grok_shell::config::load_effective_config_disk_only()
+                            .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
+                        let config = AgentConfig::new_from_toml_cfg(&config)
+                            .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
+                        xai_grok_shell::auth::run_cli_logout(&config)?;
+                    }
+                    LoginProvider::OpenaiCodex => {
+                        let manager = xai_grok_shell::auth::openai_codex::manager(
+                            &xai_grok_shell::util::grok_home::grok_home(),
+                        );
+                        let was_signed_in =
+                            xai_grok_shell::auth::openai_codex::status(&manager).signed_in;
+                        xai_grok_shell::auth::openai_codex::logout(&manager)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Failed to clear Codex auth: {e}"))?;
+                        if was_signed_in {
+                            eprintln!("Signed out from OpenAI Codex.");
+                        } else {
+                            eprintln!("No cached OpenAI Codex credential to remove.");
+                        }
+                    }
+                }
+                xai_grok_shell::instrumentation::finalize_and_exit(0);
+            }
+            Command::Auth(auth_args) => {
+                init_tracing_simple("cli");
+                match auth_args.command {
+                    AuthCommand::Status { provider, json } => match provider {
+                        LoginProvider::OpenaiCodex => {
+                            let manager = xai_grok_shell::auth::openai_codex::manager(
+                                &xai_grok_shell::util::grok_home::grok_home(),
+                            );
+                            let status = xai_grok_shell::auth::openai_codex::status(&manager);
+                            let ready = status.signed_in && (!status.expired || status.refreshable);
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::json!({
+                                        "provider": provider.as_str(),
+                                        "signedIn": status.signed_in,
+                                        "ready": ready,
+                                        "expired": status.expired,
+                                        "refreshable": status.refreshable,
+                                        "accountIdPresent": status.account_id_present,
+                                        "expiresAt": status.expires_at,
+                                    })
+                                );
+                            } else if status.signed_in && !status.expired {
+                                println!("OpenAI Codex: signed in and ready");
+                            } else if status.signed_in && status.refreshable {
+                                println!(
+                                    "OpenAI Codex: signed in; credential refreshes before the next request"
+                                );
+                            } else if status.signed_in {
+                                println!(
+                                    "OpenAI Codex: credential expired (run `grok login --provider openai-codex`)"
+                                );
+                            } else {
+                                println!(
+                                    "OpenAI Codex: signed out (run `grok login --provider openai-codex`)"
+                                );
+                            }
+                        }
+                        LoginProvider::Xai => {
+                            anyhow::bail!(
+                                "provider status currently supports --provider openai-codex"
+                            );
+                        }
+                    },
+                }
                 xai_grok_shell::instrumentation::finalize_and_exit(0);
             }
             Command::Wrap(ref wrap_args) => {
@@ -2467,6 +2590,38 @@ async fn signal_leaders_to_relaunch(installed_version: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn codex_login_cancel_signal_reaches_login_future() {
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = cancelled.clone();
+        let result: Result<(), &'static str> = run_login_with_cancel_signal(
+            move |cancellation| async move {
+                cancellation.cancelled().await;
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err("cancelled")
+            },
+            std::future::ready(Ok(())),
+        )
+        .await;
+
+        assert_eq!(result, Err("cancelled"));
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn codex_login_signal_registration_failure_still_cancels() {
+        let result: Result<(), &'static str> = run_login_with_cancel_signal(
+            |cancellation| async move {
+                cancellation.cancelled().await;
+                Err("cancelled")
+            },
+            std::future::ready(Err(std::io::Error::other("signal unavailable"))),
+        )
+        .await;
+
+        assert_eq!(result, Err("cancelled"));
+    }
     #[test]
     fn default_caps_the_core_count() {
         let nz = |n| NonZeroUsize::new(n).unwrap();

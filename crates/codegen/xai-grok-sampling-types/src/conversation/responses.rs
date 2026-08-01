@@ -171,6 +171,41 @@ pub(super) fn build_responses_input(req: &ConversationRequest) -> rs::InputParam
     rs::InputParam::Items(items)
 }
 
+/// Codex expects system guidance in the top-level `instructions` field rather
+/// than as a `role: "system"` item inside `input`. Keep the generic Responses
+/// conversion unchanged and apply this only at the Codex transport boundary.
+pub fn patch_codex_instructions(body: &mut serde_json::Value) {
+    let Some(input) = body
+        .get_mut("input")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+
+    let mut system_text = Vec::new();
+    input.retain(|item| {
+        if item.get("role").and_then(serde_json::Value::as_str) != Some("system") {
+            return true;
+        }
+        if let Some(content) = item.get("content").and_then(serde_json::Value::as_str) {
+            system_text.push(content.to_owned());
+        }
+        false
+    });
+
+    if system_text.is_empty() {
+        return;
+    }
+    if let Some(existing) = body
+        .get("instructions")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        system_text.insert(0, existing.to_owned());
+    }
+    body["instructions"] = serde_json::Value::String(system_text.join("\n\n"));
+}
+
 /// Inject the `type: "reasoning_text"` discriminator the API requires.
 /// `async-openai`'s `ReasoningTextContent` has no `type` field, so it
 /// serializes to `{"text": ...}` and the API answers 400. Delete this once

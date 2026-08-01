@@ -3,13 +3,36 @@ use super::*;
 use crate::auth::{AuthManager, AuthMode, GrokAuth, GrokComConfig};
 use agent_client_protocol as acp;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 
 /// Test refresher that returns a fresh token and records that it
 /// was invoked. Used to drive the auth-arm success path.
 struct AlwaysSucceedRefresher {
     called: Arc<AtomicBool>,
+}
+
+struct CountingCodexRefresher {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl crate::auth::refresh::TokenRefresher for CountingCodexRefresher {
+    async fn refresh(
+        &self,
+        reason: crate::auth::refresh::RefreshReason,
+    ) -> crate::auth::refresh::RefreshOutcome {
+        assert_eq!(reason, crate::auth::refresh::RefreshReason::ServerRejected);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        crate::auth::refresh::RefreshOutcome::Success(Box::new(GrokAuth {
+            key: format!("refreshed-codex-token-{call}"),
+            auth_mode: AuthMode::OpenAiCodex,
+            refresh_token: Some(format!("codex-rt-{call}")),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            account_id: Some("acct-codex".to_owned()),
+            ..GrokAuth::test_default()
+        }))
+    }
 }
 #[async_trait::async_trait]
 impl crate::auth::refresh::TokenRefresher for AlwaysSucceedRefresher {
@@ -908,6 +931,88 @@ async fn reconstruct_full_config_no_bearer_resolver_for_api_key_method() {
             assert!(
                 cfg.bearer_resolver.is_none(),
                 "api-key method must keep its configured bearer (no live resolver)"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn codex_401_forces_one_refresh_one_retry_then_second_401_is_terminal() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+            manager.hot_swap(GrokAuth {
+                key: "rejected-codex-token".to_owned(),
+                auth_mode: AuthMode::OpenAiCodex,
+                refresh_token: Some("codex-rt-0".to_owned()),
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                account_id: Some("acct-codex".to_owned()),
+                ..GrokAuth::test_default()
+            });
+            let refresh_calls = Arc::new(AtomicUsize::new(0));
+            manager.set_refresher(Arc::new(CountingCodexRefresher {
+                calls: refresh_calls.clone(),
+            }));
+            let provider = crate::auth::AuthProviderRef::openai_codex(manager);
+
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                None,
+                "openai.codex",
+                xai_chat_state::AuthType::ApiKey,
+                "rejected-codex-token".to_owned(),
+            )
+            .await;
+            let mut cfg = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("test actor sampling config");
+            cfg.api_backend = xai_grok_sampling_types::ApiBackend::CodexResponses;
+            let model_id = cfg.model.clone();
+            actor.chat_state_handle.update_sampling_config(cfg);
+            actor
+                .model_auth_memo
+                .replace(Some(crate::session::acp_session::ModelAuthMemo {
+                    model_id,
+                    facts: crate::agent::config::ModelAuthFacts {
+                        byok: crate::agent::auth_method::ModelByok::NotByok,
+                        auth_scheme: xai_grok_sampler::AuthScheme::Bearer,
+                        ready: true,
+                    },
+                    provider: Some(provider),
+                }));
+
+            let reconstructed = actor.reconstruct_full_config().await;
+            let credential = reconstructed
+                .bearer_resolver
+                .as_ref()
+                .and_then(|resolver| resolver.current_credential())
+                .expect("Codex config uses the provider's structured resolver");
+            assert_eq!(credential.access_token, "rejected-codex-token");
+            assert_eq!(credential.account_id.as_deref(), Some("acct-codex"));
+
+            let first = actor
+                .handle_sampling_failure_with_codex_retry_policy(auth_error(), true)
+                .await;
+            assert!(matches!(
+                first,
+                Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
+                    store: RecoveredStore::AuthProvider,
+                    ..
+                })
+            ));
+            assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+
+            let second = actor
+                .handle_sampling_failure_with_codex_retry_policy(auth_error(), false)
+                .await;
+            assert!(second.is_err(), "the retried 401 must terminate the turn");
+            assert_eq!(
+                refresh_calls.load(Ordering::SeqCst),
+                1,
+                "the second 401 must not trigger another refresh"
             );
         })
         .await;

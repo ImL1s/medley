@@ -25,8 +25,10 @@ impl TokenType {
             None => Self::None,
             // Oidc without a refresh_token degrades to the unrefreshable LegacySession shape.
             Some(a) => match a.auth_mode {
-                AuthMode::Oidc if a.refresh_token.is_some() => Self::OidcSession,
-                AuthMode::Oidc | AuthMode::WebLogin => Self::LegacySession,
+                AuthMode::Oidc | AuthMode::OpenAiCodex if a.refresh_token.is_some() => {
+                    Self::OidcSession
+                }
+                AuthMode::Oidc | AuthMode::OpenAiCodex | AuthMode::WebLogin => Self::LegacySession,
                 AuthMode::External => Self::ExternalBinary,
                 AuthMode::ApiKey => Self::ApiKey,
             },

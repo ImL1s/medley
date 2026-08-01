@@ -12,13 +12,14 @@ mod jwt;
 pub(crate) mod manager;
 mod model;
 pub mod oidc;
+pub mod openai_codex;
 pub(crate) mod recovery;
 pub(crate) mod refresh;
 pub(crate) mod single_flight;
 mod storage;
 mod token_output;
 pub(crate) mod token_type;
-pub use auth_provider::{AuthProviderConfig, AuthProviderRef};
+pub use auth_provider::{AuthProviderConfig, AuthProviderRef, ProviderCredentialSnapshot};
 pub(crate) use auth_provider::{
     PROVIDER_TIMEOUT_CEILING_SECS, PROVIDER_TOKEN_EXPIRY_SKEW_SECS, ProviderRefreshOutcome,
 };

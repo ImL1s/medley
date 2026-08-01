@@ -15,6 +15,10 @@ pub(crate) struct ExternalAuthOutput {
     /// (see [`crate::auth::GrokAuth::is_xai_auth`]).
     #[serde(default)]
     pub issuer: Option<String>,
+    /// Optional provider-scoped account/workspace identifier. It is metadata,
+    /// never an arbitrary header name or value supplied by the helper.
+    #[serde(default)]
+    pub account_id: Option<String>,
 }
 
 /// A bearer must be a single line: reject control characters (including an
@@ -38,6 +42,7 @@ pub(crate) struct ParsedTokenOutput {
     pub refresh_token: Option<String>,
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub issuer: Option<String>,
+    pub account_id: Option<String>,
 }
 
 /// Accepts a bare token or JSON `{access_token, expires_in, issuer, ...}`. A
@@ -73,6 +78,14 @@ pub(crate) fn parse_token_output(
             .issuer
             .map(|issuer| issuer.trim().to_owned())
             .filter(|issuer| !issuer.is_empty());
+        let account_id = parsed
+            .account_id
+            .map(|account_id| account_id.trim().to_owned())
+            .filter(|account_id| !account_id.is_empty());
+        if let Some(account_id) = account_id.as_deref() {
+            reject_control_chars(account_id)
+                .map_err(|_| anyhow::anyhow!("account_id contains control characters"))?;
+        }
         tracing::debug!(
             has_refresh_token = parsed.refresh_token.is_some(),
             expires_in = ?parsed.expires_in,
@@ -84,6 +97,7 @@ pub(crate) fn parse_token_output(
             refresh_token: parsed.refresh_token,
             expires_at: parsed.expires_in.and_then(expiry_after_seconds),
             issuer,
+            account_id,
         });
     }
 
@@ -97,6 +111,7 @@ pub(crate) fn parse_token_output(
         refresh_token: None,
         expires_at: None,
         issuer: None,
+        account_id: None,
     })
 }
 
@@ -163,6 +178,17 @@ mod tests {
         assert_eq!(parsed.refresh_token.as_deref(), Some("r"));
 
         assert_eq!(parse_token_output(&ok("bare")).unwrap().refresh_token, None);
+    }
+
+    #[test]
+    fn parse_token_output_reads_optional_account_id() {
+        let output = std::process::Output {
+            status: std::process::Command::new("true").status().unwrap(),
+            stdout: br#"{"access_token":"a","account_id":"acct-123"}"#.to_vec(),
+            stderr: vec![],
+        };
+        let parsed = parse_token_output(&output).unwrap();
+        assert_eq!(parsed.account_id.as_deref(), Some("acct-123"));
     }
 
     /// JSON-shaped output must be a valid, non-empty token payload; a botched or
