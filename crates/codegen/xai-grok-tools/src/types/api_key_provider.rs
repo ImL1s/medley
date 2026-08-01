@@ -3,6 +3,18 @@ use std::pin::Pin;
 use std::sync::Arc;
 use xai_grok_auth::CredentialComparison;
 
+/// Transport contract associated with a provider-scoped tool credential.
+///
+/// Credentials and wire semantics must move together: the ChatGPT Codex
+/// Responses backend rejects generic sampling parameters that other
+/// Responses-compatible providers accept.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ApiTransportProfile {
+    #[default]
+    GenericResponses,
+    CodexResponses,
+}
+
 /// One atomic provider credential for a tool request. The account identifier
 /// is provider metadata, not an alternate credential source; keeping it beside
 /// the bearer prevents mixed token/account rotations.
@@ -34,6 +46,11 @@ impl std::fmt::Debug for ApiCredential {
 pub trait ApiKeyProvider: Send + Sync + 'static {
     /// Sync cached read (no refresh). Override point for static providers.
     fn current_api_key(&self) -> Option<String>;
+
+    /// Wire contract for requests authenticated by this provider.
+    fn transport_profile(&self) -> ApiTransportProfile {
+        ApiTransportProfile::GenericResponses
+    }
 
     /// Per-request resolve. `AuthManager` overrides this to drive the
     /// refresh chain; default delegates to the sync method.

@@ -31,26 +31,37 @@ impl xai_grok_sampler::BearerResolver for WireValidBearerResolver {
 /// Tool-client adapter for a model's provider-scoped bearer resolver. This
 /// keeps a Codex web-search request on the Codex credential source instead of
 /// falling back to the session-wide xAI auth manager.
-pub(crate) struct ProviderScopedToolKeyProvider(xai_grok_sampler::SharedBearerResolver);
+pub(crate) struct ProviderScopedToolKeyProvider {
+    resolver: xai_grok_sampler::SharedBearerResolver,
+    transport_profile: xai_grok_tools::types::ApiTransportProfile,
+}
 
 impl ProviderScopedToolKeyProvider {
     pub(crate) fn shared(
         resolver: xai_grok_sampler::SharedBearerResolver,
+        transport_profile: xai_grok_tools::types::ApiTransportProfile,
     ) -> xai_grok_tools::types::SharedApiKeyProvider {
-        Arc::new(Self(resolver))
+        Arc::new(Self {
+            resolver,
+            transport_profile,
+        })
     }
 }
 
 impl xai_grok_tools::types::ApiKeyProvider for ProviderScopedToolKeyProvider {
     fn current_api_key(&self) -> Option<String> {
-        self.0.current_bearer()
+        self.resolver.current_bearer()
+    }
+
+    fn transport_profile(&self) -> xai_grok_tools::types::ApiTransportProfile {
+        self.transport_profile
     }
 
     fn current_api_key_async(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + '_>> {
         Box::pin(async move {
-            self.0
+            self.resolver
                 .current_credential_async()
                 .await
                 .map(|credential| credential.access_token)
@@ -67,12 +78,13 @@ impl xai_grok_tools::types::ApiKeyProvider for ProviderScopedToolKeyProvider {
         >,
     > {
         Box::pin(async move {
-            self.0.current_credential_async().await.map(|credential| {
-                xai_grok_tools::types::ApiCredential {
+            self.resolver
+                .current_credential_async()
+                .await
+                .map(|credential| xai_grok_tools::types::ApiCredential {
                     access_token: credential.access_token,
                     account_id: credential.account_id,
-                }
-            })
+                })
         })
     }
 }
@@ -734,7 +746,14 @@ mod tests {
             }
         }
 
-        let provider = ProviderScopedToolKeyProvider::shared(Arc::new(RefreshingResolver));
+        let provider = ProviderScopedToolKeyProvider::shared(
+            Arc::new(RefreshingResolver),
+            xai_grok_tools::types::ApiTransportProfile::CodexResponses,
+        );
+        assert_eq!(
+            provider.transport_profile(),
+            xai_grok_tools::types::ApiTransportProfile::CodexResponses
+        );
         assert_eq!(
             provider.current_api_key().as_deref(),
             Some("stale-snapshot")

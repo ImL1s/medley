@@ -56,9 +56,19 @@ grok logout --provider openai-codex
 ```
 
 Login uses the official Codex-compatible browser OAuth flow with PKCE. Grok
-prints the authorization URL even when opening a browser fails, so the same
-command works over SSH by opening that URL in another browser. The loopback
-callback must be reachable on `localhost` port 1455 or 1457.
+prints the authorization URL even when opening a browser fails. Over SSH, open
+both possible callback ports from the machine running the browser before
+starting Grok:
+
+```bash
+ssh -L 1455:127.0.0.1:1455 -L 1457:127.0.0.1:1457 user@remote-host
+grok login --provider openai-codex
+```
+
+Open the printed URL in a browser on that same local machine. The browser's
+`localhost:1455` or `localhost:1457` callback is then forwarded to Grok's
+loopback listener on the SSH host. Copying the URL to an unrelated machine
+without this forwarding will time out.
 
 The credential is stored under its own `openai::codex` scope in
 `~/.grok/auth.json`. Access-token refresh and refresh-token rotation happen

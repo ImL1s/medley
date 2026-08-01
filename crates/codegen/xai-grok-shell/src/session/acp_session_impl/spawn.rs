@@ -482,10 +482,18 @@ pub(crate) async fn spawn_session_actor(
     let web_search_config = if disable_web_search {
         xai_grok_tools::implementations::WebSearchConfig::Disabled
     } else if let Some(cfg) = web_search_sampling_config {
-        let api_key_provider = cfg
-            .bearer_resolver
-            .clone()
-            .map(crate::auth::credential_provider::ProviderScopedToolKeyProvider::shared);
+        let transport_profile = match cfg.api_backend {
+            xai_grok_sampling_types::ApiBackend::CodexResponses => {
+                xai_grok_tools::types::ApiTransportProfile::CodexResponses
+            }
+            _ => xai_grok_tools::types::ApiTransportProfile::GenericResponses,
+        };
+        let api_key_provider = cfg.bearer_resolver.clone().map(|resolver| {
+            crate::auth::credential_provider::ProviderScopedToolKeyProvider::shared(
+                resolver,
+                transport_profile,
+            )
+        });
         if let Some(api_key) = cfg.api_key {
             xai_grok_tools::implementations::WebSearchConfig::Enabled {
                 api_key,
