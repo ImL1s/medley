@@ -174,6 +174,55 @@ async fn subagent_spawn_context_inherits_parent_configured_cutoff() {
     );
 }
 
+#[tokio::test]
+async fn nested_spawn_uses_immediate_parent_security_after_lifecycle_reparenting() {
+    use xai_tool_types::SubagentCapabilityMode;
+
+    let agent = build_minimal_agent_for_tests();
+    let lifecycle_sid = acp::SessionId::new("root-lifecycle-parent");
+    agent.sessions.borrow_mut().insert(
+        lifecycle_sid.clone(),
+        make_test_handle("test-model", false, None),
+    );
+
+    let immediate_sid = acp::SessionId::new("execute-immediate-parent");
+    let mut immediate = make_test_handle("test-model", false, None);
+    immediate.capability_mode = Some(SubagentCapabilityMode::Execute);
+    immediate.tool_context.subagent_depth = 1;
+    let cutoff = xai_grok_sampling_types::ToolOverrides {
+        x_search: None,
+        web_search: None,
+    };
+    immediate
+        .resolved_tool_overrides
+        .store(Some(std::sync::Arc::new(cutoff.clone())));
+    agent
+        .sessions
+        .borrow_mut()
+        .insert(immediate_sid.clone(), immediate);
+
+    let (ctx, _) = agent
+        .try_build_subagent_spawn_context_for_run(
+            lifecycle_sid.0.as_ref(),
+            immediate_sid.0.as_ref(),
+        )
+        .expect("both lifecycle and immediate parent sessions exist");
+
+    assert_eq!(ctx.parent_session_id, lifecycle_sid.0.as_ref());
+    assert_eq!(ctx.parent_capability_mode, Some(SubagentCapabilityMode::Execute));
+    assert_eq!(ctx.parent_depth, 1);
+    assert_eq!(ctx.inherited_tool_overrides, Some(cutoff));
+    assert_eq!(
+        xai_grok_subagent_resolution::intersect_capability_mode_ceiling(
+            Some(SubagentCapabilityMode::All),
+            Some(SubagentCapabilityMode::All),
+            ctx.parent_capability_mode,
+        ),
+        Some(SubagentCapabilityMode::Execute),
+        "an All grandchild request must remain under the immediate Execute parent ceiling"
+    );
+}
+
 /// A subagent inherits the parent's `process_scope`, so an owner enrolled through it stays visible via the child.
 /// End-to-end reaping is covered by the spine's `process_scope_reclaim` tests.
 #[tokio::test]

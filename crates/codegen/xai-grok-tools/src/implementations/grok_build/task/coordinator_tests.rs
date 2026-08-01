@@ -39,7 +39,7 @@ struct TestRunner {
     start: tokio::sync::broadcast::Sender<()>,
     finish: tokio::sync::broadcast::Sender<()>,
     completions: mpsc::UnboundedSender<CompletionDisposition>,
-    requests: mpsc::UnboundedSender<SubagentRequest>,
+    requests: mpsc::UnboundedSender<ObservedRun>,
     started: mpsc::UnboundedSender<String>,
 }
 
@@ -60,10 +60,14 @@ impl ChildRunner for TestRunner {
         Box::pin(async move {
             let ChildRunRequest {
                 request,
+                spawn_parent_session_id,
                 cancellation,
                 reporter,
             } = run;
-            let _ = requests.send(request.clone());
+            let _ = requests.send(ObservedRun {
+                request: request.clone(),
+                spawn_parent_session_id,
+            });
             if wait_before_start {
                 tokio::select! {
                     _ = cancellation.cancelled() => {
@@ -185,9 +189,22 @@ struct Harness {
     start: tokio::sync::broadcast::Sender<()>,
     finish: tokio::sync::broadcast::Sender<()>,
     completions: mpsc::UnboundedReceiver<CompletionDisposition>,
-    requests: mpsc::UnboundedReceiver<SubagentRequest>,
+    requests: mpsc::UnboundedReceiver<ObservedRun>,
     started: mpsc::UnboundedReceiver<String>,
     actor: tokio::task::JoinHandle<()>,
+}
+
+struct ObservedRun {
+    request: SubagentRequest,
+    spawn_parent_session_id: String,
+}
+
+impl std::ops::Deref for ObservedRun {
+    type Target = SubagentRequest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
 }
 
 fn harness(wait_before_start: bool, foreground_budget: std::time::Duration) -> Harness {
@@ -1272,7 +1289,8 @@ async fn loop_tracking_covers_pending_active_and_nested_reparenting() {
         async move { backend.spawn(outer_request).await }
     });
     let observed_outer = harness.requests.recv().await.unwrap();
-    assert_eq!(observed_outer.parent_session_id, "parent");
+    assert_eq!(observed_outer.request.parent_session_id, "parent");
+    assert_eq!(observed_outer.spawn_parent_session_id, "parent");
     assert!(loop_unit_active(&harness.backend, "loop-task").await);
 
     let _ = harness.start.send(());
@@ -1291,10 +1309,15 @@ async fn loop_tracking_covers_pending_active_and_nested_reparenting() {
         async move { backend.spawn(nested_request).await }
     });
     let observed_nested = harness.requests.recv().await.unwrap();
-    assert_eq!(observed_nested.parent_session_id, "parent");
-    assert!(!observed_nested.surface_completion);
+    assert_eq!(observed_nested.request.parent_session_id, "parent");
+    assert_eq!(observed_nested.spawn_parent_session_id, "outer");
+    assert!(!observed_nested.request.surface_completion);
     assert_eq!(
-        observed_nested.runtime_overrides.loop_task_id.as_deref(),
+        observed_nested
+            .request
+            .runtime_overrides
+            .loop_task_id
+            .as_deref(),
         Some("loop-task")
     );
     assert!(loop_unit_active(&harness.backend, "loop-task").await);

@@ -59,6 +59,10 @@ pub struct StartedChild<C> {
 /// Input to one runtime-specific child run.
 pub struct ChildRunRequest<C> {
     pub request: SubagentRequest,
+    /// Session that directly emitted this spawn before coordinator lifecycle
+    /// reparenting. Security ceilings must be inherited from this session,
+    /// not from the root session that owns cancellation/completion delivery.
+    pub spawn_parent_session_id: String,
     pub cancellation: CancellationToken,
     pub reporter: ChildReporter<C>,
 }

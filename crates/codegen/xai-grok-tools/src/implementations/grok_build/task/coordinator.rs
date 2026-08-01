@@ -169,6 +169,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         match command {
             SubagentEvent::Spawn(command) => {
                 let mut request = *command.request;
+                let spawn_parent_session_id = request.parent_session_id.clone();
                 if let Some((root_parent, loop_task_id, spawner_cancelled, spawner_owner)) = self
                     .active
                     .values()
@@ -267,6 +268,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                     future: Box::pin(
                         std::panic::AssertUnwindSafe(self.runner.run(ChildRunRequest {
                             request,
+                            spawn_parent_session_id,
                             cancellation,
                             reporter,
                         }))

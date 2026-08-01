@@ -34,22 +34,27 @@ impl xai_grok_tools::implementations::grok_build::task::coordinator::ChildRunner
         Box::pin(async move {
             let xai_grok_tools::implementations::grok_build::task::coordinator::ChildRunRequest {
                 request,
+                spawn_parent_session_id,
                 cancellation,
                 reporter,
             } = run;
             let this = agent_ref.get();
-            let parent_sid = request.parent_session_id.clone();
-            let Some(mut ctx) = this.try_build_subagent_spawn_context(&parent_sid) else {
+            let lifecycle_parent_sid = request.parent_session_id.clone();
+            let Some((mut ctx, handle)) = this.try_build_subagent_spawn_context_for_run(
+                &lifecycle_parent_sid,
+                &spawn_parent_session_id,
+            ) else {
                 tracing::warn!(
-                    parent_session_id = %parent_sid,
+                    lifecycle_parent_session_id = %lifecycle_parent_sid,
+                    spawn_parent_session_id = %spawn_parent_session_id,
                     subagent_id = %request.id,
-                    "Spawn for unknown or evicted parent session"
+                    "Spawn for unknown or evicted lifecycle/immediate parent session"
                 );
                 return xai_grok_tools::implementations::grok_build::task::coordinator::ChildRunOutput {
                     result: xai_grok_tools::implementations::grok_build::task::types::SubagentResult {
                         success: false,
                         error: Some(
-                            "Parent session not found (evicted or torn down); cannot spawn subagent."
+                            "Lifecycle or immediate parent session not found (evicted or torn down); cannot inherit subagent security ceiling."
                                 .to_owned(),
                         ),
                         subagent_id: request.id.clone(),
@@ -63,16 +68,10 @@ impl xai_grok_tools::implementations::grok_build::task::coordinator::ChildRunner
             ctx.web_search_sampling_config = this
                 .prepare_web_search_sampling_config_preflight()
                 .await;
-            let parent_handle = {
-                let parent_sid = acp::SessionId::new(parent_sid);
-                this.sessions.borrow().get(&parent_sid).cloned()
-            };
-            if let Some(handle) = parent_handle {
-                ctx.parent_mcp_pool = handle.snapshot_mcp_pool().await;
-                ctx.client_hooks = handle.snapshot_client_hooks().await;
-                let definitions = handle.snapshot_tool_definitions().await;
-                ctx.parent_tool_definitions = (!definitions.is_empty()).then_some(definitions);
-            }
+            ctx.parent_mcp_pool = handle.snapshot_mcp_pool().await;
+            ctx.client_hooks = handle.snapshot_client_hooks().await;
+            let definitions = handle.snapshot_tool_definitions().await;
+            ctx.parent_tool_definitions = (!definitions.is_empty()).then_some(definitions);
             crate::agent::subagent::run_shell_child(
                 request,
                 ctx,
@@ -566,5 +565,30 @@ impl MvpAgent {
             parent_notification_handle: parent_notification_handle.clone(),
             parent_scheduler_handle: parent_scheduler_handle.clone(),
         })
+    }
+
+    /// Build the lifecycle-owned context while restoring security ceilings
+    /// from the session that directly emitted the spawn. Nested workflow
+    /// children may be reparented to the root for cancellation/completion, but
+    /// that lifecycle rewrite must not widen capability, depth, or tool-cutoff
+    /// inheritance.
+    pub(super) fn try_build_subagent_spawn_context_for_run(
+        &self,
+        lifecycle_parent_session_id: &str,
+        spawn_parent_session_id: &str,
+    ) -> Option<(
+        crate::agent::subagent::SubagentSpawnContext,
+        crate::session::handle::SessionHandle,
+    )> {
+        let mut ctx = self.try_build_subagent_spawn_context(lifecycle_parent_session_id)?;
+        let spawn_parent_sid = acp::SessionId::new(spawn_parent_session_id);
+        let handle = self.sessions.borrow().get(&spawn_parent_sid).cloned()?;
+        ctx.parent_capability_mode = handle.capability_mode;
+        ctx.parent_depth = handle.tool_context.subagent_depth;
+        ctx.inherited_tool_overrides = handle
+            .resolved_tool_overrides
+            .load_full()
+            .map(|overrides| (*overrides).clone());
+        Some((ctx, handle))
     }
 }
