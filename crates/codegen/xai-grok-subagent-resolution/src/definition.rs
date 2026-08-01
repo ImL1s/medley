@@ -7,7 +7,7 @@ use xai_grok_agent::config::{AgentDefinition, IsolationMode};
 use xai_grok_agent::plugins::PluginRegistry;
 use xai_grok_agent::prompt::context::{PromptAudience, PromptContext};
 use xai_grok_tools::implementations::grok_build::task::types::{
-    SubagentCapabilityModeExt, SubagentRuntimeOverrides, prune_orphaned_background_task_tools,
+    SubagentRuntimeOverrides, prune_orphaned_background_task_tools,
 };
 use xai_grok_tools::registry::types::ToolConfig;
 use xai_grok_tools::types::compat::CompatConfig;
@@ -219,16 +219,17 @@ pub fn apply_definition_runtime_defaults(
         runtime.isolation = SubagentIsolationMode::Worktree;
     }
 }
-/// Apply capability filtering and recursion depth to the exact production
-/// definition toolset.
+/// Apply recursion-depth constraints to the production definition toolset.
+///
+/// Capability filtering deliberately happens later in `AgentBuilder`, after
+/// trusted exact-ID external tools have been classified by `CapabilityPolicy`.
+/// Filtering here by `ToolKind` would either fail open for unclassified tools
+/// or incorrectly discard trusted external tools before the authoritative gate.
 pub fn apply_child_tool_policy(
     definition: &mut AgentDefinition,
-    capability_mode: Option<SubagentCapabilityMode>,
+    _capability_mode: Option<SubagentCapabilityMode>,
     allow_nested_subagents: bool,
 ) {
-    if let Some(mode) = capability_mode {
-        mode.filter_tool_config(&mut definition.tool_config);
-    }
     if !allow_nested_subagents {
         definition
             .tool_config
@@ -351,6 +352,41 @@ mod tests {
         assert!(!definition.tool_config.tools.is_empty());
         apply_child_tool_policy(&mut definition, Some(SubagentCapabilityMode::All), true);
         assert!(definition.tool_config.tools.is_empty());
+    }
+
+    #[test]
+    fn child_policy_defers_capability_filtering_to_agent_builder() {
+        let cwd = tempfile::tempdir().unwrap();
+        let toggles = HashMap::new();
+        let mut definition =
+            resolve_agent_definition("general-purpose", &context(cwd.path(), &toggles)).unwrap();
+        definition
+            .tool_config
+            .tools
+            .push(ToolConfig::from_id("trusted-external:read"));
+
+        apply_child_tool_policy(
+            &mut definition,
+            Some(SubagentCapabilityMode::ReadOnly),
+            true,
+        );
+
+        assert!(
+            definition
+                .tool_config
+                .tools
+                .iter()
+                .any(|tool| tool.id == "trusted-external:read"),
+            "the final policy-aware AgentBuilder gate must classify external tools"
+        );
+        assert!(
+            definition
+                .tool_config
+                .tools
+                .iter()
+                .any(|tool| tool.kind == Some(ToolKind::Execute)),
+            "legacy ToolKind filtering must not run before the final gate"
+        );
     }
     #[test]
     fn gates_disabled_and_not_allowed_definitions() {

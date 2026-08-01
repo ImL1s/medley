@@ -1585,7 +1585,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_preserves_tools_without_kind() {
+    fn restricted_filter_drops_tools_without_kind() {
         use crate::registry::types::ToolServerConfig;
         use crate::types::tool::ToolKind;
         let mut config = ToolServerConfig {
@@ -1598,10 +1598,7 @@ mod tests {
         SubagentCapabilityMode::ReadOnly.filter_tool_config(&mut config);
         let ids: Vec<&str> = config.tools.iter().map(|t| t.id.as_str()).collect();
         assert!(ids.contains(&"read_file"));
-        assert!(
-            ids.contains(&"mcp_custom_tool"),
-            "tools without kind preserved"
-        );
+        assert!(!ids.contains(&"mcp_custom_tool"));
     }
 
     // ── resume_from tests ────────────────────────────────────────────
