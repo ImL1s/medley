@@ -221,8 +221,9 @@ pub trait SubagentCapabilityModeExt {
     fn allowed_tool_kinds(self) -> &'static [crate::types::tool::ToolKind];
 }
 
-/// Prune background-task lifecycle tools (`get_task_output` / `kill_task`) when
-/// no tool that can spawn background work remains in the config.
+/// Prune background-task lifecycle tools (`get_task_output`, `wait_tasks`, and
+/// `kill_task`) when no tool that can spawn background work remains in the
+/// config.
 pub fn prune_orphaned_background_task_tools(config: &mut crate::registry::types::ToolServerConfig) {
     use crate::types::tool::ToolKind;
 
@@ -238,7 +239,11 @@ pub fn prune_orphaned_background_task_tools(config: &mut crate::registry::types:
     config.tools.retain(|tc| {
         !matches!(
             tc.kind,
-            Some(ToolKind::BackgroundTaskAction | ToolKind::KillTaskAction)
+            Some(
+                ToolKind::BackgroundTaskAction
+                    | ToolKind::WaitTasksAction
+                    | ToolKind::KillTaskAction
+            )
         )
     });
 }
@@ -1116,6 +1121,7 @@ mod tests {
                 tc("GrokBuild:grep", ToolKind::Search),
                 tc("GrokBuild:kill_task", ToolKind::KillTaskAction),
                 tc("GrokBuild:get_task_output", ToolKind::BackgroundTaskAction),
+                tc("GrokBuild:wait_tasks", ToolKind::WaitTasksAction),
             ],
             behavior_preset: None,
         };
@@ -1131,6 +1137,24 @@ mod tests {
                 "GrokBuild:grep",
             ]
         );
+    }
+
+    #[test]
+    fn explicit_prune_removes_every_lifecycle_tool_without_a_spawner() {
+        let mut config = ToolServerConfig {
+            tools: vec![
+                tc("GrokBuild:read_file", ToolKind::Read),
+                tc("GrokBuild:get_task_output", ToolKind::BackgroundTaskAction),
+                tc("GrokBuild:wait_tasks", ToolKind::WaitTasksAction),
+                tc("GrokBuild:kill_task", ToolKind::KillTaskAction),
+            ],
+            behavior_preset: None,
+        };
+
+        super::prune_orphaned_background_task_tools(&mut config);
+
+        let ids: Vec<&str> = config.tools.iter().map(|tool| tool.id.as_str()).collect();
+        assert_eq!(ids, vec!["GrokBuild:read_file"]);
     }
 
     #[test]

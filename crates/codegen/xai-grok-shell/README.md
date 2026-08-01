@@ -1755,6 +1755,14 @@ metadata is accepted only from local trusted config layers; project
 `.grok/config.toml` entries require folder trust. Remote MCP `_meta`, remote
 settings, and remote campaign patches are never treated as capability authority.
 
+Root sessions remain unrestricted (`all`), so this does not silently narrow
+top-level user permissions. Restricted workspace/SDK sessions also fail closed
+for kind-less tools: embedders must pass an equivalent locally trusted exact-ID
+catalog through `WorkspaceSessionContextFactory::with_trusted_tool_capabilities`
+or their `SessionContextFactory::trusted_tool_capabilities` implementation.
+Serialized `ToolConfig.kind` values and remote MCP/gateway metadata are ignored
+as capability authority.
+
 ---
 
 ## Plugins
