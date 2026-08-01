@@ -70,6 +70,7 @@ pub struct CodexAuthStatus {
     pub signed_in: bool,
     pub expired: bool,
     pub refreshable: bool,
+    pub permanent_failure: bool,
     pub account_id_present: bool,
     pub expires_at: Option<chrono::DateTime<Utc>>,
 }
@@ -90,8 +91,29 @@ impl std::fmt::Debug for Pkce {
 }
 
 #[derive(Deserialize)]
-struct TokenResponse {
+struct AuthCodeTokenResponse {
     access_token: String,
+    refresh_token: String,
+    id_token: String,
+    #[serde(default)]
+    expires_in: Option<u64>,
+}
+
+impl std::fmt::Debug for AuthCodeTokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthCodeTokenResponse")
+            .field("access_token_present", &!self.access_token.is_empty())
+            .field("refresh_token_present", &!self.refresh_token.is_empty())
+            .field("id_token_present", &!self.id_token.is_empty())
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
+struct RefreshTokenResponse {
+    #[serde(default)]
+    access_token: Option<String>,
     #[serde(default)]
     refresh_token: Option<String>,
     #[serde(default)]
@@ -100,10 +122,10 @@ struct TokenResponse {
     expires_in: Option<u64>,
 }
 
-impl std::fmt::Debug for TokenResponse {
+impl std::fmt::Debug for RefreshTokenResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TokenResponse")
-            .field("access_token_present", &!self.access_token.is_empty())
+        f.debug_struct("RefreshTokenResponse")
+            .field("access_token_present", &self.access_token.is_some())
             .field("refresh_token_present", &self.refresh_token.is_some())
             .field("id_token_present", &self.id_token.is_some())
             .field("expires_in", &self.expires_in)
@@ -372,9 +394,9 @@ fn token_http_client() -> reqwest::Client {
         .expect("Codex OAuth HTTP client configuration is valid")
 }
 
-async fn decode_token_response(
+async fn decode_token_response<T: serde::de::DeserializeOwned>(
     resp: reqwest::Response,
-) -> Result<TokenResponse, TokenRequestError> {
+) -> Result<T, TokenRequestError> {
     let status = resp.status();
     if !status.is_success() {
         let oauth_code = resp
@@ -388,13 +410,11 @@ async fn decode_token_response(
             network_unreachable: false,
         });
     }
-    resp.json::<TokenResponse>()
-        .await
-        .map_err(|_| TokenRequestError {
-            status: Some(status.as_u16()),
-            oauth_code: None,
-            network_unreachable: false,
-        })
+    resp.json::<T>().await.map_err(|_| TokenRequestError {
+        status: Some(status.as_u16()),
+        oauth_code: None,
+        network_unreachable: false,
+    })
 }
 
 async fn exchange_code_at(
@@ -402,7 +422,7 @@ async fn exchange_code_at(
     code: &str,
     redirect_uri: &str,
     verifier: &str,
-) -> Result<TokenResponse, TokenRequestError> {
+) -> Result<AuthCodeTokenResponse, TokenRequestError> {
     let resp = token_http_client()
         .post(endpoint)
         .form(&[
@@ -425,7 +445,7 @@ async fn exchange_code_at(
 async fn refresh_at(
     endpoint: &str,
     refresh_token: &str,
-) -> Result<TokenResponse, TokenRequestError> {
+) -> Result<RefreshTokenResponse, TokenRequestError> {
     let resp = token_http_client()
         .post(endpoint)
         .json(&serde_json::json!({
@@ -480,11 +500,11 @@ fn expiry_from_access_token(token: &str) -> Option<chrono::DateTime<Utc>> {
 }
 
 fn token_expiry(
-    tokens: &TokenResponse,
+    access_token: &str,
+    expires_in: Option<u64>,
     now: chrono::DateTime<Utc>,
 ) -> Result<chrono::DateTime<Utc>, CodexOAuthError> {
-    let expires_in = tokens
-        .expires_in
+    let expires_in = expires_in
         .map(|seconds| {
             let seconds =
                 i64::try_from(seconds).map_err(|_| CodexOAuthError::InvalidTokenResponse)?;
@@ -494,7 +514,7 @@ fn token_expiry(
                 .ok_or(CodexOAuthError::InvalidTokenResponse)
         })
         .transpose()?;
-    let jwt_expiry = expiry_from_access_token(&tokens.access_token);
+    let jwt_expiry = expiry_from_access_token(access_token);
     match (expires_in, jwt_expiry) {
         (Some(relative), Some(jwt)) => Ok(relative.min(jwt)),
         (Some(relative), None) => Ok(relative),
@@ -509,40 +529,72 @@ fn valid_account_id(value: &str) -> bool {
     !value.is_empty() && !value.contains(char::is_control)
 }
 
-fn build_auth(
-    tokens: TokenResponse,
-    previous: Option<&GrokAuth>,
-) -> Result<GrokAuth, CodexOAuthError> {
-    if tokens.access_token.is_empty() {
+fn build_login_auth(tokens: AuthCodeTokenResponse) -> Result<GrokAuth, CodexOAuthError> {
+    if tokens.access_token.is_empty()
+        || tokens.refresh_token.is_empty()
+        || tokens.id_token.is_empty()
+    {
         return Err(CodexOAuthError::InvalidTokenResponse);
     }
     let now = Utc::now();
-    let expires_at = token_expiry(&tokens, now)?;
-    let account_id = tokens
-        .id_token
-        .as_deref()
-        .and_then(account_id_from_jwt)
-        .or_else(|| account_id_from_jwt(&tokens.access_token))
-        .or_else(|| previous.and_then(|auth| auth.account_id.clone()));
-    let refresh_token = tokens
-        .refresh_token
-        .or_else(|| previous.and_then(|auth| auth.refresh_token.clone()));
-    let id_token = tokens
-        .id_token
-        .or_else(|| previous.and_then(|auth| auth.id_token.clone()));
+    let expires_at = token_expiry(&tokens.access_token, tokens.expires_in, now)?;
+    let account_id =
+        account_id_from_jwt(&tokens.id_token).or_else(|| account_id_from_jwt(&tokens.access_token));
     Ok(GrokAuth {
         key: tokens.access_token,
         auth_mode: AuthMode::OpenAiCodex,
         create_time: now,
         user_id: String::new(),
-        refresh_token,
+        refresh_token: Some(tokens.refresh_token),
         expires_at: Some(expires_at),
         oidc_issuer: Some(ISSUER.to_owned()),
         oidc_client_id: Some(CLIENT_ID.to_owned()),
-        id_token,
+        id_token: Some(tokens.id_token),
         account_id,
         ..GrokAuth::default()
     })
+}
+
+fn merge_refresh_auth(
+    tokens: RefreshTokenResponse,
+    previous: &GrokAuth,
+) -> Result<GrokAuth, CodexOAuthError> {
+    for token in [
+        tokens.access_token.as_deref(),
+        tokens.refresh_token.as_deref(),
+        tokens.id_token.as_deref(),
+    ] {
+        if token.is_some_and(str::is_empty) {
+            return Err(CodexOAuthError::InvalidTokenResponse);
+        }
+    }
+    if tokens.access_token.is_none() && tokens.refresh_token.is_none() && tokens.id_token.is_none()
+    {
+        return Err(CodexOAuthError::InvalidTokenResponse);
+    }
+
+    let now = Utc::now();
+    let new_account_id = tokens
+        .id_token
+        .as_deref()
+        .and_then(account_id_from_jwt)
+        .or_else(|| tokens.access_token.as_deref().and_then(account_id_from_jwt));
+    let mut merged = previous.clone();
+    if let Some(access_token) = tokens.access_token {
+        merged.expires_at = Some(token_expiry(&access_token, tokens.expires_in, now)?);
+        merged.key = access_token;
+        merged.create_time = now;
+    }
+    if let Some(refresh_token) = tokens.refresh_token {
+        merged.refresh_token = Some(refresh_token);
+    }
+    if let Some(id_token) = tokens.id_token {
+        merged.id_token = Some(id_token);
+    }
+    if let Some(account_id) = new_account_id {
+        merged.account_id = Some(account_id);
+    }
+    Ok(merged)
 }
 
 pub(crate) fn is_codex_credential(auth: &GrokAuth) -> bool {
@@ -585,7 +637,7 @@ where
                     Some(status) => CodexOAuthError::TokenHttp { status },
                     None => CodexOAuthError::Network,
                 })?;
-            let auth = build_auth(tokens, None)?;
+            let auth = build_login_auth(tokens)?;
             let lock = manager
                 .try_lock_auth_file_async(StdDuration::from_secs(10))
                 .await
@@ -635,6 +687,7 @@ pub fn status(manager: &AuthManager) -> CodexAuthStatus {
         refreshable: auth
             .as_ref()
             .is_some_and(|auth| auth.refresh_token.is_some()),
+        permanent_failure: manager.has_permanent_failure(),
         account_id_present: auth.as_ref().is_some_and(|auth| auth.account_id.is_some()),
         expires_at: auth.and_then(|auth| auth.expires_at),
     }
@@ -697,7 +750,7 @@ pub(crate) async fn refresh_auth(auth: &GrokAuth) -> OidcRefreshResult {
         };
     };
     match refresh_at(TOKEN_ENDPOINT, refresh_token).await {
-        Ok(tokens) => match build_auth(tokens, Some(auth)) {
+        Ok(tokens) => match merge_refresh_auth(tokens, auth) {
             Ok(new_auth) => OidcRefreshResult::Success(Box::new(new_auth)),
             Err(_) => OidcRefreshResult::Failed {
                 network_unreachable: false,
@@ -799,6 +852,21 @@ mod tests {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
         let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
         format!("{header}.{payload}.")
+    }
+
+    fn previous_codex_auth() -> GrokAuth {
+        GrokAuth {
+            key: "old-access".into(),
+            auth_mode: AuthMode::OpenAiCodex,
+            create_time: Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap(),
+            refresh_token: Some("old-refresh".into()),
+            expires_at: Some(Utc.with_ymd_and_hms(2026, 8, 2, 0, 0, 0).unwrap()),
+            oidc_issuer: Some(ISSUER.into()),
+            oidc_client_id: Some(CLIENT_ID.into()),
+            id_token: Some("old-id".into()),
+            account_id: Some("old-account".into()),
+            ..GrokAuth::default()
+        }
     }
 
     #[test]
@@ -1159,50 +1227,34 @@ mod tests {
     fn access_token_jwt_exp_drives_expiry_without_expires_in() {
         let now = Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap();
         let expected = now.checked_add_signed(Duration::hours(1)).unwrap();
-        let tokens = TokenResponse {
-            access_token: jwt(serde_json::json!({"exp": expected.timestamp()})),
-            refresh_token: None,
-            id_token: None,
-            expires_in: None,
-        };
-        assert_eq!(token_expiry(&tokens, now).unwrap(), expected);
+        let access_token = jwt(serde_json::json!({"exp": expected.timestamp()}));
+        assert_eq!(token_expiry(&access_token, None, now).unwrap(), expected);
     }
 
     #[test]
     fn missing_token_expiry_uses_checked_eight_day_fallback() {
         let now = Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap();
-        let tokens = TokenResponse {
-            access_token: "opaque-access-token".into(),
-            refresh_token: None,
-            id_token: None,
-            expires_in: None,
-        };
         let expected = now
             .checked_add_signed(Duration::seconds(EXPIRY_FALLBACK_SECONDS))
             .unwrap();
-        assert_eq!(token_expiry(&tokens, now).unwrap(), expected);
+        assert_eq!(
+            token_expiry("opaque-access-token", None, now).unwrap(),
+            expected
+        );
     }
 
     #[test]
     fn earlier_expiry_wins_and_relative_overflow_is_rejected() {
         let now = Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap();
         let jwt_expiry = now.checked_add_signed(Duration::hours(1)).unwrap();
-        let tokens = TokenResponse {
-            access_token: jwt(serde_json::json!({"exp": jwt_expiry.timestamp()})),
-            refresh_token: None,
-            id_token: None,
-            expires_in: Some(7200),
-        };
-        assert_eq!(token_expiry(&tokens, now).unwrap(), jwt_expiry);
+        let access_token = jwt(serde_json::json!({"exp": jwt_expiry.timestamp()}));
+        assert_eq!(
+            token_expiry(&access_token, Some(7200), now).unwrap(),
+            jwt_expiry
+        );
 
-        let overflow = TokenResponse {
-            access_token: "opaque-access-token".into(),
-            refresh_token: None,
-            id_token: None,
-            expires_in: Some(u64::MAX),
-        };
         assert!(matches!(
-            token_expiry(&overflow, now),
+            token_expiry("opaque-access-token", Some(u64::MAX), now),
             Err(CodexOAuthError::InvalidTokenResponse)
         ));
     }
@@ -1226,7 +1278,7 @@ mod tests {
         });
         std::fs::write(&path, serde_json::to_vec_pretty(&older).unwrap()).unwrap();
 
-        let manager = AuthManager::new_openai_codex(dir.path());
+        let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
         let auth = manager
             .current_or_expired()
             .expect("older Codex record loads");
@@ -1312,6 +1364,25 @@ mod tests {
         assert!(!status(&manager).signed_in);
     }
 
+    #[tokio::test]
+    async fn status_exposes_active_permanent_failure_without_secret_details() {
+        for reason in [
+            RefreshTokenFailedReason::ClientRejected,
+            RefreshTokenFailedReason::Other,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let manager = AuthManager::new_openai_codex(dir.path());
+            let auth = previous_codex_auth();
+            let key = auth.key.clone();
+            manager.save_without_enrichment(auth).await.unwrap();
+            manager.record_permanent_failure(key, reason.into());
+
+            let auth_status = status(&manager);
+            assert!(auth_status.permanent_failure);
+            assert!(manager.has_permanent_failure());
+        }
+    }
+
     #[test]
     fn debug_redacts_all_codex_secrets_and_account() {
         let auth = GrokAuth {
@@ -1367,7 +1438,12 @@ mod tests {
                     form.get("code_verifier").map(String::as_str),
                     Some("verifier")
                 );
-                axum::Json(serde_json::json!({"access_token":"access","expires_in":3600}))
+                axum::Json(serde_json::json!({
+                    "access_token":"access",
+                    "refresh_token":"refresh",
+                    "id_token":"id",
+                    "expires_in":3600
+                }))
             }),
         );
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
@@ -1380,6 +1456,39 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(tokens.access_token, "access");
+        assert_eq!(tokens.refresh_token, "refresh");
+        assert_eq!(tokens.id_token, "id");
+    }
+
+    #[tokio::test]
+    async fn code_exchange_missing_required_tokens_fails_closed() {
+        for body in [
+            serde_json::json!({"refresh_token":"refresh","id_token":"id"}),
+            serde_json::json!({"access_token":"access","id_token":"id"}),
+            serde_json::json!({"access_token":"access","refresh_token":"refresh"}),
+        ] {
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let addr = listener.local_addr().unwrap();
+            let router = Router::new().route(
+                "/token",
+                axum::routing::post(move || {
+                    let body = body.clone();
+                    async move { axum::Json(body) }
+                }),
+            );
+            tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+            exchange_code_at(
+                &format!("http://{addr}/token"),
+                "code",
+                "http://localhost:1455/auth/callback",
+                "verifier",
+            )
+            .await
+            .expect_err("missing required auth-code token must be rejected");
+        }
     }
 
     #[tokio::test]
@@ -1405,9 +1514,93 @@ mod tests {
         let tokens = refresh_at(&format!("http://{addr}/token"), "old-refresh")
             .await
             .unwrap();
-        let auth = build_auth(tokens, None).unwrap();
+        let previous = GrokAuth {
+            key: "old-access".into(),
+            refresh_token: Some("old-refresh".into()),
+            auth_mode: AuthMode::OpenAiCodex,
+            oidc_issuer: Some(ISSUER.into()),
+            oidc_client_id: Some(CLIENT_ID.into()),
+            ..GrokAuth::default()
+        };
+        let auth = merge_refresh_auth(tokens, &previous).unwrap();
         assert_eq!(auth.key, "new-access");
         assert_eq!(auth.refresh_token.as_deref(), Some("new-refresh"));
+    }
+
+    #[tokio::test]
+    async fn refresh_token_only_rotation_preserves_access_expiry_and_identity() {
+        use axum::extract::Json;
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = Router::new().route(
+            "/token",
+            axum::routing::post(|Json(body): Json<serde_json::Value>| async move {
+                assert_eq!(body["refresh_token"], "old-refresh");
+                axum::Json(serde_json::json!({"refresh_token":"rotated-refresh"}))
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let previous = previous_codex_auth();
+        let tokens = refresh_at(&format!("http://{addr}/token"), "old-refresh")
+            .await
+            .unwrap();
+        let merged = merge_refresh_auth(tokens, &previous).unwrap();
+
+        assert_eq!(merged.key, previous.key);
+        assert_eq!(merged.refresh_token.as_deref(), Some("rotated-refresh"));
+        assert_eq!(merged.id_token, previous.id_token);
+        assert_eq!(merged.account_id, previous.account_id);
+        assert_eq!(merged.expires_at, previous.expires_at);
+        assert_eq!(merged.create_time, previous.create_time);
+    }
+
+    #[tokio::test]
+    async fn access_token_only_refresh_atomically_persists_merged_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+        let previous = previous_codex_auth();
+        manager
+            .save_without_enrichment(previous.clone())
+            .await
+            .unwrap();
+
+        let expiry = Utc
+            .timestamp_opt((Utc::now() + Duration::hours(1)).timestamp(), 0)
+            .unwrap();
+        let access_token = jwt(serde_json::json!({
+            "exp": expiry.timestamp(),
+            AUTH_CLAIM_NAMESPACE: { "chatgpt_account_id": "new-account" }
+        }));
+        let response_access_token = access_token.clone();
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let access_token = response_access_token.clone();
+                async move { axum::Json(serde_json::json!({"access_token":access_token})) }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let tokens = refresh_at(&format!("http://{addr}/token"), "old-refresh")
+            .await
+            .unwrap();
+        let merged = merge_refresh_auth(tokens, &previous).unwrap();
+        manager.update(merged).await.unwrap();
+
+        let disk = super::super::storage::read_auth_json(&dir.path().join("auth.json")).unwrap();
+        let persisted = disk.get(AUTH_SCOPE).expect("merged credential persisted");
+        assert_eq!(persisted.key, access_token);
+        assert_eq!(persisted.refresh_token, previous.refresh_token);
+        assert_eq!(persisted.id_token, previous.id_token);
+        assert_eq!(persisted.account_id.as_deref(), Some("new-account"));
+        assert_eq!(persisted.expires_at, Some(expiry));
     }
 
     #[tokio::test]

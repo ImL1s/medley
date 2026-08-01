@@ -6019,6 +6019,12 @@ pub(crate) fn model_readiness(model: &ModelEntry) -> (bool, Option<String>) {
                 Some("invalid OpenAI Codex credential provider".to_owned()),
             );
         };
+        if status.permanent_failure {
+            return (
+                false,
+                Some("OpenAI Codex credential refresh failed; sign in again".to_owned()),
+            );
+        }
         if !status.signed_in {
             return (
                 false,
@@ -6941,6 +6947,45 @@ reasoning_effort = "low"
         assert_eq!(second_grok.api_backend, ApiBackend::ChatCompletions);
         assert_eq!(second_grok.api_key.as_deref(), Some("grok-session-2"));
         assert!(second_grok.bearer_resolver.is_none());
+    }
+    #[test]
+    fn codex_model_is_not_ready_after_retained_permanent_refresh_failure() {
+        for reason in [
+            crate::auth::error::RefreshTokenFailedReason::ClientRejected,
+            crate::auth::error::RefreshTokenFailedReason::Other,
+        ] {
+            let temp = tempfile::tempdir().expect("temporary auth home");
+            let manager = Arc::new(crate::auth::AuthManager::new_openai_codex(temp.path()));
+            manager.hot_swap(crate::auth::GrokAuth {
+                key: "codex-access".into(),
+                auth_mode: crate::auth::AuthMode::OpenAiCodex,
+                refresh_token: Some("codex-refresh".into()),
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                oidc_issuer: Some(crate::auth::openai_codex::ISSUER.into()),
+                oidc_client_id: Some(crate::auth::openai_codex::CLIENT_ID.into()),
+                account_id: Some("codex-account".into()),
+                ..crate::auth::GrokAuth::default()
+            });
+            manager.record_permanent_failure("codex-access".into(), reason.into());
+
+            let mut entry = test_model_entry(
+                "codex-model",
+                crate::auth::openai_codex::CODEX_API_BASE_URL,
+                None,
+                None,
+                None,
+            );
+            entry.info.api_backend = ApiBackend::CodexResponses;
+            entry.info.auth_scheme = AuthScheme::Bearer;
+            entry.auth_provider = Some(crate::auth::AuthProviderRef::openai_codex(manager));
+
+            let (ready, readiness_reason) = model_readiness(&entry);
+            assert!(!ready, "{reason:?} must fail Codex readiness closed");
+            assert!(
+                readiness_reason.is_some_and(|message| message.contains("sign in again")),
+                "{reason:?} must explain the reauthentication requirement"
+            );
+        }
     }
     #[test]
     fn codex_aux_sampler_without_native_resolver_fails_closed() {
