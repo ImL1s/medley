@@ -136,6 +136,27 @@ pub struct TaskWakeAdmission {
     pub respond_to: oneshot::Sender<bool>,
     pub fallback: TaskWakeFallback,
 }
+
+/// Immutable inputs prepared by the ACP handler for one actor-owned model
+/// switch transaction. The actor revalidates harness compatibility and all
+/// zero-turn prerequisites before mutating either harness or model state.
+pub struct PreparedModelSwitch {
+    pub catalog_model_id: acp::ModelId,
+    pub sampling_config: xai_grok_sampler::SamplerConfig,
+    pub use_concise: bool,
+    pub auto_compact_threshold_percent: u8,
+    pub required_agent_type: String,
+    pub required_definition: Option<xai_grok_agent::AgentDefinition>,
+}
+
+/// Receipt returned only after the actor has committed the complete switch.
+#[derive(Debug)]
+pub struct AppliedModelSwitch {
+    pub previous_model_id: acp::ModelId,
+    pub catalog_model_id: acp::ModelId,
+    pub did_rebuild: bool,
+    pub active_agent_type: Option<String>,
+}
 pub enum SessionCommand {
     Initialize {
         system_prompt: String,
@@ -203,48 +224,16 @@ pub enum SessionCommand {
         session_mode: acp::SessionModeId,
         responds_to: oneshot::Sender<()>,
     },
-    SetSessionModel {
-        /// Catalog key for persistence, auth facts, and readiness — not the wire slug.
-        catalog_model_id: acp::ModelId,
-        sampling_config: xai_grok_sampler::SamplerConfig,
-        use_concise: bool,
-        /// When `false`, skip the system prompt rewrite (concise/default swap).
-        /// Set to `false` for forked sessions so mid-session model switches
-        /// cannot contaminate the inherited prompt configuration.
-        apply_prompt_override: bool,
-        /// When `true`, suppress the system prompt rewrite even though
-        /// `apply_prompt_override` may be `true`. Set by the model-switch
-        /// orchestrator immediately after a successful
-        /// `RebuildAgentForDefinition` so the fresh harness's prompt
-        /// (already installed by the rebuild handler) is not clobbered by
-        /// the concise/default swap below.
-        skip_prompt_rewrite: bool,
-        /// Re-resolved auto-compact threshold for the new model. Computed
-        /// by `MvpAgent` against the new model id so per-model remote settings
-        /// and per-model user TOML overrides target the right model after a
-        /// `/model` switch. The session actor stores this on
-        /// `compaction.threshold_percent` (which is `Cell<u8>` so it can
-        /// update without `&mut self`).
-        auto_compact_threshold_percent: u8,
-        responds_to: oneshot::Sender<Result<acp::ModelId, acp::Error>>,
-    },
-    /// Zero-turn harness rebuild: build a brand-new `Agent` from the
-    /// session's `AgentRebuildSpec` and the new `AgentDefinition`,
-    /// re-register MCP tools, swap the live `Agent`, rewrite the
-    /// system message in the conversation, persist the new prompt
-    /// artifacts, and update `active_agent_type`.
-    ///
-    /// Triggered by `MvpAgent::set_session_model` when the new model's
-    /// `agent_type` differs from the session's current one and no user
-    /// message has been sent yet (`turn_count == 0`).
-    RebuildAgentForDefinition {
-        definition: xai_grok_agent::AgentDefinition,
-        responds_to: oneshot::Sender<Result<(), acp::Error>>,
+    /// Atomically validate, prepare, and commit a model switch. A required
+    /// zero-turn harness replacement is built before any live state changes.
+    ApplyModelSwitch {
+        prepared: Box<PreparedModelSwitch>,
+        responds_to: oneshot::Sender<Result<AppliedModelSwitch, acp::Error>>,
     },
     /// Override the model name and optionally inject extra HTTP headers
     /// into the session's sampling config.
     ///
-    /// Unlike `SetSessionModel` (which requires a fully resolved `ModelEntry`
+    /// Unlike `ApplyModelSwitch` (which requires a fully resolved `ModelEntry`
     /// and does NOT update `primaryModelId` in signals — the resolved model
     /// is already tracked via inference responses), this command also calls
     /// `set_primary_model()` so that signals report the override model

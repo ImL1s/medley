@@ -1100,22 +1100,52 @@ fn enqueue_replace_system_prompt_override_noop_when_absent_or_empty() {
 /// custom prompt body is preserved.
 #[test]
 fn harnesses_are_compatible_for_stock_family_pairs() {
-    assert!(harnesses_are_compatible("grok-build", "grok-build-plan"));
-    assert!(harnesses_are_compatible("grok-build-plan", "grok-build"));
-    assert!(harnesses_are_compatible("grok-build", "grok-build"));
+    let stock = |name: &str| {
+        let mut definition = xai_grok_agent::AgentDefinition::default_grok_build();
+        definition.name = name.to_owned();
+        definition
+    };
+    let grok_build = stock("grok-build");
+    let grok_build_plan = stock("grok-build-plan");
+    let grok_build_concise = stock("grok-build-concise");
+    let remote_sidebar = stock("remote-sidebar");
     assert!(harnesses_are_compatible(
-        "grok-build-concise",
-        "grok-build-plan"
+        &grok_build,
+        "grok-build-plan",
+        Some(&grok_build_plan),
     ));
     assert!(harnesses_are_compatible(
-        "remote-sidebar",
-        "grok-build-plan"
+        &grok_build_plan,
+        "grok-build",
+        Some(&grok_build),
+    ));
+    assert!(harnesses_are_compatible(&grok_build, "grok-build", None));
+    assert!(harnesses_are_compatible(
+        &grok_build_concise,
+        "grok-build-plan",
+        Some(&grok_build_plan),
+    ));
+    assert!(harnesses_are_compatible(
+        &remote_sidebar,
+        "grok-build-plan",
+        Some(&grok_build_plan),
     ));
 }
 #[test]
 fn harnesses_are_compatible_rejects_strict_mismatches() {
-    assert!(harnesses_are_compatible("codex", "codex"));
-    assert!(!harnesses_are_compatible("grok-build-plan", "codex"));
+    let codex = xai_grok_agent::AgentDefinition::codex();
+    let stock = xai_grok_agent::AgentDefinition::grok_build_plan();
+    assert!(harnesses_are_compatible(&codex, "codex", None));
+    assert!(!harnesses_are_compatible(
+        &stock,
+        "codex",
+        Some(&codex),
+    ));
+    assert!(!harnesses_are_compatible(
+        &stock,
+        "missing-custom-harness",
+        None,
+    ));
 }
 #[test]
 fn explicit_agent_type_wins_over_session_default() {
@@ -2030,6 +2060,140 @@ fn build_minimal_agent_for_tests() -> MvpAgent {
     let gateway = GatewaySender::new(tx);
     let cfg = AgentConfig::default();
     MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config")
+}
+
+fn build_agent_with_model_for_tests(
+    model_id: &str,
+    agent_type: &str,
+) -> MvpAgent {
+    use crate::agent::config::{Config as AgentConfig, ConfigModelOverride};
+    use crate::auth::{AuthManager, GrokComConfig};
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let auth_manager =
+        std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let gateway = GatewaySender::new(tx);
+    let mut cfg = AgentConfig::default();
+    cfg.models.default = Some(model_id.to_owned());
+    cfg.config_models.insert(
+        model_id.to_owned(),
+        ConfigModelOverride {
+            model: Some(model_id.to_owned()),
+            base_url: Some("http://localhost".to_owned()),
+            auth_scheme: Some(xai_grok_sampler::AuthScheme::None),
+            agent_type: Some(agent_type.to_owned()),
+            ..Default::default()
+        },
+    );
+    MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config")
+}
+
+#[test]
+fn zero_turn_model_switch_fails_closed_when_required_harness_is_unresolved() {
+    run_local_for_bridge_test(|| async {
+        let model_id = "unresolved-harness-model";
+        let agent = build_agent_with_model_for_tests(model_id, "missing-custom-harness");
+        let sid = acp::SessionId::new("zero-turn-unresolved-harness");
+        let mut handle = make_test_handle("previous-model", false, None);
+        handle.info.id = sid.clone();
+        handle.agent_name = "grok-build".to_owned();
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        handle.cmd_tx = cmd_tx;
+        agent.sessions.borrow_mut().insert(sid.clone(), handle);
+
+        tokio::task::spawn_local(async move {
+            while let Some(command) = cmd_rx.recv().await {
+                match command {
+                    TestSessionCommand::GetActiveAgent { responds_to } => {
+                        let _ = responds_to.send(Some("grok-build".to_owned()));
+                    }
+                    TestSessionCommand::ApplyModelSwitch {
+                        prepared,
+                        responds_to,
+                    } => {
+                        assert!(
+                            prepared.required_definition.is_none(),
+                            "the missing required harness must stay unresolved"
+                        );
+                        let _ = responds_to.send(Err(
+                            crate::agent::config::ModelSwitchHarnessError {
+                                code: crate::agent::config::MODEL_SWITCH_REBUILD_FAILED.to_owned(),
+                                active_agent_type: "grok-build".to_owned(),
+                                required_agent_type: "missing-custom-harness".to_owned(),
+                                model_id: prepared.catalog_model_id.0.to_string(),
+                                reason: "agent_definition_unresolved".to_owned(),
+                            }
+                            .into_acp_error(),
+                        ));
+                    }
+                    _ => panic!("unexpected model-switch command"),
+                }
+            }
+        });
+
+        let err = crate::agent::handlers::model_switch::apply(
+            &agent,
+            acp::SetSessionModelRequest::new(sid.clone(), acp::ModelId::new(model_id)),
+        )
+        .await
+        .expect_err("an unresolved required harness must fail the whole switch");
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(|code| code.as_str()),
+            Some(crate::agent::config::MODEL_SWITCH_REBUILD_FAILED),
+        );
+        let handle = agent.sessions.borrow();
+        let handle = handle.get(&sid).expect("session remains registered");
+        assert_eq!(handle.model_id.0.as_ref(), "previous-model");
+        assert_eq!(handle.agent_name, "grok-build");
+    });
+}
+
+#[test]
+fn new_session_explicit_model_fails_before_spawn_when_harness_is_unresolved() {
+    run_local_for_bridge_test(|| async {
+        let model_id = "unresolved-default-harness-model";
+        let agent = build_agent_with_model_for_tests(model_id, "missing-custom-harness");
+        agent
+            .auth_manager
+            .hot_swap(crate::auth::GrokAuth::test_default());
+        agent.set_auth_method(acp::AuthMethodId::new(
+            crate::agent::auth_method::XAI_API_KEY_METHOD_ID,
+        ));
+        let init = acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_capabilities(
+            acp::ClientCapabilities::new()
+                .fs(acp::FileSystemCapabilities::new())
+                .terminal(false),
+        );
+        agent
+            .initialize_request
+            .set(init)
+            .expect("test initialize request should be set once");
+        let cwd = tempfile::tempdir().expect("temporary session cwd");
+
+        let err = <MvpAgent as acp::Agent>::new_session(
+            &agent,
+            acp::NewSessionRequest::new(cwd.path().to_path_buf()).meta(
+                serde_json::json!({ "modelId": model_id })
+                    .as_object()
+                    .cloned(),
+            ),
+        )
+        .await
+        .expect_err("an unresolved explicit-model harness must fail before spawn");
+        let payload = crate::agent::config::ModelSwitchHarnessError::from_acp_error(&err)
+            .unwrap_or_else(|| panic!("expected structured harness error, got {err:?}"));
+        assert_eq!(payload.model_id, model_id);
+        assert_eq!(payload.required_agent_type, "missing-custom-harness");
+        assert_eq!(payload.reason, "agent_definition_unresolved");
+        assert!(
+            agent.sessions.borrow().is_empty(),
+            "failed harness preflight must not register a session"
+        );
+    });
 }
 fn session_usage_request(session_id: &str) -> acp::ExtRequest {
     acp::ExtRequest::new(

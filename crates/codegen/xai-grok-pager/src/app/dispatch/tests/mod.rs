@@ -351,6 +351,19 @@ pub(super) fn test_app_with_agent() -> AppView {
     switch_to_agent(&mut app, id, SwitchCause::New);
     app
 }
+
+fn insert_ready_model(app: &mut AppView, agent_id: AgentId, model_id: &acp::ModelId) {
+    app.agents
+        .get_mut(&agent_id)
+        .expect("test agent")
+        .session
+        .models
+        .available
+        .insert(
+            model_id.clone(),
+            acp::ModelInfo::new(model_id.clone(), model_id.0.to_string()),
+        );
+}
 /// Give a test agent a generated title so the dashboard renders it.
 ///
 /// The dashboard hides empty (no-real-turn) sessions

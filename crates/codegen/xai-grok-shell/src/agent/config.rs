@@ -6165,6 +6165,40 @@ pub const MODEL_SWITCH_INCOMPATIBLE_AGENT: &str = "MODEL_SWITCH_INCOMPATIBLE_AGE
 /// could not be resolved at handler time, `AgentBuilder::build()` errored,
 /// or a turn started racing the rebuild).
 pub const MODEL_SWITCH_REBUILD_FAILED: &str = "MODEL_SWITCH_REBUILD_FAILED";
+
+/// Structured error payload for a zero-turn switch whose required harness
+/// could not be prepared. The payload deliberately identifies only the model,
+/// active harness, required harness, and a stable reason; builder internals and
+/// credentials stay in server-side logs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSwitchHarnessError {
+    pub code: String,
+    pub active_agent_type: String,
+    pub required_agent_type: String,
+    pub model_id: String,
+    pub reason: String,
+}
+
+impl ModelSwitchHarnessError {
+    pub fn into_acp_error(self) -> acp::Error {
+        let message = format!(
+            "Cannot switch to model '{}': required harness '{}' could not replace active harness '{}'.",
+            self.model_id, self.required_agent_type, self.active_agent_type,
+        );
+        acp::Error::new(acp::ErrorCode::InvalidRequest.into(), message)
+            .data(serde_json::to_value(&self).ok())
+    }
+
+    pub fn from_acp_error(err: &acp::Error) -> Option<Self> {
+        let data = err.data.as_ref()?;
+        if data.get("code")?.as_str()? != MODEL_SWITCH_REBUILD_FAILED {
+            return None;
+        }
+        serde_json::from_value(data.clone()).ok()
+    }
+}
+
 /// Structured error payload for model switch rejection due to agent type
 /// incompatibility. Serialized into `acp::Error.data` by the shell and
 /// deserialized by the TUI for user-friendly error rendering.

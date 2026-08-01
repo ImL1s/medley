@@ -1627,13 +1627,6 @@ pub(in crate::app::dispatch) fn set_default_model_inner(
     true
 }
 
-/// Toast format for `default_model`. Mirrors `save_theme_toast` —
-/// renders the user-friendly model name (NOT the internal id) so the
-/// toast text matches what the user typed.
-fn save_default_model_toast(value: &str) -> String {
-    format!("\u{2713} Default model: {value}")
-}
-
 /// Outer dispatcher for `Action::SetDefaultModel`. Soft-confirms when the
 /// target model's auth class differs from the current one; otherwise
 /// switches, persists, and toasts. Idempotent: same model already active → no-op.
@@ -1739,15 +1732,14 @@ pub(in crate::app::dispatch) fn set_default_model_confirmed(
         return vec![];
     };
 
-    let (prev_id, session_id, available_has_new, new_display) = {
+    let (prev_id, session_id, available_has_new) = {
         let Some(agent) = app.agents.get(&aid) else {
             return vec![];
         };
         let prev_id = agent.session.models.current.clone();
         let session_id = agent.session.session_id.clone();
         let available_has_new = agent.session.models.available.contains_key(&new_id);
-        let new_display = agent.session.models.display_name_for(&new_id);
-        (prev_id, session_id, available_has_new, new_display)
+        (prev_id, session_id, available_has_new)
     };
 
     if !available_has_new {
@@ -1767,36 +1759,12 @@ pub(in crate::app::dispatch) fn set_default_model_confirmed(
     let did_mutate = set_default_model_inner(app, &new_id);
     debug_assert!(did_mutate, "available_has_new gate guarantees mutation");
     refresh_open_settings_modals(app);
-    tracing::info!(
-        target: "settings",
-        key = "default_model",
-        new = ?new_display,
-        new_id = %new_id.0,
-        prev_id = ?prev_id.as_ref().map(|id| id.0.as_ref()),
-        "setting changed",
-    );
-    app.show_toast(&save_default_model_toast(&new_display));
 
-    // Persist the **model ID** (catalog key), not the display name.
-    // The shell's `resolve_default_model` matches by slug / map key,
-    // so persisting the human-readable name (e.g. "Grok Build")
-    // would silently fail to resolve on the next startup.
-    //
-    // Chat (`--chat` / GROK_CHAT_MODE) catalogs use opaque `/rest/modes`
-    // slugs that must not become the global Build `default_model`.
+    // Do not persist or show a success toast until the ACP switch commits.
+    // `handle_switch_model_complete` emits `PersistPreferredModel` after a
+    // successful response. This keeps disk state unchanged when the shell
+    // rejects an unavailable required harness.
     let mut effects: Vec<Effect> = Vec::new();
-    if !xai_grok_shell::agent::chat_modes::process_chat_mode_enabled() {
-        let new_id_str = new_id.0.to_string();
-        let prev_id_str = prev_id
-            .as_ref()
-            .map(|id| id.0.to_string())
-            .unwrap_or_default();
-        effects.push(Effect::PersistSetting {
-            key: "default_model",
-            value: crate::settings::SettingValue::String(new_id_str),
-            rollback_value: crate::settings::SettingValue::String(prev_id_str),
-        });
-    }
 
     // Best-effort session-level switch. The `Effect::SwitchModel`
     // pipeline handles its own deferred-switch semantics for the

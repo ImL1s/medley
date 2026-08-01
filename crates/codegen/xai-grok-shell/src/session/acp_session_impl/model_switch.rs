@@ -1,7 +1,127 @@
 use super::*;
+use crate::agent::config;
 use crate::remote::DEFAULT_CONTEXT_WINDOW;
+use crate::session::{AppliedModelSwitch, PreparedModelSwitch};
 use xai_chat_state::conversation_util::replace_or_insert_system_head;
 impl SessionActor {
+    /// Validate, prepare, and commit a complete model switch while the session
+    /// actor owns the ordering. A required replacement agent is fully built
+    /// before either harness or model state is mutated.
+    pub(super) async fn handle_apply_model_switch(
+        &self,
+        prepared: PreparedModelSwitch,
+    ) -> Result<AppliedModelSwitch, acp::Error> {
+        let PreparedModelSwitch {
+            catalog_model_id,
+            sampling_config,
+            use_concise,
+            auto_compact_threshold_percent,
+            required_agent_type,
+            required_definition,
+        } = prepared;
+        let active_agent_type = self
+            .active_agent_type
+            .lock()
+            .clone()
+            .unwrap_or_else(|| self.agent.borrow().definition().name.clone());
+        let previous_model_id = {
+            let value = self.catalog_model_id.take();
+            self.catalog_model_id.set(value.clone());
+            acp::ModelId::new(value)
+        };
+        let model_unchanged = previous_model_id == catalog_model_id;
+        let active_is_strict = self.agent.borrow().definition().is_strict_harness()
+            || xai_grok_agent::config::is_strict_harness_agent_type(&active_agent_type);
+        let mismatch = active_agent_type != required_agent_type
+            && required_definition
+                .as_ref()
+                .is_none_or(|required| active_is_strict || required.is_strict_harness());
+        let mut did_rebuild = false;
+
+        if !self
+            .notifications
+            .gateway_enabled
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(model_switch_harness_error(
+                &catalog_model_id,
+                &active_agent_type,
+                &required_agent_type,
+                "gateway_closed",
+            ));
+        }
+
+        if mismatch {
+            let definition = required_definition.ok_or_else(|| {
+                model_switch_harness_error(
+                    &catalog_model_id,
+                    &active_agent_type,
+                    &required_agent_type,
+                    "agent_definition_unresolved",
+                )
+            })?;
+            if definition.name != required_agent_type {
+                return Err(model_switch_harness_error(
+                    &catalog_model_id,
+                    &active_agent_type,
+                    &required_agent_type,
+                    "agent_definition_mismatch",
+                ));
+            }
+            let turn_count = self
+                .signals_handle()
+                .snapshot()
+                .await
+                .ok_or_else(|| {
+                    model_switch_harness_error(
+                        &catalog_model_id,
+                        &active_agent_type,
+                        &required_agent_type,
+                        "turn_count_unavailable",
+                    )
+                })?
+                .turn_count;
+            if turn_count > 0 {
+                return Err(config::ModelSwitchIncompatibleAgentError {
+                    code: config::MODEL_SWITCH_INCOMPATIBLE_AGENT.to_owned(),
+                    active_agent_type: active_agent_type.clone(),
+                    required_agent_type: required_agent_type.clone(),
+                    model_id: catalog_model_id.0.to_string(),
+                    suggestion: "start_new_session".to_owned(),
+                }
+                .into_acp_error());
+            }
+            self.handle_rebuild_agent_for_definition(definition)
+                .await
+                .map_err(|_| {
+                    model_switch_harness_error(
+                        &catalog_model_id,
+                        &active_agent_type,
+                        &required_agent_type,
+                        "agent_build_failed",
+                    )
+                })?;
+            did_rebuild = true;
+        }
+
+        let updated_model = self
+            .handle_set_session_model(
+                catalog_model_id,
+                sampling_config,
+                use_concise,
+                !self.startup_hints.preserve_inherited_system,
+                did_rebuild || model_unchanged,
+                auto_compact_threshold_percent,
+            )
+            .await?;
+        Ok(AppliedModelSwitch {
+            previous_model_id,
+            catalog_model_id: updated_model,
+            did_rebuild,
+            active_agent_type: self.active_agent_type.lock().clone(),
+        })
+    }
+
     pub(super) async fn handle_set_session_model(
         &self,
         catalog_model_id: acp::ModelId,
@@ -131,7 +251,7 @@ impl SessionActor {
             });
         Ok(catalog_model_id)
     }
-    /// Handle [`SessionCommand::RebuildAgentForDefinition`].
+    /// Build and install the harness portion of an actor-owned model switch.
     ///
     /// Builds a fresh [`xai_grok_agent::Agent`] from the cached
     /// [`crate::session::agent_rebuild::AgentRebuildSpec`] + the supplied
@@ -350,5 +470,289 @@ impl SessionActor {
                 "handle_replace_system_prompt: head already matches, no-op"
             );
         }
+    }
+}
+
+fn model_switch_harness_error(
+    model_id: &acp::ModelId,
+    active_agent_type: &str,
+    required_agent_type: &str,
+    reason: &str,
+) -> acp::Error {
+    config::ModelSwitchHarnessError {
+        code: config::MODEL_SWITCH_REBUILD_FAILED.to_owned(),
+        active_agent_type: active_agent_type.to_owned(),
+        required_agent_type: required_agent_type.to_owned(),
+        model_id: model_id.0.to_string(),
+        reason: reason.to_owned(),
+    }
+    .into_acp_error()
+}
+
+#[cfg(test)]
+mod model_switch_transaction_tests {
+    use super::super::support::create_test_actor_ex;
+    use super::*;
+
+    fn switch_sampling_config(model: &str) -> xai_grok_sampler::SamplerConfig {
+        xai_grok_sampler::SamplerConfig {
+            api_key: None,
+            base_url: "http://127.0.0.1:11434/v1".to_owned(),
+            model: model.to_owned(),
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            api_backend: crate::sampling::ApiBackend::ChatCompletions,
+            auth_scheme: xai_grok_sampler::AuthScheme::None,
+            extra_headers: Default::default(),
+            query_params: Default::default(),
+            env_http_headers: Default::default(),
+            context_window: 128_000,
+            client_version: None,
+            force_http1: false,
+            max_retries: None,
+            stream_tool_calls: false,
+            idle_timeout_secs: None,
+            client_identifier: None,
+            reasoning_effort: None,
+            deployment_id: None,
+            user_id: None,
+            origin_client: None,
+            attribution_callback: None,
+            bearer_resolver: None,
+            supports_backend_search: true,
+            compactions_remaining: None,
+            compaction_at_tokens: None,
+            doom_loop_recovery: None,
+            header_injector: None,
+        }
+    }
+
+    fn prepared_switch(
+        required_agent_type: &str,
+        definition: Option<xai_grok_agent::AgentDefinition>,
+    ) -> PreparedModelSwitch {
+        PreparedModelSwitch {
+            catalog_model_id: acp::ModelId::new("target-model"),
+            sampling_config: switch_sampling_config("target-wire-model"),
+            use_concise: false,
+            auto_compact_threshold_percent: 73,
+            required_agent_type: required_agent_type.to_owned(),
+            required_definition: definition,
+        }
+    }
+
+    fn catalog_model_id(actor: &SessionActor) -> String {
+        let value = actor.catalog_model_id.take();
+        actor.catalog_model_id.set(value.clone());
+        value
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unresolved_zero_turn_harness_preserves_all_actor_model_state() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (persistence_tx, mut persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (actor, _event_rx) =
+                    create_test_actor_ex(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                *actor.active_agent_type.lock() = Some("grok-build".to_owned());
+                let previous_agent = actor.agent.borrow().definition().name.clone();
+                let previous_sampling = actor
+                    .chat_state_handle
+                    .get_sampling_config()
+                    .await
+                    .expect("sampling state");
+                let previous_credentials = actor.chat_state_handle.get_credentials().await;
+                let previous_conversation = actor.chat_state_handle.get_conversation().await;
+
+                let err = actor
+                    .handle_apply_model_switch(prepared_switch("missing-custom-harness", None))
+                    .await
+                    .expect_err("unresolved required harness must fail closed");
+                let payload = config::ModelSwitchHarnessError::from_acp_error(&err)
+                    .expect("structured harness error");
+                assert_eq!(payload.model_id, "target-model");
+                assert_eq!(payload.active_agent_type, "grok-build");
+                assert_eq!(payload.required_agent_type, "missing-custom-harness");
+                assert_eq!(payload.reason, "agent_definition_unresolved");
+                assert_eq!(catalog_model_id(&actor), "test");
+                assert_eq!(actor.agent.borrow().definition().name, previous_agent);
+                assert_eq!(
+                    actor.active_agent_type.lock().as_deref(),
+                    Some("grok-build")
+                );
+                let sampling = actor
+                    .chat_state_handle
+                    .get_sampling_config()
+                    .await
+                    .expect("sampling state");
+                assert_eq!(sampling.model, previous_sampling.model);
+                assert_eq!(sampling.base_url, previous_sampling.base_url);
+                assert_eq!(sampling.context_window, previous_sampling.context_window);
+                let credentials = actor.chat_state_handle.get_credentials().await;
+                assert_eq!(credentials.api_key, previous_credentials.api_key);
+                assert_eq!(credentials.auth_type, previous_credentials.auth_type);
+                assert_eq!(
+                    serde_json::to_value(actor.chat_state_handle.get_conversation().await).unwrap(),
+                    serde_json::to_value(previous_conversation).unwrap()
+                );
+                assert_eq!(actor.compaction.threshold_percent.get(), 85);
+                assert!(
+                    persistence_rx.try_recv().is_err(),
+                    "a failed prerequisite must not enqueue persistence"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nonzero_harness_mismatch_uses_incompatible_error() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (actor, _event_rx) =
+                    create_test_actor_ex(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                *actor.active_agent_type.lock() = Some("codex".to_owned());
+                actor.signals_handle().increment_turn();
+
+                let err = actor
+                    .handle_apply_model_switch(prepared_switch(
+                        "grok-build",
+                        Some(xai_grok_agent::AgentDefinition::default_grok_build()),
+                    ))
+                    .await
+                    .expect_err("nonzero mismatch must be rejected");
+                let payload = config::ModelSwitchIncompatibleAgentError::from_acp_error(&err)
+                    .expect("structured incompatibility error");
+                assert_eq!(payload.model_id, "target-model");
+                assert_eq!(payload.active_agent_type, "codex");
+                assert_eq!(payload.required_agent_type, "grok-build");
+                assert_eq!(catalog_model_id(&actor), "test");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gateway_closed_required_rebuild_fails_the_whole_switch() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (persistence_tx, mut persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (actor, _event_rx) =
+                    create_test_actor_ex(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                *actor.active_agent_type.lock() = Some("codex".to_owned());
+                actor
+                    .notifications
+                    .gateway_enabled
+                    .store(false, std::sync::atomic::Ordering::Release);
+
+                let err = actor
+                    .handle_apply_model_switch(prepared_switch(
+                        "grok-build",
+                        Some(xai_grok_agent::AgentDefinition::default_grok_build()),
+                    ))
+                    .await
+                    .expect_err("closed gateway must reject a required rebuild");
+                let payload = config::ModelSwitchHarnessError::from_acp_error(&err)
+                    .expect("structured harness error");
+                assert_eq!(payload.reason, "gateway_closed");
+                assert_eq!(catalog_model_id(&actor), "test");
+                assert_eq!(actor.active_agent_type.lock().as_deref(), Some("codex"));
+                assert_eq!(actor.compaction.threshold_percent.get(), 85);
+                assert!(persistence_rx.try_recv().is_err());
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gateway_closed_same_harness_switch_preserves_model_state() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (persistence_tx, mut persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (actor, _event_rx) =
+                    create_test_actor_ex(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                *actor.active_agent_type.lock() = Some("grok-build".to_owned());
+                let previous_sampling = actor
+                    .chat_state_handle
+                    .get_sampling_config()
+                    .await
+                    .expect("sampling state");
+                actor
+                    .notifications
+                    .gateway_enabled
+                    .store(false, std::sync::atomic::Ordering::Release);
+
+                let err = actor
+                    .handle_apply_model_switch(prepared_switch("grok-build", None))
+                    .await
+                    .expect_err("closed gateway must reject even a same-harness switch");
+                let payload = config::ModelSwitchHarnessError::from_acp_error(&err)
+                    .expect("structured harness error");
+                assert_eq!(payload.reason, "gateway_closed");
+                assert_eq!(catalog_model_id(&actor), "test");
+                assert_eq!(
+                    actor.active_agent_type.lock().as_deref(),
+                    Some("grok-build")
+                );
+                assert_eq!(actor.compaction.threshold_percent.get(), 85);
+                assert_eq!(
+                    actor
+                        .chat_state_handle
+                        .get_sampling_config()
+                        .await
+                        .expect("sampling state")
+                        .model,
+                    previous_sampling.model
+                );
+                assert!(persistence_rx.try_recv().is_err());
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn valid_zero_turn_rebuild_commits_harness_and_model_together() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (actor, _event_rx) =
+                    create_test_actor_ex(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                *actor.active_agent_type.lock() = Some("codex".to_owned());
+
+                let receipt = actor
+                    .handle_apply_model_switch(prepared_switch(
+                        "grok-build",
+                        Some(xai_grok_agent::AgentDefinition::default_grok_build()),
+                    ))
+                    .await
+                    .expect("valid zero-turn rebuild must succeed");
+                assert!(receipt.did_rebuild);
+                assert_eq!(receipt.catalog_model_id.0.as_ref(), "target-model");
+                assert_eq!(receipt.active_agent_type.as_deref(), Some("grok-build"));
+                assert_eq!(catalog_model_id(&actor), "target-model");
+                assert_eq!(
+                    actor.active_agent_type.lock().as_deref(),
+                    Some("grok-build")
+                );
+                assert_eq!(
+                    actor
+                        .chat_state_handle
+                        .get_sampling_config()
+                        .await
+                        .expect("sampling state")
+                        .model,
+                    "target-wire-model"
+                );
+                assert_eq!(actor.compaction.threshold_percent.get(), 73);
+            })
+            .await;
     }
 }

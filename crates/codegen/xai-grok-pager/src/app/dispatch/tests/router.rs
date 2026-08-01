@@ -957,6 +957,7 @@ fn switch_model_dispatch_produces_effect_and_sets_pending() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
     let model_id = acp::ModelId::new(std::sync::Arc::from("grok-4.5"));
+    insert_ready_model(&mut app, id, &model_id);
     assert!(!app.agents[&id].session.model_switch_pending);
     let effects = dispatch(
         Action::SwitchModel {
@@ -1201,6 +1202,7 @@ fn switch_model_allowed_when_agent_chat_kind() {
     let id = AgentId(0);
     app.agents.get_mut(&id).unwrap().chat_kind = true;
     let model_id = acp::ModelId::new(std::sync::Arc::from("auto"));
+    insert_ready_model(&mut app, id, &model_id);
     let effects = dispatch(
         Action::SwitchModel {
             model_id: model_id.clone(),
@@ -1218,6 +1220,7 @@ fn switch_model_allowed_when_app_chat_mode() {
     let id = AgentId(0);
     app.chat_mode = true;
     let model_id = acp::ModelId::new(std::sync::Arc::from("auto"));
+    insert_ready_model(&mut app, id, &model_id);
     let effects = dispatch(
         Action::SwitchModel {
             model_id: model_id.clone(),

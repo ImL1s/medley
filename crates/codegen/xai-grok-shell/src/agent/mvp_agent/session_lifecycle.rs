@@ -86,7 +86,7 @@ impl MvpAgent {
     /// in submission order and a cancel cannot overtake the prompt it targets.
     /// Cancels therefore wait behind an intake preamble: keep preambles lean.
     /// Bridge cancels take their own path and stay unordered against this lock.
-    pub(super) fn dispatch_lock(&self, id: &acp::SessionId) -> std::rc::Rc<tokio::sync::Mutex<()>> {
+    pub(crate) fn dispatch_lock(&self, id: &acp::SessionId) -> std::rc::Rc<tokio::sync::Mutex<()>> {
         self.session_registry.dispatch_lock(id)
     }
     /// Close a session in response to an **explicit** terminal close

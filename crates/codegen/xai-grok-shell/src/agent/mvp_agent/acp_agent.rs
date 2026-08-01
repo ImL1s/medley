@@ -1210,6 +1210,53 @@ impl acp::Agent for MvpAgent {
                  avoiding cross-client agent_type contamination in leader mode"
             );
         }
+        // A model-declared harness is a prerequisite, not a best-effort hint.
+        // Resolve it only after both explicit and default-model paths have
+        // selected their harness, but before persistence or actor creation.
+        if let Some(required_agent_type) = model_agent_type.as_deref() {
+            let plugin_registry = self.plugin_registry_handle.snapshot();
+            let selected_agent = {
+                let cfg = self.cfg.borrow();
+                Self::resolve_agent_definition_with_plugins(
+                    cwd.as_path(),
+                    cfg.agent_profile_path.as_deref(),
+                    &cfg.agent,
+                    parse_agent_profile_from_meta(arguments.meta.as_ref()),
+                    Some(required_agent_type),
+                    plugin_registry.as_deref(),
+                )
+            };
+            let required_definition = (selected_agent.name != required_agent_type)
+                .then(|| {
+                    xai_grok_agent::discovery::by_name_in_cwd_with_plugins(
+                    required_agent_type,
+                    cwd.as_path(),
+                    plugin_registry.as_deref(),
+                )
+                })
+                .flatten();
+            if !harnesses_are_compatible(
+                &selected_agent,
+                required_agent_type,
+                required_definition.as_ref(),
+            ) {
+                let requested_model = resolved_custom_model
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| self.models_manager.current_model_id().0.to_string());
+                return Err(crate::agent::config::ModelSwitchHarnessError {
+                    code: crate::agent::config::MODEL_SWITCH_REBUILD_FAILED.to_owned(),
+                    active_agent_type: selected_agent.name,
+                    required_agent_type: required_agent_type.to_owned(),
+                    model_id: requested_model,
+                    reason: if required_definition.is_some() {
+                        "incompatible_agent".to_owned()
+                    } else {
+                        "agent_definition_unresolved".to_owned()
+                    },
+                }
+                .into_acp_error());
+            }
+        }
         let origin_client = self.origin_client_info_from_meta(arguments.meta.as_ref());
         let mut session_sampling = session_sampling_override
             .unwrap_or_else(|| {
@@ -1379,13 +1426,25 @@ impl acp::Agent for MvpAgent {
             });
         }
         if let Some(model_id) = resolved_custom_model {
-            let _ = crate::timed!(log: "new_session: set_session_model", {
+            let apply_result = crate::timed!(log: "new_session: set_session_model", {
                 crate::agent::handlers::model_switch::apply(
                     self,
                     acp::SetSessionModelRequest::new(session_id.clone(), acp::ModelId::new(model_id)),
                 )
                 .await
             });
+            if let Err(err) = apply_result {
+                tracing::warn!(
+                    session_id = %session_id.0,
+                    error = ?err,
+                    "new_session: initial model switch failed; reaping invalid session"
+                );
+                self.request_session_shutdown(&session_id);
+                self.remove_session(&session_id);
+                #[cfg(feature = "local-workspace")]
+                self.shutdown_gateway_bridge(&session_id);
+                return Err(err);
+            }
             tracing::debug!(session_id = %session_id.0, "new_session: set_session_model");
         }
         if let Some(requested) = disallowed_custom {

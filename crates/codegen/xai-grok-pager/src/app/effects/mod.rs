@@ -1717,10 +1717,17 @@ pub(crate) fn execute(
                         .await
                         .map(|_| ())
                         .map_err(|e| {
-                            use xai_grok_shell::agent::config::ModelSwitchIncompatibleAgentError;
-                            if let Some(typed) = ModelSwitchIncompatibleAgentError::from_acp_error(
-                                &e,
-                            ) {
+                            use xai_grok_shell::agent::config::{
+                                ModelSwitchHarnessError, ModelSwitchIncompatibleAgentError,
+                            };
+                            if let Some(typed) = ModelSwitchHarnessError::from_acp_error(&e) {
+                                SwitchModelError::HarnessUnavailable {
+                                    error: typed,
+                                    prev_model_id: prev_model_id.clone(),
+                                }
+                            } else if let Some(typed) =
+                                ModelSwitchIncompatibleAgentError::from_acp_error(&e)
+                            {
                                 SwitchModelError::IncompatibleAgent {
                                     error: typed,
                                     prev_model_id: prev_model_id.clone(),

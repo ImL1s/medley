@@ -260,10 +260,11 @@ fn set_default_model_allowed_when_agent_chat_kind() {
     );
     assert!(app.agents[&id].session.model_switch_pending);
 }
-/// `/model <name>` dispatches `SetDefaultModel` which routes
-/// through both `PersistSetting` and `SwitchModel`.
+/// `/model <name>` dispatches `SetDefaultModel`. Persistence is deferred until
+/// the shell confirms the switch, so the optimistic path emits only
+/// `SwitchModel`.
 #[test]
-fn slash_model_valid_dispatches_set_default_model_with_switch_and_persist() {
+fn slash_model_valid_dispatches_switch_before_persist() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
     let model_id = acp::ModelId::new(std::sync::Arc::from("grok-4.5"));
@@ -280,24 +281,13 @@ fn slash_model_valid_dispatches_set_default_model_with_switch_and_persist() {
     let effects = dispatch(Action::SendPrompt("/model Grok 4.5".into()), &mut app);
     assert_eq!(
         effects.len(),
-        2,
-        "expected PersistSetting + SwitchModel effects, got {effects:?}",
+        1,
+        "expected SwitchModel only, got {effects:?}"
     );
     assert!(
-        matches!(
-            &effects[0],
-            Effect::PersistSetting {
-                key: "default_model",
-                ..
-            }
-        ),
-        "first effect must be PersistSetting(default_model), got {:?}",
+        matches!(&effects[0], Effect::SwitchModel { model_id: mid, .. } if mid == &model_id),
+        "switch must be validated before persistence, got {:?}",
         effects[0],
-    );
-    assert!(
-        matches!(&effects[1], Effect::SwitchModel { model_id: mid, .. } if mid == &model_id),
-        "second effect must be SwitchModel(<resolved id>), got {:?}",
-        effects[1],
     );
     assert!(app.agents[&id].session.model_switch_pending);
 }
@@ -1301,10 +1291,10 @@ fn clear_default_model_persists_but_keeps_live_current() {
     );
 }
 /// `Action::SetDefaultModel(<known id>)` resolves the
-/// id against the live catalog, mutates current, and emits both
-/// PersistSetting + SwitchModel effects. This is the
+/// id against the live catalog, mutates current, and emits SwitchModel. The
+/// successful completion persists the committed selection. This is the
 /// dispatch-level analog of the slash-command's
-/// `slash_model_valid_dispatches_set_default_model_with_switch_and_persist`
+/// `slash_model_valid_dispatches_switch_before_persist`
 /// test.
 #[test]
 fn set_default_model_resolves_known_name() {
@@ -1322,16 +1312,9 @@ fn set_default_model_resolves_known_name() {
         .available
         .insert(id.clone(), info);
     let effects = dispatch(Action::SetDefaultModel(id.clone()), &mut app);
-    assert_eq!(effects.len(), 2);
+    assert_eq!(effects.len(), 1);
     assert!(matches!(
         &effects[0],
-        Effect::PersistSetting {
-            key: "default_model",
-            value: crate::settings::SettingValue::String(s),
-            .. } if s == "grok-4.5"
-    ));
-    assert!(matches!(
-        &effects[1],
         Effect::SwitchModel { model_id: mid, .. } if mid == &id
     ));
     assert_eq!(app.agents[&agent_id].session.models.current, Some(id));

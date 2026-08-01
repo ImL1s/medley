@@ -1517,13 +1517,38 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                     }]
                 }
             }
-            Err(SwitchModelError::IncompatibleAgent { .. }) => {
-                if let Some(ref prev) = prev_model_id {
+            Err(SwitchModelError::IncompatibleAgent {
+                prev_model_id: error_prev,
+                ..
+            }) => {
+                let rollback = error_prev.as_ref().or(prev_model_id.as_ref()).cloned();
+                if let Some(ref prev) = rollback {
                     agent.session.models.set_current(prev.clone(), None);
+                    if app.models.available.contains_key(prev) {
+                        app.models.set_current(prev.clone(), None);
+                    }
                 }
                 agent.active_modal = None;
                 let display_name = agent.session.models.display_name_for(&model_id);
                 return open_agent_type_mismatch_question(app, model_id, effort, &display_name);
+            }
+            Err(SwitchModelError::HarnessUnavailable {
+                error,
+                prev_model_id: error_prev,
+            }) => {
+                let rollback = error_prev.as_ref().or(prev_model_id.as_ref()).cloned();
+                let message = format!(
+                    "Couldn't switch to model '{}': required harness '{}' is unavailable ({}).",
+                    error.model_id, error.required_agent_type, error.reason,
+                );
+                agent.scrollback.push_block(RenderBlock::system(message));
+                if let Some(ref prev) = rollback {
+                    agent.session.models.set_current(prev.clone(), None);
+                    if app.models.available.contains_key(prev) {
+                        app.models.set_current(prev.clone(), None);
+                    }
+                }
+                vec![]
             }
             Err(SwitchModelError::Other(msg)) => {
                 agent

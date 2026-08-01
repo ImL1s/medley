@@ -1345,6 +1345,101 @@ fn incompatible_agent_rollback_restores_previous_model() {
 }
 
 #[test]
+fn switch_model_unavailable_harness_rolls_back_default_without_new_session_modal() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let prev_model = acp::ModelId::new(std::sync::Arc::from("original-model"));
+    let rejected_model = acp::ModelId::new(std::sync::Arc::from("custom-model"));
+    let prev_info = acp::ModelInfo::new(prev_model.clone(), "Original".to_string());
+    let rejected_info = acp::ModelInfo::new(rejected_model.clone(), "Custom".to_string());
+
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent
+            .session
+            .models
+            .available
+            .insert(prev_model.clone(), prev_info.clone());
+        agent
+            .session
+            .models
+            .available
+            .insert(rejected_model.clone(), rejected_info.clone());
+        agent.session.models.set_current(prev_model.clone(), None);
+    }
+    app.models.available.insert(prev_model.clone(), prev_info);
+    app.models
+        .available
+        .insert(rejected_model.clone(), rejected_info);
+    app.models.set_current(prev_model.clone(), None);
+
+    let initial_effects = dispatch(Action::SetDefaultModel(rejected_model.clone()), &mut app);
+    assert_eq!(initial_effects.len(), 1);
+    assert!(matches!(
+        &initial_effects[0],
+        Effect::SwitchModel {
+            model_id,
+            prev_model_id: Some(previous),
+            ..
+        } if model_id == &rejected_model && previous == &prev_model
+    ));
+    assert!(
+        !initial_effects.iter().any(|effect| matches!(
+            effect,
+            Effect::PersistSetting {
+                key: "default_model",
+                ..
+            } | Effect::PersistPreferredModel { .. }
+        )),
+        "unconfirmed default selection must not reach disk: {initial_effects:?}",
+    );
+    assert_eq!(
+        app.agents[&id].session.models.current,
+        Some(rejected_model.clone())
+    );
+    assert_eq!(app.models.current, Some(rejected_model.clone()));
+
+    let error = xai_grok_shell::agent::config::ModelSwitchHarnessError {
+        code: xai_grok_shell::agent::config::MODEL_SWITCH_REBUILD_FAILED.to_string(),
+        active_agent_type: "grok-build".into(),
+        required_agent_type: "missing-custom-harness".into(),
+        model_id: rejected_model.0.to_string(),
+        reason: "agent_definition_unavailable".into(),
+    };
+    let completion_effects = dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id: id,
+            model_id: rejected_model,
+            effort: None,
+            result: Err(SwitchModelError::HarnessUnavailable {
+                error,
+                prev_model_id: Some(prev_model.clone()),
+            }),
+            prev_model_id: Some(prev_model.clone()),
+        }),
+        &mut app,
+    );
+
+    assert!(completion_effects.is_empty());
+    assert_eq!(
+        app.agents[&id].session.models.current,
+        Some(prev_model.clone())
+    );
+    assert_eq!(app.models.current, Some(prev_model));
+    assert!(app.agents[&id].question_view.is_none());
+    assert!(
+        app.agents[&id]
+            .scrollback
+            .iter_entries()
+            .any(|(_, entry)| matches!(
+                &entry.block,
+                RenderBlock::System(block) if block.text.contains("missing-custom-harness")
+            )),
+        "user-facing failure should name the unavailable harness",
+    );
+}
+
+#[test]
 fn incompatible_agent_closes_active_modal() {
     use crate::views::modal::ActiveModal;
 
@@ -1445,6 +1540,7 @@ fn switch_model_pending_lifecycle() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
     let model_id = acp::ModelId::new(std::sync::Arc::from("grok-4.5"));
+    insert_ready_model(&mut app, id, &model_id);
 
     // Initially false.
     assert!(!app.agents[&id].session.model_switch_pending);

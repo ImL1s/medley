@@ -26,6 +26,15 @@ pub enum SwitchModelError {
         /// declines to start a new session.
         prev_model_id: Option<acp::ModelId>,
     },
+    /// The target model names a harness that the shell could not resolve or
+    /// prepare. Starting a new session cannot fix this, so the pager must
+    /// fail closed without offering the incompatible-agent remediation.
+    HarnessUnavailable {
+        error: xai_grok_shell::agent::config::ModelSwitchHarnessError,
+        /// The model that was active before a default-model selection
+        /// optimistically updated the pager mirrors.
+        prev_model_id: Option<acp::ModelId>,
+    },
     /// Any other failure (network, auth, server error, etc.).
     Other(String),
 }

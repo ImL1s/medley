@@ -4005,16 +4005,42 @@ impl MvpAgent {
         acp_agent_profile: Option<xai_grok_agent::AgentDefinition>,
         model_agent_type: Option<&str>,
     ) -> xai_grok_agent::AgentDefinition {
+        Self::resolve_agent_definition_with_plugins(
+            cwd,
+            agent_profile_path,
+            agent_config,
+            acp_agent_profile,
+            model_agent_type,
+            None,
+        )
+    }
+
+    pub(crate) fn resolve_agent_definition_with_plugins(
+        cwd: &std::path::Path,
+        agent_profile_path: Option<&std::path::Path>,
+        agent_config: &config::AgentSelectionConfig,
+        acp_agent_profile: Option<xai_grok_agent::AgentDefinition>,
+        model_agent_type: Option<&str>,
+        plugins: Option<&xai_grok_agent::plugins::PluginRegistry>,
+    ) -> xai_grok_agent::AgentDefinition {
         use xai_grok_agent::AgentDefinition;
         let grok_agent_env_set = std::env::var("GROK_AGENT")
             .ok()
             .is_some_and(|s| !s.trim().is_empty());
         let config_agent_explicitly_set = agent_config.name.is_some();
-        let model_requires_strict_harness = model_agent_type
-            .is_some_and(xai_grok_agent::config::is_strict_harness_agent_type);
+        // Resolve the concrete definition before classifying it. Name-only
+        // classification deliberately treats unknown names as non-strict, but
+        // a project/user custom harness may still carry a bespoke prompt,
+        // wire template, or curated toolset.
+        let model_agent_definition = model_agent_type.and_then(|required| {
+            xai_grok_agent::discovery::by_name_in_cwd_with_plugins(required, cwd, plugins)
+        });
+        let model_requires_strict_harness = model_agent_definition
+            .as_ref()
+            .is_some_and(xai_grok_agent::AgentDefinition::is_strict_harness);
         if !grok_agent_env_set && !config_agent_explicitly_set
-            && model_requires_strict_harness && let Some(required) = model_agent_type
-            && let Some(def) = xai_grok_agent::discovery::by_name_in_cwd(required, cwd)
+            && model_requires_strict_harness
+            && let Some(def) = model_agent_definition.clone()
         {
             tracing::info!(
                 agent_name = %def.name,
@@ -4072,7 +4098,9 @@ impl MvpAgent {
                 agent_name = %name,
                 "Resolving agent definition from config.toml [agent] name"
             );
-            if let Some(def) = xai_grok_agent::discovery::by_name_in_cwd(name, cwd) {
+            if let Some(def) = xai_grok_agent::discovery::by_name_in_cwd_with_plugins(
+                name, cwd, plugins,
+            ) {
                 return def;
             }
             tracing::warn!(
@@ -4100,10 +4128,10 @@ impl MvpAgent {
                     }
                 }
             }
-            Some(name) => {
-                xai_grok_agent::discovery::by_name_in_cwd(name, cwd)
-                    .unwrap_or_else(AgentDefinition::grok_build_plan)
-            }
+            Some(name) => xai_grok_agent::discovery::by_name_in_cwd_with_plugins(
+                name, cwd, plugins,
+            )
+            .unwrap_or_else(AgentDefinition::grok_build_plan),
             None => AgentDefinition::grok_build_plan(),
         };
         if !grok_agent_env_set && !config_agent_explicitly_set
@@ -4115,7 +4143,7 @@ impl MvpAgent {
                 model_agent_type = %required,
                 "resolve_agent_definition: model requires different agent, re-resolving"
             );
-            if let Some(def) = xai_grok_agent::discovery::by_name_in_cwd(required, cwd) {
+            if let Some(def) = model_agent_definition {
                 return def;
             }
             tracing::warn!(
@@ -4480,14 +4508,16 @@ impl MvpAgent {
         let session_default_agent_profile = acp_agent_profile
             .as_ref()
             .map(|d| d.name.clone());
+        let plugin_registry = self.plugin_registry_handle.snapshot();
         let mut agent_definition = {
             let cfg = self.cfg.borrow();
-            Self::resolve_agent_definition(
+            Self::resolve_agent_definition_with_plugins(
                 cwd.as_path(),
                 cfg.agent_profile_path.as_deref(),
                 &cfg.agent,
                 acp_agent_profile,
                 model_agent_type,
+                plugin_registry.as_deref(),
             )
         };
         {

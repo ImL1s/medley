@@ -681,6 +681,25 @@ async fn resolve_effective_model_config(
     }
     resolve_subagent_sampling_config(subagent_type, definition_model, ctx).await
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubagentModelHarnessError {
+    Unavailable,
+    Incompatible,
+}
+
+fn validate_subagent_model_harness(
+    active: &xai_grok_agent::AgentDefinition,
+    required_agent_type: &str,
+    required: Option<&xai_grok_agent::AgentDefinition>,
+) -> Result<(), SubagentModelHarnessError> {
+    if active.name != required_agent_type && required.is_none() {
+        return Err(SubagentModelHarnessError::Unavailable);
+    }
+    crate::agent::mvp_agent::harnesses_are_compatible(active, required_agent_type, required)
+        .then_some(())
+        .ok_or(SubagentModelHarnessError::Incompatible)
+}
 /// Emit a unified log entry recording which model and credentials a subagent
 /// resolved to, and how they compare to the parent's.
 fn log_subagent_model_resolution(

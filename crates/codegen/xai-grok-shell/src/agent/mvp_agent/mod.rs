@@ -1065,23 +1065,22 @@ pub(crate) fn agent_name_after_model_switch(
 }
 /// Harness compatibility for zero-turn / mid-turn model switching.
 ///
-/// Two stock (non-strict) agents are interchangeable — they share the
-/// default wire format and toolset, so switching e.g. `grok-build` →
-/// `grok-build-plan` doesn't require rebuilding the harness and would
-/// destroy a client-supplied `_meta.agentProfile` if it did.
-///
-/// Strict harnesses (`codex`, …) are only compatible with
-/// themselves. Strict↔stock transitions are never compatible.
-pub(crate) fn harnesses_are_compatible(active: &str, required: &str) -> bool {
-    use xai_grok_agent::config::is_strict_harness_agent_type;
-    match (
-        is_strict_harness_agent_type(active),
-        is_strict_harness_agent_type(required),
-    ) {
-        (false, false) => true,
-        (true, true) => active == required,
-        _ => false,
+/// Exact identities are always compatible. Differing definitions are only
+/// interchangeable when both are structurally stock. A missing required
+/// definition is deliberately incompatible: unknown/custom names must never
+/// inherit the active harness merely because the name-based strict predicate
+/// cannot classify them.
+pub(crate) fn harnesses_are_compatible(
+    active: &xai_grok_agent::AgentDefinition,
+    required_agent_type: &str,
+    required: Option<&xai_grok_agent::AgentDefinition>,
+) -> bool {
+    if active.name == required_agent_type {
+        return true;
     }
+    required.is_some_and(|required| {
+        !active.is_strict_harness() && !required.is_strict_harness()
+    })
 }
 /// Read a string field from `session_meta` first, falling back to
 /// `init_meta`. The session path bypasses the `initialize_request`

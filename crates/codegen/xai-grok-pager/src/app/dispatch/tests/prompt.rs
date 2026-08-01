@@ -2435,6 +2435,7 @@ fn switch_model_holds_prompt_until_complete() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
     let model_id = acp::ModelId::new(std::sync::Arc::from("grok-4.5"));
+    insert_ready_model(&mut app, id, &model_id);
 
     dispatch(
         Action::SwitchModel {
