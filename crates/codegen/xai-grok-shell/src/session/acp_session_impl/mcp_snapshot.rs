@@ -88,7 +88,7 @@ async fn refresh_mcp_snapshot_and_schedule_reminder_inner(
         } else {
             tool_bridge.disable_managed_gateway_admission();
         }
-        let catalog = if state.gateway_tools_active {
+        let catalog = if state.gateway_tools_active && !state.gateway_refresh_in_progress {
             match &state.gateway_tool_cache {
                 crate::session::managed_mcp::GatewayToolCatalogCache::Ready(catalog) => {
                     Some(catalog.clone())
@@ -136,6 +136,7 @@ async fn refresh_mcp_snapshot_and_schedule_reminder_inner(
         // a stale gateway binding before its follow-up refresh is processed.
         let state = managed_mcp_handle.lock().await;
         let snapshot_is_current = state.gateway_tools_active
+            && !state.gateway_refresh_in_progress
             && state.gateway_tool_epoch == gateway_epoch
             && matches!(
                 &state.gateway_tool_cache,

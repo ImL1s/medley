@@ -190,7 +190,8 @@ impl SessionActor {
         let Some(am) = auth_manager else {
             return Err("no auth manager; cannot re-fetch managed configs".into());
         };
-        crate::session::managed_mcp::invalidate_cache(&self.managed_mcp_handle).await;
+        crate::session::managed_mcp::invalidate_managed_config_cache(&self.managed_mcp_handle)
+            .await;
         let fresh_configs = crate::session::managed_mcp::fetch_managed_mcp_configs(
             &self.managed_mcp_handle,
             &proxy_url,

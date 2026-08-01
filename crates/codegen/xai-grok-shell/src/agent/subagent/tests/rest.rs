@@ -2983,6 +2983,68 @@ fn plugin_agents_inherit_parent_mcp_pool_by_default() {
     assert_eq!(pool_names(&inherited), vec!["atlassian", "github"]);
 }
 #[test]
+fn restricted_children_reject_agent_owned_mcp_servers_before_session_spawn() {
+    use xai_tool_types::SubagentCapabilityMode;
+
+    let mut definition = xai_grok_agent::config::AgentDefinition::parse(
+        r#"---
+name: restricted-mcp
+description: restricted MCP admission fixture
+mcpServers:
+  - parent-server
+  - inline-server:
+      type: stdio
+      command: sh
+      args: ["-c", "exit 0"]
+---
+fixture
+"#,
+    )
+    .expect("agent definition fixture must parse");
+    for mode in [
+        SubagentCapabilityMode::ReadOnly,
+        SubagentCapabilityMode::ReadWrite,
+        SubagentCapabilityMode::Execute,
+    ] {
+        let error = super::agent_owned_mcp_server_admission_error(&definition, Some(mode))
+            .expect("restricted mode must reject agent-owned MCP startup");
+        assert!(error.contains("mcpServers"));
+        assert!(error.contains("All"));
+    }
+    assert!(
+        super::agent_owned_mcp_server_admission_error(
+            &definition,
+            Some(SubagentCapabilityMode::All)
+        )
+        .is_none()
+    );
+    assert!(super::agent_owned_mcp_server_admission_error(&definition, None).is_none());
+
+    definition.plugin_name = Some("fixture-plugin".into());
+    assert!(
+        super::agent_owned_mcp_server_admission_error(
+            &definition,
+            Some(SubagentCapabilityMode::ReadOnly)
+        )
+        .is_none(),
+        "plugin-owned configs keep the existing ignore path"
+    );
+
+    definition.plugin_name = None;
+    definition.mcp_servers.clear();
+    definition.mcp_inheritance = xai_grok_agent::config::McpInheritance::All;
+    assert!(
+        super::agent_owned_mcp_server_admission_error(
+            &definition,
+            Some(SubagentCapabilityMode::ReadOnly)
+        )
+        .is_none(),
+        "already-connected parent MCP inheritance must remain available"
+    );
+    assert!(super::agent_owned_mcp_servers_allowed(false));
+    assert!(!super::agent_owned_mcp_servers_allowed(true));
+}
+#[test]
 fn plugin_agents_can_opt_out_via_mcp_inheritance_none() {
     let pool = make_pool(&["atlassian"]);
     let inherited = super::resolve_inherited_mcp_pool(

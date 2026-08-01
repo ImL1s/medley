@@ -2433,6 +2433,102 @@ mod managed_gateway_tool_tests {
     }
 
     #[tokio::test]
+    async fn gateway_refresh_fence_prevents_stale_snapshot_reconciliation() {
+        fn catalog() -> crate::session::managed_mcp::GatewayToolCatalog {
+            crate::session::managed_mcp::GatewayToolCatalog {
+                tools: vec![crate::session::managed_mcp::GatewayTool {
+                    connector_id: "gateway".to_string(),
+                    connector_name: "Gateway".to_string(),
+                    tool_id: "search".to_string(),
+                    tool_name: "Search".to_string(),
+                    call_id: "gateway.search".to_string(),
+                    description: "Gateway search".to_string(),
+                    json_schema: serde_json::json!({"type": "object"}),
+                }],
+                total_tools: 1,
+                connectors_needing_reauth: vec![],
+            }
+        }
+
+        let bridge = Arc::new(crate::tools::bridge::ToolBridge::for_test());
+        let mcp_state = Arc::new(TokioMutex::new(McpState::new(vec![])));
+        let managed = crate::session::managed_mcp::ManagedMcpStateHandle::default();
+        let snapshot = Arc::new(std::sync::Mutex::new(
+            crate::session::tool_index::ToolMetadataSnapshot::default(),
+        ));
+        {
+            let mut state = managed.lock().await;
+            state.enable_gateway_tools();
+            let epoch = state.start_gateway_tool_fetch().unwrap();
+            assert!(state.complete_gateway_tool_fetch(epoch, catalog()));
+        }
+        refresh_mcp_snapshot_for_test(
+            bridge.clone(),
+            mcp_state.clone(),
+            managed.clone(),
+            snapshot.clone(),
+        )
+        .await;
+
+        let (snapshot_ready_tx, snapshot_ready_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+        let refresh = refresh_mcp_snapshot_for_test_paused_after_gateway_snapshot(
+            bridge.clone(),
+            mcp_state.clone(),
+            managed.clone(),
+            snapshot.clone(),
+            snapshot_ready_tx,
+            continue_rx,
+        );
+        let fence_after_snapshot = async {
+            snapshot_ready_rx
+                .await
+                .expect("refresh should expose its captured gateway snapshot");
+            let mut state = managed.lock().await;
+            state.begin_gateway_tool_refresh();
+            assert!(state.gateway_refresh_in_progress);
+            assert!(matches!(
+                &state.gateway_tool_cache,
+                crate::session::managed_mcp::GatewayToolCatalogCache::Ready(_)
+            ));
+            drop(state);
+            continue_tx
+                .send(())
+                .expect("paused refresh should still be waiting");
+        };
+        tokio::join!(refresh, fence_after_snapshot);
+
+        assert!(
+            bridge
+                .read_resource::<xai_grok_tools::types::resources::ManagedGatewayToolCatalog>()
+                .await
+                .is_some_and(|catalog| catalog.get("gateway__search").is_none()),
+            "a snapshot captured before the fence must not republish its old gateway resource"
+        );
+        assert!(
+            snapshot
+                .lock()
+                .unwrap()
+                .tools
+                .iter()
+                .all(|tool| tool.qualified_name != "gateway__search"),
+            "a snapshot captured before the fence must not re-advertise its old identity"
+        );
+
+        // A refresh that starts after the fence must not clone the still-Ready
+        // old cache either.
+        refresh_mcp_snapshot_for_test(bridge.clone(), mcp_state, managed, snapshot.clone()).await;
+        assert!(
+            snapshot
+                .lock()
+                .unwrap()
+                .tools
+                .iter()
+                .all(|tool| tool.qualified_name != "gateway__search")
+        );
+    }
+
+    #[tokio::test]
     async fn stale_gateway_snapshot_after_epoch_rotation_cannot_publish_old_catalog() {
         fn catalog(call_id: &str) -> crate::session::managed_mcp::GatewayToolCatalog {
             crate::session::managed_mcp::GatewayToolCatalog {

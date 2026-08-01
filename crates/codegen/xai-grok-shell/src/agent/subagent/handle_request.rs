@@ -379,6 +379,17 @@ pub(crate) async fn run_shell_child(
             ctx.parent_capability_mode,
         );
     definition.capability_mode = effective_runtime.capability_mode;
+    if let Some(error) =
+        agent_owned_mcp_server_admission_error(&definition, effective_runtime.capability_mode)
+    {
+        tracing::warn!(
+            subagent_id = %request.id,
+            agent = %definition.name,
+            capability_mode = ?effective_runtime.capability_mode,
+            "Rejected agent-owned MCP server startup for restricted subagent"
+        );
+        return child_run_output(failure_result(&request, error), completion_data, None);
+    }
     let child_depth = request
         .runtime_overrides
         .spawn_depth

@@ -260,7 +260,7 @@ impl MvpAgent {
             let state = self.managed_mcp_cache.lock().await;
             match &state.gateway_tool_cache {
                 crate::session::managed_mcp::GatewayToolCatalogCache::Ready(catalog)
-                    if state.gateway_tools_active =>
+                    if state.gateway_tools_active && !state.gateway_refresh_in_progress =>
                 {
                     Some(catalog.clone())
                 }
@@ -307,6 +307,99 @@ impl MvpAgent {
         &self,
     ) -> &crate::session::managed_mcp::ManagedMcpStateHandle {
         &self.managed_mcp_cache
+    }
+    pub(crate) async fn invalidate_managed_mcp_config_cache(&self) {
+        crate::session::managed_mcp::invalidate_managed_config_cache(&self.managed_mcp_cache).await;
+    }
+    /// Explicitly refresh the gateway catalog without exposing a cache-first
+    /// window where live sessions can still dispatch stale exact identities.
+    pub(crate) async fn refresh_managed_mcp_gateway_tool_catalog(
+        &self,
+    ) -> Option<crate::session::managed_mcp::GatewayToolCatalog> {
+        let _refresh_guard = self.managed_gateway_refresh_lock.lock().await;
+        self.invalidate_gateway_tool_cache_after_session_admission()
+            .await;
+        if !self.can_fetch_managed_mcp_gateway_tools() {
+            self.managed_mcp_cache.lock().await.disable_gateway_tools();
+            self.refresh_mcp_search_index_in_sessions();
+            return None;
+        }
+
+        self.managed_mcp_cache.lock().await.enable_gateway_tools();
+        let proxy_url = self.cfg.borrow().endpoints.proxy_url();
+        let auth_key = self
+            .auth_manager
+            .get_valid_token()
+            .await
+            .ok()
+            .or_else(|| self.auth_manager.current_or_expired().map(|a| a.key));
+        let catalog = crate::session::managed_mcp::get_or_fetch_gateway_tool_catalog(
+                &self.managed_mcp_cache,
+                &proxy_url,
+                auth_key.as_deref(),
+            )
+            .await;
+        self.refresh_mcp_search_index_in_sessions();
+        catalog
+    }
+    /// Wait until every currently live session has applied its admission
+    /// barrier, then invalidate the shared gateway cache. The final session
+    /// snapshot is taken while holding the cache mutex, so sessions added while
+    /// an acknowledgement or the mutex was pending are also closed before the
+    /// cache changes state.
+    pub(crate) async fn invalidate_gateway_tool_cache_after_session_admission(&self) {
+        // Raise the shared fence before queueing any session command. A refresh
+        // that already cloned the old Ready catalog must fail its final
+        // currentness check, and later refreshes must not clone it at all.
+        self.managed_mcp_cache
+            .lock()
+            .await
+            .begin_gateway_tool_refresh();
+        let mut admitted: Vec<tokio::sync::mpsc::UnboundedSender<SessionCommand>> = Vec::new();
+        loop {
+            let pending: Vec<_> = self
+                .sessions
+                .borrow()
+                .values()
+                .map(|handle| handle.cmd_tx.clone())
+                .filter(|candidate| {
+                    !admitted.iter().any(|seen| seen.same_channel(candidate))
+                })
+                .collect();
+            if !pending.is_empty() {
+                let barriers: Vec<_> = pending
+                    .iter()
+                    .filter_map(|tx| {
+                        let (respond_to, response) = tokio::sync::oneshot::channel();
+                        tx.send(SessionCommand::BeginManagedGatewayAdmission { respond_to })
+                            .ok()
+                            .map(|()| response)
+                    })
+                    .collect();
+                // Remember dead senders too: a closed actor cannot dispatch,
+                // and retrying its failed channel would otherwise spin.
+                admitted.extend(pending);
+                for barrier in barriers {
+                    let _ = barrier.await;
+                }
+                continue;
+            }
+
+            let mut state = self.managed_mcp_cache.lock().await;
+            let session_added_while_waiting = self.sessions.borrow().values().any(|handle| {
+                !admitted
+                    .iter()
+                    .any(|seen| seen.same_channel(&handle.cmd_tx))
+            });
+            if session_added_while_waiting {
+                drop(state);
+                continue;
+            }
+            state.gateway_tool_cache =
+                crate::session::managed_mcp::GatewayToolCatalogCache::NotFetched;
+            state.gateway_tool_fetch_notify.notify_waiters();
+            return;
+        }
     }
     pub(crate) fn disable_managed_gateway_tools_and_refresh_sessions(&self) {
         self.disable_managed_gateway_tools_and_refresh_sessions_with_txs(
@@ -2691,6 +2784,7 @@ impl MvpAgent {
             restore_code,
             session_registry_local,
             managed_mcp_cache: Default::default(),
+            managed_gateway_refresh_lock: tokio::sync::Mutex::new(()),
             agent_mcp_state: std::sync::Arc::new(
                 tokio::sync::Mutex::new(
                     crate::session::mcp_servers::McpState::new(vec![]),

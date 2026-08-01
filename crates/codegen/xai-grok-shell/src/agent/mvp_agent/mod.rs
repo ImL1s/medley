@@ -844,6 +844,9 @@ pub struct MvpAgent {
     session_registry_local: Option<bool>,
     /// Managed MCP configs and gateway tool catalog; lazily fetched.
     managed_mcp_cache: crate::session::managed_mcp::ManagedMcpStateHandle,
+    /// Serializes explicit gateway catalog refreshes across their session
+    /// admission fence, cache invalidation, and fetch lifecycle.
+    managed_gateway_refresh_lock: tokio::sync::Mutex<()>,
     /// Agent-level MCP server state. LEADER-SAFE(shared): MCP servers are
     /// agent-scoped, not per-client.
     agent_mcp_state: std::sync::Arc<

@@ -1880,6 +1880,103 @@ async fn warm_gateway_catalog_does_not_reopen_session_admission() {
     );
 }
 #[tokio::test(flavor = "current_thread")]
+async fn explicit_gateway_cache_invalidation_waits_for_all_session_admissions() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let agent = std::rc::Rc::new(build_agent_with_auth(crate::auth::GrokAuth {
+                key: "eligible".into(),
+                auth_mode: crate::auth::AuthMode::WebLogin,
+                ..crate::auth::GrokAuth::test_default()
+            }));
+            agent.cfg.borrow_mut().managed_mcp_gateway_tools_enabled = true;
+            {
+                let mut state = agent.managed_mcp_cache.lock().await;
+                state.enable_gateway_tools();
+                let epoch = state.start_gateway_tool_fetch().unwrap();
+                assert!(state.complete_gateway_tool_fetch(
+                    epoch,
+                    crate::session::managed_mcp::GatewayToolCatalog {
+                        tools: vec![],
+                        total_tools: 0,
+                        connectors_needing_reauth: vec![],
+                    },
+                ));
+            }
+            let sid = acp::SessionId::new("sess-explicit-gateway-refresh");
+            let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
+            agent.sessions.borrow_mut().insert(sid, handle);
+
+            let cache = agent.managed_mcp_cache.clone();
+            let invalidate_agent = agent.clone();
+            let invalidate = tokio::task::spawn_local(async move {
+                invalidate_agent
+                    .invalidate_gateway_tool_cache_after_session_admission()
+                    .await
+            });
+
+            let first = tokio::time::timeout(std::time::Duration::from_secs(1), cmd_rx.recv())
+                .await
+                .expect("first admission must be queued before cache invalidation")
+                .expect("session command channel must remain open");
+            let SessionCommand::BeginManagedGatewayAdmission {
+                respond_to: first_ack,
+            } = first
+            else {
+                panic!("expected first gateway admission barrier");
+            };
+            assert!(!invalidate.is_finished());
+            {
+                let state = cache.lock().await;
+                assert!(state.gateway_refresh_in_progress);
+                assert!(matches!(
+                    &state.gateway_tool_cache,
+                    crate::session::managed_mcp::GatewayToolCatalogCache::Ready(_)
+                ));
+            }
+
+            let sid_second = acp::SessionId::new("sess-explicit-gateway-refresh-late");
+            let (second_handle, _second_tx, mut second_rx) =
+                make_live_session_handle(&sid_second, None);
+            agent.sessions.borrow_mut().insert(sid_second, second_handle);
+            first_ack.send(()).expect("first barrier receiver remains live");
+
+            let second = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                second_rx.recv(),
+            )
+            .await
+            .expect("session added during the wait must receive admission")
+            .expect("second session command channel must remain open");
+            let SessionCommand::BeginManagedGatewayAdmission {
+                respond_to: second_ack,
+            } = second
+            else {
+                panic!("expected second gateway admission barrier");
+            };
+            assert!(!invalidate.is_finished());
+            {
+                let state = cache.lock().await;
+                assert!(state.gateway_refresh_in_progress);
+                assert!(matches!(
+                    &state.gateway_tool_cache,
+                    crate::session::managed_mcp::GatewayToolCatalogCache::Ready(_)
+                ));
+            }
+            second_ack
+                .send(())
+                .expect("second barrier receiver remains live");
+
+            invalidate.await.expect("cache invalidation task must finish");
+            let state = cache.lock().await;
+            assert!(state.gateway_refresh_in_progress);
+            assert!(matches!(
+                &state.gateway_tool_cache,
+                crate::session::managed_mcp::GatewayToolCatalogCache::NotFetched
+            ));
+        })
+        .await;
+}
+#[tokio::test(flavor = "current_thread")]
 async fn ineligible_gateway_auth_queues_barrier_before_revoking_catalog() {
     tokio::task::LocalSet::new()
         .run_until(async {
