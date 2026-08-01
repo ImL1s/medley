@@ -331,6 +331,13 @@ impl AgentRebuildSpec {
             builder = builder.with_preloaded_skills(skills);
         }
         let agent = builder.build().await?;
+        if managed_gateway_tool_client.is_some() {
+            // Until the first per-session MCP snapshot proves that gateway
+            // mode is disabled or atomically admits a catalog, restricted
+            // local/MCP exact IDs must not dispatch under a potentially shared
+            // gateway capability subject.
+            agent.tool_bridge().begin_managed_gateway_admission();
+        }
         let model_validator = models_manager.clone();
         agent
             .tool_bridge()

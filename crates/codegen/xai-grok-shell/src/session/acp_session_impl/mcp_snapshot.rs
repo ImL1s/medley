@@ -49,6 +49,72 @@ pub(super) async fn refresh_mcp_snapshot_and_schedule_reminder_with(
         ServerMetadata, ToolMetadata, extract_parameter_names, split_qualified_name,
     };
 
+    let (gateway_catalog, mut gateway_connectors, gateway_epoch, gateway_tools_active) = {
+        let state = managed_mcp_handle.lock().await;
+        let catalog = if state.gateway_tools_active {
+            match &state.gateway_tool_cache {
+                crate::session::managed_mcp::GatewayToolCatalogCache::Ready(catalog) => {
+                    Some(catalog.clone())
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let connectors: Vec<String> = state.gateway_tool_connectors_seen.iter().cloned().collect();
+        (
+            catalog,
+            connectors,
+            state.gateway_tool_epoch,
+            state.gateway_tools_active,
+        )
+    };
+
+    if gateway_tools_active {
+        tool_bridge.begin_managed_gateway_admission();
+    } else {
+        tool_bridge.disable_managed_gateway_admission();
+    }
+
+    let gateway_catalog = if let Some(mut catalog) = gateway_catalog {
+        let bindings: Vec<_> = catalog
+            .tools
+            .iter()
+            .filter(|tool| !gateway_tool_is_disabled(tool, disabled_gateway_tools))
+            .filter_map(|tool| {
+                tool.validated_qualified_name()
+                    .map(|name| (name, tool.call_id.clone()))
+            })
+            .collect();
+        let reconciliation = tool_bridge.reconcile_managed_gateway_identities(&bindings);
+        if !reconciliation.rejected.is_empty() {
+            tracing::warn!(
+                rejected_count = reconciliation.rejected.len(),
+                "Rejected managed gateway identities that collided or changed binding"
+            );
+        }
+        catalog.tools.retain(|tool| {
+            gateway_tool_is_disabled(tool, disabled_gateway_tools)
+                || tool
+                    .validated_qualified_name()
+                    .is_some_and(|name| reconciliation.accepted.contains(&name))
+        });
+        // Keep prompt/descriptor readers on the same admitted catalog. Only
+        // replace the cache when the epoch we reconciled is still current.
+        {
+            let mut state = managed_mcp_handle.lock().await;
+            if state.gateway_tools_active && state.gateway_tool_epoch == gateway_epoch {
+                state.gateway_tool_cache =
+                    crate::session::managed_mcp::GatewayToolCatalogCache::Ready(catalog.clone());
+            }
+        }
+        Some(catalog)
+    } else {
+        None
+    };
+
+    // Reconciliation may remove a local/MCP tool that collided with a gateway
+    // identity, so snapshot local definitions only after the atomic boundary.
     let all_defs = tool_bridge.tool_definitions().await;
     let mut seen_tools = std::collections::HashSet::new();
     let mut mcp_tools: Vec<ToolMetadata> = all_defs
@@ -67,22 +133,6 @@ pub(super) async fn refresh_mcp_snapshot_and_schedule_reminder_with(
             }
         })
         .collect();
-
-    let (gateway_catalog, mut gateway_connectors) = {
-        let state = managed_mcp_handle.lock().await;
-        let catalog = if state.gateway_tools_active {
-            match &state.gateway_tool_cache {
-                crate::session::managed_mcp::GatewayToolCatalogCache::Ready(catalog) => {
-                    Some(catalog.clone())
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let connectors: Vec<String> = state.gateway_tool_connectors_seen.iter().cloned().collect();
-        (catalog, connectors)
-    };
 
     if let Some(catalog) = gateway_catalog.as_ref() {
         gateway_connectors.extend(catalog.tools.iter().map(|tool| tool.connector_id.clone()));

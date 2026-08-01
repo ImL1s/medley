@@ -22,7 +22,7 @@ use crate::{
     util::remap::remap_json_keys,
 };
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 /// Process-global registry of external "tool packs" — functions that
@@ -468,6 +468,135 @@ pub struct FinalizedToolset {
     /// `prepare_dispatch`. `None` outside a workspace bind.
     workspace_viewer_ctx: Option<xai_tool_runtime::WorkspaceViewerContext>,
     capability_policy: CapabilityPolicy,
+    external_tool_identities: ManagedGatewayIdentityAuthorizer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExternalToolIdentityOwner {
+    Local,
+    ManagedGateway { call_id: String, active: bool },
+    Conflict,
+}
+
+/// Session-scoped binding between a capability-policy subject and the backend
+/// operation it is allowed to dispatch. Managed-gateway calls must match an
+/// admitted `qualified_name -> call_id` tuple on every invocation; a collision
+/// with a local/MCP tool or a changed tuple permanently poisons that name for
+/// the lifetime of the toolset.
+#[derive(Clone, Default)]
+pub struct ManagedGatewayIdentityAuthorizer {
+    owners: Arc<parking_lot::RwLock<HashMap<String, ExternalToolIdentityOwner>>>,
+    admission_pending: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl std::fmt::Debug for ManagedGatewayIdentityAuthorizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagedGatewayIdentityAuthorizer")
+            .field("identity_count", &self.owners.read().len())
+            .field(
+                "admission_pending",
+                &self
+                    .admission_pending
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
+            .finish()
+    }
+}
+
+impl ManagedGatewayIdentityAuthorizer {
+    fn begin_admission(&self) {
+        self.admission_pending
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn complete_admission(&self) {
+        self.admission_pending
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    fn disable_gateway(&self) {
+        for owner in self.owners.write().values_mut() {
+            if let ExternalToolIdentityOwner::ManagedGateway { active, .. } = owner {
+                *active = false;
+            }
+        }
+        self.complete_admission();
+    }
+
+    fn authorize_local_dispatch(
+        &self,
+        qualified_name: &str,
+    ) -> Result<(), xai_tool_runtime::ToolError> {
+        if qualified_name.contains("__")
+            && self
+                .admission_pending
+                .load(std::sync::atomic::Ordering::Acquire)
+            && matches!(
+                self.owners.read().get(qualified_name),
+                Some(ExternalToolIdentityOwner::Local)
+            )
+        {
+            return Err(xai_tool_runtime::ToolError::custom(
+                "tool_capability_denied",
+                format!(
+                    "External tool {qualified_name} is unavailable until managed gateway identity admission completes"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn authorize(
+        &self,
+        qualified_name: &str,
+        call_id: &str,
+    ) -> Result<(), xai_tool_runtime::ToolError> {
+        if self
+            .admission_pending
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(xai_tool_runtime::ToolError::custom(
+                "tool_capability_denied",
+                "Managed gateway identity admission is pending",
+            ));
+        }
+        let admitted = self.owners.read().get(qualified_name).is_some_and(|owner| {
+            matches!(
+                owner,
+                ExternalToolIdentityOwner::ManagedGateway {
+                    call_id: admitted_call_id,
+                    active: true,
+                } if admitted_call_id == call_id
+            )
+        });
+        if admitted {
+            Ok(())
+        } else {
+            Err(xai_tool_runtime::ToolError::custom(
+                "tool_capability_denied",
+                format!(
+                    "Managed gateway tool {qualified_name} does not match an admitted session identity"
+                ),
+            ))
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admit_for_test(&self, qualified_name: &str, call_id: &str) {
+        self.owners.write().insert(
+            qualified_name.to_owned(),
+            ExternalToolIdentityOwner::ManagedGateway {
+                call_id: call_id.to_owned(),
+                active: true,
+            },
+        );
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ManagedGatewayIdentityReconciliation {
+    pub accepted: HashSet<String>,
+    pub rejected: HashSet<String>,
 }
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RequirementError {
@@ -1268,6 +1397,15 @@ impl ToolRegistryBuilder {
             };
             tokio::spawn(actor.run());
         }
+        let external_tool_identities = ManagedGatewayIdentityAuthorizer::default();
+        {
+            let mut owners = external_tool_identities.owners.write();
+            owners.extend(
+                tools
+                    .iter()
+                    .map(|tool| (tool.client_name.clone(), ExternalToolIdentityOwner::Local)),
+            );
+        }
         Ok(FinalizedToolset {
             tools: parking_lot::RwLock::new(tools),
             reminders: active_reminders,
@@ -1279,6 +1417,7 @@ impl ToolRegistryBuilder {
             system_reminder_tag: ctx.system_reminder_tag,
             workspace_viewer_ctx,
             capability_policy: self.capability_policy,
+            external_tool_identities,
         })
     }
 }
@@ -1348,6 +1487,7 @@ impl FinalizedToolset {
             system_reminder_tag: "system-reminder",
             workspace_viewer_ctx: None,
             capability_policy: CapabilityPolicy::unrestricted(),
+            external_tool_identities: ManagedGatewayIdentityAuthorizer::default(),
         }
     }
     #[cfg(test)]
@@ -1356,6 +1496,158 @@ impl FinalizedToolset {
     }
     pub fn capability_policy(&self) -> &CapabilityPolicy {
         &self.capability_policy
+    }
+
+    pub fn begin_managed_gateway_admission(&self) {
+        self.external_tool_identities.begin_admission();
+    }
+
+    pub fn disable_managed_gateway_admission(&self) {
+        self.external_tool_identities.disable_gateway();
+    }
+
+    /// Atomically reconcile the managed-gateway identities advertised for this
+    /// session. Exact-ID collisions across local/MCP and gateway sources fail
+    /// closed: the local handle is removed, the gateway entry is rejected, and
+    /// the identity stays poisoned for the lifetime of the toolset. Opaque
+    /// gateway `call_id`s are bound on first admission and cannot move between
+    /// identities or change on refresh.
+    pub fn reconcile_managed_gateway_identities(
+        &self,
+        bindings: &[(String, String)],
+    ) -> ManagedGatewayIdentityReconciliation {
+        fn valid_identity(name: &str, call_id: &str) -> bool {
+            let Some((connector_id, tool_id)) = name.split_once("__") else {
+                return false;
+            };
+            !connector_id.is_empty()
+                && !tool_id.is_empty()
+                && !tool_id.contains("__")
+                && xai_tool_protocol::ToolId::new(name).is_ok()
+                && !call_id.is_empty()
+                && call_id.trim() == call_id
+                && !call_id.chars().any(char::is_control)
+        }
+
+        let mut result = ManagedGatewayIdentityReconciliation::default();
+        let mut name_occurrences: HashMap<&str, usize> = HashMap::new();
+        let mut call_occurrences: HashMap<&str, Vec<&str>> = HashMap::new();
+        for (name, call_id) in bindings {
+            if !valid_identity(name, call_id) {
+                result.rejected.insert(name.clone());
+                continue;
+            }
+            *name_occurrences.entry(name).or_default() += 1;
+            call_occurrences.entry(call_id).or_default().push(name);
+        }
+        for (name, count) in name_occurrences {
+            if count > 1 {
+                result.rejected.insert(name.to_owned());
+            }
+        }
+        for names in call_occurrences.values().filter(|names| names.len() > 1) {
+            result
+                .rejected
+                .extend(names.iter().map(|name| (*name).to_owned()));
+        }
+
+        // Keep lock ordering aligned with registration/unregistration:
+        // tool metadata first, then the identity map. No await occurs here.
+        let mut tools = self.tools.write();
+        let mut owners = self.external_tool_identities.owners.write();
+        let mut remove_local = HashSet::new();
+
+        for owner in owners.values_mut() {
+            if let ExternalToolIdentityOwner::ManagedGateway { active, .. } = owner {
+                *active = false;
+            }
+        }
+
+        for name in result.rejected.clone() {
+            if matches!(owners.get(&name), Some(ExternalToolIdentityOwner::Local)) {
+                remove_local.insert(name.clone());
+            }
+            owners.insert(name, ExternalToolIdentityOwner::Conflict);
+        }
+
+        let mut gateway_call_owners: HashMap<String, String> = owners
+            .iter()
+            .filter_map(|(name, owner)| match owner {
+                ExternalToolIdentityOwner::ManagedGateway { call_id, .. } => {
+                    Some((call_id.clone(), name.clone()))
+                }
+                ExternalToolIdentityOwner::Local | ExternalToolIdentityOwner::Conflict => None,
+            })
+            .collect();
+
+        for (name, call_id) in bindings {
+            if result.rejected.contains(name) || !valid_identity(name, call_id) {
+                continue;
+            }
+            match owners.get(name).cloned() {
+                Some(ExternalToolIdentityOwner::Local) => {
+                    remove_local.insert(name.clone());
+                    owners.insert(name.clone(), ExternalToolIdentityOwner::Conflict);
+                    result.rejected.insert(name.clone());
+                }
+                Some(ExternalToolIdentityOwner::ManagedGateway {
+                    call_id: admitted_call_id,
+                    ..
+                }) if admitted_call_id == *call_id => {
+                    owners.insert(
+                        name.clone(),
+                        ExternalToolIdentityOwner::ManagedGateway {
+                            call_id: admitted_call_id,
+                            active: true,
+                        },
+                    );
+                    result.accepted.insert(name.clone());
+                }
+                Some(ExternalToolIdentityOwner::ManagedGateway { .. })
+                | Some(ExternalToolIdentityOwner::Conflict) => {
+                    owners.insert(name.clone(), ExternalToolIdentityOwner::Conflict);
+                    result.rejected.insert(name.clone());
+                }
+                None => {
+                    if let Some(previous_name) = gateway_call_owners.get(call_id).cloned()
+                        && previous_name != *name
+                    {
+                        owners.insert(previous_name.clone(), ExternalToolIdentityOwner::Conflict);
+                        owners.insert(name.clone(), ExternalToolIdentityOwner::Conflict);
+                        result.accepted.remove(&previous_name);
+                        result.rejected.insert(previous_name);
+                        result.rejected.insert(name.clone());
+                    } else {
+                        owners.insert(
+                            name.clone(),
+                            ExternalToolIdentityOwner::ManagedGateway {
+                                call_id: call_id.clone(),
+                                active: true,
+                            },
+                        );
+                        gateway_call_owners.insert(call_id.clone(), name.clone());
+                        result.accepted.insert(name.clone());
+                    }
+                }
+            }
+        }
+
+        result
+            .accepted
+            .retain(|name| !result.rejected.contains(name));
+        if !remove_local.is_empty() {
+            let registry_ids: Vec<_> = tools
+                .iter()
+                .filter(|tool| remove_local.contains(&tool.client_name))
+                .filter_map(|tool| xai_tool_protocol::ToolId::new(&tool.registry_id).ok())
+                .collect();
+            tools.retain(|tool| !remove_local.contains(&tool.client_name));
+            for registry_id in registry_ids {
+                self.local_registry.unregister(&registry_id);
+            }
+        }
+        self.external_tool_identities.complete_admission();
+        result
     }
     /// Whether the server must await this tool's in-process cancellation cleanup.
     pub fn cooperative_cancellation(&self, tool_name: &str) -> bool {
@@ -1515,6 +1807,10 @@ impl FinalizedToolset {
                 entry.reverse_params.clone(),
             )
         };
+        if self.capability_policy.mode() != xai_tool_types::SubagentCapabilityMode::All {
+            self.external_tool_identities
+                .authorize_local_dispatch(tool_name)?;
+        }
         self.capability_policy
             .authorize(&canonical_id, &capability)?;
         let canonical_params = if reverse_params.is_empty() {
@@ -1526,6 +1822,7 @@ impl FinalizedToolset {
         ctx.extensions.insert(self.resources.clone());
         ctx.extensions.insert_arc(Arc::clone(&self.renderer));
         ctx.extensions.insert(self.capability_policy.clone());
+        ctx.extensions.insert(self.external_tool_identities.clone());
         if let Some(cancellation) = parent_ctx.get::<xai_tool_runtime::Cancellation>() {
             ctx.extensions.insert((*cancellation).clone());
         }
@@ -1703,6 +2000,10 @@ impl FinalizedToolset {
                 entry.reverse_params.clone(),
             )
         };
+        if self.capability_policy.mode() != xai_tool_types::SubagentCapabilityMode::All {
+            self.external_tool_identities
+                .authorize_local_dispatch(tool_name)?;
+        }
         self.capability_policy
             .authorize(&canonical_id, &capability)?;
         let canonical_params = if reverse_params.is_empty() {
@@ -1726,6 +2027,7 @@ impl FinalizedToolset {
         ctx.extensions.insert(self.resources.clone());
         ctx.extensions.insert_arc(Arc::clone(&self.renderer));
         ctx.extensions.insert(self.capability_policy.clone());
+        ctx.extensions.insert(self.external_tool_identities.clone());
         ctx.extensions.insert(
             crate::types::resources::InvokingToolParamNames::from_reverse_params(&reverse_params),
         );
@@ -1876,6 +2178,12 @@ impl FinalizedToolset {
                 "Tool already registered: {name}"
             )));
         }
+        let mut identity_owners = self.external_tool_identities.owners.write();
+        if identity_owners.contains_key(&name) {
+            return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
+                "Tool identity is already reserved or conflicted: {name}"
+            )));
+        }
         let description = tool.description_template().to_string();
         let kind = tool.kind();
         let input_schema = input_schema_override.unwrap_or_else(generate_schema::<T::Args>);
@@ -1885,6 +2193,7 @@ impl FinalizedToolset {
                 "Tool registry ID already registered: {registry_id}"
             )));
         }
+        identity_owners.insert(name.clone(), ExternalToolIdentityOwner::Local);
         tools.push(FinalizedTool {
             canonical_id: name.clone(),
             namespace: ToolNamespace::MCP.to_string(),
@@ -1918,20 +2227,32 @@ impl FinalizedToolset {
     }
     pub fn unregister_tools_by_prefix(&self, prefix: &str) -> usize {
         let mut tools = self.tools.write();
+        let mut identity_owners = self.external_tool_identities.owners.write();
         let before = tools.len();
         let to_remove: Vec<_> = tools
             .iter()
             .filter(|t| t.client_name.starts_with(prefix))
-            .filter_map(|t| xai_tool_protocol::ToolId::new(&t.registry_id).ok())
+            .filter_map(|t| {
+                xai_tool_protocol::ToolId::new(&t.registry_id)
+                    .ok()
+                    .map(|registry_id| (t.client_name.clone(), registry_id))
+            })
             .collect();
         tools.retain(|t| !t.client_name.starts_with(prefix));
-        for tid in &to_remove {
-            self.local_registry.unregister(tid);
+        for (name, registry_id) in &to_remove {
+            self.local_registry.unregister(registry_id);
+            if matches!(
+                identity_owners.get(name),
+                Some(ExternalToolIdentityOwner::Local)
+            ) {
+                identity_owners.remove(name);
+            }
         }
         before - tools.len()
     }
     pub fn unregister_tool_by_name(&self, name: &str) -> bool {
         let mut tools = self.tools.write();
+        let mut identity_owners = self.external_tool_identities.owners.write();
         let tool_id = tools
             .iter()
             .find(|t| t.client_name == name)
@@ -1941,6 +2262,14 @@ impl FinalizedToolset {
         let removed = tools.len() < before;
         if removed && let Some(tid) = tool_id {
             self.local_registry.unregister(&tid);
+        }
+        if removed
+            && matches!(
+                identity_owners.get(name),
+                Some(ExternalToolIdentityOwner::Local)
+            )
+        {
+            identity_owners.remove(name);
         }
         removed
     }
@@ -3497,6 +3826,228 @@ mod tests {
             &registry.find(&registry_id).expect("original remains")
         ));
         assert!(toolset.tool_definitions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn managed_gateway_collision_revokes_direct_and_wrapped_local_dispatch() {
+        let tmp = TempDir::new().unwrap();
+        let toolset = Arc::new(
+            ToolRegistryBuilder::new()
+                .finalize(
+                    ToolServerConfig {
+                        tools: vec![ToolConfig::for_tool::<
+                            crate::implementations::use_tool::UseTool,
+                        >()],
+                        behavior_preset: None,
+                    },
+                    test_session_context(&tmp),
+                )
+                .unwrap(),
+        );
+        toolset
+            .register_tool(
+                "server__tool".to_owned(),
+                FakeMcpTool {
+                    id: "server__tool".into(),
+                    description: "local target".into(),
+                },
+                None,
+            )
+            .unwrap();
+
+        let reconciliation = toolset.reconcile_managed_gateway_identities(&[(
+            "server__tool".to_owned(),
+            "gateway.call".to_owned(),
+        )]);
+        assert!(reconciliation.accepted.is_empty());
+        assert!(reconciliation.rejected.contains("server__tool"));
+        assert!(
+            toolset
+                .tool_definitions()
+                .iter()
+                .all(|definition| definition.function.name != "server__tool")
+        );
+        assert!(
+            toolset
+                .local_registry()
+                .find(&xai_tool_protocol::ToolId::new("server__tool").unwrap())
+                .is_none()
+        );
+
+        let direct = toolset
+            .call("server__tool", serde_json::json!({}), "direct", None)
+            .await
+            .expect_err("a cross-source collision must revoke direct local dispatch");
+        assert_eq!(direct.kind, xai_tool_runtime::ToolErrorKind::NotFound);
+
+        toolset
+            .resources
+            .lock()
+            .await
+            .insert(crate::types::resources::ManagedGatewayToolCatalog(
+                HashMap::from([(
+                    "server__tool".to_owned(),
+                    crate::types::resources::ManagedGatewayToolSource {
+                        connector_id: "server".into(),
+                        connector_name: "Server".into(),
+                        tool_id: "tool".into(),
+                        tool_name: "Tool".into(),
+                        call_id: "gateway.call".into(),
+                    },
+                )]),
+            ));
+        let wrapped = toolset
+            .call(
+                "use_tool",
+                serde_json::json!({"tool_name": "server__tool", "tool_input": {}}),
+                "wrapped",
+                None,
+            )
+            .await
+            .expect_err("a rejected gateway collision must not dispatch through use_tool");
+        assert!(wrapped.detail.contains("session identity"), "{wrapped}");
+
+        let re_registration = toolset.register_tool(
+            "server__tool".to_owned(),
+            FakeMcpTool {
+                id: "server__tool".into(),
+                description: "replacement target".into(),
+            },
+            None,
+        );
+        assert!(
+            re_registration
+                .expect_err("a conflicted identity remains reserved")
+                .detail
+                .contains("reserved or conflicted")
+        );
+    }
+
+    #[tokio::test]
+    async fn restricted_local_external_dispatch_waits_for_gateway_admission() {
+        let tmp = TempDir::new().unwrap();
+        let mut trusted = crate::capability::TrustedToolCapabilities::default();
+        trusted
+            .insert_classification(
+                "docs__read",
+                xai_tool_types::ToolCapabilityDescriptor::classified([
+                    xai_tool_types::ToolEffect::NetworkRead,
+                ]),
+                crate::types::config_source::ConfigSource::Builtin,
+            )
+            .unwrap();
+        let toolset = Arc::new(
+            ToolRegistryBuilder::new()
+                .with_capability_policy(CapabilityPolicy::new(
+                    xai_tool_types::SubagentCapabilityMode::ReadOnly,
+                    trusted,
+                ))
+                .finalize(ToolServerConfig::default(), test_session_context(&tmp))
+                .unwrap(),
+        );
+        toolset
+            .register_tool(
+                "docs__read".to_owned(),
+                FakeMcpTool {
+                    id: "docs__read".into(),
+                    description: "trusted local read".into(),
+                },
+                None,
+            )
+            .unwrap();
+        toolset.begin_managed_gateway_admission();
+
+        let pending = toolset
+            .call("docs__read", serde_json::json!({}), "pending", None)
+            .await
+            .expect_err("fetch failure/pending admission must fail closed");
+        assert!(pending.detail.contains("admission completes"), "{pending}");
+
+        toolset.disable_managed_gateway_admission();
+        toolset
+            .call("docs__read", serde_json::json!({}), "disabled", None)
+            .await
+            .expect("when gateway mode is proven disabled, the trusted local tool is usable");
+    }
+
+    #[test]
+    fn managed_gateway_binding_is_stable_and_call_ids_cannot_move() {
+        let toolset = FinalizedToolset::empty_for_test();
+        let admitted = toolset.reconcile_managed_gateway_identities(&[(
+            "docs__read".to_owned(),
+            "opaque.read".to_owned(),
+        )]);
+        assert_eq!(admitted.accepted, HashSet::from(["docs__read".to_owned()]));
+        toolset
+            .external_tool_identities
+            .authorize("docs__read", "opaque.read")
+            .unwrap();
+        toolset.begin_managed_gateway_admission();
+        assert!(
+            toolset
+                .external_tool_identities
+                .authorize("docs__read", "opaque.read")
+                .is_err(),
+            "a previously admitted binding must close while refresh is pending"
+        );
+        let unchanged = toolset.reconcile_managed_gateway_identities(&[(
+            "docs__read".to_owned(),
+            "opaque.read".to_owned(),
+        )]);
+        assert_eq!(unchanged.accepted, HashSet::from(["docs__read".to_owned()]));
+        assert!(unchanged.rejected.is_empty());
+        toolset
+            .external_tool_identities
+            .authorize("docs__read", "opaque.read")
+            .unwrap();
+
+        let absent = toolset.reconcile_managed_gateway_identities(&[]);
+        assert!(absent.accepted.is_empty());
+        assert!(
+            toolset
+                .external_tool_identities
+                .authorize("docs__read", "opaque.read")
+                .is_err(),
+            "an identity omitted by the current catalog must not remain active"
+        );
+        let reappeared = toolset.reconcile_managed_gateway_identities(&[(
+            "docs__read".to_owned(),
+            "opaque.read".to_owned(),
+        )]);
+        assert_eq!(
+            reappeared.accepted,
+            HashSet::from(["docs__read".to_owned()])
+        );
+
+        let changed = toolset.reconcile_managed_gateway_identities(&[(
+            "docs__read".to_owned(),
+            "opaque.write".to_owned(),
+        )]);
+        assert!(changed.rejected.contains("docs__read"));
+        assert!(
+            toolset
+                .external_tool_identities
+                .authorize("docs__read", "opaque.read")
+                .is_err()
+        );
+
+        let second_toolset = FinalizedToolset::empty_for_test();
+        second_toolset.reconcile_managed_gateway_identities(&[(
+            "docs__read".to_owned(),
+            "opaque.shared".to_owned(),
+        )]);
+        let moved = second_toolset.reconcile_managed_gateway_identities(&[(
+            "mail__read".to_owned(),
+            "opaque.shared".to_owned(),
+        )]);
+        assert!(moved.rejected.contains("docs__read"));
+        assert!(moved.rejected.contains("mail__read"));
+        assert!(
+            second_toolset
+                .external_tool_identities
+                .authorize("docs__read", "opaque.shared")
+                .is_err()
+        );
     }
 
     #[tokio::test]

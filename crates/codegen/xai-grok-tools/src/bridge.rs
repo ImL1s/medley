@@ -186,6 +186,21 @@ impl ToolBridge {
         self.registry.unregister_tool_by_name(name)
     }
 
+    pub fn reconcile_managed_gateway_identities(
+        &self,
+        bindings: &[(String, String)],
+    ) -> crate::registry::types::ManagedGatewayIdentityReconciliation {
+        self.registry.reconcile_managed_gateway_identities(bindings)
+    }
+
+    pub fn begin_managed_gateway_admission(&self) {
+        self.registry.begin_managed_gateway_admission();
+    }
+
+    pub fn disable_managed_gateway_admission(&self) {
+        self.registry.disable_managed_gateway_admission();
+    }
+
     /// Access the underlying `FinalizedToolset`.
     ///
     /// Used by `WorkspaceOps::bind_local_session` to install the agent's

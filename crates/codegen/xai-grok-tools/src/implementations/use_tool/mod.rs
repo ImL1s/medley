@@ -147,11 +147,6 @@ fn normalize_mcp_arguments(input: serde_json::Value) -> serde_json::Value {
     }
 }
 
-fn is_local_tool_id_rejection(err: &xai_tool_runtime::ToolError, tool_name: &str) -> bool {
-    err.kind == xai_tool_runtime::ToolErrorKind::InvalidArguments
-        && err.detail == format!("invalid tool name: '{tool_name}'")
-}
-
 async fn gateway_lookup(
     ctx: &xai_tool_runtime::ToolCallContext,
     tool_name: &str,
@@ -176,7 +171,20 @@ async fn gateway_lookup(
 fn authorize_gateway_target(
     ctx: &xai_tool_runtime::ToolCallContext,
     tool_name: &str,
+    call_id: &str,
 ) -> Result<(), xai_tool_runtime::ToolError> {
+    let identity_authorizer = ctx
+        .extensions
+        .get::<crate::registry::types::ManagedGatewayIdentityAuthorizer>()
+        .ok_or_else(|| {
+            xai_tool_runtime::ToolError::custom(
+                "tool_capability_denied",
+                format!(
+                    "Managed gateway tool {tool_name} is not permitted without an identity authorizer"
+                ),
+            )
+        })?;
+    identity_authorizer.authorize(tool_name, call_id)?;
     let policy = ctx
         .extensions
         .get::<crate::capability::CapabilityPolicy>()
@@ -233,28 +241,10 @@ pub async fn dispatch_mcp_tool(
     }
 
     if let Some(source) = gateway_source {
-        // A gateway-catalog name can collide with a local `server__tool` MCP
-        // tool. Local wins on a name clash: probe local dispatch first and only
-        // fall through to the gateway when the local side reports the tool as
-        // not found, or rejects the catalog-derived name as an invalid local
-        // ToolId. A real error from a local tool that actually dispatched
-        // propagates instead of silently retrying against the gateway.
-        if tool_name.contains("__")
-            && let Some(dispatch) = dispatch.clone()
-        {
-            match dispatch_local_mcp(dispatch, tool_name, tool_input.clone(), ctx.clone()).await {
-                Ok(local_output) => return Ok(local_output),
-                Err(err)
-                    if err.kind != xai_tool_runtime::ToolErrorKind::NotFound
-                        && !is_local_tool_id_rejection(&err, tool_name) =>
-                {
-                    return Err(err);
-                }
-                Err(_) => {}
-            }
-        }
-
-        authorize_gateway_target(ctx, tool_name)?;
+        // Gateway entries are provenance-bound at snapshot admission. Never
+        // probe/fallback to a same-named local tool: that would let one trusted
+        // exact-ID classification authorize a different source.
+        authorize_gateway_target(ctx, tool_name, &source.call_id)?;
 
         let Some(client) = gateway_client else {
             return Err(xai_tool_runtime::ToolError::custom(
@@ -772,7 +762,7 @@ mod tests {
         .expect_err("gateway dispatch without an authorizer must fail closed");
 
         assert_eq!(error.kind, xai_tool_runtime::ToolErrorKind::Custom);
-        assert!(error.detail.contains("capability authorizer"), "{error}");
+        assert!(error.detail.contains("identity authorizer"), "{error}");
         assert!(captured.lock().unwrap().is_none());
     }
 
@@ -1058,7 +1048,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gateway_tool_with_invalid_local_tool_id_falls_back_to_gateway() {
+    async fn gateway_tool_with_invalid_identity_fails_closed() {
         let gateway_captured: SharedArgs = Arc::new(std::sync::Mutex::new(None));
         let ctx = ctx_with_dispatch_and_resources(
             NotFoundDispatch,
@@ -1069,7 +1059,7 @@ mod tests {
             ),
         );
 
-        let result = xai_tool_runtime::Tool::run(
+        let error = xai_tool_runtime::Tool::run(
             &UseTool,
             ctx,
             UseToolInput {
@@ -1078,20 +1068,21 @@ mod tests {
             },
         )
         .await
-        .unwrap();
+        .expect_err("invalid gateway identities are never admitted");
 
-        assert_eq!(gateway_captured.lock().unwrap().clone().unwrap()["q"], "x");
-        assert!(matches!(result, ToolOutput::MCP(_)));
+        assert!(error.detail.contains("session identity"), "{error}");
+        assert!(gateway_captured.lock().unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn gateway_catalog_collision_propagates_local_non_not_found_error() {
+    async fn admitted_gateway_identity_never_falls_back_to_same_named_local_error() {
         let gateway_captured: SharedArgs = Arc::new(std::sync::Mutex::new(None));
         let ctx = ctx_with_dispatch_and_resources(
             InvalidArgumentsDispatch,
-            gateway_resources(
+            gateway_resources_with_expected_call_id(
                 Arc::clone(&gateway_captured),
-                serde_json::json!("gateway should not run"),
+                serde_json::json!("gateway ran"),
+                Some("gateway.collision"),
             ),
         );
 
@@ -1105,22 +1096,25 @@ mod tests {
         )
         .await;
 
-        let err = result.unwrap_err();
-        assert_eq!(err.kind, xai_tool_runtime::ToolErrorKind::InvalidArguments);
-        assert!(err.detail.contains("local validation failed"));
-        assert!(gateway_captured.lock().unwrap().is_none());
+        result.expect("an admitted gateway source owns the dispatch identity");
+        assert_eq!(
+            gateway_captured.lock().unwrap().clone().unwrap(),
+            serde_json::json!({"local": true})
+        );
     }
 
     #[tokio::test]
-    async fn gateway_catalog_collision_prefers_local_dispatch_for_server_tool() {
-        let captured: SharedArgs = Arc::new(std::sync::Mutex::new(None));
+    async fn admitted_gateway_identity_never_probes_same_named_local_dispatch() {
+        let local_captured: SharedArgs = Arc::new(std::sync::Mutex::new(None));
+        let gateway_captured: SharedArgs = Arc::new(std::sync::Mutex::new(None));
         let ctx = ctx_with_dispatch_and_resources(
             CapturingDispatch {
-                captured_args: Arc::clone(&captured),
+                captured_args: Arc::clone(&local_captured),
             },
-            gateway_resources(
-                Arc::new(std::sync::Mutex::new(None)),
-                serde_json::json!("gateway should not run"),
+            gateway_resources_with_expected_call_id(
+                Arc::clone(&gateway_captured),
+                serde_json::json!("gateway ran"),
+                Some("gateway.collision"),
             ),
         );
 
@@ -1135,8 +1129,11 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
-        let captured = captured.lock().unwrap().clone().unwrap();
-        assert_eq!(captured, serde_json::json!({"local": true}));
+        assert!(local_captured.lock().unwrap().is_none());
+        assert_eq!(
+            gateway_captured.lock().unwrap().clone().unwrap(),
+            serde_json::json!({"local": true})
+        );
     }
 
     #[tokio::test]
@@ -1168,6 +1165,12 @@ mod tests {
         ctx.extensions.insert(resources);
         ctx.extensions
             .insert(crate::capability::CapabilityPolicy::unrestricted());
+        let identity_authorizer =
+            crate::registry::types::ManagedGatewayIdentityAuthorizer::default();
+        identity_authorizer
+            .admit_for_test("grafana__search_dashboards", "grafana.searchDashboards");
+        identity_authorizer.admit_for_test("server__tool", "gateway.collision");
+        ctx.extensions.insert(identity_authorizer);
         ctx
     }
 

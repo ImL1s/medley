@@ -315,10 +315,21 @@ impl ManagedMcpState {
         Some(self.gateway_tool_epoch)
     }
 
-    pub fn complete_gateway_tool_fetch(&mut self, epoch: u64, catalog: GatewayToolCatalog) -> bool {
+    pub fn complete_gateway_tool_fetch(
+        &mut self,
+        epoch: u64,
+        mut catalog: GatewayToolCatalog,
+    ) -> bool {
         if !self.gateway_tools_active || self.gateway_tool_epoch != epoch {
             self.gateway_tool_fetch_notify.notify_waiters();
             return false;
+        }
+        let rejected_count = catalog.retain_unambiguous_tools();
+        if rejected_count > 0 {
+            tracing::warn!(
+                rejected_count,
+                "Rejected ambiguous managed MCP gateway tool identities"
+            );
         }
         self.gateway_tool_connectors_seen
             .extend(catalog.tools.iter().map(|tool| tool.connector_id.clone()));
@@ -420,6 +431,50 @@ pub struct GatewayTool {
 impl GatewayTool {
     pub fn qualified_name(&self) -> String {
         format!("{}__{}", self.connector_id, self.tool_id)
+    }
+
+    pub fn validated_qualified_name(&self) -> Option<String> {
+        fn valid_component(value: &str) -> bool {
+            !value.is_empty()
+                && value
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+                && !value.contains("__")
+        }
+
+        if !valid_component(&self.connector_id)
+            || !valid_component(&self.tool_id)
+            || self.call_id.is_empty()
+            || self.call_id.trim() != self.call_id
+            || self.call_id.chars().any(char::is_control)
+        {
+            return None;
+        }
+        Some(self.qualified_name())
+    }
+}
+
+impl GatewayToolCatalog {
+    /// Remove every invalid or ambiguous identity from a fetched catalog.
+    /// Duplicate qualified names and duplicate backend call IDs are rejected
+    /// as a group, so input ordering can never select a privileged winner.
+    pub fn retain_unambiguous_tools(&mut self) -> usize {
+        let before = self.tools.len();
+        let mut name_counts = HashMap::<String, usize>::new();
+        let mut call_counts = HashMap::<String, usize>::new();
+        for tool in &self.tools {
+            if let Some(name) = tool.validated_qualified_name() {
+                *name_counts.entry(name).or_default() += 1;
+                *call_counts.entry(tool.call_id.clone()).or_default() += 1;
+            }
+        }
+        self.tools.retain(|tool| {
+            let Some(name) = tool.validated_qualified_name() else {
+                return false;
+            };
+            name_counts.get(&name) == Some(&1) && call_counts.get(&tool.call_id) == Some(&1)
+        });
+        before - self.tools.len()
     }
 }
 
@@ -1180,6 +1235,18 @@ mod tests {
         }
     }
 
+    fn make_gateway_tool(connector_id: &str, tool_id: &str, call_id: &str) -> GatewayTool {
+        GatewayTool {
+            connector_id: connector_id.to_string(),
+            connector_name: connector_id.to_string(),
+            tool_id: tool_id.to_string(),
+            tool_name: tool_id.to_string(),
+            call_id: call_id.to_string(),
+            description: "test gateway tool".to_string(),
+            json_schema: serde_json::json!({ "type": "object" }),
+        }
+    }
+
     #[test]
     fn managed_mcp_debug_is_presence_only() {
         const SENTINEL: &str = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
@@ -1313,6 +1380,28 @@ mod tests {
                 .pointer("/properties/query/type")
                 .and_then(|v| v.as_str())
         );
+    }
+
+    #[test]
+    fn gateway_catalog_rejects_invalid_and_ambiguous_identities_as_groups() {
+        let mut catalog = GatewayToolCatalog {
+            tools: vec![
+                make_gateway_tool("gmail", "search", "stable.search"),
+                make_gateway_tool("bad__connector", "search", "invalid.component"),
+                make_gateway_tool("drive", "get", "duplicate.name.first"),
+                make_gateway_tool("drive", "get", "duplicate.name.second"),
+                make_gateway_tool("calendar", "list", "shared.call"),
+                make_gateway_tool("slack", "post", "shared.call"),
+                make_gateway_tool("docs", "read", " leading-space"),
+            ],
+            total_tools: 7,
+            connectors_needing_reauth: vec![],
+        };
+
+        assert_eq!(6, catalog.retain_unambiguous_tools());
+        assert_eq!(1, catalog.tools.len());
+        assert_eq!("gmail__search", catalog.tools[0].qualified_name());
+        assert_eq!("stable.search", catalog.tools[0].call_id);
     }
 
     #[tokio::test]

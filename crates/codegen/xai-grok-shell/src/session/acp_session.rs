@@ -1584,7 +1584,7 @@ mod managed_gateway_descriptor_tests {
         }
     }
     #[tokio::test]
-    async fn refresh_snapshot_indexes_only_admitted_gateway_tools() {
+    async fn refresh_snapshot_revokes_both_sides_of_gateway_local_collision() {
         let bridge = Arc::new(crate::tools::bridge::ToolBridge::for_test());
         bridge
             .register_mcp_tools(
@@ -1639,13 +1639,10 @@ mod managed_gateway_descriptor_tests {
             .map(|tool| tool.qualified_name.as_str())
             .collect();
         assert!(names.contains("gateway__search"));
-        let server_tool = snapshot
-            .tools
-            .iter()
-            .find(|tool| tool.qualified_name == "server__tool")
-            .expect("local MCP tool remains indexed");
-        assert_eq!(server_tool.server_name, "server");
-        assert_eq!(server_tool.description, "fixture");
+        assert!(
+            !names.contains("server__tool"),
+            "an exact local/gateway collision must revoke both identities"
+        );
     }
     #[tokio::test]
     async fn refresh_snapshot_excludes_disabled_gateway_tools_and_connectors() {
@@ -2132,6 +2129,90 @@ mod managed_gateway_tool_tests {
         assert!(
             catalog.get("server__tool").is_none(),
             "gateway catalog resource must match admitted snapshot and skip local collisions"
+        );
+    }
+    #[tokio::test]
+    async fn refresh_snapshot_preserves_stable_binding_and_rejects_call_id_rotation() {
+        fn catalog(call_id: &str) -> crate::session::managed_mcp::GatewayToolCatalog {
+            crate::session::managed_mcp::GatewayToolCatalog {
+                tools: vec![crate::session::managed_mcp::GatewayTool {
+                    connector_id: "gateway".to_string(),
+                    connector_name: "Gateway".to_string(),
+                    tool_id: "search".to_string(),
+                    tool_name: "Search".to_string(),
+                    call_id: call_id.to_string(),
+                    description: "Gateway search".to_string(),
+                    json_schema: serde_json::json!({"type": "object"}),
+                }],
+                total_tools: 1,
+                connectors_needing_reauth: vec![],
+            }
+        }
+
+        let bridge = Arc::new(crate::tools::bridge::ToolBridge::for_test());
+        let mcp_state = Arc::new(TokioMutex::new(McpState::new(vec![])));
+        let managed = crate::session::managed_mcp::ManagedMcpStateHandle::default();
+        let snapshot = Arc::new(std::sync::Mutex::new(
+            crate::session::tool_index::ToolMetadataSnapshot::default(),
+        ));
+
+        {
+            let mut state = managed.lock().await;
+            state.enable_gateway_tools();
+            let epoch = state.start_gateway_tool_fetch().unwrap();
+            assert!(state.complete_gateway_tool_fetch(epoch, catalog("gateway.search")));
+        }
+        refresh_mcp_snapshot_for_test(
+            bridge.clone(),
+            mcp_state.clone(),
+            managed.clone(),
+            snapshot.clone(),
+        )
+        .await;
+        assert_eq!(
+            Some("gateway.search".to_string()),
+            bridge
+                .read_resource::<xai_grok_tools::types::resources::ManagedGatewayToolCatalog>()
+                .await
+                .and_then(|catalog| {
+                    catalog
+                        .get("gateway__search")
+                        .map(|tool| tool.call_id.clone())
+                })
+        );
+
+        {
+            let mut state = managed.lock().await;
+            let epoch = state.start_gateway_tool_fetch().unwrap();
+            assert!(state.complete_gateway_tool_fetch(epoch, catalog("gateway.search")));
+        }
+        refresh_mcp_snapshot_for_test(
+            bridge.clone(),
+            mcp_state.clone(),
+            managed.clone(),
+            snapshot.clone(),
+        )
+        .await;
+        assert!(
+            bridge
+                .read_resource::<xai_grok_tools::types::resources::ManagedGatewayToolCatalog>()
+                .await
+                .is_some_and(|catalog| catalog.get("gateway__search").is_some()),
+            "an unchanged exact name-to-call-id binding should remain admitted"
+        );
+
+        {
+            let mut state = managed.lock().await;
+            let epoch = state.start_gateway_tool_fetch().unwrap();
+            assert!(state.complete_gateway_tool_fetch(epoch, catalog("gateway.rotated")));
+        }
+        refresh_mcp_snapshot_for_test(bridge.clone(), mcp_state, managed, snapshot).await;
+        assert!(
+            bridge
+                .read_resource::<xai_grok_tools::types::resources::ManagedGatewayToolCatalog>()
+                .await
+                .is_some_and(|catalog| catalog.get("gateway__search").is_none()),
+            "a session-stable exact name must not accept a changed backend call id"
         );
     }
     #[tokio::test]

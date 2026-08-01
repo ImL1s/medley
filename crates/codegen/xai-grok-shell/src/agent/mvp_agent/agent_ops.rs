@@ -247,8 +247,39 @@ impl MvpAgent {
         &self,
     ) -> Option<crate::session::managed_mcp::GatewayToolCatalog> {
         if !self.can_fetch_managed_mcp_gateway_tools() {
-            self.managed_mcp_cache.lock().await.disable_gateway_tools();
+            self.disable_managed_gateway_tools_and_refresh_sessions_with_txs(
+                self.sessions
+                    .borrow()
+                    .values()
+                    .map(|handle| handle.cmd_tx.clone())
+                    .collect(),
+            );
             return None;
+        }
+        let cached = {
+            let state = self.managed_mcp_cache.lock().await;
+            match &state.gateway_tool_cache {
+                crate::session::managed_mcp::GatewayToolCatalogCache::Ready(catalog)
+                    if state.gateway_tools_active =>
+                {
+                    Some(catalog.clone())
+                }
+                crate::session::managed_mcp::GatewayToolCatalogCache::Ready(_)
+                | crate::session::managed_mcp::GatewayToolCatalogCache::NotFetched
+                | crate::session::managed_mcp::GatewayToolCatalogCache::Fetching(_) => None,
+            }
+        };
+        if cached.is_some() {
+            return cached;
+        }
+        let session_txs: Vec<_> = self
+            .sessions
+            .borrow()
+            .values()
+            .map(|handle| handle.cmd_tx.clone())
+            .collect();
+        for barrier in Self::queue_managed_gateway_admission(&session_txs) {
+            let _ = barrier.await;
         }
         self.managed_mcp_cache.lock().await.enable_gateway_tools();
         let proxy_url = self.cfg.borrow().endpoints.proxy_url();
@@ -258,12 +289,19 @@ impl MvpAgent {
             .await
             .ok()
             .or_else(|| self.auth_manager.current_or_expired().map(|a| a.key));
-        crate::session::managed_mcp::get_or_fetch_gateway_tool_catalog(
+        let catalog = crate::session::managed_mcp::get_or_fetch_gateway_tool_catalog(
                 &self.managed_mcp_cache,
                 &proxy_url,
                 auth_key.as_deref(),
             )
-            .await
+            .await;
+        // Every admission barrier has a matching session refresh. Success
+        // admits the fetched exact bindings; failure keeps restricted external
+        // dispatch pending while the cache remains NotFetched.
+        for tx in session_txs {
+            let _ = tx.send(SessionCommand::RefreshMcpSearchIndex);
+        }
+        catalog
     }
     pub fn managed_mcp_cache(
         &self,
@@ -275,12 +313,30 @@ impl MvpAgent {
             self.sessions.borrow().values().map(|handle| handle.cmd_tx.clone()).collect(),
         );
     }
+    fn queue_managed_gateway_admission(
+        session_txs: &[tokio::sync::mpsc::UnboundedSender<SessionCommand>],
+    ) -> Vec<tokio::sync::oneshot::Receiver<()>> {
+        session_txs
+            .iter()
+            .filter_map(|tx| {
+                let (respond_to, response) = tokio::sync::oneshot::channel();
+                tx
+                    .send(SessionCommand::BeginManagedGatewayAdmission { respond_to })
+                    .ok()
+                    .map(|()| response)
+            })
+            .collect()
+    }
     fn disable_managed_gateway_tools_and_refresh_sessions_with_txs(
         &self,
         session_txs: Vec<tokio::sync::mpsc::UnboundedSender<SessionCommand>>,
     ) {
+        let admission_barriers = Self::queue_managed_gateway_admission(&session_txs);
         let cache = self.managed_mcp_cache.clone();
         tokio::task::spawn_local(async move {
+            for barrier in admission_barriers {
+                let _ = barrier.await;
+            }
             cache.lock().await.disable_gateway_tools();
             for tx in session_txs {
                 let _ = tx.send(SessionCommand::RefreshMcpSearchIndex);
@@ -300,10 +356,17 @@ impl MvpAgent {
             );
             return;
         }
+        // Queue the fail-closed boundary synchronously, before auth refresh or
+        // network I/O can yield and before a later prompt command can dispatch
+        // an exact external identity under stale local ownership.
+        let admission_barriers = Self::queue_managed_gateway_admission(&session_txs);
         let cache = self.managed_mcp_cache.clone();
         let proxy_url = self.cfg.borrow().endpoints.proxy_url();
         let auth_manager = self.auth_manager.clone();
         tokio::task::spawn_local(async move {
+            for barrier in admission_barriers {
+                let _ = barrier.await;
+            }
             let auth_key = auth_manager
                 .get_valid_token()
                 .await
