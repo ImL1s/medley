@@ -171,7 +171,10 @@ fn safe_websocket_error(err: &tokio_tungstenite::tungstenite::Error) -> String {
 
     match err {
         Error::Http(response) => {
-            format!("websocket handshake failed: HTTP {}", response.status())
+            format!(
+                "websocket handshake failed: HTTP {}",
+                response.status().as_u16()
+            )
         }
         Error::Io(io_error) if io_error.kind() == std::io::ErrorKind::TimedOut => {
             "websocket network timeout".to_owned()

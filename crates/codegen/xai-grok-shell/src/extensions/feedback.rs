@@ -18,7 +18,7 @@ use crate::agent::MvpAgent;
 use crate::session::persistence::{LocalFeedbackEntry, UserFeedbackEntry};
 use crate::session::{
     ClientFeedbackInput, CommentDeleteRequest, CommentDeleteResponse, CommentRequest,
-    CommentResponse, FeedbackRequestDismiss, FeedbackResponse, SessionCommand,
+    CommentResponse, FeedbackRequestDismiss, FeedbackResponse, SessionCommand, SideQuestionError,
 };
 use crate::upload::gcs::WithAuth as _;
 use xai_file_utils::gcs::upload_bytes;
@@ -88,7 +88,22 @@ async fn handle_btw(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         Ok(answer) => super::to_ext_response(Ok(serde_json::json!({
             "answer": answer,
         }))),
-        Err(_) => Err(acp::Error::internal_error().data("side question failed")),
+        // Model errors take the canonical mapping: overload gets its short
+        // display copy there, rate limits keep the typed code + upgrade
+        // copy, auth failures surface as auth_required.
+        Err(SideQuestionError::Sampling(e)) => {
+            Err(crate::sampling::error::map_sampling_err_to_acp(e))
+        }
+        // Keep non-model failures useful without exposing arbitrary nested
+        // error text at the ACP boundary.
+        Err(SideQuestionError::PrepareClient(_)) => Err(acp::Error::new(
+            acp::ErrorCode::InternalError.into(),
+            "failed to prepare side question client",
+        )),
+        Err(SideQuestionError::EmptyResponse) => Err(acp::Error::new(
+            acp::ErrorCode::InternalError.into(),
+            "No response from model",
+        )),
     }
 }
 
