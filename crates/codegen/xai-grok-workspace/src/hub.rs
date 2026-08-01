@@ -1061,8 +1061,8 @@ mod tests {
     #[tokio::test]
     async fn handle_call_forwards_inner_streaming_tool_progress() {
         let handle = crate::handle::tests::make_handle();
-        register_gate_stub(&handle, "gate_streamer_forward");
-        let handler = make_handler(&handle, "gate_streamer_forward");
+        register_gate_stub(&handle, "gate_streaming_stub");
+        let handler = make_handler(&handle, "gate_streaming_stub");
         let (ctx, _call_id) = make_ctx("main");
         let stream = handler.handle_call(ctx, serde_json::json!({})).await;
         let (progress, terminal, last_is_terminal) = drain_counts(stream).await;

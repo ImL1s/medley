@@ -7618,7 +7618,10 @@ pub(crate) mod tests {
             tools: vec![tc("DoesNotExist:nope", Some(ToolKind::Read))],
             behavior_preset: None,
         };
-        let cfg = fork_cfg_with("bogus", CapabilityMode::ReadOnly, Some(bad), Some("main"));
+        // Restricted modes intentionally drop unknown/unclassified entries
+        // before finalization. `All` retains them, so an invalid registry ID
+        // still exercises propagation of the underlying finalize error.
+        let cfg = fork_cfg_with("bogus", CapabilityMode::All, Some(bad), Some("main"));
         let err = handle
             .fork_session(cfg)
             .await
