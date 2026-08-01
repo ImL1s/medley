@@ -3216,6 +3216,56 @@ fn chat_new_session_model_state_matrix() {
         );
     }
 }
+#[test]
+fn parse_local_workspace_existing_fields_matrix() {
+    use serde_json::json;
+
+    let cases = [
+        (
+            "attach",
+            json!({
+                "x.ai/local_workspace": {
+                    "mode": "attach",
+                    "server_id": "lw-attach",
+                    "cwd": "/repo",
+                }
+            }),
+            Some(("lw-attach", Some("/repo"))),
+        ),
+        (
+            "own",
+            json!({
+                "x.ai/local_workspace": {
+                    "mode": "own",
+                    "server_id": "lw-own",
+                }
+            }),
+            Some(("lw-own", None)),
+        ),
+        (
+            "invalid mode",
+            json!({
+                "x.ai/local_workspace": {
+                    "mode": "bogus",
+                    "server_id": "lw-invalid",
+                }
+            }),
+            None,
+        ),
+        ("no intent", json!({"envId": "env-prod"}), None),
+    ];
+
+    for (label, meta, expected) in cases {
+        let got = parse_local_workspace_existing_fields(meta.as_object());
+        assert_eq!(
+            got.as_ref()
+                .map(|fields| (fields.server_id.as_str(), fields.cwd.as_deref())),
+            expected,
+            "[{label}] local-workspace fields mismatch"
+        );
+    }
+}
+
 /// valid `x.ai/local_workspace` → ExistingWorkspace only.
 /// Never reads `envId` / never emits SandboxEnvironment.
 #[cfg(feature = "local-workspace")]
