@@ -180,16 +180,24 @@ fn preflight_agent_serve(
 }
 
 /// Gate the entire normal CLI startup continuation behind agent-serve
-/// preflight. The continuation contains all persistent, network, tracing,
-/// update, runtime, and background-task initialization.
+/// preflight. The version flag remains an early intent and exits from the
+/// continuation before any startup work. Otherwise, the continuation contains
+/// all persistent, network, tracing, update, runtime, and background-task
+/// initialization.
 fn dispatch_after_cli_preflight<T>(
     args: PagerArgs,
     stderr_is_terminal: bool,
     continuation: impl FnOnce(PagerArgs, Option<PreparedServe>) -> T,
 ) -> Result<T> {
-    let prepared_serve = match &args.command {
-        Some(Command::Agent(agent_args)) => preflight_agent_serve(agent_args, stderr_is_terminal)?,
-        _ => None,
+    let prepared_serve = if args.version {
+        None
+    } else {
+        match &args.command {
+            Some(Command::Agent(agent_args)) => {
+                preflight_agent_serve(agent_args, stderr_is_terminal)?
+            }
+            _ => None,
+        }
     };
     Ok(continuation(args, prepared_serve))
 }
@@ -2912,6 +2920,30 @@ mod tests {
             SERVE_REMOTE_ACK_REQUIRED
         );
         assert!(!continuation_ran.get());
+    }
+
+    #[test]
+    fn version_early_intent_bypasses_agent_serve_preflight() {
+        let parsed = PagerArgs::try_parse_from([
+            "grok",
+            "--version",
+            "agent",
+            "serve",
+            "--bind",
+            "0.0.0.0:29292",
+            "--secret",
+            "client-configured-secret-Q7w5E3r1T9y7",
+        ])
+        .unwrap();
+        let continuation_ran = std::cell::Cell::new(false);
+
+        dispatch_after_cli_preflight(parsed, true, |args, prepared_serve| {
+            assert!(args.version);
+            assert!(prepared_serve.is_none());
+            continuation_ran.set(true);
+        })
+        .expect("version intent must bypass serve validation");
+        assert!(continuation_ran.get());
     }
 
     #[test]
