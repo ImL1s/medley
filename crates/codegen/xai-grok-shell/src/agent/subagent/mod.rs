@@ -125,6 +125,9 @@ pub(crate) struct SubagentSpawnContext {
     pub auth: Option<crate::auth::GrokAuth>,
     pub parent_cwd: PathBuf,
     pub parent_session_id: String,
+    /// Effective capability ceiling inherited from the immediate parent.
+    /// `None` represents an unrestricted parent.
+    pub parent_capability_mode: Option<xai_tool_types::SubagentCapabilityMode>,
     /// The parent's cutoff at spawn, applied to the child's first turn. `None` if unset.
     pub inherited_tool_overrides: Option<xai_grok_sampling_types::ToolOverrides>,
     pub yolo_mode: bool,

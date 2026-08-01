@@ -37,6 +37,16 @@ pub fn intersect_capability_modes(
     }
 }
 
+/// Intersect the caller request, resolved definition, and parent-session
+/// ceiling. `None` is unrestricted at that layer.
+pub fn intersect_capability_mode_ceiling(
+    requested: Option<SubagentCapabilityMode>,
+    definition: Option<SubagentCapabilityMode>,
+    parent: Option<SubagentCapabilityMode>,
+) -> Option<SubagentCapabilityMode> {
+    intersect_capability_modes(intersect_capability_modes(requested, definition), parent)
+}
+
 /// Resolve effective runtime config from explicit overrides, role defaults,
 /// and persona defaults.
 ///
@@ -322,6 +332,26 @@ mod tests {
             intersect_capability_modes(
                 Some(SubagentCapabilityMode::ReadWrite),
                 Some(SubagentCapabilityMode::Execute),
+            ),
+            Some(SubagentCapabilityMode::ReadOnly)
+        );
+    }
+
+    #[test]
+    fn request_definition_and_parent_form_one_capability_ceiling() {
+        assert_eq!(
+            intersect_capability_mode_ceiling(
+                Some(SubagentCapabilityMode::All),
+                Some(SubagentCapabilityMode::Execute),
+                Some(SubagentCapabilityMode::ReadWrite),
+            ),
+            Some(SubagentCapabilityMode::ReadOnly)
+        );
+        assert_eq!(
+            intersect_capability_mode_ceiling(
+                Some(SubagentCapabilityMode::All),
+                None,
+                Some(SubagentCapabilityMode::ReadOnly),
             ),
             Some(SubagentCapabilityMode::ReadOnly)
         );

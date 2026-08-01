@@ -68,9 +68,8 @@ pub(crate) fn resolve_session_toolset(
 /// the caller can store it on the session. The FinalizedToolset reflects
 /// MCP + hub merging and capability filtering on top of that baseline.
 ///
-/// **MCP-origin and hub-origin `kind: None` tools are dropped under
-/// every non-`All` mode.** Baseline `kind: None` tools are always kept —
-/// but before filtering, kind-less baseline entries whose id the binary's
+/// **Every `kind: None` tool is dropped under every non-`All` mode.** Before
+/// filtering, kind-less baseline entries whose id the binary's
 /// registry knows get their [`ToolKind`] backfilled (see
 /// [`backfill_tool_kinds`]), so the capability filter applies to pinned
 /// server-bind toolsets whose wire entries cannot carry a kind.
@@ -89,7 +88,13 @@ pub(crate) fn resolve_session_toolset_rebuild(
     notification_handle: Option<xai_grok_tools::notification::types::ToolNotificationHandle>,
     terminal_backend: Arc<dyn xai_grok_tools::computer::types::TerminalBackend>,
 ) -> WorkspaceResult<(ToolServerConfig, Arc<FinalizedToolset>)> {
-    let mut builder = factory.registry_builder();
+    let capability_policy = xai_grok_tools::capability::CapabilityPolicy::new(
+        capability_mode.into(),
+        xai_grok_tools::capability::TrustedToolCapabilities::default(),
+    );
+    let mut builder = factory
+        .registry_builder()
+        .with_capability_policy(capability_policy);
     if let Some(lr) = local_registry {
         builder = builder.with_local_registry(lr);
     }
@@ -241,9 +246,8 @@ pub(crate) fn merge_and_filter(
     }
     let kept: Vec<ToolConfig> = tagged
         .into_iter()
-        .filter(|(tool, is_external)| match tool.kind {
+        .filter(|(tool, _is_external)| match tool.kind {
             Some(k) => kind_allowed(mode, k),
-            None if !*is_external => true,
             None => matches!(mode, CapabilityMode::All),
         })
         .map(|(t, _)| t)
@@ -853,8 +857,8 @@ mod tests {
         );
         let kept_ids: Vec<&str> = filtered.tools.iter().map(|t| t.id.as_str()).collect();
         assert!(
-            kept_ids.contains(&"baseline.opaque"),
-            "baseline kind: None must survive ReadOnly: {kept_ids:?}"
+            !kept_ids.contains(&"baseline.opaque"),
+            "baseline kind: None must fail closed under ReadOnly: {kept_ids:?}"
         );
         assert!(
             !kept_ids.contains(&"mcp.opaque"),

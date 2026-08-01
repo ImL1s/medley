@@ -1264,6 +1264,7 @@ fn make_test_handle(
             cwd: "/tmp".to_string(),
         },
         max_turns: None,
+        capability_mode: None,
         resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         hunk_tracker_handle,
         chat_state_handle: xai_chat_state::ChatStateHandle::noop(),

@@ -234,8 +234,8 @@ pub fn apply_child_tool_policy(
             .tool_config
             .tools
             .retain(|tool| tool.kind != Some(ToolKind::Task));
-        prune_orphaned_background_task_tools(&mut definition.tool_config);
     }
+    prune_orphaned_background_task_tools(&mut definition.tool_config);
 }
 /// Resolve runtime overrides and definition defaults in the production order.
 pub fn resolve_runtime_config(
@@ -334,6 +334,23 @@ mod tests {
         assert!(kinds.contains(&Some(ToolKind::Search)));
         assert!(!kinds.contains(&Some(ToolKind::Execute)));
         assert!(!kinds.contains(&Some(ToolKind::Task)));
+    }
+
+    #[test]
+    fn child_policy_prunes_orphaned_lifecycle_tools_even_when_nesting_is_allowed() {
+        let cwd = tempfile::tempdir().unwrap();
+        let toggles = HashMap::new();
+        let mut definition =
+            resolve_agent_definition("general-purpose", &context(cwd.path(), &toggles)).unwrap();
+        definition.tool_config.tools.retain(|tool| {
+            matches!(
+                tool.kind,
+                Some(ToolKind::BackgroundTaskAction | ToolKind::KillTaskAction)
+            )
+        });
+        assert!(!definition.tool_config.tools.is_empty());
+        apply_child_tool_policy(&mut definition, Some(SubagentCapabilityMode::All), true);
+        assert!(definition.tool_config.tools.is_empty());
     }
     #[test]
     fn gates_disabled_and_not_allowed_definitions() {

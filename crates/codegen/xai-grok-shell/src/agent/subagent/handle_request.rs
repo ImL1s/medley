@@ -372,10 +372,13 @@ pub(crate) async fn run_shell_child(
             "Resolved runtime overrides for subagent"
         );
     }
-    effective_runtime.capability_mode = xai_grok_subagent_resolution::intersect_capability_modes(
-        effective_runtime.capability_mode,
-        definition.capability_mode,
-    );
+    effective_runtime.capability_mode =
+        xai_grok_subagent_resolution::intersect_capability_mode_ceiling(
+            effective_runtime.capability_mode,
+            definition.capability_mode,
+            ctx.parent_capability_mode,
+        );
+    definition.capability_mode = effective_runtime.capability_mode;
     let child_depth = request
         .runtime_overrides
         .spawn_depth

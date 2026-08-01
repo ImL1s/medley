@@ -275,6 +275,7 @@ impl MvpAgent {
             parent_attribution_callback,
             parent_agent_name,
             parent_managed_mcp_proxy_base_url,
+            parent_capability_mode,
         ) = {
             let sessions = self.sessions.borrow();
             let ps = sessions.get(&parent_sid);
@@ -310,6 +311,7 @@ impl MvpAgent {
                 ps.and_then(|h| h.attribution_callback.clone()),
                 ps.map(|h| h.agent_name.clone()),
                 ps.map(|h| h.managed_mcp_proxy_base_url.clone()),
+                ps.and_then(|h| h.capability_mode),
             )
         };
         let (
@@ -428,6 +430,7 @@ impl MvpAgent {
             auth: self.current_or_buffered_auth(),
             parent_cwd: parent_cwd.clone(),
             parent_session_id: parent_session_id.to_string(),
+            parent_capability_mode,
             inherited_tool_overrides,
             yolo_mode,
             subagent_event_tx: self.subagent_event_tx.clone(),
