@@ -471,6 +471,7 @@ pub(super) fn scrub_chat_workspace_bind_meta(meta: &mut Option<acp::Meta>) {
             obj.remove("x.ai/cloud_existing_workspace");
         }
     }
+    #[cfg(not(feature = "local-workspace"))]
     {
         obj.remove("x.ai/cloud_existing_workspace");
     }
