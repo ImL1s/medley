@@ -231,6 +231,11 @@ fn parse_local_workspace_existing_fields(
     Some(LocalWorkspaceExistingFields { server_id, cwd })
 }
 
+#[cfg(any(feature = "local-workspace", test))]
+fn local_workspace_server_id_missing(meta: Option<&acp::Meta>) -> bool {
+    local_workspace_intent_present(meta) && parse_local_workspace_existing_fields(meta).is_none()
+}
+
 /// valid local-workspace intent → ExistingWorkspace only.
 ///
 /// `server_id` comes from the intent object, else `cloud_existing_workspace`.
@@ -269,14 +274,13 @@ fn parse_session_computer_sessions(
 fn resolve_session_computer_sessions(
     meta: Option<&acp::Meta>,
 ) -> Result<Option<Vec<crate::gateway_bridge::ComputerSession>>, acp::Error> {
-    let sessions = parse_session_computer_sessions(meta);
-    if local_workspace_intent_present(meta) && sessions.is_none() {
+    if local_workspace_server_id_missing(meta) {
         return Err(acp::Error::invalid_params().data(serde_json::json!({
             "code": "local_workspace_server_id_missing",
             "message": "local workspace intent requires a server_id",
         })));
     }
-    Ok(sessions)
+    Ok(parse_session_computer_sessions(meta))
 }
 #[cfg(not(feature = "local-workspace"))]
 #[allow(dead_code)]

@@ -3266,6 +3266,38 @@ fn parse_local_workspace_existing_fields_matrix() {
     }
 }
 
+#[test]
+fn local_workspace_missing_server_id_with_envid_fails_closed() {
+    use serde_json::json;
+
+    for mode in ["own", "attach"] {
+        let meta = json!({
+            "x.ai/local_workspace": {
+                "mode": mode,
+                "cwd": "/repo",
+            },
+            "envId": "env-must-not-be-used",
+        });
+        assert!(
+            local_workspace_server_id_missing(meta.as_object()),
+            "[{mode}] envId must not satisfy a valid local-workspace intent"
+        );
+    }
+
+    for meta in [
+        json!({"envId": "env-prod"}),
+        json!({
+            "x.ai/local_workspace": {"mode": "bogus"},
+            "envId": "env-prod",
+        }),
+    ] {
+        assert!(
+            !local_workspace_server_id_missing(meta.as_object()),
+            "invalid or absent local intent must retain the envId fallback"
+        );
+    }
+}
+
 /// valid `x.ai/local_workspace` → ExistingWorkspace only.
 /// Never reads `envId` / never emits SandboxEnvironment.
 #[cfg(feature = "local-workspace")]
