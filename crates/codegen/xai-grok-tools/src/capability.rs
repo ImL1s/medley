@@ -326,7 +326,8 @@ pub fn descriptor_for_kind(kind: ToolKind) -> ToolCapabilityDescriptor {
         Read | ListDir | Search | Lsp | List | MemorySearch | MemoryGet | Skill => {
             ToolCapabilityDescriptor::classified([Effect::LocalRead])
         }
-        WebSearch | WebFetch => ToolCapabilityDescriptor::classified([Effect::NetworkRead]),
+        WebSearch => ToolCapabilityDescriptor::classified([Effect::NetworkRead]),
+        WebFetch => ToolCapabilityDescriptor::classified([Effect::NetworkRead, Effect::LocalWrite]),
         Edit | Delete | Write | Move => ToolCapabilityDescriptor::classified([Effect::LocalWrite]),
         Execute | BackgroundTaskAction | WaitTasksAction | KillTaskAction | Monitor => {
             ToolCapabilityDescriptor::classified([Effect::Execute])
@@ -459,5 +460,25 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn web_fetch_declares_artifact_writes_but_web_search_remains_read_only() {
+        let web_search = descriptor_for_kind(ToolKind::WebSearch);
+        let web_fetch = descriptor_for_kind(ToolKind::WebFetch);
+
+        assert_eq!(
+            web_search,
+            ToolCapabilityDescriptor::classified([ToolEffect::NetworkRead])
+        );
+        assert_eq!(
+            web_fetch,
+            ToolCapabilityDescriptor::classified(
+                [ToolEffect::NetworkRead, ToolEffect::LocalWrite,]
+            )
+        );
+        assert!(SubagentCapabilityMode::ReadOnly.allows_tool_capability(&web_search));
+        assert!(!SubagentCapabilityMode::ReadOnly.allows_tool_capability(&web_fetch));
+        assert!(SubagentCapabilityMode::ReadWrite.allows_tool_capability(&web_fetch));
     }
 }
