@@ -1306,14 +1306,21 @@ impl SamplingClient {
             request.inner.model = Some(self.defaults.model.clone());
         }
 
-        // Apply temperature default if not specified
-        if request.inner.temperature.is_none() {
-            request.inner.temperature = self.defaults.temperature;
-        }
-
-        // Apply top_p default if not specified
-        if request.inner.top_p.is_none() {
-            request.inner.top_p = self.defaults.top_p;
+        if self.is_codex() {
+            // The ChatGPT Codex Responses contract rejects these sampling
+            // knobs. Clear both inherited defaults and explicit caller values
+            // at the shared wire-preparation boundary used by streaming and
+            // non-streaming requests.
+            request.inner.temperature = None;
+            request.inner.top_p = None;
+        } else {
+            // Apply generic Responses defaults if not specified.
+            if request.inner.temperature.is_none() {
+                request.inner.temperature = self.defaults.temperature;
+            }
+            if request.inner.top_p.is_none() {
+                request.inner.top_p = self.defaults.top_p;
+            }
         }
 
         // Apply max_output_tokens default if not specified
@@ -3142,17 +3149,46 @@ mod tests {
             base_url: CODEX_BASE_URL.to_owned(),
             api_backend: ApiBackend::CodexResponses,
             bearer_resolver: Some(resolver),
+            temperature: Some(0.73),
+            top_p: Some(0.91),
             ..minimal_config()
         })
         .expect("Codex client should build");
 
         let mut request = CreateResponseWrapper::default();
+        request.inner.temperature = Some(0.42);
+        request.inner.top_p = Some(0.57);
         client.apply_response_defaults(&mut request).unwrap();
         assert_eq!(request.inner.parallel_tool_calls, Some(true));
+        assert_eq!(request.inner.temperature, None);
+        assert_eq!(request.inner.top_p, None);
 
         request.inner.parallel_tool_calls = Some(false);
         client.apply_response_defaults(&mut request).unwrap();
         assert_eq!(request.inner.parallel_tool_calls, Some(false));
+    }
+
+    #[test]
+    fn generic_responses_preserve_sampling_parameters() {
+        let client = SamplingClient::new(SamplerConfig {
+            base_url: "https://api.openai.com/v1".to_owned(),
+            api_backend: ApiBackend::Responses,
+            temperature: Some(0.73),
+            top_p: Some(0.91),
+            ..minimal_config()
+        })
+        .expect("generic Responses client should build");
+
+        let mut request = CreateResponseWrapper::default();
+        client.apply_response_defaults(&mut request).unwrap();
+        assert_eq!(request.inner.temperature, Some(0.73));
+        assert_eq!(request.inner.top_p, Some(0.91));
+
+        request.inner.temperature = Some(0.42);
+        request.inner.top_p = Some(0.57);
+        client.apply_response_defaults(&mut request).unwrap();
+        assert_eq!(request.inner.temperature, Some(0.42));
+        assert_eq!(request.inner.top_p, Some(0.57));
     }
 
     #[test]
@@ -3227,6 +3263,8 @@ mod tests {
             base_url: format!("http://{address}/backend-api/codex"),
             api_backend: ApiBackend::CodexResponses,
             bearer_resolver: Some(resolver),
+            temperature: Some(0.73),
+            top_p: Some(0.91),
             stream_tool_calls: true,
             doom_loop_recovery: Some(xai_grok_sampling_types::DoomLoopRecoveryPolicy {
                 max_threshold: 8,
@@ -3280,6 +3318,14 @@ mod tests {
                 .is_some_and(|items| items.iter().any(|item| item["role"] == "user"))
         );
         assert_eq!(body["parallel_tool_calls"], true);
+        assert!(
+            body.get("temperature").is_none(),
+            "Codex request must omit unsupported temperature: {body}"
+        );
+        assert!(
+            body.get("top_p").is_none(),
+            "Codex request must omit unsupported top_p: {body}"
+        );
         assert!(body.get("stream_tool_calls").is_none());
         assert!(
             body.get("tools")
