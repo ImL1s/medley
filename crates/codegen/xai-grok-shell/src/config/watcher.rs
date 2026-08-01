@@ -544,12 +544,23 @@ fn plan_skills_watch_targets(
     grok_home: &Path,
     project_root: Option<&Path>,
 ) -> SkillsWatchPlan {
+    plan_skills_watch_targets_with_explicit(dirs_to_watch, &[], grok_home, project_root)
+}
+
+fn plan_skills_watch_targets_with_explicit(
+    dirs_to_watch: &[PathBuf],
+    explicit_recursive_roots: &[PathBuf],
+    grok_home: &Path,
+    project_root: Option<&Path>,
+) -> SkillsWatchPlan {
     let mut vendor_roots = Vec::new();
     let mut recursive_roots = Vec::new();
     let mut refresh_dirs = Vec::new();
 
     for dir in dirs_to_watch {
-        if is_vendor_config_root(dir, grok_home) {
+        if dirs_contain(explicit_recursive_roots, dir) {
+            recursive_roots.push(dir.clone());
+        } else if is_vendor_config_root(dir, grok_home) {
             vendor_roots.push(dir.clone());
             refresh_dirs.extend(vendor_skill_refresh_dirs(dir));
         } else {
@@ -692,8 +703,18 @@ impl SkillsFileWatcher {
             config_paths,
             xai_grok_tools::types::compat::CompatConfig::default(),
         );
+        let explicit_recursive_roots =
+            xai_grok_agent::prompt::skills::resolve_skill_config_paths(config_paths)
+                .into_iter()
+                .map(|path| path.watch_root().to_path_buf())
+                .collect::<Vec<_>>();
         let project_root = cwd.map(crate::session::workflow::registry::project_root);
-        Self::start_with_dirs(&dirs_to_watch, &grok_home, project_root.as_deref())
+        Self::start_with_dirs_and_explicit(
+            &dirs_to_watch,
+            &explicit_recursive_roots,
+            &grok_home,
+            project_root.as_deref(),
+        )
     }
 
     /// Start with explicit discovery roots (benches and isolated tests).
@@ -703,6 +724,15 @@ impl SkillsFileWatcher {
     /// [`Self::refresh_new_discovery_dirs`].
     pub fn start_with_dirs(
         dirs_to_watch: &[PathBuf],
+        grok_home: &Path,
+        project_root: Option<&Path>,
+    ) -> Option<(Self, mpsc::UnboundedReceiver<DiscoveryChange>)> {
+        Self::start_with_dirs_and_explicit(dirs_to_watch, &[], grok_home, project_root)
+    }
+
+    fn start_with_dirs_and_explicit(
+        dirs_to_watch: &[PathBuf],
+        explicit_recursive_roots: &[PathBuf],
         grok_home: &Path,
         project_root: Option<&Path>,
     ) -> Option<(Self, mpsc::UnboundedReceiver<DiscoveryChange>)> {
@@ -729,7 +759,12 @@ impl SkillsFileWatcher {
             .map_err(|e| tracing::warn!(error = %e, "failed to create skills file watcher"))
             .ok()?;
 
-        let plan = plan_skills_watch_targets(dirs_to_watch, grok_home, project_root);
+        let plan = plan_skills_watch_targets_with_explicit(
+            dirs_to_watch,
+            explicit_recursive_roots,
+            grok_home,
+            project_root,
+        );
 
         let mut watched = 0;
         let mut refreshed_dirs = HashSet::new();
@@ -1011,6 +1046,41 @@ mod tests {
             expected_refresh.extend(vendor_skill_refresh_dirs(&root));
         }
         assert_eq!(plan.refresh_dirs, expected_refresh);
+    }
+
+    #[test]
+    fn explicit_vendor_named_paths_stay_recursive() {
+        let tmp = TempDir::new().unwrap();
+        let grok_home = tmp.path().join("home-grok");
+        let configured_dir = tmp.path().join("custom").join(".claude");
+        let configured_file_parent = tmp.path().join("single").join(".cursor");
+        fs::create_dir_all(&configured_dir).unwrap();
+        fs::create_dir_all(&configured_file_parent).unwrap();
+        let configured_file = configured_file_parent.join("SKILL.md");
+        fs::write(&configured_file, "---\nname: configured\n---\n").unwrap();
+
+        let configured = vec![
+            configured_dir.to_string_lossy().into_owned(),
+            configured_file.to_string_lossy().into_owned(),
+        ];
+        let explicit_recursive_roots =
+            xai_grok_agent::prompt::skills::resolve_skill_config_paths(&configured)
+                .into_iter()
+                .map(|path| path.watch_root().to_path_buf())
+                .collect::<Vec<_>>();
+        let plan = plan_skills_watch_targets_with_explicit(
+            &explicit_recursive_roots,
+            &explicit_recursive_roots,
+            &grok_home,
+            None,
+        );
+
+        assert!(plan.vendor_roots.is_empty());
+        assert_eq!(
+            plan.recursive_roots,
+            vec![configured_dir, configured_file_parent]
+        );
+        assert!(plan.refresh_dirs.is_empty());
     }
 
     #[test]
