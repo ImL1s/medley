@@ -1663,6 +1663,42 @@ where
         }
     }
 }
+
+fn codex_auth_ready(status: &xai_grok_shell::auth::openai_codex::CodexAuthStatus) -> bool {
+    status.signed_in && !status.permanent_failure && (!status.expired || status.refreshable)
+}
+
+fn codex_auth_status_json(
+    provider: &str,
+    status: &xai_grok_shell::auth::openai_codex::CodexAuthStatus,
+) -> serde_json::Value {
+    serde_json::json!({
+        "provider": provider,
+        "signedIn": status.signed_in,
+        "ready": codex_auth_ready(status),
+        "expired": status.expired,
+        "refreshable": status.refreshable,
+        "permanentFailure": status.permanent_failure,
+        "accountIdPresent": status.account_id_present,
+        "expiresAt": status.expires_at,
+    })
+}
+
+fn codex_auth_status_text(
+    status: &xai_grok_shell::auth::openai_codex::CodexAuthStatus,
+) -> &'static str {
+    if status.permanent_failure {
+        "OpenAI Codex: credential refresh failed; sign in again (run `grok login --provider openai-codex`)"
+    } else if status.signed_in && !status.expired {
+        "OpenAI Codex: signed in and ready"
+    } else if status.signed_in && status.refreshable {
+        "OpenAI Codex: signed in; credential refreshes before the next request"
+    } else if status.signed_in {
+        "OpenAI Codex: credential expired (run `grok login --provider openai-codex`)"
+    } else {
+        "OpenAI Codex: signed out (run `grok login --provider openai-codex`)"
+    }
+}
 /// Return freed-but-retained jemalloc pages to the OS.
 ///
 /// `arena.<MALLCTL_ARENAS_ALL>.purge` madvises away all dirty/muzzy pages in
@@ -2201,34 +2237,10 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                                 &xai_grok_shell::util::grok_home::grok_home(),
                             );
                             let status = xai_grok_shell::auth::openai_codex::status(&manager);
-                            let ready = status.signed_in && (!status.expired || status.refreshable);
                             if json {
-                                println!(
-                                    "{}",
-                                    serde_json::json!({
-                                        "provider": provider.as_str(),
-                                        "signedIn": status.signed_in,
-                                        "ready": ready,
-                                        "expired": status.expired,
-                                        "refreshable": status.refreshable,
-                                        "accountIdPresent": status.account_id_present,
-                                        "expiresAt": status.expires_at,
-                                    })
-                                );
-                            } else if status.signed_in && !status.expired {
-                                println!("OpenAI Codex: signed in and ready");
-                            } else if status.signed_in && status.refreshable {
-                                println!(
-                                    "OpenAI Codex: signed in; credential refreshes before the next request"
-                                );
-                            } else if status.signed_in {
-                                println!(
-                                    "OpenAI Codex: credential expired (run `grok login --provider openai-codex`)"
-                                );
+                                println!("{}", codex_auth_status_json(provider.as_str(), &status));
                             } else {
-                                println!(
-                                    "OpenAI Codex: signed out (run `grok login --provider openai-codex`)"
-                                );
+                                println!("{}", codex_auth_status_text(&status));
                             }
                         }
                         LoginProvider::Xai => {
@@ -2621,6 +2633,26 @@ mod tests {
         .await;
 
         assert_eq!(result, Err("cancelled"));
+    }
+    #[test]
+    fn codex_status_permanent_failure_is_unready_and_requires_sign_in() {
+        let status = xai_grok_shell::auth::openai_codex::CodexAuthStatus {
+            signed_in: true,
+            expired: false,
+            refreshable: true,
+            permanent_failure: true,
+            account_id_present: true,
+            expires_at: None,
+        };
+
+        assert!(!codex_auth_ready(&status));
+        let json = codex_auth_status_json("openai-codex", &status);
+        assert_eq!(json["ready"], false);
+        assert_eq!(json["permanentFailure"], true);
+        assert!(
+            codex_auth_status_text(&status).contains("sign in again"),
+            "permanent failure must take precedence over signed-in/refreshable output"
+        );
     }
     #[test]
     fn default_caps_the_core_count() {
