@@ -12,7 +12,7 @@ use std::time::Duration as StdDuration;
 use axum::{Router, extract::Query, http::StatusCode, response::Html, routing::get};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::{Duration, Utc};
+use chrono::{Duration, TimeZone, Utc};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
@@ -38,6 +38,7 @@ pub const ACCOUNT_ID_CLAIM: &str = "https://api.openai.com/auth/chatgpt_account_
 const CALLBACK_PATH: &str = "/auth/callback";
 const CALLBACK_TIMEOUT: StdDuration = StdDuration::from_secs(600);
 const REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(20);
+const EXPIRY_FALLBACK_SECONDS: i64 = 8 * 24 * 60 * 60;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CodexOAuthError {
@@ -111,14 +112,38 @@ impl std::fmt::Debug for TokenResponse {
 }
 
 #[derive(Deserialize)]
-struct OAuthErrorResponse {
-    #[serde(default)]
-    error: Option<String>,
+#[serde(untagged)]
+enum OAuthErrorField {
+    Code(String),
+    Object {
+        #[serde(default)]
+        code: Option<String>,
+    },
 }
 
-fn recognized_oauth_error(code: Option<String>) -> Option<String> {
+#[derive(Deserialize)]
+struct OAuthErrorResponse {
+    #[serde(default)]
+    error: Option<OAuthErrorField>,
+    #[serde(default)]
+    code: Option<String>,
+}
+
+fn recognized_oauth_error(body: OAuthErrorResponse) -> Option<String> {
+    let code = match body.error {
+        Some(OAuthErrorField::Code(code)) => Some(code),
+        Some(OAuthErrorField::Object { code }) => code,
+        None => None,
+    }
+    .or(body.code);
     match code.as_deref() {
-        Some("invalid_grant") | Some("invalid_client") => code,
+        Some(
+            "invalid_grant"
+            | "invalid_client"
+            | "refresh_token_expired"
+            | "refresh_token_reused"
+            | "refresh_token_invalidated",
+        ) => code,
         _ => None,
     }
 }
@@ -352,12 +377,11 @@ async fn decode_token_response(
 ) -> Result<TokenResponse, TokenRequestError> {
     let status = resp.status();
     if !status.is_success() {
-        let oauth_code = recognized_oauth_error(
-            resp.json::<OAuthErrorResponse>()
-                .await
-                .ok()
-                .and_then(|body| body.error),
-        );
+        let oauth_code = resp
+            .json::<OAuthErrorResponse>()
+            .await
+            .ok()
+            .and_then(recognized_oauth_error);
         return Err(TokenRequestError {
             status: Some(status.as_u16()),
             oauth_code,
@@ -444,6 +468,43 @@ fn account_id_from_jwt(token: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn expiry_from_access_token(token: &str) -> Option<chrono::DateTime<Utc>> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: HashMap<String, serde_json::Value> = serde_json::from_slice(&bytes).ok()?;
+    let seconds = claims.get("exp").and_then(|exp| {
+        exp.as_i64()
+            .or_else(|| exp.as_u64().and_then(|value| i64::try_from(value).ok()))
+    })?;
+    Utc.timestamp_opt(seconds, 0).single()
+}
+
+fn token_expiry(
+    tokens: &TokenResponse,
+    now: chrono::DateTime<Utc>,
+) -> Result<chrono::DateTime<Utc>, CodexOAuthError> {
+    let expires_in = tokens
+        .expires_in
+        .map(|seconds| {
+            let seconds =
+                i64::try_from(seconds).map_err(|_| CodexOAuthError::InvalidTokenResponse)?;
+            let duration =
+                Duration::try_seconds(seconds).ok_or(CodexOAuthError::InvalidTokenResponse)?;
+            now.checked_add_signed(duration)
+                .ok_or(CodexOAuthError::InvalidTokenResponse)
+        })
+        .transpose()?;
+    let jwt_expiry = expiry_from_access_token(&tokens.access_token);
+    match (expires_in, jwt_expiry) {
+        (Some(relative), Some(jwt)) => Ok(relative.min(jwt)),
+        (Some(relative), None) => Ok(relative),
+        (None, Some(jwt)) => Ok(jwt),
+        (None, None) => Duration::try_seconds(EXPIRY_FALLBACK_SECONDS)
+            .and_then(|duration| now.checked_add_signed(duration))
+            .ok_or(CodexOAuthError::InvalidTokenResponse),
+    }
+}
+
 fn valid_account_id(value: &str) -> bool {
     !value.is_empty() && !value.contains(char::is_control)
 }
@@ -455,6 +516,8 @@ fn build_auth(
     if tokens.access_token.is_empty() {
         return Err(CodexOAuthError::InvalidTokenResponse);
     }
+    let now = Utc::now();
+    let expires_at = token_expiry(&tokens, now)?;
     let account_id = tokens
         .id_token
         .as_deref()
@@ -470,12 +533,10 @@ fn build_auth(
     Ok(GrokAuth {
         key: tokens.access_token,
         auth_mode: AuthMode::OpenAiCodex,
-        create_time: Utc::now(),
+        create_time: now,
         user_id: String::new(),
         refresh_token,
-        expires_at: tokens
-            .expires_in
-            .map(|seconds| Utc::now() + Duration::seconds(seconds as i64)),
+        expires_at: Some(expires_at),
         oidc_issuer: Some(ISSUER.to_owned()),
         oidc_client_id: Some(CLIENT_ID.to_owned()),
         id_token,
@@ -656,8 +717,16 @@ pub(crate) async fn refresh_auth(auth: &GrokAuth) -> OidcRefreshResult {
 
 fn classify_refresh_error(error: &TokenRequestError) -> Option<RefreshTokenFailedReason> {
     match error.oauth_code.as_deref() {
-        Some("invalid_grant") => Some(RefreshTokenFailedReason::RefreshTokenRejected),
+        Some(
+            "invalid_grant"
+            | "refresh_token_expired"
+            | "refresh_token_reused"
+            | "refresh_token_invalidated",
+        ) => Some(RefreshTokenFailedReason::RefreshTokenRejected),
         Some("invalid_client") => Some(RefreshTokenFailedReason::ClientRejected),
+        _ if error.status == Some(StatusCode::UNAUTHORIZED.as_u16()) => {
+            Some(RefreshTokenFailedReason::Other)
+        }
         _ => None,
     }
 }
@@ -680,6 +749,11 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    #[derive(Debug)]
+    struct RejectingCodexRefresher {
+        calls: Arc<AtomicUsize>,
+    }
+
     #[async_trait::async_trait]
     impl crate::auth::refresh::TokenRefresher for RotatingCodexRefresher {
         async fn refresh(
@@ -698,6 +772,26 @@ mod tests {
                 account_id: Some("rotated-account".into()),
                 ..GrokAuth::default()
             }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::auth::refresh::TokenRefresher for RejectingCodexRefresher {
+        async fn refresh(
+            &self,
+            _reason: crate::auth::refresh::RefreshReason,
+        ) -> crate::auth::refresh::RefreshOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let attempted = GrokAuth {
+                key: "expiring-access".into(),
+                auth_mode: AuthMode::OpenAiCodex,
+                refresh_token: Some("rejected-refresh".into()),
+                ..GrokAuth::default()
+            };
+            crate::auth::refresh::RefreshOutcome::permanent_for(
+                RefreshTokenFailedReason::RefreshTokenRejected,
+                &attempted,
+            )
         }
     }
 
@@ -942,6 +1036,67 @@ mod tests {
         );
     }
 
+    async fn token_error(body: serde_json::Value, status: StatusCode) -> TokenRequestError {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let body = body.clone();
+                async move { (status, axum::Json(body)) }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        refresh_at(&format!("http://{addr}/token"), "rejected-refresh")
+            .await
+            .expect_err("error response must fail refresh")
+    }
+
+    #[tokio::test]
+    async fn official_refresh_rejection_shapes_are_terminal() {
+        for body in [
+            serde_json::json!({"error": "refresh_token_expired"}),
+            serde_json::json!({"error": {"code": "refresh_token_reused"}}),
+            serde_json::json!({"code": "refresh_token_invalidated"}),
+        ] {
+            let error = token_error(body, StatusCode::BAD_REQUEST).await;
+            assert_eq!(
+                classify_refresh_error(&error),
+                Some(RefreshTokenFailedReason::RefreshTokenRejected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_client_is_terminal_for_nested_error_shape() {
+        let error = token_error(
+            serde_json::json!({"error": {"code": "invalid_client"}}),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_eq!(
+            classify_refresh_error(&error),
+            Some(RefreshTokenFailedReason::ClientRejected)
+        );
+    }
+
+    #[tokio::test]
+    async fn unclassified_unauthorized_refresh_is_terminal_other() {
+        let error = token_error(
+            serde_json::json!({"error": {"code": "not_allowlisted"}}),
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+        assert!(error.oauth_code.is_none());
+        assert_eq!(
+            classify_refresh_error(&error),
+            Some(RefreshTokenFailedReason::Other)
+        );
+    }
+
     async fn classify_invalid_grant_description(description: &'static str) {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -998,6 +1153,58 @@ mod tests {
             "email": "person@example.test"
         }));
         assert_eq!(account_id_from_jwt(&token), None);
+    }
+
+    #[test]
+    fn access_token_jwt_exp_drives_expiry_without_expires_in() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap();
+        let expected = now.checked_add_signed(Duration::hours(1)).unwrap();
+        let tokens = TokenResponse {
+            access_token: jwt(serde_json::json!({"exp": expected.timestamp()})),
+            refresh_token: None,
+            id_token: None,
+            expires_in: None,
+        };
+        assert_eq!(token_expiry(&tokens, now).unwrap(), expected);
+    }
+
+    #[test]
+    fn missing_token_expiry_uses_checked_eight_day_fallback() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap();
+        let tokens = TokenResponse {
+            access_token: "opaque-access-token".into(),
+            refresh_token: None,
+            id_token: None,
+            expires_in: None,
+        };
+        let expected = now
+            .checked_add_signed(Duration::seconds(EXPIRY_FALLBACK_SECONDS))
+            .unwrap();
+        assert_eq!(token_expiry(&tokens, now).unwrap(), expected);
+    }
+
+    #[test]
+    fn earlier_expiry_wins_and_relative_overflow_is_rejected() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap();
+        let jwt_expiry = now.checked_add_signed(Duration::hours(1)).unwrap();
+        let tokens = TokenResponse {
+            access_token: jwt(serde_json::json!({"exp": jwt_expiry.timestamp()})),
+            refresh_token: None,
+            id_token: None,
+            expires_in: Some(7200),
+        };
+        assert_eq!(token_expiry(&tokens, now).unwrap(), jwt_expiry);
+
+        let overflow = TokenResponse {
+            access_token: "opaque-access-token".into(),
+            refresh_token: None,
+            id_token: None,
+            expires_in: Some(u64::MAX),
+        };
+        assert!(matches!(
+            token_expiry(&overflow, now),
+            Err(CodexOAuthError::InvalidTokenResponse)
+        ));
     }
 
     #[tokio::test]
@@ -1077,6 +1284,32 @@ mod tests {
         assert_eq!(persisted.key, "rotated-access");
         assert_eq!(persisted.refresh_token.as_deref(), Some("rotated-refresh"));
         assert_eq!(persisted.account_id.as_deref(), Some("rotated-account"));
+    }
+
+    #[tokio::test]
+    async fn near_expiry_terminal_rejection_makes_codex_unready() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+        manager
+            .save_without_enrichment(GrokAuth {
+                key: "expiring-access".into(),
+                auth_mode: AuthMode::OpenAiCodex,
+                refresh_token: Some("rejected-refresh".into()),
+                expires_at: Some(Utc::now() + Duration::seconds(30)),
+                oidc_issuer: Some(ISSUER.into()),
+                oidc_client_id: Some(CLIENT_ID.into()),
+                ..GrokAuth::default()
+            })
+            .await
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        manager.set_refresher(Arc::new(RejectingCodexRefresher {
+            calls: Arc::clone(&calls),
+        }));
+
+        assert!(manager.auth().await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!status(&manager).signed_in);
     }
 
     #[test]

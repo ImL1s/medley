@@ -1321,6 +1321,13 @@ impl SamplingClient {
             request.inner.max_output_tokens = self.defaults.max_completion_tokens;
         }
 
+        // The ChatGPT Codex Responses contract sends this field explicitly.
+        // Preserve an explicit caller choice, but do not depend on a changing
+        // server default for the built-in Codex transport.
+        if self.is_codex() && request.inner.parallel_tool_calls.is_none() {
+            request.inner.parallel_tool_calls = Some(true);
+        }
+
         // Set store to false if not specified (default is true, but that breaks ZDR compliance)
         if request.inner.store.is_none() {
             request.inner.store = Some(false);
@@ -3127,6 +3134,28 @@ mod tests {
     }
 
     #[test]
+    fn codex_defaults_enable_parallel_tools_without_overriding_explicit_choice() {
+        let resolver = std::sync::Arc::new(CodexCredentialResolver {
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let client = SamplingClient::new(SamplerConfig {
+            base_url: CODEX_BASE_URL.to_owned(),
+            api_backend: ApiBackend::CodexResponses,
+            bearer_resolver: Some(resolver),
+            ..minimal_config()
+        })
+        .expect("Codex client should build");
+
+        let mut request = CreateResponseWrapper::default();
+        client.apply_response_defaults(&mut request).unwrap();
+        assert_eq!(request.inner.parallel_tool_calls, Some(true));
+
+        request.inner.parallel_tool_calls = Some(false);
+        client.apply_response_defaults(&mut request).unwrap();
+        assert_eq!(request.inner.parallel_tool_calls, Some(false));
+    }
+
+    #[test]
     fn codex_transport_rejects_non_allowlisted_origins_and_query_params() {
         for base_url in [
             "https://api.openai.com/v1",
@@ -3250,6 +3279,7 @@ mod tests {
                 .as_array()
                 .is_some_and(|items| items.iter().any(|item| item["role"] == "user"))
         );
+        assert_eq!(body["parallel_tool_calls"], true);
         assert!(body.get("stream_tool_calls").is_none());
         assert!(
             body.get("tools")
