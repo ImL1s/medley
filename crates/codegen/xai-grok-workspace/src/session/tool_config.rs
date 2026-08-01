@@ -106,13 +106,24 @@ pub(crate) fn resolve_session_toolset_rebuild(
         &capability_policy,
         session_id,
     );
-    let hub_ids: std::collections::HashSet<&str> =
-        hub_snapshot.iter().map(|t| t.id.as_str()).collect();
+    let baseline_ids: std::collections::HashSet<&str> =
+        baseline.tools.iter().map(|tool| tool.id.as_str()).collect();
+    let external_ids: std::collections::HashSet<&str> = mcp_snapshot
+        .iter()
+        .chain(hub_snapshot)
+        .map(|tool| tool.id.as_str())
+        // Baseline wins an exact-ID collision and remains a native tool.
+        .filter(|id| !baseline_ids.contains(id))
+        .collect();
     let finalize_config = ToolServerConfig {
         tools: filtered
             .tools
             .iter()
-            .filter(|t| !hub_ids.contains(t.id.as_str()))
+            // Snapshot tools are dispatched by their external MCP/hub
+            // boundary. They participate in capability filtering and
+            // discoverability, but are not native registry entries to
+            // instantiate during `finalize`.
+            .filter(|tool| !external_ids.contains(tool.id.as_str()))
             .cloned()
             .collect(),
         behavior_preset: filtered.behavior_preset.clone(),
@@ -1045,7 +1056,12 @@ mod tests {
             tools: vec![test_support::tc("baseline.custom_read", None)],
             behavior_preset: None,
         };
-        let mcp = vec![test_support::tc("mcp.remote_read", Some(ToolKind::Execute))];
+        let mcp = vec![
+            test_support::tc("mcp.remote_read", Some(ToolKind::Execute)),
+            // A snapshot collision cannot make the baseline winner look
+            // external and disappear from native finalization.
+            test_support::tc("GrokBuild:read_file", Some(ToolKind::Other)),
+        ];
         let hub = vec![test_support::tc("hub:remote_read", Some(ToolKind::Other))];
 
         let filtered =
@@ -1058,6 +1074,64 @@ mod tests {
         assert!(
             filtered.tools.iter().all(|tool| tool.kind.is_none()),
             "serialized external kinds must not become capability authority"
+        );
+    }
+    #[tokio::test]
+    async fn trusted_external_snapshot_ids_survive_full_restricted_resolution() {
+        use xai_grok_tools::capability::TrustedToolCapabilities;
+        use xai_grok_tools::types::config_source::ConfigSource;
+        use xai_tool_types::{ToolCapabilityDescriptor, ToolEffect};
+
+        let mut trusted = TrustedToolCapabilities::default();
+        for id in ["mcp.remote_read", "hub:remote_read"] {
+            trusted
+                .insert_classification(
+                    id,
+                    ToolCapabilityDescriptor::classified([ToolEffect::NetworkRead]),
+                    ConfigSource::Builtin,
+                )
+                .unwrap();
+        }
+        let factory = WorkspaceSessionContextFactory::new().with_trusted_tool_capabilities(trusted);
+        let baseline = ToolServerConfig {
+            tools: vec![test_support::tc("GrokBuild:read_file", None)],
+            behavior_preset: None,
+        };
+        let mcp = vec![test_support::tc("mcp.remote_read", Some(ToolKind::Execute))];
+        let hub = vec![test_support::tc("hub:remote_read", Some(ToolKind::Other))];
+
+        let (effective, toolset, _backend) = resolve_session_toolset(
+            baseline,
+            CapabilityMode::ReadOnly,
+            &mcp,
+            &hub,
+            PathBuf::from("/tmp"),
+            empty_env(),
+            "trusted-full-resolution",
+            &factory,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("trusted external snapshot IDs must not be finalized as unknown native tools");
+
+        assert_eq!(
+            effective.tools.len(),
+            1,
+            "the stored baseline stays unchanged"
+        );
+        let names: Vec<String> = toolset
+            .tool_definitions()
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect();
+        assert!(names.iter().any(|name| name == "read_file"));
+        assert!(
+            names
+                .iter()
+                .all(|name| name != "mcp.remote_read" && name != "hub:remote_read"),
+            "external snapshot tools must stay on their MCP/hub dispatch boundary: {names:?}"
         );
     }
     #[test]

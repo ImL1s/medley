@@ -75,6 +75,17 @@ impl From<CapabilityMode> for xai_tool_types::SubagentCapabilityMode {
     }
 }
 
+impl From<xai_tool_types::SubagentCapabilityMode> for CapabilityMode {
+    fn from(value: xai_tool_types::SubagentCapabilityMode) -> Self {
+        match value {
+            xai_tool_types::SubagentCapabilityMode::ReadOnly => Self::ReadOnly,
+            xai_tool_types::SubagentCapabilityMode::ReadWrite => Self::ReadWrite,
+            xai_tool_types::SubagentCapabilityMode::Execute => Self::Execute,
+            xai_tool_types::SubagentCapabilityMode::All => Self::All,
+        }
+    }
+}
+
 /// Every `ToolKind` variant. Used by `is_subset_of` and by parameterised
 /// tests. When a new variant is added to `ToolKind`, the compile-time
 /// assertion below fires so it can't be silently omitted.
