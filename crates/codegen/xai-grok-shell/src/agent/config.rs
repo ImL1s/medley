@@ -5596,11 +5596,13 @@ pub async fn resolve_aux_model_sampling_config_preflight(
 /// helper model keeps the session's auth/attribution. Shared by image-describe
 /// and the auto-mode classifier so the two can't drift.
 ///
-/// The resolver gate is host-based, stricter than `session_token_auth_gate`:
-/// a session-token deployment on a custom `models_base_url` loses aux-sampler
-/// refresh, rather than risk the session bearer on a third-party endpoint.
-/// `AuthScheme::None` aux models also skip the resolver so a keyless helper
-/// never inherits a live session bearer.
+/// Resolver inheritance is fail-closed and provider-compatible: both the
+/// active session and auxiliary target must use xAI bearer endpoints, the
+/// target must require auth, and a resolver already owned by the auxiliary
+/// model is never replaced. A session-token deployment on a custom
+/// `models_base_url` loses aux-sampler refresh rather than risk its bearer on a
+/// third-party endpoint; a Codex session likewise cannot stamp its provider
+/// credential onto an xAI helper.
 pub fn stamp_session_local_sampler_fields(
     cfg: &mut SamplerConfig,
     active_session_config: &SamplerConfig,
@@ -5609,7 +5611,12 @@ pub fn stamp_session_local_sampler_fields(
 ) {
     cfg.client_identifier = client_identifier;
     cfg.attribution_callback = active_session_config.attribution_callback.clone();
-    if cfg.auth_scheme != AuthScheme::None && crate::util::is_xai_api_bearer_url(&cfg.base_url) {
+    if cfg.bearer_resolver.is_none()
+        && cfg.auth_scheme != AuthScheme::None
+        && active_session_config.auth_scheme != AuthScheme::None
+        && crate::util::is_xai_api_bearer_url(&cfg.base_url)
+        && crate::util::is_xai_api_bearer_url(&active_session_config.base_url)
+    {
         cfg.bearer_resolver = active_session_config.bearer_resolver.clone();
     }
     cfg.max_retries = max_retries;
@@ -7094,11 +7101,10 @@ reasoning_effort = "low"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
-    /// The session bearer resolver must never be stamped onto a third-party
-    /// sampler: the sampler substitutes the resolver's bearer at request
-    /// time. `AuthScheme::None` also refuses the stamp on first-party hosts.
+    /// The session bearer resolver must never cross a provider boundary or
+    /// replace a resolver already owned by the auxiliary model.
     #[test]
-    fn session_resolver_is_not_stamped_onto_third_party_samplers() {
+    fn session_resolver_is_only_stamped_between_xai_samplers() {
         #[derive(Debug)]
         struct SessionResolver;
         impl xai_grok_sampler::BearerResolver for SessionResolver {
@@ -7106,7 +7112,15 @@ reasoning_effort = "low"
                 Some("session-jwt".into())
             }
         }
+        #[derive(Debug)]
+        struct AuxiliaryResolver;
+        impl xai_grok_sampler::BearerResolver for AuxiliaryResolver {
+            fn current_bearer(&self) -> Option<String> {
+                Some("auxiliary-jwt".into())
+            }
+        }
         let session_cfg = SamplerConfig {
+            base_url: EndpointsConfig::default().resolve_inference_base_url(),
             bearer_resolver: Some(std::sync::Arc::new(SessionResolver)),
             ..SamplerConfig::default()
         };
@@ -7137,6 +7151,45 @@ reasoning_effort = "low"
         assert!(
             none_scheme.bearer_resolver.is_none(),
             "AuthScheme::None must never inherit the session bearer resolver"
+        );
+
+        let codex_session = SamplerConfig {
+            base_url: "https://chatgpt.com/backend-api/codex".into(),
+            api_backend: ApiBackend::CodexResponses,
+            bearer_resolver: Some(std::sync::Arc::new(SessionResolver)),
+            ..SamplerConfig::default()
+        };
+        let mut xai_aux = SamplerConfig {
+            api_key: Some("xai-aux-key".into()),
+            base_url: EndpointsConfig::default().resolve_inference_base_url(),
+            ..SamplerConfig::default()
+        };
+        stamp_session_local_sampler_fields(&mut xai_aux, &codex_session, None, None);
+        assert!(
+            xai_aux.bearer_resolver.is_none(),
+            "a Codex resolver must never be copied onto an xAI auxiliary sampler"
+        );
+        assert_eq!(xai_aux.api_key.as_deref(), Some("xai-aux-key"));
+
+        let mut independently_authenticated_aux = SamplerConfig {
+            base_url: EndpointsConfig::default().resolve_inference_base_url(),
+            bearer_resolver: Some(std::sync::Arc::new(AuxiliaryResolver)),
+            ..SamplerConfig::default()
+        };
+        stamp_session_local_sampler_fields(
+            &mut independently_authenticated_aux,
+            &session_cfg,
+            None,
+            None,
+        );
+        assert_eq!(
+            independently_authenticated_aux
+                .bearer_resolver
+                .as_ref()
+                .and_then(|resolver| resolver.current_bearer())
+                .as_deref(),
+            Some("auxiliary-jwt"),
+            "an auxiliary model's own resolver must not be overwritten"
         );
     }
     /// A cold cache disables web search rather than sending an

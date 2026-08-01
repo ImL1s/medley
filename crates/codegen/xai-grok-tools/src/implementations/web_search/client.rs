@@ -66,17 +66,22 @@ impl WebSearchClient {
             headers.insert(header_name, header_value);
         }
         let _ = alpha_test_key;
-        let http = xai_grok_extra_ca::with_extra_root_certificates(
-            reqwest::Client::builder().default_headers(headers),
-        )
-        .build()
-        .map_err(|_| {
-            xai_tool_runtime::ToolError::execution(
-                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                "Failed to build HTTP client.".to_string(),
-            )
-        })?;
         let provider_scoped = api_key_provider.is_some();
+        let mut http_builder = reqwest::Client::builder().default_headers(headers);
+        if provider_scoped {
+            // A provider-scoped credential is valid only for the configured
+            // Responses endpoint. Do not let bearer/account headers follow a
+            // same-origin path redirect or escape to another origin.
+            http_builder = http_builder.redirect(reqwest::redirect::Policy::none());
+        }
+        let http = xai_grok_extra_ca::with_extra_root_certificates(http_builder)
+            .build()
+            .map_err(|_| {
+                xai_tool_runtime::ToolError::execution(
+                    xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+                    "Failed to build HTTP client.".to_string(),
+                )
+            })?;
         Ok(Self {
             http,
             base_url: base_url.clone(),
@@ -671,6 +676,22 @@ mod tests {
             None
         }
     }
+    struct ScopedProvider;
+    impl crate::types::ApiKeyProvider for ScopedProvider {
+        fn current_api_key(&self) -> Option<String> {
+            Some("codex-key".to_string())
+        }
+
+        fn current_credential_async(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<ApiCredential>> + Send + '_>>
+        {
+            Box::pin(std::future::ready(Some(ApiCredential {
+                access_token: "codex-key".to_string(),
+                account_id: Some("codex-account".to_string()),
+            })))
+        }
+    }
     /// When the dynamic provider returns `None`, the static `api_key`
     /// from config must still be sent as the Authorization header.
     /// This is a regression scenario: API-key users
@@ -891,6 +912,88 @@ mod tests {
         assert!(
             server.received_requests().await.unwrap().is_empty(),
             "a missing scoped credential must not fall back to the session-wide bearer"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_scoped_search_does_not_follow_same_origin_redirect() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/responses"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer codex-key",
+            ))
+            .and(wiremock::matchers::header(
+                "chatgpt-account-id",
+                "codex-account",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(307).insert_header("Location", "/outside-codex"),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/outside-codex"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let scoped: SharedApiKeyProvider = std::sync::Arc::new(ScopedProvider);
+        let config = WebSearchConfig::Enabled {
+            api_key: "stale-codex-key".to_string(),
+            base_url: server.uri(),
+            model: "test-model".to_string(),
+            extra_headers: IndexMap::new(),
+            alpha_test_key: None,
+            api_key_provider: Some(scoped),
+        };
+        let client = WebSearchClient::new(&config, None).expect("client should build");
+        let error = client.search("test query", None).await.unwrap_err();
+        assert!(error.to_string().contains("HTTP 307"));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/outside-codex")
+                .count(),
+            0,
+            "provider-scoped credentials must not follow redirects outside the fixed path"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_scoped_search_does_not_follow_cross_origin_redirect() {
+        let sink = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&sink)
+            .await;
+        let source = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/responses"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(307)
+                    .insert_header("Location", format!("{}/capture", sink.uri())),
+            )
+            .mount(&source)
+            .await;
+
+        let scoped: SharedApiKeyProvider = std::sync::Arc::new(ScopedProvider);
+        let config = WebSearchConfig::Enabled {
+            api_key: "stale-codex-key".to_string(),
+            base_url: source.uri(),
+            model: "test-model".to_string(),
+            extra_headers: IndexMap::new(),
+            alpha_test_key: None,
+            api_key_provider: Some(scoped),
+        };
+        let client = WebSearchClient::new(&config, None).expect("client should build");
+        let error = client.search("test query", None).await.unwrap_err();
+        assert!(error.to_string().contains("HTTP 307"));
+        assert!(
+            sink.received_requests().await.unwrap().is_empty(),
+            "provider-scoped credential metadata must not cross an origin redirect"
         );
     }
 
