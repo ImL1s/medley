@@ -189,6 +189,28 @@ impl xai_grok_sampler::BearerResolver for AuthProviderRef {
             }
         })
     }
+
+    fn current_credential_async(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Option<xai_grok_sampler::config::ProviderCredentialSnapshot>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let current = self.cached_token();
+            let _ = self.ensure_fresh_token(current.as_deref()).await;
+            self.cached_credential().map(|credential| {
+                xai_grok_sampler::config::ProviderCredentialSnapshot {
+                    access_token: credential.access_token,
+                    account_id: credential.account_id,
+                }
+            })
+        })
+    }
 }
 
 /// Ignores the slot; a deserialized ref compares unequal until resolution

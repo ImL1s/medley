@@ -441,6 +441,7 @@ impl SessionContextFactory for WorkspaceSessionContextFactory {
                                 model: default_web_search_model(),
                                 extra_headers: headers,
                                 alpha_test_key: None,
+                                api_key_provider: None,
                             },
                             AppBuilderDeployerConfig::default(),
                         )

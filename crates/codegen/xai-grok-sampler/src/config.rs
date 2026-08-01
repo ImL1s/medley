@@ -220,6 +220,17 @@ pub trait BearerResolver: Send + Sync + std::fmt::Debug {
             .map(ProviderCredentialSnapshot::bearer_only)
     }
 
+    /// Resolve the credential immediately before an async request. Providers
+    /// with refresh capability can override this while cache-only resolvers
+    /// retain the existing synchronous behavior.
+    fn current_credential_async(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<ProviderCredentialSnapshot>> + Send + '_>,
+    > {
+        Box::pin(std::future::ready(self.current_credential()))
+    }
+
     fn compare_sent_credential(&self, sent: Option<&str>) -> CredentialComparison {
         let current = self.current_bearer();
         CredentialComparison::compare(sent, current.as_deref())

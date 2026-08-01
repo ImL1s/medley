@@ -27,6 +27,55 @@ impl xai_grok_sampler::BearerResolver for WireValidBearerResolver {
         self.0.current_wire_valid().map(|a| a.key)
     }
 }
+
+/// Tool-client adapter for a model's provider-scoped bearer resolver. This
+/// keeps a Codex web-search request on the Codex credential source instead of
+/// falling back to the session-wide xAI auth manager.
+pub(crate) struct ProviderScopedToolKeyProvider(xai_grok_sampler::SharedBearerResolver);
+
+impl ProviderScopedToolKeyProvider {
+    pub(crate) fn shared(
+        resolver: xai_grok_sampler::SharedBearerResolver,
+    ) -> xai_grok_tools::types::SharedApiKeyProvider {
+        Arc::new(Self(resolver))
+    }
+}
+
+impl xai_grok_tools::types::ApiKeyProvider for ProviderScopedToolKeyProvider {
+    fn current_api_key(&self) -> Option<String> {
+        self.0.current_bearer()
+    }
+
+    fn current_api_key_async(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + '_>> {
+        Box::pin(async move {
+            self.0
+                .current_credential_async()
+                .await
+                .map(|credential| credential.access_token)
+        })
+    }
+
+    fn current_credential_async(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Option<xai_grok_tools::types::ApiCredential>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            self.0.current_credential_async().await.map(|credential| {
+                xai_grok_tools::types::ApiCredential {
+                    access_token: credential.access_token,
+                    account_id: credential.account_id,
+                }
+            })
+        })
+    }
+}
 /// Production impl: wraps the live `AuthManager`. 401 recovery
 /// delegates to `AuthManager::unauthorized_recovery`.
 pub struct ShellAuthCredentialProvider {
@@ -654,6 +703,52 @@ mod tests {
             Some("fresh-token"),
             "the same resolver must serve the rotated token without a rebuild"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_scoped_tool_key_provider_uses_request_boundary_refresh() {
+        #[derive(Debug)]
+        struct RefreshingResolver;
+
+        impl xai_grok_sampler::BearerResolver for RefreshingResolver {
+            fn current_bearer(&self) -> Option<String> {
+                Some("stale-snapshot".to_string())
+            }
+
+            fn current_credential_async(
+                &self,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Option<xai_grok_sampler::config::ProviderCredentialSnapshot>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(std::future::ready(Some(
+                    xai_grok_sampler::config::ProviderCredentialSnapshot {
+                        access_token: "refreshed-provider-token".to_string(),
+                        account_id: Some("provider-account".to_string()),
+                    },
+                )))
+            }
+        }
+
+        let provider = ProviderScopedToolKeyProvider::shared(Arc::new(RefreshingResolver));
+        assert_eq!(
+            provider.current_api_key().as_deref(),
+            Some("stale-snapshot")
+        );
+        assert_eq!(
+            provider.current_api_key_async().await.as_deref(),
+            Some("refreshed-provider-token")
+        );
+        let credential = provider
+            .current_credential_async()
+            .await
+            .expect("provider credential");
+        assert_eq!(credential.access_token, "refreshed-provider-token");
+        assert_eq!(credential.account_id.as_deref(), Some("provider-account"));
     }
     /// `apply()` and `snapshot()` agree (snapshot==wire invariant) when the
     /// in-memory token is fresh.

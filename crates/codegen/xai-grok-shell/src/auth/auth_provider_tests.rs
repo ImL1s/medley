@@ -18,13 +18,17 @@ async fn provider_bearer_resolver_returns_atomic_codex_credential() {
             ..Default::default()
         },
     );
-    assert!(provider.ensure_fresh_token(None).await.rotated().is_some());
-
     let credential = provider
-        .current_credential()
-        .expect("warm provider cache supplies a structured request credential");
+        .current_credential_async()
+        .await
+        .expect("request-boundary resolution mints a structured credential atomically");
     assert_eq!(credential.access_token, "codex-token");
     assert_eq!(credential.account_id.as_deref(), Some("acct-123"));
+    let cached = provider
+        .current_credential()
+        .expect("request-boundary resolution warms the provider cache");
+    assert_eq!(cached.access_token, "codex-token");
+    assert_eq!(cached.account_id.as_deref(), Some("acct-123"));
 }
 
 #[tokio::test]
