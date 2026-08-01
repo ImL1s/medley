@@ -184,13 +184,11 @@ pub(crate) fn jwt_claim_matches_user_subscription_tier(
     }
 }
 /// ACP `_meta` key for chat+local workspace intent (pager stamps on chat create).
-#[cfg(any(feature = "local-workspace", test))]
+#[cfg(feature = "local-workspace")]
 const LOCAL_WORKSPACE_META_KEY: &str = "x.ai/local_workspace";
-#[cfg(any(feature = "local-workspace", test))]
-const CLOUD_EXISTING_WORKSPACE_META_KEY: &str = "x.ai/cloud_existing_workspace";
 /// True when `_meta` carries a valid chat+local intent object
 /// (`mode` is `"own"` or `"attach"`).
-#[cfg(any(feature = "local-workspace", test))]
+#[cfg(feature = "local-workspace")]
 fn local_workspace_intent_present(meta: Option<&acp::Meta>) -> bool {
     meta.and_then(|m| m.get(LOCAL_WORKSPACE_META_KEY))
         .and_then(|v| v.as_object())
@@ -198,44 +196,6 @@ fn local_workspace_intent_present(meta: Option<&acp::Meta>) -> bool {
         .and_then(|m| m.as_str())
         .is_some_and(|mode| mode == "own" || mode == "attach")
 }
-#[cfg(any(feature = "local-workspace", test))]
-#[derive(Debug, PartialEq, Eq)]
-struct LocalWorkspaceExistingFields {
-    server_id: String,
-    cwd: Option<String>,
-}
-
-#[cfg(any(feature = "local-workspace", test))]
-fn meta_non_empty_str(value: &serde_json::Value, key: &str) -> Option<String> {
-    value
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned)
-}
-
-#[cfg(any(feature = "local-workspace", test))]
-fn parse_local_workspace_existing_fields(
-    meta: Option<&acp::Meta>,
-) -> Option<LocalWorkspaceExistingFields> {
-    let local = meta.and_then(|m| m.get(LOCAL_WORKSPACE_META_KEY))?;
-    let mode = local.get("mode").and_then(|v| v.as_str())?;
-    if mode != "own" && mode != "attach" {
-        return None;
-    }
-    let cloud_existing = meta.and_then(|m| m.get(CLOUD_EXISTING_WORKSPACE_META_KEY));
-    let server_id = meta_non_empty_str(local, "server_id")
-        .or_else(|| cloud_existing.and_then(|w| meta_non_empty_str(w, "server_id")))?;
-    let cwd = meta_non_empty_str(local, "cwd")
-        .or_else(|| cloud_existing.and_then(|w| meta_non_empty_str(w, "cwd")));
-    Some(LocalWorkspaceExistingFields { server_id, cwd })
-}
-
-#[cfg(any(feature = "local-workspace", test))]
-fn local_workspace_server_id_missing(meta: Option<&acp::Meta>) -> bool {
-    local_workspace_intent_present(meta) && parse_local_workspace_existing_fields(meta).is_none()
-}
-
 /// valid local-workspace intent → ExistingWorkspace only.
 ///
 /// `server_id` comes from the intent object, else `cloud_existing_workspace`.
@@ -245,49 +205,32 @@ fn parse_local_workspace_existing(
     meta: Option<&acp::Meta>,
 ) -> Option<crate::gateway_bridge::ComputerSession> {
     use crate::gateway_bridge::ComputerSession;
-    let LocalWorkspaceExistingFields { server_id, cwd } =
-        parse_local_workspace_existing_fields(meta)?;
+    let local = meta.and_then(|m| m.get(LOCAL_WORKSPACE_META_KEY))?;
+    let mode = local.get("mode").and_then(|v| v.as_str())?;
+    if mode != "own" && mode != "attach" {
+        return None;
+    }
+    let server_id = meta_non_empty_str(local, "server_id")
+        .or_else(|| {
+            meta
+                .and_then(|m| m.get(CLOUD_EXISTING_WORKSPACE_META_KEY))
+                .and_then(|w| meta_non_empty_str(w, "server_id"))
+        })?;
+    let cwd = meta_non_empty_str(local, "cwd")
+        .or_else(|| {
+            meta
+                .and_then(|m| m.get(CLOUD_EXISTING_WORKSPACE_META_KEY))
+                .and_then(|w| meta_non_empty_str(w, "cwd"))
+        });
     Some(ComputerSession::ExistingWorkspace {
         server_id,
         cwd,
     })
 }
-#[cfg(feature = "local-workspace")]
-fn parse_session_computer_sessions(
-    meta: Option<&acp::Meta>,
-) -> Option<Vec<crate::gateway_bridge::ComputerSession>> {
-    use crate::gateway_bridge::ComputerSession;
-
-    if local_workspace_intent_present(meta) {
-        return parse_local_workspace_existing(meta).map(|existing| vec![existing]);
-    }
-    meta.and_then(|m| m.get("envId"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|environment_id| !environment_id.trim().is_empty())
-        .map(|environment_id| {
-            vec![ComputerSession::SandboxEnvironment {
-                environment_id: Some(environment_id.to_owned()),
-            }]
-        })
-}
-#[cfg(feature = "local-workspace")]
-fn resolve_session_computer_sessions(
-    meta: Option<&acp::Meta>,
-) -> Result<Option<Vec<crate::gateway_bridge::ComputerSession>>, acp::Error> {
-    if local_workspace_server_id_missing(meta) {
-        return Err(acp::Error::invalid_params().data(serde_json::json!({
-            "code": "local_workspace_server_id_missing",
-            "message": "local workspace intent requires a server_id",
-        })));
-    }
-    Ok(parse_session_computer_sessions(meta))
-}
-#[cfg(not(feature = "local-workspace"))]
 #[allow(dead_code)]
 fn parse_session_computer_sessions(_meta: Option<&acp::Meta>) -> Option<Vec<()>> {
     None
 }
-#[cfg(not(feature = "local-workspace"))]
 fn resolve_session_computer_sessions(
     _meta: Option<&acp::Meta>,
 ) -> Result<Option<Vec<()>>, acp::Error> {

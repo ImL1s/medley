@@ -12,12 +12,7 @@ dhat-heap = ["dep:dhat"]
 # load, and bench tests. Off by default; the tests/benches that use it declare
 # it via `required-features`.
 test-support = []
-# Local Computer Hub workspace_server (own/attach + crash-restart). Requires
-local-workspace = []
-default-bazel = [
-    "local-workspace",
-    "test-support",
-]
+default-bazel = ["test-support"]
 
 [dependencies]
 dunce = { workspace = true }

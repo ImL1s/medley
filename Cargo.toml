@@ -390,6 +390,9 @@ incremental = true
 [profile.bench]
 debug = true
 
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("local-workspace"))'] }
+
 [workspace.lints.clippy]
 # prost 0.14 renders proto doc-comment bullet lists in a way that trips this
 # lint on generated code. Kept in sync with bazel/lint/linters.bzl.
