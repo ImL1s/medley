@@ -1350,7 +1350,8 @@ impl FinalizedToolset {
             capability_policy: CapabilityPolicy::unrestricted(),
         }
     }
-    pub fn local_registry(&self) -> &xai_computer_hub_sdk::LocalRegistry {
+    #[cfg(test)]
+    pub(crate) fn local_registry(&self) -> &xai_computer_hub_sdk::LocalRegistry {
         &self.local_registry
     }
     pub fn capability_policy(&self) -> &CapabilityPolicy {
@@ -3232,6 +3233,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restricted_capability_matrix_finalizes_and_dispatches_with_one_policy() {
+        use xai_tool_types::{
+            SubagentCapabilityMode as Mode, ToolCapabilityDescriptor, ToolEffect,
+        };
+
+        let rows = [
+            (Mode::ReadOnly, vec!["read_file", "search_tool", "use_tool"]),
+            (
+                Mode::ReadWrite,
+                vec!["read_file", "alias_apply_patch", "search_tool", "use_tool"],
+            ),
+            (
+                Mode::Execute,
+                vec!["read_file", "monitor", "search_tool", "use_tool"],
+            ),
+            (
+                Mode::All,
+                vec![
+                    "read_file",
+                    "alias_apply_patch",
+                    "monitor",
+                    "search_tool",
+                    "use_tool",
+                ],
+            ),
+        ];
+
+        for (mode, expected_builtins) in rows {
+            let tmp = TempDir::new().unwrap();
+            let targets = [
+                (
+                    "mcp__read",
+                    Some(ToolCapabilityDescriptor::classified([
+                        ToolEffect::NetworkRead,
+                    ])),
+                ),
+                (
+                    "custom__write",
+                    Some(ToolCapabilityDescriptor::classified([
+                        ToolEffect::ExternalMutation,
+                    ])),
+                ),
+                (
+                    "custom__execute",
+                    Some(ToolCapabilityDescriptor::classified([ToolEffect::Execute])),
+                ),
+                ("opaque__unknown", None),
+            ];
+            let mut trusted = crate::capability::TrustedToolCapabilities::default();
+            for (target, descriptor) in &targets {
+                if let Some(descriptor) = descriptor {
+                    trusted
+                        .insert_classification(
+                            *target,
+                            descriptor.clone(),
+                            crate::types::config_source::ConfigSource::Builtin,
+                        )
+                        .unwrap();
+                }
+            }
+            let policy = CapabilityPolicy::new(mode, trusted);
+            let mut aliased_write = ToolConfig::for_tool::<codex::apply_patch::ApplyPatchTool>();
+            aliased_write.name_override = Some("alias_apply_patch".into());
+            let toolset = Arc::new(
+                ToolRegistryBuilder::new()
+                    .with_capability_policy(policy)
+                    .finalize(
+                        ToolServerConfig {
+                            tools: vec![
+                                ToolConfig::for_tool::<grok_build::ReadFileTool>(),
+                                aliased_write,
+                                ToolConfig::for_tool::<grok_build::MonitorTool>(),
+                                ToolConfig::for_tool::<
+                                    crate::implementations::search_tool::SearchTool,
+                                >(),
+                                ToolConfig::for_tool::<crate::implementations::use_tool::UseTool>(),
+                            ],
+                            behavior_preset: None,
+                        },
+                        test_session_context(&tmp),
+                    )
+                    .expect("policy-filtered built-ins should finalize"),
+            );
+            let builtin_names: Vec<String> = toolset
+                .tool_definitions()
+                .into_iter()
+                .map(|definition| definition.function.name)
+                .collect();
+            assert_eq!(builtin_names, expected_builtins, "mode {mode:?}");
+
+            for (target, descriptor) in &targets {
+                let expected_allowed = descriptor
+                    .as_ref()
+                    .is_some_and(|descriptor| mode.allows_tool_capability(descriptor))
+                    || (descriptor.is_none() && mode == Mode::All);
+                let registration = toolset.register_tool(
+                    (*target).to_owned(),
+                    FakeMcpTool {
+                        id: (*target).into(),
+                        description: format!("{target} test target"),
+                    },
+                    None,
+                );
+                assert_eq!(
+                    registration.is_ok(),
+                    expected_allowed,
+                    "{mode:?} / {target}"
+                );
+                if expected_allowed {
+                    let output = toolset
+                        .call(
+                            target,
+                            serde_json::json!({}),
+                            &format!("direct-{target}"),
+                            None,
+                        )
+                        .await
+                        .expect("authorized dynamic target should dispatch");
+                    assert!(matches!(output.output, ToolOutput::Text(_)));
+                }
+            }
+
+            let forwarded = toolset
+                .call(
+                    "use_tool",
+                    serde_json::json!({
+                        "tool_name": "mcp__read",
+                        "tool_input": {}
+                    }),
+                    "forward-read",
+                    None,
+                )
+                .await
+                .expect("zero-effect wrapper should forward to an authorized exact target");
+            assert_eq!(forwarded.effective_tool_name.as_deref(), Some("mcp__read"));
+        }
+    }
+
+    #[tokio::test]
     async fn dynamic_registration_requires_trusted_exact_id_capability() {
         let tmp = TempDir::new().unwrap();
         let toolset = ToolRegistryBuilder::new()
@@ -3357,61 +3497,6 @@ mod tests {
             &registry.find(&registry_id).expect("original remains")
         ));
         assert!(toolset.tool_definitions().is_empty());
-    }
-
-    #[tokio::test]
-    async fn nested_use_tool_dispatch_rechecks_target_capability() {
-        let tmp = TempDir::new().unwrap();
-        let use_tool_config = ToolConfig::for_tool::<crate::implementations::use_tool::UseTool>();
-        let mut toolset = ToolRegistryBuilder::new()
-            .finalize(
-                ToolServerConfig {
-                    tools: vec![use_tool_config.clone()],
-                    behavior_preset: None,
-                },
-                test_session_context(&tmp),
-            )
-            .unwrap();
-        toolset
-            .register_tool(
-                "malicious__opaque".to_owned(),
-                FakeMcpTool {
-                    id: "malicious__opaque".into(),
-                    description: "mutates an external system".into(),
-                },
-                None,
-            )
-            .unwrap();
-
-        // Model a toolset that survived a policy/config refresh. The wrapper
-        // itself is explicitly audited, but its unclassified target is not.
-        let mut trusted = crate::capability::TrustedToolCapabilities::default();
-        trusted
-            .insert_unclassified_override(
-                use_tool_config.id,
-                crate::capability::UnclassifiedToolOverride {
-                    modes: vec![xai_tool_types::SubagentCapabilityMode::ReadOnly],
-                    reason: "audited wrapper; targets still require their own capability".into(),
-                    source: crate::types::config_source::ConfigSource::Builtin,
-                },
-            )
-            .unwrap();
-        toolset.capability_policy =
-            CapabilityPolicy::new(xai_tool_types::SubagentCapabilityMode::ReadOnly, trusted);
-
-        let error = Arc::new(toolset)
-            .call(
-                "use_tool",
-                serde_json::json!({
-                    "tool_name": "malicious__opaque",
-                    "tool_input": {}
-                }),
-                "call-restricted-wrapper",
-                None,
-            )
-            .await
-            .expect_err("nested dispatch must not bypass the target capability gate");
-        assert!(error.to_string().contains("not permitted"), "{error}");
     }
 
     #[tokio::test]

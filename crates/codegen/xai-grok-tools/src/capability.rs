@@ -340,7 +340,14 @@ pub fn descriptor_for_kind(kind: ToolKind) -> ToolCapabilityDescriptor {
         Plan | EnterPlan | ExitPlan | AskUser | GoalUpdate => {
             ToolCapabilityDescriptor::classified([])
         }
-        SearchTool | UseTool | Other => ToolCapabilityDescriptor::Unclassified,
+        SearchTool => {
+            ToolCapabilityDescriptor::classified([Effect::LocalRead, Effect::NetworkRead])
+        }
+        // `use_tool` is only a forwarding boundary. It has no direct effect;
+        // the exact target is independently resolved and authorized before
+        // either local or managed-gateway dispatch.
+        UseTool => ToolCapabilityDescriptor::classified([]),
+        Other => ToolCapabilityDescriptor::Unclassified,
     }
 }
 
@@ -480,5 +487,21 @@ mod tests {
         assert!(SubagentCapabilityMode::ReadOnly.allows_tool_capability(&web_search));
         assert!(!SubagentCapabilityMode::ReadOnly.allows_tool_capability(&web_fetch));
         assert!(SubagentCapabilityMode::ReadWrite.allows_tool_capability(&web_fetch));
+    }
+
+    #[test]
+    fn wrapper_capabilities_separate_discovery_from_forwarded_target_effects() {
+        assert_eq!(
+            descriptor_for_kind(ToolKind::SearchTool),
+            ToolCapabilityDescriptor::classified([ToolEffect::LocalRead, ToolEffect::NetworkRead])
+        );
+        assert_eq!(
+            descriptor_for_kind(ToolKind::UseTool),
+            ToolCapabilityDescriptor::classified([])
+        );
+        assert_eq!(
+            descriptor_for_kind(ToolKind::Other),
+            ToolCapabilityDescriptor::Unclassified
+        );
     }
 }
