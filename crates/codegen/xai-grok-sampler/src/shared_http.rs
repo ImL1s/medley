@@ -18,6 +18,8 @@ use std::time::Duration;
 
 static SHARED_H2: OnceLock<reqwest::Client> = OnceLock::new();
 static SHARED_HTTP1: OnceLock<reqwest::Client> = OnceLock::new();
+static SHARED_NO_REDIRECT_H2: OnceLock<reqwest::Client> = OnceLock::new();
+static SHARED_NO_REDIRECT_HTTP1: OnceLock<reqwest::Client> = OnceLock::new();
 
 /// Kill switch: `GROK_SAMPLER_SHARED_CLIENT=0` (or `false`, any case)
 /// restores the old behavior of building a fresh `reqwest::Client` per
@@ -67,6 +69,23 @@ pub(crate) fn client_http1() -> Result<reqwest::Client, reqwest::Error> {
     shared(&SHARED_HTTP1, build_http_client_http1, sharing_disabled())
 }
 
+/// Sampling client for authenticated transports that must not follow redirects.
+pub(crate) fn client_no_redirect(force_http1: bool) -> Result<reqwest::Client, reqwest::Error> {
+    if force_http1 {
+        shared(
+            &SHARED_NO_REDIRECT_HTTP1,
+            build_http_client_http1_no_redirect,
+            sharing_disabled(),
+        )
+    } else {
+        shared(
+            &SHARED_NO_REDIRECT_H2,
+            build_http_client_no_redirect,
+            sharing_disabled(),
+        )
+    }
+}
+
 /// Build a `reqwest::Client` for sampling with HTTP/2 + connection pooling.
 /// Env knobs are read once, when the shared client is first built.
 fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
@@ -97,6 +116,34 @@ fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
     .build()
 }
 
+fn build_http_client_no_redirect() -> Result<reqwest::Client, reqwest::Error> {
+    let pool_max_idle: usize = std::env::var("GROK_POOL_MAX_IDLE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
+    let pool_idle_timeout_secs: u64 = std::env::var("GROK_POOL_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(90);
+    let connect_timeout_secs: u64 = std::env::var("GROK_CONNECT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+
+    xai_grok_extra_ca::with_extra_root_certificates(
+        reqwest::Client::builder()
+            .pool_max_idle_per_host(pool_max_idle)
+            .pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs))
+            .connect_timeout(Duration::from_secs(connect_timeout_secs))
+            .tcp_nodelay(true)
+            .http2_keep_alive_interval(Duration::from_secs(15))
+            .http2_keep_alive_timeout(Duration::from_secs(5))
+            .http2_keep_alive_while_idle(true)
+            .redirect(reqwest::redirect::Policy::none()),
+    )
+    .build()
+}
+
 /// Build a `reqwest::Client` constrained to HTTP/1.1 with pooling disabled.
 /// Used as a fallback after HTTP/2 transport failures.
 fn build_http_client_http1() -> Result<reqwest::Client, reqwest::Error> {
@@ -116,12 +163,30 @@ fn build_http_client_http1() -> Result<reqwest::Client, reqwest::Error> {
     .build()
 }
 
+fn build_http_client_http1_no_redirect() -> Result<reqwest::Client, reqwest::Error> {
+    let connect_timeout_secs: u64 = std::env::var("GROK_CONNECT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+
+    xai_grok_extra_ca::with_extra_root_certificates(
+        reqwest::Client::builder()
+            .pool_max_idle_per_host(0)
+            .pool_idle_timeout(Duration::from_secs(0))
+            .connect_timeout(Duration::from_secs(connect_timeout_secs))
+            .tcp_nodelay(true)
+            .http1_only()
+            .redirect(reqwest::redirect::Policy::none()),
+    )
+    .build()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::shared;
+    use super::{build_http_client_no_redirect, shared};
 
     static BUILD_CALLS: AtomicUsize = AtomicUsize::new(0);
 
@@ -156,5 +221,35 @@ mod tests {
             CELL.get().is_none(),
             "disabled mode must never touch the cell"
         );
+    }
+
+    #[tokio::test]
+    async fn no_redirect_client_returns_redirect_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let address = listener.local_addr().expect("loopback address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = [0_u8; 2048];
+            let _ = socket.read(&mut request).await.expect("read request");
+            socket
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: https://example.invalid/leak\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write redirect");
+        });
+
+        let response = build_http_client_no_redirect()
+            .expect("build no-redirect client")
+            .get(format!("http://{address}/redirect"))
+            .send()
+            .await
+            .expect("receive redirect response");
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        server.await.expect("server task");
     }
 }

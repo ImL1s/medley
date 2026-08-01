@@ -4,6 +4,17 @@ use super::config::{ConfigModelOverride, EnvKeys};
 use super::config_model_override_parse::{ConfigWarning, ConfigWarningKind};
 use crate::sampling::ApiBackend;
 
+/// Reserved first-party provider profile for ChatGPT Codex OAuth traffic.
+pub const OPENAI_CODEX_PROVIDER_ID: &str = "openai-codex";
+
+fn openai_codex_provider() -> ModelProviderConfig {
+    ModelProviderConfig {
+        base_url: Some(crate::auth::openai_codex::CODEX_API_BASE_URL.to_owned()),
+        api_backend: Some(ApiBackend::CodexResponses),
+        ..ModelProviderConfig::default()
+    }
+}
+
 #[derive(Clone, Default, serde::Deserialize)]
 #[serde(default)]
 pub struct ModelProviderConfig {
@@ -90,6 +101,7 @@ pub(crate) fn parse_model_providers(
     raw_config: &toml::Value,
 ) -> (IndexMap<String, ModelProviderConfig>, Vec<ConfigWarning>) {
     let mut providers = IndexMap::new();
+    providers.insert(OPENAI_CODEX_PROVIDER_ID.to_owned(), openai_codex_provider());
     let mut warnings = Vec::new();
     let Some(section) = raw_config.get("model_providers") else {
         return (providers, warnings);
@@ -106,6 +118,15 @@ pub(crate) fn parse_model_providers(
         return (providers, warnings);
     };
     for (id, value) in table {
+        if id == OPENAI_CODEX_PROVIDER_ID {
+            warnings.push(ConfigWarning::model_provider(
+                id,
+                None,
+                ConfigWarningKind::ConflictingFields,
+                "reserved built-in provider; user configuration ignored".to_owned(),
+            ));
+            continue;
+        }
         let mut unknown = Vec::new();
         match serde_ignored::deserialize::<_, _, ModelProviderConfig>(value.clone(), |path| {
             unknown.push(path.to_string());
@@ -553,7 +574,8 @@ mod tests {
         let raw_config: toml::Value = toml::from_str(r#"model_providers = "oops""#).unwrap();
         let cfg = Config::new_from_toml_cfg(&raw_config)
             .expect("a non-table model_providers must not fail the config");
-        assert!(cfg.model_providers.is_empty());
+        assert_eq!(cfg.model_providers.len(), 1);
+        assert!(cfg.model_providers.contains_key(OPENAI_CODEX_PROVIDER_ID));
         assert!(
             cfg.config_warnings.iter().any(|w| {
                 matches!(w.target, WarningTarget::ModelProviderSection)
@@ -1053,6 +1075,225 @@ mod tests {
                 .map(String::as_str),
             Some("model"),
             "a model that sets its own query params inherits none of the provider's"
+        );
+    }
+
+    #[test]
+    fn openai_codex_is_reserved_and_cannot_be_overridden() {
+        let toml_cfg: toml::Value = toml::from_str(
+            r#"
+            [model_providers.openai-codex]
+            base_url = "https://attacker.invalid/v1"
+            api_key = "must-not-survive"
+
+            [model.codex]
+            model = "supported-codex-model"
+            model_provider = "openai-codex"
+            base_url = "https://attacker.invalid/model"
+            api_base_url = "https://api.openai.com/v1"
+            api_key = "platform-key-must-not-survive"
+            env_key = "OPENAI_API_KEY"
+            api_backend = "responses"
+
+            [model.codex.extra_headers]
+            X-Grok-User-Id = "must-not-survive"
+            "#,
+        )
+        .unwrap();
+
+        let cfg = Config::new_from_toml_cfg(&toml_cfg).expect("config should parse");
+        let provider = cfg
+            .model_providers
+            .get(OPENAI_CODEX_PROVIDER_ID)
+            .expect("built-in provider remains registered");
+        assert_eq!(
+            provider.base_url.as_deref(),
+            Some(crate::auth::openai_codex::CODEX_API_BASE_URL)
+        );
+        assert_eq!(provider.api_backend, Some(ApiBackend::CodexResponses));
+        assert!(provider.api_key.is_none());
+        assert!(cfg.config_warnings.iter().any(|warning| {
+            matches!(
+                &warning.target,
+                crate::agent::config_model_override_parse::WarningTarget::ModelProvider {
+                    id,
+                    field: None,
+                } if id == OPENAI_CODEX_PROVIDER_ID
+            )
+        }));
+
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved.get("codex").expect("Codex model should exist");
+        assert_eq!(
+            model.info.base_url,
+            crate::auth::openai_codex::CODEX_API_BASE_URL
+        );
+        assert_eq!(model.info.api_backend, ApiBackend::CodexResponses);
+        assert_eq!(model.info.auth_scheme, xai_grok_sampler::AuthScheme::Bearer);
+        assert!(model.api_base_url.is_none());
+        assert!(model.api_key.is_none());
+        assert!(model.env_key.is_none());
+        assert!(model.info.extra_headers.is_empty());
+        assert_eq!(
+            model
+                .auth_provider
+                .as_ref()
+                .map(|provider| provider.name.as_str()),
+            Some(OPENAI_CODEX_PROVIDER_ID)
+        );
+    }
+
+    #[test]
+    fn direct_openai_codex_auth_provider_cannot_authenticate_a_custom_origin() {
+        let toml_cfg: toml::Value = toml::from_str(
+            r#"
+            [model.exfiltration]
+            model = "attacker-model"
+            base_url = "https://attacker.invalid/v1"
+            api_backend = "responses"
+            auth_provider = "openai-codex"
+            "#,
+        )
+        .unwrap();
+
+        let cfg = Config::new_from_toml_cfg(&toml_cfg).expect("config should parse");
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved
+            .get("exfiltration")
+            .expect("custom model should remain visible but fail closed");
+        assert!(
+            !model.config_validation_errors.is_empty(),
+            "the reserved native provider must require model_provider provenance"
+        );
+        assert!(
+            model
+                .auth_provider
+                .as_ref()
+                .is_some_and(crate::auth::AuthProviderRef::is_fail_closed)
+        );
+
+        let credentials = resolve_credentials(model, Some("ambient-xai-session"));
+        assert_eq!(credentials.api_key, None);
+        let sampler = crate::agent::config::sampling_config_for_model(
+            model,
+            credentials,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(sampler.base_url, "https://attacker.invalid/v1");
+        assert_eq!(sampler.auth_scheme, xai_grok_sampler::AuthScheme::None);
+        assert!(sampler.api_key.is_none());
+        assert!(sampler.bearer_resolver.is_none());
+
+        let temp = tempfile::tempdir().expect("temporary auth home");
+        let manager = std::sync::Arc::new(crate::auth::AuthManager::new_openai_codex(temp.path()));
+        manager.hot_swap(crate::auth::GrokAuth {
+            key: "native-codex-secret".to_owned(),
+            auth_mode: crate::auth::AuthMode::OpenAiCodex,
+            ..crate::auth::GrokAuth::default()
+        });
+        let live_native_provider = crate::auth::AuthProviderRef::openai_codex(manager);
+        assert_eq!(
+            live_native_provider.cached_token().as_deref(),
+            Some("native-codex-secret")
+        );
+        let mut custom_entry = model.clone();
+        custom_entry.config_validation_errors.clear();
+        custom_entry.auth_provider = Some(live_native_provider);
+        let prefetched = IndexMap::from([("custom-native-ref".to_owned(), custom_entry)]);
+        let isolated = resolve_model_list(&Config::default(), Some(prefetched));
+        let isolated = &isolated["custom-native-ref"];
+        assert!(
+            isolated
+                .auth_provider
+                .as_ref()
+                .is_some_and(crate::auth::AuthProviderRef::is_fail_closed)
+        );
+        assert_eq!(
+            resolve_credentials(isolated, None).api_key,
+            None,
+            "even a live native Codex token is detached from a custom-origin entry"
+        );
+    }
+
+    #[test]
+    fn openai_codex_model_without_a_live_credential_is_unready() {
+        let toml_cfg: toml::Value = toml::from_str(
+            r#"
+            [model.codex]
+            model = "supported-codex-model"
+            model_provider = "openai-codex"
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&toml_cfg).expect("config should parse");
+        let mut resolved = resolve_model_list(&cfg, None);
+        let model = resolved.get_mut("codex").expect("Codex model should exist");
+        let temp = tempfile::tempdir().expect("temporary auth home");
+        model.auth_provider = Some(crate::auth::AuthProviderRef::openai_codex(
+            crate::auth::openai_codex::manager(temp.path()),
+        ));
+
+        let (ready, reason) = crate::agent::config::model_readiness(model);
+        assert!(!ready);
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("login"))
+        );
+        assert!(
+            resolve_credentials(model, Some("xai-session-token"))
+                .api_key
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn expired_refreshable_openai_codex_credential_stays_selectable() {
+        let toml_cfg: toml::Value = toml::from_str(
+            r#"
+            [model.codex]
+            model = "supported-codex-model"
+            model_provider = "openai-codex"
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&toml_cfg).expect("config should parse");
+        let mut resolved = resolve_model_list(&cfg, None);
+        let model = resolved.get_mut("codex").expect("Codex model should exist");
+
+        let temp = tempfile::tempdir().expect("temporary auth home");
+        let auth = crate::auth::GrokAuth {
+            key: "expired-access-token".to_owned(),
+            auth_mode: crate::auth::AuthMode::OpenAiCodex,
+            refresh_token: Some("rotating-refresh-token".to_owned()),
+            expires_at: Some(chrono::Utc::now() - chrono::Duration::minutes(1)),
+            oidc_issuer: Some(crate::auth::openai_codex::ISSUER.to_owned()),
+            oidc_client_id: Some(crate::auth::openai_codex::CLIENT_ID.to_owned()),
+            account_id: Some("account-id".to_owned()),
+            ..crate::auth::GrokAuth::default()
+        };
+        let auth_map = std::collections::HashMap::from([(
+            crate::auth::openai_codex::AUTH_SCOPE.to_owned(),
+            auth,
+        )]);
+        std::fs::write(
+            temp.path().join("auth.json"),
+            serde_json::to_vec(&auth_map).unwrap(),
+        )
+        .unwrap();
+        model.auth_provider = Some(crate::auth::AuthProviderRef::openai_codex(
+            crate::auth::openai_codex::manager(temp.path()),
+        ));
+
+        assert_eq!(crate::agent::config::model_readiness(model), (true, None));
+        assert!(
+            resolve_credentials(model, Some("xai-session-token"))
+                .api_key
+                .is_none(),
+            "an expired Codex bearer must refresh pre-turn, never fall back to xAI"
         );
     }
 }

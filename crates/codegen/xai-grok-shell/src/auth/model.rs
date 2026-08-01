@@ -37,6 +37,8 @@ pub enum AuthMode {
     External,
     /// Plain API key (e.g. from grok-desktop login or `grok login --api-key`)
     ApiKey,
+    /// Native OpenAI Codex OAuth credential, scoped independently from xAI.
+    OpenAiCodex,
 }
 
 /// Wire value of `principal_type` for team OAuth principals (capitalized by
@@ -104,6 +106,17 @@ pub struct GrokAuth {
     /// OIDC client_id used to obtain this token (needed for refresh).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oidc_client_id: Option<String>,
+
+    /// OAuth id_token retained for account metadata refresh. Never sent as the
+    /// API bearer and never included in Debug output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_token: Option<String>,
+
+    /// ChatGPT account/workspace id used only for the allowlisted Codex header.
+    /// Extracted from an unverified JWT as a compatibility hint; the service
+    /// remains authoritative for access control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
 }
 
 impl std::fmt::Debug for GrokAuth {
@@ -116,6 +129,8 @@ impl std::fmt::Debug for GrokAuth {
             .field("refresh_token_present", &self.refresh_token.is_some())
             .field("oidc_issuer_present", &self.oidc_issuer.is_some())
             .field("oidc_client_id_present", &self.oidc_client_id.is_some())
+            .field("id_token_present", &self.id_token.is_some())
+            .field("account_id_present", &self.account_id.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -145,7 +160,7 @@ impl GrokAuth {
                 .oidc_issuer
                 .as_deref()
                 .is_some_and(is_xai_oauth2_issuer),
-            AuthMode::ApiKey | AuthMode::WebLogin => false,
+            AuthMode::ApiKey | AuthMode::WebLogin | AuthMode::OpenAiCodex => false,
         }
     }
 
@@ -164,7 +179,7 @@ impl GrokAuth {
         match self.auth_mode {
             AuthMode::WebLogin | AuthMode::Oidc => true,
             AuthMode::External => self.is_xai_auth(),
-            AuthMode::ApiKey => false,
+            AuthMode::ApiKey | AuthMode::OpenAiCodex => false,
         }
     }
 
@@ -232,6 +247,8 @@ impl Default for GrokAuth {
             expires_at: None,
             oidc_issuer: None,
             oidc_client_id: None,
+            id_token: None,
+            account_id: None,
         }
     }
 }
@@ -407,6 +424,8 @@ mod tests {
             expires_at: None,
             oidc_issuer: None,
             oidc_client_id: None,
+            id_token: None,
+            account_id: None,
         }
     }
 

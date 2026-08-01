@@ -1,3 +1,4 @@
+use crate::types::SharedApiKeyProvider;
 use indexmap::IndexMap;
 
 /// Configuration for the web search tool.
@@ -17,6 +18,10 @@ pub enum WebSearchConfig {
         extra_headers: IndexMap<String, String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         alpha_test_key: Option<String>,
+        /// Optional provider scoped to this web-search model. Runtime-only:
+        /// deserialized configs continue to use the caller's default provider.
+        #[serde(skip)]
+        api_key_provider: Option<SharedApiKeyProvider>,
     },
 }
 
@@ -30,6 +35,7 @@ impl std::fmt::Debug for WebSearchConfig {
                 model,
                 extra_headers,
                 alpha_test_key,
+                api_key_provider,
             } => f
                 .debug_struct("WebSearchConfig::Enabled")
                 .field("api_key_present", &!api_key.is_empty())
@@ -37,6 +43,7 @@ impl std::fmt::Debug for WebSearchConfig {
                 .field("model_present", &!model.is_empty())
                 .field("extra_headers_present", &!extra_headers.is_empty())
                 .field("alpha_test_key_present", &alpha_test_key.is_some())
+                .field("provider_scoped", &api_key_provider.is_some())
                 .finish(),
         }
     }
@@ -66,6 +73,7 @@ impl WebSearchConfig {
                 model: model.clone(),
                 extra_headers: extra_headers.clone(),
                 alpha_test_key: None,
+                api_key_provider: None,
             },
         }
     }
@@ -89,6 +97,7 @@ mod tests {
             model: "test-web-search-model".to_string(),
             extra_headers: IndexMap::new(),
             alpha_test_key: None,
+            api_key_provider: None,
         };
         assert!(config.is_enabled());
     }
@@ -103,6 +112,7 @@ mod tests {
             model: "test-web-search-model".to_string(),
             extra_headers: headers,
             alpha_test_key: Some("alpha-secret".to_string()),
+            api_key_provider: None,
         };
         let redacted = config.redacted();
         match redacted {
@@ -112,12 +122,14 @@ mod tests {
                 model,
                 extra_headers,
                 alpha_test_key,
+                api_key_provider,
             } => {
                 assert_eq!(api_key, "***REDACTED***");
                 assert_eq!(base_url, "https://api.x.ai/v1");
                 assert_eq!(model, "test-web-search-model");
                 assert_eq!(extra_headers.get("X-Custom").unwrap(), "value");
                 assert!(alpha_test_key.is_none());
+                assert!(api_key_provider.is_none());
             }
             _ => panic!("Expected Enabled variant"),
         }
@@ -132,6 +144,7 @@ mod tests {
             model: "test-web-search-model".to_string(),
             extra_headers: IndexMap::from([("Authorization".to_string(), sentinel.to_string())]),
             alpha_test_key: Some(sentinel.to_string()),
+            api_key_provider: None,
         };
         let rendered = format!("{config:?}");
         assert!(!rendered.contains(sentinel));

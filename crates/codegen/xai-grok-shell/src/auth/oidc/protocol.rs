@@ -257,6 +257,8 @@ pub(super) fn build_grok_auth(
         expires_at: tokens.expires_in.map(|s| now + Duration::seconds(s as i64)),
         oidc_issuer: Some(issuer.to_owned()),
         oidc_client_id: Some(client_id.to_owned()),
+        id_token: None,
+        account_id: None,
     }
 }
 #[derive(Debug, Clone, Deserialize)]

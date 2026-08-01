@@ -13,6 +13,7 @@
 //! This is distinct from the `AuthCredentialProvider` HTTP consumers in
 //! [`crate::auth::credential_provider`].
 
+use super::AuthManager;
 use super::token_output::{expiry_after_seconds, parse_token_output};
 
 /// One named `[auth_provider.<name>]` table, honored only from the trusted
@@ -66,6 +67,9 @@ pub struct AuthProviderRef {
     /// joins the shared slot for its name.
     resolved: bool,
     fail_closed: bool,
+    /// Built-in native provider. Skipped by serde and reattached from trusted
+    /// configuration after deserialization, like the command config above.
+    native_codex: Option<std::sync::Arc<AuthManager>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -105,6 +109,7 @@ impl AuthProviderRef {
             slot,
             resolved: true,
             fail_closed: false,
+            native_codex: None,
         }
     }
 
@@ -117,6 +122,7 @@ impl AuthProviderRef {
             slot: ProviderSlot::default(),
             resolved: false,
             fail_closed: false,
+            native_codex: None,
         }
     }
 
@@ -127,6 +133,7 @@ impl AuthProviderRef {
             slot: ProviderSlot::default(),
             resolved: true,
             fail_closed: true,
+            native_codex: None,
         }
     }
 
@@ -144,6 +151,72 @@ impl AuthProviderRef {
         self.config = config.cloned().unwrap_or_default();
         self.slot = provider_slot(&self.name);
         self.resolved = true;
+        self.native_codex = None;
+    }
+
+    /// Attach the built-in provider-scoped Codex credential manager.
+    pub fn attach_openai_codex(&mut self, manager: std::sync::Arc<AuthManager>) {
+        self.config = AuthProviderConfig::default();
+        self.slot = ProviderSlot::default();
+        self.resolved = true;
+        self.fail_closed = false;
+        self.native_codex = Some(manager);
+    }
+
+    /// Construct a resolved native Codex provider reference.
+    pub fn openai_codex(manager: std::sync::Arc<AuthManager>) -> Self {
+        let mut provider = Self::unresolved("openai-codex".to_owned());
+        provider.attach_openai_codex(manager);
+        provider
+    }
+
+    /// Dynamic sampler resolver over this provider's atomic credential view.
+    pub(crate) fn bearer_resolver(&self) -> xai_grok_sampler::SharedBearerResolver {
+        std::sync::Arc::new(self.clone())
+    }
+}
+
+impl xai_grok_sampler::BearerResolver for AuthProviderRef {
+    fn current_bearer(&self) -> Option<String> {
+        self.cached_token()
+    }
+
+    fn current_credential(&self) -> Option<xai_grok_sampler::config::ProviderCredentialSnapshot> {
+        self.cached_credential().map(|credential| {
+            xai_grok_sampler::config::ProviderCredentialSnapshot {
+                access_token: credential.access_token,
+                account_id: credential.account_id,
+            }
+        })
+    }
+
+    fn current_credential_async(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Option<xai_grok_sampler::config::ProviderCredentialSnapshot>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let current = self.cached_token();
+            let _ = self.ensure_fresh_token(current.as_deref()).await;
+            self.cached_credential().map(|credential| {
+                xai_grok_sampler::config::ProviderCredentialSnapshot {
+                    access_token: credential.access_token,
+                    account_id: credential.account_id,
+                }
+            })
+        })
+    }
+
+    fn recover_rejected_credential_async<'a>(
+        &'a self,
+        rejected_bearer: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move { self.recover_rejected_token(rejected_bearer).await.is_some() })
     }
 }
 
@@ -163,6 +236,7 @@ impl std::fmt::Debug for AuthProviderRef {
             .field("name", &self.name)
             .field("config", &self.config)
             .field("resolved", &self.resolved)
+            .field("native_codex", &self.native_codex.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -174,6 +248,8 @@ struct MintedProviderToken {
     /// Drives the 401 fresh-mint guard.
     minted_at: std::time::Instant,
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    account_id: Option<String>,
+    issuer: Option<String>,
     /// The table version that minted the token; a different version reads as
     /// stale (see [`token_identity`]), so edits re-mint.
     minted_with: AuthProviderConfig,
@@ -447,8 +523,31 @@ async fn mint_provider_token(
         refresh_token: parsed.refresh_token,
         minted_at: std::time::Instant::now(),
         expires_at,
+        account_id: parsed.account_id,
+        issuer: parsed.issuer,
         minted_with: config.clone(),
     })
+}
+
+/// Atomic request-time credential view. Only these allowlisted fields cross
+/// the provider boundary; refresh tokens and id_tokens never do.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderCredentialSnapshot {
+    pub access_token: String,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub account_id: Option<String>,
+    pub issuer: Option<String>,
+}
+
+impl std::fmt::Debug for ProviderCredentialSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderCredentialSnapshot")
+            .field("access_token_present", &!self.access_token.is_empty())
+            .field("expires_at", &self.expires_at)
+            .field("account_id_present", &self.account_id.is_some())
+            .field("issuer_present", &self.issuer.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -480,7 +579,7 @@ impl AuthProviderRef {
     async fn locked_slot(
         &self,
     ) -> Option<tokio::sync::OwnedMutexGuard<Option<MintedProviderToken>>> {
-        if !self.resolved {
+        if !self.resolved || self.native_codex.is_some() {
             return None;
         }
         let mut slot = self.slot.clone().lock_owned().await;
@@ -503,8 +602,23 @@ impl AuthProviderRef {
     /// mutates. `None` for an unresolved ref, a cold or stale cache, or a mint
     /// in progress; minting happens pre-turn via [`AuthProviderRef::ensure_fresh_token`].
     pub(crate) fn cached_token(&self) -> Option<String> {
+        self.cached_credential()
+            .map(|credential| credential.access_token)
+    }
+
+    /// Cache-only atomic access-token/account snapshot for request assembly.
+    pub fn cached_credential(&self) -> Option<ProviderCredentialSnapshot> {
         if !self.resolved {
             return None;
+        }
+        if let Some(manager) = &self.native_codex {
+            let auth = manager.current()?;
+            return Some(ProviderCredentialSnapshot {
+                access_token: auth.key,
+                expires_at: auth.expires_at,
+                account_id: auth.account_id,
+                issuer: auth.oidc_issuer,
+            });
         }
         if !self.config.is_usable() {
             if !self.fail_closed {
@@ -521,7 +635,19 @@ impl AuthProviderRef {
         guard
             .as_ref()
             .filter(|m| !minted_token_is_stale(m, &self.config))
-            .map(|m| m.token.clone())
+            .map(|m| ProviderCredentialSnapshot {
+                access_token: m.token.clone(),
+                expires_at: m.expires_at,
+                account_id: m.account_id.clone(),
+                issuer: m.issuer.clone(),
+            })
+    }
+
+    /// Read-only readiness state for the built-in Codex provider.
+    pub fn openai_codex_status(&self) -> Option<crate::auth::openai_codex::CodexAuthStatus> {
+        self.native_codex
+            .as_deref()
+            .map(crate::auth::openai_codex::status)
     }
 
     /// The token that should replace `current_key` on the wire: serves the
@@ -532,6 +658,18 @@ impl AuthProviderRef {
         &self,
         current_key: Option<&str>,
     ) -> ProviderRefreshOutcome {
+        if let Some(manager) = &self.native_codex {
+            return match manager.auth().await {
+                Ok(auth) if current_key == Some(auth.key.as_str()) => {
+                    ProviderRefreshOutcome::Unchanged
+                }
+                Ok(auth) => ProviderRefreshOutcome::Rotated(auth.key),
+                Err(error) => {
+                    tracing::warn!(error = %error, "native Codex auth unavailable");
+                    ProviderRefreshOutcome::MintFailed
+                }
+            };
+        }
         let Some(mut slot) = self.locked_slot().await else {
             return ProviderRefreshOutcome::Unusable;
         };
@@ -567,6 +705,21 @@ impl AuthProviderRef {
     /// under the current table (the fresh-mint guard, which an edited table
     /// bypasses).
     pub(crate) async fn recover_rejected_token(&self, rejected_key: &str) -> Option<String> {
+        if let Some(manager) = &self.native_codex {
+            let current = manager.current_or_expired()?;
+            if current.key != rejected_key {
+                return Some(current.key);
+            }
+            let token_type = crate::auth::token_type::TokenType::from_auth(Some(&current));
+            return manager
+                .refresh_chain(
+                    token_type,
+                    crate::auth::manager::RefreshReason::ServerRejected,
+                )
+                .await
+                .ok()
+                .map(|auth| auth.key);
+        }
         let mut slot = self.locked_slot().await?;
         if let Some(ref minted) = *slot {
             if minted.token != rejected_key && !minted_token_is_stale(minted, &self.config) {

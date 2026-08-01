@@ -1,6 +1,7 @@
 use crate::agent::auth_method::ModelByok;
 use crate::agent::model_providers::{
-    ModelProviderConfig, auth_config_issues, model_provider_auth_name, parse_model_providers,
+    ModelProviderConfig, OPENAI_CODEX_PROVIDER_ID, auth_config_issues, model_provider_auth_name,
+    parse_model_providers,
 };
 use crate::auth::{AuthManager, GrokComConfig, OidcAuthConfig};
 use crate::remote::DEFAULT_CONTEXT_WINDOW;
@@ -3730,6 +3731,7 @@ pub fn resolve_model_list(
     prefetched: Option<IndexMap<String, ModelEntry>>,
 ) -> IndexMap<String, ModelEntry> {
     let mut resolved: IndexMap<String, ModelEntry> = IndexMap::new();
+    let mut canonical_codex_models = std::collections::HashSet::new();
     if cfg.endpoints.has_custom_endpoint() {
         tracing::info!(
             models_base_url_configured = cfg.endpoints.models_base_url.is_some(),
@@ -3795,6 +3797,25 @@ pub fn resolve_model_list(
         });
         let effective = with_provider.as_ref().unwrap_or(model_override);
         let mut entry = effective.apply(key, base, &cfg.endpoints);
+        if model_override.model_provider.as_deref() == Some(OPENAI_CODEX_PROVIDER_ID) {
+            // This is a fixed security profile, not a configurable generic
+            // Responses endpoint. A model may supply metadata and its routing
+            // slug, but cannot carry an API key, xAI session fallback, custom
+            // endpoint, or user-controlled headers into Codex traffic.
+            entry.info.base_url = crate::auth::openai_codex::CODEX_API_BASE_URL.to_owned();
+            entry.info.api_backend = ApiBackend::CodexResponses;
+            entry.info.auth_scheme = AuthScheme::Bearer;
+            entry.info.extra_headers.clear();
+            entry.info.query_params.clear();
+            entry.info.env_http_headers.clear();
+            entry.api_base_url = None;
+            entry.api_key = None;
+            entry.env_key = None;
+            entry.auth_provider = Some(crate::auth::AuthProviderRef::unresolved(
+                OPENAI_CODEX_PROVIDER_ID.to_owned(),
+            ));
+            canonical_codex_models.insert(key.clone());
+        }
         let session_bearer_unsafe = !crate::util::is_xai_api_bearer_url(&entry.info.base_url)
             || entry
                 .api_base_url
@@ -3820,9 +3841,32 @@ pub fn resolve_model_list(
         );
         resolved.insert(key.clone(), entry);
     }
+    let mut openai_codex_manager = None;
     for (key, entry) in resolved.iter_mut() {
         if let Some(ref mut provider) = entry.auth_provider {
             if provider.is_fail_closed() {
+                continue;
+            }
+            if provider.name == OPENAI_CODEX_PROVIDER_ID {
+                if !canonical_codex_models.contains(key) {
+                    tracing::warn!(
+                        model_key = %key,
+                        "reserved OpenAI Codex auth provider used outside its built-in model profile; failing closed"
+                    );
+                    entry.config_validation_errors.push(
+                        "auth_provider = \"openai-codex\" is reserved; use model_provider = \
+                         \"openai-codex\""
+                            .to_owned(),
+                    );
+                    *provider = crate::auth::AuthProviderRef::fail_closed(format!(
+                        "{OPENAI_CODEX_PROVIDER_ID} (reserved; fail-closed)"
+                    ));
+                    continue;
+                }
+                let manager = openai_codex_manager.get_or_insert_with(|| {
+                    crate::auth::openai_codex::manager(&crate::util::grok_home::grok_home())
+                });
+                provider.attach_openai_codex(manager.clone());
                 continue;
             }
             let config = cfg.auth_providers.get(&provider.name);
@@ -5422,6 +5466,16 @@ pub fn resolve_aux_model_sampling_config(
             None,
             None,
         );
+        if sampler.api_backend == ApiBackend::CodexResponses {
+            if sampler.bearer_resolver.is_some() {
+                return Some(sampler);
+            }
+            tracing::warn!(
+                model = %model_id,
+                "Codex auxiliary model has no structured credential resolver; failing closed"
+            );
+            return None;
+        }
         if sampler.api_key.is_some() || sampler.auth_scheme == AuthScheme::None {
             return Some(sampler);
         }
@@ -5498,16 +5552,57 @@ pub fn resolve_aux_model_sampling_config(
     );
     None
 }
+
+/// Async request-boundary companion to [`resolve_aux_model_sampling_config`].
+/// Generic providers retain the existing synchronous behavior; native Codex
+/// first runs its single-flight refresh so early-invalidated access tokens do
+/// not make an otherwise refreshable auxiliary model appear unavailable.
+pub async fn resolve_aux_model_sampling_config_preflight(
+    model_id: &str,
+    models: &IndexMap<String, ModelEntry>,
+    endpoints: &EndpointsConfig,
+    session_key: Option<&str>,
+    disable_api_key_auth: bool,
+    alpha_test_key: Option<String>,
+    client_version: Option<String>,
+) -> Option<SamplerConfig> {
+    if let Some(entry) = find_model_by_id(models, model_id)
+        && entry.info.api_backend == ApiBackend::CodexResponses
+    {
+        let provider = entry.effective_auth_provider()?;
+        provider.openai_codex_status()?;
+        let current = provider.cached_token();
+        let _ = provider.ensure_fresh_token(current.as_deref()).await;
+        if provider.cached_credential().is_none() {
+            tracing::warn!(
+                model = %model_id,
+                "Codex auxiliary credential refresh failed; failing closed"
+            );
+            return None;
+        }
+    }
+    resolve_aux_model_sampling_config(
+        model_id,
+        models,
+        endpoints,
+        session_key,
+        disable_api_key_auth,
+        alpha_test_key,
+        client_version,
+    )
+}
 /// Stamp the session-local fields (client id, attribution, bearer resolver,
 /// retries) from the active session onto a routed aux `SamplerConfig` so a
 /// helper model keeps the session's auth/attribution. Shared by image-describe
 /// and the auto-mode classifier so the two can't drift.
 ///
-/// The resolver gate is host-based, stricter than `session_token_auth_gate`:
-/// a session-token deployment on a custom `models_base_url` loses aux-sampler
-/// refresh, rather than risk the session bearer on a third-party endpoint.
-/// `AuthScheme::None` aux models also skip the resolver so a keyless helper
-/// never inherits a live session bearer.
+/// Resolver inheritance is fail-closed and provider-compatible: both the
+/// active session and auxiliary target must use xAI bearer endpoints, the
+/// target must require auth, and a resolver already owned by the auxiliary
+/// model is never replaced. A session-token deployment on a custom
+/// `models_base_url` loses aux-sampler refresh rather than risk its bearer on a
+/// third-party endpoint; a Codex session likewise cannot stamp its provider
+/// credential onto an xAI helper.
 pub fn stamp_session_local_sampler_fields(
     cfg: &mut SamplerConfig,
     active_session_config: &SamplerConfig,
@@ -5516,7 +5611,12 @@ pub fn stamp_session_local_sampler_fields(
 ) {
     cfg.client_identifier = client_identifier;
     cfg.attribution_callback = active_session_config.attribution_callback.clone();
-    if cfg.auth_scheme != AuthScheme::None && crate::util::is_xai_api_bearer_url(&cfg.base_url) {
+    if cfg.bearer_resolver.is_none()
+        && cfg.auth_scheme != AuthScheme::None
+        && active_session_config.auth_scheme != AuthScheme::None
+        && crate::util::is_xai_api_bearer_url(&cfg.base_url)
+        && crate::util::is_xai_api_bearer_url(&active_session_config.base_url)
+    {
         cfg.bearer_resolver = active_session_config.bearer_resolver.clone();
     }
     cfg.max_retries = max_retries;
@@ -5600,7 +5700,7 @@ pub fn sampling_config_for_model(
         &credentials.base_url,
     );
     let api_backend = info.api_backend.clone();
-    SamplerConfig {
+    let mut config = SamplerConfig {
         api_key: credentials.api_key,
         model: model_name,
         base_url: credentials.base_url,
@@ -5630,7 +5730,18 @@ pub fn sampling_config_for_model(
         compaction_at_tokens: info.compaction_at_tokens,
         doom_loop_recovery: None,
         header_injector: None,
+    };
+    if config.api_backend == ApiBackend::CodexResponses {
+        // Codex request auth is a structured, provider-scoped snapshot. Never
+        // freeze its access token into an auxiliary config: the resolver also
+        // carries the account id and observes refresh-token rotation.
+        config.api_key = None;
+        config.bearer_resolver = model
+            .effective_auth_provider()
+            .filter(|provider| provider.openai_codex_status().is_some())
+            .map(crate::auth::AuthProviderRef::bearer_resolver);
     }
+    config
 }
 /// Fold URL-derived headers into `extra_headers`.
 ///
@@ -5790,6 +5901,56 @@ pub fn resolve_web_search_sampling_config(
     }
     resolved.map(crate::tools::config::web_search_sampling_config)
 }
+
+/// Refresh-aware web-search resolver. Codex web search ultimately crosses the
+/// legacy tool config boundary as a credential snapshot, so snapshot it only
+/// after the native provider's single-flight refresh and include its account
+/// identity header. Missing refreshed credentials fail closed.
+pub async fn resolve_web_search_sampling_config_preflight(
+    model_id: &str,
+    models: &IndexMap<String, ModelEntry>,
+    session_key: Option<&str>,
+    disable_api_key_auth: bool,
+    alpha_test_key: Option<String>,
+    client_version: Option<String>,
+    endpoints: &EndpointsConfig,
+) -> Option<SamplerConfig> {
+    let codex = find_model_by_id(models, model_id)
+        .is_some_and(|entry| entry.info.api_backend == ApiBackend::CodexResponses);
+    if codex {
+        let entry = find_model_by_id(models, model_id)?;
+        let provider = entry.effective_auth_provider()?;
+        provider.openai_codex_status()?;
+        let current = provider.cached_token();
+        let _ = provider.ensure_fresh_token(current.as_deref()).await;
+        if provider.cached_credential().is_none() {
+            tracing::warn!(
+                web_search_model = %model_id,
+                "Codex web-search credential refresh failed; disabling web search"
+            );
+            return None;
+        }
+    }
+    let mut config = resolve_web_search_sampling_config(
+        model_id,
+        models,
+        session_key,
+        disable_api_key_auth,
+        alpha_test_key,
+        client_version,
+        endpoints,
+    )?;
+    if codex {
+        let credential = config.bearer_resolver.as_ref()?.current_credential()?;
+        config.api_key = Some(credential.access_token);
+        if let Some(account_id) = credential.account_id {
+            config
+                .extra_headers
+                .insert("chatgpt-account-id".to_owned(), account_id);
+        }
+    }
+    Some(config)
+}
 /// Wire string for [`AuthScheme`] in ACP model `_meta` (`authScheme`).
 fn auth_scheme_meta_value(scheme: AuthScheme) -> &'static str {
     match scheme {
@@ -5851,6 +6012,60 @@ fn provider_hint_for_url(base_url: &str) -> String {
 pub(crate) fn model_readiness(model: &ModelEntry) -> (bool, Option<String>) {
     if let Some(reason) = model.config_validation_errors.first().map(|e| e.as_str()) {
         return (false, Some(reason.to_owned()));
+    }
+    if model.info.api_backend == ApiBackend::CodexResponses {
+        let Some(provider) = model.auth_provider.as_ref() else {
+            return (
+                false,
+                Some("missing OpenAI Codex credential provider".to_owned()),
+            );
+        };
+        let Some(status) = provider.openai_codex_status() else {
+            return (
+                false,
+                Some("invalid OpenAI Codex credential provider".to_owned()),
+            );
+        };
+        if status.permanent_failure {
+            return (
+                false,
+                Some("OpenAI Codex credential refresh failed; sign in again".to_owned()),
+            );
+        }
+        if !status.signed_in {
+            return (
+                false,
+                Some("sign in with `grok login --provider openai-codex`".to_owned()),
+            );
+        }
+        // An expired access token with a scoped refresh token is selectable:
+        // the existing pre-turn single-flight refresh obtains the live bearer
+        // before any request. Status/readiness remain strictly read-only.
+        if status.expired {
+            return if status.refreshable {
+                (true, None)
+            } else {
+                (
+                    false,
+                    Some("OpenAI Codex credential expired; sign in again".to_owned()),
+                )
+            };
+        }
+        let Some(credential) = provider.cached_credential() else {
+            return (
+                false,
+                Some("OpenAI Codex credential is unavailable; sign in again".to_owned()),
+            );
+        };
+        if credential.access_token.trim().is_empty()
+            || credential.issuer.as_deref() != Some(crate::auth::openai_codex::ISSUER)
+        {
+            return (
+                false,
+                Some("OpenAI Codex credential is invalid; sign in again".to_owned()),
+            );
+        }
+        return (true, None);
     }
     if model.info.auth_scheme == AuthScheme::None {
         return (true, None);
@@ -6000,7 +6215,33 @@ impl ModelSwitchIncompatibleAgentError {
 mod tests {
     use super::*;
     use serial_test::serial;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use xai_grok_test_support::EnvGuard;
+
+    struct RotatingCodexAuxRefresher {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::auth::refresh::TokenRefresher for RotatingCodexAuxRefresher {
+        async fn refresh(
+            &self,
+            _reason: crate::auth::refresh::RefreshReason,
+        ) -> crate::auth::refresh::RefreshOutcome {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            crate::auth::refresh::RefreshOutcome::Success(Box::new(crate::auth::GrokAuth {
+                key: format!("rotated-codex-token-{call}"),
+                auth_mode: crate::auth::AuthMode::OpenAiCodex,
+                refresh_token: Some(format!("rotated-refresh-token-{call}")),
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                oidc_issuer: Some(crate::auth::openai_codex::ISSUER.to_owned()),
+                oidc_client_id: Some(crate::auth::openai_codex::CLIENT_ID.to_owned()),
+                account_id: Some(format!("rotated-account-{call}")),
+                ..crate::auth::GrokAuth::default()
+            }))
+        }
+    }
 
     fn assert_no_secret_windows(rendered: &str, secret: &str) {
         assert!(!rendered.contains(secret));
@@ -6598,11 +6839,272 @@ reasoning_effort = "low"
         assert_eq!(resolved.base_url, "https://litellm.example/v1");
         assert_eq!(resolved.api_key.as_deref(), Some("aux-token"));
     }
-    /// The session bearer resolver must never be stamped onto a third-party
-    /// sampler: the sampler substitutes the resolver's bearer at request
-    /// time. `AuthScheme::None` also refuses the stamp on first-party hosts.
     #[test]
-    fn session_resolver_is_not_stamped_onto_third_party_samplers() {
+    fn codex_aux_sampler_uses_live_structured_credential_and_observes_rotation() {
+        let temp = tempfile::tempdir().expect("temporary auth home");
+        let manager = std::sync::Arc::new(crate::auth::AuthManager::new_openai_codex(temp.path()));
+        let codex_auth = |key: &str, account_id: &str| crate::auth::GrokAuth {
+            key: key.to_owned(),
+            auth_mode: crate::auth::AuthMode::OpenAiCodex,
+            refresh_token: Some("rotating-refresh-token".to_owned()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            oidc_issuer: Some(crate::auth::openai_codex::ISSUER.to_owned()),
+            oidc_client_id: Some(crate::auth::openai_codex::CLIENT_ID.to_owned()),
+            account_id: Some(account_id.to_owned()),
+            ..crate::auth::GrokAuth::default()
+        };
+        manager.hot_swap(codex_auth("codex-token-1", "account-1"));
+
+        let mut entry = test_model_entry(
+            "supported-codex-model",
+            crate::auth::openai_codex::CODEX_API_BASE_URL,
+            None,
+            None,
+            None,
+        );
+        entry.info.api_backend = ApiBackend::CodexResponses;
+        entry.info.auth_scheme = AuthScheme::Bearer;
+        entry.auth_provider = Some(crate::auth::AuthProviderRef::openai_codex(manager.clone()));
+        let catalog = IndexMap::from([("codex-aux".to_owned(), entry)]);
+
+        let sampler = resolve_aux_model_sampling_config(
+            "codex-aux",
+            &catalog,
+            &EndpointsConfig::default(),
+            Some("ambient-xai-session"),
+            false,
+            None,
+            None,
+        )
+        .expect("ready Codex aux model should resolve");
+        assert!(
+            sampler.api_key.is_none(),
+            "Codex aux config must not freeze a static access-token snapshot"
+        );
+        let resolver = sampler
+            .bearer_resolver
+            .expect("Codex aux config carries its provider resolver");
+        let first = resolver
+            .current_credential()
+            .expect("current structured credential");
+        assert_eq!(first.access_token, "codex-token-1");
+        assert_eq!(first.account_id.as_deref(), Some("account-1"));
+
+        manager.hot_swap(codex_auth("codex-token-2", "account-2"));
+        let rotated = resolver
+            .current_credential()
+            .expect("rotated structured credential");
+        assert_eq!(rotated.access_token, "codex-token-2");
+        assert_eq!(rotated.account_id.as_deref(), Some("account-2"));
+    }
+    #[test]
+    fn model_switch_grok_codex_grok_reselects_transport_and_live_credentials() {
+        let temp = tempfile::tempdir().expect("temporary auth home");
+        let manager = Arc::new(crate::auth::AuthManager::new_openai_codex(temp.path()));
+        manager.hot_swap(crate::auth::GrokAuth {
+            key: "codex-access".into(),
+            auth_mode: crate::auth::AuthMode::OpenAiCodex,
+            refresh_token: Some("codex-refresh".into()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            oidc_issuer: Some(crate::auth::openai_codex::ISSUER.into()),
+            oidc_client_id: Some(crate::auth::openai_codex::CLIENT_ID.into()),
+            account_id: Some("codex-account".into()),
+            ..crate::auth::GrokAuth::default()
+        });
+
+        let grok = test_model_entry("grok-model", "https://api.x.ai/v1", None, None, None);
+        let mut codex = test_model_entry(
+            "codex-model",
+            crate::auth::openai_codex::CODEX_API_BASE_URL,
+            None,
+            None,
+            None,
+        );
+        codex.info.api_backend = ApiBackend::CodexResponses;
+        codex.info.auth_scheme = AuthScheme::Bearer;
+        codex.auth_provider = Some(crate::auth::AuthProviderRef::openai_codex(manager));
+        let catalog = IndexMap::from([("grok".into(), grok), ("codex".into(), codex)]);
+
+        let resolve = |model, session| {
+            resolve_model_to_sampling_config(model, &catalog, Some(session), None, None, None)
+                .expect("model resolves in the same running process")
+        };
+        let first_grok = resolve("grok", "grok-session-1");
+        let codex = resolve("codex", "must-not-reach-codex");
+        let second_grok = resolve("grok", "grok-session-2");
+
+        assert_eq!(first_grok.api_backend, ApiBackend::ChatCompletions);
+        assert_eq!(first_grok.api_key.as_deref(), Some("grok-session-1"));
+        assert_eq!(codex.api_backend, ApiBackend::CodexResponses);
+        assert_eq!(
+            codex.base_url,
+            crate::auth::openai_codex::CODEX_API_BASE_URL
+        );
+        assert!(codex.api_key.is_none());
+        let codex_credential = codex
+            .bearer_resolver
+            .as_ref()
+            .and_then(|resolver| resolver.current_credential())
+            .expect("Codex model uses its provider-scoped live credential");
+        assert_eq!(codex_credential.access_token, "codex-access");
+        assert_eq!(
+            codex_credential.account_id.as_deref(),
+            Some("codex-account")
+        );
+        assert_eq!(second_grok.api_backend, ApiBackend::ChatCompletions);
+        assert_eq!(second_grok.api_key.as_deref(), Some("grok-session-2"));
+        assert!(second_grok.bearer_resolver.is_none());
+    }
+    #[test]
+    fn codex_model_is_not_ready_after_retained_permanent_refresh_failure() {
+        for reason in [
+            crate::auth::error::RefreshTokenFailedReason::ClientRejected,
+            crate::auth::error::RefreshTokenFailedReason::Other,
+        ] {
+            let temp = tempfile::tempdir().expect("temporary auth home");
+            let manager = Arc::new(crate::auth::AuthManager::new_openai_codex(temp.path()));
+            manager.hot_swap(crate::auth::GrokAuth {
+                key: "codex-access".into(),
+                auth_mode: crate::auth::AuthMode::OpenAiCodex,
+                refresh_token: Some("codex-refresh".into()),
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                oidc_issuer: Some(crate::auth::openai_codex::ISSUER.into()),
+                oidc_client_id: Some(crate::auth::openai_codex::CLIENT_ID.into()),
+                account_id: Some("codex-account".into()),
+                ..crate::auth::GrokAuth::default()
+            });
+            manager.record_permanent_failure("codex-access".into(), reason.into());
+
+            let mut entry = test_model_entry(
+                "codex-model",
+                crate::auth::openai_codex::CODEX_API_BASE_URL,
+                None,
+                None,
+                None,
+            );
+            entry.info.api_backend = ApiBackend::CodexResponses;
+            entry.info.auth_scheme = AuthScheme::Bearer;
+            entry.auth_provider = Some(crate::auth::AuthProviderRef::openai_codex(manager));
+
+            let (ready, readiness_reason) = model_readiness(&entry);
+            assert!(!ready, "{reason:?} must fail Codex readiness closed");
+            assert!(
+                readiness_reason.is_some_and(|message| message.contains("sign in again")),
+                "{reason:?} must explain the reauthentication requirement"
+            );
+        }
+    }
+    #[test]
+    fn codex_aux_sampler_without_native_resolver_fails_closed() {
+        let mut entry = test_model_entry(
+            "supported-codex-model",
+            crate::auth::openai_codex::CODEX_API_BASE_URL,
+            None,
+            None,
+            None,
+        );
+        entry.info.api_backend = ApiBackend::CodexResponses;
+        entry.info.auth_scheme = AuthScheme::Bearer;
+        let catalog = IndexMap::from([("codex-aux".to_owned(), entry)]);
+
+        assert!(
+            resolve_aux_model_sampling_config(
+                "codex-aux",
+                &catalog,
+                &EndpointsConfig::default(),
+                Some("ambient-xai-session"),
+                false,
+                None,
+                None,
+            )
+            .is_none(),
+            "Codex aux traffic must not fall back to an ambient xAI bearer"
+        );
+    }
+    #[tokio::test]
+    async fn codex_aux_and_web_preflight_refresh_near_expiry_structured_credential() {
+        let temp = tempfile::tempdir().expect("temporary auth home");
+        let manager = Arc::new(crate::auth::AuthManager::new_openai_codex(temp.path()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        manager.set_refresher(Arc::new(RotatingCodexAuxRefresher {
+            calls: calls.clone(),
+        }));
+        let near_expiry = |key: &str| crate::auth::GrokAuth {
+            key: key.to_owned(),
+            auth_mode: crate::auth::AuthMode::OpenAiCodex,
+            refresh_token: Some("near-expiry-refresh-token".to_owned()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::seconds(30)),
+            oidc_issuer: Some(crate::auth::openai_codex::ISSUER.to_owned()),
+            oidc_client_id: Some(crate::auth::openai_codex::CLIENT_ID.to_owned()),
+            account_id: Some("stale-account".to_owned()),
+            ..crate::auth::GrokAuth::default()
+        };
+        manager.hot_swap(near_expiry("near-expiry-token-1"));
+
+        let mut entry = test_model_entry(
+            "supported-codex-model",
+            crate::auth::openai_codex::CODEX_API_BASE_URL,
+            None,
+            None,
+            None,
+        );
+        entry.info.api_backend = ApiBackend::CodexResponses;
+        entry.info.auth_scheme = AuthScheme::Bearer;
+        entry.auth_provider = Some(crate::auth::AuthProviderRef::openai_codex(manager.clone()));
+        let catalog = IndexMap::from([("codex-aux".to_owned(), entry)]);
+
+        let aux = resolve_aux_model_sampling_config_preflight(
+            "codex-aux",
+            &catalog,
+            &EndpointsConfig::default(),
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("near-expiry Codex aux credential should refresh");
+        let refreshed = aux
+            .bearer_resolver
+            .as_ref()
+            .and_then(|resolver| resolver.current_credential())
+            .expect("refreshed structured auxiliary credential");
+        assert_eq!(refreshed.access_token, "rotated-codex-token-1");
+        assert_eq!(refreshed.account_id.as_deref(), Some("rotated-account-1"));
+
+        let web_temp = tempfile::tempdir().expect("temporary web-search auth home");
+        let web_manager = Arc::new(crate::auth::AuthManager::new_openai_codex(web_temp.path()));
+        web_manager.set_refresher(Arc::new(RotatingCodexAuxRefresher {
+            calls: calls.clone(),
+        }));
+        web_manager.hot_swap(near_expiry("near-expiry-token-2"));
+        let mut web_entry = catalog["codex-aux"].clone();
+        web_entry.auth_provider = Some(crate::auth::AuthProviderRef::openai_codex(web_manager));
+        let web_catalog = IndexMap::from([("codex-aux".to_owned(), web_entry)]);
+        let web = resolve_web_search_sampling_config_preflight(
+            "codex-aux",
+            &web_catalog,
+            None,
+            false,
+            None,
+            None,
+            &EndpointsConfig::default(),
+        )
+        .await
+        .expect("near-expiry Codex web-search credential should refresh");
+        assert_eq!(web.api_key.as_deref(), Some("rotated-codex-token-2"));
+        assert_eq!(
+            web.extra_headers
+                .get("chatgpt-account-id")
+                .map(String::as_str),
+            Some("rotated-account-2")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+    /// The session bearer resolver must never cross a provider boundary or
+    /// replace a resolver already owned by the auxiliary model.
+    #[test]
+    fn session_resolver_is_only_stamped_between_xai_samplers() {
         #[derive(Debug)]
         struct SessionResolver;
         impl xai_grok_sampler::BearerResolver for SessionResolver {
@@ -6610,7 +7112,15 @@ reasoning_effort = "low"
                 Some("session-jwt".into())
             }
         }
+        #[derive(Debug)]
+        struct AuxiliaryResolver;
+        impl xai_grok_sampler::BearerResolver for AuxiliaryResolver {
+            fn current_bearer(&self) -> Option<String> {
+                Some("auxiliary-jwt".into())
+            }
+        }
         let session_cfg = SamplerConfig {
+            base_url: EndpointsConfig::default().resolve_inference_base_url(),
             bearer_resolver: Some(std::sync::Arc::new(SessionResolver)),
             ..SamplerConfig::default()
         };
@@ -6641,6 +7151,45 @@ reasoning_effort = "low"
         assert!(
             none_scheme.bearer_resolver.is_none(),
             "AuthScheme::None must never inherit the session bearer resolver"
+        );
+
+        let codex_session = SamplerConfig {
+            base_url: "https://chatgpt.com/backend-api/codex".into(),
+            api_backend: ApiBackend::CodexResponses,
+            bearer_resolver: Some(std::sync::Arc::new(SessionResolver)),
+            ..SamplerConfig::default()
+        };
+        let mut xai_aux = SamplerConfig {
+            api_key: Some("xai-aux-key".into()),
+            base_url: EndpointsConfig::default().resolve_inference_base_url(),
+            ..SamplerConfig::default()
+        };
+        stamp_session_local_sampler_fields(&mut xai_aux, &codex_session, None, None);
+        assert!(
+            xai_aux.bearer_resolver.is_none(),
+            "a Codex resolver must never be copied onto an xAI auxiliary sampler"
+        );
+        assert_eq!(xai_aux.api_key.as_deref(), Some("xai-aux-key"));
+
+        let mut independently_authenticated_aux = SamplerConfig {
+            base_url: EndpointsConfig::default().resolve_inference_base_url(),
+            bearer_resolver: Some(std::sync::Arc::new(AuxiliaryResolver)),
+            ..SamplerConfig::default()
+        };
+        stamp_session_local_sampler_fields(
+            &mut independently_authenticated_aux,
+            &session_cfg,
+            None,
+            None,
+        );
+        assert_eq!(
+            independently_authenticated_aux
+                .bearer_resolver
+                .as_ref()
+                .and_then(|resolver| resolver.current_bearer())
+                .as_deref(),
+            Some("auxiliary-jwt"),
+            "an auxiliary model's own resolver must not be overwritten"
         );
     }
     /// A cold cache disables web search rather than sending an

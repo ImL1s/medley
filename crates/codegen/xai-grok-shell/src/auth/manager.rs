@@ -30,22 +30,21 @@ use xai_grok_telemetry::events::ManualAuthSurface;
 #[cfg(test)]
 use super::model::UserInfo;
 use super::model::{
-    AuthMode, GrokAuth, early_invalidation, is_expired, is_expired_with_buffer, lookup_auth,
+    AuthMode, AuthStore, GrokAuth, early_invalidation, is_expired, is_expired_with_buffer,
+    lookup_auth,
 };
 use super::refresh::{RefreshOutcome, TokenRefresher, resolve_refresh_credential};
 use super::storage::{
     AuthFileLock, read_auth_json, read_auth_json_or_empty_recovering_corrupt, write_auth_json,
+    write_auth_json_strict,
 };
 
-#[cfg(test)]
 use super::storage::read_auth_json_or_empty;
 #[cfg(test)]
 use chrono::DateTime;
 #[cfg(test)]
 use enrichment::apply_user_info_enrichment;
 
-#[cfg(test)]
-use super::model::AuthStore;
 use super::model::LEGACY_SCOPE;
 
 /// Why a token refresh is being requested.
@@ -141,6 +140,9 @@ pub struct AuthManager {
     inner: Arc<RwLock<Option<GrokAuth>>>,
     path: PathBuf,
     scope: String,
+    /// xAI-only policy and `/user` enrichment are forbidden for provider
+    /// credentials such as OpenAI Codex.
+    xai_session: bool,
     grok_com_config: GrokComConfig,
     proxy_base_url: String,
     refresher: RwLock<Option<Arc<dyn TokenRefresher>>>,
@@ -315,6 +317,7 @@ impl AuthManager {
                     grok_com_config,
                     proxy_base_url,
                     None,
+                    true,
                 );
             }
             tracing::warn!("GROK_AUTH set but failed to parse as JSON, falling back to file");
@@ -390,11 +393,52 @@ impl AuthManager {
             grok_com_config,
             proxy_base_url,
             Some(initial_disk_state),
+            true,
         );
         // Clear a wrong-team session left on disk before the pin was deployed,
         // so the first launch forces a compliant login.
         manager.enforce_pin_on_loaded_token();
         manager
+    }
+
+    /// Construct a manager for the provider-scoped OpenAI Codex credential.
+    ///
+    /// This deliberately ignores `GROK_AUTH` so an inline xAI credential can
+    /// never be adopted as a Codex bearer. It shares the normal auth.json path
+    /// (including `GROK_AUTH_PATH`) so atomic multi-scope writes and locking are
+    /// reused without replacing the active xAI entry.
+    pub fn new_openai_codex(grok_home: &Path) -> Self {
+        let path = std::env::var("GROK_AUTH_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| grok_home.join("auth.json"));
+        let scope = crate::auth::openai_codex::AUTH_SCOPE.to_owned();
+        let (auth, disk_state) = match read_auth_json(&path) {
+            Ok(map) => {
+                let auth = map
+                    .get(&scope)
+                    .filter(|auth| crate::auth::openai_codex::is_codex_credential(auth))
+                    .cloned();
+                let state = if auth.is_some() {
+                    DiskAuthState::Ok
+                } else {
+                    DiskAuthState::EntryMissing
+                };
+                (auth, state)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                (None, DiskAuthState::FileMissing)
+            }
+            Err(_) => (None, DiskAuthState::Unreadable),
+        };
+        Self::assemble(
+            auth,
+            path,
+            scope,
+            GrokComConfig::default(),
+            String::new(),
+            Some(disk_state),
+            false,
+        )
     }
 
     /// Single field-assembly point for [`Self::new`]'s two construction paths
@@ -408,11 +452,13 @@ impl AuthManager {
         grok_com_config: GrokComConfig,
         proxy_base_url: String,
         disk_state: Option<DiskAuthState>,
+        xai_session: bool,
     ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(inner)),
             path,
             scope,
+            xai_session,
             grok_com_config,
             proxy_base_url,
             refresher: RwLock::new(None),
@@ -467,6 +513,28 @@ impl AuthManager {
         self.remove_scope(&self.scope)
     }
 
+    /// Durably remove the current scope, waiting up to `timeout` for the
+    /// auth-file lock. Unlike [`Self::clear`], this never reports success or
+    /// clears memory while the on-disk credential may still be present.
+    pub(crate) async fn clear_durable(&self, timeout: StdDuration) -> std::io::Result<()> {
+        let Some(lock) = self.try_lock_auth_file_async(timeout).await else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "auth credential store is busy",
+            ));
+        };
+        if !lock.still_live(&self.path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "auth credential store lock is no longer live",
+            ));
+        }
+
+        let disk_mutation = self.write_scope_removal_durable(&self.scope)?;
+        self.finish_scope_removal(&self.scope, disk_mutation);
+        Ok(())
+    }
+
     /// Remove a scope entry from auth.json. When `scope == self.scope`, also
     /// drops in-memory auth so a later `auth()` reports `NotLoggedIn`, not stale
     /// `invalid_grant` (the scoped verdict reads inert with no credential).
@@ -484,6 +552,11 @@ impl AuthManager {
         } else {
             ScopeRemoval::SkippedLockUnavailable
         };
+        self.finish_scope_removal(scope, disk_mutation);
+        Ok(())
+    }
+
+    fn finish_scope_removal(&self, scope: &str, disk_mutation: ScopeRemoval) {
         // Intentional removal must be attributable from unified.jsonl:
         // downstream, a deliberately deleted auth.json is indistinguishable
         // from accidental loss (corruption, external deletion).
@@ -503,7 +576,6 @@ impl AuthManager {
             // next state is NotLoggedIn, not a retained invalid_grant verdict.
             *self.permanent_failure.write() = None;
         }
-        Ok(())
     }
 
     /// Drop `scope` from auth.json and persist, deleting the file when the last
@@ -516,6 +588,25 @@ impl AuthManager {
         auth_store.remove(scope);
         if auth_store.is_empty() {
             let _ = std::fs::remove_file(&self.path);
+            Ok(ScopeRemoval::FileDeleted)
+        } else {
+            write_auth_json(&self.path, &auth_store)?;
+            Ok(ScopeRemoval::EntryRemoved)
+        }
+    }
+
+    /// Strict counterpart used by provider logout: missing auth.json is an
+    /// already-logged-out success, while unreadable data and write failures
+    /// are surfaced so memory cannot diverge from durable state.
+    fn write_scope_removal_durable(&self, scope: &str) -> std::io::Result<ScopeRemoval> {
+        let mut auth_store = read_auth_json_or_empty(&self.path)?;
+        auth_store.remove(scope);
+        if auth_store.is_empty() {
+            match std::fs::remove_file(&self.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
             Ok(ScopeRemoval::FileDeleted)
         } else {
             write_auth_json(&self.path, &auth_store)?;
@@ -668,6 +759,9 @@ impl AuthManager {
     /// authoritative). An API-key session is rejected under the kill switch,
     /// else allowed.
     pub(crate) fn cached_token_policy_error(&self, auth: &GrokAuth) -> Option<AuthError> {
+        if !self.xai_session {
+            return None;
+        }
         if auth.auth_mode == AuthMode::ApiKey {
             // Else enforce_disable_api_key_auth swaps the key for itself (no-op).
             return self
@@ -843,6 +937,9 @@ impl AuthManager {
     /// Returns the input `GrokAuth` BEFORE enrichment lands; callers
     /// needing the post-enrichment view re-read `current()`.
     pub(crate) async fn update(self: &Arc<Self>, auth: GrokAuth) -> std::io::Result<GrokAuth> {
+        if !self.xai_session {
+            return self.save_provider_strict(auth).await;
+        }
         let update_started = std::time::Instant::now();
         let map = match read_auth_json_or_empty_recovering_corrupt(&self.path) {
             Ok(map) => map,
@@ -855,7 +952,9 @@ impl AuthManager {
                     Some(serde_json::json!({ "error": e.to_string() })),
                 );
                 self.with_inner_write(|inner| *inner = Some(auth.clone()));
-                self.spawn_user_info_enrichment(auth.clone());
+                if self.xai_session {
+                    self.spawn_user_info_enrichment(auth.clone());
+                }
                 return Ok(auth);
             }
         };
@@ -894,7 +993,9 @@ impl AuthManager {
         // Fire-and-forget enrichment. Off the critical path -- a slow
         // `/user` would otherwise widen the sibling-process
         // `invalid_grant` race window.
-        self.spawn_user_info_enrichment(auth.clone());
+        if self.xai_session {
+            self.spawn_user_info_enrichment(auth.clone());
+        }
 
         write_result?;
         Ok(auth)
@@ -906,6 +1007,9 @@ impl AuthManager {
         &self,
         auth: GrokAuth,
     ) -> std::io::Result<GrokAuth> {
+        if !self.xai_session {
+            return self.save_provider_strict(auth).await;
+        }
         let started = std::time::Instant::now();
         let map = match read_auth_json_or_empty_recovering_corrupt(&self.path) {
             Ok(map) => map,
@@ -952,6 +1056,19 @@ impl AuthManager {
         Ok(auth)
     }
 
+    /// Persist a rotating provider credential atomically before publishing it
+    /// to memory. No ENOSPC in-place fallback is permitted because losing a
+    /// rotated refresh token can invalidate the whole token family.
+    async fn save_provider_strict(&self, auth: GrokAuth) -> std::io::Result<GrokAuth> {
+        debug_assert!(!self.xai_session);
+        let mut map = read_auth_json_or_empty_recovering_corrupt(&self.path)?;
+        map.insert(self.scope.clone(), auth.clone());
+        write_auth_json_strict(&self.path, &map)?;
+        *self.permanent_failure.write() = None;
+        self.with_inner_write(|inner| *inner = Some(auth.clone()));
+        Ok(auth)
+    }
+
     /// Spawn the `/user` enrichment task; body in the `enrichment` submodule.
     fn spawn_user_info_enrichment(self: &Arc<Self>, auth: GrokAuth) {
         enrichment::spawn(Arc::clone(self), auth);
@@ -959,7 +1076,9 @@ impl AuthManager {
 
     /// Blocking `/user` enrichment for login flows that exit before the background task lands.
     pub(crate) async fn enrich_auth_inline(&self, auth: &mut GrokAuth) {
-        enrichment::enrich_inline(self, auth).await;
+        if self.xai_session {
+            enrichment::enrich_inline(self, auth).await;
+        }
     }
 
     /// Path to the `auth.json` this manager reads/writes (respects
@@ -1170,7 +1289,17 @@ impl AuthManager {
     fn read_disk_auth_silent(&self) -> Option<GrokAuth> {
         read_auth_json(&self.path)
             .ok()
-            .and_then(|map| lookup_auth(&map, &self.scope))
+            .and_then(|map| self.lookup_scoped_auth(&map))
+    }
+
+    fn lookup_scoped_auth(&self, map: &AuthStore) -> Option<GrokAuth> {
+        if self.xai_session {
+            lookup_auth(map, &self.scope)
+        } else {
+            map.get(&self.scope)
+                .filter(|auth| crate::auth::openai_codex::is_codex_credential(auth))
+                .cloned()
+        }
     }
 
     /// Wire-valid token present in on-disk `auth.json`, judged by actual expiry
@@ -1198,7 +1327,7 @@ impl AuthManager {
     pub(crate) fn read_disk_auth_with_state(&self) -> (Option<GrokAuth>, DiskAuthState) {
         let (auth, state, err_detail) = match read_auth_json(&self.path) {
             Ok(map) => {
-                let found = lookup_auth(&map, &self.scope);
+                let found = self.lookup_scoped_auth(&map);
                 let state = if found.is_some() {
                     DiskAuthState::Ok
                 } else {
@@ -1391,7 +1520,8 @@ impl AuthManager {
             }
             // On devboxes, try minting fresh credentials before giving up.
             // preferred_method=api_key forbids automatic OIDC mint.
-            if !self.grok_com_config.blocks_automatic_oidc()
+            if self.xai_session
+                && !self.grok_com_config.blocks_automatic_oidc()
                 && self.is_devbox_environment()
                 && let Ok(auth) = self.try_devbox_recovery().await
             {
@@ -1465,7 +1595,8 @@ impl AuthManager {
         // the remote devbox login helper. Purges existing auth.json and writes only
         // the new OIDC entry so we start from a clean state.
         // preferred_method=api_key forbids automatic OIDC mint.
-        if result.is_err()
+        if self.xai_session
+            && result.is_err()
             && !self.grok_com_config.blocks_automatic_oidc()
             && self.is_devbox_environment()
             && let Ok(auth) = self.try_devbox_recovery().await
@@ -1500,6 +1631,9 @@ impl AuthManager {
     /// Fail-closed under `preferred_method=api_key` (no automatic OIDC mint),
     /// including direct callers such as sampler 401 recovery.
     pub(crate) async fn try_devbox_recovery(self: &Arc<Self>) -> Result<GrokAuth, AuthError> {
+        if !self.xai_session {
+            return Err(AuthError::NotLoggedIn);
+        }
         if self.grok_com_config.blocks_automatic_oidc() {
             tracing::debug!(
                 "auth: devbox recovery skipped (preferred_method=api_key blocks automatic OIDC)"
@@ -2046,7 +2180,7 @@ impl AuthManager {
     /// reconstructing a rotation chain after an incident.
     pub(crate) fn pick_up_sibling_token(&self) -> bool {
         let auth = match read_auth_json(&self.path) {
-            Ok(map) => lookup_auth(&map, &self.scope),
+            Ok(map) => self.lookup_scoped_auth(&map),
             _ => None,
         };
         if let Some(ref a) = auth

@@ -118,7 +118,7 @@ impl MvpAgent {
             .unwrap_or(crate::models::default_session_summary_model())
             .to_owned()
     }
-    pub(super) fn build_summary_client(
+    pub(super) async fn build_summary_client(
         &self,
         primary: &SamplingConfig,
     ) -> Result<(OaiCompatClient, String), acp::Error> {
@@ -134,7 +134,7 @@ impl MvpAgent {
                 cfg.client_version.clone(),
             )
         };
-        let config = match crate::agent::config::resolve_aux_model_sampling_config(
+        let config = match crate::agent::config::resolve_aux_model_sampling_config_preflight(
             &slug,
             &models,
             &endpoints,
@@ -142,7 +142,9 @@ impl MvpAgent {
             disable_api_key_auth,
             alpha_test_key,
             client_version,
-        ) {
+        )
+        .await
+        {
             Some(mut cfg) => {
                 crate::agent::config::stamp_session_local_sampler_fields(
                     &mut cfg,
@@ -2417,6 +2419,39 @@ impl MvpAgent {
         );
         Some(cfg)
     }
+    pub(super) async fn prepare_web_search_sampling_config_preflight(
+        &self,
+    ) -> Option<SamplingConfig> {
+        let (model_id, disable_api_key_auth, alpha_test_key, client_version, endpoints) = {
+            let cfg = self.cfg.borrow();
+            (
+                cfg.web_search_model.clone(),
+                cfg.grok_com_config.api_key_auth_disabled(),
+                cfg.endpoints.alpha_test_key.clone(),
+                cfg.client_version.clone(),
+                cfg.endpoints.clone(),
+            )
+        };
+        let models = self.models_manager.models();
+        let session = self.current_or_buffered_auth();
+        let mut cfg = config::resolve_web_search_sampling_config_preflight(
+            &model_id,
+            &models,
+            session.as_ref().map(|a| a.key.as_str()),
+            disable_api_key_auth,
+            alpha_test_key.clone(),
+            client_version,
+            &endpoints,
+        )
+        .await?;
+        inject_proxy_headers(
+            &mut cfg.extra_headers,
+            cfg.client_version.as_deref(),
+            alpha_test_key.as_deref(),
+            &cfg.base_url,
+        );
+        Some(cfg)
+    }
     /// Returns `Err` with a user-facing message on invalid config; the caller at
     /// the process boundary prints it and exits.
     pub fn new(
@@ -4451,7 +4486,9 @@ impl MvpAgent {
             .find(|entry| entry.info.model == sampling_config.model)
             .and_then(|entry| entry.info.max_retries);
         let origin_client = self.origin_client_info_from_meta(init.meta.as_ref());
-        let web_search_sampling_config = self.prepare_web_search_sampling_config();
+        let web_search_sampling_config = self
+            .prepare_web_search_sampling_config_preflight()
+            .await;
         let image_gen_config = self.prepare_image_gen_config();
         let video_gen_config = self.prepare_video_gen_config();
         let app_builder_deployer_config = self.prepare_app_builder_deployer_config();

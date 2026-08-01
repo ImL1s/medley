@@ -1,6 +1,6 @@
 use super::types::WebSearchConfig;
 use crate::attribution::{SharedAttributionCallback, ToolConsumer};
-use crate::types::SharedApiKeyProvider;
+use crate::types::{ApiCredential, ApiTransportProfile, SharedApiKeyProvider};
 use async_openai::types::responses as rs;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 /// A minimal, purpose-built HTTP client for calling the Responses API
@@ -11,6 +11,8 @@ pub struct WebSearchClient {
     base_url: String,
     model: String,
     api_key_provider: Option<SharedApiKeyProvider>,
+    provider_scoped: bool,
+    transport_profile: ApiTransportProfile,
     /// Optional 401-attribution hook. Callers can wire this so a 401
     /// from the Responses API emits an `auth_401_attribution` event
     /// with `consumer == "WebSearch"`.
@@ -22,7 +24,7 @@ impl WebSearchClient {
     /// Returns `Err` if the config is `Disabled` or if header values are invalid.
     pub fn new(
         config: &WebSearchConfig,
-        api_key_provider: Option<SharedApiKeyProvider>,
+        default_api_key_provider: Option<SharedApiKeyProvider>,
     ) -> Result<Self, xai_tool_runtime::ToolError> {
         let WebSearchConfig::Enabled {
             api_key,
@@ -30,6 +32,7 @@ impl WebSearchClient {
             model,
             extra_headers,
             alpha_test_key,
+            api_key_provider,
         } = config
         else {
             return Err(xai_tool_runtime::ToolError::execution(
@@ -64,21 +67,33 @@ impl WebSearchClient {
             headers.insert(header_name, header_value);
         }
         let _ = alpha_test_key;
-        let http = xai_grok_extra_ca::with_extra_root_certificates(
-            reqwest::Client::builder().default_headers(headers),
-        )
-        .build()
-        .map_err(|_| {
-            xai_tool_runtime::ToolError::execution(
-                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                "Failed to build HTTP client.".to_string(),
-            )
-        })?;
+        let provider_scoped = api_key_provider.is_some();
+        let transport_profile = api_key_provider
+            .as_ref()
+            .map(|provider| provider.transport_profile())
+            .unwrap_or_default();
+        let mut http_builder = reqwest::Client::builder().default_headers(headers);
+        if provider_scoped {
+            // A provider-scoped credential is valid only for the configured
+            // Responses endpoint. Do not let bearer/account headers follow a
+            // same-origin path redirect or escape to another origin.
+            http_builder = http_builder.redirect(reqwest::redirect::Policy::none());
+        }
+        let http = xai_grok_extra_ca::with_extra_root_certificates(http_builder)
+            .build()
+            .map_err(|_| {
+                xai_tool_runtime::ToolError::execution(
+                    xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+                    "Failed to build HTTP client.".to_string(),
+                )
+            })?;
         Ok(Self {
             http,
             base_url: base_url.clone(),
             model: model.clone(),
-            api_key_provider,
+            api_key_provider: api_key_provider.clone().or(default_api_key_provider),
+            provider_scoped,
+            transport_profile,
             attribution_callback: None,
         })
     }
@@ -91,8 +106,8 @@ impl WebSearchClient {
         self.attribution_callback = callback;
         self
     }
-    async fn current_bearer(&self) -> Option<String> {
-        crate::types::api_key_provider::resolve_bearer(self.api_key_provider.as_ref()).await
+    async fn current_credential(&self) -> Option<ApiCredential> {
+        crate::types::api_key_provider::resolve_credential(self.api_key_provider.as_ref()).await
     }
     async fn compare_sent_credential(
         &self,
@@ -110,6 +125,101 @@ impl WebSearchClient {
             ToolConsumer::WebSearch,
             comparison,
         );
+    }
+
+    async fn execute_authenticated<T: serde::Serialize + ?Sized>(
+        &self,
+        url: &str,
+        body: &T,
+    ) -> Result<reqwest::Response, xai_tool_runtime::ToolError> {
+        let mut recovered_once = false;
+        loop {
+            let request = self.build_authenticated_request(url, body).await?;
+            let sent_bearer = crate::types::api_key_provider::request_credential(&request);
+            let response = self.http.execute(request).await.map_err(|_| {
+                xai_tool_runtime::ToolError::execution(
+                    xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+                    "Responses API transport failed.".to_string(),
+                )
+            })?;
+            let status = response.status();
+            if !crate::types::api_key_provider::is_auth_failure(status) {
+                return Ok(response);
+            }
+
+            let comparison = self.compare_sent_credential(sent_bearer.as_deref()).await;
+            self.record_401_attribution(comparison);
+            drop(response);
+
+            let provider_owns_auth_retry = status == reqwest::StatusCode::UNAUTHORIZED
+                && self.provider_scoped
+                && self.transport_profile == ApiTransportProfile::CodexResponses;
+            if !recovered_once
+                && provider_owns_auth_retry
+                && let Some(rejected_bearer) = sent_bearer.as_deref()
+                && crate::types::api_key_provider::recover_rejected_bearer(
+                    self.api_key_provider.as_ref(),
+                    rejected_bearer,
+                )
+                .await
+            {
+                recovered_once = true;
+                continue;
+            }
+
+            return Err(xai_tool_runtime::ToolError::unauthorized(format!(
+                "Responses API authentication failed (HTTP {status})."
+            ))
+            .with_details(serde_json::json!({
+                "tool_id": "web_search",
+                "status": status.as_u16(),
+                (crate::types::PROVIDER_AUTH_RETRY_HANDLED_DETAILS_KEY): provider_owns_auth_retry,
+            })));
+        }
+    }
+
+    async fn build_authenticated_request<T: serde::Serialize + ?Sized>(
+        &self,
+        url: &str,
+        body: &T,
+    ) -> Result<reqwest::Request, xai_tool_runtime::ToolError> {
+        let live_credential = self.current_credential().await;
+        if self.provider_scoped && live_credential.is_none() {
+            return Err(xai_tool_runtime::ToolError::unauthorized(
+                "Provider-scoped web search credential is unavailable.".to_string(),
+            ));
+        }
+        let mut request = self.http.post(url).json(body).build().map_err(|_| {
+            xai_tool_runtime::ToolError::execution(
+                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+                "Failed to build HTTP request.".to_string(),
+            )
+        })?;
+        if let Some(credential) = live_credential {
+            let authorization =
+                HeaderValue::from_str(&format!("Bearer {}", credential.access_token)).map_err(
+                    |_| {
+                        xai_tool_runtime::ToolError::execution(
+                            xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+                            "Provider returned an invalid bearer credential.".to_string(),
+                        )
+                    },
+                )?;
+            request.headers_mut().insert(AUTHORIZATION, authorization);
+            let account_header = HeaderName::from_static("chatgpt-account-id");
+            if let Some(account_id) = credential.account_id {
+                let account_id = HeaderValue::from_str(&account_id).map_err(|_| {
+                    xai_tool_runtime::ToolError::execution(
+                        xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+                        "Provider returned an invalid account identifier.".to_string(),
+                    )
+                })?;
+                request.headers_mut().insert(account_header, account_id);
+            } else {
+                request.headers_mut().remove(account_header);
+            }
+        }
+        Ok(request)
     }
     /// Perform a web search query using the Responses API.
     ///
@@ -129,52 +239,25 @@ impl WebSearchClient {
                     format!("Failed to build web search tool: {e}"),
                 )
             })?;
-        let request = rs::CreateResponseArgs::default()
+        let mut request_builder = rs::CreateResponseArgs::default();
+        request_builder
             .model(self.model.clone())
             .input(query.to_string())
             .tools(vec![rs::Tool::WebSearch(web_search)])
             .store(false)
-            .temperature(0.1)
-            .top_p(0.95)
-            .max_output_tokens(8192u32)
-            .build()
-            .map_err(|e| {
-                xai_tool_runtime::ToolError::execution(
-                    xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                    format!("Failed to build request: {e}"),
-                )
-            })?;
+            .max_output_tokens(8192u32);
+        if self.transport_profile != ApiTransportProfile::CodexResponses {
+            request_builder.temperature(0.1).top_p(0.95);
+        }
+        let request = request_builder.build().map_err(|e| {
+            xai_tool_runtime::ToolError::execution(
+                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+                format!("Failed to build request: {e}"),
+            )
+        })?;
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
-        let sent_bearer = self.current_bearer().await;
-        let mut req = self.http.post(&url).json(&request);
-        if let Some(ref key) = sent_bearer {
-            req = req.header(AUTHORIZATION, format!("Bearer {key}"));
-        }
-        let request = req.build().map_err(|_| {
-            xai_tool_runtime::ToolError::execution(
-                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                "Failed to build HTTP request.".to_string(),
-            )
-        })?;
-        let sent_bearer = crate::types::api_key_provider::request_credential(&request);
-        let response = self.http.execute(request).await.map_err(|_| {
-            xai_tool_runtime::ToolError::execution(
-                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                "Responses API transport failed.".to_string(),
-            )
-        })?;
+        let response = self.execute_authenticated(&url, &request).await?;
         let status = response.status();
-        if crate::types::api_key_provider::is_auth_failure(status) {
-            let comparison = self.compare_sent_credential(sent_bearer.as_deref()).await;
-            self.record_401_attribution(comparison);
-            return Err(xai_tool_runtime::ToolError::unauthorized(format!(
-                "Responses API authentication failed (HTTP {status})."
-            ))
-            .with_details(serde_json::json!({
-                "tool_id": "web_search",
-                "status": status.as_u16(),
-            })));
-        }
         if !status.is_success() {
             return Err(xai_tool_runtime::ToolError::execution(
                 xai_tool_protocol::ToolId::new("web_search").expect("valid"),
@@ -220,52 +303,25 @@ impl WebSearchClient {
                     format!("Failed to build web search tool: {e}"),
                 )
             })?;
-        let request = rs::CreateResponseArgs::default()
+        let mut request_builder = rs::CreateResponseArgs::default();
+        request_builder
             .model(self.model.clone())
             .input(query.to_string())
             .tools(vec![rs::Tool::WebSearch(web_search)])
             .store(false)
-            .temperature(0.1)
-            .top_p(0.95)
-            .max_output_tokens(8192u32)
-            .build()
-            .map_err(|e| {
-                xai_tool_runtime::ToolError::execution(
-                    xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                    format!("Failed to build request: {e}"),
-                )
-            })?;
+            .max_output_tokens(8192u32);
+        if self.transport_profile != ApiTransportProfile::CodexResponses {
+            request_builder.temperature(0.1).top_p(0.95);
+        }
+        let request = request_builder.build().map_err(|e| {
+            xai_tool_runtime::ToolError::execution(
+                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+                format!("Failed to build request: {e}"),
+            )
+        })?;
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
-        let sent_bearer = self.current_bearer().await;
-        let mut req = self.http.post(&url).json(&request);
-        if let Some(ref key) = sent_bearer {
-            req = req.header(AUTHORIZATION, format!("Bearer {key}"));
-        }
-        let request = req.build().map_err(|_| {
-            xai_tool_runtime::ToolError::execution(
-                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                "Failed to build HTTP request.".to_string(),
-            )
-        })?;
-        let sent_bearer = crate::types::api_key_provider::request_credential(&request);
-        let response = self.http.execute(request).await.map_err(|_| {
-            xai_tool_runtime::ToolError::execution(
-                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                "Responses API transport failed.".to_string(),
-            )
-        })?;
+        let response = self.execute_authenticated(&url, &request).await?;
         let status = response.status();
-        if crate::types::api_key_provider::is_auth_failure(status) {
-            let comparison = self.compare_sent_credential(sent_bearer.as_deref()).await;
-            self.record_401_attribution(comparison);
-            return Err(xai_tool_runtime::ToolError::unauthorized(format!(
-                "Responses API authentication failed (HTTP {status})."
-            ))
-            .with_details(serde_json::json!({
-                "tool_id": "web_search",
-                "status": status.as_u16(),
-            })));
-        }
         if !status.is_success() {
             return Err(xai_tool_runtime::ToolError::execution(
                 xai_tool_protocol::ToolId::new("web_search").expect("valid"),
@@ -367,6 +423,7 @@ mod tests {
             model: "custom-enterprise-model".to_string(),
             extra_headers: IndexMap::new(),
             alpha_test_key: None,
+            api_key_provider: None,
         };
         let client = WebSearchClient::new(&config, None).expect("client should build");
         assert_eq!(client.model, "custom-enterprise-model");
@@ -401,6 +458,7 @@ mod tests {
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
             alpha_test_key: None,
+            api_key_provider: None,
         };
         let client = WebSearchClient::new(&config, None)
             .expect("client should build")
@@ -425,6 +483,7 @@ mod tests {
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
             alpha_test_key: None,
+            api_key_provider: None,
         };
         let client = WebSearchClient::new(&config, None).expect("client should build");
         client.record_401_attribution(xai_grok_auth::CredentialComparison::same_as_current());
@@ -640,6 +699,303 @@ mod tests {
             None
         }
     }
+    struct ScopedProvider;
+    impl crate::types::ApiKeyProvider for ScopedProvider {
+        fn current_api_key(&self) -> Option<String> {
+            Some("codex-key".to_string())
+        }
+
+        fn transport_profile(&self) -> ApiTransportProfile {
+            ApiTransportProfile::CodexResponses
+        }
+
+        fn current_credential_async(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<ApiCredential>> + Send + '_>>
+        {
+            Box::pin(std::future::ready(Some(ApiCredential {
+                access_token: "codex-key".to_string(),
+                account_id: Some("codex-account".to_string()),
+            })))
+        }
+    }
+
+    #[derive(Default)]
+    struct RecoveringCodexProvider {
+        recovered: std::sync::atomic::AtomicBool,
+        recovery_calls: std::sync::atomic::AtomicUsize,
+    }
+    impl RecoveringCodexProvider {
+        fn credential(&self) -> ApiCredential {
+            if self.recovered.load(std::sync::atomic::Ordering::SeqCst) {
+                ApiCredential {
+                    access_token: "fresh-codex-key".to_string(),
+                    account_id: Some("fresh-codex-account".to_string()),
+                }
+            } else {
+                ApiCredential {
+                    access_token: "rejected-codex-key".to_string(),
+                    account_id: Some("rejected-codex-account".to_string()),
+                }
+            }
+        }
+    }
+    impl crate::types::ApiKeyProvider for RecoveringCodexProvider {
+        fn current_api_key(&self) -> Option<String> {
+            Some(self.credential().access_token)
+        }
+
+        fn transport_profile(&self) -> ApiTransportProfile {
+            ApiTransportProfile::CodexResponses
+        }
+
+        fn current_credential_async(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<ApiCredential>> + Send + '_>>
+        {
+            Box::pin(std::future::ready(Some(self.credential())))
+        }
+
+        fn recover_rejected_credential_async<'a>(
+            &'a self,
+            rejected_bearer: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            Box::pin(async move {
+                self.recovery_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if rejected_bearer != "rejected-codex-key" {
+                    return false;
+                }
+                !self
+                    .recovered
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            })
+        }
+    }
+    struct GenericScopedProvider;
+    impl crate::types::ApiKeyProvider for GenericScopedProvider {
+        fn current_api_key(&self) -> Option<String> {
+            Some("generic-key".to_string())
+        }
+    }
+
+    fn successful_search_response(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "resp_test",
+            "object": "response",
+            "created_at": 1234567890,
+            "status": "completed",
+            "model": "test-model",
+            "output": [{
+                "type": "message",
+                "id": "msg_1",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": text,
+                    "annotations": []
+                }]
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn codex_web_search_omits_unsupported_sampling_parameters() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(successful_search_response("codex result")),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let scoped: SharedApiKeyProvider = std::sync::Arc::new(ScopedProvider);
+        let config = WebSearchConfig::Enabled {
+            api_key: "stale-codex-key".to_string(),
+            base_url: server.uri(),
+            model: "codex-model".to_string(),
+            extra_headers: IndexMap::new(),
+            alpha_test_key: None,
+            api_key_provider: Some(scoped),
+        };
+        let client = WebSearchClient::new(&config, None).expect("client should build");
+        client.search("first query", None).await.unwrap();
+        client
+            .search_with_titles("second query", None)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert!(
+                body.get("temperature").is_none(),
+                "Codex request must omit temperature: {body}"
+            );
+            assert!(
+                body.get("top_p").is_none(),
+                "Codex request must omit top_p: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_web_search_recovers_scoped_401_for_both_entry_points() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for with_titles in [false, true] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/responses"))
+                .and(header("Authorization", "Bearer rejected-codex-key"))
+                .and(header("chatgpt-account-id", "rejected-codex-account"))
+                .respond_with(ResponseTemplate::new(401))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/responses"))
+                .and(header("Authorization", "Bearer fresh-codex-key"))
+                .and(header("chatgpt-account-id", "fresh-codex-account"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(successful_search_response("recovered result")),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let provider = std::sync::Arc::new(RecoveringCodexProvider::default());
+            let scoped: SharedApiKeyProvider = provider.clone();
+            let config = WebSearchConfig::Enabled {
+                api_key: "snapshot-codex-key".to_string(),
+                base_url: server.uri(),
+                model: "codex-model".to_string(),
+                extra_headers: IndexMap::new(),
+                alpha_test_key: None,
+                api_key_provider: Some(scoped),
+            };
+            let client = WebSearchClient::new(&config, None).expect("client should build");
+
+            let content = if with_titles {
+                client
+                    .search_with_titles("query", None)
+                    .await
+                    .expect("titled search should recover")
+                    .0
+            } else {
+                client
+                    .search("query", None)
+                    .await
+                    .expect("search should recover")
+                    .0
+            };
+            assert_eq!(content, "recovered result");
+            assert_eq!(
+                provider
+                    .recovery_calls
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_web_search_scoped_401_recovery_retries_only_once() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("Authorization", "Bearer rejected-codex-key"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("Authorization", "Bearer fresh-codex-key"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = std::sync::Arc::new(RecoveringCodexProvider::default());
+        let scoped: SharedApiKeyProvider = provider.clone();
+        let config = WebSearchConfig::Enabled {
+            api_key: "snapshot-codex-key".to_string(),
+            base_url: server.uri(),
+            model: "codex-model".to_string(),
+            extra_headers: IndexMap::new(),
+            alpha_test_key: None,
+            api_key_provider: Some(scoped),
+        };
+        let client = WebSearchClient::new(&config, None).expect("client should build");
+
+        let error = client.search("query", None).await.unwrap_err();
+        assert!(error.to_string().contains("HTTP 401"));
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(
+                    |details| details.get(crate::types::PROVIDER_AUTH_RETRY_HANDLED_DETAILS_KEY)
+                )
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "session-wide auth retry must not replace the exhausted scoped credential"
+        );
+        assert_eq!(
+            provider
+                .recovery_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn generic_web_search_preserves_sampling_parameters() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(successful_search_response("generic result")),
+            )
+            .mount(&server)
+            .await;
+        let config = WebSearchConfig::Enabled {
+            api_key: "generic-key".to_string(),
+            base_url: server.uri(),
+            model: "generic-model".to_string(),
+            extra_headers: IndexMap::new(),
+            alpha_test_key: None,
+            api_key_provider: Some(std::sync::Arc::new(GenericScopedProvider)),
+        };
+        let client = WebSearchClient::new(&config, None).expect("client should build");
+        client.search("generic query", None).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body.get("temperature"), Some(&serde_json::json!(0.1)));
+        assert_eq!(body.get("top_p"), Some(&serde_json::json!(0.95)));
+    }
     /// When the dynamic provider returns `None`, the static `api_key`
     /// from config must still be sent as the Authorization header.
     /// This is a regression scenario: API-key users
@@ -678,6 +1034,7 @@ mod tests {
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
             alpha_test_key: None,
+            api_key_provider: None,
         };
         let provider: SharedApiKeyProvider = std::sync::Arc::new(NoneProvider);
         let client = WebSearchClient::new(&config, Some(provider)).expect("client should build");
@@ -728,6 +1085,7 @@ mod tests {
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
             alpha_test_key: None,
+            api_key_provider: None,
         };
         let provider: SharedApiKeyProvider = std::sync::Arc::new(FreshProvider);
         let client = WebSearchClient::new(&config, Some(provider)).expect("client should build");
@@ -736,6 +1094,211 @@ mod tests {
             .await
             .expect("search must succeed with provider key");
         assert_eq!(content, "fresh result");
+    }
+
+    /// A model-scoped provider must win over the session-wide default. Codex
+    /// web search uses this boundary so an xAI session token can never replace
+    /// its refreshed OpenAI bearer on a request to the Codex endpoint.
+    #[tokio::test]
+    async fn provider_scoped_key_wins_over_default_provider() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        struct StaticProvider(&'static str);
+        impl crate::types::ApiKeyProvider for StaticProvider {
+            fn current_api_key(&self) -> Option<String> {
+                Some(self.0.to_string())
+            }
+        }
+
+        struct RefreshingScopedProvider;
+        impl crate::types::ApiKeyProvider for RefreshingScopedProvider {
+            fn current_api_key(&self) -> Option<String> {
+                Some("stale-codex-key".to_string())
+            }
+
+            fn current_api_key_async(
+                &self,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + '_>>
+            {
+                Box::pin(std::future::ready(Some("refreshed-codex-key".to_string())))
+            }
+
+            fn current_credential_async(
+                &self,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Option<ApiCredential>> + Send + '_>,
+            > {
+                Box::pin(std::future::ready(Some(ApiCredential {
+                    access_token: "refreshed-codex-key".to_string(),
+                    account_id: Some("refreshed-codex-account".to_string()),
+                })))
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("Authorization", "Bearer refreshed-codex-key"))
+            .and(header("chatgpt-account-id", "refreshed-codex-account"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_test",
+                "object": "response",
+                "created_at": 1234567890,
+                "status": "completed",
+                "model": "test-model",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_1",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "provider scoped result",
+                        "annotations": []
+                    }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let scoped: SharedApiKeyProvider = std::sync::Arc::new(RefreshingScopedProvider);
+        let default: SharedApiKeyProvider = std::sync::Arc::new(StaticProvider("xai-session-key"));
+        let extra_headers = IndexMap::from([(
+            "chatgpt-account-id".to_string(),
+            "stale-codex-account".to_string(),
+        )]);
+        let config = WebSearchConfig::Enabled {
+            api_key: "snapshot-codex-key".to_string(),
+            base_url: server.uri(),
+            model: "test-model".to_string(),
+            extra_headers,
+            alpha_test_key: None,
+            api_key_provider: Some(scoped),
+        };
+        let client = WebSearchClient::new(&config, Some(default)).expect("client should build");
+        let (content, _) = client
+            .search("test query", None)
+            .await
+            .expect("scoped provider must authenticate the request");
+        assert_eq!(content, "provider scoped result");
+    }
+
+    #[tokio::test]
+    async fn missing_scoped_key_fails_closed_without_using_default_provider() {
+        struct DefaultProvider;
+        impl crate::types::ApiKeyProvider for DefaultProvider {
+            fn current_api_key(&self) -> Option<String> {
+                Some("xai-session-key".to_string())
+            }
+        }
+
+        let server = wiremock::MockServer::start().await;
+        let scoped: SharedApiKeyProvider = std::sync::Arc::new(NoneProvider);
+        let default: SharedApiKeyProvider = std::sync::Arc::new(DefaultProvider);
+        let config = WebSearchConfig::Enabled {
+            api_key: "stale-codex-snapshot".to_string(),
+            base_url: server.uri(),
+            model: "test-model".to_string(),
+            extra_headers: IndexMap::from([(
+                "chatgpt-account-id".to_string(),
+                "stale-codex-account".to_string(),
+            )]),
+            alpha_test_key: None,
+            api_key_provider: Some(scoped),
+        };
+        let client = WebSearchClient::new(&config, Some(default)).expect("client should build");
+        let error = client.search("test query", None).await.unwrap_err();
+        assert!(
+            error.to_string().contains("credential is unavailable"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "a missing scoped credential must not fall back to the session-wide bearer"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_scoped_search_does_not_follow_same_origin_redirect() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/responses"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer codex-key",
+            ))
+            .and(wiremock::matchers::header(
+                "chatgpt-account-id",
+                "codex-account",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(307).insert_header("Location", "/outside-codex"),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/outside-codex"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let scoped: SharedApiKeyProvider = std::sync::Arc::new(ScopedProvider);
+        let config = WebSearchConfig::Enabled {
+            api_key: "stale-codex-key".to_string(),
+            base_url: server.uri(),
+            model: "test-model".to_string(),
+            extra_headers: IndexMap::new(),
+            alpha_test_key: None,
+            api_key_provider: Some(scoped),
+        };
+        let client = WebSearchClient::new(&config, None).expect("client should build");
+        let error = client.search("test query", None).await.unwrap_err();
+        assert!(error.to_string().contains("HTTP 307"));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/outside-codex")
+                .count(),
+            0,
+            "provider-scoped credentials must not follow redirects outside the fixed path"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_scoped_search_does_not_follow_cross_origin_redirect() {
+        let sink = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&sink)
+            .await;
+        let source = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/responses"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(307)
+                    .insert_header("Location", format!("{}/capture", sink.uri())),
+            )
+            .mount(&source)
+            .await;
+
+        let scoped: SharedApiKeyProvider = std::sync::Arc::new(ScopedProvider);
+        let config = WebSearchConfig::Enabled {
+            api_key: "stale-codex-key".to_string(),
+            base_url: source.uri(),
+            model: "test-model".to_string(),
+            extra_headers: IndexMap::new(),
+            alpha_test_key: None,
+            api_key_provider: Some(scoped),
+        };
+        let client = WebSearchClient::new(&config, None).expect("client should build");
+        let error = client.search("test query", None).await.unwrap_err();
+        assert!(error.to_string().contains("HTTP 307"));
+        assert!(
+            sink.received_requests().await.unwrap().is_empty(),
+            "provider-scoped credential metadata must not cross an origin redirect"
+        );
     }
 
     #[derive(Debug)]
@@ -787,6 +1350,7 @@ mod tests {
             model: "test-model".into(),
             extra_headers: IndexMap::new(),
             alpha_test_key: None,
+            api_key_provider: None,
         };
         let client = WebSearchClient::new(&config, Some(provider))
             .unwrap()
@@ -812,6 +1376,7 @@ mod tests {
             model: "test-model".into(),
             extra_headers: IndexMap::new(),
             alpha_test_key: None,
+            api_key_provider: None,
         };
         let client = WebSearchClient::new(&config, None).unwrap();
         let error = client.search("query", None).await.unwrap_err().to_string();

@@ -60,6 +60,9 @@ impl xai_grok_tools::implementations::grok_build::task::coordinator::ChildRunner
                     snapshot_ref: None,
                 };
             };
+            ctx.web_search_sampling_config = this
+                .prepare_web_search_sampling_config_preflight()
+                .await;
             let parent_handle = {
                 let parent_sid = acp::SessionId::new(parent_sid);
                 this.sessions.borrow().get(&parent_sid).cloned()

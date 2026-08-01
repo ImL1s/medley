@@ -1960,6 +1960,14 @@ impl SessionActor {
         let mut identical_tool_calls = IdenticalToolCallRun::default();
         let mut todo_gate_fires: u32 = 0;
         let mut auth_retry_schedule = AuthRetrySchedule::new();
+        let codex_backend = self
+            .chat_state_handle
+            .get_sampling_config()
+            .await
+            .is_some_and(|config| {
+                config.api_backend == xai_grok_sampling_types::ApiBackend::CodexResponses
+            });
+        let mut codex_retry_budget = Codex401RetryBudget::new();
         let mut turn_span_totals = TurnSpanTotals::default();
         let mut model_fingerprint: Option<String> = None;
         let mut structured_output_retries: u32 = 0;
@@ -2188,7 +2196,10 @@ impl SessionActor {
                 })),
             );
             let model_timer = std::time::Instant::now();
-            let (response, latency) = match self.run_turn_via_sampler(request.clone()).await {
+            let (response, latency) = match self
+                .run_turn_via_sampler(request.clone(), codex_retry_budget.available())
+                .await
+            {
                 Ok(SamplerTurnOutcome::Response(r, latency)) => (r, latency),
                 Err(error) => {
                     self.tool_context.fail_task_output_usage_closed();
@@ -2199,6 +2210,32 @@ impl SessionActor {
                     continue;
                 }
                 Ok(SamplerTurnOutcome::RefreshAuthAndResubmit { credential, store }) => {
+                    if codex_backend && store == RecoveredStore::AuthProvider {
+                        let consumed = codex_retry_budget.consume();
+                        debug_assert!(consumed);
+                        tracing::warn!(
+                            "auth 401 retry: resubmitting Codex request once with refreshed auth"
+                        );
+                        xai_grok_telemetry::unified_log::warn(
+                            "shell.turn.codex_auth_retry",
+                            Some(self.session_info.id.0.as_ref()),
+                            Some(serde_json::json!({
+                                "loop_index": loop_index,
+                                "attempt": 1,
+                                "max_retries": 1,
+                            })),
+                        );
+                        self.send_xai_notification(XaiSessionUpdate::RetryState(
+                            crate::extensions::notification::RetryState::Retrying {
+                                attempt: 1,
+                                max_retries: 1,
+                                reason: "Re-authenticated OpenAI Codex after 401; retrying request"
+                                    .to_string(),
+                            },
+                        ))
+                        .await;
+                        continue;
+                    }
                     if auth_retry_schedule.reset_if_incident_spans_suspend() {
                         tracing::info!("auth 401 retry: incident spanned a suspend; budget reset");
                         xai_grok_telemetry::unified_log::info(

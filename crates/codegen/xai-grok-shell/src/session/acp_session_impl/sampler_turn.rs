@@ -14,12 +14,20 @@ use super::*;
 /// going through the structured `HttpFailure` path (e.g. JSON-only
 /// `invalid_token` payloads, BYOK key-validation messages).
 pub(super) fn is_auth_tool_error(err: &xai_tool_runtime::ToolError) -> bool {
-    if let Some(details) = &err.details
-        && let Some(status) = details
+    if let Some(details) = &err.details {
+        if details
+            .get(xai_grok_tools::types::PROVIDER_AUTH_RETRY_HANDLED_DETAILS_KEY)
+            .and_then(|handled| handled.as_bool())
+            == Some(true)
+        {
+            return false;
+        }
+        if let Some(status) = details
             .get(HTTP_STATUS_DETAILS_KEY)
             .and_then(|s| s.as_u64())
-    {
-        return status == 401;
+        {
+            return status == 401;
+        }
     }
     let lower = err.to_string().to_ascii_lowercase();
     lower.contains("unauthorized")
@@ -316,16 +324,30 @@ impl SessionActor {
             crate::auth::ProviderRefreshOutcome::Unusable => {}
         }
     }
-    /// 401 arm for a provider-backed model: re-run the helper once and
-    /// resubmit. A missing key means the cold mint failed and the request
-    /// went out unauthenticated, so mint instead. Returns `false` when the
-    /// fresh-mint guard blocked the re-run or the helper failed; the 401
-    /// then surfaces as a terminal error.
-    async fn try_provider_401_recovery(&self, provider: &crate::auth::AuthProviderRef) -> bool {
-        let rejected_key = self.chat_state_handle.get_credentials().await.api_key;
-        let recovered = match rejected_key {
-            Some(ref rejected_key) => provider.recover_rejected_token(rejected_key).await,
-            None => provider.ensure_fresh_token(None).await.rotated(),
+    /// 401 arm for a provider-backed model. Recovery is based on the
+    /// credential relationship captured from the actual rejected request,
+    /// never chat-state's potentially stale snapshot.
+    async fn try_provider_401_recovery(
+        &self,
+        provider: &crate::auth::AuthProviderRef,
+        request_credential: xai_grok_sampling_types::SentCredential,
+    ) -> bool {
+        let cached = provider.cached_token();
+        let action = provider_401_recovery_action(request_credential, cached.is_some());
+        let recovered = match action {
+            Provider401RecoveryAction::AdoptCached => cached,
+            Provider401RecoveryAction::RefreshServerRejected => {
+                provider
+                    .recover_rejected_token(
+                        cached
+                            .as_deref()
+                            .expect("recovery action requires a current provider credential"),
+                    )
+                    .await
+            }
+            Provider401RecoveryAction::EnsureFresh => {
+                provider.ensure_fresh_token(None).await.rotated()
+            }
         };
         let Some(new_key) = recovered else {
             tracing::warn!(
@@ -442,7 +464,7 @@ impl SessionActor {
             });
         let creds = self.chat_state_handle.get_credentials().await;
         let catalog_model_id = self.catalog_model_id_str();
-        let model_facts = self.model_auth_facts(&catalog_model_id);
+        let (model_facts, model_auth_provider) = self.model_auth_state(&catalog_model_id);
         let auth_method = self.auth_method_id.load();
         let gate = SessionTokenAuthGate::new(
             auth_method.as_deref(),
@@ -457,21 +479,26 @@ impl SessionActor {
         // also stay credential-free at turn reconstruct — this is the final
         // wire choke point (chat-state does not persist readiness).
         let mut auth_scheme = model_facts.auth_scheme;
-        let mut use_bearer_resolver =
+        let mut use_session_bearer_resolver =
             gate.active() && auth_scheme != xai_grok_sampler::AuthScheme::None;
+        let mut use_provider_bearer_resolver = cfg.api_backend
+            == xai_grok_sampling_types::ApiBackend::CodexResponses
+            && model_auth_provider.is_some()
+            && auth_scheme != xai_grok_sampler::AuthScheme::None;
         if !model_facts.ready {
             tracing::warn!(
                 model = %catalog_model_id,
                 "reconstruct_full_config: active model not ready; stripping credentials"
             );
             auth_scheme = xai_grok_sampler::AuthScheme::None;
-            use_bearer_resolver = false;
+            use_session_bearer_resolver = false;
+            use_provider_bearer_resolver = false;
         }
         self.log_auth_gate_unknown("reconstruct_full_config", gate, &cfg.base_url);
         // Refresh before taking the initial bearer snapshot. The dynamic
         // resolver handles later rotations, while this keeps the first request
         // from starting with a stale chat-state credential.
-        if use_bearer_resolver && let Some(am) = self.auth_manager.as_ref() {
+        if use_session_bearer_resolver && let Some(am) = self.auth_manager.as_ref() {
             let _ = am.auth().await;
         }
         let mut extra_headers = cfg.extra_headers;
@@ -510,7 +537,11 @@ impl SessionActor {
         // bearer; the resolver below supplies subsequent rotations.
         let api_key = if auth_scheme == xai_grok_sampler::AuthScheme::None {
             None
-        } else if use_bearer_resolver {
+        } else if use_provider_bearer_resolver {
+            model_auth_provider
+                .as_ref()
+                .and_then(crate::auth::AuthProviderRef::cached_token)
+        } else if use_session_bearer_resolver {
             self.auth_manager
                 .as_ref()
                 .and_then(|am| am.current_wire_valid().map(|a| a.key))
@@ -557,7 +588,11 @@ impl SessionActor {
             user_id,
             origin_client: self.origin_client.clone(),
             attribution_callback: self.attribution_callback.clone(),
-            bearer_resolver: if use_bearer_resolver {
+            bearer_resolver: if use_provider_bearer_resolver {
+                model_auth_provider
+                    .as_ref()
+                    .map(crate::auth::AuthProviderRef::bearer_resolver)
+            } else if use_session_bearer_resolver {
                 self.auth_manager.as_ref().map(|am| {
                     crate::auth::credential_provider::WireValidBearerResolver::shared(am.clone())
                 })
@@ -718,7 +753,7 @@ impl SessionActor {
             .as_ref()
             .map(|am| am.grok_com_config().api_key_auth_disabled())
             .unwrap_or(false);
-        crate::agent::config::resolve_aux_model_sampling_config(
+        crate::agent::config::resolve_aux_model_sampling_config_preflight(
             slug,
             &models,
             &endpoints,
@@ -727,6 +762,7 @@ impl SessionActor {
             creds.alpha_test_key.clone(),
             creds.client_version.clone(),
         )
+        .await
     }
     /// Resolve a dedicated sampler for the Auto-mode classifier model `slug`,
     /// stamping session-local auth/attribution like image-describe (which relies
@@ -817,6 +853,15 @@ impl SessionActor {
     pub(crate) async fn handle_sampling_failure(
         self: &Arc<Self>,
         error: xai_grok_sampler::SamplingErrorInfo,
+    ) -> Result<SamplerFailureRecovery, acp::Error> {
+        self.handle_sampling_failure_with_codex_retry_policy(error, true)
+            .await
+    }
+
+    pub(super) async fn handle_sampling_failure_with_codex_retry_policy(
+        self: &Arc<Self>,
+        error: xai_grok_sampler::SamplingErrorInfo,
+        codex_retry_available: bool,
     ) -> Result<SamplerFailureRecovery, acp::Error> {
         use xai_grok_sampler::SamplingErrorKind;
         let safe_provider_failure = || match error.status_code {
@@ -1023,14 +1068,27 @@ impl SessionActor {
                 None,
             );
         }
-        if let Some(ref provider) = auth_provider
-            && self.try_provider_401_recovery(provider).await
-        {
-            self.prepare_sampler_for_turn().await;
-            return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
-                credential: error.credential,
-                store: RecoveredStore::AuthProvider,
-            });
+        let is_codex_provider = auth_provider.as_ref().is_some_and(|provider| {
+            provider.name == crate::agent::model_providers::OPENAI_CODEX_PROVIDER_ID
+        });
+        let codex_retry_exhausted = is_codex_provider && !codex_retry_available;
+        if let Some(ref provider) = auth_provider {
+            if codex_retry_exhausted {
+                tracing::warn!(
+                    session_id = %self.session_info.id.0,
+                    provider = %provider.name,
+                    "auth recovery: Codex 401 retry already consumed; surfacing failure"
+                );
+            } else if self
+                .try_provider_401_recovery(provider, error.credential)
+                .await
+            {
+                self.prepare_sampler_for_turn().await;
+                return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
+                    credential: error.credential,
+                    store: RecoveredStore::AuthProvider,
+                });
+            }
         }
         if matches!(error.kind, SamplingErrorKind::IdleTimeout) {
             self.signals_handle().record_idle_timeout();
@@ -1135,7 +1193,24 @@ impl SessionActor {
         } else {
             error.kind.as_str()
         };
-        let (error_type, detailed_message) = if error_type == "auth"
+        let (error_type, detailed_message) = if codex_retry_exhausted {
+            (
+                "auth",
+                format!(
+                    "{detailed_message}\n\nOpenAI Codex rejected the refreshed credential. \
+                     Sign in again with `grok login --provider openai-codex`."
+                ),
+            )
+        } else if is_codex_provider && error_type == "auth" {
+            (
+                "auth",
+                format!(
+                    "{detailed_message}\n\nOpenAI Codex authentication could not recover. \
+                     Retry once after a network interruption; if it persists, sign in again with \
+                     `grok login --provider openai-codex`."
+                ),
+            )
+        } else if error_type == "auth"
             && self
                 .auth_manager
                 .as_ref()
@@ -1189,6 +1264,7 @@ impl SessionActor {
     pub(crate) async fn run_turn_via_sampler(
         self: &Arc<Self>,
         request: ConversationRequest,
+        codex_retry_available: bool,
     ) -> Result<SamplerTurnOutcome, acp::Error> {
         self.prepare_sampler_for_turn().await;
         let stream_drained_rx = {
@@ -1230,7 +1306,10 @@ impl SessionActor {
             Err(rich_err) => {
                 self.turn_stream_drained.lock().take();
                 let info = xai_grok_sampler::SamplingErrorInfo::from(&rich_err);
-                match self.handle_sampling_failure(info).await? {
+                match self
+                    .handle_sampling_failure_with_codex_retry_policy(info, codex_retry_available)
+                    .await?
+                {
                     SamplerFailureRecovery::CompactAndResubmit => {
                         Ok(SamplerTurnOutcome::CompactAndResubmit)
                     }
@@ -1251,9 +1330,22 @@ impl SessionActor {
     /// Soft failures with a still-usable access token still return here
     /// (grace / optimistic send); 401 recovery remains the safety net.
     pub(crate) async fn refresh_token_if_expired(&self) {
+        let current_model_id = self.catalog_model_id_str();
+        if let Some(provider) = self.model_auth_provider(&current_model_id)
+            && provider.name == crate::agent::model_providers::OPENAI_CODEX_PROVIDER_ID
+        {
+            let current_key = self.chat_state_handle.get_credentials().await.api_key;
+            self.refresh_provider_token_pre_turn(
+                &provider,
+                current_key.as_deref(),
+                &current_model_id,
+            )
+            .await;
+            return;
+        }
         if let Some(ref am) = self.auth_manager {
             let creds = self.chat_state_handle.get_credentials().await;
-            let catalog_model_id = self.catalog_model_id_str();
+            let catalog_model_id = current_model_id.clone();
             let base_url = self
                 .chat_state_handle
                 .get_sampling_config()
@@ -1308,7 +1400,6 @@ impl SessionActor {
         const REFRESH_THRESHOLD: chrono::Duration = chrono::Duration::minutes(5);
         let creds = self.chat_state_handle.get_credentials().await;
         let current_key = creds.api_key;
-        let current_model_id = self.catalog_model_id_str();
         if let Some(provider) = self.model_auth_provider(&current_model_id) {
             self.refresh_provider_token_pre_turn(
                 &provider,

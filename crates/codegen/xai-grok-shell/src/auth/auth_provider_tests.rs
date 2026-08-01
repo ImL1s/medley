@@ -6,6 +6,32 @@ use super::test_counting_provider as counting_provider;
 use super::*;
 
 #[tokio::test]
+async fn provider_bearer_resolver_returns_atomic_codex_credential() {
+    use xai_grok_sampler::BearerResolver as _;
+
+    let provider = AuthProviderRef::new(
+        "test-structured-resolver".to_owned(),
+        AuthProviderConfig {
+            command: "printf '%s' '{\"access_token\":\"codex-token\",\"account_id\":\"acct-123\"}'"
+                .to_owned(),
+            token_ttl_secs: Some(3600),
+            ..Default::default()
+        },
+    );
+    let credential = provider
+        .current_credential_async()
+        .await
+        .expect("request-boundary resolution mints a structured credential atomically");
+    assert_eq!(credential.access_token, "codex-token");
+    assert_eq!(credential.account_id.as_deref(), Some("acct-123"));
+    let cached = provider
+        .current_credential()
+        .expect("request-boundary resolution warms the provider cache");
+    assert_eq!(cached.access_token, "codex-token");
+    assert_eq!(cached.account_id.as_deref(), Some("acct-123"));
+}
+
+#[tokio::test]
 async fn provider_token_is_cached_while_fresh() {
     let dir = tempfile::tempdir().unwrap();
     let provider = counting_provider("test-cache", dir.path());

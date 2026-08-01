@@ -30,7 +30,7 @@ use xai_grok_sampling_types::{
 };
 
 use crate::config::{AuthScheme, OriginClientInfo, SamplerConfig};
-use xai_grok_auth::CredentialComparison;
+use xai_grok_auth::{CredentialComparison, SentCredentialRelation};
 
 /// Credential bytes from the final outbound header map. This value stays
 /// request-local, never implements `Debug`/`Serialize`, and is projected to a
@@ -46,6 +46,8 @@ const DEFAULT_CLIENT_IDENTIFIER: &str = "grok-shell";
 /// Product identifier baked into User-Agent strings.
 const AGENT_PRODUCT: &str = "grok-shell";
 const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 128_000;
+const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const CHATGPT_ACCOUNT_ID: HeaderName = HeaderName::from_static("chatgpt-account-id");
 
 fn should_send_xai_identity_headers(auth_scheme: AuthScheme, base_url: &str) -> bool {
     !matches!(auth_scheme, AuthScheme::None) && crate::util::is_xai_api_url(base_url)
@@ -54,6 +56,65 @@ fn should_send_xai_identity_headers(auth_scheme: AuthScheme, base_url: &str) -> 
 fn strip_xai_identity_headers(headers: &mut HeaderMap) {
     headers.remove(HeaderName::from_static("x-grok-deployment-id"));
     headers.remove(HeaderName::from_static("x-grok-user-id"));
+}
+
+fn normalize_codex_base_url(base_url: &str) -> Result<String> {
+    let url = reqwest::Url::parse(base_url)
+        .map_err(|_| SamplingError::InvalidConfiguration("invalid OpenAI Codex base URL"))?;
+    let is_production = url.scheme() == "https"
+        && url.host_str() == Some("chatgpt.com")
+        && url.port().is_none()
+        && url.path().trim_end_matches('/') == "/backend-api/codex"
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.username().is_empty()
+        && url.password().is_none();
+    if is_production {
+        return Ok(CODEX_BASE_URL.to_owned());
+    }
+
+    // Unit tests may point the transport at an in-process mock. This branch is
+    // compiled out of normal library builds, so production remains fail closed.
+    #[cfg(test)]
+    {
+        let is_loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"))
+            && matches!(url.scheme(), "http" | "https")
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && url.username().is_empty()
+            && url.password().is_none();
+        if is_loopback {
+            return Ok(base_url.trim_end_matches('/').to_owned());
+        }
+    }
+
+    Err(SamplingError::InvalidConfiguration(
+        "OpenAI Codex traffic must use https://chatgpt.com/backend-api/codex",
+    ))
+}
+
+fn retain_codex_headers(
+    headers: &mut HeaderMap,
+    authorization: Option<HeaderValue>,
+    account_id: Option<&str>,
+) {
+    let content_type = headers.get(CONTENT_TYPE).cloned();
+    let user_agent = headers.get(USER_AGENT).cloned();
+    headers.clear();
+    if let Some(value) = content_type {
+        headers.insert(CONTENT_TYPE, value);
+    }
+    if let Some(value) = user_agent {
+        headers.insert(USER_AGENT, value);
+    }
+    if let Some(value) = authorization {
+        headers.insert(AUTHORIZATION, value);
+    }
+    if let Some(account_id) = account_id
+        && let Ok(value) = HeaderValue::from_str(account_id)
+    {
+        headers.insert(CHATGPT_ACCOUNT_ID, value);
+    }
 }
 
 /// Per-request `x-grok-*` headers. Optional fields are skipped when empty/`None`.
@@ -576,15 +637,19 @@ pub fn user_agent_string_for(origin: &OriginClientInfo) -> String {
     }
 }
 
-/// Build a structured authentication failure from the request-local credential
-/// capture without exposing any credential bytes.
-fn auth_rejected(
-    message: impl Into<String>,
-    final_credential: &FinalRequestCredential,
-) -> SamplingError {
+/// Build a structured authentication failure from the secret-free comparison
+/// captured at the 401 response boundary. Raw request credentials stay local
+/// to [`FinalRequestCredential`] and never enter the error/event metadata.
+fn auth_rejected(message: impl Into<String>, comparison: CredentialComparison) -> SamplingError {
+    let credential = match comparison.relation {
+        SentCredentialRelation::NotSent => SentCredential::Missing,
+        SentCredentialRelation::CurrentUnavailable => SentCredential::CurrentUnavailable,
+        SentCredentialRelation::SameAsCurrent => SentCredential::SameAsCurrent,
+        SentCredentialRelation::DifferentFromCurrent => SentCredential::DifferentFromCurrent,
+    };
     SamplingError::Auth {
         message: message.into(),
-        credential: SentCredential::from_sent_fragment(final_credential.0.as_deref()),
+        credential,
     }
 }
 
@@ -600,6 +665,17 @@ impl SamplingClient {
     /// pre-computes the default request headers. This does not perform
     /// any network I/O.
     pub fn new(config: SamplerConfig) -> Result<Self> {
+        let is_codex = matches!(config.api_backend, ApiBackend::CodexResponses);
+        if is_codex && !config.query_params.is_empty() {
+            return Err(SamplingError::InvalidConfiguration(
+                "OpenAI Codex transport does not accept query parameters",
+            ));
+        }
+        let base_url = if is_codex {
+            normalize_codex_base_url(&config.base_url)?
+        } else {
+            config.base_url.clone()
+        };
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         if let Some(ref api_key) = config.api_key {
@@ -664,7 +740,7 @@ impl SamplingClient {
             );
         }
 
-        if should_send_xai_identity_headers(config.auth_scheme, &config.base_url) {
+        if should_send_xai_identity_headers(config.auth_scheme, &base_url) {
             if let Some(deployment_id) = config.deployment_id.as_ref()
                 && let Ok(header_value) = HeaderValue::from_str(deployment_id)
             {
@@ -710,7 +786,10 @@ impl SamplingClient {
             }
         }
 
-        let http = if config.force_http1 {
+        let http = if is_codex {
+            crate::shared_http::client_no_redirect(config.force_http1)
+                .map_err(SamplingError::from)?
+        } else if config.force_http1 {
             tracing::info!("Using HTTP/1.1 for sampling client (force_http1=true)");
             crate::shared_http::client_http1().map_err(SamplingError::from)?
         } else {
@@ -744,12 +823,12 @@ impl SamplingClient {
             doom_loop_recovery: config.doom_loop_recovery,
         };
 
-        let endpoint = EndpointTemplate::new(&config.base_url, &config.query_params);
+        let endpoint = EndpointTemplate::new(&base_url, &config.query_params);
 
         Ok(Self {
             http,
             default_headers: headers,
-            base_url: config.base_url,
+            base_url,
             defaults,
             attribution_callback: config.attribution_callback,
             bearer_resolver: config.bearer_resolver,
@@ -769,6 +848,10 @@ impl SamplingClient {
         should_send_xai_identity_headers(self.defaults.auth_scheme, &self.base_url)
     }
 
+    fn is_codex(&self) -> bool {
+        matches!(self.defaults.api_backend, ApiBackend::CodexResponses)
+    }
+
     /// POST with default headers, returning the builder plus the request-local
     /// credential from the final header map.
     ///
@@ -780,13 +863,15 @@ impl SamplingClient {
         url: impl reqwest::IntoUrl,
     ) -> (reqwest::RequestBuilder, FinalRequestCredential) {
         let mut headers = self.default_headers.clone();
+        let mut live_credential = None;
         if let Some(resolver) = &self.bearer_resolver {
             headers.remove(AUTHORIZATION);
             headers.remove(HeaderName::from_static("x-api-key"));
-            if let Some(fresh) = resolver.current_bearer() {
+            live_credential = resolver.current_credential();
+            if let Some(fresh) = live_credential.as_ref().map(|value| &value.access_token) {
                 match self.defaults.auth_scheme {
                     AuthScheme::XApiKey => {
-                        if let Ok(v) = HeaderValue::from_str(&fresh) {
+                        if let Ok(v) = HeaderValue::from_str(fresh) {
                             headers.insert(HeaderName::from_static("x-api-key"), v);
                         }
                     }
@@ -799,6 +884,10 @@ impl SamplingClient {
                 }
             }
         }
+        let codex_authorization = self
+            .is_codex()
+            .then(|| headers.get(AUTHORIZATION).cloned())
+            .flatten();
         if let Some(injector) = &self.header_injector {
             injector.inject(&mut headers);
         }
@@ -810,6 +899,15 @@ impl SamplingClient {
         }
         if !self.sends_xai_identity_headers() {
             strip_xai_identity_headers(&mut headers);
+        }
+        if self.is_codex() {
+            retain_codex_headers(
+                &mut headers,
+                codex_authorization,
+                live_credential
+                    .as_ref()
+                    .and_then(|credential| credential.account_id.as_deref()),
+            );
         }
         let final_credential = FinalRequestCredential(
             Self::sent_credential_from_headers(&headers, self.defaults.auth_scheme)
@@ -826,7 +924,7 @@ impl SamplingClient {
             has_authorization_header = headers.get(AUTHORIZATION).is_some(),
             has_x_api_key_header = headers.get(HeaderName::from_static("x-api-key")).is_some(),
             sent_credential_present = final_credential.0.is_some(),
-            current_credential_present = self.current_credential_present(),
+            current_credential_present = final_credential.0.is_some(),
         );
         (self.http.post(url).headers(headers), final_credential)
     }
@@ -890,13 +988,12 @@ impl SamplingClient {
         &self,
         consumer: crate::attribution::SamplingConsumer,
         final_credential: &FinalRequestCredential,
-    ) {
+    ) -> CredentialComparison {
+        let comparison = self.compare_final_request_credential(final_credential);
         if let Some(cb) = self.attribution_callback.as_ref() {
-            cb.record_401(
-                consumer,
-                self.compare_final_request_credential(final_credential),
-            );
+            cb.record_401(consumer, comparison);
         }
+        comparison
     }
 
     pub fn auth_info(&self) -> crate::sampling_log::AuthInfo {
@@ -966,14 +1063,14 @@ impl SamplingClient {
 
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
-                self.record_401_attribution(
+                let comparison = self.record_401_attribution(
                     crate::attribution::SamplingConsumer::ChatCompletions,
                     &final_credential,
                 );
                 let server_message = user_facing_api_error_message(status, bytes.as_ref());
                 return Err(auth_rejected(
                     format!("Unauthorized (401): {server_message}"),
-                    &final_credential,
+                    comparison,
                 ));
             }
             let message = user_facing_api_error_message(status, bytes.as_ref());
@@ -1108,7 +1205,7 @@ impl SamplingClient {
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 span.record("error", "unauthorized (401)");
-                self.record_401_attribution(
+                let comparison = self.record_401_attribution(
                     crate::attribution::SamplingConsumer::ChatCompletionsStream,
                     &final_credential,
                 );
@@ -1116,7 +1213,7 @@ impl SamplingClient {
                 let server_message = user_facing_api_error_message(status, body.as_ref());
                 return Err(auth_rejected(
                     format!("Unauthorized (401): {server_message}"),
-                    &final_credential,
+                    comparison,
                 ));
             }
 
@@ -1209,19 +1306,33 @@ impl SamplingClient {
             request.inner.model = Some(self.defaults.model.clone());
         }
 
-        // Apply temperature default if not specified
-        if request.inner.temperature.is_none() {
-            request.inner.temperature = self.defaults.temperature;
-        }
-
-        // Apply top_p default if not specified
-        if request.inner.top_p.is_none() {
-            request.inner.top_p = self.defaults.top_p;
+        if self.is_codex() {
+            // The ChatGPT Codex Responses contract rejects these sampling
+            // knobs. Clear both inherited defaults and explicit caller values
+            // at the shared wire-preparation boundary used by streaming and
+            // non-streaming requests.
+            request.inner.temperature = None;
+            request.inner.top_p = None;
+        } else {
+            // Apply generic Responses defaults if not specified.
+            if request.inner.temperature.is_none() {
+                request.inner.temperature = self.defaults.temperature;
+            }
+            if request.inner.top_p.is_none() {
+                request.inner.top_p = self.defaults.top_p;
+            }
         }
 
         // Apply max_output_tokens default if not specified
         if request.inner.max_output_tokens.is_none() {
             request.inner.max_output_tokens = self.defaults.max_completion_tokens;
+        }
+
+        // The ChatGPT Codex Responses contract sends this field explicitly.
+        // Preserve an explicit caller choice, but do not depend on a changing
+        // server default for the built-in Codex transport.
+        if self.is_codex() && request.inner.parallel_tool_calls.is_none() {
+            request.inner.parallel_tool_calls = Some(true);
         }
 
         // Set store to false if not specified (default is true, but that breaks ZDR compliance)
@@ -1277,15 +1388,21 @@ impl SamplingClient {
             tracing::error!("Failed to serialize responses request: {}", e);
             SamplingError::Serialization(e)
         })?;
+        if self.is_codex() {
+            xai_grok_sampling_types::patch_codex_instructions(&mut request_body);
+        }
         // async-openai's ReasoningTextContent struct omits the `type`
         // discriminator that the Responses API requires on input. Patch
         // it in post-serialize. This is the last surviving piece of the
         // old raw_output machinery.
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
         let (builder, final_credential) = self.post(self.endpoint("responses"));
-        let http_request = grok_headers
-            .apply(builder, self.sends_xai_identity_headers())
-            .json(&request_body);
+        let http_request = if self.is_codex() {
+            builder
+        } else {
+            grok_headers.apply(builder, self.sends_xai_identity_headers())
+        }
+        .json(&request_body);
 
         let response = http_request.send().await.map_err(request_transport_error)?;
 
@@ -1297,14 +1414,14 @@ impl SamplingClient {
 
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
-                self.record_401_attribution(
+                let comparison = self.record_401_attribution(
                     crate::attribution::SamplingConsumer::Responses,
                     &final_credential,
                 );
                 let server_message = user_facing_api_error_message(status, bytes.as_ref());
                 return Err(auth_rejected(
                     format!("Unauthorized (401): {server_message}"),
-                    &final_credential,
+                    comparison,
                 ));
             }
 
@@ -1397,13 +1514,16 @@ impl SamplingClient {
             tracing::error!("Failed to serialize responses request: {}", e);
             SamplingError::Serialization(e)
         })?;
-        // Inject xAI-specific fields not in async-openai's CreateResponse type.
-        if self.defaults.stream_tool_calls {
+        if self.is_codex() {
+            xai_grok_sampling_types::patch_codex_instructions(&mut request_body);
+        }
+        // Inject xAI-specific fields only for the generic Responses transport.
+        if !self.is_codex() && self.defaults.stream_tool_calls {
             request_body["stream_tool_calls"] = serde_json::json!(true);
         }
         // Inject xAI-specific tools (e.g., x_search) that can't be expressed
         // via async_openai's rs::Tool enum.
-        if !extra_tool_entries.is_empty() {
+        if !self.is_codex() && !extra_tool_entries.is_empty() {
             if let Some(tools) = request_body.get_mut("tools").and_then(|v| v.as_array_mut()) {
                 tools.extend(extra_tool_entries);
             } else {
@@ -1413,14 +1533,17 @@ impl SamplingClient {
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
         // Fresh per attempt so signals never leak across retries; `None`
         // (check disabled) sends no header and does no peek work per event.
-        let doom_loop = self
-            .defaults
-            .doom_loop_recovery
+        let doom_loop = (!self.is_codex())
+            .then_some(self.defaults.doom_loop_recovery)
+            .flatten()
             .map(crate::doom_loop::DoomLoopSignalCollector::new);
         let (builder, final_credential) = self.post(self.endpoint("responses"));
-        let mut http_request = grok_headers
-            .apply(builder, self.sends_xai_identity_headers())
-            .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
+        let mut http_request = if self.is_codex() {
+            builder
+        } else {
+            grok_headers.apply(builder, self.sends_xai_identity_headers())
+        }
+        .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
         if doom_loop.is_some() {
             // Presence opts in; the server ignores the value.
             http_request = http_request.header(DOOM_LOOP_CHECK_HEADER, "true");
@@ -1448,7 +1571,7 @@ impl SamplingClient {
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 span.record("error", "unauthorized (401)");
-                self.record_401_attribution(
+                let comparison = self.record_401_attribution(
                     crate::attribution::SamplingConsumer::ResponsesStream,
                     &final_credential,
                 );
@@ -1456,7 +1579,7 @@ impl SamplingClient {
                 let server_message = user_facing_api_error_message(status, body.as_ref());
                 return Err(auth_rejected(
                     format!("Unauthorized (401): {server_message}"),
-                    &final_credential,
+                    comparison,
                 ));
             }
             let model_metadata = extract_model_metadata(response.headers());
@@ -1622,14 +1745,14 @@ impl SamplingClient {
 
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
-                self.record_401_attribution(
+                let comparison = self.record_401_attribution(
                     crate::attribution::SamplingConsumer::Messages,
                     &final_credential,
                 );
                 let server_message = user_facing_api_error_message(status, bytes.as_ref());
                 return Err(auth_rejected(
                     format!("Unauthorized (401): {server_message}"),
-                    &final_credential,
+                    comparison,
                 ));
             }
 
@@ -1734,7 +1857,7 @@ impl SamplingClient {
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 span.record("error", "unauthorized (401)");
-                self.record_401_attribution(
+                let comparison = self.record_401_attribution(
                     crate::attribution::SamplingConsumer::MessagesStream,
                     &final_credential,
                 );
@@ -1742,7 +1865,7 @@ impl SamplingClient {
                 let server_message = user_facing_api_error_message(status, body.as_ref());
                 return Err(auth_rejected(
                     format!("Unauthorized (401): {server_message}"),
-                    &final_credential,
+                    comparison,
                 ));
             }
             let model_metadata = extract_model_metadata(response.headers());
@@ -2051,7 +2174,7 @@ impl SamplingClient {
                     crate::stream::stream_chat_completions(raw, meta, request_id, idle_timeout);
                 crate::stream::collect_response(events).await
             }
-            ApiBackend::Responses => {
+            ApiBackend::Responses | ApiBackend::CodexResponses => {
                 let (raw, meta, doom_loop) = self.conversation_stream_responses(request).await?;
                 let events =
                     crate::stream::stream_responses(raw, meta, request_id, idle_timeout, doom_loop);
@@ -2909,6 +3032,397 @@ mod tests {
             req.headers().contains_key("traceparent"),
             "HeaderInjector should inject traceparent into post() requests"
         );
+    }
+
+    #[derive(Debug)]
+    struct CodexCredentialResolver {
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::config::BearerResolver for CodexCredentialResolver {
+        fn current_bearer(&self) -> Option<String> {
+            panic!("Codex requests must use the structured snapshot seam")
+        }
+
+        fn current_credential(&self) -> Option<crate::config::ProviderCredentialSnapshot> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(crate::config::ProviderCredentialSnapshot {
+                access_token: "live-codex-token".to_owned(),
+                account_id: Some("workspace-123".to_owned()),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct HostileCodexInjector;
+
+    impl crate::config::HeaderInjector for HostileCodexInjector {
+        fn inject(&self, headers: &mut HeaderMap) {
+            headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer attacker"));
+            headers.insert(
+                HeaderName::from_static("chatgpt-account-id"),
+                HeaderValue::from_static("wrong-account"),
+            );
+            for name in [
+                "x-api-key",
+                "x-xai-token-auth",
+                "x-grok-conv-id",
+                "x-grok-client-version",
+                "x-grok-doom-loop-check",
+                "x-compactions-remaining",
+                "proxy-authorization",
+                "traceparent",
+            ] {
+                headers.insert(
+                    HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    HeaderValue::from_static("must-not-leak"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_transport_normalizes_endpoint_and_isolates_live_headers() {
+        let resolver = std::sync::Arc::new(CodexCredentialResolver {
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let cfg = SamplerConfig {
+            api_key: Some("stale-xai-token".to_owned()),
+            base_url: "https://chatgpt.com/backend-api/codex/".to_owned(),
+            api_backend: ApiBackend::CodexResponses,
+            bearer_resolver: Some(resolver.clone()),
+            header_injector: Some(std::sync::Arc::new(HostileCodexInjector)),
+            ..minimal_config()
+        };
+        let client = SamplingClient::new(cfg).expect("Codex client should build");
+
+        assert_eq!(
+            client.endpoint("responses"),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        let request = client
+            .post(client.endpoint("responses"))
+            .0
+            .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
+            .build()
+            .expect("request should build");
+
+        assert_eq!(resolver.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(request.headers()[AUTHORIZATION], "Bearer live-codex-token");
+        assert_eq!(request.headers()[CHATGPT_ACCOUNT_ID], "workspace-123");
+        for name in [
+            "x-api-key",
+            "x-xai-token-auth",
+            "x-grok-conv-id",
+            "x-grok-client-version",
+            "x-grok-doom-loop-check",
+            "x-compactions-remaining",
+            "proxy-authorization",
+            "traceparent",
+        ] {
+            assert!(
+                request.headers().get(name).is_none(),
+                "leaked header {name}"
+            );
+        }
+        for name in request.headers().keys() {
+            assert!(
+                matches!(
+                    name.as_str(),
+                    "authorization"
+                        | "chatgpt-account-id"
+                        | "content-type"
+                        | "accept"
+                        | "user-agent"
+                ),
+                "unexpected Codex header {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_defaults_enable_parallel_tools_without_overriding_explicit_choice() {
+        let resolver = std::sync::Arc::new(CodexCredentialResolver {
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let client = SamplingClient::new(SamplerConfig {
+            base_url: CODEX_BASE_URL.to_owned(),
+            api_backend: ApiBackend::CodexResponses,
+            bearer_resolver: Some(resolver),
+            temperature: Some(0.73),
+            top_p: Some(0.91),
+            ..minimal_config()
+        })
+        .expect("Codex client should build");
+
+        let mut request = CreateResponseWrapper::default();
+        request.inner.temperature = Some(0.42);
+        request.inner.top_p = Some(0.57);
+        client.apply_response_defaults(&mut request).unwrap();
+        assert_eq!(request.inner.parallel_tool_calls, Some(true));
+        assert_eq!(request.inner.temperature, None);
+        assert_eq!(request.inner.top_p, None);
+
+        request.inner.parallel_tool_calls = Some(false);
+        client.apply_response_defaults(&mut request).unwrap();
+        assert_eq!(request.inner.parallel_tool_calls, Some(false));
+    }
+
+    #[test]
+    fn generic_responses_preserve_sampling_parameters() {
+        let client = SamplingClient::new(SamplerConfig {
+            base_url: "https://api.openai.com/v1".to_owned(),
+            api_backend: ApiBackend::Responses,
+            temperature: Some(0.73),
+            top_p: Some(0.91),
+            ..minimal_config()
+        })
+        .expect("generic Responses client should build");
+
+        let mut request = CreateResponseWrapper::default();
+        client.apply_response_defaults(&mut request).unwrap();
+        assert_eq!(request.inner.temperature, Some(0.73));
+        assert_eq!(request.inner.top_p, Some(0.91));
+
+        request.inner.temperature = Some(0.42);
+        request.inner.top_p = Some(0.57);
+        client.apply_response_defaults(&mut request).unwrap();
+        assert_eq!(request.inner.temperature, Some(0.42));
+        assert_eq!(request.inner.top_p, Some(0.57));
+    }
+
+    #[test]
+    fn codex_transport_rejects_non_allowlisted_origins_and_query_params() {
+        for base_url in [
+            "https://api.openai.com/v1",
+            "https://chatgpt.com.evil.test/backend-api/codex",
+            "http://chatgpt.com/backend-api/codex",
+            "https://chatgpt.com/backend-api/codex?token=secret",
+        ] {
+            let result = SamplingClient::new(SamplerConfig {
+                base_url: base_url.to_owned(),
+                api_backend: ApiBackend::CodexResponses,
+                ..minimal_config()
+            });
+            assert!(result.is_err(), "accepted unsafe Codex origin {base_url}");
+        }
+
+        let mut with_query = SamplerConfig {
+            base_url: CODEX_BASE_URL.to_owned(),
+            api_backend: ApiBackend::CodexResponses,
+            ..minimal_config()
+        };
+        with_query.query_params.insert("key".into(), "value".into());
+        assert!(SamplingClient::new(with_query).is_err());
+    }
+
+    #[test]
+    fn platform_responses_transport_is_not_rerouted_to_codex() {
+        let client = SamplingClient::new(SamplerConfig {
+            base_url: "https://api.openai.com/v1".to_owned(),
+            api_backend: ApiBackend::Responses,
+            ..minimal_config()
+        })
+        .expect("Platform Responses client should build");
+        assert_eq!(
+            client.endpoint("responses"),
+            "https://api.openai.com/v1/responses"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn codex_mock_request_has_exact_path_and_no_xai_extensions() {
+        use axum::Router;
+        use axum::body::Bytes;
+        use axum::http::Uri;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        let captured: Arc<Mutex<Option<(Uri, HeaderMap, Bytes)>>> = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&captured);
+        let app = Router::new().route(
+            "/backend-api/codex/responses",
+            post(move |uri: Uri, headers: HeaderMap, body: Bytes| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    *sink.lock().unwrap() = Some((uri, headers, body));
+                    ([(CONTENT_TYPE, "text/event-stream")], "data: [DONE]\n\n")
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let resolver = Arc::new(CodexCredentialResolver {
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let client = SamplingClient::new(SamplerConfig {
+            base_url: format!("http://{address}/backend-api/codex"),
+            api_backend: ApiBackend::CodexResponses,
+            bearer_resolver: Some(resolver),
+            temperature: Some(0.73),
+            top_p: Some(0.91),
+            stream_tool_calls: true,
+            doom_loop_recovery: Some(xai_grok_sampling_types::DoomLoopRecoveryPolicy {
+                max_threshold: 8,
+                max_retries: 2,
+            }),
+            ..minimal_config()
+        })
+        .expect("loopback Codex mock should be allowed in unit tests");
+        let mut request = CreateResponseWrapper::default();
+        request.inner.input = rs::InputParam::Items(vec![
+            rs::InputItem::EasyMessage(rs::EasyInputMessage {
+                r#type: rs::MessageType::Message,
+                role: rs::Role::System,
+                content: rs::EasyInputContent::ContentList(vec![rs::InputContent::InputText(
+                    rs::InputTextContent {
+                        text: "system guidance".to_owned(),
+                    },
+                )]),
+            }),
+            rs::InputItem::EasyMessage(rs::EasyInputMessage {
+                r#type: rs::MessageType::Message,
+                role: rs::Role::User,
+                content: rs::EasyInputContent::Text("hello".to_owned()),
+            }),
+        ]);
+        request.x_grok_conv_id = Some("must-not-leak".to_owned());
+        request.x_grok_req_id = Some("must-not-leak".to_owned());
+        request.extra_tool_entries = vec![serde_json::json!({"type": "x_search"})];
+
+        let (_, _, doom_loop) = client
+            .create_response_stream(request)
+            .await
+            .expect("mock Codex request should start");
+        assert!(
+            doom_loop.is_none(),
+            "Codex must not enable xAI doom-loop mode"
+        );
+
+        let (uri, headers, body) = captured.lock().unwrap().take().expect("request captured");
+        assert_eq!(uri.path(), "/backend-api/codex/responses");
+        assert_eq!(headers[AUTHORIZATION], "Bearer live-codex-token");
+        assert_eq!(headers[CHATGPT_ACCOUNT_ID], "workspace-123");
+        assert!(headers.get("x-grok-conv-id").is_none());
+        assert!(headers.get(DOOM_LOOP_CHECK_HEADER).is_none());
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(body["instructions"], "system guidance");
+        assert!(
+            body["input"]
+                .as_array()
+                .is_some_and(|items| items.iter().all(|item| item["role"] != "system"))
+        );
+        assert!(
+            body["input"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["role"] == "user"))
+        );
+        assert_eq!(body["parallel_tool_calls"], true);
+        assert!(
+            body.get("temperature").is_none(),
+            "Codex request must omit unsupported temperature: {body}"
+        );
+        assert!(
+            body.get("top_p").is_none(),
+            "Codex request must omit unsupported top_p: {body}"
+        );
+        assert!(body.get("stream_tool_calls").is_none());
+        assert!(
+            body.get("tools")
+                .and_then(|tools| tools.as_array())
+                .is_none_or(|tools| tools.iter().all(|tool| tool["type"] != "x_search"))
+        );
+    }
+
+    /// Regression for stale chat-state A / live provider B. The resolver puts
+    /// B on the actual request; if B is rejected, the auth error must report
+    /// `same_as_current` so the shell forces ServerRejected refresh instead of
+    /// consulting stale A and merely re-adopting the already-rejected B.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn codex_401_reports_actual_live_request_credential_relation_without_secrets() {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        const STALE_CHAT_A: &str = "stale-chat-state-token-a";
+        const LIVE_PROVIDER_B: &str = "live-provider-token-b";
+
+        #[derive(Debug)]
+        struct RejectedCodexCredentialResolver;
+
+        impl crate::config::BearerResolver for RejectedCodexCredentialResolver {
+            fn current_bearer(&self) -> Option<String> {
+                Some(LIVE_PROVIDER_B.to_owned())
+            }
+
+            fn current_credential(&self) -> Option<crate::config::ProviderCredentialSnapshot> {
+                Some(crate::config::ProviderCredentialSnapshot {
+                    access_token: LIVE_PROVIDER_B.to_owned(),
+                    account_id: Some("workspace-123".to_owned()),
+                })
+            }
+        }
+
+        let captured_authorization = Arc::new(Mutex::new(None::<String>));
+        let captured = Arc::clone(&captured_authorization);
+        let app = Router::new().route(
+            "/backend-api/codex/responses",
+            post(move |headers: HeaderMap| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    *captured.lock().unwrap() = headers
+                        .get(AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    (StatusCode::UNAUTHORIZED, "credential rejected")
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = SamplingClient::new(SamplerConfig {
+            api_key: Some(STALE_CHAT_A.to_owned()),
+            base_url: format!("http://{address}/backend-api/codex"),
+            api_backend: ApiBackend::CodexResponses,
+            bearer_resolver: Some(Arc::new(RejectedCodexCredentialResolver)),
+            ..minimal_config()
+        })
+        .expect("loopback Codex mock should be allowed in unit tests");
+
+        let err = match client
+            .create_response_stream(CreateResponseWrapper::default())
+            .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("mock server's 401 must surface as an auth error"),
+        };
+        assert_eq!(
+            captured_authorization.lock().unwrap().as_deref(),
+            Some("Bearer live-provider-token-b"),
+            "the rejected request used live provider B, not stale chat-state A",
+        );
+        assert!(matches!(
+            &err,
+            SamplingError::Auth {
+                credential: SentCredential::SameAsCurrent,
+                ..
+            }
+        ));
+
+        let info = crate::events::SamplingErrorInfo::from(&err);
+        let metadata = serde_json::to_string(&info).expect("auth metadata serializes");
+        assert!(metadata.contains("same_as_current"));
+        assert_no_secret_fragments(&metadata, STALE_CHAT_A);
+        assert_no_secret_fragments(&metadata, LIVE_PROVIDER_B);
     }
 
     #[test]

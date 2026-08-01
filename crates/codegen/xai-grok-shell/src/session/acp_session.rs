@@ -100,7 +100,8 @@ mod turn;
 #[path = "acp_session_impl/workflow.rs"]
 mod workflow_run;
 pub(crate) use auth_retry::{
-    AuthRetryDecision, AuthRetrySchedule, human_duration, pace_uncharged_resubmit,
+    AuthRetryDecision, AuthRetrySchedule, Codex401RetryBudget, Provider401RecoveryAction,
+    human_duration, pace_uncharged_resubmit, provider_401_recovery_action,
 };
 #[path = "acp_session_impl/interjection.rs"]
 mod interjection;

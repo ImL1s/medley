@@ -67,6 +67,8 @@ fn auth_with_mode(mode: crate::auth::AuthMode, key: &str) -> crate::auth::GrokAu
         expires_at: None,
         oidc_issuer: None,
         oidc_client_id: None,
+        id_token: None,
+        account_id: None,
     }
 }
 #[test]

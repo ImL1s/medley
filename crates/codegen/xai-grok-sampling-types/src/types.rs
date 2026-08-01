@@ -1016,6 +1016,12 @@ pub enum ApiBackend {
     ChatCompletions,
     /// Use the Responses API (/v1/responses)
     Responses,
+    /// Use the ChatGPT Codex Responses API (/backend-api/codex/responses).
+    ///
+    /// This is a distinct transport profile because its OAuth credential,
+    /// account header, endpoint allowlist, and redirect policy must never be
+    /// shared with OpenAI Platform or generic Responses-compatible providers.
+    CodexResponses,
     /// Use the Anthropic Messages API (/v1/messages)
     Messages,
 }
@@ -1025,7 +1031,10 @@ impl ApiBackend {
     /// tool calls. The Messages API does not (a schema there blocks tool use),
     /// so structured output there goes through the StructuredOutput tool.
     pub fn supports_native_schema(&self) -> bool {
-        matches!(self, Self::ChatCompletions | Self::Responses)
+        matches!(
+            self,
+            Self::ChatCompletions | Self::Responses | Self::CodexResponses
+        )
     }
 }
 
