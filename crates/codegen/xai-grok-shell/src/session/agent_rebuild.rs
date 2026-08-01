@@ -47,6 +47,7 @@ use xai_grok_agent::error::AgentBuildError;
 use xai_grok_agent::prompt::context::PromptAudience;
 use xai_grok_agent::prompt::skills::SkillsConfig;
 use xai_grok_agent::{Agent, AgentBuilder, CompactionPolicy, ReminderPolicy};
+use xai_grok_tools::capability::CapabilityPolicy;
 use xai_grok_tools::computer::types::{AsyncFileSystem, TerminalBackend};
 use xai_grok_tools::implementations::grok_build::ask_user_question::types::UserQuestionRequest;
 use xai_grok_tools::implementations::grok_build::deploy_app::AppBuilderDeployerConfig;
@@ -239,12 +240,23 @@ impl AgentRebuildSpec {
         #[allow(unused_variables)]
         let is_cursor_template =
             crate::session::is_cursor_system_template(&definition.system_prompt);
+        let capability_policy = CapabilityPolicy::new(
+            definition
+                .capability_mode
+                .unwrap_or(xai_tool_types::SubagentCapabilityMode::All),
+            crate::config::tool_capabilities::load_trusted_tool_capabilities(
+                working_directory,
+                crate::agent::folder_trust::project_scope_allowed(working_directory),
+            )
+            .into_trusted(),
+        );
         let mut builder = AgentBuilder::new(
             working_directory.clone(),
             terminal_backend.clone(),
             tools_notification_handle.clone(),
         )
         .from_definition(definition)
+        .with_capability_policy(capability_policy)
         .with_compaction_policy(compaction_policy.clone())
         .with_reminder_policy(reminder_policy.clone())
         .with_memory_enabled(*memory_enabled)
