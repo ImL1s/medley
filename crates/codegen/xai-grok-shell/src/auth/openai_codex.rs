@@ -673,6 +673,33 @@ pub fn manager(grok_home: &Path) -> Arc<AuthManager> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct RotatingCodexRefresher {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::auth::refresh::TokenRefresher for RotatingCodexRefresher {
+        async fn refresh(
+            &self,
+            _reason: crate::auth::refresh::RefreshReason,
+        ) -> crate::auth::refresh::RefreshOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(StdDuration::from_millis(25)).await;
+            crate::auth::refresh::RefreshOutcome::Success(Box::new(GrokAuth {
+                key: "rotated-access".into(),
+                auth_mode: AuthMode::OpenAiCodex,
+                refresh_token: Some("rotated-refresh".into()),
+                expires_at: Some(Utc::now() + Duration::hours(1)),
+                oidc_issuer: Some(ISSUER.into()),
+                oidc_client_id: Some(CLIENT_ID.into()),
+                account_id: Some("rotated-account".into()),
+                ..GrokAuth::default()
+            }))
+        }
+    }
 
     fn jwt(claims: serde_json::Value) -> String {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
@@ -915,6 +942,44 @@ mod tests {
         );
     }
 
+    async fn classify_invalid_grant_description(description: &'static str) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = Router::new().route(
+            "/token",
+            axum::routing::post(move || async move {
+                (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({
+                        "error": "invalid_grant",
+                        "error_description": description,
+                    })),
+                )
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let error = refresh_at(&format!("http://{addr}/token"), "rejected-refresh")
+            .await
+            .expect_err("invalid_grant must fail refresh");
+        assert_eq!(
+            classify_refresh_error(&error),
+            Some(RefreshTokenFailedReason::RefreshTokenRejected)
+        );
+    }
+
+    #[tokio::test]
+    async fn revoked_refresh_invalid_grant_is_terminal_refresh_rejection() {
+        classify_invalid_grant_description("refresh token revoked").await;
+    }
+
+    #[tokio::test]
+    async fn reused_refresh_invalid_grant_is_terminal_refresh_rejection() {
+        classify_invalid_grant_description("refresh token already used").await;
+    }
+
     #[test]
     fn account_claim_is_compatibility_metadata_only() {
         let token = jwt(serde_json::json!({
@@ -924,6 +989,94 @@ mod tests {
         let fallback = jwt(serde_json::json!({ ACCOUNT_ID_CLAIM: "acct-flat" }));
         assert_eq!(account_id_from_jwt(&fallback).as_deref(), Some("acct-flat"));
         assert_eq!(account_id_from_jwt("not-a-jwt"), None);
+    }
+
+    #[test]
+    fn valid_jwt_without_account_claim_returns_none() {
+        let token = jwt(serde_json::json!({
+            "sub": "user-123",
+            "email": "person@example.test"
+        }));
+        assert_eq!(account_id_from_jwt(&token), None);
+    }
+
+    #[tokio::test]
+    async fn older_codex_auth_schema_loads_and_migrates_with_safe_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let older = serde_json::json!({
+            AUTH_SCOPE: {
+                "key": "legacy-access",
+                "auth_mode": "open_ai_codex",
+                "create_time": "2026-01-01T00:00:00Z",
+                "user_id": "",
+                "email": null,
+                "refresh_token": "legacy-refresh",
+                "expires_at": "2099-01-01T00:00:00Z",
+                "oidc_issuer": ISSUER,
+                "oidc_client_id": CLIENT_ID
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&older).unwrap()).unwrap();
+
+        let manager = AuthManager::new_openai_codex(dir.path());
+        let auth = manager
+            .current_or_expired()
+            .expect("older Codex record loads");
+        assert_eq!(auth.key, "legacy-access");
+        assert_eq!(auth.refresh_token.as_deref(), Some("legacy-refresh"));
+        assert!(auth.coding_data_retention_opt_out);
+        assert!(auth.id_token.is_none());
+        assert!(auth.account_id.is_none());
+
+        manager.save_without_enrichment(auth).await.unwrap();
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(migrated[AUTH_SCOPE]["coding_data_retention_opt_out"], true);
+        assert_eq!(migrated[AUTH_SCOPE]["auth_mode"], "open_ai_codex");
+        assert!(migrated[AUTH_SCOPE].get("account_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_codex_refresh_is_single_flight_and_persists_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+        manager
+            .save_without_enrichment(GrokAuth {
+                key: "expiring-access".into(),
+                auth_mode: AuthMode::OpenAiCodex,
+                refresh_token: Some("old-refresh".into()),
+                expires_at: Some(Utc::now() + Duration::seconds(30)),
+                oidc_issuer: Some(ISSUER.into()),
+                oidc_client_id: Some(CLIENT_ID.into()),
+                account_id: Some("old-account".into()),
+                ..GrokAuth::default()
+            })
+            .await
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        manager.set_refresher(Arc::new(RotatingCodexRefresher {
+            calls: Arc::clone(&calls),
+        }));
+
+        let results = futures_util::future::join_all((0..8).map(|_| {
+            let manager = Arc::clone(&manager);
+            async move { manager.auth().await }
+        }))
+        .await;
+
+        assert!(results.iter().all(|result| {
+            result.as_ref().is_ok_and(|auth| {
+                auth.key == "rotated-access"
+                    && auth.refresh_token.as_deref() == Some("rotated-refresh")
+            })
+        }));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let disk = super::super::storage::read_auth_json(&dir.path().join("auth.json")).unwrap();
+        let persisted = disk.get(AUTH_SCOPE).expect("rotated credential persisted");
+        assert_eq!(persisted.key, "rotated-access");
+        assert_eq!(persisted.refresh_token.as_deref(), Some("rotated-refresh"));
+        assert_eq!(persisted.account_id.as_deref(), Some("rotated-account"));
     }
 
     #[test]

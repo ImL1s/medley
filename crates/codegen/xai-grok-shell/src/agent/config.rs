@@ -6885,6 +6885,64 @@ reasoning_effort = "low"
         assert_eq!(rotated.account_id.as_deref(), Some("account-2"));
     }
     #[test]
+    fn model_switch_grok_codex_grok_reselects_transport_and_live_credentials() {
+        let temp = tempfile::tempdir().expect("temporary auth home");
+        let manager = Arc::new(crate::auth::AuthManager::new_openai_codex(temp.path()));
+        manager.hot_swap(crate::auth::GrokAuth {
+            key: "codex-access".into(),
+            auth_mode: crate::auth::AuthMode::OpenAiCodex,
+            refresh_token: Some("codex-refresh".into()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            oidc_issuer: Some(crate::auth::openai_codex::ISSUER.into()),
+            oidc_client_id: Some(crate::auth::openai_codex::CLIENT_ID.into()),
+            account_id: Some("codex-account".into()),
+            ..crate::auth::GrokAuth::default()
+        });
+
+        let grok = test_model_entry("grok-model", "https://api.x.ai/v1", None, None, None);
+        let mut codex = test_model_entry(
+            "codex-model",
+            crate::auth::openai_codex::CODEX_API_BASE_URL,
+            None,
+            None,
+            None,
+        );
+        codex.info.api_backend = ApiBackend::CodexResponses;
+        codex.info.auth_scheme = AuthScheme::Bearer;
+        codex.auth_provider = Some(crate::auth::AuthProviderRef::openai_codex(manager));
+        let catalog = IndexMap::from([("grok".into(), grok), ("codex".into(), codex)]);
+
+        let resolve = |model, session| {
+            resolve_model_to_sampling_config(model, &catalog, Some(session), None, None, None)
+                .expect("model resolves in the same running process")
+        };
+        let first_grok = resolve("grok", "grok-session-1");
+        let codex = resolve("codex", "must-not-reach-codex");
+        let second_grok = resolve("grok", "grok-session-2");
+
+        assert_eq!(first_grok.api_backend, ApiBackend::ChatCompletions);
+        assert_eq!(first_grok.api_key.as_deref(), Some("grok-session-1"));
+        assert_eq!(codex.api_backend, ApiBackend::CodexResponses);
+        assert_eq!(
+            codex.base_url,
+            crate::auth::openai_codex::CODEX_API_BASE_URL
+        );
+        assert!(codex.api_key.is_none());
+        let codex_credential = codex
+            .bearer_resolver
+            .as_ref()
+            .and_then(|resolver| resolver.current_credential())
+            .expect("Codex model uses its provider-scoped live credential");
+        assert_eq!(codex_credential.access_token, "codex-access");
+        assert_eq!(
+            codex_credential.account_id.as_deref(),
+            Some("codex-account")
+        );
+        assert_eq!(second_grok.api_backend, ApiBackend::ChatCompletions);
+        assert_eq!(second_grok.api_key.as_deref(), Some("grok-session-2"));
+        assert!(second_grok.bearer_resolver.is_none());
+    }
+    #[test]
     fn codex_aux_sampler_without_native_resolver_fails_closed() {
         let mut entry = test_model_entry(
             "supported-codex-model",

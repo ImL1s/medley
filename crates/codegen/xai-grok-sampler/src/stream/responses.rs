@@ -668,6 +668,13 @@ mod tests {
         })
     }
 
+    fn incomplete_event() -> rs::ResponseStreamEvent {
+        rs::ResponseStreamEvent::ResponseIncomplete(rs_types::ResponseIncompleteEvent {
+            response: build_response(rs_types::Status::Incomplete),
+            sequence_number: 0,
+        })
+    }
+
     async fn collect(s: impl Stream<Item = SamplingEvent>) -> Vec<SamplingEvent> {
         let mut out = Vec::new();
         let mut s = pin!(s);
@@ -727,6 +734,30 @@ mod tests {
         match events.last().unwrap() {
             SamplingEvent::Completed { response, .. } => {
                 assert_eq!(response.stop_reason, Some(StopReason::Stop));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn response_incomplete_yields_completed_with_length_stop() {
+        let raw = stream::iter(vec![
+            Ok(text_delta_event("partial")),
+            Ok(incomplete_event()),
+        ])
+        .boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(response.stop_reason, Some(StopReason::Length));
             }
             other => panic!("expected Completed, got {other:?}"),
         }
