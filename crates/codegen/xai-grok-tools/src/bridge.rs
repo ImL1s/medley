@@ -762,19 +762,14 @@ mod tests {
         // PascalCase + grok_build's snake_case in one registry
         // to exercise the lookup on the literal name strings each
         // namespace ships.
-        register_fixture(&toolset, "Write", ToolKind::Write, "fixture_write");
-        register_fixture(
-            &toolset,
-            "StrReplace",
-            ToolKind::Edit,
-            "fixture_str_replace",
-        );
-        register_fixture(&toolset, "Delete", ToolKind::Delete, "fixture_delete");
+        register_fixture(&toolset, "Write", ToolKind::Write, "Write");
+        register_fixture(&toolset, "StrReplace", ToolKind::Edit, "StrReplace");
+        register_fixture(&toolset, "Delete", ToolKind::Delete, "Delete");
         register_fixture(
             &toolset,
             "run_terminal_cmd",
             ToolKind::Execute,
-            "fixture_run_terminal_cmd",
+            "run_terminal_cmd",
         );
 
         assert_eq!(bridge.tool_kind("Write"), Some(ToolKind::Write));
