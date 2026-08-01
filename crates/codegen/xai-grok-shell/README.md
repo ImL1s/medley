@@ -1728,11 +1728,12 @@ Both are also discovered from `.grok/roles/*.toml` and `.grok/personas/*.toml` f
 ### External Tool Capability Metadata
 
 Restricted subagents fail closed for MCP/custom tools without capability
-metadata. Classify a trusted tool by its exact runtime ID (for example,
-`mcp__server__tool`):
+metadata. Classify a trusted tool by its exact runtime ID, which follows the
+`server__tool` form used by `search_tool` / `use_tool` (for example,
+`docs__read`):
 
 ```toml
-[subagents.tool_capabilities."mcp__docs__read"]
+[subagents.tool_capabilities."docs__read"]
 classification = "classified"
 effects = ["network-read"]
 ```
@@ -1745,7 +1746,7 @@ For a temporary, audited migration of a still-unclassified tool, an exact-ID
 exception must name restricted modes and include a non-empty reason:
 
 ```toml
-[subagents.unclassified_tool_overrides."mcp__legacy__read"]
+[subagents.unclassified_tool_overrides."legacy__read"]
 modes = ["read-only"]
 reason = "Audited read-only connector pending descriptor support"
 ```
@@ -1754,6 +1755,8 @@ Exceptions emit a warning and appear in both `grok inspect` views. Capability
 metadata is accepted only from local trusted config layers; project
 `.grok/config.toml` entries require folder trust. Remote MCP `_meta`, remote
 settings, and remote campaign patches are never treated as capability authority.
+User/system/MDM requirements remain the final authority over trusted project
+entries for the same exact tool ID.
 
 Root sessions remain unrestricted (`all`), so this does not silently narrow
 top-level user permissions. Restricted workspace/SDK sessions also fail closed

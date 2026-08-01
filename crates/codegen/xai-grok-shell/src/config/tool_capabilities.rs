@@ -111,21 +111,6 @@ pub fn load_trusted_tool_capabilities(
         },
         &mut resolved,
     );
-    for requirements in [
-        layers.user_requirements.as_ref(),
-        layers.system_requirements.as_ref(),
-        layers.mdm_requirements.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        merge_source(
-            requirements,
-            ConfigSource::Managed { path: None },
-            &mut resolved,
-        );
-    }
-
     let mut load_diagnostics = Vec::new();
     if project_trusted {
         for path in super::find_project_configs(cwd) {
@@ -146,6 +131,23 @@ pub fn load_trusted_tool_capabilities(
                 }
             }
         }
+    }
+    // Requirements are the final authority, matching ConfigLayers' normal
+    // precedence contract. A trusted project must never downgrade an admin or
+    // MDM descriptor/override for the same exact tool ID.
+    for requirements in [
+        layers.user_requirements.as_ref(),
+        layers.system_requirements.as_ref(),
+        layers.mdm_requirements.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        merge_source(
+            requirements,
+            ConfigSource::Managed { path: None },
+            &mut resolved,
+        );
     }
     resolved.diagnostics.splice(0..0, load_diagnostics);
     append_active_override_diagnostics(&mut resolved);
@@ -241,6 +243,11 @@ fn merge_source(
                         resolved.diagnostics.push(invalid(path, &source, reason));
                         continue;
                     }
+                    // A higher-authority declaration shadows lower entries
+                    // before validation. Invalid admin metadata therefore
+                    // fails closed instead of reviving a project allow rule.
+                    resolved.trusted.classifications.remove(tool_id);
+                    resolved.trusted.unclassified_overrides.remove(tool_id);
                     match raw.clone().try_into::<ToolCapabilityDescriptor>() {
                         Ok(descriptor) => match resolved.trusted.insert_classification(
                             tool_id.clone(),
@@ -285,6 +292,12 @@ fn merge_source(
                         resolved.diagnostics.push(invalid(path, &source, reason));
                         continue;
                     }
+                    // A higher-authority override changes the tool back to an
+                    // explicitly unclassified exception. It must shadow both
+                    // lower classifications and lower overrides before
+                    // validation so invalid admin metadata fails closed.
+                    resolved.trusted.classifications.remove(tool_id);
+                    resolved.trusted.unclassified_overrides.remove(tool_id);
                     let parsed = match raw.clone().try_into::<RawUnclassifiedToolOverride>() {
                         Ok(parsed) => parsed,
                         Err(error) => {
@@ -374,6 +387,10 @@ mod tests {
         ConfigSource::Project {
             path: "/repo/.grok/config.toml".into(),
         }
+    }
+
+    fn admin_source() -> ConfigSource {
+        ConfigSource::Managed { path: None }
     }
 
     #[test]
@@ -571,5 +588,120 @@ mod tests {
                 .classifications
                 .contains_key("mcp__remote__claimed_safe")
         );
+    }
+
+    #[test]
+    fn requirements_remain_authoritative_over_trusted_project_entries() {
+        let project = parse(
+            r#"
+            [subagents.tool_capabilities."admin__classified"]
+            classification = "classified"
+            effects = ["local-read"]
+
+            [subagents.tool_capabilities."admin__invalid"]
+            classification = "classified"
+            effects = ["local-read"]
+
+            [subagents.tool_capabilities."admin__override"]
+            classification = "classified"
+            effects = []
+
+            [subagents.tool_capabilities."admin__invalid_override"]
+            classification = "classified"
+            effects = ["local-read"]
+
+            [subagents.unclassified_tool_overrides."admin__override"]
+            modes = ["read-only"]
+            reason = "project exception"
+
+            [subagents.unclassified_tool_overrides."admin__invalid"]
+            modes = ["read-only"]
+            reason = "project exception that invalid admin metadata must revoke"
+
+            [subagents.unclassified_tool_overrides."admin__invalid_override"]
+            modes = ["read-only"]
+            reason = "project exception that invalid admin override must revoke"
+            "#,
+        );
+        let requirements = parse(
+            r#"
+            [subagents.tool_capabilities."admin__classified"]
+            classification = "classified"
+            effects = ["external-mutation"]
+
+            [subagents.tool_capabilities."admin__invalid"]
+            classification = "classified"
+            effects = ["not-a-real-effect"]
+
+            [subagents.unclassified_tool_overrides."admin__override"]
+            modes = ["execute"]
+            reason = "admin-scoped exception"
+
+            [subagents.unclassified_tool_overrides."admin__invalid_override"]
+            modes = ["read-only"]
+            reason = "   "
+            "#,
+        );
+
+        let mut resolved = ResolvedTrustedToolCapabilities::default();
+        merge_source(&project, project_source(), &mut resolved);
+        // Production loads requirements after trusted project layers.
+        merge_source(&requirements, admin_source(), &mut resolved);
+
+        let classified = &resolved.trusted.classifications["admin__classified"];
+        assert_eq!(
+            classified.descriptor,
+            ToolCapabilityDescriptor::classified([ToolEffect::ExternalMutation])
+        );
+        assert_eq!(
+            classified.origin,
+            xai_grok_tools::capability::CapabilityOrigin::TrustedConfig {
+                source: admin_source(),
+            }
+        );
+        let override_entry = &resolved.trusted.unclassified_overrides["admin__override"];
+        assert_eq!(override_entry.modes, vec![SubagentCapabilityMode::Execute]);
+        assert_eq!(override_entry.reason, "admin-scoped exception");
+        assert_eq!(override_entry.source, admin_source());
+        assert!(
+            !resolved
+                .trusted
+                .classifications
+                .contains_key("admin__override"),
+            "an authoritative unclassified override must shadow a lower classification"
+        );
+
+        assert!(
+            !resolved
+                .trusted
+                .classifications
+                .contains_key("admin__invalid"),
+            "invalid higher-authority descriptors must revoke lower classifications"
+        );
+        assert!(
+            !resolved
+                .trusted
+                .unclassified_overrides
+                .contains_key("admin__invalid"),
+            "invalid higher-authority descriptors must not revive a lower allow override"
+        );
+        assert!(
+            !resolved
+                .trusted
+                .classifications
+                .contains_key("admin__invalid_override"),
+            "invalid authoritative overrides must remove lower classifications"
+        );
+        assert!(
+            !resolved
+                .trusted
+                .unclassified_overrides
+                .contains_key("admin__invalid_override"),
+            "invalid authoritative overrides must remove lower overrides"
+        );
+        assert!(resolved.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path.contains("admin__invalid")
+                && diagnostic.kind == ToolCapabilityConfigDiagnosticKind::InvalidEntry
+        }));
     }
 }
