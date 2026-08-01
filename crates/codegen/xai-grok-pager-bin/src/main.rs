@@ -166,6 +166,18 @@ fn write_generated_serve_secret(writer: &mut impl std::io::Write, secret: &str) 
     writer.flush()?;
     Ok(())
 }
+
+/// Validate and prepare `agent serve` before command dispatch performs any
+/// persistent, network, update, tracing, or background-task side effects.
+fn preflight_agent_serve(
+    agent_args: &xai_grok_pager::app::AgentArgs,
+    stderr_is_terminal: bool,
+) -> Result<Option<PreparedServe>> {
+    match agent_args.mode.as_ref() {
+        Some(AgentCmd::Serve(args)) => prepare_serve(args, stderr_is_terminal).map(Some),
+        _ => Ok(None),
+    }
+}
 /// Entrypoint tag for `grok -p`; keys the quiet stderr default in `init_tracing_simple`.
 const HEADLESS_ENTRYPOINT: &str = "headless";
 /// Initialize simple tracing for non-TUI agent modes.
@@ -1096,6 +1108,11 @@ async fn run_agent_command(
     disable_web_search: bool,
     update_config: &UpdateConfig,
 ) -> Result<()> {
+    // Keep this as the first operation: rejected remote exposure must not grant
+    // folder trust, start prefetch/update traffic, initialise tracing, or spawn
+    // any background work.
+    let prepared_serve = preflight_agent_serve(&agent_args, std::io::stderr().is_terminal())?;
+
     let _signal_flush = tokio::spawn(async {
         #[cfg(unix)]
         {
@@ -1451,7 +1468,8 @@ async fn run_agent_command(
         Some(AgentCmd::Serve(a)) => {
             let mut agent_config = agent_config.clone();
             apply_headless_args_to_config(&a.headless, &mut agent_config);
-            let prepared = prepare_serve(&a, std::io::stderr().is_terminal())?;
+            let prepared = prepared_serve
+                .ok_or_else(|| anyhow::anyhow!("agent serve preflight result missing"))?;
             {
                 let stderr = std::io::stderr();
                 let mut stderr = stderr.lock();
@@ -2843,6 +2861,31 @@ mod tests {
     fn assert_prepared(prepared: PreparedServe, expected_secret: &str, expected_generated: bool) {
         assert_eq!(prepared.secret, expected_secret);
         assert_eq!(prepared.generated_secret, expected_generated);
+    }
+
+    #[test]
+    fn issue8_agent_serve_security_command_preflight_rejects_remote_before_dispatch() {
+        let parsed = PagerArgs::try_parse_from([
+            "grok",
+            "agent",
+            "serve",
+            "--bind",
+            "0.0.0.0:2419",
+            "--secret",
+            "client-configured-secret-Q7w5E3r1T9y7",
+        ])
+        .unwrap();
+        let Some(Command::Agent(agent_args)) = parsed.command else {
+            panic!("expected agent command");
+        };
+
+        assert_eq!(
+            preflight_agent_serve(&agent_args, true)
+                .err()
+                .expect("remote serve must fail before command dispatch")
+                .to_string(),
+            SERVE_REMOTE_ACK_REQUIRED
+        );
     }
 
     #[test]
