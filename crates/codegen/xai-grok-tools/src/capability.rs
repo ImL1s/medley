@@ -176,10 +176,10 @@ impl CapabilityPolicy {
 
     pub fn resolve_builtin(&self, canonical_id: &str, kind: ToolKind) -> ResolvedToolCapability {
         let descriptor = descriptor_for_kind(kind);
-        if matches!(descriptor, ToolCapabilityDescriptor::Unclassified) {
-            if let Some(trusted) = self.trusted.classifications.get(canonical_id) {
-                return trusted.clone();
-            }
+        if matches!(descriptor, ToolCapabilityDescriptor::Unclassified)
+            && let Some(trusted) = self.trusted.classifications.get(canonical_id)
+        {
+            return trusted.clone();
         }
         ResolvedToolCapability {
             descriptor,
