@@ -523,21 +523,6 @@ fn manager_collection_predicates_fail_directions() {
     );
 }
 
-// -- token_suffix ----------------------------------------------------------------
-
-#[test]
-fn token_suffix_matrix() {
-    let cases: &[(&str, &str)] = &[
-        ("abcdefghijklmnop", "efghijklmnop"), // takes last 12
-        ("short", "short"),                   // short unchanged
-        ("", ""),                             // empty
-        ("123456789012", "123456789012"),     // exact 12
-    ];
-    for (input, expected) in cases {
-        assert_eq!(token_suffix(input), *expected, "input={input:?}");
-    }
-}
-
 // -- read_disk_auth ----------------------------------------------------------
 
 // -- hot_swap / try_use_disk_token ---------------------------------------
@@ -3970,6 +3955,48 @@ async fn shared_api_key_provider_sync_buffered_session_beats_static() {
     });
     let provider = super::SharedAuthKeyProvider(mgr);
     assert_eq!(provider.current_api_key().as_deref(), Some("buffered-oidc"));
+}
+
+/// A request that falls through from a rejected refresh to a static key must
+/// compare against that same async ladder. The sync ladder still sees the
+/// wire-valid buffered session before refresh and would misclassify the sent
+/// static key as different.
+#[tokio::test]
+#[serial_test::serial]
+async fn shared_api_key_comparison_uses_async_static_fallback_after_refresh_failure() {
+    use xai_grok_auth::CredentialComparison;
+    use xai_grok_test_support::EnvGuard;
+    use xai_grok_tools::types::ApiKeyProvider;
+
+    let _legacy = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
+    let _key = EnvGuard::set("XAI_API_KEY", "static-after-refresh-failure");
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    mgr.hot_swap(GrokAuth {
+        key: "buffered-oidc".into(),
+        auth_mode: AuthMode::Oidc,
+        refresh_token: Some("rejected-refresh-token".into()),
+        expires_at: Some(Utc::now() + Duration::minutes(2)),
+        ..GrokAuth::test_default()
+    });
+    let refresh_count = Arc::new(AtomicU32::new(0));
+    mgr.set_refresher(Arc::new(FailingRefresher {
+        call_count: refresh_count.clone(),
+    }));
+    let provider = super::SharedAuthKeyProvider(mgr);
+
+    assert_eq!(
+        provider.current_api_key().as_deref(),
+        Some("buffered-oidc"),
+        "sync ladder divergence is the regression precondition"
+    );
+    let sent = provider.current_api_key_async().await;
+    assert_eq!(sent.as_deref(), Some("static-after-refresh-failure"));
+    assert_eq!(refresh_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        provider.compare_sent_credential(sent.as_deref()).await,
+        CredentialComparison::same_as_current()
+    );
 }
 
 /// Auth.json create, rewrite (including same-length, caught by the inode in

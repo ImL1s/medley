@@ -24,6 +24,46 @@ use super::refresh::{ProjectInitializationComplete, RefreshTarget};
 use super::{DiagnosticsNotify, LspError, LspMainLoop, file_uri, workspace_open};
 use crate::util::{ProcessGroup, ProcessScope};
 
+fn io_error_class(error: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind;
+
+    match error.kind() {
+        ErrorKind::NotFound => "not_found",
+        ErrorKind::PermissionDenied => "permission_denied",
+        ErrorKind::ConnectionRefused => "connection_refused",
+        ErrorKind::ConnectionReset => "connection_reset",
+        ErrorKind::ConnectionAborted => "connection_aborted",
+        ErrorKind::NotConnected => "not_connected",
+        ErrorKind::AddrInUse => "address_in_use",
+        ErrorKind::AddrNotAvailable => "address_unavailable",
+        ErrorKind::BrokenPipe => "broken_pipe",
+        ErrorKind::AlreadyExists => "already_exists",
+        ErrorKind::WouldBlock => "would_block",
+        ErrorKind::InvalidInput => "invalid_input",
+        ErrorKind::InvalidData => "invalid_data",
+        ErrorKind::TimedOut => "timeout",
+        ErrorKind::WriteZero => "write_zero",
+        ErrorKind::Interrupted => "interrupted",
+        ErrorKind::UnexpectedEof => "unexpected_eof",
+        _ => "io",
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct StderrDiagnostic {
+    server_configured: bool,
+    stderr_present: bool,
+    stderr_bytes: usize,
+}
+
+fn stderr_diagnostic(server_name: &str, line: &str) -> StderrDiagnostic {
+    StderrDiagnostic {
+        server_configured: !server_name.is_empty(),
+        stderr_present: !line.is_empty(),
+        stderr_bytes: line.len(),
+    }
+}
+
 #[cfg(test)]
 use super::config::REQUEST_TIMEOUT;
 #[cfg(test)]
@@ -386,9 +426,12 @@ impl LspClient {
         xai_tty_utils::detach_std_command(&mut cmd);
         cmd.envs(xai_tty_utils::pager_env());
         #[allow(clippy::disallowed_methods)] // enrolled by LspClient::enroll once started
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| LspError::SpawnFailed(format!("'{}': {e}", config.command)))?;
+        let mut child = cmd.spawn().map_err(|error| {
+            LspError::SpawnFailed(format!(
+                "server process spawn failed ({})",
+                io_error_class(&error)
+            ))
+        })?;
 
         let child_stdout = child
             .stdout
@@ -407,17 +450,32 @@ impl LspClient {
                 let Ok(stderr) = stderr else { return };
                 let mut lines = tokio::io::BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(server = %name, "stderr: {line}");
+                    let diagnostic = stderr_diagnostic(&name, &line);
+                    tracing::debug!(
+                        server_configured = diagnostic.server_configured,
+                        stderr_present = diagnostic.stderr_present,
+                        stderr_bytes = diagnostic.stderr_bytes,
+                        "LSP server wrote to stderr"
+                    );
                 }
             })
         });
 
         tracing::debug!(server = %server_name, pid = ?child.id(), "LSP server spawned (stdio)");
 
-        let async_stdout = tokio::process::ChildStdout::from_std(child_stdout)
-            .map_err(|e| LspError::SpawnFailed(format!("stdout async wrap: {e}")))?;
-        let async_stdin = tokio::process::ChildStdin::from_std(child_stdin)
-            .map_err(|e| LspError::SpawnFailed(format!("stdin async wrap: {e}")))?;
+        let async_stdout =
+            tokio::process::ChildStdout::from_std(child_stdout).map_err(|error| {
+                LspError::SpawnFailed(format!(
+                    "stdout async wrap failed ({})",
+                    io_error_class(&error)
+                ))
+            })?;
+        let async_stdin = tokio::process::ChildStdin::from_std(child_stdin).map_err(|error| {
+            LspError::SpawnFailed(format!(
+                "stdin async wrap failed ({})",
+                io_error_class(&error)
+            ))
+        })?;
 
         let name = server_name.to_string();
         let handle = tokio::spawn(async move {
@@ -893,5 +951,31 @@ impl LspClient {
             }
             None => vec![],
         })
+    }
+}
+
+#[cfg(test)]
+mod credential_diagnostic_tests {
+    use super::{io_error_class, stderr_diagnostic};
+
+    #[test]
+    fn lsp_stderr_and_io_diagnostics_omit_secret_fragments() {
+        const SENTINEL: &str = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+        let stderr = format!("language server echoed Authorization: Bearer {SENTINEL}");
+        let server_name = format!("server-{SENTINEL}");
+        let diagnostic = format!("{:?}", stderr_diagnostic(&server_name, &stderr));
+        let error = std::io::Error::other(format!("spawn env contained {SENTINEL}"));
+        let error_class = io_error_class(&error);
+
+        assert!(diagnostic.contains("server_configured: true"));
+        assert!(diagnostic.contains("stderr_present: true"));
+        assert_eq!(error_class, "io");
+        for rendered in [diagnostic.as_str(), error_class] {
+            assert!(!rendered.contains(SENTINEL));
+            for window in SENTINEL.as_bytes().windows(8) {
+                let fragment = std::str::from_utf8(window).expect("ASCII sentinel");
+                assert!(!rendered.contains(fragment), "leaked fragment {fragment}");
+            }
+        }
     }
 }

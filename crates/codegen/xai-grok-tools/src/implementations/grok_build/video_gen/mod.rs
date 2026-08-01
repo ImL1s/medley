@@ -123,10 +123,10 @@ impl ZdrVideoOutputS3Config {
 impl std::fmt::Debug for ZdrVideoOutputS3Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ZdrVideoOutputS3Config")
-            .field("bucket", &self.bucket)
-            .field("endpoint", &self.endpoint)
-            .field("region", &self.region)
-            .field("key_prefix", &self.key_prefix)
+            .field("bucket_present", &!self.bucket.is_empty())
+            .field("endpoint_present", &!self.endpoint.is_empty())
+            .field("region_present", &!self.region.is_empty())
+            .field("key_prefix_present", &!self.key_prefix.is_empty())
             .field("expires_secs", &self.expires_secs)
             .field("read_write", &self.read_write)
             .field("read_only", &self.read_only.as_ref().map(|_| "[redacted]"))
@@ -178,24 +178,18 @@ impl VideoGenClient {
         // The dynamic provider overrides per-request; this is the fallback.
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
-                xai_tool_runtime::ToolError::invalid_arguments(format!(
-                    "Invalid API key for header: {e}"
-                ))
+            HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|_| {
+                xai_tool_runtime::ToolError::invalid_arguments("Invalid API key for header.")
             })?,
         );
 
         extra_headers.into_iter().try_for_each(|(key, value)| {
             let header_name =
-                reqwest::header::HeaderName::from_bytes(key.as_bytes()).map_err(|e| {
-                    xai_tool_runtime::ToolError::invalid_arguments(format!(
-                        "Invalid header name '{key}': {e}"
-                    ))
+                reqwest::header::HeaderName::from_bytes(key.as_bytes()).map_err(|_| {
+                    xai_tool_runtime::ToolError::invalid_arguments("Invalid extra header name.")
                 })?;
-            let header_value = HeaderValue::from_str(value).map_err(|e| {
-                xai_tool_runtime::ToolError::invalid_arguments(format!(
-                    "Invalid header value for '{key}': {e}"
-                ))
+            let header_value = HeaderValue::from_str(value).map_err(|_| {
+                xai_tool_runtime::ToolError::invalid_arguments("Invalid extra header value.")
             })?;
             headers.insert(header_name, header_value);
             Ok::<(), xai_tool_runtime::ToolError>(())
@@ -205,10 +199,8 @@ impl VideoGenClient {
             reqwest::Client::builder().default_headers(headers),
         )
         .build()
-        .map_err(|e| {
-            xai_tool_runtime::ToolError::invalid_arguments(format!(
-                "Failed to build HTTP client: {e}"
-            ))
+        .map_err(|_| {
+            xai_tool_runtime::ToolError::invalid_arguments("Failed to build HTTP client.")
         })?;
 
         let download_http = xai_grok_extra_ca::with_extra_root_certificates(
@@ -216,10 +208,8 @@ impl VideoGenClient {
                 .timeout(std::time::Duration::from_secs(VIDEO_DOWNLOAD_TIMEOUT_SECS)),
         )
         .build()
-        .map_err(|e| {
-            xai_tool_runtime::ToolError::invalid_arguments(format!(
-                "Failed to build download client: {e}"
-            ))
+        .map_err(|_| {
+            xai_tool_runtime::ToolError::invalid_arguments("Failed to build download client.")
         })?;
 
         Ok(Self {
@@ -258,8 +248,23 @@ impl VideoGenClient {
         crate::types::api_key_provider::resolve_bearer(self.api_key_provider.as_ref()).await
     }
 
-    fn record_401_attribution(&self, consumer: ToolConsumer, sent_bearer: Option<&str>) {
-        crate::attribution::emit_401(self.attribution_callback.as_ref(), consumer, sent_bearer);
+    async fn compare_sent_credential(
+        &self,
+        sent_bearer: Option<&str>,
+    ) -> xai_grok_auth::CredentialComparison {
+        crate::types::api_key_provider::compare_sent_bearer(
+            self.api_key_provider.as_ref(),
+            sent_bearer,
+        )
+        .await
+    }
+
+    fn record_401_attribution(
+        &self,
+        consumer: ToolConsumer,
+        comparison: xai_grok_auth::CredentialComparison,
+    ) {
+        crate::attribution::emit_401(self.attribution_callback.as_ref(), consumer, comparison);
     }
 
     pub async fn generate_with_images(
@@ -304,40 +309,41 @@ impl VideoGenClient {
         if let Some(ref key) = sent_bearer {
             req = req.header(AUTHORIZATION, format!("Bearer {key}"));
         }
-
-        let response = req.send().await.map_err(|e| {
-            xai_tool_runtime::ToolError::invalid_arguments(format!(
-                "Video generation API request failed: {e}"
-            ))
+        let request = req.build().map_err(|_| {
+            xai_tool_runtime::ToolError::invalid_arguments(
+                "Failed to build video generation request.",
+            )
+        })?;
+        let sent_bearer = crate::types::api_key_provider::request_credential(&request);
+        let response = self.http.execute(request).await.map_err(|_| {
+            xai_tool_runtime::ToolError::invalid_arguments("Video generation API transport failed.")
         })?;
 
         let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            self.record_401_attribution(ToolConsumer::VideoGenStart, sent_bearer.as_deref());
+        if crate::types::api_key_provider::is_auth_failure(status) {
+            let comparison = self.compare_sent_credential(sent_bearer.as_deref()).await;
+            self.record_401_attribution(ToolConsumer::VideoGenStart, comparison);
         }
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            let truncated: String = body.chars().take(200).collect();
-            tracing::warn!(http_status = %status, "Video generation API error: {truncated}");
+            tracing::warn!(http_status = %status, "Video generation API request failed");
             return Err(xai_tool_runtime::ToolError::new(
                 xai_tool_runtime::ToolErrorKind::Custom,
-                format!("Video generation failed with HTTP {status}: {truncated}"),
+                format!("Video generation failed (HTTP {status})."),
             )
             .with_details(serde_json::json!({"code": "http_failure", "status": status.as_u16()})));
         }
 
-        let body = response.text().await.map_err(|e| {
-            xai_tool_runtime::ToolError::invalid_arguments(format!(
-                "Failed to read video generation start response body: {e}"
-            ))
+        let body = response.text().await.map_err(|_| {
+            xai_tool_runtime::ToolError::invalid_arguments(
+                "Failed to read video generation start response.",
+            )
         })?;
 
-        let start_resp: VideoGenStartResponse = serde_json::from_str(&body).map_err(|e| {
-            let preview: String = body.chars().take(500).collect();
-            tracing::warn!("Video generation API returned unparseable body: {preview}");
-            xai_tool_runtime::ToolError::invalid_arguments(format!(
-                "Failed to parse video generation start response: {e} — body preview: {preview}"
-            ))
+        let start_resp: VideoGenStartResponse = serde_json::from_str(&body).map_err(|_| {
+            tracing::warn!("Video generation API returned an invalid start response");
+            xai_tool_runtime::ToolError::invalid_arguments(
+                "Video generation API returned an invalid start response.",
+            )
         })?;
 
         let request_id = start_resp.request_id;
@@ -347,7 +353,7 @@ impl VideoGenClient {
             ));
         }
 
-        tracing::info!(request_id = %request_id, "Video generation started, polling for completion");
+        tracing::info!("Video generation started, polling for completion");
 
         let poll_url = format!(
             "{}/videos/{}",
@@ -364,7 +370,7 @@ impl VideoGenClient {
 
             if started.elapsed() >= deadline {
                 return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
-                    "Video generation did not complete within {}s (request_id={request_id})",
+                    "Video generation did not complete within {}s.",
                     VIDEO_GEN_TIMEOUT_SECS
                 )));
             }
@@ -374,57 +380,57 @@ impl VideoGenClient {
             if let Some(ref key) = poll_sent_bearer {
                 poll_req = poll_req.header(AUTHORIZATION, format!("Bearer {key}"));
             }
-
-            let poll_response = poll_req.send().await.map_err(|e| {
-                xai_tool_runtime::ToolError::invalid_arguments(format!(
-                    "Video poll request failed: {e}"
-                ))
+            let poll_request = poll_req.build().map_err(|_| {
+                xai_tool_runtime::ToolError::invalid_arguments(
+                    "Failed to build video poll request.",
+                )
+            })?;
+            let poll_sent_bearer =
+                crate::types::api_key_provider::request_credential(&poll_request);
+            let poll_response = self.http.execute(poll_request).await.map_err(|_| {
+                xai_tool_runtime::ToolError::invalid_arguments("Video poll transport failed.")
             })?;
 
             let poll_status = poll_response.status();
-            if poll_status == reqwest::StatusCode::UNAUTHORIZED {
-                self.record_401_attribution(
-                    ToolConsumer::VideoGenPoll,
-                    poll_sent_bearer.as_deref(),
-                );
+            if crate::types::api_key_provider::is_auth_failure(poll_status) {
+                let poll_comparison = self
+                    .compare_sent_credential(poll_sent_bearer.as_deref())
+                    .await;
+                self.record_401_attribution(ToolConsumer::VideoGenPoll, poll_comparison);
             }
             if !poll_status.is_success() && poll_status.as_u16() != 202 {
-                let body = poll_response.text().await.unwrap_or_default();
-                let truncated: String = body.chars().take(200).collect();
                 return Err(xai_tool_runtime::ToolError::new(
                     xai_tool_runtime::ToolErrorKind::Custom,
-                    format!("Video poll failed with HTTP {poll_status}: {truncated}"),
+                    format!("Video poll failed (HTTP {poll_status})."),
                 )
                 .with_details(
                     serde_json::json!({"code": "http_failure", "status": poll_status.as_u16()}),
                 ));
             }
 
-            let poll_body = poll_response.text().await.map_err(|e| {
-                xai_tool_runtime::ToolError::invalid_arguments(format!(
-                    "Failed to read video poll response body: {e}"
-                ))
+            let poll_body = poll_response.text().await.map_err(|_| {
+                xai_tool_runtime::ToolError::invalid_arguments(
+                    "Failed to read video poll response.",
+                )
             })?;
 
             let poll_data: VideoGenPollResponse =
-                serde_json::from_str(&poll_body).map_err(|e| {
-                    let preview: String = poll_body.chars().take(500).collect();
-                    tracing::warn!("Video poll API returned unparseable body: {preview}");
-                    xai_tool_runtime::ToolError::invalid_arguments(format!(
-                        "Failed to parse video poll response: {e} — body preview: {preview}"
-                    ))
+                serde_json::from_str(&poll_body).map_err(|_| {
+                    tracing::warn!("Video poll API returned an invalid response");
+                    xai_tool_runtime::ToolError::invalid_arguments(
+                        "Video poll API returned an invalid response.",
+                    )
                 })?;
 
             match poll_data.status.as_str() {
                 "done" => {
                     let video_url = poll_data.video.and_then(|v| v.url).unwrap_or_default();
                     tracing::info!(
-                        request_id = %request_id,
                         elapsed_secs = started.elapsed().as_secs(),
                         "Video generation completed"
                     );
                     return match presigned {
-                        Some(urls) => self.finish_zdr_video(&request_id, urls).await,
+                        Some(urls) => self.finish_zdr_video(urls).await,
                         None if video_url.is_empty() => {
                             Err(xai_tool_runtime::ToolError::invalid_arguments(
                                 "Video generation completed but no download URL was returned.",
@@ -437,19 +443,18 @@ impl VideoGenClient {
                     };
                 }
                 "failed" => {
-                    let preview: String = poll_body.chars().take(300).collect();
-                    return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
-                        "Video generation failed on the server (request_id={request_id}): {preview}"
-                    )));
+                    return Err(xai_tool_runtime::ToolError::invalid_arguments(
+                        "Video generation failed on the server.",
+                    ));
                 }
                 "expired" => {
-                    return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
-                        "Video generation request expired (request_id={request_id})."
-                    )));
+                    return Err(xai_tool_runtime::ToolError::invalid_arguments(
+                        "Video generation request expired.",
+                    ));
                 }
-                other => {
+                _ => {
                     tracing::debug!(
-                        status = %other,
+                        status_class = "pending_or_unknown",
                         elapsed_secs = started.elapsed().as_secs(),
                         "Video generation still in progress"
                     );
@@ -460,8 +465,8 @@ impl VideoGenClient {
 
     /// Download video bytes from a pre-signed temporary URL (no auth headers).
     async fn download_video(&self, url: &str) -> Result<Vec<u8>, xai_tool_runtime::ToolError> {
-        let response = self.download_http.get(url).send().await.map_err(|e| {
-            xai_tool_runtime::ToolError::invalid_arguments(format!("Failed to download video: {e}"))
+        let response = self.download_http.get(url).send().await.map_err(|_| {
+            xai_tool_runtime::ToolError::invalid_arguments("Video download transport failed.")
         })?;
 
         if !response.status().is_success() {
@@ -473,16 +478,13 @@ impl VideoGenClient {
             .with_details(serde_json::json!({"code": "http_failure", "status": status.as_u16()})));
         }
 
-        response.bytes().await.map(|b| b.to_vec()).map_err(|e| {
-            xai_tool_runtime::ToolError::invalid_arguments(format!(
-                "Failed to read video bytes: {e}"
-            ))
+        response.bytes().await.map(|b| b.to_vec()).map_err(|_| {
+            xai_tool_runtime::ToolError::invalid_arguments("Failed to read video bytes.")
         })
     }
 
     async fn finish_zdr_video(
         &self,
-        request_id: &str,
         urls: ZdrPresignedUrls,
     ) -> Result<VideoOutcome, xai_tool_runtime::ToolError> {
         let config = self.zdr_video_output_s3.as_ref().ok_or_else(|| {
@@ -491,31 +493,27 @@ impl VideoGenClient {
             )
         })?;
 
-        // A presigned GET means the client must download locally. Propagate
-        // failures instead of silently treating the run as upload-only success.
+        // A presigned GET means the client should download locally. If that
+        // fails after the provider already uploaded the object, preserve the
+        // successful generation as a credential-free S3 object reference.
         if let Some(get_url) = urls.get_url.as_deref() {
-            let bytes = self.download_video(get_url).await.map_err(|e| {
-                tracing::warn!(
-                    request_id = %request_id,
-                    "Presigned video download failed (GET URL was minted): {e}"
-                );
-                e
-            })?;
-            return Ok(VideoOutcome::Bytes(bytes));
+            return match self.download_video(get_url).await {
+                Ok(bytes) => Ok(VideoOutcome::Bytes(bytes)),
+                Err(_) => {
+                    tracing::warn!("Presigned video download failed; returning object reference");
+                    Ok(zdr_uploaded_reference_outcome(config, &urls))
+                }
+            };
         }
 
         // No pre-minted GET URL — retry presign (may succeed now that the
-        // object exists) and attempt a local download before falling back to
-        // a remote reference URL for the model.
-        match self.presign_and_download(config, &urls, request_id).await {
+        // object exists) and attempt a local download. A presigned URL is never
+        // returned to the model; upload-success fallback uses only bucket/key.
+        match self.presign_and_download(config, &urls).await {
             Ok(bytes) => Ok(VideoOutcome::Bytes(bytes)),
-            Err(e) => {
-                tracing::warn!(
-                    request_id = %request_id,
-                    "Post-upload video download failed, returning remote reference: {e}"
-                );
-                let reference_url = self.zdr_reference_url(config, &urls).await?;
-                Ok(VideoOutcome::UploadedUrl(reference_url))
+            Err(_) => {
+                tracing::warn!("Post-upload video download failed; returning object reference");
+                Ok(zdr_uploaded_reference_outcome(config, &urls))
             }
         }
     }
@@ -539,26 +537,20 @@ impl VideoGenClient {
             expires_in,
         )
         .await
-        .map_err(|e| {
-            xai_tool_runtime::ToolError::invalid_arguments(format!(
-                "Failed to presign video upload URL: {e}"
-            ))
+        .map_err(|_| {
+            xai_tool_runtime::ToolError::invalid_arguments("Failed to presign video upload URL.")
         })?;
 
-        if !is_http_url(&upload_url) {
-            return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
-                "Presigned upload URL is not http(s): {upload_url}"
-            )));
-        }
+        ensure_http_url(&upload_url, "Presigned video upload URL is invalid.")?;
 
         let get_url = match self
             .presign_zdr_get_url(config, &object_key, expires_in)
             .await
         {
             Ok(url) => Some(url),
-            Err(e) => {
+            Err(_) => {
                 tracing::warn!(
-                    "Video GET presign failed before generation; will retry download after upload completes: {e}"
+                    "Video GET presign failed before generation; will retry download after upload completes"
                 );
                 None
             }
@@ -577,28 +569,12 @@ impl VideoGenClient {
         &self,
         config: &ZdrVideoOutputS3Config,
         urls: &ZdrPresignedUrls,
-        request_id: &str,
     ) -> Result<Vec<u8>, xai_tool_runtime::ToolError> {
         let get_url = self
             .presign_zdr_get_url(config, &urls.object_key, urls.expires_in)
             .await?;
-        tracing::info!(
-            request_id = %request_id,
-            "Post-upload video GET presign succeeded, attempting download"
-        );
+        tracing::info!("Post-upload video GET presign succeeded, attempting download");
         self.download_video(&get_url).await
-    }
-
-    async fn zdr_reference_url(
-        &self,
-        config: &ZdrVideoOutputS3Config,
-        urls: &ZdrPresignedUrls,
-    ) -> Result<String, xai_tool_runtime::ToolError> {
-        if let Some(get_url) = urls.get_url.as_deref().filter(|u| is_http_url(u)) {
-            return Ok(get_url.to_owned());
-        }
-        self.presign_zdr_get_url(config, &urls.object_key, urls.expires_in)
-            .await
     }
 
     async fn presign_zdr_get_url(
@@ -618,17 +594,13 @@ impl VideoGenClient {
             expires_in,
         )
         .await
-        .map_err(|e| {
+        .map_err(|_| {
             xai_tool_runtime::ToolError::invalid_arguments(format!(
-                "Failed to presign video GET URL ({creds_source}): {e}"
+                "Failed to presign video GET URL ({creds_source})."
             ))
         })?;
 
-        if !is_http_url(&url) {
-            return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
-                "Presigned GET URL is not http(s): {url}"
-            )));
-        }
+        ensure_http_url(&url, "Presigned video download URL is invalid.")?;
         Ok(url)
     }
 }
@@ -664,16 +636,47 @@ fn zdr_video_object_key(prefix: &str) -> String {
     }
 }
 
+/// Build a stable remote reference from non-secret S3 coordinates only.
+/// Presigned URLs, endpoints, and credentials must never reach model output.
+fn zdr_object_reference(bucket: &str, object_key: &str) -> String {
+    let mut reference = url::Url::parse("s3://configured/").expect("valid static S3 URL");
+    if reference.set_host(Some(bucket.trim())).is_err() {
+        return "s3://configured/object".to_string();
+    }
+    if let Ok(mut segments) = reference.path_segments_mut() {
+        segments.clear();
+        for segment in object_key.split('/').filter(|segment| !segment.is_empty()) {
+            segments.push(segment);
+        }
+    }
+    reference.to_string()
+}
+
+fn zdr_uploaded_reference_outcome(
+    config: &ZdrVideoOutputS3Config,
+    urls: &ZdrPresignedUrls,
+) -> VideoOutcome {
+    VideoOutcome::UploadedReference(zdr_object_reference(&config.bucket, &urls.object_key))
+}
+
 fn is_http_url(raw: &str) -> bool {
     url::Url::parse(raw)
         .map(|u| matches!(u.scheme(), "http" | "https"))
         .unwrap_or(false)
 }
 
+fn ensure_http_url(raw: &str, safe_error: &'static str) -> Result<(), xai_tool_runtime::ToolError> {
+    if is_http_url(raw) {
+        Ok(())
+    } else {
+        Err(xai_tool_runtime::ToolError::invalid_arguments(safe_error))
+    }
+}
+
 /// Session-level configuration. Same shape as [`ImageGenConfig`].
 ///
 /// [`ImageGenConfig`]: super::image_gen::ImageGenConfig
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub enum VideoGenConfig {
     #[default]
     Disabled,
@@ -688,6 +691,31 @@ pub enum VideoGenConfig {
         /// the subscription tier; always `false` for team / API-key / workspace.
         tier_restricted: bool,
     },
+}
+
+impl std::fmt::Debug for VideoGenConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled => f.write_str("VideoGenConfig::Disabled"),
+            Self::Enabled {
+                api_key,
+                base_url,
+                extra_headers,
+                zdr_video_output_s3,
+                tier_restricted,
+            } => f
+                .debug_struct("VideoGenConfig::Enabled")
+                .field("api_key_present", &!api_key.is_empty())
+                .field("base_url_present", &!base_url.is_empty())
+                .field("extra_headers_present", &!extra_headers.is_empty())
+                .field(
+                    "zdr_video_output_s3_present",
+                    &zdr_video_output_s3.is_some(),
+                )
+                .field("tier_restricted", tier_restricted)
+                .finish(),
+        }
+    }
 }
 
 impl VideoGenConfig {
@@ -718,7 +746,7 @@ fn default_resolution_name() -> String {
 
 pub enum VideoOutcome {
     Bytes(Vec<u8>),
-    UploadedUrl(String),
+    UploadedReference(String),
 }
 
 #[derive(serde::Serialize)]
@@ -762,14 +790,14 @@ struct VideoGenStartResponse {
     request_id: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(serde::Deserialize)]
 struct VideoGenPollResponse {
     #[serde(default)]
     status: String,
     video: Option<VideoGenVideoInfo>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(serde::Deserialize)]
 struct VideoGenVideoInfo {
     url: Option<String>,
 }
@@ -798,10 +826,8 @@ async fn resolve_image_reference(value: &str) -> Result<String, xai_tool_runtime
         return Ok(value.to_owned());
     }
 
-    let raw_bytes = tokio::fs::read(value).await.map_err(|e| {
-        xai_tool_runtime::ToolError::invalid_arguments(format!(
-            "image reference not readable: {value} ({e})"
-        ))
+    let raw_bytes = tokio::fs::read(value).await.map_err(|_| {
+        xai_tool_runtime::ToolError::invalid_arguments("Image reference is not readable.")
     })?;
     if raw_bytes.is_empty() {
         return Err(xai_tool_runtime::ToolError::invalid_arguments(
@@ -810,8 +836,8 @@ async fn resolve_image_reference(value: &str) -> Result<String, xai_tool_runtime
     }
 
     let (_w, _h, mime) =
-        crate::util::image_validate::validate_image_bytes(&raw_bytes).map_err(|e| {
-            xai_tool_runtime::ToolError::invalid_arguments(format!("invalid image reference: {e}"))
+        crate::util::image_validate::validate_image_bytes(&raw_bytes).map_err(|_| {
+            xai_tool_runtime::ToolError::invalid_arguments("Image reference is invalid.")
         })?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&raw_bytes);
     Ok(format!("data:{mime};base64,{b64}"))
@@ -975,7 +1001,7 @@ async fn media_output_from_outcome(
             let path = save_video_bytes(client, session_folder, &bytes).await?;
             Ok(MediaGenOutput::new(path))
         }
-        VideoOutcome::UploadedUrl(url) => Ok(MediaGenOutput::uploaded(url)),
+        VideoOutcome::UploadedReference(reference) => Ok(MediaGenOutput::uploaded(reference)),
     }
 }
 
@@ -1199,6 +1225,92 @@ mod tests {
     use super::*;
     use crate::types::tool_metadata::test_ctx_with_call_id;
 
+    fn assert_no_secret_windows(rendered: &str, secret: &str) {
+        assert!(!rendered.contains(secret));
+        for window in secret.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(
+                !rendered.contains(window),
+                "leaked sentinel window: {window}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_debug_is_presence_only() {
+        let secret = "GB002-video-config-secret-0123456789abcdef";
+        let storage = ZdrVideoOutputS3Config {
+            bucket: secret.to_owned(),
+            endpoint: format!("https://user:{secret}@example.test/?token={secret}"),
+            region: secret.to_owned(),
+            key_prefix: secret.to_owned(),
+            expires_secs: 900,
+            read_write: S3AccessCredentials {
+                access_key_id: secret.to_owned(),
+                secret_access_key: secret.to_owned(),
+            },
+            read_only: None,
+        };
+        assert_no_secret_windows(&format!("{storage:?}"), secret);
+
+        let config = VideoGenConfig::Enabled {
+            api_key: secret.to_owned(),
+            base_url: format!("https://user:{secret}@example.test/?token={secret}"),
+            extra_headers: indexmap::IndexMap::from([(
+                "Authorization".to_owned(),
+                secret.to_owned(),
+            )]),
+            zdr_video_output_s3: Some(Box::new(storage)),
+            tier_restricted: false,
+        };
+        assert_no_secret_windows(&format!("{config:?}"), secret);
+    }
+
+    #[test]
+    fn invalid_presigned_url_error_does_not_echo_url() {
+        let secret = "GB002-zqxv-token-0123456789abcdef";
+        let invalid_url = format!("ftp://user:{secret}@example.test/?token={secret}");
+        for message in [
+            "Presigned video upload URL is invalid.",
+            "Presigned video download URL is invalid.",
+        ] {
+            let error = ensure_http_url(&invalid_url, message)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, message);
+            assert_no_secret_windows(&error, secret);
+        }
+    }
+
+    #[test]
+    fn invalid_credential_header_error_is_fixed_and_secret_free() {
+        let secret = "GB002-zqxv-header-0123456789abcdef";
+        let config = VideoGenConfig::Enabled {
+            api_key: format!("{secret}\n"),
+            base_url: "https://example.test".to_owned(),
+            extra_headers: indexmap::IndexMap::new(),
+            zdr_video_output_s3: None,
+            tier_restricted: false,
+        };
+        let error = match VideoGenClient::new(&config, None) {
+            Ok(_) => panic!("invalid credential header must fail"),
+            Err(error) => error.to_string(),
+        };
+        assert_eq!(error, "Invalid API key for header.");
+        assert_no_secret_windows(&error, secret);
+    }
+
+    #[tokio::test]
+    async fn unreadable_image_reference_error_is_fixed_and_secret_free() {
+        let secret = "GB002-zqxv-image-ref-0123456789abcdef";
+        let error = resolve_image_reference(&format!("/missing/{secret}"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "Image reference is not readable.");
+        assert_no_secret_windows(&error, secret);
+    }
+
     #[test]
     fn image_to_video_name_and_description() {
         let tool = ImageToVideoTool;
@@ -1421,6 +1533,47 @@ mod tests {
     }
 
     #[test]
+    fn zdr_upload_fallback_reference_excludes_credentials_and_presigned_urls() {
+        const ACCESS_SECRET: &str = "GB002-video-access-secret-0123456789";
+        const SIGNING_SECRET: &str = "GB002-video-signing-secret-9876543210";
+        const QUERY_SECRET: &str = "GB002-video-query-secret-2468135790";
+        let config = ZdrVideoOutputS3Config {
+            bucket: "team-videos".into(),
+            endpoint: format!("https://user:{QUERY_SECRET}@s3.example.test/?token={QUERY_SECRET}"),
+            region: "us-east-1".into(),
+            key_prefix: "generated/session".into(),
+            expires_secs: 600,
+            read_write: S3AccessCredentials {
+                access_key_id: ACCESS_SECRET.into(),
+                secret_access_key: SIGNING_SECRET.into(),
+            },
+            read_only: None,
+        };
+        let urls = ZdrPresignedUrls {
+            object_key: "generated/session/video.mp4".into(),
+            upload_url: format!("https://upload.example.test/?signature={QUERY_SECRET}"),
+            get_url: Some(format!(
+                "https://download.example.test/?signature={QUERY_SECRET}"
+            )),
+            expires_in: std::time::Duration::from_secs(600),
+        };
+        let VideoOutcome::UploadedReference(reference) =
+            zdr_uploaded_reference_outcome(&config, &urls)
+        else {
+            panic!("download failure must preserve upload success")
+        };
+
+        assert_eq!(reference, "s3://team-videos/generated/session/video.mp4");
+        for secret in [ACCESS_SECRET, SIGNING_SECRET, QUERY_SECRET] {
+            assert!(!reference.contains(secret));
+            for window in secret.as_bytes().windows(8) {
+                assert!(!reference.contains(std::str::from_utf8(window).unwrap()));
+            }
+        }
+        assert!(!reference.contains('?'));
+    }
+
+    #[test]
     fn is_http_url_validates_scheme() {
         assert!(is_http_url("https://bucket.example.com/signed?token=abc"));
         assert!(is_http_url("http://localhost:9000/test"));
@@ -1506,6 +1659,97 @@ mod tests {
         .await
         .expect_err("Expected image count error");
         assert!(err.to_string().contains("at least two"));
+    }
+
+    #[tokio::test]
+    async fn provider_error_body_never_reaches_video_generation_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let secret = "video-secret-0123456789";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/videos/generations"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string(format!("provider echoed {secret} and {}", &secret[4..16])),
+            )
+            .mount(&server)
+            .await;
+        let config = VideoGenConfig::Enabled {
+            api_key: secret.into(),
+            base_url: server.uri(),
+            extra_headers: indexmap::IndexMap::new(),
+            zdr_video_output_s3: None,
+            tier_restricted: false,
+        };
+        let client = VideoGenClient::new(&config, None).unwrap();
+        let result = client
+            .generate_with_images(
+                XAI_VIDEO_BASE_MODEL,
+                "prompt",
+                Some(6),
+                Some("16:9"),
+                "480p",
+                None,
+                Vec::new(),
+            )
+            .await;
+        let error = match result {
+            Ok(_) => panic!("provider failure must not succeed"),
+            Err(error) => error.to_string(),
+        };
+        assert!(!error.contains(secret));
+        for window in secret.as_bytes().windows(8) {
+            assert!(!error.contains(std::str::from_utf8(window).unwrap()));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_request_id_never_reaches_video_generation_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let secret = "video_request_SENTINEL_0123456789abcdef";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/videos/generations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "request_id": secret,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/videos/{secret}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "failed",
+            })))
+            .mount(&server)
+            .await;
+        let config = VideoGenConfig::Enabled {
+            api_key: secret.into(),
+            base_url: server.uri(),
+            extra_headers: indexmap::IndexMap::new(),
+            zdr_video_output_s3: None,
+            tier_restricted: false,
+        };
+        let client = VideoGenClient::new(&config, None).unwrap();
+        let outcome = client
+            .generate_with_images(
+                XAI_VIDEO_BASE_MODEL,
+                "prompt",
+                Some(6),
+                Some("16:9"),
+                "480p",
+                None,
+                Vec::new(),
+            )
+            .await;
+        let error = match outcome {
+            Ok(_) => panic!("provider failure must not succeed"),
+            Err(error) => error.to_string(),
+        };
+        assert_no_secret_windows(&error, secret);
     }
 
     #[test]

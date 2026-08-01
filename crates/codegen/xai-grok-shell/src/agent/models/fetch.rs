@@ -208,8 +208,7 @@ fn start_early_prefetch_impl(
 fn spawn_prefetch_thread(env: PrefetchEnv) -> EarlyPrefetchHandle {
     std::thread::spawn(move || {
         let mut timer = crate::instrumentation_timer!("startup.early_prefetch");
-        let proxy_endpoint = env.endpoints.proxy_url();
-        timer.with_field("endpoint", proxy_endpoint.as_str());
+        timer.with_field("endpoint_configured", "true");
         let (models, settings) = prefetch_models_and_settings_blocking(
             &env.endpoints,
             env.auth.as_ref(),

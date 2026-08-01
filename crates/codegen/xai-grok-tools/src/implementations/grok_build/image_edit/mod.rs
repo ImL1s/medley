@@ -380,40 +380,37 @@ impl xai_tool_runtime::Tool for ImageEditTool {
         if let Some(ref key) = sent_bearer {
             req = req.header(AUTHORIZATION, format!("Bearer {key}"));
         }
-
-        let response = req.send().await.map_err(|e| {
-            xai_tool_runtime::ToolError::invalid_arguments(format!(
-                "Image edit API request failed: {e}"
-            ))
+        let request = req.build().map_err(|_| {
+            xai_tool_runtime::ToolError::invalid_arguments("Failed to build image edit request.")
+        })?;
+        let sent_bearer = crate::types::api_key_provider::request_credential(&request);
+        let response = client.http().execute(request).await.map_err(|_| {
+            xai_tool_runtime::ToolError::invalid_arguments("Image edit API transport failed.")
         })?;
 
         let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            client.record_401_attribution(ToolConsumer::ImageGen, sent_bearer.as_deref());
+        if crate::types::api_key_provider::is_auth_failure(status) {
+            let comparison = client.compare_sent_credential(sent_bearer.as_deref()).await;
+            client.record_401_attribution(ToolConsumer::ImageGen, comparison);
         }
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            let truncated: String = body.chars().take(200).collect();
-            tracing::warn!(http_status = %status, "Imagine edit API error: {truncated}");
+            tracing::warn!(http_status = %status, "Imagine edit API request failed");
             return Err(xai_tool_runtime::ToolError::new(
                 xai_tool_runtime::ToolErrorKind::Custom,
-                format!("Image edit failed with HTTP {status}: {truncated}"),
+                format!("Image edit failed (HTTP {status})."),
             )
             .with_details(serde_json::json!({"code": "http_failure", "status": status.as_u16()})));
         }
 
-        let body = response.text().await.map_err(|e| {
-            xai_tool_runtime::ToolError::invalid_arguments(format!(
-                "Failed to read image edit response body: {e}"
-            ))
+        let body = response.text().await.map_err(|_| {
+            xai_tool_runtime::ToolError::invalid_arguments("Failed to read image edit response.")
         })?;
 
-        let resp_json: ImageGenResponse = serde_json::from_str(&body).map_err(|e| {
-            let preview: String = body.chars().take(500).collect();
-            tracing::warn!("Imagine edit API returned unparseable body: {preview}");
-            xai_tool_runtime::ToolError::invalid_arguments(format!(
-                "Failed to parse image edit response: {e} — body preview: {preview}"
-            ))
+        let resp_json: ImageGenResponse = serde_json::from_str(&body).map_err(|_| {
+            tracing::warn!("Imagine edit API returned an invalid response");
+            xai_tool_runtime::ToolError::invalid_arguments(
+                "Image edit API returned an invalid response.",
+            )
         })?;
 
         let b64_data = resp_json.b64_data().unwrap_or("");
@@ -616,6 +613,55 @@ mod tests {
         let uri = format!("file://{}", path.display());
         let url = resolve_to_data_url(&uri).await.unwrap();
         assert!(url.starts_with("data:image/jpeg;base64,"));
+    }
+
+    #[tokio::test]
+    async fn provider_error_body_never_reaches_image_edit_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let secret = "edit-secret-0123456789";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/images/edits"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string(format!("provider echoed {secret} and {}", &secret[4..16])),
+            )
+            .mount(&server)
+            .await;
+        let config = super::super::image_gen::ImageGenConfig::Enabled {
+            api_key: secret.into(),
+            base_url: server.uri(),
+            extra_headers: indexmap::IndexMap::new(),
+            image_gen_enabled: true,
+            image_edit_enabled: true,
+            model_override: None,
+            edit_model_override: None,
+            tier_restricted: false,
+        };
+        let mut resources = crate::types::resources::Resources::new();
+        resources.insert(ImageGenClient::new(&config, None).unwrap());
+        resources.insert(SessionFolder(tempfile::tempdir().unwrap().keep()));
+        let data_url = format!(
+            "data:image/jpeg;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(tiny_jpeg())
+        );
+        let result = xai_tool_runtime::Tool::run(
+            &ImageEditTool,
+            test_ctx_with_call_id(resources.into_shared(), "test-call"),
+            ImageEditInput {
+                prompt: "edit".into(),
+                image: vec![data_url],
+                aspect_ratio: "auto".into(),
+            },
+        )
+        .await;
+        let error = result.unwrap_err().to_string();
+        assert!(!error.contains(secret));
+        for window in secret.as_bytes().windows(8) {
+            assert!(!error.contains(std::str::from_utf8(window).unwrap()));
+        }
     }
 
     // ── parse_attachment_token ───────────────────────────────────────

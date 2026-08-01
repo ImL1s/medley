@@ -198,9 +198,13 @@ pub enum MarketplaceCommand {
 
 fn kind_label(kind: &InstallKind) -> String {
     match kind {
-        InstallKind::Git { url, .. } => format!("git: {url}"),
+        InstallKind::Git { url, .. } => format!("git: {}", safe_git_url(url)),
         InstallKind::Local { source_path, .. } => format!("local: {}", source_path.display()),
     }
+}
+
+fn safe_git_url(url: &str) -> String {
+    xai_grok_agent::plugins::git_install::redact_git_url(url)
 }
 
 fn print_component_summary(manifest: &PluginManifest, root: &Path) {
@@ -304,7 +308,7 @@ fn installed_plugins(
         .iter()
         .flat_map(|(repo_key, repo)| {
             let source = match &repo.kind {
-                InstallKind::Git { url, .. } => url.clone(),
+                InstallKind::Git { url, .. } => safe_git_url(url),
                 InstallKind::Local { source_path, .. } => source_path.display().to_string(),
             };
             let marketplace = repo
@@ -387,7 +391,12 @@ fn resolve_marketplace_root(
                 xai_grok_plugin_marketplace::git::SyncMode::UseTtl,
             )
             .map(|lease| (lease.path.clone(), Some(lease)))
-            .map_err(|e| tracing::warn!("failed to sync marketplace {url}: {e}"))
+            .map_err(|_| {
+                tracing::warn!(
+                    error_class = "git_sync_failed",
+                    "failed to sync marketplace"
+                )
+            })
             .ok()
         }
         _ => None,
@@ -425,11 +434,18 @@ fn cmd_install(source: &str, trust: bool) -> Result<()> {
 
     if !trust {
         use xai_grok_agent::plugins::git_install::{self, InstallSource};
-        let subject = match git_install::parse_install_source(source, &cwd) {
-            InstallSource::Git { url, .. } => format!("from git repo {url}"),
-            InstallSource::Local { path, .. } => format!("from directory {}", path.display()),
+        let parsed = git_install::parse_install_source(source, &cwd);
+        let (subject, safe_source_arg) = match parsed {
+            InstallSource::Git { url, .. } => {
+                let safe = safe_git_url(&url);
+                (format!("from git repo {safe}"), safe)
+            }
+            InstallSource::Local { path, .. } => (
+                format!("from directory {}", path.display()),
+                source.to_owned(),
+            ),
         };
-        eprintln!("{}", trust_prompt(&subject, source));
+        eprintln!("{}", trust_prompt(&subject, &safe_source_arg));
         std::process::exit(1);
     }
 
@@ -440,7 +456,7 @@ fn cmd_install(source: &str, trust: bool) -> Result<()> {
             }
             log_plugin_installed(install_kind(!outcome.is_local), true, None);
             println!(
-                "Installed {} plugin(s) from {source}: {}",
+                "Installed {} plugin(s) from the configured source: {}",
                 outcome.plugin_names.len(),
                 outcome.plugin_names.join(", "),
             );
@@ -762,8 +778,8 @@ fn cmd_tag(path: &str, push: bool, force: bool, dry_run: bool) -> Result<()> {
     let out = cmd.current_dir(&root).output()?;
     if !out.status.success() {
         bail!(
-            "Failed to create tag: {}",
-            String::from_utf8_lossy(&out.stderr)
+            "Failed to create tag (git exited {}).",
+            out.status.code().unwrap_or(-1)
         );
     }
     println!("Created tag: {tag}");
@@ -777,8 +793,8 @@ fn cmd_tag(path: &str, push: bool, force: bool, dry_run: bool) -> Result<()> {
         let out = push_cmd.current_dir(&root).output()?;
         if !out.status.success() {
             bail!(
-                "Failed to push tag: {}",
-                String::from_utf8_lossy(&out.stderr)
+                "Failed to push tag (git exited {}).",
+                out.status.code().unwrap_or(-1)
             );
         }
         println!("Pushed tag {tag} to origin.");
@@ -813,7 +829,7 @@ fn marketplace_list(
             .map(|s| {
                 let detail = match &s.kind {
                     SourceKind::Git { url, branch } => MarketplaceSourceDetail::Git {
-                        url: url.clone(),
+                        url: safe_git_url(url),
                         branch: branch.clone(),
                     },
                     SourceKind::Local { path } => {
@@ -836,7 +852,7 @@ fn marketplace_list(
     } else {
         for s in sources {
             let id = match &s.kind {
-                SourceKind::Git { url, .. } => url.clone(),
+                SourceKind::Git { url, .. } => safe_git_url(url),
                 SourceKind::Local { path } => path.display().to_string(),
             };
             println!("  {}: {id}", s.name);
@@ -859,6 +875,10 @@ fn marketplace_add(
 
     let cwd = std::env::current_dir().unwrap_or_default();
     let input = plugin::classify_marketplace_add_input(url, &cwd);
+    if let MarketplaceAddInput::GitUrl(git_url) = &input {
+        xai_grok_agent::plugins::git_install::validate_git_url(git_url)
+            .map_err(|_| anyhow::anyhow!("Marketplace git URL is not permitted."))?;
+    }
 
     // Fail fast on missing local paths: without this, a path input would be
     // stored as a git URL and only error after network clone attempts.
@@ -897,13 +917,13 @@ fn marketplace_add(
             .any(|s| matches!(&s.kind, SourceKind::Local { path: p } if p == path)),
     };
     if already_configured {
-        bail!("Marketplace source already configured: {identity}");
+        bail!("Marketplace source already configured.");
     }
 
     if !force && let MarketplaceAddInput::GitUrl(git_url) = &input {
-        xai_grok_plugin_marketplace::git::probe_git_remote(git_url).map_err(|e| {
+        xai_grok_plugin_marketplace::git::probe_git_remote(git_url).map_err(|_| {
             anyhow::anyhow!(
-                "{e}\nNot adding \"{url}\": it doesn't look like a reachable git repository. \
+                "Marketplace git probe failed: it doesn't look like a reachable git repository. \
                  Re-run with --force to add it anyway (e.g. a host only reachable on VPN)."
             )
         })?;
@@ -946,7 +966,7 @@ fn marketplace_add(
 
     std::fs::write(&config_path, doc.to_string())?;
 
-    println!("Added marketplace source: {name} ({identity})");
+    println!("Added marketplace source: {name}");
     Ok(())
 }
 
@@ -963,7 +983,10 @@ fn find_removal_source<'a>(
             let identities: Vec<String> = sources
                 .iter()
                 .filter(|s| s.name == input)
-                .map(source_identity)
+                .map(|source| match &source.kind {
+                    SourceKind::Git { url, .. } => safe_git_url(url),
+                    SourceKind::Local { path } => path.display().to_string(),
+                })
                 .collect();
             return Err(format!(
                 "Multiple sources are named \"{input}\"; remove by URL/path instead: {}",
@@ -998,10 +1021,10 @@ fn find_removal_source<'a>(
         .ok_or_else(|| {
             let names: Vec<&str> = sources.iter().map(|s| s.name.as_str()).collect();
             if names.is_empty() {
-                format!("Marketplace source \"{input}\" not found; no sources are configured.")
+                "Marketplace source not found; no sources are configured.".into()
             } else {
                 format!(
-                    "Marketplace source \"{input}\" not found. Configured sources: {}",
+                    "Marketplace source not found. Configured sources: {}",
                     names.join(", ")
                 )
             }
@@ -1044,7 +1067,7 @@ fn marketplace_remove(
     }
 
     if uninstalled.is_empty() {
-        println!("Removed marketplace source: {} ({identity})", source.name);
+        println!("Removed marketplace source: {}", source.name);
     } else {
         println!(
             "Removed marketplace source and uninstalled {} plugin(s): {}",
@@ -1092,18 +1115,18 @@ fn marketplace_update_with_cache_root(
                     println!("  {}: synced", source.name);
                     refreshed += 1;
                 }
-                Err(e) => errors.push(format!("{}: {e}", source.name)),
+                Err(_) => errors.push(format!("{}: git sync failed", source.name)),
             }
         }
     }
 
     if refreshed == 0 && errors.is_empty() {
-        if let Some(filter) = name {
+        if name.is_some() {
             if name_matched {
                 // Source exists but is local — nothing to sync.
-                println!("Source \"{filter}\" is local — nothing to sync.");
+                println!("Selected source is local — nothing to sync.");
             } else {
-                bail!("Marketplace source \"{filter}\" not found.");
+                bail!("Marketplace source not found.");
             }
         } else {
             println!("No marketplace sources configured.");
@@ -1124,6 +1147,20 @@ fn marketplace_update_with_cache_root(
 mod tests {
     use super::*;
     use xai_grok_plugin_marketplace::MarketplaceSource;
+
+    fn assert_sentinel_absent(rendered: &str, sentinel: &str) {
+        assert!(
+            !rendered.contains(sentinel),
+            "full sentinel leaked: {rendered}"
+        );
+        for window in sentinel.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).unwrap();
+            assert!(
+                !rendered.contains(window),
+                "sentinel window {window:?} leaked: {rendered}"
+            );
+        }
+    }
 
     fn removal_fixture() -> Vec<MarketplaceSource> {
         vec![
@@ -1180,7 +1217,7 @@ mod tests {
     fn find_removal_source_not_found_lists_names() {
         let sources = removal_fixture();
         let err = find_removal_source(&sources, "nope", Path::new("/")).unwrap_err();
-        assert!(err.contains("\"nope\" not found"), "{err}");
+        assert!(err.contains("Marketplace source not found"), "{err}");
         assert!(err.contains("jira, official, local"), "{err}");
     }
 
@@ -1239,6 +1276,16 @@ mod tests {
             local.starts_with("Installing from directory /tmp/p requires confirmation."),
             "{local}"
         );
+    }
+
+    #[test]
+    fn git_source_display_and_prompt_redact_credentials() {
+        let sentinel = "TOKEN-0123456789abcdef";
+        let url = format!("https://user:{sentinel}@host.example/repo.git?auth={sentinel}#frag");
+        let safe = safe_git_url(&url);
+        let prompt = trust_prompt(&format!("from git repo {safe}"), &safe);
+        assert_eq!(safe, "https://host.example/repo.git");
+        assert_sentinel_absent(&prompt, sentinel);
     }
 
     #[test]

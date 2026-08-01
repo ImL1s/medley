@@ -20,6 +20,37 @@ pub struct RunContext<'a> {
     pub process_scope: Option<xai_grok_tools::util::ProcessScope>,
 }
 
+/// Closed failure facts emitted by runners when the cause is known without
+/// retaining provider-controlled output, URLs, command text, or response data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookFailureClass {
+    MissingConfiguration,
+    InvalidUrl,
+    InsecureScheme,
+    UserinfoRejected,
+    SsrfBlocked,
+    Dns,
+    Timeout,
+    Serialization,
+    HttpTransport,
+}
+
+impl HookFailureClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingConfiguration => "missing_configuration",
+            Self::InvalidUrl => "invalid_url",
+            Self::InsecureScheme => "insecure_scheme",
+            Self::UserinfoRejected => "userinfo_rejected",
+            Self::SsrfBlocked => "ssrf_blocked",
+            Self::Dns => "dns",
+            Self::Timeout => "timeout",
+            Self::Serialization => "serialization",
+            Self::HttpTransport => "http_transport",
+        }
+    }
+}
+
 /// Result of running a single hook (any handler type).
 #[derive(Debug)]
 pub enum HookRunnerResult {
@@ -28,6 +59,8 @@ pub enum HookRunnerResult {
     Success,
     /// Failed: the caller fails open.
     Failed(String),
+    /// Failed with a runner-owned closed classification; no raw cause exists.
+    FailedClassified(HookFailureClass),
 }
 
 /// JSON from `PreToolUse` gate hooks:

@@ -191,7 +191,7 @@ pub struct WorkspaceMgmtArgs {
     #[command(subcommand)]
     pub command: WorkspaceMgmtCommand,
 }
-#[derive(Debug, Subcommand, Clone)]
+#[derive(Subcommand, Clone)]
 pub enum WorkspaceMgmtCommand {
     /// Start (or update) the workspace→hub exposure.
     Start(WorkspaceStartArgs),
@@ -231,7 +231,7 @@ pub enum WorkspaceMgmtCommand {
         json: bool,
     },
 }
-#[derive(Debug, clap::Args, Clone)]
+#[derive(clap::Args, Clone)]
 pub struct WorkspaceStartArgs {
     /// Computer Hub WebSocket URL (default: `[hub].url`, then the prod hub).
     #[arg(long, value_name = "URL")]
@@ -249,8 +249,49 @@ pub struct WorkspaceStartArgs {
     #[arg(long)]
     pub json: bool,
 }
+
+impl std::fmt::Debug for WorkspaceMgmtCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Start(args) => f.debug_tuple("Start").field(args).finish(),
+            Self::Pause { target, json } => f
+                .debug_struct("Pause")
+                .field("target", target)
+                .field("json", json)
+                .finish(),
+            Self::Resume { target, json } => f
+                .debug_struct("Resume")
+                .field("target", target)
+                .field("json", json)
+                .finish(),
+            Self::Stop { target, json } => f
+                .debug_struct("Stop")
+                .field("target", target)
+                .field("json", json)
+                .finish(),
+            Self::Restart(args) => f.debug_tuple("Restart").field(args).finish(),
+            Self::Status { target, json } => f
+                .debug_struct("Status")
+                .field("target", target)
+                .field("json", json)
+                .finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for WorkspaceStartArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkspaceStartArgs")
+            .field("hub_url_present", &self.hub_url.is_some())
+            .field("cwd", &self.cwd)
+            .field("leader", &self.leader)
+            .field("no_leader", &self.no_leader)
+            .field("json", &self.json)
+            .finish()
+    }
+}
 /// Arguments for the `agent` subcommand.
-#[derive(Debug, clap::Args, Clone)]
+#[derive(clap::Args, Clone)]
 pub struct AgentArgs {
     /// Run authentication before starting the agent
     #[arg(
@@ -302,6 +343,28 @@ pub struct AgentArgs {
     #[command(subcommand)]
     pub mode: Option<AgentCmd>,
 }
+
+impl std::fmt::Debug for AgentArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentArgs")
+            .field("reauthenticate", &self.reauthenticate)
+            .field("model_present", &self.model.is_some())
+            .field("reasoning_effort_present", &self.reasoning_effort.is_some())
+            .field("yolo", &self.yolo)
+            .field("agent_profile_present", &self.agent_profile.is_some())
+            .field("plugin_dir_count", &self.plugin_dirs.len())
+            .field("leader", &self.leader)
+            .field("no_leader", &self.no_leader)
+            .field("headless", &self.headless)
+            .field(
+                "cli_chat_proxy_base_url_present",
+                &self.cli_chat_proxy_base_url.is_some(),
+            )
+            .field("xai_api_base_url_present", &self.xai_api_base_url.is_some())
+            .field("mode", &self.mode)
+            .finish()
+    }
+}
 impl AgentArgs {
     /// Canonicalized `--plugin-dir` paths, warning to stderr and skipping
     /// anything that isn't an existing directory (stderr is safe: JSON-RPC
@@ -327,7 +390,7 @@ impl AgentArgs {
     }
 }
 /// Agent sub-subcommands.
-#[derive(Debug, Subcommand, Clone)]
+#[derive(Subcommand, Clone)]
 pub enum AgentCmd {
     /// Run the agent over stdio
     Stdio,
@@ -338,16 +401,36 @@ pub enum AgentCmd {
     /// Run as the shared leader process for other clients
     Leader(LeaderArgs),
 }
+
+impl std::fmt::Debug for AgentCmd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stdio => f.write_str("Stdio"),
+            Self::Headless(args) => f.debug_tuple("Headless").field(args).finish(),
+            Self::Serve(args) => f.debug_tuple("Serve").field(args).finish(),
+            Self::Leader(args) => f.debug_tuple("Leader").field(args).finish(),
+        }
+    }
+}
 /// WebSocket URL override arguments, used by headless / leader / serve modes.
-#[derive(Debug, clap::Args, Clone, Default)]
+#[derive(clap::Args, Clone, Default)]
 pub struct HeadlessArgs {
     #[arg(long = "grok-ws-origin")]
     pub grok_ws_origin: Option<String>,
     #[arg(long = "grok-ws-url")]
     pub grok_ws_url: Option<String>,
 }
+
+impl std::fmt::Debug for HeadlessArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeadlessArgs")
+            .field("grok_ws_origin_present", &self.grok_ws_origin.is_some())
+            .field("grok_ws_url_present", &self.grok_ws_url.is_some())
+            .finish()
+    }
+}
 /// Arguments for the `agent serve` subcommand.
-#[derive(Debug, clap::Args, Clone)]
+#[derive(clap::Args, Clone)]
 pub struct ServeArgs {
     /// Address for the server to listen on
     #[arg(long, default_value = "127.0.0.1:2419")]
@@ -362,6 +445,22 @@ pub struct ServeArgs {
     #[command(flatten)]
     pub headless: HeadlessArgs,
 }
+
+impl std::fmt::Debug for ServeArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServeArgs")
+            .field("bind", &self.bind)
+            .field("secret_present", &self.secret.is_some())
+            .field("remote_present", &self.remote.is_some())
+            .field(
+                "grok_ws_origin_present",
+                &self.headless.grok_ws_origin.is_some(),
+            )
+            .field("grok_ws_url_present", &self.headless.grok_ws_url.is_some())
+            .finish()
+    }
+}
+
 impl ServeArgs {
     /// Get the secret, generating a random one if not provided.
     pub fn get_secret(&self) -> String {
@@ -376,7 +475,7 @@ fn generate_random_key(len: usize) -> String {
     raw.chars().cycle().take(len).collect()
 }
 /// Arguments for the `agent leader` subcommand.
-#[derive(Debug, clap::Args, Clone)]
+#[derive(clap::Args, Clone)]
 pub struct LeaderArgs {
     /// Keep the leader running after the last client disconnects.
     #[arg(long)]
@@ -395,6 +494,17 @@ pub struct LeaderArgs {
     /// All environment URL overrides (passed from follower process)
     #[command(flatten)]
     pub headless: HeadlessArgs,
+}
+
+impl std::fmt::Debug for LeaderArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LeaderArgs")
+            .field("no_exit_on_disconnect", &self.no_exit_on_disconnect)
+            .field("relay_on_demand", &self.relay_on_demand)
+            .field("no_auto_update", &self.no_auto_update)
+            .field("headless", &self.headless)
+            .finish()
+    }
 }
 #[derive(Debug, Clone, Parser)]
 #[command(
@@ -984,6 +1094,97 @@ impl PagerArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_no_secret_fragments(output: &str, sentinel: &str) {
+        assert!(!output.contains(sentinel));
+        for window in sentinel.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(
+                !output.contains(fragment),
+                "credential fragment {fragment:?} leaked in {output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_bearing_cli_debug_is_presence_only_through_all_wrappers() {
+        const SENTINEL: &str = "GB002CLI-Q7w5E3r1T9y7Z6x4C2v8";
+        let url = |scheme: &str, path: &str| {
+            format!("{scheme}://{SENTINEL}:password@example.test/{path}?token={SENTINEL}")
+        };
+        let headless = HeadlessArgs {
+            grok_ws_origin: Some(url("https", "origin")),
+            grok_ws_url: Some(url("wss", "ws")),
+        };
+        let serve = ServeArgs {
+            bind: "127.0.0.1:2419".parse().expect("valid socket address"),
+            secret: Some(SENTINEL.to_owned()),
+            remote: Some(url("https", "remote")),
+            headless: headless.clone(),
+        };
+        let leader = LeaderArgs {
+            no_exit_on_disconnect: true,
+            relay_on_demand: true,
+            no_auto_update: true,
+            headless: headless.clone(),
+        };
+        let agent = AgentArgs {
+            reauthenticate: true,
+            model: Some("grok-safe".to_owned()),
+            reasoning_effort: Some("high".to_owned()),
+            yolo: true,
+            agent_profile: Some(PathBuf::from("profile.toml")),
+            plugin_dirs: vec![PathBuf::from("plugin")],
+            leader: true,
+            no_leader: false,
+            headless: headless.clone(),
+            cli_chat_proxy_base_url: Some(url("https", "chat-proxy")),
+            xai_api_base_url: Some(url("https", "api")),
+            mode: Some(AgentCmd::Serve(serve.clone())),
+        };
+        let workspace = WorkspaceStartArgs {
+            hub_url: Some(url("wss", "hub")),
+            cwd: Some(PathBuf::from("/tmp/workspace")),
+            leader: true,
+            no_leader: false,
+            json: true,
+        };
+
+        let outputs = [
+            format!("{headless:?}"),
+            format!("{serve:?}"),
+            format!("{leader:?}"),
+            format!("{:?}", AgentCmd::Headless(headless.clone())),
+            format!("{:?}", AgentCmd::Serve(serve.clone())),
+            format!("{:?}", AgentCmd::Leader(leader.clone())),
+            format!("{agent:?}"),
+            format!("{:?}", Command::Agent(Box::new(agent))),
+            format!("{workspace:?}"),
+            format!("{:?}", WorkspaceMgmtCommand::Start(workspace.clone())),
+            format!("{:?}", WorkspaceMgmtCommand::Restart(workspace.clone())),
+            format!(
+                "{:?}",
+                WorkspaceMgmtArgs {
+                    command: WorkspaceMgmtCommand::Start(workspace.clone()),
+                }
+            ),
+            format!(
+                "{:?}",
+                Command::Workspace(WorkspaceMgmtArgs {
+                    command: WorkspaceMgmtCommand::Start(workspace),
+                })
+            ),
+        ];
+        for output in outputs {
+            assert_no_secret_fragments(&output, SENTINEL);
+        }
+        let serve_output = format!("{serve:?}");
+        assert!(serve_output.contains("secret_present: true"));
+        assert!(serve_output.contains("remote_present: true"));
+        assert!(serve_output.contains("grok_ws_origin_present: true"));
+        assert!(serve_output.contains("grok_ws_url_present: true"));
+    }
+
     #[test]
     fn version_flags_parse_as_early_intent_without_exiting() {
         for flag in ["--version", "-v", "-V"] {

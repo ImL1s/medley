@@ -2583,23 +2583,42 @@ async fn subagent_override_provider_model_spawns_cache_only_credentials() {
     assert_eq!(config.base_url, "https://gateway.example/v1");
 }
 #[test]
-fn key_prefix_truncates_to_8_chars() {
-    let key = Some("eyJ0eXAiOiJhbGciOiJSUzI1NiJ9".to_string());
-    assert_eq!(key_prefix(&key), "eyJ0eXAi");
-}
-#[test]
-fn key_prefix_short_key_not_truncated() {
-    let key = Some("abc".to_string());
-    assert_eq!(key_prefix(&key), "abc");
-}
-#[test]
-fn key_prefix_none_returns_placeholder() {
-    assert_eq!(key_prefix(&None), "<none>");
-}
-#[test]
-fn key_prefix_empty_string() {
-    let key = Some(String::new());
-    assert_eq!(key_prefix(&key), "");
+fn subagent_resolution_diagnostics_never_emit_parent_or_child_credentials() {
+    // Keep the sentinel high-entropy: embedding diagnostic field names such as
+    // `credential` would make an 8-byte-window assertion match the safe JSON
+    // key rather than leaked secret material.
+    let parent_secret = "GB002P-Q7w5E3r1T9y7Z6x4C2v8";
+    let child_secret = "GB002C-A7s5D3f1G9h7J6k4L2m8";
+    let parent = xai_grok_sampler::SamplerConfig {
+        model: "parent-model".to_string(),
+        base_url: "https://api.x.ai/v1".to_string(),
+        api_key: Some(parent_secret.to_string()),
+        ..xai_grok_sampler::SamplerConfig::default()
+    };
+    let child = xai_grok_sampler::SamplerConfig {
+        model: "child-model".to_string(),
+        base_url: "https://provider.example/v1".to_string(),
+        api_key: Some(child_secret.to_string()),
+        ..xai_grok_sampler::SamplerConfig::default()
+    };
+
+    let context = subagent_model_resolution_context(
+        "executor",
+        "config_override",
+        &child,
+        &acp::ModelId::new("child-model"),
+        &parent,
+    );
+    assert_eq!(context["child_credential_present"], true);
+    assert_eq!(context["parent_credential_present"], true);
+    assert_eq!(context["keys_match"], false);
+    let rendered = context.to_string();
+    for secret in [parent_secret, child_secret] {
+        assert!(!rendered.contains(secret));
+        for window in secret.as_bytes().windows(8) {
+            assert!(!rendered.contains(std::str::from_utf8(window).unwrap()));
+        }
+    }
 }
 #[test]
 fn non_cursor_persona_injected_as_system_reminder() {

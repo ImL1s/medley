@@ -460,7 +460,12 @@ impl S3StorageClient {
     ) -> anyhow::Result<Self> {
         let client =
             build_s3_client(region, credentials_content, credentials_file, endpoint_url).await?;
-        tracing::debug!(bucket = %bucket, region, endpoint = ?endpoint_url, "S3StorageClient created");
+        tracing::debug!(
+            bucket = %bucket,
+            region,
+            endpoint_configured = endpoint_url.is_some(),
+            "S3StorageClient created"
+        );
         Ok(Self { client, bucket })
     }
 

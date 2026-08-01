@@ -31,7 +31,7 @@ pub struct EndpointScopedCredentials {
 impl std::fmt::Debug for EndpointScopedCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EndpointScopedCredentials")
-            .field("endpoint", &self.endpoint)
+            .field("endpoint_present", &self.endpoint.is_some())
             .field("has_auth_credentials", &self.auth_credentials.is_some())
             .field("has_api_key_provider", &self.api_key_provider.is_some())
             .finish()
@@ -66,7 +66,8 @@ impl EndpointScopedCredentials {
         if auth_credentials.is_some() || api_key_provider.is_some() {
             tracing::info!(
                 target: xai_grok_telemetry::memory_log::TARGET,
-                endpoint,
+                endpoint_present = !endpoint.is_empty(),
+                endpoint_parseable = reqwest::Url::parse(endpoint).is_ok(),
                 "memory embeddings: session credentials withheld for non-first-party endpoint; its own key, if any, still applies"
             );
         }
@@ -153,8 +154,9 @@ async fn build_embedding_provider(
     if !credentials_approved {
         tracing::error!(
             target: xai_grok_telemetry::memory_log::TARGET,
-            base_url,
-            approved = ?credentials.endpoint,
+            request_endpoint_present = !base_url.is_empty(),
+            request_endpoint_parseable = reqwest::Url::parse(base_url).is_ok(),
+            approved_endpoint_present = credentials.endpoint.is_some(),
             "memory embeddings: scoped credentials do not match the request URL; dropping them"
         );
     }
@@ -1249,6 +1251,31 @@ mod tests {
     use crate::index::{MemoryIndex, init_sqlite_vec};
     use tempfile::TempDir;
     use xai_grok_config_types::MemoryIndexConfig;
+
+    fn assert_no_secret_windows(rendered: &str, secret: &str) {
+        assert!(
+            !rendered.contains(secret),
+            "leaked full sentinel: {rendered}"
+        );
+        for window in secret.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(
+                !rendered.contains(fragment),
+                "leaked sentinel window {fragment}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_scoped_credentials_debug_is_presence_only() {
+        const SENTINEL: &str = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+        let endpoint = format!("https://user:{SENTINEL}@memory.example/?token={SENTINEL}");
+        let credentials = EndpointScopedCredentials::for_endpoint(&endpoint, |_| true, None, None);
+
+        let rendered = format!("{credentials:?}");
+        assert!(rendered.contains("endpoint_present: true"));
+        assert_no_secret_windows(&rendered, SENTINEL);
+    }
 
     /// An api-key provider that fails the test if its key is ever resolved,
     /// proving a scoped-away credential is never consulted.

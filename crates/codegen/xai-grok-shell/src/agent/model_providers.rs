@@ -4,7 +4,7 @@ use super::config::{ConfigModelOverride, EnvKeys};
 use super::config_model_override_parse::{ConfigWarning, ConfigWarningKind};
 use crate::sampling::ApiBackend;
 
-#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[derive(Clone, Default, serde::Deserialize)]
 #[serde(default)]
 pub struct ModelProviderConfig {
     pub base_url: Option<String>,
@@ -21,6 +21,27 @@ pub struct ModelProviderConfig {
     pub auth_provider: Option<String>,
     pub auth: Option<crate::auth::AuthProviderConfig>,
     pub context_window: Option<u64>,
+}
+
+impl std::fmt::Debug for ModelProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelProviderConfig")
+            .field("base_url_present", &self.base_url.is_some())
+            .field("api_base_url_present", &self.api_base_url.is_some())
+            .field("env_key_present", &self.env_key.is_some())
+            .field("api_key_present", &self.api_key.is_some())
+            .field("api_backend", &self.api_backend)
+            .field("extra_headers_present", &!self.extra_headers.is_empty())
+            .field("query_params_present", &!self.query_params.is_empty())
+            .field(
+                "env_http_headers_present",
+                &!self.env_http_headers.is_empty(),
+            )
+            .field("auth_provider_present", &self.auth_provider.is_some())
+            .field("auth_present", &self.auth.is_some())
+            .field("context_window", &self.context_window)
+            .finish()
+    }
 }
 
 pub(crate) fn model_provider_auth_name(provider_id: &str) -> String {
@@ -229,7 +250,34 @@ impl ConfigModelOverride {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::agent::config::{Config, resolve_credentials, resolve_model_list};
+
+    #[test]
+    fn provider_debug_is_presence_only() {
+        let secret = "GB002-provider-config-secret-0123456789abcdef";
+        let config = ModelProviderConfig {
+            base_url: Some(format!(
+                "https://user:{secret}@example.test/?token={secret}"
+            )),
+            api_base_url: Some(secret.to_owned()),
+            api_key: Some(secret.to_owned()),
+            extra_headers: IndexMap::from([("Authorization".to_owned(), secret.to_owned())]),
+            query_params: IndexMap::from([("token".to_owned(), secret.to_owned())]),
+            env_http_headers: IndexMap::from([("X-Secret".to_owned(), secret.to_owned())]),
+            auth_provider: Some(secret.to_owned()),
+            ..ModelProviderConfig::default()
+        };
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains(secret));
+        for window in secret.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(
+                !rendered.contains(window),
+                "leaked sentinel window: {window}"
+            );
+        }
+    }
     #[test]
     fn model_inherits_provider_connection_defaults() {
         let raw_config: toml::Value = toml::from_str(

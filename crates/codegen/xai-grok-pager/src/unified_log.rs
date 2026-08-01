@@ -41,6 +41,7 @@ fn now_ts() -> String {
 
 fn push_entry(lvl: LogLevel, msg: &str, sid: Option<&str>, ctx: Option<serde_json::Value>) {
     let entry = ClientLogEntry {
+        credential_safety_schema: None,
         ts: now_ts(),
         pid: Some(std::process::id()),
         ver: Some(xai_grok_version::VERSION.to_owned()),

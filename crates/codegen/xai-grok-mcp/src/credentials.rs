@@ -194,10 +194,7 @@ impl McpCredentialStore {
         let key = Self::key(server_name, server_url);
         self.locked_mutate_and_save(&move |store: &mut Self| {
             if disk_entry_is_newer(store.entries.get(&key), &creds) {
-                tracing::info!(
-                    key = key.as_str(),
-                    "mcp credentials: skipping stale save (disk entry is newer)"
-                );
+                log_stale_save_skip(server_name, server_url);
                 return;
             }
             store.entries.insert(key.clone(), creds.clone());
@@ -319,6 +316,19 @@ impl McpCredentialStore {
     }
 }
 
+/// Emit only closed presence facts for the stale-save decision. The on-disk
+/// composite key contains the full configured MCP URL, whose userinfo or query
+/// may carry credentials and therefore must never cross an observability sink.
+fn log_stale_save_skip(server_name: &str, server_url: &Url) {
+    let server_name_present = !server_name.is_empty();
+    let server_url_present = !server_url.as_str().is_empty();
+    tracing::info!(
+        server_name_present,
+        server_url_present,
+        "mcp credentials: skipping stale save (disk entry is newer)"
+    );
+}
+
 /// `true` when the on-disk `existing` entry is strictly newer than the
 /// `incoming` credentials by `token_received_at` — the [`Self::insert_and_save`]
 /// freshness guard. Missing timestamps on either side compare as "not newer"
@@ -410,6 +420,54 @@ impl rmcp::transport::auth::CredentialStore for McpCredentialStoreAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct LogCapture(std::sync::Arc<parking_lot::Mutex<Vec<String>>>);
+
+    #[derive(Default)]
+    struct RenderedFields(String);
+
+    impl tracing::field::Visit for RenderedFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            let _ = write!(&mut self.0, "{}={value:?};", field.name());
+        }
+    }
+
+    impl tracing::Subscriber for LogCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target().starts_with("xai_grok_mcp::credentials")
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut rendered = RenderedFields::default();
+            event.record(&mut rendered);
+            self.0.lock().push(rendered.0);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    fn assert_no_secret_windows(rendered: &str, secret: &str) {
+        assert!(!rendered.contains(secret), "full secret leaked: {rendered}");
+        for window in secret.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(
+                !rendered.contains(fragment),
+                "secret fragment {fragment:?} leaked: {rendered}"
+            );
+        }
+    }
 
     fn test_stored_creds(client_id: &str) -> rmcp::transport::auth::StoredCredentials {
         rmcp::transport::auth::StoredCredentials::new(client_id.to_string(), None, Vec::new(), None)
@@ -599,6 +657,26 @@ mod tests {
             !disk_entry_is_newer(Some(&no_ts), &older),
             "timestamp-less disk entry keeps pre-guard behavior (writes)"
         );
+    }
+
+    #[test]
+    fn stale_save_log_omits_mcp_url_userinfo_and_query_credentials() {
+        const USERINFO_SECRET: &str = "Q7vN2xK9mR4pL8cD1sF6hJ3w";
+        const QUERY_SECRET: &str = "Z5tB8yU1iO4aS7dG0kM3nP6q";
+        let url = Url::parse(&format!(
+            "https://oauth:{USERINFO_SECRET}@mcp.example.test/rpc?access_token={QUERY_SECRET}"
+        ))
+        .expect("sentinel URL");
+        let capture = LogCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+
+        log_stale_save_skip("sentinel-server", &url);
+
+        let rendered = capture.0.lock().join("\n");
+        assert!(rendered.contains("server_name_present=true"));
+        assert!(rendered.contains("server_url_present=true"));
+        assert_no_secret_windows(&rendered, USERINFO_SECRET);
+        assert_no_secret_windows(&rendered, QUERY_SECRET);
     }
 
     /// The refresh-failure classifier that gates browser escalation

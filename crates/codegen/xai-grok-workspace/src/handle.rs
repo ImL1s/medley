@@ -3259,7 +3259,7 @@ impl WorkspaceHandle {
         if hub_guard.is_some() {
             return Ok(());
         }
-        tracing::info!(url = %hub_config.url, "WorkspaceHandle::connect_hub — connecting to hub");
+        tracing::info!("WorkspaceHandle::connect_hub — connecting to configured hub");
         let catalog_started = std::time::Instant::now();
         let catalog_result = (|| -> WorkspaceResult<_> {
             let session_env = Arc::new(std::collections::HashMap::new());

@@ -383,6 +383,7 @@ async fn provider_expiry_source_precedence() {
         jwt_with_exp(chrono::Utc::now().timestamp() + 7200)
     }
     fn jwt_with_exp(exp: i64) -> String {
+        let _ = jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER.install_default();
         jsonwebtoken::encode(
             &jsonwebtoken::Header::default(),
             &serde_json::json!({ "exp": exp }),
@@ -717,6 +718,42 @@ async fn failed_pre_turn_mint_does_not_serve_the_stale_token() {
         None,
         "a stale token whose pre-turn re-mint failed must not be served"
     );
+}
+
+fn assert_provider_secret_absent(rendered: &str, secret: &str) {
+    assert!(!rendered.contains(secret), "leaked full secret: {rendered}");
+    for window in secret.as_bytes().windows(8) {
+        let window = std::str::from_utf8(window).expect("ASCII sentinel window");
+        assert!(
+            !rendered.contains(window),
+            "leaked secret window {window}: {rendered}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn provider_failure_never_echoes_command_or_stderr() {
+    let command_secret = "M8k6J4h2G0f8Q2w4E6r8T0y2";
+    let stderr_secret = "P9o7I5u3Y1t9R3e5W7q9A1s3";
+    let provider = AuthProviderRef::new(
+        "test-provider-secret-safe-failure".to_owned(),
+        AuthProviderConfig {
+            command: format!("printf '%s' '{stderr_secret}' >&2; exit 9 # {command_secret}"),
+            args: None,
+            token_ttl_secs: None,
+            timeout_secs: Some(5),
+            cwd: None,
+        },
+    );
+
+    let error = mint_provider_token(&provider, false, None)
+        .await
+        .err()
+        .expect("nonzero helper must fail");
+    let rendered = format!("{error:?}\n{error}\n{provider:?}");
+    assert_provider_secret_absent(&rendered, command_secret);
+    assert_provider_secret_absent(&rendered, stderr_secret);
+    assert!(rendered.contains("command_present"));
 }
 
 /// A helper that writes past the stdout cap fails closed (permanent), so a

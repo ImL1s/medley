@@ -2,7 +2,68 @@ use crate::config::HookSpec;
 use crate::discovery::HookRegistry;
 use crate::event::{HookEventEnvelope, HookEventName};
 use crate::result::{HookDecision, HookRunResult};
-use crate::runner::{self, GateKind, HookRunnerResult, RunContext};
+use crate::runner::{self, GateKind, HookFailureClass, HookRunnerResult, RunContext};
+
+fn hook_failure_class(error: &str) -> &'static str {
+    let error = error.to_ascii_lowercase();
+    if error.contains("timed out") || error.contains("timeout") {
+        "timeout"
+    } else if error.contains("not found") || error.contains("spawn") {
+        "spawn"
+    } else if error.contains("exit code") {
+        "exit"
+    } else if error.contains("json") || error.contains("decision") || error.contains("output") {
+        "invalid_output"
+    } else if error.contains("http") || error.contains("request") || error.contains("response") {
+        "http"
+    } else {
+        "execution"
+    }
+}
+
+fn safe_hook_failure(error: &str) -> String {
+    format!("hook failed ({})", hook_failure_class(error))
+}
+
+fn safe_classified_hook_failure(class: HookFailureClass) -> String {
+    format!("hook failed ({})", class.as_str())
+}
+
+/// Project provider-controlled hook text into a closed, credential-safe
+/// diagnostic. The raw text is relevant only for its presence; it must not
+/// cross the dispatcher boundary into UI, model feedback, telemetry, or
+/// support-facing values.
+pub fn safe_deny_reason(reason: &str) -> String {
+    if reason.trim().is_empty() {
+        "hook denied".to_string()
+    } else {
+        "hook denied (reason provided)".to_string()
+    }
+}
+
+fn safe_stop_block_reason(reason: &str) -> String {
+    if reason.trim().is_empty() {
+        "stop blocked by hook".to_string()
+    } else {
+        "stop blocked by hook (reason provided)".to_string()
+    }
+}
+
+fn safe_stop_prevent_reason(reason: &str) -> String {
+    if reason.trim().is_empty() {
+        "continuation prevented by hook".to_string()
+    } else {
+        "continuation prevented by hook (reason provided)".to_string()
+    }
+}
+
+fn safe_additional_context(context: &str) -> String {
+    if context.trim().is_empty() {
+        "hook provided additional context".to_string()
+    } else {
+        "hook provided additional context (content omitted)".to_string()
+    }
+}
 
 fn dispatch_span(event: HookEventName, hook_count: usize) -> tracing::Span {
     tracing::info_span!(
@@ -93,22 +154,27 @@ pub async fn dispatch_pre_tool_use(
 
         match result {
             HookRunnerResult::Decision(HookDecision::Deny { reason, .. }) => {
+                let safe_reason = safe_deny_reason(&reason);
                 tracing::info!(
                     hook_name = %spec.name,
                     elapsed_ms = elapsed.as_millis() as u64,
-                    reason = %reason,
+                    reason_present = !reason.is_empty(),
                     "hook denied"
                 );
                 run_results.push(HookRunResult::Blocked {
                     hook_name: spec.name.clone(),
-                    detail: format!("denied: {reason}"),
+                    detail: if reason.is_empty() {
+                        "hook denied".to_string()
+                    } else {
+                        "hook denied (reason provided)".to_string()
+                    },
                     elapsed,
                     http_info,
                 });
                 record_dispatch_counts(&span, &run_results);
                 return PreToolUseResult {
                     decision: HookDecision::Deny {
-                        reason,
+                        reason: safe_reason,
                         hook_name: spec.name.clone(),
                     },
                     results: run_results,
@@ -127,15 +193,31 @@ pub async fn dispatch_pre_tool_use(
                 });
             }
             HookRunnerResult::Failed(err) => {
+                let error_class = hook_failure_class(&err);
                 tracing::warn!(
                     hook_name = %spec.name,
                     elapsed_ms = elapsed.as_millis() as u64,
-                    error = %err,
+                    error_class,
+                    error_len = err.len(),
                     "hook failed; ignoring (fail-open)"
                 );
                 run_results.push(HookRunResult::Failed {
                     hook_name: spec.name.clone(),
-                    error: err.clone(),
+                    error: safe_hook_failure(&err),
+                    elapsed,
+                    http_info,
+                });
+            }
+            HookRunnerResult::FailedClassified(class) => {
+                tracing::warn!(
+                    hook_name = %spec.name,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    error_class = class.as_str(),
+                    "hook failed; ignoring (fail-open)"
+                );
+                run_results.push(HookRunResult::Failed {
+                    hook_name: spec.name.clone(),
+                    error: safe_classified_hook_failure(class),
                     elapsed,
                     http_info,
                 });
@@ -192,28 +274,42 @@ impl StopDispatchResult {
         {
             self.prevent_continuation = Some(StopBlock {
                 hook_name: hook_name.to_string(),
-                reason,
+                reason: safe_stop_prevent_reason(&reason),
             });
         }
         if let Some(reason) = signals.block_reason {
             self.blocks.push(StopBlock {
                 hook_name: hook_name.to_string(),
-                reason,
+                reason: safe_stop_block_reason(&reason),
             });
         }
         if let Some(context) = signals.additional_context {
-            self.additional_context.push(context);
+            self.additional_context
+                .push(safe_additional_context(&context));
         }
     }
 }
 
 /// One hook's stop signals, normalized for [`StopDispatchResult::absorb`].
 /// A `Some` in `stop_reason` is what marks the hook as force-stopping.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct StopSignals {
     pub block_reason: Option<String>,
     pub stop_reason: Option<String>,
     pub additional_context: Option<String>,
+}
+
+impl std::fmt::Debug for StopSignals {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StopSignals")
+            .field("block_reason_present", &self.block_reason.is_some())
+            .field("stop_reason_present", &self.stop_reason.is_some())
+            .field(
+                "additional_context_present",
+                &self.additional_context.is_some(),
+            )
+            .finish()
+    }
 }
 
 /// Scrollback detail for a stop signal, shared by the file and client gates so
@@ -225,11 +321,11 @@ pub fn stop_detail(
 ) -> Option<String> {
     if prevented {
         return Some(match prevent_reason {
-            Some(reason) => format!("prevented continuation: {reason}"),
+            Some(_) => "prevented continuation (reason provided)".to_string(),
             None => "prevented continuation".to_string(),
         });
     }
-    block_reason.map(|reason| format!("blocked stop: {reason}"))
+    block_reason.map(|_| "blocked stop (reason provided)".to_string())
 }
 
 fn stop_outcome_detail(outcome: &crate::result::StopHookOutcome) -> Option<String> {
@@ -245,10 +341,11 @@ fn stop_outcome_detail(outcome: &crate::result::StopHookOutcome) -> Option<Strin
 
 /// Dispatch a `Stop` or `SubagentStop` gate against all matching hooks.
 ///
-/// Every hook runs (no short-circuit) so the model sees all block reasons and
-/// additional context at once. Hook failures (timeouts, crashes, malformed
-/// output) are fail-open: recorded for the UI but contribute no signal, so the
-/// agent stops normally.
+/// Every hook runs (no short-circuit) so the model sees closed block/context
+/// categories for every signal at once. Provider-controlled reason/context
+/// text is discarded at this boundary. Hook failures (timeouts, crashes,
+/// malformed output) are fail-open: recorded for the UI but contribute no
+/// signal, so the agent stops normally.
 pub async fn dispatch_stop(
     registry: &HookRegistry,
     event: HookEventName,
@@ -326,15 +423,31 @@ pub async fn dispatch_stop(
                 );
             }
             HookRunnerResult::Failed(err) => {
+                let error_class = hook_failure_class(&err);
                 tracing::warn!(
                     hook_name = %spec.name,
                     elapsed_ms = elapsed.as_millis() as u64,
-                    error = %err,
+                    error_class,
+                    error_len = err.len(),
                     "stop hook failed; ignoring (fail-open)"
                 );
                 out.results.push(HookRunResult::Failed {
                     hook_name: spec.name.clone(),
-                    error: err,
+                    error: safe_hook_failure(&err),
+                    elapsed,
+                    http_info,
+                });
+            }
+            HookRunnerResult::FailedClassified(class) => {
+                tracing::warn!(
+                    hook_name = %spec.name,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    error_class = class.as_str(),
+                    "stop hook failed; ignoring (fail-open)"
+                );
+                out.results.push(HookRunResult::Failed {
+                    hook_name: spec.name.clone(),
+                    error: safe_classified_hook_failure(class),
                     elapsed,
                     http_info,
                 });
@@ -404,15 +517,31 @@ pub async fn dispatch_non_blocking(
                 });
             }
             HookRunnerResult::Failed(err) => {
+                let error_class = hook_failure_class(&err);
                 tracing::warn!(
                     hook_name = %spec.name,
                     elapsed_ms = elapsed.as_millis() as u64,
-                    error = %err,
+                    error_class,
+                    error_len = err.len(),
                     "hook failed"
                 );
                 results.push(HookRunResult::Failed {
                     hook_name: spec.name.clone(),
-                    error: err,
+                    error: safe_hook_failure(&err),
+                    elapsed,
+                    http_info,
+                });
+            }
+            HookRunnerResult::FailedClassified(class) => {
+                tracing::warn!(
+                    hook_name = %spec.name,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    error_class = class.as_str(),
+                    "hook failed"
+                );
+                results.push(HookRunResult::Failed {
+                    hook_name: spec.name.clone(),
+                    error: safe_classified_hook_failure(class),
                     elapsed,
                     http_info,
                 });
@@ -624,7 +753,7 @@ mod tests {
                 ref reason,
                 ref hook_name,
             } => {
-                assert_eq!(reason, "blocked");
+                assert_eq!(reason, "hook denied (reason provided)");
                 assert_eq!(hook_name, "deny-hook");
             }
             ref other => panic!("expected Deny, got {other:?}"),
@@ -662,7 +791,9 @@ mod tests {
         )
         .await;
         match fired.decision {
-            HookDecision::Deny { ref reason, .. } => assert_eq!(reason, "bash blocked"),
+            HookDecision::Deny { ref reason, .. } => {
+                assert_eq!(reason, "hook denied (reason provided)")
+            }
             ref other => panic!("expected Deny, got {other:?}"),
         }
 
@@ -694,7 +825,7 @@ mod tests {
                 ref hook_name,
                 ..
             } => {
-                assert_eq!(reason, "first says no");
+                assert_eq!(reason, "hook denied (reason provided)");
                 assert_eq!(hook_name, "first-deny");
             }
             ref other => panic!("expected Deny, got {other:?}"),
@@ -720,7 +851,7 @@ mod tests {
                 ref hook_name,
                 ..
             } => {
-                assert_eq!(reason, "strict policy");
+                assert_eq!(reason, "hook denied (reason provided)");
                 assert_eq!(hook_name, "strict-deny");
             }
             ref other => panic!("expected Deny from strict filter, got {other:?}"),
@@ -764,17 +895,70 @@ mod tests {
                 ref reason,
             } => {
                 assert_eq!(hook_name, "denier");
-                assert_eq!(reason, "nope");
+                assert_eq!(reason, "hook denied (reason provided)");
             }
             ref other => panic!("expected Deny from explicit denier, got {other:?}"),
         }
         assert_eq!(result.results.len(), 2);
         assert!(
             matches!(&result.results[1], HookRunResult::Blocked { detail, .. }
-                if detail == "denied: nope"),
+                if detail == "hook denied (reason provided)"),
             "a deny is the hook's decision, not a failure: {:?}",
             result.results[1]
         );
+    }
+
+    #[tokio::test]
+    async fn hook_results_omit_provider_controlled_full_and_partial_credentials() {
+        const SECRET: &str = "GB002SECabcdefgh87654321";
+        const PREFIX: &str = "GB002SEC";
+        const SUFFIX: &str = "87654321";
+
+        let invalid_spec = make_command_spec(
+            "invalid",
+            None,
+            true,
+            &format!("echo '{{\"decision\":\"{SECRET}\"}}'"),
+        );
+        let deny_spec = make_command_spec(
+            "deny",
+            None,
+            true,
+            &format!("echo '{{\"decision\":\"deny\",\"reason\":\"{SECRET}\"}}'"),
+        );
+        let registry = registry_from_specs(vec![invalid_spec, deny_spec]);
+        let result = dispatch_pre_tool_use(
+            &registry,
+            &pre_tool_use_envelope("run_terminal_cmd"),
+            &run_ctx(),
+        )
+        .await;
+
+        let rendered = format!(
+            "decision={:?}; results={:?}",
+            result.decision, result.results
+        );
+        for fragment in [SECRET, PREFIX, SUFFIX] {
+            assert!(
+                !rendered.contains(fragment),
+                "hook result leaked credential fragment: {fragment}"
+            );
+        }
+        for fragment in SECRET.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(fragment).unwrap();
+            assert!(
+                !rendered.contains(fragment),
+                "hook decision/result leaked credential fragment: {fragment}"
+            );
+        }
+        assert!(matches!(
+            &result.results[0],
+            HookRunResult::Failed { error, .. } if error == "hook failed (invalid_output)"
+        ));
+        assert!(matches!(
+            &result.results[1],
+            HookRunResult::Blocked { detail, .. } if detail == "hook denied (reason provided)"
+        ));
     }
 
     fn stop_envelope() -> HookEventEnvelope {
@@ -837,15 +1021,24 @@ mod tests {
                 .iter()
                 .map(|b| b.reason.as_str())
                 .collect::<Vec<_>>(),
-            ["first block", "second block"]
+            [
+                "stop blocked by hook (reason provided)",
+                "stop blocked by hook (reason provided)"
+            ]
         );
-        assert_eq!(out.additional_context, ["ctx"]);
+        assert_eq!(
+            out.additional_context,
+            ["hook provided additional context (content omitted)"]
+        );
         let prevent = out
             .prevent_continuation
             .as_ref()
             .expect("force-stop captured");
         assert_eq!(prevent.hook_name, "s1");
-        assert_eq!(prevent.reason, "stop now");
+        assert_eq!(
+            prevent.reason,
+            "continuation prevented by hook (reason provided)"
+        );
     }
 
     #[test]
@@ -874,7 +1067,10 @@ mod tests {
                 .iter()
                 .map(|b| b.reason.as_str())
                 .collect::<Vec<_>>(),
-            ["first", "second"]
+            [
+                "stop blocked by hook (reason provided)",
+                "stop blocked by hook (reason provided)"
+            ]
         );
         assert_eq!(result.results.len(), 3, "all hooks must have run");
     }
@@ -898,7 +1094,10 @@ mod tests {
             .prevent_continuation
             .expect("continue:false captured");
         assert_eq!(prevent.hook_name, "stopper");
-        assert_eq!(prevent.reason, "enough");
+        assert_eq!(
+            prevent.reason,
+            "continuation prevented by hook (reason provided)"
+        );
         assert_eq!(result.blocks.len(), 1);
     }
 
@@ -916,8 +1115,56 @@ mod tests {
             dispatch_stop(&registry, HookEventName::Stop, &stop_envelope(), &run_ctx()).await;
         assert!(result.wants_continuation());
         assert_eq!(result.blocks.len(), 1);
-        assert_eq!(result.blocks[0].reason, "fix the build");
-        assert_eq!(result.additional_context, ["note"]);
+        assert_eq!(
+            result.blocks[0].reason,
+            "stop blocked by hook (reason provided)"
+        );
+        assert_eq!(
+            result.additional_context,
+            ["hook provided additional context (content omitted)"]
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_scrollback_result_omits_stderr_credential_fragments() {
+        const SECRET: &str = "GB002SECabcdefgh87654321";
+        const PREFIX: &str = "GB002SEC";
+        const SUFFIX: &str = "87654321";
+
+        let registry = registry_from_specs(vec![
+            stop_spec("exit2", &format!("echo '{SECRET}' >&2; exit 2")),
+            stop_spec(
+                "context",
+                &format!(
+                    "echo '{{\"hookSpecificOutput\":{{\"additionalContext\":\"{SECRET}\"}}}}'"
+                ),
+            ),
+        ]);
+        let result =
+            dispatch_stop(&registry, HookEventName::Stop, &stop_envelope(), &run_ctx()).await;
+
+        let rendered = format!("{result:?}");
+        assert_eq!(
+            result.blocks[0].reason,
+            "stop blocked by hook (reason provided)"
+        );
+        for fragment in [SECRET, PREFIX, SUFFIX] {
+            assert!(
+                !rendered.contains(fragment),
+                "stop hook result leaked credential fragment: {fragment}"
+            );
+        }
+        for fragment in SECRET.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(fragment).unwrap();
+            assert!(
+                !rendered.contains(fragment),
+                "stop hook projection leaked credential fragment: {fragment}"
+            );
+        }
+        assert!(matches!(
+            &result.results[0],
+            HookRunResult::Blocked { detail, .. } if detail == "blocked stop (reason provided)"
+        ));
     }
 
     #[tokio::test]
@@ -934,7 +1181,10 @@ mod tests {
         );
         assert!(result.blocks.is_empty());
         assert!(result.prevent_continuation.is_none());
-        assert_eq!(result.additional_context, ["run the tests"]);
+        assert_eq!(
+            result.additional_context,
+            ["hook provided additional context (content omitted)"]
+        );
     }
 
     /// A timed-out stop hook fails open: stdout of a killed hook is never
@@ -1046,7 +1296,10 @@ mod tests {
         )
         .await;
         assert_eq!(result.blocks.len(), 1, "only the matching spec runs");
-        assert_eq!(result.blocks[0].reason, "from explorer");
+        assert_eq!(
+            result.blocks[0].reason,
+            "stop blocked by hook (reason provided)"
+        );
     }
 
     #[tokio::test]

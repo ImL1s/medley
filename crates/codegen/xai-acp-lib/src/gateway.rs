@@ -3,7 +3,6 @@ use std::pin::Pin;
 use std::rc::Rc;
 
 use agent_client_protocol as acp;
-use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument;
 
@@ -108,33 +107,36 @@ pub type AcpAgentGatewaySender = AcpGatewaySender<acp::AgentSide>;
 pub type AcpClientGatewayReceiver = AcpGatewayReceiver<acp::ClientSide, acp::ClientSideConnection>;
 pub type AcpClientGatewaySender = AcpGatewaySender<acp::ClientSide>;
 
-fn before_request<T: AcpRequest>(args: &AcpArgs<T>, tracing: bool) -> Option<String> {
+fn before_request<T: AcpRequest>(args: &AcpArgs<T>, tracing: bool) -> Option<&'static str> {
     tracing.then(|| {
-        let method = crate::common::compact_json(&args.method_name());
-        tracing::debug!(
-            "sending {method} request: {}",
-            crate::common::compact_json(&args.request)
-        );
+        let method = args.method_name();
+        tracing::debug!(event = "outbound_request", method, request_present = true);
         method
     })
 }
 
-fn after_request<T: Serialize>(
+fn after_request<T>(
     response_tx: oneshot::Sender<AcpResult<T>>,
     response: AcpResult<T>,
-    method: Option<String>,
+    method: Option<&'static str>,
 ) -> bool {
     if let Some(method) = method {
-        match response {
-            Ok(ref response) => {
+        match &response {
+            Ok(_) => {
                 tracing::debug!(
-                    "received {method} response: {}",
-                    crate::common::compact_json(&response)
+                    event = "outbound_response",
+                    method,
+                    outcome = "success",
+                    response_present = true
                 );
             }
-            Err(ref err) => {
-                // Log at debug level - errors are handled visually in the TUI status bar
-                tracing::debug!("received {method} error: {err}");
+            Err(_) => {
+                tracing::debug!(
+                    event = "outbound_response",
+                    method,
+                    outcome = "error",
+                    response_present = false
+                );
             }
         }
     }
@@ -376,10 +378,10 @@ impl<S: AcpSide> AcpGatewaySender<S> {
         S::OutMessage: From<AcpArgs<T>>,
     {
         if self.tracing {
-            let method = crate::common::compact_json(&request.method_name());
             tracing::debug!(
-                "received {method} request: {}",
-                crate::common::compact_json(&request)
+                event = "inbound_request",
+                method = request.method_name(),
+                request_present = true
             );
         }
         acp_send(request, &self.tx).await
@@ -526,8 +528,13 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     use agent_client_protocol as acp;
+    use tracing::Subscriber;
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::layer::{Context, Layer};
+    use tracing_subscriber::registry::LookupSpan;
 
     struct OrderTrackingClient {
         log: Rc<RefCell<Vec<String>>>,
@@ -558,6 +565,126 @@ mod tests {
                 acp::TextContent::new(marker),
             ))),
         )
+    }
+
+    #[derive(Default)]
+    struct EventCollector {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for EventCollector {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            let mut visitor = EventVisitor::default();
+            event.record(&mut visitor);
+            self.events.lock().unwrap().push(visitor.fields.join(" "));
+        }
+    }
+
+    #[derive(Default)]
+    struct EventVisitor {
+        fields: Vec<String>,
+    }
+
+    impl Visit for EventVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.fields.push(format!("{}={value:?}", field.name()));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.fields.push(format!("{}={value}", field.name()));
+        }
+
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            self.fields.push(format!("{}={value}", field.name()));
+        }
+    }
+
+    fn assert_secret_absent(rendered: &str, secret: &str) {
+        assert!(!rendered.contains(secret), "leaked full secret: {rendered}");
+        for window in secret.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).expect("ASCII sentinel window");
+            assert!(
+                !rendered.contains(window),
+                "leaked secret window {window:?}: {rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_observability_omits_mcp_header_env_response_and_error_secrets() {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        let header_secret = "GB002-header-secret-0123456789abcdef";
+        let env_secret = "GB002-env-secret-fedcba9876543210";
+        let response_secret = "Z9Y8X7W6V5U4T3S2R1Q0P9O8N7M6";
+        let error_secret = "M6N7O8P9Q0R1S2T3U4V5W6X7Y8Z9";
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let _guard = tracing_subscriber::registry()
+            .with(EventCollector {
+                events: events.clone(),
+            })
+            .set_default();
+
+        let mcp_servers = vec![
+            acp::McpServer::Http(
+                acp::McpServerHttp::new("private-http", "https://example.invalid")
+                    .headers(vec![acp::HttpHeader::new("Authorization", header_secret)]),
+            ),
+            acp::McpServer::Stdio(
+                acp::McpServerStdio::new("private-stdio", "/bin/false")
+                    .env(vec![acp::EnvVariable::new("PRIVATE_TOKEN", env_secret)]),
+            ),
+        ];
+        let new_session = acp::NewSessionRequest::new("/tmp").mcp_servers(mcp_servers.clone());
+        let load_session =
+            acp::LoadSessionRequest::new("session-id", "/tmp").mcp_servers(mcp_servers);
+
+        let (new_tx, _new_rx) = oneshot::channel();
+        let new_args = AcpArgs {
+            request: new_session.clone(),
+            response_tx: new_tx,
+        };
+        assert_eq!(before_request(&new_args, true), Some("session/new"));
+
+        let (load_tx, _load_rx) = oneshot::channel();
+        let load_args = AcpArgs {
+            request: load_session.clone(),
+            response_tx: load_tx,
+        };
+        assert_eq!(before_request(&load_args, true), Some("session/load"));
+
+        let (success_tx, _success_rx) = oneshot::channel();
+        assert!(after_request(
+            success_tx,
+            Ok(response_secret.to_string()),
+            Some("session/new")
+        ));
+        let (error_tx, _error_rx) = oneshot::channel::<AcpResult<String>>();
+        assert!(after_request(
+            error_tx,
+            Err(crate::common::acp_internal_error(error_secret)),
+            Some("session/load")
+        ));
+
+        let (gateway_tx, gateway_rx) = mpsc::unbounded_channel::<AcpAgentMessage>();
+        drop(gateway_rx);
+        let sender = AcpGatewaySender::<acp::ClientSide>::new(gateway_tx).with_tracing(true);
+        assert!(sender.send(new_session).await.is_err());
+        assert!(sender.send(load_session).await.is_err());
+
+        let rendered = events.lock().unwrap().join("\n");
+        for secret in [header_secret, env_secret, response_secret, error_secret] {
+            assert_secret_absent(&rendered, secret);
+        }
+        assert!(rendered.contains("event=outbound_request"), "{rendered}");
+        assert!(rendered.contains("event=outbound_response"), "{rendered}");
+        assert!(rendered.contains("event=inbound_request"), "{rendered}");
+        assert!(rendered.contains("method=session/new"), "{rendered}");
+        assert!(rendered.contains("method=session/load"), "{rendered}");
+        assert!(rendered.contains("outcome=success"), "{rendered}");
+        assert!(rendered.contains("outcome=error"), "{rendered}");
     }
 
     /// Regression: draining completion receivers preserves notification ordering.

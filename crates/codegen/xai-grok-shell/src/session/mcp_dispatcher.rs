@@ -74,9 +74,8 @@ pub struct McpServerStatusPayload {
     pub status: McpServerStatus,
     /// What drove the status change. See [`McpServerStatusReason`].
     pub reason: McpServerStatusReason,
-    /// Optional human-readable detail. Surfaces the full handshake /
-    /// transport error reason to the UI verbatim — no sanitization or
-    /// truncation — so failures are easy to debug.
+    /// Optional human-readable detail. Provider-controlled transport and
+    /// handshake errors are never copied into this wire payload.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     /// Reserved for future use; always `null` today; may fill
@@ -376,8 +375,8 @@ fn kind_of(ev: &McpClientEvent) -> McpClientEventKind {
 /// Project an [`McpClientEvent`] + its coalescing key into a
 /// wire-ready [`McpServerStatusPayload`].
 ///
-/// The `HandshakeFailed` `reason` is passed through verbatim as the
-/// `detail` field (full error, no sanitization) to ease debugging.
+/// Handshake error text is used only for local classification and is never
+/// copied into the wire payload.
 pub fn build_payload(
     session_id: &str,
     key: &(McpServerName, McpClientEventKind),
@@ -405,17 +404,14 @@ pub fn build_payload(
             (
                 McpServerStatus::NeedsAuth,
                 McpServerStatusReason::AuthExpired,
-                Some(reason.clone()),
+                None,
             )
         }
-        (McpClientEventKind::HandshakeFailed, McpClientEvent::HandshakeFailed { reason, .. }) => {
-            let detail = reason.clone();
-            (
-                McpServerStatus::Unavailable,
-                McpServerStatusReason::HandshakeFailed,
-                Some(detail),
-            )
-        }
+        (McpClientEventKind::HandshakeFailed, McpClientEvent::HandshakeFailed { .. }) => (
+            McpServerStatus::Unavailable,
+            McpServerStatusReason::HandshakeFailed,
+            None,
+        ),
         (McpClientEventKind::HandshakeFailed, _) => (
             McpServerStatus::Unavailable,
             McpServerStatusReason::HandshakeFailed,
@@ -963,25 +959,26 @@ mod tests {
         assert!(payload.tools.is_none());
     }
 
-    /// Contract: HandshakeFailed `reason` is surfaced verbatim (full
-    /// error, no sanitization/truncation) so debugging is unobstructed.
+    /// Contract: provider-controlled handshake reasons never cross the ACP
+    /// payload boundary.
     #[test]
-    fn payload_passes_full_handshake_reason() {
+    fn payload_drops_full_handshake_reason() {
+        let secret = "GB002-mcp-handshake-Q7w5E3r1T9y7";
         let key = ("linear".to_string(), McpClientEventKind::HandshakeFailed);
         let ev = McpClientEvent::HandshakeFailed {
             server: "linear".to_string(),
-            // Internal service names and full length must pass through
-            // untouched — the UI shows the raw error.
-            reason: "cli-chat-proxy returned 502".to_string(),
+            reason: format!("cli-chat-proxy returned 502: {secret}"),
         };
         let payload = build_payload("sess1", &key, &ev);
         assert_eq!(payload.status, McpServerStatus::Unavailable);
         assert_eq!(payload.reason, McpServerStatusReason::HandshakeFailed);
-        let detail = payload.detail.expect("detail set on handshake failure");
-        assert_eq!(
-            detail, "cli-chat-proxy returned 502",
-            "reason must be passed through verbatim, got: {detail}",
-        );
+        assert_eq!(payload.detail, None);
+        let rendered = serde_json::to_string(&payload).unwrap();
+        assert!(!rendered.contains(secret));
+        for window in secret.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(!rendered.contains(window), "leaked secret window: {window}");
+        }
     }
 
     /// Contract: a managed connector whose handshake is rejected for
@@ -1002,6 +999,7 @@ mod tests {
         assert_eq!(payload.source, McpServerSource::Managed);
         assert_eq!(payload.status, McpServerStatus::NeedsAuth);
         assert_eq!(payload.reason, McpServerStatusReason::AuthExpired);
+        assert_eq!(payload.detail, None);
         let json = serde_json::to_value(&payload).unwrap();
         // `McpServerStatus` serializes lowercase (no underscore); the
         // reason enum serializes snake_case.

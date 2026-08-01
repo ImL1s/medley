@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Result, anyhow};
 use reqwest::RequestBuilder;
 use serde::de::DeserializeOwned;
 
@@ -21,6 +21,50 @@ use prod_mc_cli_chat_proxy_types::feedback_types::{
 
 /// Client version header sent on every request to cli-chat-proxy for version gating.
 const CLIENT_VERSION_HEADER: &str = "x-grok-client-version";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FeedbackOperation {
+    SignalsUpdate,
+    EventRecording,
+    FeedbackSubmission,
+    CompleteRequest,
+    DismissRequest,
+    CreateRequest,
+    FetchConfig,
+    SendTurnDelta,
+}
+
+impl FeedbackOperation {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::SignalsUpdate => "Signals update",
+            Self::EventRecording => "Event recording",
+            Self::FeedbackSubmission => "Feedback submission",
+            Self::CompleteRequest => "Completing feedback request",
+            Self::DismissRequest => "Dismissing feedback request",
+            Self::CreateRequest => "Creating feedback request",
+            Self::FetchConfig => "Fetching feedback config",
+            Self::SendTurnDelta => "Sending turn delta",
+        }
+    }
+
+    const fn diagnostic_consumer(
+        self,
+    ) -> xai_grok_telemetry::unified_log::CredentialDiagnosticConsumer {
+        use xai_grok_telemetry::unified_log::CredentialDiagnosticConsumer;
+
+        match self {
+            Self::SignalsUpdate => CredentialDiagnosticConsumer::FeedbackSignalsUpdate,
+            Self::EventRecording => CredentialDiagnosticConsumer::FeedbackEventRecording,
+            Self::FeedbackSubmission => CredentialDiagnosticConsumer::FeedbackSubmission,
+            Self::CompleteRequest => CredentialDiagnosticConsumer::FeedbackCompleteRequest,
+            Self::DismissRequest => CredentialDiagnosticConsumer::FeedbackDismissRequest,
+            Self::CreateRequest => CredentialDiagnosticConsumer::FeedbackCreateRequest,
+            Self::FetchConfig => CredentialDiagnosticConsumer::FeedbackFetchConfig,
+            Self::SendTurnDelta => CredentialDiagnosticConsumer::FeedbackSendTurnDelta,
+        }
+    }
+}
 
 // ============================================================================
 // Turn delta wire types (local to xai-grok-shell until cli-chat-proxy catches up)
@@ -295,11 +339,10 @@ pub struct SessionTurnDeltaResponse {
 /// Used to let callers distinguish auth failures (401) from transient errors
 /// without fragile string matching on error messages.
 #[derive(Debug, thiserror::Error)]
-#[error("{context} failed with status {status}: {body}")]
+#[error("{context} failed with status {status}")]
 pub struct FeedbackApiError {
     pub status: reqwest::StatusCode,
     pub context: &'static str,
-    pub body: String,
 }
 
 impl FeedbackApiError {
@@ -426,13 +469,13 @@ impl FeedbackClient {
                 ),
             )
         } else {
-            let wire_bearer = credentials
+            let selected_credential = credentials
                 .deployment_key
                 .clone()
                 .or(credentials.user_token.clone());
             Arc::new(xai_grok_auth::StaticAuthCredentialProvider::new(
                 Box::new(credentials.clone()),
-                wire_bearer,
+                selected_credential,
             ))
         }
     }
@@ -440,21 +483,17 @@ impl FeedbackClient {
     fn record_401_attribution_if_needed(
         &self,
         response: &reqwest::Response,
-        stamp: Option<&xai_grok_auth::StampedBearerSuffix>,
-        op: &str,
+        comparison: xai_grok_auth::CredentialComparison,
+        operation: FeedbackOperation,
     ) {
         if response.status() == reqwest::StatusCode::UNAUTHORIZED
             && let Some(am) = self.credentials.auth_manager()
         {
-            // Attribute what the middleware stamped, never a re-resolved or
-            // constructor-time credential (see `StampedBearerSuffix`).
-            // `None` = the request went out with no bearer.
             crate::auth::attribution::record_consumer_401(
                 am.as_ref(),
                 self.session_id.as_deref(),
-                crate::auth::attribution::ConsumerKind::FeedbackClient,
-                op,
-                stamp.map(|s| s.0.as_str()),
+                operation.diagnostic_consumer(),
+                comparison,
             );
         }
     }
@@ -516,15 +555,18 @@ impl FeedbackClient {
     async fn send_json<T: DeserializeOwned>(
         &self,
         request: RequestBuilder,
-        context: &'static str,
+        operation: FeedbackOperation,
     ) -> Result<T> {
+        let context = operation.as_str();
         let request = xai_file_utils::trace_context::inject_trace_context_into_request(request);
-        let req = request.build().context(context)?;
-        let (response, stamp) = xai_grok_auth::execute_with_stamp(&self.client, req)
+        let req = request
+            .build()
+            .map_err(|_| anyhow!("{context}: request build failed"))?;
+        let (response, comparison) = xai_grok_auth::execute_with_auth_relation(&self.client, req)
             .await
-            .context(context)?;
+            .map_err(|_| anyhow!("{context}: request transport failed"))?;
 
-        self.record_401_attribution_if_needed(&response, stamp.as_ref(), context);
+        self.record_401_attribution_if_needed(&response, comparison, operation);
 
         if response.status() == reqwest::StatusCode::FORBIDDEN {
             tracing::debug!("{context} rejected (403), skipping");
@@ -533,32 +575,30 @@ impl FeedbackClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(FeedbackApiError {
-                status,
-                context,
-                body,
-            }
-            .into());
+            return Err(FeedbackApiError { status, context }.into());
         }
 
         response
             .json()
             .await
-            .with_context(|| format!("Failed to parse {} response", context))
+            .map_err(|_| anyhow!("{context}: invalid response JSON"))
     }
 
-    async fn send_empty(&self, request: RequestBuilder, context: &'static str) -> Result<()> {
+    async fn send_empty(
+        &self,
+        request: RequestBuilder,
+        operation: FeedbackOperation,
+    ) -> Result<()> {
+        let context = operation.as_str();
         let request = xai_file_utils::trace_context::inject_trace_context_into_request(request);
-        let req = request.build().context(context)?;
-        let (response, stamp) = xai_grok_auth::execute_with_stamp(&self.client, req)
+        let req = request
+            .build()
+            .map_err(|_| anyhow!("{context}: request build failed"))?;
+        let (response, comparison) = xai_grok_auth::execute_with_auth_relation(&self.client, req)
             .await
-            .context(context)?;
+            .map_err(|_| anyhow!("{context}: request transport failed"))?;
 
-        self.record_401_attribution_if_needed(&response, stamp.as_ref(), context);
+        self.record_401_attribution_if_needed(&response, comparison, operation);
 
         if response.status() == reqwest::StatusCode::FORBIDDEN {
             tracing::debug!("{context} rejected (403), skipping");
@@ -567,16 +607,7 @@ impl FeedbackClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(FeedbackApiError {
-                status,
-                context,
-                body,
-            }
-            .into());
+            return Err(FeedbackApiError { status, context }.into());
         }
 
         Ok(())
@@ -591,7 +622,8 @@ impl FeedbackClient {
     ) -> Result<SessionSignalsUpdateResponse> {
         let url = format!("{}/sessions/{}/signals", self.base_url, session_id);
         let request = self.post(&url).json(update);
-        self.send_json(request, "Signals update").await
+        self.send_json(request, FeedbackOperation::SignalsUpdate)
+            .await
     }
 
     /// Record a session event.
@@ -603,7 +635,8 @@ impl FeedbackClient {
     ) -> Result<SessionEventResponse> {
         let url = format!("{}/sessions/{}/events", self.base_url, session_id);
         let request = self.post(&url).json(event);
-        self.send_json(request, "Event recording").await
+        self.send_json(request, FeedbackOperation::EventRecording)
+            .await
     }
 
     /// Submit feedback.
@@ -614,7 +647,8 @@ impl FeedbackClient {
     ) -> Result<FeedbackResponse> {
         let url = format!("{}/feedback", self.base_url);
         let request = self.post(&url).json(submission);
-        self.send_json(request, "Feedback submission").await
+        self.send_json(request, FeedbackOperation::FeedbackSubmission)
+            .await
     }
 
     /// Complete a feedback request.
@@ -629,7 +663,7 @@ impl FeedbackClient {
             self.base_url, request_id
         );
         let request = self.post(&url).json(submission);
-        self.send_empty(request, "Completing feedback request")
+        self.send_empty(request, FeedbackOperation::CompleteRequest)
             .await
     }
 
@@ -638,7 +672,8 @@ impl FeedbackClient {
     pub async fn dismiss_request(&self, request_id: &str) -> Result<FeedbackRequestUpdateResponse> {
         let url = format!("{}/feedback/requests/{}/dismiss", self.base_url, request_id);
         let request = self.post(&url);
-        self.send_json(request, "Dismissing feedback request").await
+        self.send_json(request, FeedbackOperation::DismissRequest)
+            .await
     }
 
     /// Create a new feedback request.
@@ -653,7 +688,8 @@ impl FeedbackClient {
     ) -> Result<CreateFeedbackRequestResponse> {
         let url = format!("{}/feedback/requests", self.base_url);
         let request = self.post(&url).json(input);
-        self.send_json(request, "Creating feedback request").await
+        self.send_json(request, FeedbackOperation::CreateRequest)
+            .await
     }
 
     /// Get the active feedback heuristics configuration.
@@ -664,7 +700,8 @@ impl FeedbackClient {
     pub async fn get_feedback_config(&self) -> Result<FeedbackHeuristicsConfig> {
         let url = format!("{}/feedback/config", self.base_url);
         let request = self.get(&url);
-        self.send_json(request, "Fetching feedback config").await
+        self.send_json(request, FeedbackOperation::FetchConfig)
+            .await
     }
 
     /// Send a per-turn delta to the backend.
@@ -679,7 +716,8 @@ impl FeedbackClient {
     ) -> Result<SessionTurnDeltaResponse> {
         let url = format!("{}/sessions/{}/turn-deltas", self.base_url, session_id);
         let request = self.post(&url).json(delta);
-        self.send_json(request, "Sending turn delta").await
+        self.send_json(request, FeedbackOperation::SendTurnDelta)
+            .await
     }
 }
 
@@ -871,6 +909,49 @@ pub fn snapshot_to_turn_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn feedback_operation_mapping_is_complete_and_closed() {
+        let cases = [
+            (
+                FeedbackOperation::SignalsUpdate,
+                "FeedbackClient.signals_update",
+            ),
+            (
+                FeedbackOperation::EventRecording,
+                "FeedbackClient.event_recording",
+            ),
+            (
+                FeedbackOperation::FeedbackSubmission,
+                "FeedbackClient.feedback_submission",
+            ),
+            (
+                FeedbackOperation::CompleteRequest,
+                "FeedbackClient.complete_request",
+            ),
+            (
+                FeedbackOperation::DismissRequest,
+                "FeedbackClient.dismiss_request",
+            ),
+            (
+                FeedbackOperation::CreateRequest,
+                "FeedbackClient.create_request",
+            ),
+            (
+                FeedbackOperation::FetchConfig,
+                "FeedbackClient.fetch_config",
+            ),
+            (
+                FeedbackOperation::SendTurnDelta,
+                "FeedbackClient.send_turn_delta",
+            ),
+        ];
+
+        for (operation, expected) in cases {
+            assert_eq!(operation.diagnostic_consumer().as_str(), expected);
+            assert!(!operation.as_str().is_empty());
+        }
+    }
 
     #[test]
     fn test_signals_to_update() {
@@ -1065,6 +1146,20 @@ mod forbidden_tests {
     use std::net::SocketAddr;
     use tokio::net::TcpListener;
 
+    fn assert_sentinel_absent(rendered: &str, sentinel: &str) {
+        assert!(
+            !rendered.contains(sentinel),
+            "leaked full sentinel: {rendered}"
+        );
+        for window in sentinel.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).expect("ASCII sentinel window");
+            assert!(
+                !rendered.contains(window),
+                "leaked sentinel window {window:?}: {rendered}"
+            );
+        }
+    }
+
     async fn start_server(router: Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1120,6 +1215,67 @@ mod forbidden_tests {
             err.to_string().contains("(403)"),
             "error must mention 403, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn transport_error_hides_userinfo_and_query_credentials() {
+        let sentinel = "cred_SENTINEL_0123456789abcdef";
+        let client = FeedbackClient::with_client(
+            reqwest::Client::new(),
+            format!("http://{sentinel}:password@127.0.0.1:1/v1?token={sentinel}"),
+            None,
+        );
+
+        let error = client
+            .get_feedback_config()
+            .await
+            .expect_err("dead loopback port must fail");
+        let rendered = format!("{error} {error:?}");
+
+        assert!(rendered.contains("request transport failed"));
+        assert_sentinel_absent(&rendered, sentinel);
+    }
+
+    #[tokio::test]
+    async fn build_error_hides_userinfo_and_query_credentials() {
+        let sentinel = "cred_SENTINEL_0123456789abcdef";
+        let client = FeedbackClient::with_client(
+            reqwest::Client::new(),
+            format!("http://{sentinel}:password@127.0.0.1:notaport/v1?token={sentinel}"),
+            None,
+        );
+
+        let error = client
+            .get_feedback_config()
+            .await
+            .expect_err("invalid port must fail request construction");
+        let rendered = format!("{error} {error:?}");
+
+        assert!(rendered.contains("request build failed"));
+        assert_sentinel_absent(&rendered, sentinel);
+    }
+
+    #[tokio::test]
+    async fn invalid_json_error_hides_request_url_credentials() {
+        let router = Router::new().route("/invalid", axum::routing::get(|| async { "not-json" }));
+        let (addr, _) = start_server(router).await;
+        let sentinel = "cred_SENTINEL_0123456789abcdef";
+        let client = FeedbackClient::with_client(reqwest::Client::new(), "http://unused", None);
+        let request = client.get(&format!(
+            "http://{sentinel}:password@{addr}/invalid?token={sentinel}"
+        ));
+
+        let error = client
+            .send_json::<serde_json::Value>(request, FeedbackOperation::FetchConfig)
+            .await
+            .expect_err("invalid JSON must fail");
+        let rendered = format!("{error} {error:?}");
+
+        assert_eq!(
+            error.to_string(),
+            "Fetching feedback config: invalid response JSON"
+        );
+        assert_sentinel_absent(&rendered, sentinel);
     }
 }
 

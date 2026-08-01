@@ -53,7 +53,7 @@ pub struct OtelClientInfo {
 }
 /// OTLP trace-export transport settings, resolved from the `OTEL_*` env vars /
 /// managed config.
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct OtelExporterConfig {
     /// Full OTLP traces endpoint URL (e.g. `https://cli-chat-proxy.grok.com/v1/traces`).
     pub traces_url: String,
@@ -65,6 +65,18 @@ pub struct OtelExporterConfig {
     pub timeout: Option<std::time::Duration>,
     /// `false` when `OTEL_TRACES_EXPORTER=none`: spans created, never exported.
     pub enabled: bool,
+}
+
+impl std::fmt::Debug for OtelExporterConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OtelExporterConfig")
+            .field("traces_url_configured", &(!self.traces_url.is_empty()))
+            .field("extra_header_count", &self.extra_headers.len())
+            .field("export_interval", &self.export_interval)
+            .field("timeout", &self.timeout)
+            .field("enabled", &self.enabled)
+            .finish()
+    }
 }
 /// Creates an OpenTelemetry layer that bridges tracing spans to OpenTelemetry.
 /// This enables trace context propagation and OTLP export to the cli-chat-proxy.
@@ -100,6 +112,11 @@ where
             "sampling_log=off"
                 .parse()
                 .expect("static directive must parse"),
+        )
+        .add_directive(
+            format!("{}=off", crate::debug_log::RMCP_AUTH_SENSITIVE_TARGET)
+                .parse()
+                .expect("static rmcp auth directive must parse"),
         );
     OpenTelemetryLayer::new(tracer)
         .with_context_activation(false)
@@ -135,10 +152,15 @@ struct RefreshableSpanExporter {
 impl std::fmt::Debug for RefreshableSpanExporter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RefreshableSpanExporter")
-            .field("endpoint", &self.endpoint)
-            .field("static_headers", &self.static_headers)
-            .field("credentials", &"configured")
-            .field("last_token", &"***")
+            .field("endpoint_configured", &!self.endpoint.is_empty())
+            .field("static_header_count", &self.static_headers.len())
+            .field("credential_provider_configured", &true)
+            .field("cached_token_storage_configured", &true)
+            .field(
+                "token_auth_header_configured",
+                &!self.token_header_value.is_empty(),
+            )
+            .field("extra_header_count", &self.extra_headers.len())
             .finish_non_exhaustive()
     }
 }
@@ -215,7 +237,7 @@ impl RefreshableSpanExporter {
         })
     }
 }
-/// Stamp `deployment.id`/`api_key.id`/`organization.id`/`team.id`/`user.id`
+/// Stamp provider-issued `deployment.id`/`organization.id`/`team.id`/`user.id`
 /// per-export (they're only known after auth is wired, post-init — stamping at
 /// init would leave them blank for a session that authenticates mid-run).
 fn resource_with_tenant_id(
@@ -224,7 +246,6 @@ fn resource_with_tenant_id(
 ) -> opentelemetry_sdk::Resource {
     let tenant_attrs: Vec<opentelemetry::KeyValue> = [
         ("deployment.id", &snapshot.deployment_id),
-        ("api_key.id", &snapshot.api_key_id),
         ("organization.id", &snapshot.organization_id),
         ("team.id", &snapshot.team_id),
         ("user.id", &snapshot.user_id),
@@ -483,6 +504,32 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::Mutex;
     use xai_grok_auth::{AuthCredentialProvider, CredentialSnapshot, HttpAuth};
+
+    fn assert_no_secret_fragments(output: &str, secret: &str) {
+        assert!(!output.contains(secret), "full credential leaked: {output}");
+        for window in secret.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).expect("ASCII test sentinel");
+            assert!(
+                !output.contains(fragment),
+                "credential fragment {fragment:?} leaked: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn exporter_config_debug_is_presence_only() {
+        let sentinel = "cred_SENTINEL_0123456789abcdef";
+        let config = OtelExporterConfig {
+            traces_url: format!("https://user:{sentinel}@example.test/v1/traces?token={sentinel}"),
+            extra_headers: vec![("Authorization".into(), format!("Bearer {sentinel}"))],
+            enabled: true,
+            ..Default::default()
+        };
+        let rendered = format!("{config:?}");
+        assert_no_secret_fragments(&rendered, sentinel);
+        assert!(rendered.contains("traces_url_configured: true"));
+        assert!(rendered.contains("extra_header_count: 1"));
+    }
     /// Test double for `AuthCredentialProvider`. When constructed with
     /// `with_refresh`, `refresh_after_unauthorized` rotates the token and
     /// returns `true`; otherwise it returns `false`.
@@ -563,6 +610,33 @@ mod tests {
             extra_headers: Arc::new(Vec::new()),
         }
     }
+
+    #[test]
+    fn refreshable_exporter_debug_is_presence_only_for_endpoint_and_credentials() {
+        let sentinel = "GB002-otel-Q7w5E3r1T9y7Z6x4C2v8";
+        let provider = Arc::new(TestProvider::new(Some(sentinel)));
+        let mut exporter = make_exporter(provider, sentinel);
+        exporter.endpoint = Arc::from(
+            format!("https://user:{sentinel}@otel.example.test/v1?token={sentinel}")
+                .into_boxed_str(),
+        );
+        exporter.static_headers = Arc::new(std::collections::HashMap::from([(
+            "Authorization".to_owned(),
+            format!("Bearer {sentinel}"),
+        )]));
+        exporter.token_header_value = Arc::from(sentinel);
+        exporter.extra_headers = Arc::new(vec![("X-Secret".to_owned(), sentinel.to_owned())]);
+
+        let rendered = format!("{exporter:?}");
+        assert_no_secret_fragments(&rendered, sentinel);
+        assert!(rendered.contains("endpoint_configured: true"));
+        assert!(rendered.contains("static_header_count: 1"));
+        assert!(rendered.contains("credential_provider_configured: true"));
+        assert!(rendered.contains("cached_token_storage_configured: true"));
+        assert!(rendered.contains("token_auth_header_configured: true"));
+        assert!(rendered.contains("extra_header_count: 1"));
+    }
+
     #[test]
     fn build_export_headers_tracks_snapshot_and_respects_overrides() {
         let static_headers = std::collections::HashMap::new();
@@ -605,7 +679,6 @@ mod tests {
             .build();
         let plain = resource_with_tenant_id(base.clone(), &CredentialSnapshot::default());
         assert!(plain.get(&Key::from("deployment.id")).is_none());
-        assert!(plain.get(&Key::from("api_key.id")).is_none());
         let snap = CredentialSnapshot {
             deployment_id: Some("dep-7b97".into()),
             ..Default::default()
@@ -618,15 +691,6 @@ mod tests {
         assert!(
             r.get(&Key::from("user.id")).is_some(),
             "base attrs preserved"
-        );
-        let snap = CredentialSnapshot {
-            api_key_id: Some("ak-0c2b".into()),
-            ..Default::default()
-        };
-        let r = resource_with_tenant_id(base.clone(), &snap);
-        assert_eq!(
-            r.get(&Key::from("api_key.id")).map(|v| v.to_string()),
-            Some("ak-0c2b".to_string())
         );
         let snap = CredentialSnapshot {
             organization_id: Some("org-abc".into()),

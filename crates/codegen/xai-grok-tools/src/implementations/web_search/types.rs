@@ -4,7 +4,7 @@ use indexmap::IndexMap;
 ///
 /// Use `Disabled` when no API key is available or web search should be turned off.
 /// Use `Enabled { … }` to provide credentials and endpoint configuration.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, serde::Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum WebSearchConfig {
     #[default]
@@ -18,6 +18,28 @@ pub enum WebSearchConfig {
         #[serde(skip_serializing_if = "Option::is_none")]
         alpha_test_key: Option<String>,
     },
+}
+
+impl std::fmt::Debug for WebSearchConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled => f.write_str("WebSearchConfig::Disabled"),
+            Self::Enabled {
+                api_key,
+                base_url,
+                model,
+                extra_headers,
+                alpha_test_key,
+            } => f
+                .debug_struct("WebSearchConfig::Enabled")
+                .field("api_key_present", &!api_key.is_empty())
+                .field("base_url_present", &!base_url.is_empty())
+                .field("model_present", &!model.is_empty())
+                .field("extra_headers_present", &!extra_headers.is_empty())
+                .field("alpha_test_key_present", &alpha_test_key.is_some())
+                .finish(),
+        }
+    }
 }
 
 impl WebSearchConfig {
@@ -102,17 +124,24 @@ mod tests {
     }
 
     #[test]
-    fn test_config_serde_roundtrip() {
+    fn debug_does_not_leak_secret_fields_or_windows() {
+        let sentinel = "GB002-web-search-secret-0123456789abcdef";
         let config = WebSearchConfig::Enabled {
-            api_key: "key".to_string(),
-            base_url: "https://api.x.ai/v1".to_string(),
+            api_key: sentinel.to_string(),
+            base_url: format!("https://user:{sentinel}@example.test/?token={sentinel}"),
             model: "test-web-search-model".to_string(),
-            extra_headers: IndexMap::new(),
-            alpha_test_key: None,
+            extra_headers: IndexMap::from([("Authorization".to_string(), sentinel.to_string())]),
+            alpha_test_key: Some(sentinel.to_string()),
         };
-        let json = serde_json::to_string(&config).unwrap();
-        let parsed: WebSearchConfig = serde_json::from_str(&json).unwrap();
-        assert!(parsed.is_enabled());
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains(sentinel));
+        for window in sentinel.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(
+                !rendered.contains(window),
+                "leaked sentinel window: {window}"
+            );
+        }
     }
 
     #[test]

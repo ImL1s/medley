@@ -89,7 +89,7 @@ impl WebFetchClient {
         {
             let cache = self.cache.read();
             if let Some(cached) = cache.get(&url_str) {
-                tracing::debug!("web_fetch cache hit for {url_str}");
+                tracing::debug!("web_fetch cache hit");
                 return Ok(cached.clone());
             }
         }
@@ -152,10 +152,7 @@ impl WebFetchClient {
         // Image: validate magic bytes, save to disk.
         if is_image(&content_type) {
             if !validate_media_magic_bytes(&content_type, &body) {
-                return Err(WebFetchError::ContentTypeMismatch {
-                    content_type,
-                    url: final_url,
-                });
+                return Err(WebFetchError::ContentTypeMismatch { content_type });
             }
             let media_session_folder = require_media_session_folder(session_folder)?;
             let output = save_image(
@@ -174,10 +171,7 @@ impl WebFetchClient {
         // Video: validate magic bytes, save to disk.
         if is_video(&content_type) {
             if !validate_media_magic_bytes(&content_type, &body) {
-                return Err(WebFetchError::ContentTypeMismatch {
-                    content_type,
-                    url: final_url,
-                });
+                return Err(WebFetchError::ContentTypeMismatch { content_type });
             }
             let media_session_folder = require_media_session_folder(session_folder)?;
             let output = save_video(
@@ -194,10 +188,7 @@ impl WebFetchClient {
 
         // Reject binary content types that would produce garbage through lossy UTF-8.
         if is_binary_content_type(&content_type) {
-            return Err(WebFetchError::UnsupportedContentType {
-                content_type,
-                url: final_url,
-            });
+            return Err(WebFetchError::UnsupportedContentType { content_type });
         }
 
         let processed = self
@@ -397,7 +388,7 @@ async fn fetch_url(
                 let location_str = location.to_str().unwrap_or("");
                 let mut next_url = current_url
                     .join(location_str)
-                    .map_err(|e| WebFetchError::InvalidRedirect(format!("{e}")))?;
+                    .map_err(|_| WebFetchError::InvalidRedirect)?;
                 if is_same_host(&current_url, &next_url) {
                     // Re-apply https upgrade on every hop: Location may be
                     // absolute `http://…` and would otherwise silently
@@ -409,7 +400,7 @@ async fn fetch_url(
                 }
                 return Ok(FetchResult::CrossHostRedirect {
                     original_host: current_url.host_str().unwrap_or("unknown").to_string(),
-                    redirect_url: next_url.to_string(),
+                    redirect_url: observable_url(&next_url),
                 });
             }
         }
@@ -420,7 +411,7 @@ async fn fetch_url(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("text/html")
             .to_string();
-        let final_url = resp.url().to_string();
+        let final_url = observable_url(resp.url());
         let status_code = status.as_u16();
 
         let body = resp.bytes().await?;
@@ -438,6 +429,17 @@ async fn fetch_url(
             status_code,
         });
     }
+}
+
+/// Preserve a useful source URL while dropping the two URL components that
+/// routinely carry credentials: userinfo and query parameters.
+fn observable_url(url: &Url) -> String {
+    let mut safe = url.clone();
+    let _ = safe.set_username("");
+    let _ = safe.set_password(None);
+    safe.set_query(None);
+    safe.set_fragment(None);
+    safe.to_string()
 }
 
 /// Exact host equality — no `www.` stripping. Distinct DNS labels (even when
@@ -904,6 +906,20 @@ mod tests {
         assert!(validate_url("https://docs.rs/reqwest/latest").is_ok());
         assert!(validate_url("https://github.com/seanmonstar/reqwest").is_ok());
         assert!(validate_url("http://example.com/path?q=1#frag").is_ok());
+    }
+
+    #[test]
+    fn observable_url_omits_userinfo_query_and_fragment() {
+        let sentinel = "cred_SENTINEL_0123456789abcdef";
+        let url = Url::parse(&format!(
+            "https://user:{sentinel}@example.com/path?token={sentinel}#{sentinel}"
+        ))
+        .unwrap();
+        let rendered = observable_url(&url);
+        assert_eq!(rendered, "https://example.com/path");
+        for window in sentinel.as_bytes().windows(8) {
+            assert!(!rendered.contains(std::str::from_utf8(window).unwrap()));
+        }
     }
 
     #[test]

@@ -64,11 +64,7 @@ impl ModelsCacheManager {
             return None;
         }
         if cache.origin.as_deref() != Some(expected_origin) {
-            tracing::debug!(
-                cached = ?cache.origin,
-                expected = expected_origin,
-                "models cache origin mismatch"
-            );
+            tracing::debug!("models cache origin mismatch");
             return None;
         }
         if !cache.is_fresh(self.ttl) {

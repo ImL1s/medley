@@ -745,13 +745,13 @@ pub(crate) async fn run_shell_child(
             "subagent_type": &request.subagent_type,
             "effective_model": effective_model_id.0.as_ref(),
             "effective_model_raw": &effective_sampling_config.model,
-            "base_url": &effective_sampling_config.base_url,
-            "key_prefix": key_prefix(&effective_sampling_config.api_key),
+            "endpoint_is_first_party": crate::util::is_xai_api_url(&effective_sampling_config.base_url),
+            "credential_present": effective_sampling_config.api_key.is_some(),
             "auth_type": format!("{:?}", inherited_auth_type),
             "model_has_own_creds": model_has_own_creds,
             "auth_method_id": ctx.auth_method_id.0.as_ref(),
             "parent_model": ctx.model_id.0.as_ref(),
-            "parent_key_prefix": key_prefix(&ctx.sampling_config.api_key),
+            "parent_credential_present": ctx.sampling_config.api_key.is_some(),
             "context_window": effective_sampling_config.context_window,
         })),
     );
@@ -1845,7 +1845,13 @@ pub(crate) async fn run_shell_child(
         result.worktree_path = None;
     }
     let success = result.success && !result.cancelled;
-    let preview = crate::util::truncate(&result.output, 200);
+    let error_class = if result.cancelled {
+        "cancelled"
+    } else if result.error.is_some() {
+        "subagent_error"
+    } else {
+        "none"
+    };
     let level_fn = if success {
         xai_grok_telemetry::unified_log::info
     } else {
@@ -1867,8 +1873,10 @@ pub(crate) async fn run_shell_child(
             "duration_ms": result.duration_ms,
             "turns": result.turns,
             "tool_calls": result.tool_calls,
-            "output_preview": preview,
-            "error": &result.error,
+            "output_present": !result.output.is_empty(),
+            "output_len": result.output.len(),
+            "error_present": result.error.is_some(),
+            "error_class": error_class,
         })),
     );
     child_run_output(result, completion_data, disposed_snapshot_ref)

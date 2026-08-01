@@ -664,8 +664,11 @@ impl SessionActor {
 
         let response = match sampling_client.conversation_collect(request).await {
             Ok(r) => r,
-            Err(e) => {
-                tracing::debug!(error = %e, "prompt suggest inference failed");
+            Err(_) => {
+                tracing::debug!(
+                    error_class = "sampling_request",
+                    "prompt suggest inference failed"
+                );
                 return None;
             }
         };
@@ -682,7 +685,8 @@ impl SessionActor {
             suggestion = None;
         }
         tracing::debug!(
-            raw_preview = %xai_grok_tools::util::truncate_str(raw.trim(), 60),
+            response_present = !raw.trim().is_empty(),
+            response_len = raw.len(),
             accepted = suggestion.is_some(),
             "prompt suggest: response"
         );

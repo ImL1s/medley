@@ -2017,7 +2017,7 @@ fn spawn_permission_manager_with_pin(
                                 Ok(parsed_url) => {
                                     if static_domain_matcher.check(&parsed_url).is_none() {
                                         tracing::debug!(
-                                            url = %url,
+                                            url_configured = !url.is_empty(),
                                             source = "static_allowlist",
                                             "web_fetch domain auto-approved"
                                         );
@@ -2027,16 +2027,16 @@ fn spawn_permission_manager_with_pin(
                                         let domain = normalize_domain(host);
                                         if state.allowed_web_fetch_domains.contains(&domain) {
                                             tracing::debug!(
-                                                url = %url,
-                                                %domain,
+                                                url_configured = !url.is_empty(),
+                                                domain_configured = !domain.is_empty(),
                                                 source = "session_allowlist",
                                                 "web_fetch domain auto-approved"
                                             );
                                             Some((Decision::Allow, reasons::PERSISTED_GRANT))
                                         } else {
                                             tracing::debug!(
-                                                url = %url,
-                                                %domain,
+                                                url_configured = !url.is_empty(),
+                                                domain_configured = !domain.is_empty(),
                                                 source = "prompt",
                                                 "web_fetch domain not in allowlist, prompting user"
                                             );
@@ -2047,10 +2047,10 @@ fn spawn_permission_manager_with_pin(
                                         None
                                     }
                                 }
-                                Err(e) => {
+                                Err(_) => {
                                     tracing::debug!(
-                                        url = %url,
-                                        error = %e,
+                                        url_configured = !url.is_empty(),
+                                        error_class = "invalid_url",
                                         "web_fetch URL unparseable, prompting user"
                                     );
                                     None

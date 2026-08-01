@@ -3,6 +3,51 @@
 
 use super::*;
 
+fn hook_run_entry_dto(
+    result: &xai_grok_hooks::result::HookRunResult,
+) -> crate::extensions::notification::HookRunEntryDto {
+    use crate::extensions::notification::{HookRunEntryDto, HookRunStatusDto};
+    use xai_grok_hooks::result::HookRunResult;
+
+    let (name, status) = match result {
+        HookRunResult::Success {
+            hook_name, elapsed, ..
+        } => (
+            hook_name.clone(),
+            HookRunStatusDto::Success {
+                elapsed_ms: elapsed.as_millis() as u64,
+            },
+        ),
+        HookRunResult::Skipped { hook_name } => (hook_name.clone(), HookRunStatusDto::Skipped),
+        HookRunResult::Blocked {
+            hook_name, elapsed, ..
+        } => (
+            hook_name.clone(),
+            HookRunStatusDto::Failed {
+                error: "hook blocked".to_string(),
+                elapsed_ms: elapsed.as_millis() as u64,
+                blocked: true,
+            },
+        ),
+        HookRunResult::Failed {
+            hook_name, elapsed, ..
+        } => (
+            hook_name.clone(),
+            HookRunStatusDto::Failed {
+                error: "hook failed".to_string(),
+                elapsed_ms: elapsed.as_millis() as u64,
+                blocked: false,
+            },
+        ),
+    };
+
+    HookRunEntryDto {
+        name,
+        status,
+        output: None,
+    }
+}
+
 /// Map a turn result to the hub protocol's `TurnHookOutcome`.
 pub(super) fn turn_result_to_hook_outcome(
     result: &Result<TurnOutcome, acp::Error>,
@@ -131,58 +176,7 @@ impl SessionActor {
         {
             return;
         }
-        use crate::extensions::notification::{HookRunEntryDto, HookRunStatusDto};
-        use xai_grok_hooks::result::HookRunResult;
-
-        let runs: Vec<HookRunEntryDto> = results
-            .iter()
-            .map(|r| {
-                let (name, status) = match r {
-                    HookRunResult::Success {
-                        hook_name, elapsed, ..
-                    } => (
-                        hook_name.clone(),
-                        HookRunStatusDto::Success {
-                            elapsed_ms: elapsed.as_millis() as u64,
-                        },
-                    ),
-                    HookRunResult::Skipped { hook_name } => {
-                        (hook_name.clone(), HookRunStatusDto::Skipped)
-                    }
-                    HookRunResult::Blocked {
-                        hook_name,
-                        detail,
-                        elapsed,
-                        ..
-                    } => (
-                        hook_name.clone(),
-                        HookRunStatusDto::Failed {
-                            error: detail.clone(),
-                            elapsed_ms: elapsed.as_millis() as u64,
-                            blocked: true,
-                        },
-                    ),
-                    HookRunResult::Failed {
-                        hook_name,
-                        error,
-                        elapsed,
-                        ..
-                    } => (
-                        hook_name.clone(),
-                        HookRunStatusDto::Failed {
-                            error: error.clone(),
-                            elapsed_ms: elapsed.as_millis() as u64,
-                            blocked: false,
-                        },
-                    ),
-                };
-                HookRunEntryDto {
-                    name,
-                    status,
-                    output: None,
-                }
-            })
-            .collect();
+        let runs = results.iter().map(hook_run_entry_dto).collect();
 
         self.send_xai_notification(XaiSessionUpdate::HookExecution {
             event_name: event_name.to_string(),
@@ -302,6 +296,39 @@ mod notification_hook_filter_tests {
     use crate::extensions::notification::{
         FeedbackRequestNotification, HookRunEntryDto, HookRunStatusDto, RetryState,
     };
+
+    #[test]
+    fn hook_execution_dto_omits_full_and_partial_credentials() {
+        const SECRET: &str = "GB002SECabcdefgh87654321";
+        const PREFIX: &str = "GB002SEC";
+        const SUFFIX: &str = "87654321";
+        let results = [
+            xai_grok_hooks::result::HookRunResult::Blocked {
+                hook_name: "blocker".into(),
+                detail: format!("denied: {SECRET}"),
+                elapsed: std::time::Duration::from_millis(3),
+                http_info: None,
+            },
+            xai_grok_hooks::result::HookRunResult::Failed {
+                hook_name: "failure".into(),
+                error: format!("provider error: {SECRET}"),
+                elapsed: std::time::Duration::from_millis(5),
+                http_info: None,
+            },
+        ];
+
+        let rendered =
+            serde_json::to_string(&results.iter().map(hook_run_entry_dto).collect::<Vec<_>>())
+                .expect("hook DTOs serialize");
+        for fragment in [SECRET, PREFIX, SUFFIX] {
+            assert!(
+                !rendered.contains(fragment),
+                "hook execution DTO leaked credential fragment: {fragment}"
+            );
+        }
+        assert!(rendered.contains("hook blocked"));
+        assert!(rendered.contains("hook failed"));
+    }
 
     #[test]
     fn hook_updates_do_not_fire_notification_hook() {

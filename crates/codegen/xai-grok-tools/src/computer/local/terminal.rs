@@ -2725,7 +2725,7 @@ async fn drain_remaining_output(process: &mut ProcessState) {
 
     if timed_out.is_err() {
         tracing::debug!(
-            command = %process.command,
+            command_configured = !process.command.is_empty(),
             "drain timed out after {:?}, a backgrounded child may be holding the pipe open",
             DRAIN_TIMEOUT,
         );

@@ -27,7 +27,7 @@ pub use xai_grok_config_types::{McpConfig, RelaySyncConfig};
 pub use xai_grok_config_types::PoolConfig;
 
 /// TUI/CLI settings. Composed from typed section configs defined in `agent::config`.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Config {
     pub cli: crate::agent::config::CliConfig,
     pub models: crate::agent::config::ModelsConfig,
@@ -51,6 +51,34 @@ pub struct Config {
     pub ask_user_question: crate::tools::config::AskUserQuestionToolConfig,
     /// `[privacy]` — local banner ack (not auth-metadata).
     pub privacy: PrivacyConfig,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // This aggregate sits above several independently evolving config
+        // types. Do not recursively trust their Debug implementations: nested
+        // sections may gain URL, header, command, or credential-shaped fields.
+        f.debug_struct("Config")
+            .field("cli_section", &"configured")
+            .field("models_section", &"configured")
+            .field("ui_section", &"configured")
+            .field("harness_section", &"configured")
+            .field("skills_section", &"configured")
+            .field("compat_section", &"configured")
+            .field(
+                "management_api_key_present",
+                &self.management_api_key.is_some(),
+            )
+            .field("permission_present", &self.permission.is_some())
+            .field("diagnostics_section", &"configured")
+            .field("session_section", &"configured")
+            .field("ask_user_question_section", &"configured")
+            .field(
+                "privacy_banner_ack_present",
+                &self.privacy.privacy_banner_acked.is_some(),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -1825,6 +1853,47 @@ pub fn session_registry_local_override(root: Option<&TomlValue>) -> Option<bool>
 mod tests {
     use super::*;
     use toml::Value as TomlValue;
+
+    #[test]
+    fn config_debug_reports_management_key_presence_without_exposing_fragments() {
+        const URL_SECRET: &str = "GB002URL-A7s5D3f1G9h7J6k4L2m8";
+        const MANAGEMENT_SECRET: &str = "GB002MGT-Q7w5E3r1T9y7Z6x4C2v8";
+        let secret_url =
+            format!("https://user:{URL_SECRET}@registry.example.test/npm?token={URL_SECRET}");
+        let config = Config {
+            cli: crate::agent::config::CliConfig {
+                npm_registry: Some(secret_url),
+                channel: Some(URL_SECRET.to_owned()),
+                ..crate::agent::config::CliConfig::default()
+            },
+            management_api_key: Some(MANAGEMENT_SECRET.to_owned()),
+            privacy: PrivacyConfig {
+                privacy_banner_acked: Some(URL_SECRET.to_owned()),
+            },
+            ..Config::default()
+        };
+
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("management_api_key_present: true"),
+            "{debug}"
+        );
+        assert!(debug.contains("cli_section: \"configured\""), "{debug}");
+        assert!(
+            debug.contains("privacy_banner_ack_present: true"),
+            "{debug}"
+        );
+        for secret in [URL_SECRET, MANAGEMENT_SECRET] {
+            assert!(!debug.contains(secret), "{debug}");
+            for window in secret.as_bytes().windows(8) {
+                let fragment = std::str::from_utf8(window).expect("ASCII sentinel");
+                assert!(
+                    !debug.contains(fragment),
+                    "leaked fragment {fragment:?}: {debug}"
+                );
+            }
+        }
+    }
 
     /// Env beats config.toml; unrecognized env defers; both absent defers to remote.
     #[test]

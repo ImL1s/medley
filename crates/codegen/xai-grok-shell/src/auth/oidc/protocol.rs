@@ -22,8 +22,8 @@ pub(super) enum OidcError {
     BindLoopback(String),
     #[error("failed to save OIDC auth: {0}")]
     SaveAuth(String),
-    #[error("OIDC discovery failed: HTTP {status} from {url}")]
-    DiscoveryHttp { status: u16, url: String },
+    #[error("OIDC discovery failed: HTTP {status}")]
+    DiscoveryHttp { status: u16 },
     /// Keep the "10 minutes" text in sync with `AUTH_CALLBACK_TIMEOUT` in `login.rs`.
     #[error("Login timed out after 10 minutes. Please try again.")]
     CallbackTimeout,
@@ -33,10 +33,13 @@ pub(super) enum OidcError {
     CallbackAuthFailed(String),
     #[error("failed to parse pasted input: {0}")]
     InvalidPastedInput(String),
-    #[error("OIDC token exchange failed: HTTP {status} — {body}")]
-    TokenExchangeHttp { status: u16, body: String },
-    #[error("OIDC token refresh failed: HTTP {status} — {body}")]
-    TokenRefreshHttp { status: u16, body: String },
+    #[error("OIDC token exchange failed: HTTP {status}")]
+    TokenExchangeHttp { status: u16 },
+    #[error("OIDC token refresh failed: HTTP {status}")]
+    TokenRefreshHttp {
+        status: u16,
+        terminal_error_code: Option<String>,
+    },
     #[error("OIDC authentication failed: state mismatch")]
     StateMismatch,
     #[error("OIDC id_token uses unsupported algorithm: {0}")]
@@ -304,7 +307,10 @@ fn discovery_retry_policy() -> backon::ExponentialBuilder {
 }
 async fn discover_once(issuer_key: &str) -> anyhow::Result<Discovery> {
     let url = format!("{issuer_key}/.well-known/openid-configuration");
-    tracing::debug!(url = %url, "OIDC: fetching discovery document");
+    tracing::debug!(
+        discovery_url_present = !url.is_empty(),
+        "OIDC: fetching discovery document"
+    );
     let resp = with_alpha_test_key(
         crate::http::shared_client()
             .get(&url)
@@ -316,14 +322,13 @@ async fn discover_once(issuer_key: &str) -> anyhow::Result<Discovery> {
     if !resp.status().is_success() {
         return Err(anyhow::Error::new(OidcError::DiscoveryHttp {
             status: resp.status().as_u16(),
-            url,
         }));
     }
     let doc: Discovery = resp.json().await?;
     tracing::debug!(
-        authorization_endpoint = %doc.authorization_endpoint,
-        token_endpoint = %doc.token_endpoint,
-        jwks_uri = ?doc.jwks_uri,
+        authorization_endpoint_present = !doc.authorization_endpoint.is_empty(),
+        token_endpoint_present = !doc.token_endpoint.is_empty(),
+        jwks_uri_present = doc.jwks_uri.is_some(),
         id_token_algs = ?doc.id_token_signing_alg_values_supported,
         "OIDC: discovery complete"
     );
@@ -391,7 +396,7 @@ pub(super) fn build_authorize_url(
     url.push_str(&format!("&referrer={}", urlencoding::encode(referrer)));
     url
 }
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub(super) struct TokenResponse {
     pub(super) access_token: String,
     #[serde(default)]
@@ -401,6 +406,17 @@ pub(super) struct TokenResponse {
     #[serde(default)]
     pub(super) expires_in: Option<u64>,
 }
+
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("access_token_present", &!self.access_token.is_empty())
+            .field("refresh_token_present", &self.refresh_token.is_some())
+            .field("id_token_present", &self.id_token.is_some())
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
+}
 pub(super) async fn exchange_code(
     token_endpoint: &str,
     code: &str,
@@ -408,7 +424,10 @@ pub(super) async fn exchange_code(
     client_id: &str,
     code_verifier: &str,
 ) -> anyhow::Result<TokenResponse> {
-    tracing::debug!(token_endpoint = %token_endpoint, "OIDC: exchanging code for tokens");
+    tracing::debug!(
+        token_endpoint_present = !token_endpoint.is_empty(),
+        "OIDC: exchanging code for tokens"
+    );
     let resp = with_alpha_test_key(
         crate::http::shared_client()
             .post(token_endpoint)
@@ -427,11 +446,7 @@ pub(super) async fn exchange_code(
     .await?;
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow::Error::new(OidcError::TokenExchangeHttp {
-            status,
-            body,
-        }));
+        return Err(anyhow::Error::new(OidcError::TokenExchangeHttp { status }));
     }
     Ok(resp.json().await?)
 }
@@ -440,19 +455,17 @@ pub(super) async fn exchange_code(
 /// `invalid_client`) stops retries. Everything else (5xx, 429, bare 4xx, or an
 /// unrecognized/RFC-transient code) is retried.
 fn is_transient_refresh_error(err: &anyhow::Error) -> bool {
-    let Some(OidcError::TokenRefreshHttp { status, body }) = err.downcast_ref::<OidcError>() else {
+    let Some(OidcError::TokenRefreshHttp {
+        status,
+        terminal_error_code,
+    }) = err.downcast_ref::<OidcError>()
+    else {
         return true;
     };
     if *status >= 500 || *status == 429 {
         return true;
     }
-    let error_code = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v.get("error")?.as_str().map(str::to_owned));
-    error_code
-        .as_deref()
-        .and_then(super::refresh::classify_terminal)
-        .is_none()
+    terminal_error_code.is_none()
 }
 /// Up to 3 attempts (1 + 2 retries), 200ms-2s jittered exponential
 /// backoff. Bounded so a hard outage still surfaces to the user
@@ -473,7 +486,7 @@ pub(super) async fn refresh_tokens(
 ) -> anyhow::Result<TokenResponse> {
     use backon::Retryable;
     tracing::debug!(
-        token_endpoint = %token_endpoint,
+        token_endpoint_present = !token_endpoint.is_empty(),
         principal_type = ?principal_type,
         principal_id = ?principal_id,
         "OIDC: refreshing token"
@@ -499,7 +512,7 @@ pub(super) async fn refresh_tokens(
                 None,
                 Some(serde_json::json!({
                     "suspended_ms": probe.suspended_ms(),
-                    "error": err.to_string(),
+                    "error_kind": "oidc_refresh_retry_suppressed",
                 })),
             );
             return false;
@@ -541,20 +554,21 @@ async fn refresh_tokens_once(
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
         let body = resp.text().await.unwrap_or_default();
-        let error_code = serde_json::from_str::<serde_json::Value>(&body)
+        let terminal_error_code = serde_json::from_str::<serde_json::Value>(&body)
             .ok()
-            .and_then(|v| v.get("error")?.as_str().map(str::to_owned));
+            .and_then(|v| v.get("error")?.as_str().map(str::to_owned))
+            .filter(|code| super::refresh::classify_terminal(code).is_some());
         tracing::warn!(
             http_status = status,
-            oauth2_error = ?error_code,
-            rt_prefix = crate::auth::token_suffix(refresh_token),
-            client_id = %client_id,
+            oauth2_terminal_error = ?terminal_error_code,
+            refresh_token_present = !refresh_token.is_empty(),
+            client_id_present = !client_id.is_empty(),
             principal_type = ?principal_type,
             "OIDC: token refresh HTTP error"
         );
         return Err(anyhow::Error::new(OidcError::TokenRefreshHttp {
             status,
-            body,
+            terminal_error_code,
         }));
     }
     Ok(resp.json().await?)
@@ -589,7 +603,11 @@ pub(super) fn aud_matches(aud: &serde_json::Value, expected: &str) -> bool {
 }
 pub(super) fn validate_state(expected: &str, received: &str) -> anyhow::Result<()> {
     if received != expected {
-        tracing::warn!(expected = %expected, received = %received, "OIDC: state mismatch");
+        tracing::warn!(
+            expected_present = !expected.is_empty(),
+            received_present = !received.is_empty(),
+            "OIDC: state mismatch"
+        );
         return Err(anyhow::Error::new(OidcError::StateMismatch));
     }
     Ok(())
@@ -767,6 +785,20 @@ pub(super) async fn extract_user_info(
 mod tests {
     use super::super::test_helpers::*;
     use super::*;
+    #[test]
+    fn token_response_debug_contains_presence_only() {
+        let response = TokenResponse {
+            access_token: "access-SENTINEL-0123456789".into(),
+            refresh_token: Some("refresh-SENTINEL-9876543210".into()),
+            id_token: Some("id-SENTINEL-abcdef".into()),
+            expires_in: Some(60),
+        };
+        let debug = format!("{response:?}");
+        for secret in ["access-SENTINEL", "refresh-SENTINEL", "id-SENTINEL"] {
+            assert!(!debug.contains(secret), "debug leaked {secret:?}: {debug}");
+        }
+        assert!(debug.contains("access_token_present: true"));
+    }
     #[test]
     fn pkce_s256_challenge_matches_verifier() {
         let pkce = generate_pkce();

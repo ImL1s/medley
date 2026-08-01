@@ -410,11 +410,11 @@ pub fn init_tracing() -> TracingHandle {
     use tracing_subscriber::{
         EnvFilter, Layer as _, filter::LevelFilter, fmt, layer::SubscriberExt as _,
     };
-    use xai_grok_telemetry::debug_log::RMCP_SSE_NOISE_TARGET;
+    use xai_grok_telemetry::debug_log::{RMCP_AUTH_SENSITIVE_TARGET, RMCP_SSE_NOISE_TARGET};
     let (make_writer, rx) = TracingChannelMakeWriter::new();
     let payload_level = "off";
     let directives = format!(
-        "xai_grok_shell=info,xai_grok_pager=trace,xai_grok_tools=info,xai_acp_lib=info,{RMCP_SSE_NOISE_TARGET}=error,sampling_log=off,{ACP_UPDATE_TARGET}=debug,{ACP_UPDATE_PAYLOAD_TARGET}={payload_level}"
+        "xai_grok_shell=info,xai_grok_pager=trace,xai_grok_tools=info,xai_acp_lib=info,{RMCP_SSE_NOISE_TARGET}=error,{RMCP_AUTH_SENSITIVE_TARGET}=off,sampling_log=off,{ACP_UPDATE_TARGET}=debug,{ACP_UPDATE_PAYLOAD_TARGET}={payload_level}"
     );
     let env_filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::WARN.into())

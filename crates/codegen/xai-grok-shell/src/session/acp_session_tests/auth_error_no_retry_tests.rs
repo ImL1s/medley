@@ -118,6 +118,30 @@ async fn make_actor_with_method_and_credentials(
     (Arc::new(actor), persistence_rx)
 }
 
+/// Pin the fixture's synthetic model as a ready first-party bearer model.
+/// `create_test_actor` intentionally uses a localhost endpoint and an
+/// uncatalogued model, so production resolution otherwise classifies it as
+/// unknown/custom and masks the session-method behavior these tests exercise.
+async fn pin_first_party_session_model(actor: &SessionActor) {
+    let model_id = actor
+        .chat_state_handle
+        .get_sampling_config()
+        .await
+        .map(|cfg| cfg.model)
+        .unwrap_or_default();
+    actor
+        .model_auth_memo
+        .replace(Some(crate::session::acp_session::ModelAuthMemo {
+            model_id,
+            facts: crate::agent::config::ModelAuthFacts {
+                byok: crate::agent::auth_method::ModelByok::NotByok,
+                auth_scheme: xai_grok_sampler::AuthScheme::Bearer,
+                ready: true,
+            },
+            provider: None,
+        }));
+}
+
 /// `(tempdir, manager)` holding a valid OIDC token (so `get_valid_token()` is a
 /// cache hit). The tempdir must outlive the manager (auth.json path).
 fn auth_manager_with_valid_token(key: &str) -> (tempfile::TempDir, Arc<AuthManager>) {
@@ -836,6 +860,7 @@ async fn reconstruct_full_config_wires_bearer_resolver_for_session_method_despit
                 "stale-session-jwt".to_string(),
             )
             .await;
+            pin_first_party_session_model(&actor).await;
 
             let cfg = actor.reconstruct_full_config().await;
 
@@ -923,6 +948,7 @@ async fn session_born_on_api_key_recovers_after_oidc_login_without_restart() {
                 "stale-session-jwt".to_string(),
             )
             .await;
+            pin_first_party_session_model(&actor).await;
 
             // Born on api_key: the gate is inactive, so no live resolver.
             assert!(

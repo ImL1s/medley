@@ -60,11 +60,17 @@ pub const ACP_UPDATE_PAYLOAD_TARGET: &str = "acp_update_payload";
 /// which subscribers demote to `error` to drop the flood. Re-check on rmcp bump.
 pub const RMCP_SSE_NOISE_TARGET: &str = "rmcp::transport::common::client_side_sse";
 
+/// rmcp 2.1 renders provider-controlled OAuth refresh failures at WARN with
+/// `%Display`. Product-owned subscribers must suppress that dependency target
+/// so response bodies, URLs, or credential fragments cannot enter local logs.
+/// Re-check this target when upgrading rmcp.
+pub const RMCP_AUTH_SENSITIVE_TARGET: &str = "rmcp::transport::auth";
+
 // Broad firehose filter for the routing/GROK_DEBUG_LOG sources: capture our
 // crates at debug regardless of a narrowing RUST_LOG, with deps at info so they
 // don't flood. Curated first-party allowlist: new grok crates default to `info`
 // until added here.
-const FIREHOSE_BASE_DIRECTIVES: &str = "info,xai_grok_pager=debug,xai_grok_shell=debug,xai_grok_tools=debug,xai_grok_telemetry=debug,xai_grok_agent=debug,xai_grok_mcp=debug,xai_acp_lib=debug,sampling_log=off";
+const FIREHOSE_BASE_DIRECTIVES: &str = "info,xai_grok_pager=debug,xai_grok_shell=debug,xai_grok_tools=debug,xai_grok_telemetry=debug,xai_grok_agent=debug,xai_grok_mcp=debug,xai_acp_lib=debug,sampling_log=off,rmcp::transport::auth=off";
 
 // Full firehose directives: the curated crate list plus the pager's ACP
 // update target (built from the constant above, not a literal).
@@ -88,6 +94,11 @@ fn default_file_filter() -> EnvFilter {
             "sampling_log=off"
                 .parse()
                 .expect("static directive is valid"),
+        )
+        .add_directive(
+            format!("{RMCP_AUTH_SENSITIVE_TARGET}=off")
+                .parse()
+                .expect("static rmcp auth directive is valid"),
         )
 }
 
@@ -672,6 +683,7 @@ mod tests {
         let directives = firehose_directives();
         assert!(directives.contains(&format!("{ACP_UPDATE_TARGET}=debug")));
         assert!(!directives.contains(&format!("{ACP_UPDATE_PAYLOAD_TARGET}=debug")));
+        assert!(directives.contains(&format!("{RMCP_AUTH_SENSITIVE_TARGET}=off")));
     }
 
     #[test]
@@ -754,6 +766,42 @@ mod tests {
             !dir.path().join("agent-7.txt").exists(),
             "event must route to the session file, not the fallback"
         );
+    }
+
+    #[test]
+    fn firehose_drops_provider_controlled_rmcp_auth_errors() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let _lock = flush_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let secret = "GB002-rmcp-refresh-Q7w5E3r1T9y7";
+        let layer = RoutingLayer::new(dir.path().to_path_buf(), "agent".to_owned(), 8)
+            .with_filter(firehose_filter());
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info_span!(
+                target: "xai_grok_telemetry::session_ctx",
+                "session",
+                session_id = %"sid-rmcp"
+            )
+            .in_scope(|| {
+                tracing::info!(target: "xai_grok_shell", "positive control");
+                tracing::warn!(
+                    target: RMCP_AUTH_SENSITIVE_TARGET,
+                    error = %secret,
+                    "provider-controlled refresh failure"
+                );
+            });
+        });
+        crate::appender::flush_file_log_guards();
+
+        let captured = std::fs::read_to_string(dir.path().join("sid-rmcp.txt")).unwrap();
+        assert!(captured.contains("positive control"));
+        assert!(!captured.contains(secret));
+        for window in secret.as_bytes().windows(8) {
+            assert!(!captured.contains(std::str::from_utf8(window).unwrap()));
+        }
     }
 
     #[test]

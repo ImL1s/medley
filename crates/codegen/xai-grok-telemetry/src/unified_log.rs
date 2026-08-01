@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+use xai_grok_auth::{CredentialComparison, SentCredentialRelation};
 use xai_grok_config::grok_home;
 
 /// Binary version stamped into every log entry. Set once at startup via
@@ -28,6 +29,12 @@ pub fn set_version(ver: &str) {
 pub const LOG_DIR: &str = "logs";
 const LOG_FILE: &str = "unified.jsonl";
 pub const MAX_SIZE: u64 = 5 * 1024 * 1024; // 5 MB
+
+/// Safety schema required before a unified-log record may leave the machine.
+///
+/// Records without this exact value may have been written by a legacy process
+/// that emitted credential fragments, so upload filtering fails closed.
+pub const CURRENT_CREDENTIAL_SAFETY_SCHEMA: u16 = 1;
 
 /// ACP method name for unified log notifications.
 pub const LOG_METHOD: &str = "x.ai/log";
@@ -61,9 +68,226 @@ pub enum LogSource {
     GrokDesktop,
 }
 
+/// Finite consumer categories accepted by the credential-diagnostic upload
+/// contract. No arbitrary string crosses this boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CredentialDiagnosticConsumer {
+    OaiCompatChatCompletionsStream,
+    OaiCompatChatCompletions,
+    OaiCompatResponsesStream,
+    OaiCompatResponses,
+    OaiCompatMessagesStream,
+    OaiCompatMessages,
+    StorageGetUploadLimits,
+    StorageCheckExists,
+    StorageBatchCheckExists,
+    StorageBatchUpload,
+    StorageBatchUploadJson,
+    StorageDownloadBlob,
+    StorageUpload,
+    StorageUploadFile,
+    StorageUploadStream,
+    StorageMultipartInit,
+    StorageMultipartComplete,
+    StorageGetSignedUploadUrl,
+    StorageUploadPart,
+    FeedbackSignalsUpdate,
+    FeedbackEventRecording,
+    FeedbackSubmission,
+    FeedbackCompleteRequest,
+    FeedbackDismissRequest,
+    FeedbackCreateRequest,
+    FeedbackFetchConfig,
+    FeedbackSendTurnDelta,
+    SessionRegistryRegister,
+    SessionRegistryUpdate,
+    SessionRegistryFinalize,
+    SessionRegistrySearch,
+    SessionRegistryGet,
+    SessionRegistryDownloadUrl,
+    SessionRegistryDownload,
+    IdleResumeModelRefresh,
+    ImageGen,
+    VideoGenStart,
+    VideoGenPoll,
+    WebSearch,
+}
+
+impl CredentialDiagnosticConsumer {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OaiCompatChatCompletionsStream => "OaiCompatClient.chat_completions_stream",
+            Self::OaiCompatChatCompletions => "OaiCompatClient.chat_completions",
+            Self::OaiCompatResponsesStream => "OaiCompatClient.responses_stream",
+            Self::OaiCompatResponses => "OaiCompatClient.responses",
+            Self::OaiCompatMessagesStream => "OaiCompatClient.messages_stream",
+            Self::OaiCompatMessages => "OaiCompatClient.messages",
+            Self::StorageGetUploadLimits => "StorageClient.get_upload_limits",
+            Self::StorageCheckExists => "StorageClient.check_exists",
+            Self::StorageBatchCheckExists => "StorageClient.batch_check_exists",
+            Self::StorageBatchUpload => "StorageClient.batch_upload",
+            Self::StorageBatchUploadJson => "StorageClient.batch_upload_json",
+            Self::StorageDownloadBlob => "StorageClient.download_blob",
+            Self::StorageUpload => "StorageClient.upload",
+            Self::StorageUploadFile => "StorageClient.upload_file",
+            Self::StorageUploadStream => "StorageClient.upload_stream",
+            Self::StorageMultipartInit => "StorageClient.multipart_init",
+            Self::StorageMultipartComplete => "StorageClient.multipart_complete",
+            Self::StorageGetSignedUploadUrl => "StorageClient.get_signed_upload_url",
+            Self::StorageUploadPart => "StorageClient.upload_part",
+            Self::FeedbackSignalsUpdate => "FeedbackClient.signals_update",
+            Self::FeedbackEventRecording => "FeedbackClient.event_recording",
+            Self::FeedbackSubmission => "FeedbackClient.feedback_submission",
+            Self::FeedbackCompleteRequest => "FeedbackClient.complete_request",
+            Self::FeedbackDismissRequest => "FeedbackClient.dismiss_request",
+            Self::FeedbackCreateRequest => "FeedbackClient.create_request",
+            Self::FeedbackFetchConfig => "FeedbackClient.fetch_config",
+            Self::FeedbackSendTurnDelta => "FeedbackClient.send_turn_delta",
+            Self::SessionRegistryRegister => "SessionRegistryClient.register",
+            Self::SessionRegistryUpdate => "SessionRegistryClient.update",
+            Self::SessionRegistryFinalize => "SessionRegistryClient.finalize",
+            Self::SessionRegistrySearch => "SessionRegistryClient.search",
+            Self::SessionRegistryGet => "SessionRegistryClient.get",
+            Self::SessionRegistryDownloadUrl => "SessionRegistryClient.download_url",
+            Self::SessionRegistryDownload => "SessionRegistryClient.download",
+            Self::IdleResumeModelRefresh => "IdleResumeModelRefresh",
+            Self::ImageGen => "ImageGen",
+            Self::VideoGenStart => "VideoGen.start",
+            Self::VideoGenPoll => "VideoGen.poll",
+            Self::WebSearch => "WebSearch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SafeSentCredentialRelation {
+    NotSent,
+    CurrentUnavailable,
+    SameAsCurrent,
+    DifferentFromCurrent,
+}
+
+impl From<SentCredentialRelation> for SafeSentCredentialRelation {
+    fn from(value: SentCredentialRelation) -> Self {
+        match value {
+            SentCredentialRelation::NotSent => Self::NotSent,
+            SentCredentialRelation::CurrentUnavailable => Self::CurrentUnavailable,
+            SentCredentialRelation::SameAsCurrent => Self::SameAsCurrent,
+            SentCredentialRelation::DifferentFromCurrent => Self::DifferentFromCurrent,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialAttributionContext {
+    sent_credential_relation: SafeSentCredentialRelation,
+    sent_credential_present: bool,
+    current_credential_present: bool,
+    mint_age_seconds: i64,
+    expires_at_seconds_from_now: i64,
+    consumer: CredentialDiagnosticConsumer,
+    is_stale_snapshot: bool,
+}
+
+impl CredentialAttributionContext {
+    fn new(
+        consumer: CredentialDiagnosticConsumer,
+        comparison: CredentialComparison,
+        mint_age_seconds: i64,
+        expires_at_seconds_from_now: i64,
+    ) -> Self {
+        Self {
+            sent_credential_relation: comparison.relation.into(),
+            sent_credential_present: comparison.sent_credential_present(),
+            current_credential_present: comparison.current_credential_present,
+            mint_age_seconds,
+            expires_at_seconds_from_now,
+            consumer,
+            is_stale_snapshot: comparison.relation == SentCredentialRelation::DifferentFromCurrent,
+        }
+    }
+
+    fn is_consistent(&self) -> bool {
+        let expected = match self.sent_credential_relation {
+            SafeSentCredentialRelation::NotSent => (false, self.current_credential_present, false),
+            SafeSentCredentialRelation::CurrentUnavailable => (true, false, false),
+            SafeSentCredentialRelation::SameAsCurrent => (true, true, false),
+            SafeSentCredentialRelation::DifferentFromCurrent => (true, true, true),
+        };
+        (
+            self.sent_credential_present,
+            self.current_credential_present,
+            self.is_stale_snapshot,
+        ) == expected
+    }
+}
+
+const CREDENTIAL_ATTRIBUTION_MESSAGE: &str = "auth 401 attribution";
+const UPLOAD_FAILURE_MESSAGE: &str = "file upload failed";
+
+/// Closed event discriminator for records eligible for diagnostic upload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SafeUploadEvent {
+    Auth401Attribution,
+    UploadFailure,
+    UploadRecovered,
+}
+
+/// Closed artifact category for operational upload failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UploadFailureArtifact {
+    TraceArtifact,
+}
+
+/// Closed failure category; raw error strings never cross this boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UploadFailureReason {
+    UploadFailed,
+    GcsUploadFailed,
+    DirectUploadFailed,
+    DirectUploadTimedOut,
+    Other,
+}
+
+/// Closed upload backend category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UploadFailureMethod {
+    DirectGcs,
+    Proxy,
+    DirectS3,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct UploadFailureContext {
+    artifact: UploadFailureArtifact,
+    reason: UploadFailureReason,
+    method: UploadFailureMethod,
+    phase_present: bool,
+    status_code: Option<u16>,
+    bytes: Option<u64>,
+    suppressed_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct UploadRecoveryContext {
+    method: UploadFailureMethod,
+    prior_failure_count: u64,
+}
+
+const UPLOAD_RECOVERED_MESSAGE: &str = "file upload recovered";
+
 /// A single unified log entry, written as one JSONL line.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
+    /// Credential-observability contract understood by the export filter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_safety_schema: Option<u16>,
     /// RFC 3339 timestamp (millisecond precision, UTC).
     pub ts: String,
     /// Component that produced the entry.
@@ -107,6 +331,10 @@ pub struct LogNotificationParams {
 /// Entry as sent by a client (no `src` field -- shell stamps it).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientLogEntry {
+    /// Copied verbatim by the shell. Legacy clients remain unmarked and their
+    /// records are therefore ineligible for upload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_safety_schema: Option<u16>,
     pub ts: String,
     /// Client process id. Stamped by the client when the entry is
     /// created; preserved through ACP forwarding so the on-disk log
@@ -399,6 +627,9 @@ fn now_ts() -> String {
 /// Emit a log entry from shell itself.
 pub fn emit(lvl: LogLevel, msg: &str, sid: Option<&str>, ctx: Option<serde_json::Value>) {
     let entry = LogEntry {
+        // Generic messages and JSON context are intentionally not self-attested
+        // as upload-safe. Only typed constructors may stamp the safety schema.
+        credential_safety_schema: None,
         ts: now_ts(),
         src: LogSource::Shell,
         pid: Some(std::process::id()),
@@ -407,6 +638,99 @@ pub fn emit(lvl: LogLevel, msg: &str, sid: Option<&str>, ctx: Option<serde_json:
         sid: sid.map(Into::into),
         msg: msg.into(),
         ctx,
+    };
+    write_entry(&entry);
+}
+
+/// Emit the schema-1 credential-attribution shape: a credential-free 401
+/// relation composed only of enums, booleans, and integers.
+pub fn emit_credential_attribution(
+    consumer: CredentialDiagnosticConsumer,
+    comparison: CredentialComparison,
+    mint_age_seconds: i64,
+    expires_at_seconds_from_now: i64,
+    sid: Option<&str>,
+) {
+    let context = CredentialAttributionContext::new(
+        consumer,
+        comparison,
+        mint_age_seconds,
+        expires_at_seconds_from_now,
+    );
+    let entry = LogEntry {
+        credential_safety_schema: Some(CURRENT_CREDENTIAL_SAFETY_SCHEMA),
+        ts: now_ts(),
+        src: LogSource::Shell,
+        pid: Some(std::process::id()),
+        ver: VERSION.get().cloned(),
+        lvl: LogLevel::Warn,
+        sid: sid.map(Into::into),
+        msg: CREDENTIAL_ATTRIBUTION_MESSAGE.to_string(),
+        ctx: serde_json::to_value(context).ok(),
+    };
+    write_entry(&entry);
+}
+
+/// Emit a credential-free operational upload failure using only closed enums,
+/// booleans, and bounded numeric metadata.
+pub fn emit_upload_failure(
+    artifact: UploadFailureArtifact,
+    reason: UploadFailureReason,
+    method: UploadFailureMethod,
+    phase_present: bool,
+    status_code: Option<u16>,
+    bytes: Option<u64>,
+    suppressed_count: u64,
+    sid: Option<&str>,
+) {
+    let context = UploadFailureContext {
+        artifact,
+        reason,
+        method,
+        phase_present,
+        status_code,
+        bytes,
+        suppressed_count,
+    };
+    let entry = LogEntry {
+        credential_safety_schema: Some(CURRENT_CREDENTIAL_SAFETY_SCHEMA),
+        ts: now_ts(),
+        src: LogSource::Shell,
+        pid: Some(std::process::id()),
+        ver: VERSION.get().cloned(),
+        lvl: if method == UploadFailureMethod::DirectS3 {
+            LogLevel::Warn
+        } else {
+            LogLevel::Error
+        },
+        sid: sid.map(Into::into),
+        msg: UPLOAD_FAILURE_MESSAGE.to_owned(),
+        ctx: serde_json::to_value(context).ok(),
+    };
+    write_entry(&entry);
+}
+
+/// Emit a low-volume lifecycle event when a successful upload closes an
+/// existing failure episode.
+pub fn emit_upload_recovered(
+    method: UploadFailureMethod,
+    prior_failure_count: u64,
+    sid: Option<&str>,
+) {
+    let entry = LogEntry {
+        credential_safety_schema: Some(CURRENT_CREDENTIAL_SAFETY_SCHEMA),
+        ts: now_ts(),
+        src: LogSource::Shell,
+        pid: Some(std::process::id()),
+        ver: VERSION.get().cloned(),
+        lvl: LogLevel::Info,
+        sid: sid.map(Into::into),
+        msg: UPLOAD_RECOVERED_MESSAGE.to_owned(),
+        ctx: serde_json::to_value(UploadRecoveryContext {
+            method,
+            prior_failure_count,
+        })
+        .ok(),
     };
     write_entry(&entry);
 }
@@ -422,16 +746,7 @@ pub fn ingest_client_entries(src: LogSource, entries: &[ClientLogEntry]) {
     // Serialize all entries up front, then write in a single lock acquisition.
     let mut buf = Vec::new();
     for client_entry in entries {
-        let entry = LogEntry {
-            ts: client_entry.ts.clone(),
-            src,
-            pid: client_entry.pid,
-            ver: client_entry.ver.clone(),
-            lvl: client_entry.lvl,
-            sid: client_entry.sid.clone(),
-            msg: client_entry.msg.clone(),
-            ctx: client_entry.ctx.clone(),
-        };
+        let entry = client_entry_to_log_entry(src, client_entry);
         if let Ok(mut line) = serde_json::to_vec(&entry) {
             line.push(b'\n');
             buf.extend_from_slice(&line);
@@ -439,6 +754,22 @@ pub fn ingest_client_entries(src: LogSource, entries: &[ClientLogEntry]) {
     }
     if !buf.is_empty() {
         write_lines(&buf);
+    }
+}
+
+fn client_entry_to_log_entry(src: LogSource, client_entry: &ClientLogEntry) -> LogEntry {
+    LogEntry {
+        // ACP clients are not trusted to attest free-form message/context
+        // safety. Typed safe records are emitted only by the shell.
+        credential_safety_schema: None,
+        ts: client_entry.ts.clone(),
+        src,
+        pid: client_entry.pid,
+        ver: client_entry.ver.clone(),
+        lvl: client_entry.lvl,
+        sid: client_entry.sid.clone(),
+        msg: client_entry.msg.clone(),
+        ctx: client_entry.ctx.clone(),
     }
 }
 
@@ -512,13 +843,339 @@ pub fn snapshot_session_log(session_id: &str) -> Option<Vec<u8>> {
     if out.is_empty() { None } else { Some(out) }
 }
 
+/// Read the current unified log and return only typed records proven safe to upload.
+///
+/// The local file is never rewritten. Each line is independently classified,
+/// so malformed, legacy, or concurrently appended legacy records are simply
+/// omitted while current safe records remain available.
+pub fn snapshot_log_for_upload() -> Option<Vec<u8>> {
+    flush_writer();
+    snapshot_path_for_upload(&log_path(), None)
+}
+
+/// Read the current unified log and return upload-safe records for one session.
+pub fn snapshot_session_log_for_upload(session_id: &str) -> Option<Vec<u8>> {
+    flush_writer();
+    snapshot_path_for_upload(&log_path(), Some(session_id))
+}
+
+fn flush_writer() {
+    if let Ok(mut guard) = WRITER.lock()
+        && let Some(ref mut writer) = *guard
+    {
+        let _ = writer.file.flush();
+    }
+}
+
+const LOG_ENTRY_FIELDS: &[&str] = &[
+    "credential_safety_schema",
+    "ts",
+    "src",
+    "pid",
+    "ver",
+    "lvl",
+    "sid",
+    "msg",
+    "ctx",
+];
+
+/// Exact legacy identifiers shared with the repository static guard.
+const LEGACY_CREDENTIAL_FRAGMENT_FIELDS: &[&str] = &[
+    "token_suffix",
+    "bearer_tail_fragment",
+    "StampedBearerSuffix",
+    "SENT_BEARER_PREFIX_LEN",
+    "bearer_suffix",
+    "sent_bearer_prefix",
+    "auth_prefix",
+    "key_prefix",
+    "rt_prefix",
+    "sent_key_prefix",
+    "current_key_prefix",
+    "tried_rt_prefix",
+    "disk_rt_prefix",
+    "disk_key_prefix",
+    "tried_key_prefix",
+    "adopted_key_prefix",
+    "prev_key_prefix",
+    "new_key_prefix",
+    "old_key_prefix",
+    "retained_key_prefix",
+    "dropped_key_prefix",
+    "written_key_prefix",
+    "child_key_prefix",
+    "parent_key_prefix",
+    "attempt_bearer",
+    "wire_bearer",
+    "failed_bearer",
+    "deployment_id_from_key",
+    "api_key_id_for",
+];
+
+fn snapshot_path_for_upload(path: &std::path::Path, session_id: Option<&str>) -> Option<Vec<u8>> {
+    let data = match fs::read(path) {
+        Ok(data) if !data.is_empty() => data,
+        _ => return None,
+    };
+    filter_upload_lines(&data, session_id)
+}
+
+fn filter_upload_lines(data: &[u8], session_id: Option<&str>) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    for line in data
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        if object
+            .keys()
+            .any(|key| !LOG_ENTRY_FIELDS.contains(&key.as_str()))
+            || object
+                .get("credential_safety_schema")
+                .and_then(serde_json::Value::as_u64)
+                != Some(u64::from(CURRENT_CREDENTIAL_SAFETY_SCHEMA))
+            || contains_legacy_credential_field(&value)
+        {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_value::<LogEntry>(value) else {
+            continue;
+        };
+        if session_id.is_some_and(|wanted| entry.sid.as_deref() != Some(wanted)) {
+            continue;
+        }
+
+        let Some(mut safe_value) = typed_upload_value(&entry) else {
+            continue;
+        };
+        redact_json_strings(&mut safe_value);
+        let Ok(mut safe_line) = serde_json::to_vec(&safe_value) else {
+            continue;
+        };
+        safe_line.push(b'\n');
+        out.extend_from_slice(&safe_line);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Rebuild a record from typed safe fields instead of forwarding the
+/// self-attested input object. Free-form `msg` and `ctx` never cross the
+/// upload boundary; session/version strings survive only under a narrow
+/// canonical envelope grammar.
+fn typed_upload_value(entry: &LogEntry) -> Option<serde_json::Value> {
+    if entry.src != LogSource::Shell || entry.pid.is_none() {
+        return None;
+    }
+
+    let timestamp = chrono::DateTime::parse_from_rfc3339(&entry.ts)
+        .ok()?
+        .with_timezone(&Utc)
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let version = canonical_envelope_value(
+        entry.ver.as_deref().filter(|value| {
+            value.as_bytes().first().is_some_and(u8::is_ascii_digit) && value.contains('.')
+        }),
+        64,
+        |byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'_'),
+    );
+    let session_id = entry
+        .sid
+        .as_deref()
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        .map(|value| value.to_string());
+
+    let (level, message, event, context) =
+        if entry.lvl == LogLevel::Warn && entry.msg == CREDENTIAL_ATTRIBUTION_MESSAGE {
+            let context: CredentialAttributionContext =
+                serde_json::from_value(entry.ctx.clone()?).ok()?;
+            if !context.is_consistent() {
+                return None;
+            }
+            (
+                LogLevel::Warn,
+                CREDENTIAL_ATTRIBUTION_MESSAGE,
+                SafeUploadEvent::Auth401Attribution,
+                serde_json::to_value(context).ok()?,
+            )
+        } else if matches!(entry.lvl, LogLevel::Error | LogLevel::Warn)
+            && entry.msg == UPLOAD_FAILURE_MESSAGE
+        {
+            let context: UploadFailureContext = serde_json::from_value(entry.ctx.clone()?).ok()?;
+            let expected_level = if context.method == UploadFailureMethod::DirectS3 {
+                LogLevel::Warn
+            } else {
+                LogLevel::Error
+            };
+            if entry.lvl != expected_level {
+                return None;
+            }
+            (
+                expected_level,
+                UPLOAD_FAILURE_MESSAGE,
+                SafeUploadEvent::UploadFailure,
+                serde_json::to_value(context).ok()?,
+            )
+        } else if entry.lvl == LogLevel::Info && entry.msg == UPLOAD_RECOVERED_MESSAGE {
+            let context: UploadRecoveryContext = serde_json::from_value(entry.ctx.clone()?).ok()?;
+            if context.prior_failure_count == 0 {
+                return None;
+            }
+            (
+                LogLevel::Info,
+                UPLOAD_RECOVERED_MESSAGE,
+                SafeUploadEvent::UploadRecovered,
+                serde_json::to_value(context).ok()?,
+            )
+        } else {
+            return None;
+        };
+
+    Some(serde_json::json!({
+        "credential_safety_schema": CURRENT_CREDENTIAL_SAFETY_SCHEMA,
+        "ts": timestamp,
+        "src": LogSource::Shell,
+        "pid": entry.pid,
+        "ver": version,
+        "lvl": level,
+        "sid": session_id,
+        "msg": message,
+        "event": event,
+        "ctx": context,
+    }))
+}
+
+fn canonical_envelope_value<'a>(
+    value: Option<&'a str>,
+    max_len: usize,
+    allowed: impl Fn(u8) -> bool,
+) -> Option<&'a str> {
+    value.filter(|value| !value.is_empty() && value.len() <= max_len && value.bytes().all(&allowed))
+}
+
+fn contains_legacy_credential_field(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => object.iter().any(|(key, child)| {
+            LEGACY_CREDENTIAL_FRAGMENT_FIELDS.contains(&key.as_str())
+                || key.ends_with("_credential_prefix")
+                || key.ends_with("_credential_suffix")
+                || contains_legacy_credential_field(child)
+        }),
+        serde_json::Value::Array(values) => values.iter().any(contains_legacy_credential_field),
+        _ => false,
+    }
+}
+
+fn redact_json_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(string) => {
+            if let Some(redacted) = crate::redact_common::redact_owned(string) {
+                *string = redacted;
+            }
+        }
+        serde_json::Value::Array(values) => values.iter_mut().for_each(redact_json_strings),
+        serde_json::Value::Object(object) => {
+            object.values_mut().for_each(redact_json_strings);
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const CANONICAL_SESSION_ID: &str = "019c43b5-c4ae-7190-b058-693e24669ba9";
+
+    fn self_attested_entry(sid: Option<&str>, msg: &str, ctx: serde_json::Value) -> Vec<u8> {
+        let entry = serde_json::json!({
+            "credential_safety_schema": CURRENT_CREDENTIAL_SAFETY_SCHEMA,
+            "ts": "2026-08-01T00:00:00.000Z",
+            "src": "shell",
+            "pid": 42,
+            "ver": "1.0.0",
+            "lvl": "warn",
+            "sid": sid,
+            "msg": msg,
+            "ctx": ctx,
+        });
+        let mut line = serde_json::to_vec(&entry).unwrap();
+        line.push(b'\n');
+        line
+    }
+
+    fn safe_upload_entry(sid: Option<&str>) -> Vec<u8> {
+        self_attested_entry(
+            sid,
+            CREDENTIAL_ATTRIBUTION_MESSAGE,
+            serde_json::to_value(CredentialAttributionContext::new(
+                CredentialDiagnosticConsumer::OaiCompatResponses,
+                CredentialComparison::different_from_current(),
+                12,
+                -3,
+            ))
+            .unwrap(),
+        )
+    }
+
+    fn safe_operational_upload_entry(sid: Option<&str>) -> Vec<u8> {
+        let mut value = serde_json::from_slice::<serde_json::Value>(&self_attested_entry(
+            sid,
+            UPLOAD_FAILURE_MESSAGE,
+            serde_json::to_value(UploadFailureContext {
+                artifact: UploadFailureArtifact::TraceArtifact,
+                reason: UploadFailureReason::GcsUploadFailed,
+                method: UploadFailureMethod::DirectGcs,
+                phase_present: true,
+                status_code: Some(503),
+                bytes: Some(4096),
+                suppressed_count: 2,
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+        value["lvl"] = serde_json::json!("error");
+        let mut line = serde_json::to_vec(&value).unwrap();
+        line.push(b'\n');
+        line
+    }
+
+    fn safe_upload_recovery_entry(sid: Option<&str>) -> Vec<u8> {
+        let mut value = serde_json::from_slice::<serde_json::Value>(&self_attested_entry(
+            sid,
+            UPLOAD_RECOVERED_MESSAGE,
+            serde_json::to_value(UploadRecoveryContext {
+                method: UploadFailureMethod::Proxy,
+                prior_failure_count: 3,
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+        value["lvl"] = serde_json::json!("info");
+        let mut line = serde_json::to_vec(&value).unwrap();
+        line.push(b'\n');
+        line
+    }
+
+    fn assert_no_secret_fragments(rendered: &str, secret: &str) {
+        assert!(!rendered.contains(secret), "secret leaked: {rendered}");
+        for window in secret.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(
+                !rendered.contains(fragment),
+                "secret fragment {fragment:?} leaked: {rendered}"
+            );
+        }
+    }
+
     #[test]
     fn log_entry_serializes_minimal() {
         let entry = LogEntry {
+            credential_safety_schema: Some(CURRENT_CREDENTIAL_SAFETY_SCHEMA),
             ts: "2025-07-14T10:30:00.123Z".into(),
             src: LogSource::Shell,
             pid: None,
@@ -539,6 +1196,7 @@ mod tests {
     #[test]
     fn log_entry_serializes_full() {
         let entry = LogEntry {
+            credential_safety_schema: Some(CURRENT_CREDENTIAL_SAFETY_SCHEMA),
             ts: "2025-07-14T10:30:00.123Z".into(),
             src: LogSource::GrokPager,
             pid: Some(4242),
@@ -560,8 +1218,294 @@ mod tests {
         let wire = r#"{"ts":"2025-07-14T10:30:00.123Z","lvl":"info","msg":"hello"}"#;
         let entry: ClientLogEntry = serde_json::from_str(wire).unwrap();
         assert_eq!(entry.msg, "hello");
+        assert!(entry.credential_safety_schema.is_none());
         assert!(entry.sid.is_none());
         assert!(entry.ctx.is_none());
+    }
+
+    #[test]
+    fn client_ingest_never_trusts_client_safety_attestation() {
+        let client: ClientLogEntry = serde_json::from_str(
+            r#"{"credential_safety_schema":1,"ts":"2025-07-14T10:30:00.123Z","lvl":"info","msg":"client"}"#,
+        )
+        .unwrap();
+        let ingested = client_entry_to_log_entry(LogSource::GrokPager, &client);
+        assert_eq!(ingested.credential_safety_schema, None);
+        assert!(
+            !serde_json::to_string(&ingested)
+                .unwrap()
+                .contains("credential_safety_schema"),
+            "shell must never trust a free-form client record",
+        );
+    }
+
+    #[test]
+    fn upload_filter_drops_legacy_unknown_malformed_and_fragment_records() {
+        let mut input = Vec::new();
+        input.extend_from_slice(b"{not json}\n");
+        input.extend_from_slice(
+            br#"{"ts":"2026-08-01T00:00:00Z","src":"shell","lvl":"info","msg":"legacy"}"#,
+        );
+        input.push(b'\n');
+        input.extend_from_slice(
+            br#"{"credential_safety_schema":2,"ts":"2026-08-01T00:00:00Z","src":"shell","lvl":"info","msg":"future"}"#,
+        );
+        input.push(b'\n');
+        input.extend_from_slice(&self_attested_entry(
+            Some("safe-session"),
+            "nested fragment",
+            serde_json::json!({"nested": [{"current_key_prefix": "CANARY"}]}),
+        ));
+        let mut unknown = serde_json::from_slice::<serde_json::Value>(&self_attested_entry(
+            Some("safe-session"),
+            "unknown top level",
+            serde_json::json!({}),
+        ))
+        .unwrap();
+        unknown["unexpected"] = serde_json::json!(true);
+        input.extend_from_slice(&serde_json::to_vec(&unknown).unwrap());
+        input.push(b'\n');
+        input.extend_from_slice(&safe_upload_entry(Some("safe-session")));
+
+        let output = filter_upload_lines(&input, None).expect("one safe record remains");
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains(CREDENTIAL_ATTRIBUTION_MESSAGE));
+        assert!(output.contains("OaiCompatResponses"));
+        for rejected in [
+            "legacy",
+            "future",
+            "nested fragment",
+            "unknown top level",
+            "CANARY",
+        ] {
+            assert!(
+                !output.contains(rejected),
+                "rejected record survived: {rejected}"
+            );
+        }
+        assert_eq!(output.lines().count(), 1);
+    }
+
+    #[test]
+    fn upload_filter_preserves_typed_operational_event_and_session_envelope() {
+        let mut input = safe_operational_upload_entry(Some(CANONICAL_SESSION_ID));
+        input.extend_from_slice(&safe_upload_entry(Some("session-b")));
+
+        let output = filter_upload_lines(&input, Some(CANONICAL_SESSION_ID))
+            .expect("typed operational event remains");
+        let lines = String::from_utf8(output).unwrap();
+        assert_eq!(lines.lines().count(), 1);
+        let value: serde_json::Value = serde_json::from_str(lines.trim()).unwrap();
+        assert_eq!(value["credential_safety_schema"], 1);
+        assert_eq!(value["ts"], "2026-08-01T00:00:00.000Z");
+        assert_eq!(value["src"], "shell");
+        assert_eq!(value["lvl"], "error");
+        assert_eq!(value["pid"], 42);
+        assert_eq!(value["ver"], "1.0.0");
+        assert_eq!(value["sid"], CANONICAL_SESSION_ID);
+        assert_eq!(value["msg"], UPLOAD_FAILURE_MESSAGE);
+        assert_eq!(value["event"], "upload_failure");
+        assert_eq!(value["ctx"]["artifact"], "trace_artifact");
+        assert_eq!(value["ctx"]["reason"], "gcs_upload_failed");
+        assert_eq!(value["ctx"]["method"], "direct_gcs");
+        assert_eq!(value["ctx"]["phase_present"], true);
+        assert_eq!(value["ctx"]["status_code"], 503);
+        assert_eq!(value["ctx"]["bytes"], 4096);
+        assert_eq!(value["ctx"]["suppressed_count"], 2);
+    }
+
+    #[test]
+    fn upload_filter_preserves_non_auth_recovery_lifecycle_without_secret_windows() {
+        const SECRET: &str = "M8n6B4v2C0x8Z6a4S2d0F8g6H4j2K0l8";
+        let mut value = serde_json::from_slice::<serde_json::Value>(&safe_upload_recovery_entry(
+            Some(CANONICAL_SESSION_ID),
+        ))
+        .unwrap();
+        value["ctx"]["error"] = serde_json::json!(SECRET);
+        value["ctx"]["gcs_path"] = serde_json::json!(format!("bucket/{SECRET}/trace"));
+        let mut input = serde_json::to_vec(&value).unwrap();
+        input.push(b'\n');
+
+        let output = filter_upload_lines(&input, Some(CANONICAL_SESSION_ID))
+            .expect("typed upload recovery lifecycle remains");
+        let rendered = String::from_utf8(output).unwrap();
+        let projected: serde_json::Value = serde_json::from_str(rendered.trim()).unwrap();
+        assert_eq!(projected["ts"], "2026-08-01T00:00:00.000Z");
+        assert_eq!(projected["src"], "shell");
+        assert_eq!(projected["pid"], 42);
+        assert_eq!(projected["ver"], "1.0.0");
+        assert_eq!(projected["lvl"], "info");
+        assert_eq!(projected["sid"], CANONICAL_SESSION_ID);
+        assert_eq!(projected["msg"], UPLOAD_RECOVERED_MESSAGE);
+        assert_eq!(projected["event"], "upload_recovered");
+        assert_eq!(projected["ctx"]["method"], "proxy");
+        assert_eq!(projected["ctx"]["prior_failure_count"], 3);
+        assert!(projected["ctx"].get("error").is_none());
+        assert!(projected["ctx"].get("gcs_path").is_none());
+        assert_no_secret_fragments(&rendered, SECRET);
+    }
+
+    #[test]
+    fn upload_filter_preserves_auth_event_canonical_version_and_session() {
+        let output = filter_upload_lines(
+            &safe_upload_entry(Some(CANONICAL_SESSION_ID)),
+            Some(CANONICAL_SESSION_ID),
+        )
+        .expect("auth event remains");
+        let value: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
+        assert_eq!(value["ver"], "1.0.0");
+        assert_eq!(value["sid"], CANONICAL_SESSION_ID);
+        assert_eq!(value["event"], "auth401_attribution");
+    }
+
+    #[test]
+    fn upload_filter_drops_unsafe_operational_fields_without_dropping_event() {
+        const SECRET: &str = "Q7w5E3r1T9y7U5i3O1p9A7s5D3f1H9j7";
+        let mut value = serde_json::from_slice::<serde_json::Value>(
+            &safe_operational_upload_entry(Some(CANONICAL_SESSION_ID)),
+        )
+        .unwrap();
+        value["ctx"]["error"] = serde_json::json!(SECRET);
+        value["ctx"]["gcs_path"] = serde_json::json!(format!("bucket/{SECRET}/artifact"));
+        value["ctx"]["free_form"] = serde_json::json!({"nested": SECRET});
+        let mut input = serde_json::to_vec(&value).unwrap();
+        input.push(b'\n');
+
+        let output = filter_upload_lines(&input, Some(CANONICAL_SESSION_ID))
+            .expect("known typed event remains after unsafe fields are projected out");
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("\"event\":\"upload_failure\""));
+        let projected: serde_json::Value = serde_json::from_str(rendered.trim()).unwrap();
+        for unsafe_field in ["error", "gcs_path", "free_form"] {
+            assert!(projected["ctx"].get(unsafe_field).is_none());
+        }
+        assert_no_secret_fragments(&rendered, SECRET);
+    }
+
+    #[test]
+    fn upload_filter_keeps_untyped_and_client_operational_records_fail_closed() {
+        let mut client = serde_json::from_slice::<serde_json::Value>(
+            &safe_operational_upload_entry(Some(CANONICAL_SESSION_ID)),
+        )
+        .unwrap();
+        client["src"] = serde_json::json!("grok-pager");
+        let mut client_line = serde_json::to_vec(&client).unwrap();
+        client_line.push(b'\n');
+        assert!(filter_upload_lines(&client_line, None).is_none());
+
+        let mut untyped = client;
+        untyped["src"] = serde_json::json!("shell");
+        untyped
+            .as_object_mut()
+            .unwrap()
+            .remove("credential_safety_schema");
+        let mut untyped_line = serde_json::to_vec(&untyped).unwrap();
+        untyped_line.push(b'\n');
+        assert!(filter_upload_lines(&untyped_line, None).is_none());
+    }
+
+    #[test]
+    fn upload_filter_omits_noncanonical_secret_session_and_version_envelope_values() {
+        const SECRET: &str = "R9t7Y5u3I1o9P7a5S3d1F9g7H5j3K1l9";
+        let mut value =
+            serde_json::from_slice::<serde_json::Value>(&safe_upload_recovery_entry(Some(SECRET)))
+                .unwrap();
+        value["ver"] = serde_json::json!(SECRET);
+        let mut input = serde_json::to_vec(&value).unwrap();
+        input.push(b'\n');
+
+        let output = filter_upload_lines(&input, Some(SECRET))
+            .expect("typed event survives unsafe optional envelope values");
+        let rendered = String::from_utf8(output).unwrap();
+        let projected: serde_json::Value = serde_json::from_str(rendered.trim()).unwrap();
+        assert!(projected["sid"].is_null());
+        assert!(projected["ver"].is_null());
+        assert_no_secret_fragments(&rendered, SECRET);
+    }
+
+    #[test]
+    fn upload_filter_rejects_wildcard_credential_fragment_fields() {
+        for field in ["access_credential_prefix", "refresh_credential_suffix"] {
+            let mut context = serde_json::Map::new();
+            context.insert(field.to_owned(), serde_json::json!("fragment"));
+            let input = self_attested_entry(None, "unsafe", serde_json::Value::Object(context));
+            assert!(
+                filter_upload_lines(&input, None).is_none(),
+                "accepted {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn upload_filter_rejects_opaque_free_form_credentials_fail_closed() {
+        let secret = "Q7w5E3r1T9y7U5i3O1p9A7s5";
+        for input in [
+            self_attested_entry(Some("session-a"), secret, serde_json::json!({})),
+            self_attested_entry(
+                Some("session-a"),
+                CREDENTIAL_ATTRIBUTION_MESSAGE,
+                serde_json::json!({"detail": secret}),
+            ),
+        ] {
+            let output = filter_upload_lines(&input, Some("session-a"));
+            assert!(output.is_none(), "free-form self-attested record survived");
+            let rendered = output
+                .map(String::from_utf8)
+                .transpose()
+                .unwrap()
+                .unwrap_or_default();
+            assert!(!rendered.contains(secret));
+            for window in secret.as_bytes().windows(8) {
+                assert!(!rendered.contains(std::str::from_utf8(window).unwrap()));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upload_snapshot_preserves_file_inode_and_filters_concurrent_legacy_writes() {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unified.jsonl");
+        fs::write(&path, safe_upload_entry(Some("session"))).unwrap();
+        let inode = fs::metadata(&path).unwrap().ino();
+        let barrier = Arc::new(Barrier::new(2));
+        let writer_barrier = Arc::clone(&barrier);
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            let mut file = OpenOptions::new().append(true).open(writer_path).unwrap();
+            writer_barrier.wait();
+            for index in 0..100 {
+                if index % 2 == 0 {
+                    file.write_all(b"{malformed legacy line}\n").unwrap();
+                } else {
+                    file.write_all(&safe_upload_entry(Some("session"))).unwrap();
+                }
+                file.flush().unwrap();
+            }
+        });
+
+        barrier.wait();
+        for _ in 0..20 {
+            let snapshot = snapshot_path_for_upload(&path, Some("session")).unwrap();
+            let text = String::from_utf8(snapshot).unwrap();
+            assert!(!text.contains("malformed legacy line"));
+            assert!(text.lines().all(|line| {
+                serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| {
+                    value["credential_safety_schema"]
+                        == serde_json::json!(CURRENT_CREDENTIAL_SAFETY_SCHEMA)
+                })
+            }));
+        }
+        writer.join().unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        assert!(
+            fs::read_to_string(path)
+                .unwrap()
+                .contains("malformed legacy line")
+        );
     }
 
     /// The reason this incident was undiagnosable: `trim_file` used to
@@ -890,6 +1834,7 @@ mod tests {
         ingest_client_entries(
             LogSource::Shell,
             &[ClientLogEntry {
+                credential_safety_schema: Some(CURRENT_CREDENTIAL_SAFETY_SCHEMA),
                 ts: "2025-01-01T00:00:00.000Z".into(),
                 pid: None,
                 ver: None,
@@ -918,6 +1863,7 @@ mod tests {
             src: LogSource::GrokPager,
             entries: vec![
                 ClientLogEntry {
+                    credential_safety_schema: Some(CURRENT_CREDENTIAL_SAFETY_SCHEMA),
                     ts: "2025-07-14T10:30:00.123Z".into(),
                     pid: Some(1234),
                     ver: None,
@@ -927,6 +1873,7 @@ mod tests {
                     ctx: None,
                 },
                 ClientLogEntry {
+                    credential_safety_schema: Some(CURRENT_CREDENTIAL_SAFETY_SCHEMA),
                     ts: "2025-07-14T10:30:00.456Z".into(),
                     pid: Some(1234),
                     ver: Some("0.1.211".into()),

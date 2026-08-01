@@ -18,10 +18,16 @@ pub struct Mixpanel {
 /// Error type for Mixpanel operations.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("HTTP request failed: {0}")]
-    Http(#[from] reqwest::Error),
+    #[error("HTTP request failed")]
+    Http,
     #[error("JSON serialization failed: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+impl From<reqwest::Error> for Error {
+    fn from(_: reqwest::Error) -> Self {
+        Self::Http
+    }
 }
 
 impl Mixpanel {
@@ -116,6 +122,19 @@ impl Mixpanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_error_is_fixed_and_cannot_retain_provider_details() {
+        let sentinel = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+        let rendered = format!("{:?} {}", Error::Http, Error::Http);
+
+        assert_eq!(Error::Http.to_string(), "HTTP request failed");
+        assert!(!rendered.contains(sentinel));
+        for window in sentinel.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).unwrap();
+            assert!(!rendered.contains(fragment));
+        }
+    }
 
     /// Project token is deliberately Bearer-shaped: it would be redacted
     /// if `prepare_properties` ran the scrubber after token injection.

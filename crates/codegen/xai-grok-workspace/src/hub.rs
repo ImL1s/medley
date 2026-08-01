@@ -80,9 +80,10 @@ pub struct HubConfig {
 impl std::fmt::Debug for HubConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HubConfig")
-            .field("url", &self.url.as_str())
+            .field("url_configured", &true)
             .field("auth", &"<redacted>")
-            .field("server_id", &self.server_id)
+            .field("server_id_configured", &self.server_id.is_some())
+            .field("alpha_test_key_configured", &self.alpha_test_key.is_some())
             .finish()
     }
 }
@@ -652,9 +653,52 @@ fn parse_server_id(id: &str) -> Result<xai_tool_protocol::ServerId, ClientError>
     xai_tool_protocol::ServerId::new(id)
         .map_err(|e| ClientError::InvalidConfig(format!("invalid server_id {id:?}: {e}")))
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HubConnectFailureKind {
+    Auth,
+    Connect,
+}
+
+fn client_error_failure_kind(err: &ClientError) -> HubConnectFailureKind {
+    match err {
+        ClientError::AuthError(_) | ClientError::HandshakeAuthFailed { .. } => {
+            HubConnectFailureKind::Auth
+        }
+        _ => HubConnectFailureKind::Connect,
+    }
+}
+
+pub fn workspace_hub_failure_kind(err: &WorkspaceError) -> Option<HubConnectFailureKind> {
+    match err {
+        WorkspaceError::HubError(message) if message == "hub authentication failed" => {
+            Some(HubConnectFailureKind::Auth)
+        }
+        WorkspaceError::HubError(_) => Some(HubConnectFailureKind::Connect),
+        _ => None,
+    }
+}
 /// Map a [`ClientError`] into a [`WorkspaceError::HubError`].
 pub(crate) fn client_error_to_workspace(err: ClientError) -> WorkspaceError {
-    WorkspaceError::HubError(err.to_string())
+    let failure_kind = client_error_failure_kind(&err);
+    let message = match err {
+        ClientError::AuthError(_) | ClientError::HandshakeAuthFailed { .. } => {
+            "hub authentication failed"
+        }
+        ClientError::NetworkError(_) | ClientError::Closed(_) => "hub network connection failed",
+        ClientError::ProtocolError(_) | ClientError::Serde(_) | ClientError::Wire(_) => {
+            "hub protocol operation failed"
+        }
+        ClientError::RegistrationConflict(_) => "hub registration conflict",
+        ClientError::BackpressureError(_) => "hub request backpressure",
+        ClientError::InvalidConfig(_) | ClientError::InsecureScheme => "hub configuration invalid",
+        ClientError::CallIdInUse { .. } => "hub call id already in use",
+    };
+    let workspace_error = WorkspaceError::HubError(message.to_owned());
+    debug_assert_eq!(
+        workspace_hub_failure_kind(&workspace_error),
+        Some(failure_kind)
+    );
+    workspace_error
 }
 /// Map a server connection failure into a [`WorkspaceResult`].
 pub(crate) fn hub_result<T>(result: Result<T, ClientError>) -> WorkspaceResult<T> {
@@ -664,6 +708,29 @@ pub(crate) fn hub_result<T>(result: Result<T, ClientError>) -> WorkspaceResult<T
 mod tests {
     use super::*;
     use xai_grok_tools::types::tool::ToolKind;
+
+    #[test]
+    fn hub_config_debug_omits_url_and_auth_credentials() {
+        let sentinel = "cred_SENTINEL_0123456789abcdef";
+        let config = HubConfig {
+            url: Url::parse(&format!(
+                "wss://user:{sentinel}@hub.example.test/socket?token={sentinel}"
+            ))
+            .unwrap(),
+            auth: Arc::new(xai_computer_hub_sdk::AuthCredential::bearer(sentinel)),
+            activity_tracker: None,
+            server_id: Some(sentinel.into()),
+            alpha_test_key: Some(sentinel.into()),
+            allow_insecure_ws: false,
+            diag: None,
+        };
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains(sentinel));
+        for window in sentinel.as_bytes().windows(8) {
+            assert!(!rendered.contains(std::str::from_utf8(window).unwrap()));
+        }
+    }
+
     #[test]
     fn hub_tool_ids_to_tool_configs_basic() {
         let ids = vec![
@@ -747,6 +814,48 @@ mod tests {
             );
         }
         assert!(parse_server_id("sess-abc123").is_ok());
+    }
+
+    #[test]
+    fn client_error_mapping_omits_peer_controlled_secret_fragments() {
+        const SENTINEL: &str = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+        for error in [
+            ClientError::AuthError(SENTINEL.into()),
+            ClientError::NetworkError(SENTINEL.into()),
+            ClientError::ProtocolError(SENTINEL.into()),
+            ClientError::Closed(SENTINEL.into()),
+        ] {
+            let rendered = client_error_to_workspace(error).to_string();
+            assert!(!rendered.contains(SENTINEL));
+            for window in SENTINEL.as_bytes().windows(8) {
+                let fragment = std::str::from_utf8(window).expect("ASCII sentinel");
+                assert!(!rendered.contains(fragment), "leaked fragment {fragment}");
+            }
+        }
+    }
+    #[test]
+    fn real_client_errors_preserve_typed_hub_failure_classification() {
+        for error in [
+            ClientError::AuthError("rejected".into()),
+            ClientError::HandshakeAuthFailed { status: 401 },
+        ] {
+            let workspace_error = client_error_to_workspace(error);
+            assert_eq!(
+                workspace_hub_failure_kind(&workspace_error),
+                Some(HubConnectFailureKind::Auth)
+            );
+        }
+        for error in [
+            ClientError::NetworkError("offline".into()),
+            ClientError::ProtocolError("bad hello".into()),
+            ClientError::Closed("closed".into()),
+        ] {
+            let workspace_error = client_error_to_workspace(error);
+            assert_eq!(
+                workspace_hub_failure_kind(&workspace_error),
+                Some(HubConnectFailureKind::Connect)
+            );
+        }
     }
     fn make_ctx(session_id: &str) -> (ToolCallContext, String) {
         let mut ctx = ToolCallContext::new(ToolCallId::new_v7());

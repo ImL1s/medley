@@ -4,4 +4,10 @@
 /// build the request without reaching back into shell types.
 pub trait HttpAuth: Send + Sync {
     fn apply(&self, builder: reqwest::RequestBuilder, base_url: &str) -> reqwest::RequestBuilder;
+
+    /// Whether bearer requests require the user/OAuth companion header.
+    /// Deployment keys use a bare `Authorization: Bearer ...` header.
+    fn needs_token_auth_header(&self) -> bool {
+        true
+    }
 }

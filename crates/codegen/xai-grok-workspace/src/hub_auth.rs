@@ -53,7 +53,7 @@ fn identity_from_entry(entry: &AuthEntry) -> AuthIdentity {
     }
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(serde::Deserialize)]
 struct AuthEntry {
     key: String,
     #[serde(default)]
@@ -401,14 +401,20 @@ mod tests {
         }"#,
         );
 
-        let err = read_auth_entry(&path).unwrap_err();
+        let err = match read_auth_entry(&path) {
+            Ok(_) => panic!("non-OIDC auth entry must be rejected"),
+            Err(err) => err,
+        };
         assert!(err.to_string().contains("no OIDC auth entry"));
     }
 
     #[test]
     fn read_auth_entry_missing_file() {
         let path = PathBuf::from("/nonexistent/auth.json");
-        let err = read_auth_entry(&path).unwrap_err();
+        let err = match read_auth_entry(&path) {
+            Ok(_) => panic!("missing auth file must be rejected"),
+            Err(err) => err,
+        };
         assert!(err.to_string().contains("No auth credentials"));
     }
 

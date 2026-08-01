@@ -703,6 +703,7 @@ impl SessionActor {
             || m.contains("out of credits")
             || m.contains("usage balance exhausted")
             || m.contains("usage limit reached")
+            || m.contains("provider credit balance exhausted")
         {
             SuppressReason::CreditBlock
         } else if is_context_length_error(&m) {
@@ -3390,6 +3391,10 @@ mod inline_auto_compact_flow_tests {
         );
         assert_eq!(
             classify("Grok Build usage limit reached"),
+            SuppressReason::CreditBlock
+        );
+        assert_eq!(
+            classify("provider credit balance exhausted"),
             SuppressReason::CreditBlock
         );
         assert_eq!(

@@ -109,14 +109,13 @@ pub struct GrokAuth {
 impl std::fmt::Debug for GrokAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GrokAuth")
-            .field("key", &token_suffix(&self.key))
+            .field("key_present", &!self.key.is_empty())
             .field("auth_mode", &self.auth_mode)
-            .field("user_id", &self.user_id)
+            .field("user_id_present", &!self.user_id.is_empty())
             .field("expires_at", &self.expires_at)
-            .field(
-                "refresh_token",
-                &self.refresh_token.as_deref().map(token_suffix),
-            )
+            .field("refresh_token_present", &self.refresh_token.is_some())
+            .field("oidc_issuer_present", &self.oidc_issuer.is_some())
+            .field("oidc_client_id_present", &self.oidc_client_id.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -299,14 +298,36 @@ pub(crate) struct UserInfo {
     pub(crate) subscription_tier: Option<String>,
 }
 
-/// Last 12 chars of a token string, safe for diagnostic logging.
-/// Uses the tail because JWT access tokens all share the same base64
-/// header prefix (`eyJ0eXAiOiJh…`); the tail (signature bytes) is
-/// unique per token and makes `key_changed` / `is_stale_snapshot`
-/// diagnostics meaningful.
-pub(crate) fn token_suffix(t: &str) -> &str {
-    let len = t.len();
-    if len > 12 { &t[len - 12..] } else { t }
+#[cfg(test)]
+mod credential_debug_tests {
+    use super::*;
+
+    #[test]
+    fn grok_auth_debug_contains_presence_only() {
+        let access = "access-SENTINEL-0123456789";
+        let refresh = "refresh-SENTINEL-9876543210";
+        let auth = GrokAuth {
+            key: access.into(),
+            refresh_token: Some(refresh.into()),
+            user_id: "user-SENTINEL".into(),
+            oidc_issuer: Some("https://issuer.example/SENTINEL".into()),
+            oidc_client_id: Some("client-SENTINEL".into()),
+            ..GrokAuth::test_default()
+        };
+
+        let debug = format!("{auth:?}");
+        for secret in [
+            access,
+            refresh,
+            "user-SENTINEL",
+            "issuer.example",
+            "client-SENTINEL",
+        ] {
+            assert!(!debug.contains(secret), "debug leaked {secret:?}: {debug}");
+        }
+        assert!(debug.contains("key_present: true"));
+        assert!(debug.contains("refresh_token_present: true"));
+    }
 }
 
 /// Look up auth from the store by scope key.

@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use xai_grok_shell::trace_classifier::{RunArgs, run, validate_min_confidence};
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(
     name = "trace_classify",
     about = "Replay a session trace against the TodoGate + Laziness classifier"
@@ -79,6 +79,21 @@ struct Cli {
     /// tests / sandboxed invocations.
     #[arg(long)]
     grok_home: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for Cli {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cli")
+            .field("trace", &self.trace)
+            .field("output", &self.output)
+            .field("model", &self.model)
+            .field("api_base_url_configured", &!self.api_base_url.is_empty())
+            .field("api_key_present", &self.api_key.is_some())
+            .field("min_confidence", &self.min_confidence)
+            .field("include_reasoning", &self.include_reasoning)
+            .field("grok_home", &self.grok_home)
+            .finish()
+    }
 }
 
 /// `current_thread` flavour: the replay is strictly sequential
@@ -219,6 +234,34 @@ mod tests {
             // Parsing failed — that's all we need. Exact error text
             // is clap-version-dependent.
             let _ = err.to_string();
+        }
+    }
+
+    #[test]
+    fn cli_debug_reports_api_key_presence_without_exposing_fragments() {
+        const SECRET: &str = "GB002CLI-Q7w5E3r1T9y7Z6x4C2v8";
+        let api_base_url = format!("https://user:{SECRET}@api.example/v1?token={SECRET}");
+        let cli = Cli::try_parse_from([
+            "trace_classify",
+            "--trace",
+            "foo.json",
+            "--api-key",
+            SECRET,
+            "--api-base-url",
+            api_base_url.as_str(),
+        ])
+        .expect("parse");
+
+        let debug = format!("{cli:?}");
+        assert!(debug.contains("api_key_present: true"), "{debug}");
+        assert!(debug.contains("api_base_url_configured: true"), "{debug}");
+        assert!(!debug.contains(SECRET), "{debug}");
+        for window in SECRET.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(
+                !debug.contains(fragment),
+                "leaked fragment {fragment:?}: {debug}"
+            );
         }
     }
 }

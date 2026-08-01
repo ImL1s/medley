@@ -108,8 +108,7 @@ pub async fn fetch_subagent_bundle(
     .await?;
     if !response.status().is_success() {
         let status = response.status().as_u16();
-        let body = response.text().await.unwrap_or_default();
-        return Err(BackendError::RequestFailed { status, body });
+        return Err(BackendError::RequestFailed { status });
     }
     let bundle: SubagentBundle = parse_json_response(response).await?;
     tracing::debug!(
@@ -183,16 +182,17 @@ async fn fetch_bundle_inner(
         }
     }
     let archive_response = request.send().await.map_err(|e| match e {
-        reqwest_middleware::Error::Reqwest(e) => BackendError::Network(e),
-        reqwest_middleware::Error::Middleware(e) => BackendError::Auth(e.to_string()),
+        reqwest_middleware::Error::Reqwest(e) => BackendError::from(e),
+        reqwest_middleware::Error::Middleware(_) => {
+            BackendError::Auth("Authentication middleware failed".to_string())
+        }
     })?;
     if archive_response.status().is_success() {
         let bytes = archive_response.bytes().await?;
         return Ok(FetchedBundle::Archive(bytes.to_vec()));
     }
     if archive_response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        let body = archive_response.text().await.unwrap_or_default();
-        return Err(BackendError::RequestFailed { status: 401, body });
+        return Err(BackendError::RequestFailed { status: 401 });
     }
     tracing::debug!(
         status = %archive_response.status(),
@@ -259,23 +259,45 @@ pub struct SessionUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
 }
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum BackendError {
-    #[error("Network error: {0}")]
-    Network(#[from] reqwest::Error),
-    #[error("Request failed: {status} - {body}")]
-    RequestFailed { status: u16, body: String },
-    #[error("Serialization error: {0}")]
+    #[error("Network request failed")]
+    Network(#[source] reqwest::Error),
+    #[error("Request failed with status {status}")]
+    RequestFailed { status: u16 },
+    #[error("Response serialization failed")]
     Serialization(#[from] serde_json::Error),
-    #[error("Session not found: {session_id}")]
+    #[error("Session not found")]
     SessionNotFound { session_id: String },
-    #[error("Hydration I/O error at {path}: {source}")]
+    #[error("Hydration I/O failed")]
     Hydration {
         path: std::path::PathBuf,
         source: std::io::Error,
     },
     #[error("Auth error: {0}")]
     Auth(String),
+}
+
+impl std::fmt::Debug for BackendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Network(_) => f.write_str("BackendError::Network"),
+            Self::RequestFailed { status } => f
+                .debug_struct("BackendError::RequestFailed")
+                .field("status", status)
+                .finish(),
+            Self::Serialization(_) => f.write_str("BackendError::Serialization"),
+            Self::SessionNotFound { .. } => f.write_str("BackendError::SessionNotFound"),
+            Self::Hydration { .. } => f.write_str("BackendError::Hydration"),
+            Self::Auth(_) => f.write_str("BackendError::Auth"),
+        }
+    }
+}
+
+impl From<reqwest::Error> for BackendError {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Network(error.without_url())
+    }
 }
 pub struct BackendClient {
     reqwest_client: reqwest::Client,
@@ -444,8 +466,10 @@ impl BackendClient {
         );
         let request = builder.build()?;
         self.client.execute(request).await.map_err(|e| match e {
-            reqwest_middleware::Error::Reqwest(e) => BackendError::Network(e),
-            reqwest_middleware::Error::Middleware(e) => BackendError::Auth(e.to_string()),
+            reqwest_middleware::Error::Reqwest(e) => BackendError::from(e),
+            reqwest_middleware::Error::Middleware(_) => {
+                BackendError::Auth("Authentication middleware failed".to_string())
+            }
         })
     }
     pub async fn upsert_session(
@@ -469,8 +493,7 @@ impl BackendClient {
             .await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(BackendError::RequestFailed { status, body });
+            return Err(BackendError::RequestFailed { status });
         }
         Ok(())
     }
@@ -490,8 +513,7 @@ impl BackendClient {
             .await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(BackendError::RequestFailed { status, body });
+            return Err(BackendError::RequestFailed { status });
         }
         Ok(())
     }
@@ -501,8 +523,7 @@ impl BackendClient {
         let response = self.send_with_auth(self.reqwest_client.get(&url)).await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(BackendError::RequestFailed { status, body });
+            return Err(BackendError::RequestFailed { status });
         }
         #[derive(Deserialize)]
         struct ListResponse {
@@ -524,8 +545,7 @@ impl BackendClient {
         }
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(BackendError::RequestFailed { status, body });
+            return Err(BackendError::RequestFailed { status });
         }
         let data: LoadDataResponse = response.json().await?;
         Ok(data)
@@ -535,8 +555,7 @@ impl BackendClient {
         let response = self.send_with_auth(self.reqwest_client.post(&url)).await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(BackendError::RequestFailed { status, body });
+            return Err(BackendError::RequestFailed { status });
         }
         let share_response: ShareResponse = response.json().await?;
         Ok(share_response)
@@ -548,8 +567,7 @@ impl BackendClient {
             .await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(BackendError::RequestFailed { status, body });
+            return Err(BackendError::RequestFailed { status });
         }
         Ok(())
     }
@@ -853,6 +871,7 @@ pub(crate) fn validate_models_catalog_auth(
 }
 /// Fetch models from an OpenAI-compatible `/v1/models` endpoint.
 /// Fetch result: model entries + optional etag from response.
+#[derive(Debug)]
 pub struct FetchModelsResult {
     pub models: Vec<crate::agent::config::ModelEntryConfig>,
     pub etag: Option<String>,
@@ -865,7 +884,7 @@ pub(crate) fn fetch_models_blocking(
     let client = models_catalog_blocking_client();
     let source = ListModelsEndpoint::from_endpoints(endpoints, fetch_auth);
     let inference_base_url = endpoints.resolve_inference_base_url();
-    tracing::info!("Fetching models from {}", source.url);
+    tracing::info!("Fetching models from configured catalog endpoint");
     let mut request = client.get(&source.url);
     match source.auth {
         EndpointAuth::ApiKey => {
@@ -885,14 +904,11 @@ pub(crate) fn fetch_models_blocking(
             request = add_models_session_headers_blocking(request, auth);
         }
     }
-    let response = request.send()?;
+    let response = request.send().map_err(BackendError::from)?;
     if !response.status().is_success() {
         let status = response.status().as_u16();
-        // Catalog error bodies are untrusted and can reflect the request's
-        // bearer credential. Never return or log them.
-        let body = "catalog response body omitted".to_string();
         tracing::warn!(status, "Failed to fetch models");
-        return Err(BackendError::RequestFailed { status, body });
+        return Err(BackendError::RequestFailed { status });
     }
     let etag = response
         .headers()
@@ -900,11 +916,7 @@ pub(crate) fn fetch_models_blocking(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
     let models_response: ModelsResponse = response.json()?;
-    tracing::info!(
-        "Fetched {} models from {}",
-        models_response.data.len(),
-        source.url
-    );
+    tracing::info!(count = models_response.data.len(), "Fetched models");
     let mut models = Vec::with_capacity(models_response.data.len());
     for (idx, value) in models_response.data.into_iter().enumerate() {
         match parse_remote_model_value(&value, &inference_base_url) {
@@ -1164,6 +1176,17 @@ mod tests {
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+
+    fn assert_no_secret_fragments(output: &str, secret: &str) {
+        assert!(!output.contains(secret), "full credential leaked: {output}");
+        for window in secret.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).expect("ASCII test sentinel");
+            assert!(
+                !output.contains(fragment),
+                "credential fragment {fragment:?} leaked: {output}"
+            );
+        }
+    }
     #[test]
     fn login_config_response_parses_tristate() {
         let parse = |s: &str| {
@@ -2073,12 +2096,13 @@ mod tests {
         assert_eq!(ep.auth, EndpointAuth::CustomApiKey);
     }
     fn deterministic_catalog_endpoints() -> crate::agent::config::EndpointsConfig {
-        let mut endpoints = crate::agent::config::EndpointsConfig::default();
-        endpoints.cli_chat_proxy_base_url = None;
-        endpoints.xai_api_base_url = "https://api.x.ai/v1".into();
-        endpoints.models_base_url = None;
-        endpoints.models_list_url = None;
-        endpoints
+        crate::agent::config::EndpointsConfig {
+            cli_chat_proxy_base_url: None,
+            xai_api_base_url: "https://api.x.ai/v1".into(),
+            models_base_url: None,
+            models_list_url: None,
+            ..crate::agent::config::EndpointsConfig::default()
+        }
     }
     fn custom_catalog_endpoints(models_list_url: String) -> crate::agent::config::EndpointsConfig {
         let mut endpoints = deterministic_catalog_endpoints();
@@ -2322,16 +2346,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial]
     async fn catalog_security_omits_reflected_oversized_error_body() {
-        let _api_key = crate::env::EnvVarGuard::set("XAI_API_KEY", "catalog-api-key");
+        let sentinel = "cred_SENTINEL_0123456789abcdef";
+        let _api_key = crate::env::EnvVarGuard::set("XAI_API_KEY", sentinel);
         let _legacy_api_key = LegacyApiKeyGuard::remove();
         let auth = GrokAuth {
-            key: "resume-session-sentinel".into(),
+            key: sentinel.into(),
             ..GrokAuth::test_default()
         };
-        let reflected = format!(
-            "catalog-api-key Bearer catalog-api-key bearer catalog-api-key resume-session-sentinel {}",
-            "x".repeat(16_384)
-        );
+        let reflected = format!("Bearer {sentinel} {}", "x".repeat(16_384));
         let app = Router::new().route(
             "/models",
             get(move || {
@@ -2351,14 +2373,41 @@ mod tests {
         .await
         .unwrap();
         server.abort();
-        let Err(BackendError::RequestFailed { status, body }) = result else {
+        let Err(BackendError::RequestFailed { status }) = result else {
             panic!("expected catalog request failure");
         };
         assert_eq!(status, 401);
-        assert!(body.len() <= 64, "catalog error must stay bounded");
-        assert!(!body.contains("catalog-api-key"));
-        assert!(!body.contains("resume-session-sentinel"));
-        assert!(!body.to_ascii_lowercase().contains("bearer"));
+        let error = BackendError::RequestFailed { status };
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert_no_secret_fragments(&rendered, sentinel);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn catalog_network_error_omits_configured_url_credentials() {
+        let sentinel = "cred_SENTINEL_0123456789abcdef";
+        let _api_key = crate::env::EnvVarGuard::set("XAI_API_KEY", sentinel);
+        let _legacy_api_key = LegacyApiKeyGuard::remove();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let endpoint =
+            format!("http://user:{sentinel}@127.0.0.1:{port}/models?access_token={sentinel}");
+        let endpoints = custom_catalog_endpoints(endpoint);
+        let result = tokio::task::spawn_blocking(move || {
+            fetch_models_blocking(
+                &endpoints,
+                None,
+                crate::agent::models::ModelFetchAuth::CustomEndpoint,
+            )
+        })
+        .await
+        .unwrap();
+        let error = result.expect_err("closed listener must reject the request");
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert_no_secret_fragments(&rendered, sentinel);
+        }
     }
     /// Catalog credentials must not be replayed to a redirect target.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

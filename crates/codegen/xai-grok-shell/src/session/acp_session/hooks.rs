@@ -6,10 +6,11 @@
 //! - **Gates** (awaited reverse *requests* `x.ai/hooks/run`):
 //!   - `PreToolUse`: a `deny` blocks the tool.
 //!   - `Stop` / `SubagentStop` (turn-end gate): a `deny` blocks the agent from
-//!     stopping (its `systemMessage` becomes the feedback), `continue: false`
-//!     (+ `stopReason`) force-stops overriding blocks, and `additionalContext`
-//!     keeps the agent working with non-error feedback: the same vocabulary
-//!     file hooks produce, aggregated in [`Self::run_stop_client_hooks`].
+//!     stopping (the presence of `systemMessage` is retained, but its text is
+//!     omitted), `continue: false` (+ optional `stopReason`) force-stops
+//!     overriding blocks, and `additionalContext` keeps the agent working with
+//!     a closed non-error marker: the same safe vocabulary file hooks produce,
+//!     aggregated in [`Self::run_stop_client_hooks`].
 //! - **All other events**: fire-and-forget *notifications* `x.ai/hooks/event`,
 //!   observe-only (the callback's return is ignored). Sent per matching callback.
 
@@ -72,8 +73,11 @@ fn classify(outcome: ReverseOutcome) -> (ClientHookResponse, ClientHookGateOutco
                     };
                     (resp, label)
                 }
-                Err(err) => {
-                    tracing::warn!(%err, "malformed x.ai/hooks/run response; failing open");
+                Err(_) => {
+                    tracing::warn!(
+                        error_class = "malformed_response",
+                        "malformed x.ai/hooks/run response; failing open"
+                    );
                     (
                         ClientHookResponse::default(),
                         ClientHookGateOutcome::Malformed,
@@ -81,8 +85,11 @@ fn classify(outcome: ReverseOutcome) -> (ClientHookResponse, ClientHookGateOutco
                 }
             }
         }
-        ReverseOutcome::Transport(err) => {
-            tracing::warn!(%err, "x.ai/hooks/run transport error (no client wired?); failing open");
+        ReverseOutcome::Transport(_) => {
+            tracing::warn!(
+                error_class = "transport",
+                "x.ai/hooks/run transport error (no client wired?); failing open"
+            );
             (
                 ClientHookResponse::default(),
                 ClientHookGateOutcome::TransportError,
@@ -117,9 +124,18 @@ fn matching_callback_ids<'a>(
 /// rather than panic the session actor.
 fn dispatch_params(dispatch: &ClientHookDispatch<'_>) -> Option<Arc<RawValue>> {
     serde_json::value::to_raw_value(dispatch)
-        .inspect_err(|err| tracing::warn!(%err, "failed to serialize client hook dispatch"))
+        .inspect_err(|_| {
+            tracing::warn!(
+                error_class = "serialization",
+                "failed to serialize client hook dispatch"
+            )
+        })
         .ok()
         .map(Into::into)
+}
+
+fn reason_diagnostics(reason: &str) -> bool {
+    !reason.trim().is_empty()
 }
 
 impl SessionActor {
@@ -182,18 +198,25 @@ impl SessionActor {
         hook_name: String,
         reason: String,
     ) -> Result<ToolLoop, acp::Error> {
-        tracing::info!(%tool_name, %hook_name, %reason, "tool call denied by pre_tool_use hook");
+        let reason_present = reason_diagnostics(&reason);
+        let safe_reason = xai_grok_hooks::dispatcher::safe_deny_reason(&reason);
+        tracing::info!(
+            %tool_name,
+            %hook_name,
+            reason_present,
+            "tool call denied by pre_tool_use hook"
+        );
         xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::HookBlocked {
             hook_name: hook_name.clone(),
         });
         self.handle_tool_not_executed(
             model_call_id,
             tool_call_id,
-            format!("Hook denied: {reason}"),
+            format!("Hook denied: {safe_reason}"),
         )
         .await?;
         self.send_hook_annotation(&format!(
-            "\u{26a0} `{tool_name}` blocked by hook `{hook_name}`: {reason}"
+            "\u{26a0} `{tool_name}` blocked by hook `{hook_name}`: {safe_reason}"
         ))
         .await;
         Ok(ToolLoop::HookDenied { hook_name })
@@ -436,6 +459,22 @@ mod tests {
 
     fn raw(value: serde_json::Value) -> Arc<RawValue> {
         serde_json::value::to_raw_value(&value).unwrap().into()
+    }
+
+    #[test]
+    fn deny_reason_diagnostics_omit_full_and_partial_credentials() {
+        const SECRET: &str = "GB002SECabcdefgh87654321";
+        const PREFIX: &str = "GB002SEC";
+        const SUFFIX: &str = "87654321";
+
+        let rendered = format!("{:?}", reason_diagnostics(SECRET));
+        assert!(reason_diagnostics(SECRET));
+        for fragment in [SECRET, PREFIX, SUFFIX] {
+            assert!(
+                !rendered.contains(fragment),
+                "deny reason diagnostics leaked credential fragment: {fragment}"
+            );
+        }
     }
 
     /// Only an explicit `deny` blocks; malformed/transport/timeout all proceed. The second

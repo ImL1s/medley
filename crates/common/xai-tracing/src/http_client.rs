@@ -41,7 +41,14 @@ impl Middleware for TracingMiddleware {
         next: reqwest_middleware::Next<'_>,
     ) -> reqwest_middleware::Result<reqwest::Response> {
         let method = req.method().as_str().to_owned();
-        let url = req.url().clone();
+        let url_scheme = match req.url().scheme() {
+            "http" => "http",
+            "https" => "https",
+            _ => "other",
+        };
+        let url_userinfo_present =
+            !req.url().username().is_empty() || req.url().password().is_some();
+        let url_query_present = req.url().query().is_some();
         // No active dispatcher → the span has no consumer and would only be
         // downgraded to `log` spam. See `crate::dispatcher_active`.
         let span = if crate::dispatcher_active() {
@@ -49,7 +56,9 @@ impl Middleware for TracingMiddleware {
                 "http_request",
                 otel.kind = "client",
                 "http.request.method" = %method,
-                "url.full" = %url,
+                url_scheme,
+                url_userinfo_present,
+                url_query_present,
                 "http.response.status_code" = field::Empty,
             )
         } else {
@@ -77,6 +86,16 @@ mod tests {
     use tracing::Instrument;
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const SECRET: &str = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+
+    fn assert_secret_absent(text: &str) {
+        assert!(!text.contains(SECRET), "full secret leaked: {text}");
+        for window in SECRET.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).unwrap();
+            assert!(!text.contains(window), "secret window leaked: {window}");
+        }
+    }
 
     #[tokio::test]
     async fn attach_trace_to_http_request_writes_traceparent() {
@@ -151,5 +170,35 @@ mod tests {
                 .get("traceparent")
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn traced_client_otel_attributes_exclude_url_secrets() {
+        let env = OtelTestEnv::install();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let url = reqwest::Url::parse(&server.uri()).unwrap();
+        let url = format!(
+            "{}://observer:{SECRET}@{}:{}/health?baggage={SECRET}",
+            url.scheme(),
+            url.host_str().unwrap(),
+            url.port().unwrap()
+        );
+        traced_client_new().get(url).send().await.unwrap();
+
+        let spans = env.finished_spans();
+        let http = spans
+            .iter()
+            .find(|span| span.name == "http_request")
+            .expect("http_request span");
+        let attributes = format!("{:?}", http.attributes);
+        assert_secret_absent(&attributes);
+        assert!(attributes.contains("url_scheme"));
+        assert!(attributes.contains("url_userinfo_present"));
+        assert!(attributes.contains("url_query_present"));
     }
 }

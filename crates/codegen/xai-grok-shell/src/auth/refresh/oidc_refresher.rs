@@ -5,7 +5,7 @@ use crate::auth::error::RefreshTokenFailedReason;
 use crate::auth::manager::RefreshReason;
 use crate::auth::oidc::OidcRefreshResult;
 
-use super::{AuthSnapshot, DiagnosticUploader, RefreshOutcome, TokenRefresher};
+use super::{AuthSnapshot, DiagnosticUploader, RefreshOutcome, TokenRefresher, TriedDiskRelation};
 
 #[cfg(test)]
 use crate::auth::manager::AuthManager;
@@ -111,12 +111,23 @@ impl OidcRefresher {
         // If disk has a valid AT that differs from what we tried,
         // a sibling already refreshed. Adopt directly — no IdP call.
         if !crate::auth::is_expired(&disk_now) && disk_now.key != tried.key {
+            let access_relation = TriedDiskRelation::compare(Some(&tried.key), Some(&disk_now.key));
+            let refresh_relation = TriedDiskRelation::compare(
+                tried.refresh_token.as_deref(),
+                disk_now.refresh_token.as_deref(),
+            );
             crate::unified_log::info(
                 "oidc refresh: disk has valid AT, adopting instead of consuming RT",
                 None,
                 Some(serde_json::json!({
-                    "disk_key_prefix": crate::auth::token_suffix(&disk_now.key),
-                    "tried_key_prefix": crate::auth::token_suffix(&tried.key),
+                    "access_relation": access_relation.as_str(),
+                    "access_tried_present": access_relation.tried_present(),
+                    "access_disk_present": access_relation.disk_present(),
+                    "refresh_relation": refresh_relation.as_str(),
+                    "refresh_tried_present": refresh_relation.tried_present(),
+                    "refresh_disk_present": refresh_relation.disk_present(),
+                    "retry_attempted": false,
+                    "final_attempt_source": "disk_access_token",
                 })),
             );
             self.note_refresh_progress();
@@ -129,18 +140,23 @@ impl OidcRefresher {
             return None;
         }
 
+        let access_relation = TriedDiskRelation::compare(Some(&tried.key), Some(&disk_now.key));
+        let refresh_relation = TriedDiskRelation::compare(
+            tried.refresh_token.as_deref(),
+            disk_now.refresh_token.as_deref(),
+        );
         crate::unified_log::info(
             "oidc refresh retrying with disk token",
             None,
             Some(serde_json::json!({
-                "tried_rt_prefix": tried
-                    .refresh_token
-                    .as_deref()
-                    .map(crate::auth::token_suffix),
-                "disk_rt_prefix": disk_now
-                    .refresh_token
-                    .as_deref()
-                    .map(crate::auth::token_suffix),
+                "access_relation": access_relation.as_str(),
+                "access_tried_present": access_relation.tried_present(),
+                "access_disk_present": access_relation.disk_present(),
+                "refresh_relation": refresh_relation.as_str(),
+                "refresh_tried_present": refresh_relation.tried_present(),
+                "refresh_disk_present": refresh_relation.disk_present(),
+                "retry_attempted": true,
+                "final_attempt_source": "disk_refresh_token",
             })),
         );
 
@@ -187,11 +203,29 @@ impl TokenRefresher for OidcRefresher {
             && !crate::auth::is_expired(d)
             && self.auth.current().map(|a| a.key).as_deref() != Some(&d.key)
         {
+            let tried = self.auth.current();
+            let access_relation = TriedDiskRelation::compare(
+                tried.as_ref().map(|auth| auth.key.as_str()),
+                Some(&d.key),
+            );
+            let refresh_relation = TriedDiskRelation::compare(
+                tried
+                    .as_ref()
+                    .and_then(|auth| auth.refresh_token.as_deref()),
+                d.refresh_token.as_deref(),
+            );
             crate::unified_log::info(
                 "oidc refresh: sibling refreshed, adopting valid disk AT",
                 None,
                 Some(serde_json::json!({
-                    "disk_key_prefix": crate::auth::token_suffix(&d.key),
+                    "access_relation": access_relation.as_str(),
+                    "access_tried_present": access_relation.tried_present(),
+                    "access_disk_present": access_relation.disk_present(),
+                    "refresh_relation": refresh_relation.as_str(),
+                    "refresh_tried_present": refresh_relation.tried_present(),
+                    "refresh_disk_present": refresh_relation.disk_present(),
+                    "retry_attempted": false,
+                    "final_attempt_source": "disk_access_token",
                 })),
             );
             self.note_refresh_progress();
@@ -214,14 +248,13 @@ impl TokenRefresher for OidcRefresher {
             None,
             Some(serde_json::json!({
                 "has_rt": auth.refresh_token.is_some(),
-                "issuer": auth.oidc_issuer,
-                "client_id": auth.oidc_client_id,
+                "issuer_present": auth.oidc_issuer.is_some(),
+                "client_id_present": auth.oidc_client_id.is_some(),
                 "expires_at": auth.expires_at.map(|e| e.to_rfc3339()),
             })),
         );
 
-        // Snapshot for diagnostic upload on failure (user id, never email).
-        let pre_token = crate::auth::model::token_suffix(&auth.key).to_owned();
+        // Snapshot the non-secret object-path identity for diagnostic upload.
         let pre_user_id = if auth.user_id.is_empty() {
             "unknown".into()
         } else {
@@ -243,12 +276,7 @@ impl TokenRefresher for OidcRefresher {
                 }
 
                 if let Some(uploader) = &self.diagnostic_uploader {
-                    spawn_diagnostic_upload(
-                        uploader,
-                        pre_token,
-                        pre_user_id,
-                        &self.upload_in_flight,
-                    );
+                    spawn_diagnostic_upload(uploader, pre_user_id, &self.upload_in_flight);
                 }
                 RefreshOutcome::permanent_for(reason, &auth)
             }
@@ -260,8 +288,8 @@ impl TokenRefresher for OidcRefresher {
                     user_id = %auth.user_id,
                     has_refresh_token = auth.refresh_token.is_some(),
                     network_unreachable,
-                    issuer = ?auth.oidc_issuer,
-                    client_id = ?auth.oidc_client_id,
+                    issuer_present = auth.oidc_issuer.is_some(),
+                    client_id_present = auth.oidc_client_id.is_some(),
                     expires_at = ?auth.expires_at,
                     "auth: OIDC token refresh failed"
                 );
@@ -272,18 +300,13 @@ impl TokenRefresher for OidcRefresher {
                         "has_refresh_token": auth.refresh_token.is_some(),
                         "auth_mode": format!("{:?}", auth.auth_mode),
                         "network_unreachable": network_unreachable,
-                        "issuer": auth.oidc_issuer,
-                        "client_id": auth.oidc_client_id,
+                        "issuer_present": auth.oidc_issuer.is_some(),
+                        "client_id_present": auth.oidc_client_id.is_some(),
                         "expires_at": auth.expires_at.map(|e| e.to_rfc3339()),
                     })),
                 );
                 if let Some(uploader) = &self.diagnostic_uploader {
-                    spawn_diagnostic_upload(
-                        uploader,
-                        pre_token,
-                        pre_user_id,
-                        &self.upload_in_flight,
-                    );
+                    spawn_diagnostic_upload(uploader, pre_user_id, &self.upload_in_flight);
                 }
                 self.record_transient_failure(
                     "OIDC token refresh failed".into(),
@@ -299,7 +322,6 @@ impl TokenRefresher for OidcRefresher {
 /// `user_id` is the GCS path segment (never email).
 fn spawn_diagnostic_upload(
     uploader: &DiagnosticUploader,
-    auth_token: String,
     user_id: String,
     in_flight: &Arc<AtomicBool>,
 ) {
@@ -315,28 +337,29 @@ fn spawn_diagnostic_upload(
     let uploader = uploader.clone();
 
     tokio::spawn(async move {
-        // snapshot_log() holds a mutex, flushes, and reads up to 5 MB —
-        // run it on a blocking thread to avoid stalling the tokio executor.
-        let log_bytes = match tokio::task::spawn_blocking(crate::unified_log::snapshot_log).await {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => {
-                crate::unified_log::debug("diagnostic snapshot empty", None, None);
-                in_flight.store(false, Ordering::Release);
-                return;
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "auth: snapshot_log task failed");
-                crate::unified_log::error(
-                    "diagnostic snapshot failed",
-                    None,
-                    Some(serde_json::json!({ "error": format!("{e}") })),
-                );
-                in_flight.store(false, Ordering::Release);
-                return;
-            }
-        };
+        // The upload snapshot rejects malformed, legacy, or unsafe records.
+        // It performs blocking file I/O, so keep it off the tokio executor.
+        let log_bytes =
+            match tokio::task::spawn_blocking(crate::unified_log::snapshot_log_for_upload).await {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => {
+                    crate::unified_log::debug("diagnostic snapshot empty", None, None);
+                    in_flight.store(false, Ordering::Release);
+                    return;
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "auth: snapshot_log task failed");
+                    crate::unified_log::error(
+                        "diagnostic snapshot failed",
+                        None,
+                        Some(serde_json::json!({ "error": format!("{e}") })),
+                    );
+                    in_flight.store(false, Ordering::Release);
+                    return;
+                }
+            };
 
-        uploader(log_bytes, auth_token, user_id).await;
+        uploader(log_bytes, user_id).await;
         in_flight.store(false, Ordering::Release);
     });
 }

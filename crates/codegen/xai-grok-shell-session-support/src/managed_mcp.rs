@@ -203,20 +203,21 @@ async fn get_authenticated_json<T: serde::de::DeserializeOwned>(
             tracing::warn!(status = %status, "{}", unavailable_message);
             return Err(ManagedMcpFetchError::Status {
                 status,
-                message: format!("HTTP {status}"),
+                gateway_code: None,
             });
         }
         Err(e) => {
-            tracing::warn!(error = %e, "{}", fetch_failed_message);
-            return Err(e.into());
+            let kind = ManagedMcpTransportKind::from_reqwest_error(&e);
+            tracing::warn!(transport_kind = %kind, "{}", fetch_failed_message);
+            return Err(ManagedMcpFetchError::Transport { kind });
         }
     };
 
     match resp.json::<T>().await {
         Ok(value) => Ok(value),
-        Err(e) => {
-            tracing::debug!(error = %e, "{}", parse_error_message);
-            Err(e.into())
+        Err(_) => {
+            tracing::debug!(failure_kind = "invalid_response", "{}", parse_error_message);
+            Err(ManagedMcpFetchError::InvalidResponse)
         }
     }
 }
@@ -346,7 +347,7 @@ impl ManagedMcpState {
 
 pub type ManagedMcpStateHandle = Arc<tokio::sync::Mutex<ManagedMcpState>>;
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 pub struct ManagedMcpConfig {
     /// Human-readable connector name (e.g. "Slack", "Linear").
     #[serde(default)]
@@ -361,6 +362,20 @@ pub struct ManagedMcpConfig {
     pub scope_id: Option<String>,
     #[serde(default)]
     pub scope_name: Option<String>,
+}
+
+impl std::fmt::Debug for ManagedMcpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagedMcpConfig")
+            .field("name_present", &!self.name.is_empty())
+            .field("endpoint_present", &!self.endpoint.is_empty())
+            .field("header_count", &self.headers.len())
+            .field("token_expiry_present", &self.token_expires_at.is_some())
+            .field("scope_present", &self.scope.is_some())
+            .field("scope_id_present", &self.scope_id.is_some())
+            .field("scope_name_present", &self.scope_name.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -413,16 +428,104 @@ impl GatewayTool {
 /// agent cache never commits a transient failure as a permanent empty catalog.
 #[derive(Debug, thiserror::Error)]
 pub enum ManagedMcpFetchError {
-    #[error("HTTP {status}: {message}")]
+    #[error("HTTP {status}")]
     Status {
         status: reqwest::StatusCode,
-        message: String,
+        gateway_code: Option<ManagedMcpGatewayErrorCode>,
     },
-    #[error("transport: {0}")]
-    Transport(#[from] reqwest::Error),
+    #[error("transport failure: {kind}")]
+    Transport { kind: ManagedMcpTransportKind },
+    #[error("invalid response")]
+    InvalidResponse,
     /// No usable auth token at fetch time.
     #[error("no auth token available")]
     NoAuth,
+}
+
+/// Closed, credential-free classification of an allowlisted managed-MCP
+/// gateway error code. Provider-controlled error text never crosses the HTTP
+/// boundary; callers can still give the model a fixed recovery hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedMcpGatewayErrorCode {
+    InvalidArguments,
+    AuthenticationRequired,
+    PermissionDenied,
+    RateLimited,
+    ConnectorReauthorizationRequired,
+}
+
+impl ManagedMcpGatewayErrorCode {
+    fn from_wire_code(code: &str) -> Option<Self> {
+        match code.trim() {
+            "Client specified an invalid argument" | "INVALID_ARGUMENT" | "invalid_argument" => {
+                Some(Self::InvalidArguments)
+            }
+            "UNAUTHENTICATED" | "AUTHENTICATION_REQUIRED" | "authentication_required" => {
+                Some(Self::AuthenticationRequired)
+            }
+            "PERMISSION_DENIED" | "permission_denied" => Some(Self::PermissionDenied),
+            "RESOURCE_EXHAUSTED" | "RATE_LIMITED" | "rate_limited" => Some(Self::RateLimited),
+            "CONNECTOR_REAUTHORIZATION_REQUIRED"
+            | "connector_reauthorization_required"
+            | "REAUTHORIZATION_REQUIRED" => Some(Self::ConnectorReauthorizationRequired),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidArguments => "invalid_arguments",
+            Self::AuthenticationRequired => "authentication_required",
+            Self::PermissionDenied => "permission_denied",
+            Self::RateLimited => "rate_limited",
+            Self::ConnectorReauthorizationRequired => "connector_reauthorization_required",
+        }
+    }
+
+    pub fn recovery_hint(self) -> &'static str {
+        match self {
+            Self::InvalidArguments => {
+                "invalid arguments; review the connector tool schema and required fields"
+            }
+            Self::AuthenticationRequired => {
+                "authentication required; reconnect the managed MCP connector"
+            }
+            Self::PermissionDenied => "permission denied; verify the connector permissions",
+            Self::RateLimited => "rate limited; retry the connector tool later",
+            Self::ConnectorReauthorizationRequired => {
+                "connector reauthorization required; reconnect the managed MCP connector"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedMcpTransportKind {
+    Timeout,
+    Connect,
+    Request,
+}
+
+impl ManagedMcpTransportKind {
+    fn from_reqwest_error(error: &reqwest::Error) -> Self {
+        if error.is_timeout() {
+            Self::Timeout
+        } else if error.is_connect() {
+            Self::Connect
+        } else {
+            Self::Request
+        }
+    }
+}
+
+impl std::fmt::Display for ManagedMcpTransportKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Timeout => "timeout",
+            Self::Connect => "connect",
+            Self::Request => "request",
+        })
+    }
 }
 
 /// Fetch managed MCP configs from cli-chat-proxy (`GET /v1/mcp/configs`).
@@ -485,52 +588,60 @@ pub async fn call_gateway_tool(
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
             let status = r.status();
-            let message = gateway_error_message(status, r).await;
+            let gateway_code = gateway_error_code(r).await;
             tracing::warn!(
-                call_id = %call_id,
+                status = %status,
+                gateway_code = gateway_code.map(ManagedMcpGatewayErrorCode::as_str),
                 "Managed MCP gateway tool call unavailable: HTTP {status}"
             );
-            return Err(ManagedMcpFetchError::Status { status, message });
+            return Err(ManagedMcpFetchError::Status {
+                status,
+                gateway_code,
+            });
         }
         Err(e) => {
+            let kind = ManagedMcpTransportKind::from_reqwest_error(&e);
             tracing::warn!(
-                call_id = %call_id,
-                "Managed MCP gateway tool call failed: {}",
-                e
+                transport_kind = %kind,
+                "Managed MCP gateway tool call failed"
             );
-            return Err(e.into());
+            return Err(ManagedMcpFetchError::Transport { kind });
         }
     };
 
     match resp.json::<GatewayToolCallResponse>().await {
         Ok(response) => Ok(response),
-        Err(e) => {
+        Err(_) => {
             tracing::debug!(
-                call_id = %call_id,
-                "Managed MCP gateway tool call parse error: {}",
-                e
+                failure_kind = "invalid_response",
+                "Managed MCP gateway tool call parse error"
             );
-            Err(e.into())
+            Err(ManagedMcpFetchError::InvalidResponse)
         }
     }
 }
 
-async fn gateway_error_message(status: reqwest::StatusCode, response: reqwest::Response) -> String {
-    let fallback = format!("HTTP {status}");
-    let Ok(body) = response.text().await else {
-        return fallback;
-    };
-    if body.trim().is_empty() {
-        return fallback;
+const GATEWAY_ERROR_BODY_MAX_BYTES: usize = 16 * 1024;
+
+#[derive(serde::Deserialize)]
+struct GatewayErrorEnvelope {
+    code: Option<String>,
+}
+
+async fn gateway_error_code(mut response: reqwest::Response) -> Option<ManagedMcpGatewayErrorCode> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if body.len().saturating_add(chunk.len()) > GATEWAY_ERROR_BODY_MAX_BYTES {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
     }
-    match serde_json::from_str::<serde_json::Value>(&body) {
-        Ok(value) => value
-            .get("error")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-            .unwrap_or(fallback),
-        Err(_) => fallback,
-    }
+
+    let envelope: GatewayErrorEnvelope = serde_json::from_slice(&body).ok()?;
+    envelope
+        .code
+        .as_deref()
+        .and_then(ManagedMcpGatewayErrorCode::from_wire_code)
 }
 
 /// Fetch the managed MCP gateway tool catalog from cli-chat-proxy
@@ -813,8 +924,7 @@ pub fn inject_managed_headers(servers: &mut [acp::McpServer], managed: &[Managed
             if managed_by_url.contains_key(&normalized_url) {
                 skipped_no_prefix += 1;
                 tracing::debug!(
-                    server_name = %name,
-                    server_url = %url,
+                    server_configured = true,
                     "Skipping managed injection: URL matches but name lacks '{}' prefix",
                     MANAGED_MCP_PREFIX,
                 );
@@ -842,10 +952,9 @@ pub fn inject_managed_headers(servers: &mut [acp::McpServer], managed: &[Managed
         let Some(config) = config else {
             skipped_no_match += 1;
             tracing::debug!(
-                server_name = %name,
-                server_url = %url,
-                scope = ?scope,
-                scope_id = ?scope_id,
+                server_configured = true,
+                scope_present = scope.is_some(),
+                scope_id_present = scope_id.is_some(),
                 "Skipping managed injection: no matching managed config"
             );
             continue;
@@ -854,8 +963,7 @@ pub fn inject_managed_headers(servers: &mut [acp::McpServer], managed: &[Managed
         if config.headers.is_empty() {
             skipped_no_headers += 1;
             tracing::debug!(
-                server_name = %name,
-                server_url = %url,
+                server_configured = true,
                 "Skipping managed injection: managed config matched but has no headers",
             );
             continue;
@@ -1009,6 +1117,56 @@ pub fn spawn_cache_refresh_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<String>>);
+
+    struct LogVisitor<'a>(&'a mut String);
+
+    impl tracing::field::Visit for LogVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, "{}={value:?};", field.name());
+        }
+    }
+
+    impl tracing::Subscriber for LogCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut output = self.0.lock().expect("log capture mutex");
+            event.record(&mut LogVisitor(&mut output));
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    fn assert_no_secret_windows(rendered: &str, secret: &str) {
+        assert!(
+            !rendered.contains(secret),
+            "leaked full sentinel: {rendered}"
+        );
+        for window in secret.as_bytes().windows(8) {
+            let window = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(
+                !rendered.contains(window),
+                "leaked sentinel window {window}: {rendered}"
+            );
+        }
+    }
 
     fn make_managed(name: &str, endpoint: &str, scope: &str) -> ManagedMcpConfig {
         ManagedMcpConfig {
@@ -1020,6 +1178,25 @@ mod tests {
             scope_id: Some(format!("{scope}-id-123")),
             scope_name: None,
         }
+    }
+
+    #[test]
+    fn managed_mcp_debug_is_presence_only() {
+        const SENTINEL: &str = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
+        let config = ManagedMcpConfig {
+            name: format!("connector-{SENTINEL}"),
+            endpoint: format!("https://user:{SENTINEL}@mcp.example/?token={SENTINEL}"),
+            headers: HashMap::from([("Authorization".into(), format!("Bearer {SENTINEL}"))]),
+            token_expires_at: Some(Utc::now()),
+            scope: Some(SENTINEL.into()),
+            scope_id: Some(SENTINEL.into()),
+            scope_name: Some(SENTINEL.into()),
+        };
+
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("endpoint_present: true"));
+        assert!(rendered.contains("header_count: 1"));
+        assert_no_secret_windows(&rendered, SENTINEL);
     }
 
     #[test]
@@ -1042,6 +1219,32 @@ mod tests {
             Some(now - chrono::Duration::minutes(1)),
             now
         ));
+    }
+
+    #[test]
+    fn managed_header_injection_logs_never_expose_server_urls() {
+        let secret = "GB002-managed-server-url-secret-0123456789abcdef";
+        let matching_url = format!("https://user:{secret}@example.test/mcp?token={secret}");
+        let empty_headers_url =
+            format!("https://user:{secret}@empty.example.test/mcp?token={secret}");
+        let missing_url = format!("https://user:{secret}@missing.example.test/mcp?token={secret}");
+        let capture = LogCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let mut empty_headers = make_managed("Empty", &empty_headers_url, "user");
+        empty_headers.headers.clear();
+        let managed = vec![
+            make_managed("Matched", &matching_url, "user"),
+            empty_headers,
+        ];
+        let mut servers = vec![
+            acp::McpServer::Http(acp::McpServerHttp::new("plain", matching_url)),
+            acp::McpServer::Http(acp::McpServerHttp::new("grok_com_missing", missing_url)),
+            acp::McpServer::Http(acp::McpServerHttp::new("grok_com_empty", empty_headers_url)),
+        ];
+
+        inject_managed_headers(&mut servers, &managed);
+
+        assert_no_secret_windows(&capture.0.lock().expect("log capture mutex"), secret);
     }
 
     /// A failed fetch (here: no auth token) must NOT be committed to the
@@ -1113,21 +1316,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gateway_tool_call_error_preserves_proxy_message() {
+    async fn gateway_tool_call_status_drops_reflected_provider_body() {
         use axum::Router;
         use axum::routing::post;
         use tokio::net::TcpListener;
 
+        let secret = "GB002-managed-mcp-body-secret-0123456789abcdef";
+        let capture = LogCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let reflected = secret.to_owned();
+
         let app = Router::new().route(
             "/mcp/tools/call",
-            post(|| async {
-                (
-                    axum::http::StatusCode::BAD_REQUEST,
-                    axum::Json(serde_json::json!({
-                        "code": "Client specified an invalid argument",
-                        "error": "Invalid arguments for google_calendar_availability: missing field `calendars`"
-                    })),
-                )
+            post(move || {
+                let reflected = reflected.clone();
+                async move {
+                    (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        axum::Json(serde_json::json!({
+                            "code": "Client specified an invalid argument",
+                            "error": reflected,
+                        })),
+                    )
+                }
             }),
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1143,16 +1354,96 @@ mod tests {
         .await
         .unwrap_err();
 
-        match err {
-            ManagedMcpFetchError::Status { status, message } => {
-                assert_eq!(reqwest::StatusCode::BAD_REQUEST, status);
+        match &err {
+            ManagedMcpFetchError::Status {
+                status,
+                gateway_code,
+            } => {
+                assert_eq!(reqwest::StatusCode::BAD_REQUEST, *status);
                 assert_eq!(
-                    "Invalid arguments for google_calendar_availability: missing field `calendars`",
-                    message
+                    Some(ManagedMcpGatewayErrorCode::InvalidArguments),
+                    *gateway_code
                 );
             }
             other => panic!("expected status error, got {other:?}"),
         }
+        assert_no_secret_windows(&format!("{err}"), secret);
+        assert_no_secret_windows(&format!("{err:?}"), secret);
+        assert_no_secret_windows(&capture.0.lock().expect("log capture mutex"), secret);
+    }
+
+    #[tokio::test]
+    async fn gateway_tool_call_drops_unknown_provider_code() {
+        use axum::Router;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        let secret = "GB002-managed-mcp-code-secret-0123456789abcdef";
+        let reflected = secret.to_owned();
+        let app = Router::new().route(
+            "/mcp/tools/call",
+            post(move || {
+                let reflected = reflected.clone();
+                async move {
+                    (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        axum::Json(serde_json::json!({
+                            "code": reflected,
+                            "error": "provider-controlled text",
+                        })),
+                    )
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let err = call_gateway_tool(
+            &format!("http://{addr}"),
+            "token",
+            "google_calendar_availability",
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ManagedMcpFetchError::Status {
+                status: reqwest::StatusCode::BAD_REQUEST,
+                gateway_code: None,
+            }
+        ));
+        assert_no_secret_windows(&format!("{err}"), secret);
+        assert_no_secret_windows(&format!("{err:?}"), secret);
+    }
+
+    #[tokio::test]
+    async fn transport_error_drops_url_userinfo_query_and_auth_sentinels() {
+        use tokio::net::TcpListener;
+
+        let secret = "GB002-managed-mcp-url-secret-0123456789abcdef";
+        let capture = LogCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let proxy_url = format!("http://user:{secret}@{addr}?access_token={secret}");
+
+        let err = call_gateway_tool(
+            &proxy_url,
+            secret,
+            "managed_test_call",
+            serde_json::json!({"reflected": secret}),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, ManagedMcpFetchError::Transport { .. }));
+        assert_no_secret_windows(&format!("{err}"), secret);
+        assert_no_secret_windows(&format!("{err:?}"), secret);
+        assert_no_secret_windows(&capture.0.lock().expect("log capture mutex"), secret);
     }
 
     #[test]

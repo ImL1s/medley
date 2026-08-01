@@ -2970,11 +2970,8 @@ mod delete_session_history_tests {
 
     #[test]
     fn remote_404_is_treated_as_already_deleted() {
-        let removed = classify_remote_delete(Err(BackendError::RequestFailed {
-            status: 404,
-            body: "not found".into(),
-        }))
-        .expect("a 404 means the remote copy is gone — deletion must stay idempotent");
+        let removed = classify_remote_delete(Err(BackendError::RequestFailed { status: 404 }))
+            .expect("a 404 means the remote copy is gone — deletion must stay idempotent");
         assert!(
             !removed,
             "a 404 must report that nothing was removed remotely"
@@ -2983,10 +2980,7 @@ mod delete_session_history_tests {
 
     #[test]
     fn remote_non_404_request_failure_aborts() {
-        let res = classify_remote_delete(Err(BackendError::RequestFailed {
-            status: 500,
-            body: "boom".into(),
-        }));
+        let res = classify_remote_delete(Err(BackendError::RequestFailed { status: 500 }));
         assert!(matches!(res, Err(DeleteSessionError::Remote(_))));
     }
 

@@ -430,9 +430,9 @@ pub enum TransportFailureKind {
     Permanent,
 }
 
-/// A classified `reqwest` request/send failure: a [`TransportFailureKind`] plus the
-/// joined cause-chain detail. Derives `PartialEq` so the kind-to-error mapping can
-/// be unit-tested by constructing values directly.
+/// A classified `reqwest` request/send failure plus a credential-safe category.
+/// Raw reqwest details are deliberately not retained because they include the
+/// configured request URL, whose userinfo or query may contain credentials.
 #[derive(Debug, PartialEq)]
 pub struct TransportFailure {
     pub kind: TransportFailureKind,
@@ -443,7 +443,6 @@ impl TransportFailure {
     /// Classify a `reqwest` request/send error. `is_connect()` MUST be checked first:
     /// in reqwest 0.12 a connect failure is also `Kind::Request`.
     pub fn classify(e: &reqwest::Error) -> Self {
-        let detail = error_cause_chain(e);
         let kind = if e.is_connect() {
             TransportFailureKind::Unreachable
         } else if e.is_timeout() || e.is_request() || e.is_body() {
@@ -451,6 +450,12 @@ impl TransportFailure {
         } else {
             TransportFailureKind::Permanent
         };
+        let detail = match kind {
+            TransportFailureKind::Unreachable => "network endpoint unreachable",
+            TransportFailureKind::Interrupted => "network request interrupted",
+            TransportFailureKind::Permanent => "network request rejected",
+        }
+        .to_string();
         Self { kind, detail }
     }
 }
