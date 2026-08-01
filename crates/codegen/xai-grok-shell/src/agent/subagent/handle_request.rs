@@ -394,8 +394,7 @@ pub(crate) async fn run_shell_child(
         tracing::info!(
             subagent_id = %request.id,
             capability_mode = ?mode,
-            tools_remaining = definition.tool_config.tools.len(),
-            "Applied capability mode filter to agent tool config"
+            "Deferred capability enforcement to the final agent tool policy"
         );
     }
     if !allow_nested_subagents && definition.tool_config.tools.len() < tools_before_policy {
