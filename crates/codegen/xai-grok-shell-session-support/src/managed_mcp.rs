@@ -121,6 +121,10 @@ pub struct ManagedMcpState {
     pub fetch_notify: Arc<tokio::sync::Notify>,
     pub gateway_tools_active: bool,
     pub gateway_tool_epoch: u64,
+    /// True from the start of an explicit gateway refresh until a fresh
+    /// catalog commits. Session snapshots must not admit a cached catalog while
+    /// this fence is raised, including snapshots captured before it was raised.
+    pub gateway_refresh_in_progress: bool,
     pub gateway_tool_cache: GatewayToolCatalogCache,
     pub gateway_tool_fetch_notify: Arc<tokio::sync::Notify>,
     /// Retained across gateway disable/cache invalidation so the on-disk
@@ -148,6 +152,7 @@ impl Default for ManagedMcpState {
             fetch_notify: Arc::new(tokio::sync::Notify::new()),
             gateway_tools_active: false,
             gateway_tool_epoch: 0,
+            gateway_refresh_in_progress: false,
             gateway_tool_cache: GatewayToolCatalogCache::NotFetched,
             gateway_tool_fetch_notify: Arc::new(tokio::sync::Notify::new()),
             gateway_tool_connectors_seen: HashSet::new(),
@@ -307,6 +312,16 @@ impl ManagedMcpState {
         self.gateway_tool_epoch
     }
 
+    /// Fence session admission before an explicit gateway catalog refresh.
+    /// Rotating the epoch also prevents an older in-flight fetch from clearing
+    /// the fence by committing after the refresh began.
+    pub fn begin_gateway_tool_refresh(&mut self) -> u64 {
+        self.gateway_refresh_in_progress = true;
+        self.gateway_tool_epoch = self.gateway_tool_epoch.wrapping_add(1);
+        self.gateway_tool_fetch_notify.notify_waiters();
+        self.gateway_tool_epoch
+    }
+
     pub fn start_gateway_tool_fetch(&mut self) -> Option<u64> {
         if !self.gateway_tools_active {
             return None;
@@ -315,14 +330,26 @@ impl ManagedMcpState {
         Some(self.gateway_tool_epoch)
     }
 
-    pub fn complete_gateway_tool_fetch(&mut self, epoch: u64, catalog: GatewayToolCatalog) -> bool {
+    pub fn complete_gateway_tool_fetch(
+        &mut self,
+        epoch: u64,
+        mut catalog: GatewayToolCatalog,
+    ) -> bool {
         if !self.gateway_tools_active || self.gateway_tool_epoch != epoch {
             self.gateway_tool_fetch_notify.notify_waiters();
             return false;
         }
+        let rejected_count = catalog.retain_unambiguous_tools();
+        if rejected_count > 0 {
+            tracing::warn!(
+                rejected_count,
+                "Rejected ambiguous managed MCP gateway tool identities"
+            );
+        }
         self.gateway_tool_connectors_seen
             .extend(catalog.tools.iter().map(|tool| tool.connector_id.clone()));
         self.gateway_tool_cache = GatewayToolCatalogCache::Ready(catalog);
+        self.gateway_refresh_in_progress = false;
         self.gateway_tool_fetch_notify.notify_waiters();
         true
     }
@@ -340,6 +367,7 @@ impl ManagedMcpState {
     pub fn disable_gateway_tools(&mut self) {
         self.gateway_tools_active = false;
         self.gateway_tool_epoch = self.gateway_tool_epoch.wrapping_add(1);
+        self.gateway_refresh_in_progress = false;
         self.gateway_tool_cache = GatewayToolCatalogCache::NotFetched;
         self.gateway_tool_fetch_notify.notify_waiters();
     }
@@ -396,7 +424,7 @@ pub struct GatewayToolCallResponse {
     pub connectors_needing_reauth: Vec<String>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct GatewayToolCatalog {
     #[serde(default)]
     pub tools: Vec<GatewayTool>,
@@ -406,7 +434,7 @@ pub struct GatewayToolCatalog {
     pub connectors_needing_reauth: Vec<String>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct GatewayTool {
     pub connector_id: String,
     pub connector_name: String,
@@ -420,6 +448,50 @@ pub struct GatewayTool {
 impl GatewayTool {
     pub fn qualified_name(&self) -> String {
         format!("{}__{}", self.connector_id, self.tool_id)
+    }
+
+    pub fn validated_qualified_name(&self) -> Option<String> {
+        fn valid_component(value: &str) -> bool {
+            !value.is_empty()
+                && value
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+                && !value.contains("__")
+        }
+
+        if !valid_component(&self.connector_id)
+            || !valid_component(&self.tool_id)
+            || self.call_id.is_empty()
+            || self.call_id.trim() != self.call_id
+            || self.call_id.chars().any(char::is_control)
+        {
+            return None;
+        }
+        Some(self.qualified_name())
+    }
+}
+
+impl GatewayToolCatalog {
+    /// Remove every invalid or ambiguous identity from a fetched catalog.
+    /// Duplicate qualified names and duplicate backend call IDs are rejected
+    /// as a group, so input ordering can never select a privileged winner.
+    pub fn retain_unambiguous_tools(&mut self) -> usize {
+        let before = self.tools.len();
+        let mut name_counts = HashMap::<String, usize>::new();
+        let mut call_counts = HashMap::<String, usize>::new();
+        for tool in &self.tools {
+            if let Some(name) = tool.validated_qualified_name() {
+                *name_counts.entry(name).or_default() += 1;
+                *call_counts.entry(tool.call_id.clone()).or_default() += 1;
+            }
+        }
+        self.tools.retain(|tool| {
+            let Some(name) = tool.validated_qualified_name() else {
+                return false;
+            };
+            name_counts.get(&name) == Some(&1) && call_counts.get(&tool.call_id) == Some(&1)
+        });
+        before - self.tools.len()
     }
 }
 
@@ -674,19 +746,13 @@ pub async fn fetch_gateway_tool_catalog(
     Ok(catalog)
 }
 
-/// Invalidate all managed MCP caches so the next caller refetches both legacy
-/// managed configs and gateway tools.
-pub async fn invalidate_cache(handle: &ManagedMcpStateHandle) {
+/// Invalidate only legacy managed MCP configs.
+///
+/// Gateway cache changes require the agent-level session admission fence and
+/// must never be performed through this shared support helper.
+pub async fn invalidate_managed_config_cache(handle: &ManagedMcpStateHandle) {
     let mut state = handle.lock().await;
     state.cache = ManagedMcpCache::NotFetched;
-    state.gateway_tool_cache = GatewayToolCatalogCache::NotFetched;
-}
-
-/// Invalidate only the gateway tool catalog so the next gateway-aware caller
-/// refetches `/v1/mcp/tools/list`.
-pub async fn invalidate_gateway_tool_cache(handle: &ManagedMcpStateHandle) {
-    let mut state = handle.lock().await;
-    state.gateway_tool_cache = GatewayToolCatalogCache::NotFetched;
 }
 
 /// Fetch-or-wait: returns cached configs if ready, otherwise fetches once
@@ -755,6 +821,9 @@ pub async fn get_or_fetch_gateway_tool_catalog(
                 return None;
             }
             match &state.gateway_tool_cache {
+                GatewayToolCatalogCache::Ready(_) if state.gateway_refresh_in_progress => {
+                    return None;
+                }
                 GatewayToolCatalogCache::Ready(catalog) => return Some(catalog.clone()),
                 GatewayToolCatalogCache::Fetching(_) => {
                     Some(state.gateway_tool_fetch_notify.clone().notified_owned())
@@ -1180,6 +1249,18 @@ mod tests {
         }
     }
 
+    fn make_gateway_tool(connector_id: &str, tool_id: &str, call_id: &str) -> GatewayTool {
+        GatewayTool {
+            connector_id: connector_id.to_string(),
+            connector_name: connector_id.to_string(),
+            tool_id: tool_id.to_string(),
+            tool_name: tool_id.to_string(),
+            call_id: call_id.to_string(),
+            description: "test gateway tool".to_string(),
+            json_schema: serde_json::json!({ "type": "object" }),
+        }
+    }
+
     #[test]
     fn managed_mcp_debug_is_presence_only() {
         const SENTINEL: &str = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
@@ -1313,6 +1394,28 @@ mod tests {
                 .pointer("/properties/query/type")
                 .and_then(|v| v.as_str())
         );
+    }
+
+    #[test]
+    fn gateway_catalog_rejects_invalid_and_ambiguous_identities_as_groups() {
+        let mut catalog = GatewayToolCatalog {
+            tools: vec![
+                make_gateway_tool("gmail", "search", "stable.search"),
+                make_gateway_tool("bad__connector", "search", "invalid.component"),
+                make_gateway_tool("drive", "get", "duplicate.name.first"),
+                make_gateway_tool("drive", "get", "duplicate.name.second"),
+                make_gateway_tool("calendar", "list", "shared.call"),
+                make_gateway_tool("slack", "post", "shared.call"),
+                make_gateway_tool("docs", "read", " leading-space"),
+            ],
+            total_tools: 7,
+            connectors_needing_reauth: vec![],
+        };
+
+        assert_eq!(6, catalog.retain_unambiguous_tools());
+        assert_eq!(1, catalog.tools.len());
+        assert_eq!("gmail__search", catalog.tools[0].qualified_name());
+        assert_eq!("stable.search", catalog.tools[0].call_id);
     }
 
     #[tokio::test]
@@ -1470,6 +1573,93 @@ mod tests {
         assert!(matches!(
             state.gateway_tool_cache,
             GatewayToolCatalogCache::NotFetched
+        ));
+    }
+
+    #[tokio::test]
+    async fn explicit_gateway_refresh_fence_clears_only_on_fresh_commit() {
+        let handle = ManagedMcpStateHandle::default();
+        let old_epoch = {
+            let mut state = handle.lock().await;
+            state.enable_gateway_tools();
+            let epoch = state.start_gateway_tool_fetch().unwrap();
+            assert!(state.complete_gateway_tool_fetch(
+                epoch,
+                GatewayToolCatalog {
+                    tools: vec![],
+                    total_tools: 0,
+                    connectors_needing_reauth: vec![],
+                }
+            ));
+            let refresh_epoch = state.begin_gateway_tool_refresh();
+            assert_ne!(refresh_epoch, epoch);
+            assert!(state.gateway_refresh_in_progress);
+            assert!(matches!(
+                state.gateway_tool_cache,
+                GatewayToolCatalogCache::Ready(_)
+            ));
+            epoch
+        };
+
+        assert!(
+            get_or_fetch_gateway_tool_catalog(&handle, "http://127.0.0.1:0", Some("token"))
+                .await
+                .is_none(),
+            "the fenced old Ready catalog must not be returned"
+        );
+        let mut state = handle.lock().await;
+        assert!(!state.complete_gateway_tool_fetch(
+            old_epoch,
+            GatewayToolCatalog {
+                tools: vec![],
+                total_tools: 0,
+                connectors_needing_reauth: vec![],
+            }
+        ));
+        state.gateway_tool_cache = GatewayToolCatalogCache::NotFetched;
+        let fresh_epoch = state.start_gateway_tool_fetch().unwrap();
+        assert!(state.complete_gateway_tool_fetch(
+            fresh_epoch,
+            GatewayToolCatalog {
+                tools: vec![],
+                total_tools: 0,
+                connectors_needing_reauth: vec![],
+            }
+        ));
+        assert!(!state.gateway_refresh_in_progress);
+        assert!(matches!(
+            state.gateway_tool_cache,
+            GatewayToolCatalogCache::Ready(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_config_invalidation_preserves_gateway_catalog() {
+        let handle = ManagedMcpStateHandle::default();
+        {
+            let mut state = handle.lock().await;
+            state.cache = ManagedMcpCache::Ready(vec![]);
+            state.enable_gateway_tools();
+            let epoch = state.start_gateway_tool_fetch().unwrap();
+            assert!(state.complete_gateway_tool_fetch(
+                epoch,
+                GatewayToolCatalog {
+                    tools: vec![],
+                    total_tools: 0,
+                    connectors_needing_reauth: vec![],
+                }
+            ));
+        }
+
+        invalidate_managed_config_cache(&handle).await;
+
+        let state = handle.lock().await;
+        assert!(matches!(state.cache, ManagedMcpCache::NotFetched));
+        assert!(state.gateway_tools_active);
+        assert!(!state.gateway_refresh_in_progress);
+        assert!(matches!(
+            state.gateway_tool_cache,
+            GatewayToolCatalogCache::Ready(_)
         ));
     }
 

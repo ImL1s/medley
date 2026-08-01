@@ -23,6 +23,7 @@ pub fn error_code(err: &WorkspaceError) -> &'static str {
         WorkspaceError::CannotDropMainSession => "cannot_drop_main",
         WorkspaceError::Finalize(_) => "finalize",
         WorkspaceError::CapabilityWidening { .. } => "capability_widening",
+        WorkspaceError::CapabilityDenied { .. } => "capability_denied",
         WorkspaceError::Unauthorized { .. } => "unauthorized",
         WorkspaceError::TurnActive(_) => xai_grok_workspace_types::rpc::envelope::TURN_ACTIVE,
         WorkspaceError::MaxDepthExceeded { .. } => "max_depth_exceeded",
@@ -73,6 +74,9 @@ pub fn rpc_error_to_workspace(err: RpcError) -> WorkspaceError {
         "capability_widening" => {
             WorkspaceError::HubError(format!("capability_widening: {}", err.message))
         }
+        "capability_denied" => {
+            WorkspaceError::HubError(format!("capability_denied: {}", err.message))
+        }
         "unauthorized" => WorkspaceError::HubError(format!("unauthorized: {}", err.message)),
         "turn_active" => WorkspaceError::TurnActive(err.message),
         "max_depth_exceeded" => {
@@ -109,6 +113,11 @@ mod tests {
                 parent: CapabilityMode::ReadOnly,
                 child: CapabilityMode::All,
             },
+            WorkspaceError::CapabilityDenied {
+                session: "s".into(),
+                operation: "workspace.configure_mcp",
+                mode: CapabilityMode::ReadOnly,
+            },
             WorkspaceError::Unauthorized {
                 caller: "a".into(),
                 target: "b".into(),
@@ -134,11 +143,12 @@ mod tests {
             let recovered = rpc_error_to_workspace(rpc_err);
             let recovered_code = error_code(&recovered);
             match err {
-                WorkspaceError::CapabilityWidening { .. } => {
+                WorkspaceError::CapabilityWidening { .. }
+                | WorkspaceError::CapabilityDenied { .. } => {
                     assert_eq!(recovered_code, "hub_error");
                     let msg = recovered.to_string();
                     assert!(
-                        msg.contains("capability_widening"),
+                        msg.contains(code),
                         "degraded error should contain original code: {msg}"
                     );
                 }

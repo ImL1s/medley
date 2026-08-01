@@ -1,4 +1,5 @@
 use crate::{
+    capability::{CapabilityPolicy, ResolvedToolCapability},
     computer::types::{AsyncFileSystem, TerminalBackend},
     implementations::{
         codex, grok_build, grok_build_concise, grok_build_hashline, opencode,
@@ -21,7 +22,7 @@ use crate::{
     util::remap::remap_json_keys,
 };
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 /// Process-global registry of external "tool packs" — functions that
@@ -69,20 +70,14 @@ pub struct ToolConfig {
     /// Only valid for version-managed tools (see `versions::MANAGED_TOOLS`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub behavior_version: Option<String>,
-    /// The tool's capability category. Populated automatically by
-    /// `for_tool::<T>()` / `From<&T: Tool>` and used by capability-mode
-    /// enforcement to filter tools without a hardcoded ID mapping.
-    ///
-    /// `None` means the tool's kind is unknown (e.g. MCP/custom tools
-    /// created via `ToolConfig::from_id()`). Capability-mode filtering
-    /// preserves tools with `kind: None` — this is intentional to avoid
-    /// breaking extensibility.
+    /// Advisory serialized capability category. At finalization, built-in
+    /// IDs are always overwritten with the registry's authoritative kind;
+    /// unknown IDs remain unclassified.
     ///
     /// `ToolKind` is `#[serde(other)]`, so an unknown deserialized `kind` becomes
-    /// `Some(Other)` (dropped by restrictive modes) rather than an error — not a
-    /// live path today since `kind` is auto-populated and `from_id` leaves it
-    /// `None`. [`deserialize_config_kind`] warns on that sink so a config typo
-    /// doesn't silently demote the tool.
+    /// `Some(Other)` rather than an error. [`deserialize_config_kind`] warns on
+    /// that sink; finalization still replaces the value from trusted registry
+    /// metadata before authorization.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -128,8 +123,8 @@ impl ToolConfig {
     /// Build a `ToolConfig` from a string id (no associated Rust type).
     ///
     /// Use this for MCP/custom tools or anywhere the id is only known at
-    /// runtime. `kind` is left as `None`; capability-mode filtering then
-    /// preserves the tool unconditionally.
+    /// runtime. `kind` is left as `None`, so restricted capability modes treat
+    /// it as unclassified unless trusted exact-ID metadata authorizes it.
     pub fn from_id(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
@@ -412,12 +407,14 @@ struct ReminderEntry {
 }
 /// A tool ready for dispatch, with pre-built client-facing definition.
 struct FinalizedTool {
+    /// Stable ID used for capability classification. Presentation aliases do
+    /// not change this identity.
+    canonical_id: String,
     namespace: String,
     id: String,
     /// The key under which this tool is stored in the `LocalRegistry`.
-    /// For built-in tools this equals `id`; for dynamically-registered
-    /// (MCP) tools it is `Tool::id().as_str()` which may differ from
-    /// the client-facing `id` / `client_name`.
+    /// Dynamic registration requires this to match the exact canonical and
+    /// client-facing name so authorization and dispatch share one identity.
     registry_id: String,
     client_name: String,
     /// Tool metadata — kind, fingerprinting, doom-loop, reminders.
@@ -445,6 +442,7 @@ struct FinalizedTool {
     /// `"legacy-0.4.10"`). `None` for unmanaged tools and dynamically
     /// registered (MCP) tools.
     contract_version: Option<String>,
+    capability: ResolvedToolCapability,
 }
 /// Toolset produced by `ToolRegistryBuilder::finalize()`.
 ///
@@ -469,6 +467,136 @@ pub struct FinalizedToolset {
     /// Per-user feature-flag bag stamped on every dispatch ctx by
     /// `prepare_dispatch`. `None` outside a workspace bind.
     workspace_viewer_ctx: Option<xai_tool_runtime::WorkspaceViewerContext>,
+    capability_policy: CapabilityPolicy,
+    external_tool_identities: ManagedGatewayIdentityAuthorizer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExternalToolIdentityOwner {
+    Local,
+    ManagedGateway { call_id: String, active: bool },
+    Conflict,
+}
+
+/// Session-scoped binding between a capability-policy subject and the backend
+/// operation it is allowed to dispatch. Managed-gateway calls must match an
+/// admitted `qualified_name -> call_id` tuple on every invocation; a collision
+/// with a local/MCP tool or a changed tuple permanently poisons that name for
+/// the lifetime of the toolset.
+#[derive(Clone, Default)]
+pub struct ManagedGatewayIdentityAuthorizer {
+    owners: Arc<parking_lot::RwLock<HashMap<String, ExternalToolIdentityOwner>>>,
+    admission_pending: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl std::fmt::Debug for ManagedGatewayIdentityAuthorizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagedGatewayIdentityAuthorizer")
+            .field("identity_count", &self.owners.read().len())
+            .field(
+                "admission_pending",
+                &self
+                    .admission_pending
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
+            .finish()
+    }
+}
+
+impl ManagedGatewayIdentityAuthorizer {
+    fn begin_admission(&self) {
+        self.admission_pending
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn complete_admission(&self) {
+        self.admission_pending
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    fn disable_gateway(&self) {
+        for owner in self.owners.write().values_mut() {
+            if let ExternalToolIdentityOwner::ManagedGateway { active, .. } = owner {
+                *active = false;
+            }
+        }
+        self.complete_admission();
+    }
+
+    fn authorize_local_dispatch(
+        &self,
+        qualified_name: &str,
+    ) -> Result<(), xai_tool_runtime::ToolError> {
+        if qualified_name.contains("__")
+            && self
+                .admission_pending
+                .load(std::sync::atomic::Ordering::Acquire)
+            && matches!(
+                self.owners.read().get(qualified_name),
+                Some(ExternalToolIdentityOwner::Local)
+            )
+        {
+            return Err(xai_tool_runtime::ToolError::custom(
+                "tool_capability_denied",
+                format!(
+                    "External tool {qualified_name} is unavailable until managed gateway identity admission completes"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn authorize(
+        &self,
+        qualified_name: &str,
+        call_id: &str,
+    ) -> Result<(), xai_tool_runtime::ToolError> {
+        if self
+            .admission_pending
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(xai_tool_runtime::ToolError::custom(
+                "tool_capability_denied",
+                "Managed gateway identity admission is pending",
+            ));
+        }
+        let admitted = self.owners.read().get(qualified_name).is_some_and(|owner| {
+            matches!(
+                owner,
+                ExternalToolIdentityOwner::ManagedGateway {
+                    call_id: admitted_call_id,
+                    active: true,
+                } if admitted_call_id == call_id
+            )
+        });
+        if admitted {
+            Ok(())
+        } else {
+            Err(xai_tool_runtime::ToolError::custom(
+                "tool_capability_denied",
+                format!(
+                    "Managed gateway tool {qualified_name} does not match an admitted session identity"
+                ),
+            ))
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admit_for_test(&self, qualified_name: &str, call_id: &str) {
+        self.owners.write().insert(
+            qualified_name.to_owned(),
+            ExternalToolIdentityOwner::ManagedGateway {
+                call_id: call_id.to_owned(),
+                active: true,
+            },
+        );
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ManagedGatewayIdentityReconciliation {
+    pub accepted: HashSet<String>,
+    pub rejected: HashSet<String>,
 }
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RequirementError {
@@ -537,6 +665,7 @@ pub struct ToolRegistryBuilder {
     /// behavior); the tools server sets it from
     /// `FinalizeToolServerConfigRequest.system_reminders_enabled`.
     system_reminders_enabled: bool,
+    capability_policy: CapabilityPolicy,
 }
 impl Default for ToolRegistryBuilder {
     fn default() -> Self {
@@ -677,6 +806,7 @@ impl ToolRegistryBuilder {
             reminders: Vec::new(),
             shared_local_registry: None,
             system_reminders_enabled: true,
+            capability_policy: CapabilityPolicy::unrestricted(),
         };
         b.register_with_params::<grok_build::BashTool, grok_build::bash::BashParams>();
         b.register_with_params::<grok_build::ReadFileTool, grok_build::read_file::ReadFileParams>();
@@ -765,6 +895,10 @@ impl ToolRegistryBuilder {
     }
     pub fn with_local_registry(mut self, registry: xai_computer_hub_sdk::LocalRegistry) -> Self {
         self.shared_local_registry = Some(registry);
+        self
+    }
+    pub fn with_capability_policy(mut self, policy: CapabilityPolicy) -> Self {
+        self.capability_policy = policy;
         self
     }
     /// Dump tools manifest as JSON for the client.
@@ -958,11 +1092,21 @@ impl ToolRegistryBuilder {
     /// `workspace_viewer_ctx` is `None` outside a workspace bind.
     pub fn finalize_with_trunc_config(
         mut self,
-        config: ToolServerConfig,
+        mut config: ToolServerConfig,
         ctx: SessionContext,
         truncation_config: crate::types::context::TruncationConfig,
         workspace_viewer_ctx: Option<xai_tool_runtime::WorkspaceViewerContext>,
     ) -> Result<FinalizedToolset, Vec<RequirementError>> {
+        // Serialized `kind` is untrusted input. Always replace it from the
+        // registry's static taxonomy before applying the fail-closed policy;
+        // unknown dynamic IDs remain unclassified.
+        for tool in &mut config.tools {
+            tool.kind = self.tools.get(&tool.id).map(|entry| entry.kind);
+        }
+        self.capability_policy.filter_tool_config(&mut config);
+        crate::implementations::grok_build::task::types::prune_orphaned_background_task_tools(
+            &mut config,
+        );
         let errors = self.validate_config(&config);
         if !errors.is_empty() {
             return Err(errors);
@@ -1121,6 +1265,10 @@ impl ToolRegistryBuilder {
         let local_registry = self.shared_local_registry.take().unwrap_or_default();
         for tool_config in &config.tools {
             let entry = self.tools.remove(&tool_config.id).unwrap();
+            let canonical_id = tool_config.id.clone();
+            let capability = self
+                .capability_policy
+                .resolve_builtin(&canonical_id, entry.kind);
             (entry.register_in_local)(&local_registry);
             let contract_version = crate::versions::resolve_version(
                 preset_name,
@@ -1174,6 +1322,7 @@ impl ToolRegistryBuilder {
             );
             (entry.apply_params)(&effective_params, &mut resources);
             tools.push(FinalizedTool {
+                canonical_id,
                 namespace: entry.namespace,
                 registry_id: entry.id.clone(),
                 id: entry.id,
@@ -1186,6 +1335,7 @@ impl ToolRegistryBuilder {
                 reverse_params,
                 parse_input: Arc::from(entry.parse_input),
                 contract_version,
+                capability,
             });
         }
         let native_tool_names: std::collections::HashSet<String> = tools
@@ -1247,6 +1397,15 @@ impl ToolRegistryBuilder {
             };
             tokio::spawn(actor.run());
         }
+        let external_tool_identities = ManagedGatewayIdentityAuthorizer::default();
+        {
+            let mut owners = external_tool_identities.owners.write();
+            owners.extend(
+                tools
+                    .iter()
+                    .map(|tool| (tool.client_name.clone(), ExternalToolIdentityOwner::Local)),
+            );
+        }
         Ok(FinalizedToolset {
             tools: parking_lot::RwLock::new(tools),
             reminders: active_reminders,
@@ -1257,6 +1416,8 @@ impl ToolRegistryBuilder {
             renderer: renderer_arc,
             system_reminder_tag: ctx.system_reminder_tag,
             workspace_viewer_ctx,
+            capability_policy: self.capability_policy,
+            external_tool_identities,
         })
     }
 }
@@ -1310,6 +1471,9 @@ impl FinalizedToolset {
     ///
     /// Safe to call from sync `#[test]` — does not require a tokio runtime.
     pub fn empty_for_test() -> Self {
+        Self::empty_for_test_with_capability_policy(CapabilityPolicy::unrestricted())
+    }
+    pub fn empty_for_test_with_capability_policy(policy: CapabilityPolicy) -> Self {
         Self {
             tools: parking_lot::RwLock::new(vec![]),
             reminders: vec![],
@@ -1325,10 +1489,176 @@ impl FinalizedToolset {
             )),
             system_reminder_tag: "system-reminder",
             workspace_viewer_ctx: None,
+            capability_policy: policy,
+            external_tool_identities: ManagedGatewayIdentityAuthorizer::default(),
         }
     }
-    pub fn local_registry(&self) -> &xai_computer_hub_sdk::LocalRegistry {
+    #[cfg(test)]
+    pub(crate) fn local_registry(&self) -> &xai_computer_hub_sdk::LocalRegistry {
         &self.local_registry
+    }
+    pub fn capability_policy(&self) -> &CapabilityPolicy {
+        &self.capability_policy
+    }
+
+    /// Whether this session's capability policy permits an exact external
+    /// MCP/custom identity to be exposed. Remote metadata is intentionally
+    /// ignored; only the locally trusted exact-ID catalog participates.
+    pub fn external_tool_is_permitted(&self, canonical_id: &str) -> bool {
+        let capability = self.capability_policy.resolve_external(canonical_id);
+        self.capability_policy
+            .evaluate(canonical_id, &capability)
+            .is_kept()
+    }
+
+    pub fn begin_managed_gateway_admission(&self) {
+        self.external_tool_identities.begin_admission();
+    }
+
+    pub fn disable_managed_gateway_admission(&self) {
+        self.external_tool_identities.disable_gateway();
+    }
+
+    /// Atomically reconcile the managed-gateway identities advertised for this
+    /// session. Exact-ID collisions across local/MCP and gateway sources fail
+    /// closed: the local handle is removed, the gateway entry is rejected, and
+    /// the identity stays poisoned for the lifetime of the toolset. Opaque
+    /// gateway `call_id`s are bound on first admission and cannot move between
+    /// identities or change on refresh.
+    pub fn reconcile_managed_gateway_identities(
+        &self,
+        bindings: &[(String, String)],
+    ) -> ManagedGatewayIdentityReconciliation {
+        fn valid_identity(name: &str, call_id: &str) -> bool {
+            let Some((connector_id, tool_id)) = name.split_once("__") else {
+                return false;
+            };
+            !connector_id.is_empty()
+                && !tool_id.is_empty()
+                && !tool_id.contains("__")
+                && xai_tool_protocol::ToolId::new(name).is_ok()
+                && !call_id.is_empty()
+                && call_id.trim() == call_id
+                && !call_id.chars().any(char::is_control)
+        }
+
+        let mut result = ManagedGatewayIdentityReconciliation::default();
+        let mut name_occurrences: HashMap<&str, usize> = HashMap::new();
+        let mut call_occurrences: HashMap<&str, Vec<&str>> = HashMap::new();
+        for (name, call_id) in bindings {
+            if !valid_identity(name, call_id) {
+                result.rejected.insert(name.clone());
+                continue;
+            }
+            *name_occurrences.entry(name).or_default() += 1;
+            call_occurrences.entry(call_id).or_default().push(name);
+        }
+        for (name, count) in name_occurrences {
+            if count > 1 {
+                result.rejected.insert(name.to_owned());
+            }
+        }
+        for names in call_occurrences.values().filter(|names| names.len() > 1) {
+            result
+                .rejected
+                .extend(names.iter().map(|name| (*name).to_owned()));
+        }
+
+        // Keep lock ordering aligned with registration/unregistration:
+        // tool metadata first, then the identity map. No await occurs here.
+        let mut tools = self.tools.write();
+        let mut owners = self.external_tool_identities.owners.write();
+        let mut remove_local = HashSet::new();
+
+        for owner in owners.values_mut() {
+            if let ExternalToolIdentityOwner::ManagedGateway { active, .. } = owner {
+                *active = false;
+            }
+        }
+
+        for name in result.rejected.clone() {
+            if matches!(owners.get(&name), Some(ExternalToolIdentityOwner::Local)) {
+                remove_local.insert(name.clone());
+            }
+            owners.insert(name, ExternalToolIdentityOwner::Conflict);
+        }
+
+        let mut gateway_call_owners: HashMap<String, String> = owners
+            .iter()
+            .filter_map(|(name, owner)| match owner {
+                ExternalToolIdentityOwner::ManagedGateway { call_id, .. } => {
+                    Some((call_id.clone(), name.clone()))
+                }
+                ExternalToolIdentityOwner::Local | ExternalToolIdentityOwner::Conflict => None,
+            })
+            .collect();
+
+        for (name, call_id) in bindings {
+            if result.rejected.contains(name) || !valid_identity(name, call_id) {
+                continue;
+            }
+            match owners.get(name).cloned() {
+                Some(ExternalToolIdentityOwner::Local) => {
+                    remove_local.insert(name.clone());
+                    owners.insert(name.clone(), ExternalToolIdentityOwner::Conflict);
+                    result.rejected.insert(name.clone());
+                }
+                Some(ExternalToolIdentityOwner::ManagedGateway {
+                    call_id: admitted_call_id,
+                    ..
+                }) if admitted_call_id == *call_id => {
+                    owners.insert(
+                        name.clone(),
+                        ExternalToolIdentityOwner::ManagedGateway {
+                            call_id: admitted_call_id,
+                            active: true,
+                        },
+                    );
+                    result.accepted.insert(name.clone());
+                }
+                Some(ExternalToolIdentityOwner::ManagedGateway { .. })
+                | Some(ExternalToolIdentityOwner::Conflict) => {
+                    owners.insert(name.clone(), ExternalToolIdentityOwner::Conflict);
+                    result.rejected.insert(name.clone());
+                }
+                None => {
+                    if let Some(previous_name) = gateway_call_owners.get(call_id).cloned()
+                        && previous_name != *name
+                    {
+                        owners.insert(previous_name.clone(), ExternalToolIdentityOwner::Conflict);
+                        owners.insert(name.clone(), ExternalToolIdentityOwner::Conflict);
+                        result.accepted.remove(&previous_name);
+                        result.rejected.insert(previous_name);
+                        result.rejected.insert(name.clone());
+                    } else {
+                        owners.insert(
+                            name.clone(),
+                            ExternalToolIdentityOwner::ManagedGateway {
+                                call_id: call_id.clone(),
+                                active: true,
+                            },
+                        );
+                        gateway_call_owners.insert(call_id.clone(), name.clone());
+                        result.accepted.insert(name.clone());
+                    }
+                }
+            }
+        }
+
+        result
+            .accepted
+            .retain(|name| !result.rejected.contains(name));
+        if !remove_local.is_empty() {
+            tools.retain(|tool| !remove_local.contains(&tool.client_name));
+            // `LocalRegistry` may be shared by multiple finalized session
+            // toolsets. Removing the handle here would let one session's
+            // remote gateway catalog break sibling sessions whose independent
+            // metadata still authorizes the local tool. Revoking this
+            // toolset's metadata and poisoning its identity is sufficient to
+            // fail its direct/wrapped dispatch closed.
+        }
+        self.external_tool_identities.complete_admission();
+        result
     }
     /// Whether the server must await this tool's in-process cancellation cleanup.
     pub fn cooperative_cancellation(&self, tool_name: &str) -> bool {
@@ -1474,18 +1804,26 @@ impl FinalizedToolset {
         tool_args: serde_json::Value,
         parent_ctx: xai_tool_runtime::ToolCallContext,
     ) -> Result<crate::types::output::ToolOutput, xai_tool_runtime::ToolError> {
-        let (registry_id, output_converter, reverse_params) = {
+        let (canonical_id, capability, registry_id, output_converter, reverse_params) = {
             let tools = self.tools.read();
             let entry = tools
                 .iter()
                 .find(|t| t.client_name == tool_name)
                 .ok_or_else(|| Self::tool_not_found_error(tool_name))?;
             (
+                entry.canonical_id.clone(),
+                entry.capability.clone(),
                 entry.registry_id.clone(),
                 entry.output_converter.clone(),
                 entry.reverse_params.clone(),
             )
         };
+        if self.capability_policy.mode() != xai_tool_types::SubagentCapabilityMode::All {
+            self.external_tool_identities
+                .authorize_local_dispatch(tool_name)?;
+        }
+        self.capability_policy
+            .authorize(&canonical_id, &capability)?;
         let canonical_params = if reverse_params.is_empty() {
             tool_args
         } else {
@@ -1494,6 +1832,8 @@ impl FinalizedToolset {
         let mut ctx = xai_tool_runtime::ToolCallContext::new(parent_ctx.call_id.clone());
         ctx.extensions.insert(self.resources.clone());
         ctx.extensions.insert_arc(Arc::clone(&self.renderer));
+        ctx.extensions.insert(self.capability_policy.clone());
+        ctx.extensions.insert(self.external_tool_identities.clone());
         if let Some(cancellation) = parent_ctx.get::<xai_tool_runtime::Cancellation>() {
             ctx.extensions.insert((*cancellation).clone());
         }
@@ -1657,18 +1997,26 @@ impl FinalizedToolset {
         cwd_override: Option<std::path::PathBuf>,
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<DispatchParts, xai_tool_runtime::ToolError> {
-        let (registry_id, output_converter, reverse_params) = {
+        let (canonical_id, capability, registry_id, output_converter, reverse_params) = {
             let tools = self.tools.read();
             let entry = tools
                 .iter()
                 .find(|t| t.client_name == tool_name)
                 .ok_or_else(|| Self::tool_not_found_error(tool_name))?;
             (
+                entry.canonical_id.clone(),
+                entry.capability.clone(),
                 entry.registry_id.clone(),
                 entry.output_converter.clone(),
                 entry.reverse_params.clone(),
             )
         };
+        if self.capability_policy.mode() != xai_tool_types::SubagentCapabilityMode::All {
+            self.external_tool_identities
+                .authorize_local_dispatch(tool_name)?;
+        }
+        self.capability_policy
+            .authorize(&canonical_id, &capability)?;
         let canonical_params = if reverse_params.is_empty() {
             tool_args
         } else {
@@ -1689,6 +2037,8 @@ impl FinalizedToolset {
         let mut ctx = xai_tool_runtime::ToolCallContext::new(rt_call_id);
         ctx.extensions.insert(self.resources.clone());
         ctx.extensions.insert_arc(Arc::clone(&self.renderer));
+        ctx.extensions.insert(self.capability_policy.clone());
+        ctx.extensions.insert(self.external_tool_identities.clone());
         ctx.extensions.insert(
             crate::types::resources::InvokingToolParamNames::from_reverse_params(&reverse_params),
         );
@@ -1825,19 +2175,38 @@ impl FinalizedToolset {
         T: xai_tool_runtime::Tool + ToolMetadata + std::fmt::Debug + Send + Sync + 'static,
         T::Output: serde::Serialize,
     {
+        let registry_id = xai_tool_runtime::Tool::id(&tool).as_str().to_owned();
+        if registry_id != name {
+            return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
+                "Dynamic tool registration name '{name}' must match Tool::id() '{registry_id}'"
+            )));
+        }
+        let capability = self.capability_policy.resolve_external(&name);
+        self.capability_policy.authorize(&name, &capability)?;
         let mut tools = self.tools.write();
         if tools.iter().any(|t| t.client_name == name) {
             return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
                 "Tool already registered: {name}"
             )));
         }
+        let mut identity_owners = self.external_tool_identities.owners.write();
+        if identity_owners.contains_key(&name) {
+            return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
+                "Tool identity is already reserved or conflicted: {name}"
+            )));
+        }
         let description = tool.description_template().to_string();
         let kind = tool.kind();
-        let registry_id = xai_tool_runtime::Tool::id(&tool).as_str().to_owned();
         let input_schema = input_schema_override.unwrap_or_else(generate_schema::<T::Args>);
         let definition = ToolDefinition::function(&name, Some(&description), input_schema.clone());
-        self.local_registry.register(tool);
+        if !self.local_registry.try_register(tool) {
+            return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
+                "Tool registry ID already registered: {registry_id}"
+            )));
+        }
+        identity_owners.insert(name.clone(), ExternalToolIdentityOwner::Local);
         tools.push(FinalizedTool {
+            canonical_id: name.clone(),
             namespace: ToolNamespace::MCP.to_string(),
             id: name.clone(),
             registry_id,
@@ -1863,25 +2232,38 @@ impl FinalizedToolset {
                 }))
             }),
             contract_version: None,
+            capability,
         });
         Ok(())
     }
     pub fn unregister_tools_by_prefix(&self, prefix: &str) -> usize {
         let mut tools = self.tools.write();
+        let mut identity_owners = self.external_tool_identities.owners.write();
         let before = tools.len();
         let to_remove: Vec<_> = tools
             .iter()
             .filter(|t| t.client_name.starts_with(prefix))
-            .filter_map(|t| xai_tool_protocol::ToolId::new(&t.registry_id).ok())
+            .filter_map(|t| {
+                xai_tool_protocol::ToolId::new(&t.registry_id)
+                    .ok()
+                    .map(|registry_id| (t.client_name.clone(), registry_id))
+            })
             .collect();
         tools.retain(|t| !t.client_name.starts_with(prefix));
-        for tid in &to_remove {
-            self.local_registry.unregister(tid);
+        for (name, registry_id) in &to_remove {
+            self.local_registry.unregister(registry_id);
+            if matches!(
+                identity_owners.get(name),
+                Some(ExternalToolIdentityOwner::Local)
+            ) {
+                identity_owners.remove(name);
+            }
         }
         before - tools.len()
     }
     pub fn unregister_tool_by_name(&self, name: &str) -> bool {
         let mut tools = self.tools.write();
+        let mut identity_owners = self.external_tool_identities.owners.write();
         let tool_id = tools
             .iter()
             .find(|t| t.client_name == name)
@@ -1891,6 +2273,14 @@ impl FinalizedToolset {
         let removed = tools.len() < before;
         if removed && let Some(tid) = tool_id {
             self.local_registry.unregister(&tid);
+        }
+        if removed
+            && matches!(
+                identity_owners.get(name),
+                Some(ExternalToolIdentityOwner::Local)
+            )
+        {
+            identity_owners.remove(name);
         }
         removed
     }
@@ -3112,7 +3502,16 @@ mod tests {
     }
     #[derive(Debug)]
     struct FakeMcpTool {
+        id: String,
         description: String,
+    }
+    impl Default for FakeMcpTool {
+        fn default() -> Self {
+            Self {
+                id: "server__tool".to_owned(),
+                description: "shared local MCP fixture".to_owned(),
+            }
+        }
     }
     impl crate::types::tool_metadata::ToolMetadata for FakeMcpTool {
         fn kind(&self) -> ToolKind {
@@ -3127,24 +3526,596 @@ mod tests {
     }
     impl xai_tool_runtime::Tool for FakeMcpTool {
         type Args = serde_json::Value;
-        type Output = String;
+        type Output = ToolOutput;
         fn id(&self) -> xai_tool_protocol::ToolId {
-            xai_tool_protocol::ToolId::new("fake_mcp").expect("valid")
+            xai_tool_protocol::ToolId::new(&self.id).expect("valid")
         }
         fn description(
             &self,
             _ctx: &::xai_tool_runtime::ListToolsContext,
         ) -> xai_tool_types::ToolDescription {
-            xai_tool_types::ToolDescription::new("fake_mcp", &self.description)
+            xai_tool_types::ToolDescription::new(&self.id, &self.description)
         }
         async fn run(
             &self,
             _ctx: xai_tool_runtime::ToolCallContext,
             _input: serde_json::Value,
-        ) -> Result<String, xai_tool_runtime::ToolError> {
-            Ok("ok".into())
+        ) -> Result<ToolOutput, xai_tool_runtime::ToolError> {
+            Ok(ToolOutput::Text("ok".into()))
         }
     }
+
+    fn restricted_policy(mode: xai_tool_types::SubagentCapabilityMode) -> CapabilityPolicy {
+        CapabilityPolicy::new(mode, crate::capability::TrustedToolCapabilities::default())
+    }
+
+    #[tokio::test]
+    async fn restricted_finalize_backfills_builtin_kinds_and_rejects_alias_bypasses() {
+        let tmp = TempDir::new().unwrap();
+        let builder = ToolRegistryBuilder::new().with_capability_policy(restricted_policy(
+            xai_tool_types::SubagentCapabilityMode::ReadOnly,
+        ));
+        let mut aliased_write = ToolConfig::for_tool::<codex::apply_patch::ApplyPatchTool>();
+        aliased_write.name_override = Some("harmless_read".to_owned());
+        aliased_write.kind = Some(ToolKind::Read);
+        let mut spoofed_read = ToolConfig::for_tool::<grok_build::ReadFileTool>();
+        spoofed_read.kind = Some(ToolKind::Edit);
+        let config = ToolServerConfig {
+            tools: vec![
+                spoofed_read,
+                aliased_write,
+                ToolConfig::from_id("malicious__opaque"),
+            ],
+            behavior_preset: None,
+        };
+
+        let toolset = builder
+            .finalize(config, test_session_context(&tmp))
+            .expect("restricted finalization should drop denied tools before validation");
+        let names: Vec<String> = toolset
+            .tool_definitions()
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect();
+        assert_eq!(names, vec!["read_file"]);
+    }
+
+    #[tokio::test]
+    async fn restricted_capability_matrix_finalizes_and_dispatches_with_one_policy() {
+        use xai_tool_types::{
+            SubagentCapabilityMode as Mode, ToolCapabilityDescriptor, ToolEffect,
+        };
+
+        let rows = [
+            (Mode::ReadOnly, vec!["read_file", "search_tool", "use_tool"]),
+            (
+                Mode::ReadWrite,
+                vec!["read_file", "alias_apply_patch", "search_tool", "use_tool"],
+            ),
+            (
+                Mode::Execute,
+                vec!["read_file", "monitor", "search_tool", "use_tool"],
+            ),
+            (
+                Mode::All,
+                vec![
+                    "read_file",
+                    "alias_apply_patch",
+                    "monitor",
+                    "search_tool",
+                    "use_tool",
+                ],
+            ),
+        ];
+
+        for (mode, expected_builtins) in rows {
+            let tmp = TempDir::new().unwrap();
+            let targets = [
+                (
+                    "mcp__read",
+                    Some(ToolCapabilityDescriptor::classified([
+                        ToolEffect::NetworkRead,
+                    ])),
+                ),
+                (
+                    "custom__write",
+                    Some(ToolCapabilityDescriptor::classified([
+                        ToolEffect::ExternalMutation,
+                    ])),
+                ),
+                (
+                    "custom__execute",
+                    Some(ToolCapabilityDescriptor::classified([ToolEffect::Execute])),
+                ),
+                ("opaque__unknown", None),
+            ];
+            let mut trusted = crate::capability::TrustedToolCapabilities::default();
+            for (target, descriptor) in &targets {
+                if let Some(descriptor) = descriptor {
+                    trusted
+                        .insert_classification(
+                            *target,
+                            descriptor.clone(),
+                            crate::types::config_source::ConfigSource::Builtin,
+                        )
+                        .unwrap();
+                }
+            }
+            let policy = CapabilityPolicy::new(mode, trusted);
+            let mut aliased_write = ToolConfig::for_tool::<codex::apply_patch::ApplyPatchTool>();
+            aliased_write.name_override = Some("alias_apply_patch".into());
+            let toolset = Arc::new(
+                ToolRegistryBuilder::new()
+                    .with_capability_policy(policy)
+                    .finalize(
+                        ToolServerConfig {
+                            tools: vec![
+                                ToolConfig::for_tool::<grok_build::ReadFileTool>(),
+                                aliased_write,
+                                ToolConfig::for_tool::<grok_build::MonitorTool>(),
+                                ToolConfig::for_tool::<
+                                    crate::implementations::search_tool::SearchTool,
+                                >(),
+                                ToolConfig::for_tool::<crate::implementations::use_tool::UseTool>(),
+                            ],
+                            behavior_preset: None,
+                        },
+                        test_session_context(&tmp),
+                    )
+                    .expect("policy-filtered built-ins should finalize"),
+            );
+            let builtin_names: Vec<String> = toolset
+                .tool_definitions()
+                .into_iter()
+                .map(|definition| definition.function.name)
+                .collect();
+            assert_eq!(builtin_names, expected_builtins, "mode {mode:?}");
+
+            for (target, descriptor) in &targets {
+                let expected_allowed = descriptor
+                    .as_ref()
+                    .is_some_and(|descriptor| mode.allows_tool_capability(descriptor))
+                    || (descriptor.is_none() && mode == Mode::All);
+                let registration = toolset.register_tool(
+                    (*target).to_owned(),
+                    FakeMcpTool {
+                        id: (*target).into(),
+                        description: format!("{target} test target"),
+                    },
+                    None,
+                );
+                assert_eq!(
+                    registration.is_ok(),
+                    expected_allowed,
+                    "{mode:?} / {target}"
+                );
+                if expected_allowed {
+                    let output = toolset
+                        .call(
+                            target,
+                            serde_json::json!({}),
+                            &format!("direct-{target}"),
+                            None,
+                        )
+                        .await
+                        .expect("authorized dynamic target should dispatch");
+                    assert!(matches!(output.output, ToolOutput::Text(_)));
+                }
+            }
+
+            let forwarded = toolset
+                .call(
+                    "use_tool",
+                    serde_json::json!({
+                        "tool_name": "mcp__read",
+                        "tool_input": {}
+                    }),
+                    "forward-read",
+                    None,
+                )
+                .await
+                .expect("zero-effect wrapper should forward to an authorized exact target");
+            assert_eq!(forwarded.effective_tool_name.as_deref(), Some("mcp__read"));
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_registration_requires_trusted_exact_id_capability() {
+        let tmp = TempDir::new().unwrap();
+        let toolset = ToolRegistryBuilder::new()
+            .with_capability_policy(restricted_policy(
+                xai_tool_types::SubagentCapabilityMode::ReadOnly,
+            ))
+            .finalize(
+                ToolServerConfig {
+                    tools: vec![ToolConfig::for_tool::<grok_build::ReadFileTool>()],
+                    behavior_preset: None,
+                },
+                test_session_context(&tmp),
+            )
+            .unwrap();
+        let error = toolset
+            .register_tool(
+                "malicious__opaque".to_owned(),
+                FakeMcpTool {
+                    id: "malicious__opaque".into(),
+                    description: "mutates an external system".into(),
+                },
+                None,
+            )
+            .expect_err("unclassified dynamic tools must fail closed");
+        assert!(error.to_string().contains("not permitted"), "{error}");
+
+        let source = crate::types::config_source::ConfigSource::User {
+            path: tmp.path().join("config.toml"),
+        };
+        let mut trusted = crate::capability::TrustedToolCapabilities::default();
+        trusted
+            .insert_classification(
+                "github__get_issue",
+                xai_tool_types::ToolCapabilityDescriptor::classified([
+                    xai_tool_types::ToolEffect::NetworkRead,
+                ]),
+                source,
+            )
+            .unwrap();
+        let safe_toolset = ToolRegistryBuilder::new()
+            .with_capability_policy(CapabilityPolicy::new(
+                xai_tool_types::SubagentCapabilityMode::ReadOnly,
+                trusted,
+            ))
+            .finalize(
+                ToolServerConfig {
+                    tools: vec![],
+                    behavior_preset: None,
+                },
+                test_session_context(&tmp),
+            )
+            .unwrap();
+        safe_toolset
+            .register_tool(
+                "github__get_issue".to_owned(),
+                FakeMcpTool {
+                    id: "github__get_issue".into(),
+                    description: "read one issue".into(),
+                },
+                None,
+            )
+            .expect("trusted read-only dynamic tool should remain available");
+        assert_eq!(safe_toolset.tool_definitions().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dynamic_registration_rejects_name_id_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let toolset = ToolRegistryBuilder::new()
+            .finalize(ToolServerConfig::default(), test_session_context(&tmp))
+            .unwrap();
+
+        let error = toolset
+            .register_tool(
+                "trusted__alias".to_owned(),
+                FakeMcpTool {
+                    id: "actual__target".into(),
+                    description: "mismatched identity".into(),
+                },
+                None,
+            )
+            .expect_err("caller-supplied name must match Tool::id");
+
+        assert!(error.detail.contains("must match Tool::id"), "{error}");
+        assert!(toolset.tool_definitions().is_empty());
+        assert!(
+            toolset
+                .local_registry()
+                .find(&xai_tool_protocol::ToolId::new("actual__target").unwrap())
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_registration_registry_collision_is_atomic() {
+        let tmp = TempDir::new().unwrap();
+        let registry = xai_computer_hub_sdk::LocalRegistry::new();
+        let registry_id = xai_tool_protocol::ToolId::new("server__tool").unwrap();
+        registry.register(FakeMcpTool {
+            id: registry_id.as_str().into(),
+            description: "original".into(),
+        });
+        let original = registry.find(&registry_id).expect("original resolves");
+        let toolset = ToolRegistryBuilder::new()
+            .with_local_registry(registry.clone())
+            .finalize(ToolServerConfig::default(), test_session_context(&tmp))
+            .unwrap();
+
+        let error = toolset
+            .register_tool(
+                registry_id.as_str().to_owned(),
+                FakeMcpTool {
+                    id: registry_id.as_str().into(),
+                    description: "replacement".into(),
+                },
+                None,
+            )
+            .expect_err("registry collision must be rejected");
+
+        assert!(error.detail.contains("already registered"), "{error}");
+        assert!(Arc::ptr_eq(
+            &original,
+            &registry.find(&registry_id).expect("original remains")
+        ));
+        assert!(toolset.tool_definitions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn managed_gateway_collision_revokes_direct_and_wrapped_local_dispatch() {
+        let tmp = TempDir::new().unwrap();
+        let toolset = Arc::new(
+            ToolRegistryBuilder::new()
+                .finalize(
+                    ToolServerConfig {
+                        tools: vec![ToolConfig::for_tool::<
+                            crate::implementations::use_tool::UseTool,
+                        >()],
+                        behavior_preset: None,
+                    },
+                    test_session_context(&tmp),
+                )
+                .unwrap(),
+        );
+        toolset
+            .register_tool(
+                "server__tool".to_owned(),
+                FakeMcpTool {
+                    id: "server__tool".into(),
+                    description: "local target".into(),
+                },
+                None,
+            )
+            .unwrap();
+
+        let reconciliation = toolset.reconcile_managed_gateway_identities(&[(
+            "server__tool".to_owned(),
+            "gateway.call".to_owned(),
+        )]);
+        assert!(reconciliation.accepted.is_empty());
+        assert!(reconciliation.rejected.contains("server__tool"));
+        assert!(
+            toolset
+                .tool_definitions()
+                .iter()
+                .all(|definition| definition.function.name != "server__tool")
+        );
+        assert!(
+            toolset
+                .local_registry()
+                .find(&xai_tool_protocol::ToolId::new("server__tool").unwrap())
+                .is_some(),
+            "session-scoped revocation must not unregister a potentially shared handle"
+        );
+
+        let direct = toolset
+            .call("server__tool", serde_json::json!({}), "direct", None)
+            .await
+            .expect_err("a cross-source collision must revoke direct local dispatch");
+        assert_eq!(direct.kind, xai_tool_runtime::ToolErrorKind::NotFound);
+
+        toolset
+            .resources
+            .lock()
+            .await
+            .insert(crate::types::resources::ManagedGatewayToolCatalog(
+                HashMap::from([(
+                    "server__tool".to_owned(),
+                    crate::types::resources::ManagedGatewayToolSource {
+                        connector_id: "server".into(),
+                        connector_name: "Server".into(),
+                        tool_id: "tool".into(),
+                        tool_name: "Tool".into(),
+                        call_id: "gateway.call".into(),
+                    },
+                )]),
+            ));
+        let wrapped = toolset
+            .call(
+                "use_tool",
+                serde_json::json!({"tool_name": "server__tool", "tool_input": {}}),
+                "wrapped",
+                None,
+            )
+            .await
+            .expect_err("a rejected gateway collision must not dispatch through use_tool");
+        assert!(wrapped.detail.contains("session identity"), "{wrapped}");
+
+        let re_registration = toolset.register_tool(
+            "server__tool".to_owned(),
+            FakeMcpTool {
+                id: "server__tool".into(),
+                description: "replacement target".into(),
+            },
+            None,
+        );
+        assert!(
+            re_registration
+                .expect_err("a conflicted identity remains reserved")
+                .detail
+                .contains("reserved or conflicted")
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_gateway_collision_does_not_revoke_shared_registry_sibling() {
+        fn build_toolset(
+            tmp: &TempDir,
+            registry: xai_computer_hub_sdk::LocalRegistry,
+        ) -> Arc<FinalizedToolset> {
+            let mut builder = ToolRegistryBuilder::new();
+            builder.register::<FakeMcpTool>();
+            Arc::new(
+                builder
+                    .with_local_registry(registry)
+                    .finalize(
+                        ToolServerConfig {
+                            tools: vec![ToolConfig::from_id("MCP:server__tool")],
+                            behavior_preset: None,
+                        },
+                        test_session_context(tmp),
+                    )
+                    .expect("shared MCP fixture should finalize"),
+            )
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let registry = xai_computer_hub_sdk::LocalRegistry::new();
+        let session_a = build_toolset(&tmp, registry.clone());
+        let session_b = build_toolset(&tmp, registry.clone());
+        session_b
+            .call("server__tool", serde_json::json!({}), "before", None)
+            .await
+            .expect("sibling precondition: shared local handle dispatches");
+
+        let reconciliation = session_a.reconcile_managed_gateway_identities(&[(
+            "server__tool".to_owned(),
+            "gateway.collision".to_owned(),
+        )]);
+        assert!(reconciliation.rejected.contains("server__tool"));
+        session_a
+            .call("server__tool", serde_json::json!({}), "revoked", None)
+            .await
+            .expect_err("the colliding session must revoke its own metadata");
+        session_b
+            .call("server__tool", serde_json::json!({}), "after", None)
+            .await
+            .expect("one session's gateway collision must not break a sibling toolset");
+    }
+
+    #[tokio::test]
+    async fn restricted_local_external_dispatch_waits_for_gateway_admission() {
+        let tmp = TempDir::new().unwrap();
+        let mut trusted = crate::capability::TrustedToolCapabilities::default();
+        trusted
+            .insert_classification(
+                "docs__read",
+                xai_tool_types::ToolCapabilityDescriptor::classified([
+                    xai_tool_types::ToolEffect::NetworkRead,
+                ]),
+                crate::types::config_source::ConfigSource::Builtin,
+            )
+            .unwrap();
+        let toolset = Arc::new(
+            ToolRegistryBuilder::new()
+                .with_capability_policy(CapabilityPolicy::new(
+                    xai_tool_types::SubagentCapabilityMode::ReadOnly,
+                    trusted,
+                ))
+                .finalize(ToolServerConfig::default(), test_session_context(&tmp))
+                .unwrap(),
+        );
+        toolset
+            .register_tool(
+                "docs__read".to_owned(),
+                FakeMcpTool {
+                    id: "docs__read".into(),
+                    description: "trusted local read".into(),
+                },
+                None,
+            )
+            .unwrap();
+        toolset.begin_managed_gateway_admission();
+
+        let pending = toolset
+            .call("docs__read", serde_json::json!({}), "pending", None)
+            .await
+            .expect_err("fetch failure/pending admission must fail closed");
+        assert!(pending.detail.contains("admission completes"), "{pending}");
+
+        toolset.disable_managed_gateway_admission();
+        toolset
+            .call("docs__read", serde_json::json!({}), "disabled", None)
+            .await
+            .expect("when gateway mode is proven disabled, the trusted local tool is usable");
+    }
+
+    #[test]
+    fn managed_gateway_binding_is_stable_and_call_ids_cannot_move() {
+        let toolset = FinalizedToolset::empty_for_test();
+        let admitted = toolset.reconcile_managed_gateway_identities(&[(
+            "docs__read".to_owned(),
+            "opaque.read".to_owned(),
+        )]);
+        assert_eq!(admitted.accepted, HashSet::from(["docs__read".to_owned()]));
+        toolset
+            .external_tool_identities
+            .authorize("docs__read", "opaque.read")
+            .unwrap();
+        toolset.begin_managed_gateway_admission();
+        assert!(
+            toolset
+                .external_tool_identities
+                .authorize("docs__read", "opaque.read")
+                .is_err(),
+            "a previously admitted binding must close while refresh is pending"
+        );
+        let unchanged = toolset.reconcile_managed_gateway_identities(&[(
+            "docs__read".to_owned(),
+            "opaque.read".to_owned(),
+        )]);
+        assert_eq!(unchanged.accepted, HashSet::from(["docs__read".to_owned()]));
+        assert!(unchanged.rejected.is_empty());
+        toolset
+            .external_tool_identities
+            .authorize("docs__read", "opaque.read")
+            .unwrap();
+
+        let absent = toolset.reconcile_managed_gateway_identities(&[]);
+        assert!(absent.accepted.is_empty());
+        assert!(
+            toolset
+                .external_tool_identities
+                .authorize("docs__read", "opaque.read")
+                .is_err(),
+            "an identity omitted by the current catalog must not remain active"
+        );
+        let reappeared = toolset.reconcile_managed_gateway_identities(&[(
+            "docs__read".to_owned(),
+            "opaque.read".to_owned(),
+        )]);
+        assert_eq!(
+            reappeared.accepted,
+            HashSet::from(["docs__read".to_owned()])
+        );
+
+        let changed = toolset.reconcile_managed_gateway_identities(&[(
+            "docs__read".to_owned(),
+            "opaque.write".to_owned(),
+        )]);
+        assert!(changed.rejected.contains("docs__read"));
+        assert!(
+            toolset
+                .external_tool_identities
+                .authorize("docs__read", "opaque.read")
+                .is_err()
+        );
+
+        let second_toolset = FinalizedToolset::empty_for_test();
+        second_toolset.reconcile_managed_gateway_identities(&[(
+            "docs__read".to_owned(),
+            "opaque.shared".to_owned(),
+        )]);
+        let moved = second_toolset.reconcile_managed_gateway_identities(&[(
+            "mail__read".to_owned(),
+            "opaque.shared".to_owned(),
+        )]);
+        assert!(moved.rejected.contains("docs__read"));
+        assert!(moved.rejected.contains("mail__read"));
+        assert!(
+            second_toolset
+                .external_tool_identities
+                .authorize("docs__read", "opaque.shared")
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn call_sets_effective_tool_name_for_use_tool_dispatch() {
         let tmp = TempDir::new().unwrap();
@@ -3161,6 +4132,7 @@ mod tests {
             .register_tool(
                 "linear__save_issue".to_string(),
                 FakeMcpTool {
+                    id: "linear__save_issue".into(),
                     description: "Create or update a Linear issue".into(),
                 },
                 Some(serde_json::json!({"type": "object", "properties": {}})),
@@ -3285,13 +4257,13 @@ mod tests {
         let toolset = Arc::new(builder.finalize(config, ctx).unwrap());
         toolset
             .register_tool(
-                "stub".to_string(),
+                "non_streaming_stub".to_string(),
                 NonStreamingStub,
                 Some(serde_json::json!({"type": "object", "properties": {}})),
             )
             .unwrap();
         let result = toolset
-            .call("stub", serde_json::json!({}), "call-a", None)
+            .call("non_streaming_stub", serde_json::json!({}), "call-a", None)
             .await
             .expect("call should succeed for the non-streaming stub");
         assert!(
@@ -3318,12 +4290,13 @@ mod tests {
         let toolset = Arc::new(builder.finalize(config, ctx).unwrap());
         toolset
             .register_tool(
-                "streamer".to_string(),
+                "streaming_stub".to_string(),
                 StreamingStub,
                 Some(serde_json::json!({"type": "object", "properties": {}})),
             )
             .unwrap();
-        let mut stream = toolset.call_streaming("streamer", serde_json::json!({}), "call-b", None);
+        let mut stream =
+            toolset.call_streaming("streaming_stub", serde_json::json!({}), "call-b", None);
         let mut progress_count = 0;
         let mut terminal: Option<ToolRunResult> = None;
         while let Some(item) = stream.next().await {
@@ -3350,7 +4323,7 @@ mod tests {
             streamed.prompt_text
         );
         let via_call = toolset
-            .call("streamer", serde_json::json!({}), "call-b2", None)
+            .call("streaming_stub", serde_json::json!({}), "call-b2", None)
             .await
             .expect("call should succeed and drain progress silently");
         assert_eq!(via_call.prompt_text, streamed.prompt_text);
@@ -3432,13 +4405,18 @@ mod tests {
         let toolset = Arc::new(builder.finalize(config, ctx).unwrap());
         toolset
             .register_tool(
-                "no_terminal".to_string(),
+                "no_terminal_stub".to_string(),
                 NoTerminalStub,
                 Some(serde_json::json!({"type": "object", "properties": {}})),
             )
             .unwrap();
         let err = toolset
-            .call("no_terminal", serde_json::json!({}), "call-no-term", None)
+            .call(
+                "no_terminal_stub",
+                serde_json::json!({}),
+                "call-no-term",
+                None,
+            )
             .await
             .expect_err("empty inner stream must produce an Err, not panic");
         let msg = err.to_string();
@@ -3577,6 +4555,7 @@ mod tests {
             .register_tool(
                 "linear__save_issue".to_string(),
                 FakeMcpTool {
+                    id: "linear__save_issue".into(),
                     description: "Create or update a Linear issue".into(),
                 },
                 Some(serde_json::json!({"type": "object", "properties": {}})),

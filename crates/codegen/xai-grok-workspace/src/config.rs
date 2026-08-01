@@ -2,7 +2,7 @@
 use crate::capability::CapabilityMode;
 use crate::hub::HubConfig;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use xai_grok_tools::registry::types::{SessionContext, ToolRegistryBuilder, ToolServerConfig};
 /// Default capacity for the workspace event broadcast channel.
@@ -89,6 +89,18 @@ pub trait SessionContextFactory: Send + Sync {
     /// Build a fresh [`ToolRegistryBuilder`] with the workspace's
     /// full set of registered tools.
     fn registry_builder(&self) -> ToolRegistryBuilder;
+    /// Trusted exact-ID capability metadata for external/custom tools in a
+    /// restricted workspace session rooted at `cwd`.
+    ///
+    /// The default is empty and therefore fail closed. Embedders that expose
+    /// kind-less tools in restricted sessions must opt in with locally trusted
+    /// classifications or explicit per-tool migration overrides.
+    fn trusted_tool_capabilities(
+        &self,
+        _cwd: &Path,
+    ) -> xai_grok_tools::capability::TrustedToolCapabilities {
+        xai_grok_tools::capability::TrustedToolCapabilities::default()
+    }
     fn known_tool_ids(&self) -> Arc<std::collections::HashSet<String>> {
         Arc::new(self.registry_builder().known_tool_ids())
     }

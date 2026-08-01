@@ -2586,6 +2586,28 @@ impl WorkspaceHandle {
         }
         Some(outcome)
     }
+    fn unrestricted_session_generation_guard(
+        &self,
+        session_id: &str,
+        expected_session: &Arc<WorkspaceSession>,
+    ) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        let shared = Arc::downgrade(&self.shared);
+        let expected_session = Arc::downgrade(expected_session);
+        let session_id = session_id.to_owned();
+        Arc::new(move || {
+            let (Some(shared), Some(expected_session)) =
+                (shared.upgrade(), expected_session.upgrade())
+            else {
+                return false;
+            };
+            let sessions = shared.sessions.read();
+            sessions.get(&session_id).is_some_and(|current| {
+                Arc::ptr_eq(current, &expected_session)
+                    && current.capability_mode() == CapabilityMode::All
+            })
+        })
+    }
+
     /// Start MCP servers for a session and bridge them to the server.
     pub async fn start_session_mcp_servers(
         &self,
@@ -2600,6 +2622,28 @@ impl WorkspaceHandle {
         use xai_computer_hub_sdk::ToolServerHandler as _;
         use xai_grok_mcp::servers::MCP_TOOL_NAME_DELIMITER;
         use xai_tool_protocol::SessionId;
+        let session = self
+            .session(session_id)
+            .ok_or_else(|| WorkspaceError::SessionNotFound(session_id.to_owned()))?;
+        // ACP MCP configs carry neither a trusted server effect nor trusted
+        // exact-tool capabilities. Starting one can execute a local process,
+        // perform network/OAuth work, and expose arbitrary handlers, so the
+        // entire configure operation is unclassified and must fail closed in
+        // every restricted subagent mode. Check before hub lookup, teardown,
+        // or process startup so rejection has no observable side effects.
+        if session.capability_mode() != CapabilityMode::All {
+            return Err(WorkspaceError::CapabilityDenied {
+                session: session_id.to_owned(),
+                operation: "workspace.configure_mcp",
+                mode: session.capability_mode(),
+            });
+        }
+        let session_generation_is_current_and_unrestricted =
+            self.unrestricted_session_generation_guard(session_id, &session);
+        let _configure_guard = session.mcp_configure_lock.lock().await;
+        if !session_generation_is_current_and_unrestricted() {
+            return Err(WorkspaceError::SessionNotFound(session_id.to_owned()));
+        }
         let tool_server = {
             let hub_guard = self.shared.hub_handle.lock().await;
             let hub = hub_guard
@@ -2607,20 +2651,26 @@ impl WorkspaceHandle {
                 .ok_or_else(|| WorkspaceError::HubError("no hub connection".into()))?;
             hub.server.clone()
         };
-        let session = self
-            .session(session_id)
-            .ok_or_else(|| WorkspaceError::SessionNotFound(session_id.to_owned()))?;
         let sid = SessionId::new(session_id)
             .map_err(|e| WorkspaceError::HubError(format!("invalid session_id: {e}")))?;
         {
             let mut tool_ids = session.mcp_tool_ids.lock().await;
             for tid in tool_ids.drain(..) {
-                let _ = tool_server.unregister_tool_dynamic(&tid, &sid).await;
+                let _ = tool_server
+                    .unregister_tool_dynamic_if(
+                        &tid,
+                        &sid,
+                        session_generation_is_current_and_unrestricted.as_ref(),
+                    )
+                    .await;
             }
             let mut existing_bridges = session.mcp_bridges.lock().await;
             existing_bridges.clear();
             let mut state = session.mcp_state.lock().await;
             state.owned_clients.clear();
+        }
+        if !session_generation_is_current_and_unrestricted() {
+            return Err(WorkspaceError::SessionNotFound(session_id.to_owned()));
         }
         let session_id_owned = session_id.to_owned();
         let event_writer = self.shared.session_event_writer(session_id);
@@ -2681,6 +2731,7 @@ impl WorkspaceHandle {
                                 let qualified = match QualifiedMcpToolHandler::try_new(
                                     qualified_name.clone(),
                                     handler.clone(),
+                                    session_generation_is_current_and_unrestricted.clone(),
                                 ) {
                                     Some(h) => Arc::new(h),
                                     None => continue,
@@ -2735,6 +2786,16 @@ impl WorkspaceHandle {
                 }
             }
         }
+        if !session_generation_is_current_and_unrestricted() {
+            let _ = tool_server.prune_unavailable_tools(&sid).await;
+            for bridge in &bridges {
+                let _ = bridge.bridge.shutdown().await;
+            }
+            session.mcp_tool_ids.lock().await.clear();
+            session.mcp_bridges.lock().await.clear();
+            session.mcp_state.lock().await.owned_clients.clear();
+            return Err(WorkspaceError::SessionNotFound(session_id.to_owned()));
+        }
         {
             let mut session_bridges = session.mcp_bridges.lock().await;
             session_bridges.extend(bridges);
@@ -2772,13 +2833,25 @@ impl WorkspaceHandle {
             Some(s) => s,
             None => return,
         };
+        let session_generation_is_current_and_unrestricted =
+            self.unrestricted_session_generation_guard(session_id, &session);
+        let _configure_guard = session.mcp_configure_lock.lock().await;
+        if !session_generation_is_current_and_unrestricted() {
+            return;
+        }
         let sid = match xai_tool_protocol::SessionId::new(session_id) {
             Ok(s) => s,
             Err(_) => return,
         };
         let mut tool_ids = session.mcp_tool_ids.lock().await;
         for tid in tool_ids.drain(..) {
-            let _ = tool_server.unregister_tool_dynamic(&tid, &sid).await;
+            let _ = tool_server
+                .unregister_tool_dynamic_if(
+                    &tid,
+                    &sid,
+                    session_generation_is_current_and_unrestricted.as_ref(),
+                )
+                .await;
         }
         let mut bridges = session.mcp_bridges.lock().await;
         bridges.clear();
@@ -2901,8 +2974,11 @@ impl WorkspaceHandle {
         self.finalize_session_setup(&session).await;
         Ok(session)
     }
-    /// Remove a session.
-    pub fn drop_session(&self, caller_session_id: &str, session_id: &str) -> WorkspaceResult<()> {
+    fn remove_session_for_drop(
+        &self,
+        caller_session_id: &str,
+        session_id: &str,
+    ) -> WorkspaceResult<Arc<WorkspaceSession>> {
         if caller_session_id != session_id {
             return Err(WorkspaceError::Unauthorized {
                 caller: caller_session_id.to_owned(),
@@ -2918,7 +2994,71 @@ impl WorkspaceHandle {
         session.shutdown_terminal_backend();
         session.cancel_hunk_tracker();
         self.shared.tool_defs_last_emit.remove(session_id);
+        Ok(session)
+    }
+
+    /// Remove a session immediately and schedule generation-safe MCP cleanup.
+    /// Callers that must not acknowledge the drop before the clean snapshot is
+    /// published should use [`Self::drop_session_and_wait`].
+    pub fn drop_session(&self, caller_session_id: &str, session_id: &str) -> WorkspaceResult<()> {
+        let session = self.remove_session_for_drop(caller_session_id, session_id)?;
+        let session = Arc::downgrade(&session);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let handle = self.clone();
+            let session_id = session_id.to_owned();
+            runtime.spawn(async move {
+                handle
+                    .publish_dropped_session_mcp_cleanup(&session_id)
+                    .await;
+                if let Some(session) = session.upgrade() {
+                    Self::clear_dropped_session_mcp_resources(&session).await;
+                }
+            });
+        }
         Ok(())
+    }
+
+    /// Remove a session and wait until expired-generation MCP handlers have
+    /// been pruned and the resulting tool snapshot has been published.
+    pub async fn drop_session_and_wait(
+        &self,
+        caller_session_id: &str,
+        session_id: &str,
+    ) -> WorkspaceResult<()> {
+        let session = self.remove_session_for_drop(caller_session_id, session_id)?;
+        self.publish_dropped_session_mcp_cleanup(session_id).await;
+        Self::clear_dropped_session_mcp_resources(&session).await;
+        Ok(())
+    }
+
+    async fn publish_dropped_session_mcp_cleanup(&self, session_id: &str) {
+        let tool_server = {
+            let hub_guard = self.shared.hub_handle.lock().await;
+            hub_guard.as_ref().map(|hub| hub.server.clone())
+        };
+        if let (Some(tool_server), Ok(sid)) =
+            (tool_server, xai_tool_protocol::SessionId::new(session_id))
+            && let Err(error) = tool_server.prune_unavailable_tools(&sid).await
+        {
+            tracing::warn!(
+                %session_id,
+                %error,
+                "failed to publish MCP cleanup for dropped workspace session"
+            );
+        }
+    }
+
+    async fn clear_dropped_session_mcp_resources(session: &WorkspaceSession) {
+        let _configure_guard = session.mcp_configure_lock.lock().await;
+        session.mcp_tool_ids.lock().await.clear();
+        let bridges = {
+            let mut bridges = session.mcp_bridges.lock().await;
+            std::mem::take(&mut *bridges)
+        };
+        for bridge in &bridges {
+            let _ = bridge.bridge.shutdown().await;
+        }
+        session.mcp_state.lock().await.owned_clients.clear();
     }
     /// Re-resolve every session's toolset against `new_snapshot` and
     /// emit one `WorkspaceEvent::ToolsChanged` per session.
@@ -7255,6 +7395,117 @@ pub(crate) mod tests {
         assert!(matches!(err, WorkspaceError::EmptyAgentId), "got {err:?}");
     }
     #[tokio::test]
+    async fn unrestricted_generation_guard_rejects_reused_session_id() {
+        let handle = make_handle();
+        let original = handle.session("main").expect("fixture main session");
+        let original_guard = handle.unrestricted_session_generation_guard("main", &original);
+        assert!(original_guard());
+
+        handle.drop_session("main", "main").expect("drop original");
+        assert!(!original_guard(), "dropped generation must be revoked");
+
+        let replacement = handle
+            .create_session_with_config("main", None, None, CapabilityMode::All, None, false)
+            .expect("same-id replacement session");
+        assert!(
+            !original_guard(),
+            "same-id All replacement must not satisfy the old Arc identity"
+        );
+        let replacement_guard = handle.unrestricted_session_generation_guard("main", &replacement);
+        assert!(replacement_guard());
+    }
+
+    #[tokio::test]
+    async fn drop_cleanup_clears_old_generation_resources_written_in_flight() {
+        let handle = make_handle();
+        let original = handle.session("main").expect("fixture main session");
+        let original_guard = handle.unrestricted_session_generation_guard("main", &original);
+        let configure_guard = original.mcp_configure_lock.lock().await;
+
+        handle.drop_session("main", "main").expect("drop original");
+        handle
+            .create_session_with_config("main", None, None, CapabilityMode::ReadOnly, None, false)
+            .expect("same-id restricted replacement");
+        tokio::task::yield_now().await;
+
+        original
+            .mcp_tool_ids
+            .lock()
+            .await
+            .push(xai_tool_protocol::ToolId::new("stale__late").unwrap());
+        assert!(!original_guard(), "old configure must observe revocation");
+        drop(configure_guard);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if original.mcp_tool_ids.lock().await.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drop cleanup must clear late old-generation resources");
+    }
+
+    #[tokio::test]
+    async fn start_session_mcp_servers_requires_existing_all_session_before_side_effects() {
+        let handle = make_handle();
+
+        let missing = handle
+            .start_session_mcp_servers("missing-mcp-session", vec![])
+            .await
+            .expect_err("unknown session must fail before hub lookup");
+        assert!(
+            matches!(&missing, WorkspaceError::SessionNotFound(id) if id == "missing-mcp-session"),
+            "got {missing:?}"
+        );
+
+        for (name, mode) in [
+            ("direct-mcp-read-only", CapabilityMode::ReadOnly),
+            ("direct-mcp-read-write", CapabilityMode::ReadWrite),
+            ("direct-mcp-execute", CapabilityMode::Execute),
+        ] {
+            let session = handle
+                .create_session_with_config(name, None, None, mode, None, false)
+                .expect("restricted fixture session should be created");
+            let sentinel = xai_tool_protocol::ToolId::new("sentinel__existing").unwrap();
+            session.mcp_tool_ids.lock().await.push(sentinel.clone());
+
+            let error = handle
+                .start_session_mcp_servers(name, vec![])
+                .await
+                .expect_err("restricted configure_mcp must fail before hub lookup");
+            assert!(
+                matches!(
+                    &error,
+                    WorkspaceError::CapabilityDenied {
+                        session,
+                        operation,
+                        mode: denied_mode,
+                    } if session == name
+                        && *operation == "workspace.configure_mcp"
+                        && *denied_mode == mode
+                ),
+                "got {error:?}"
+            );
+            assert_eq!(
+                session.mcp_tool_ids.lock().await.as_slice(),
+                &[sentinel],
+                "capability denial must happen before old MCP teardown"
+            );
+        }
+
+        let all = handle
+            .start_session_mcp_servers("main", vec![])
+            .await
+            .expect_err("test fixture has no hub connection");
+        assert!(
+            matches!(&all, WorkspaceError::HubError(message) if message.contains("no hub connection")),
+            "All mode must pass the capability gate: {all:?}"
+        );
+    }
+    #[tokio::test]
     async fn fork_session_capability_widening_rejected() {
         let handle = make_handle();
         handle
@@ -7367,7 +7618,10 @@ pub(crate) mod tests {
             tools: vec![tc("DoesNotExist:nope", Some(ToolKind::Read))],
             behavior_preset: None,
         };
-        let cfg = fork_cfg_with("bogus", CapabilityMode::ReadOnly, Some(bad), Some("main"));
+        // Restricted modes intentionally drop unknown/unclassified entries
+        // before finalization. `All` retains them, so an invalid registry ID
+        // still exercises propagation of the underlying finalize error.
+        let cfg = fork_cfg_with("bogus", CapabilityMode::All, Some(bad), Some("main"));
         let err = handle
             .fork_session(cfg)
             .await

@@ -150,6 +150,52 @@ jobs:
           run_nonzero -p xai-file-utils --lib \
             upload_config_debug_redacts_all_secret_carriers -- --nocapture
 
+      - name: Restricted subagent capability boundaries
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
+              echo "test filter matched zero tests: $*" >&2
+              rm -f "$output"
+              return 1
+            }
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-tools --lib \
+            restricted_capability_matrix_finalizes_and_dispatches_with_one_policy -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            readonly_gateway_target_rejects_unclassified_and_external_mutation -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            restricted_gateway_snapshot_exposes_only_trusted_permitted_tools_per_session -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            restricted_children_reject_agent_owned_mcp_servers_before_session_spawn -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            explicit_gateway_cache_invalidation_waits_for_all_session_admissions -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            gateway_refresh_fence_prevents_stale_snapshot_reconciliation -- --nocapture
+          run_nonzero -p xai-grok-shell-session-support --lib \
+            explicit_gateway_refresh_fence_clears_only_on_fresh_commit -- --nocapture
+          run_nonzero -p xai-grok-shell-session-support --lib \
+            legacy_config_invalidation_preserves_gateway_catalog -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            subagent_trusted_tool_capabilities_render_in_human_and_json_views -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            resolve_session_toolset_mcp_kind_none_dropped_under_readonly -- --nocapture
+          run_nonzero -p xai-computer-hub-sdk --lib \
+            unavailable_handlers_are_absent_from_publish_and_dispatch -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            dispatch_configure_mcp -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            qualified_handler_fails_closed_when_session_generation_expires -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            unrestricted_generation_guard_rejects_reused_session_id -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            drop_cleanup_clears_old_generation_resources_written_in_flight -- --nocapture
+
       - name: Shell auth + readiness meta
         env:
           PROTOC: protoc

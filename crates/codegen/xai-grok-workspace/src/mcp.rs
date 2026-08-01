@@ -15,7 +15,7 @@ use xai_computer_hub_sdk::ToolServerHandler;
 use xai_grok_mcp::rmcp;
 use xai_grok_mcp::servers::{McpClient, parse_mcp_qualified_name};
 use xai_tool_protocol::ToolId;
-use xai_tool_runtime::{ToolCallContext, ToolStream, TypedToolOutput};
+use xai_tool_runtime::{ToolCallContext, ToolError, ToolStream, TypedToolOutput, terminal_only};
 use xai_tool_types::ToolDescription;
 
 /// Adapts [`McpClient`] to the [`McpTransport`] trait for [`McpBridge`].
@@ -140,11 +140,16 @@ pub(crate) struct QualifiedMcpToolHandler {
     qualified_id: ToolId,
     qualified_name: String,
     inner: Arc<McpToolHandler>,
+    session_is_current_and_unrestricted: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 impl QualifiedMcpToolHandler {
     /// Returns `None` if the qualified name is invalid or ambiguous.
-    pub fn try_new(qualified_name: String, inner: Arc<McpToolHandler>) -> Option<Self> {
+    pub fn try_new(
+        qualified_name: String,
+        inner: Arc<McpToolHandler>,
+        session_is_current_and_unrestricted: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Option<Self> {
         let qualified_id = match parse_mcp_qualified_name(&qualified_name) {
             Some((id, _, _)) => id,
             None => {
@@ -159,7 +164,22 @@ impl QualifiedMcpToolHandler {
             qualified_id,
             qualified_name,
             inner,
+            session_is_current_and_unrestricted,
         })
+    }
+
+    fn authorize_current_session(&self) -> Result<(), ToolError> {
+        if (self.session_is_current_and_unrestricted)() {
+            Ok(())
+        } else {
+            Err(ToolError::custom(
+                "tool_capability_denied",
+                format!(
+                    "Tool {} is no longer authorized for the current workspace session",
+                    self.qualified_name
+                ),
+            ))
+        }
     }
 }
 
@@ -178,7 +198,14 @@ impl ToolServerHandler for QualifiedMcpToolHandler {
         self.inner.input_schema()
     }
 
+    fn is_available(&self) -> bool {
+        (self.session_is_current_and_unrestricted)()
+    }
+
     async fn handle_call(&self, ctx: ToolCallContext, args: Value) -> ToolStream<TypedToolOutput> {
+        if let Err(error) = self.authorize_current_session() {
+            return terminal_only(Err(error));
+        }
         self.inner.handle_call(ctx, args).await
     }
 }
@@ -268,9 +295,47 @@ mod tests {
         .bridge;
         let inner = bridge.handlers()[0].clone();
 
-        let valid = QualifiedMcpToolHandler::try_new("123__lookup".to_owned(), inner.clone())
-            .expect("valid qualified ToolId");
+        let available: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| true);
+        let valid = QualifiedMcpToolHandler::try_new(
+            "123__lookup".to_owned(),
+            inner.clone(),
+            available.clone(),
+        )
+        .expect("valid qualified ToolId");
         assert_eq!(valid.tool_id().as_str(), "123__lookup");
-        assert!(QualifiedMcpToolHandler::try_new("foo___bar".to_owned(), inner).is_none());
+        assert!(valid.is_available());
+        assert!(
+            QualifiedMcpToolHandler::try_new("foo___bar".to_owned(), inner, available).is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn qualified_handler_fails_closed_when_session_generation_expires() {
+        let bridge = McpBridge::connect(
+            Arc::new(TestTransport),
+            &make_bridge_config(SessionId::new("session").unwrap(), "test"),
+        )
+        .await
+        .unwrap()
+        .bridge;
+        let handler = QualifiedMcpToolHandler::try_new(
+            "test__tool".to_owned(),
+            bridge.handlers()[0].clone(),
+            Arc::new(|| false),
+        )
+        .expect("valid qualified handler");
+        assert!(!handler.is_available());
+        let mut stream = handler
+            .handle_call(
+                ToolCallContext::new(xai_tool_protocol::ToolCallId::new_v7()),
+                serde_json::json!({}),
+            )
+            .await;
+        use futures::StreamExt as _;
+        assert!(matches!(
+            stream.next().await,
+            Some(xai_tool_runtime::ToolStreamItem::Terminal(Err(error)))
+                if error.detail.contains("no longer authorized")
+        ));
     }
 }

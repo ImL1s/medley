@@ -907,15 +907,11 @@ async fn handle_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         .and_then(|sid| agent.get_session_cwd(&acp::SessionId::new(sid.clone())))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-    // NOTE: `invalidate_cache` must remain O(μs) (in-memory `Mutex` clear)
-    // so this serial pre-step does not eat into the latency budget. If
-    // it ever grows IO (fsync, contended lock, network), fold it into the
-    // managed-fetch arm of the `tokio::join!` below instead of keeping it
-    // here — otherwise the cache=false path silently re-introduces the
-    // sequential ~500ms+ gap the concurrent layout removed.
+    // Only the legacy managed-config cache is cleared here. Gateway cache
+    // invalidation must wait for every live session to apply its fail-closed
+    // admission barrier, so it stays inside the concurrent gateway arm below.
     if !req.cache {
-        crate::session::managed_mcp::invalidate_cache(agent.managed_mcp_cache()).await;
-        crate::session::managed_mcp::invalidate_gateway_tool_cache(agent.managed_mcp_cache()).await;
+        agent.invalidate_managed_mcp_config_cache().await;
     }
 
     // Resolve the session handle synchronously up front so the session-state
@@ -947,7 +943,11 @@ async fn handle_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         agent.get_managed_mcp_configs(),
         async {
             if gateway_tools_enabled {
-                agent.get_managed_mcp_gateway_tool_catalog().await
+                if cache {
+                    agent.get_managed_mcp_gateway_tool_catalog().await
+                } else {
+                    agent.refresh_managed_mcp_gateway_tool_catalog().await
+                }
             } else {
                 None
             }
@@ -972,15 +972,9 @@ async fn handle_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         if managed_ready {
             agent.sync_fresh_managed_mcp_to_sessions(&managed_configs);
         }
-        // 2. Agent-level gateway catalog -> session `search_tool` index. Only
-        //    when a fresh gateway catalog committed (`Some`); a failed refetch is
-        //    `None` and must not wipe the last-good index. This must fire even
-        //    when `managed_ready` is false: in gateway mode the legacy managed
-        //    cache stays `NotFetched`, yet the fresh gateway catalog still needs
-        //    a session-side rebuild.
-        if gateway_catalog.is_some() {
-            agent.refresh_mcp_search_index_in_sessions();
-        }
+        // Gateway catalog fetches own their matching session refresh. On a
+        // failed explicit refetch they deliberately refresh against NotFetched
+        // so restricted external dispatch remains pending.
     }
 
     let compat = agent.cfg.borrow().compat_resolved;
@@ -1743,7 +1737,8 @@ async fn handle_toggle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
             .server_name
             .starts_with(crate::session::managed_mcp::MANAGED_MCP_PREFIX)
         {
-            crate::session::managed_mcp::invalidate_cache(agent.managed_mcp_cache()).await;
+            crate::session::managed_mcp::invalidate_managed_config_cache(agent.managed_mcp_cache())
+                .await;
         }
         let managed_configs = agent.get_managed_mcp_configs().await;
         if let Err(e) =

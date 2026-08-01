@@ -207,20 +207,23 @@ pub fn is_valid_resume_id(s: &str) -> bool {
 /// Extension methods for [`SubagentCapabilityMode`] that depend on this crate's
 /// tool-config internals (`ToolKind` / `ToolServerConfig`).
 pub trait SubagentCapabilityModeExt {
-    /// Filter a tool config to only include tools allowed by this mode.
+    /// Legacy built-in-only filter for callers that do not have a
+    /// [`CapabilityPolicy`](crate::capability::CapabilityPolicy).
     ///
     /// Uses the `kind` field on each `ToolConfig`, populated automatically
     /// by `for_tool::<T>()` / `From<&T: Tool>` at toolset construction time.
-    /// Tools without a `kind` (e.g. MCP/custom tools via
-    /// `ToolConfig::from_id()`) are preserved unconditionally.
+    /// Restricted modes fail closed for tools without a `kind`. Production
+    /// agent construction must instead use the policy-aware final gate so
+    /// trusted exact-ID external tools can be classified before filtering.
     fn filter_tool_config(self, config: &mut crate::registry::types::ToolServerConfig);
 
     /// Return the set of `ToolKind`s allowed under this capability mode.
     fn allowed_tool_kinds(self) -> &'static [crate::types::tool::ToolKind];
 }
 
-/// Prune background-task lifecycle tools (`get_task_output` / `kill_task`) when
-/// no tool that can spawn background work remains in the config.
+/// Prune background-task lifecycle tools (`get_task_output`, `wait_tasks`, and
+/// `kill_task`) when no tool that can spawn background work remains in the
+/// config.
 pub fn prune_orphaned_background_task_tools(config: &mut crate::registry::types::ToolServerConfig) {
     use crate::types::tool::ToolKind;
 
@@ -236,7 +239,11 @@ pub fn prune_orphaned_background_task_tools(config: &mut crate::registry::types:
     config.tools.retain(|tc| {
         !matches!(
             tc.kind,
-            Some(ToolKind::BackgroundTaskAction | ToolKind::KillTaskAction)
+            Some(
+                ToolKind::BackgroundTaskAction
+                    | ToolKind::WaitTasksAction
+                    | ToolKind::KillTaskAction
+            )
         )
     });
 }
@@ -262,7 +269,7 @@ impl SubagentCapabilityModeExt for SubagentCapabilityMode {
         let allowed = self.allowed_tool_kinds();
         config.tools.retain(|tc| match tc.kind {
             Some(k) => allowed.contains(&k),
-            None => true,
+            None => false,
         });
         prune_orphaned_background_task_tools(config);
     }
@@ -1114,6 +1121,7 @@ mod tests {
                 tc("GrokBuild:grep", ToolKind::Search),
                 tc("GrokBuild:kill_task", ToolKind::KillTaskAction),
                 tc("GrokBuild:get_task_output", ToolKind::BackgroundTaskAction),
+                tc("GrokBuild:wait_tasks", ToolKind::WaitTasksAction),
             ],
             behavior_preset: None,
         };
@@ -1129,6 +1137,24 @@ mod tests {
                 "GrokBuild:grep",
             ]
         );
+    }
+
+    #[test]
+    fn explicit_prune_removes_every_lifecycle_tool_without_a_spawner() {
+        let mut config = ToolServerConfig {
+            tools: vec![
+                tc("GrokBuild:read_file", ToolKind::Read),
+                tc("GrokBuild:get_task_output", ToolKind::BackgroundTaskAction),
+                tc("GrokBuild:wait_tasks", ToolKind::WaitTasksAction),
+                tc("GrokBuild:kill_task", ToolKind::KillTaskAction),
+            ],
+            behavior_preset: None,
+        };
+
+        super::prune_orphaned_background_task_tools(&mut config);
+
+        let ids: Vec<&str> = config.tools.iter().map(|tool| tool.id.as_str()).collect();
+        assert_eq!(ids, vec!["GrokBuild:read_file"]);
     }
 
     #[test]
@@ -1199,6 +1225,22 @@ mod tests {
             config.tools.is_empty(),
             "execute tools should still be filtered out"
         );
+    }
+
+    #[test]
+    fn restricted_legacy_filter_fails_closed_for_tools_without_kind() {
+        let mut config = ToolServerConfig {
+            tools: vec![
+                tc("GrokBuild:read_file", ToolKind::Read),
+                ToolConfig::from_id("trusted-external:read"),
+            ],
+            behavior_preset: None,
+        };
+
+        SubagentCapabilityMode::ReadOnly.filter_tool_config(&mut config);
+
+        let ids: Vec<&str> = config.tools.iter().map(|tc| tc.id.as_str()).collect();
+        assert_eq!(ids, vec!["GrokBuild:read_file"]);
     }
 
     #[test]

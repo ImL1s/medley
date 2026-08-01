@@ -174,6 +174,100 @@ async fn subagent_spawn_context_inherits_parent_configured_cutoff() {
     );
 }
 
+#[tokio::test]
+async fn nested_spawn_uses_immediate_parent_security_after_lifecycle_reparenting() {
+    use std::sync::Arc;
+    use xai_tool_types::SubagentCapabilityMode;
+
+    let agent = build_minimal_agent_for_tests();
+    let lifecycle_sid = acp::SessionId::new("root-lifecycle-parent");
+    let mut lifecycle = make_test_handle("root-model", true, None);
+    lifecycle.info.cwd = "/main-checkout".to_owned();
+    let lifecycle_scope = xai_tty_utils::ProcessScope::new();
+    let lifecycle_owner = Arc::new(xai_tty_utils::ProcessGroup::new().expect("process group"));
+    lifecycle_scope.register(&lifecycle_owner);
+    lifecycle.tool_context.process_scope = Some(lifecycle_scope);
+    agent
+        .sessions
+        .borrow_mut()
+        .insert(lifecycle_sid.clone(), lifecycle);
+
+    let immediate_sid = acp::SessionId::new("execute-immediate-parent");
+    let mut immediate = make_test_handle("immediate-model", false, None);
+    let immediate_cwd = std::path::PathBuf::from("/isolated-worktree");
+    immediate.info.cwd = immediate_cwd.to_string_lossy().into_owned();
+    let immediate_terminal: Arc<dyn crate::terminal::AsyncTerminalRunner> =
+        Arc::new(crate::terminal::LocalTerminalRunner);
+    immediate.tool_context = crate::tools::ToolContext::new_local_context(
+        xai_grok_paths::AbsPathBuf::new(immediate_cwd.clone()).unwrap(),
+        Arc::new(xai_grok_workspace::file_system::LocalFs::new(
+            immediate_cwd.clone(),
+        )),
+        immediate_terminal.clone(),
+    );
+    immediate.tool_context.session_env = Arc::new(std::collections::HashMap::from([(
+        "SPAWN_SCOPE".to_owned(),
+        "immediate".to_owned(),
+    )]));
+    immediate.capability_mode = Some(SubagentCapabilityMode::Execute);
+    immediate.tool_context.subagent_depth = 1;
+    let cutoff = xai_grok_sampling_types::ToolOverrides {
+        x_search: None,
+        web_search: None,
+    };
+    immediate
+        .resolved_tool_overrides
+        .store(Some(std::sync::Arc::new(cutoff.clone())));
+    agent
+        .sessions
+        .borrow_mut()
+        .insert(immediate_sid.clone(), immediate);
+
+    let (ctx, _) = agent
+        .try_build_subagent_spawn_context_for_run(
+            lifecycle_sid.0.as_ref(),
+            immediate_sid.0.as_ref(),
+        )
+        .expect("both lifecycle and immediate parent sessions exist");
+
+    assert_eq!(ctx.parent_session_id, lifecycle_sid.0.as_ref());
+    assert_eq!(ctx.model_id.0.as_ref(), "immediate-model");
+    assert_eq!(ctx.parent_cwd, immediate_cwd);
+    assert_eq!(
+        ctx.parent_session_info.as_ref().map(|info| info.cwd.as_str()),
+        Some("/isolated-worktree")
+    );
+    assert_eq!(ctx.fs.root(), std::path::Path::new("/isolated-worktree"));
+    assert!(Arc::ptr_eq(&ctx.terminal, &immediate_terminal));
+    assert_eq!(
+        ctx.session_env.get("SPAWN_SCOPE").map(String::as_str),
+        Some("immediate")
+    );
+    assert!(
+        !ctx.yolo_mode,
+        "a root YOLO setting must not widen an immediate parent's permissions"
+    );
+    assert_eq!(
+        ctx.process_scope
+            .as_ref()
+            .expect("lifecycle process scope must remain root-owned")
+            .live_count(),
+        1
+    );
+    assert_eq!(ctx.parent_capability_mode, Some(SubagentCapabilityMode::Execute));
+    assert_eq!(ctx.parent_depth, 1);
+    assert_eq!(ctx.inherited_tool_overrides, Some(cutoff));
+    assert_eq!(
+        xai_grok_subagent_resolution::intersect_capability_mode_ceiling(
+            Some(SubagentCapabilityMode::All),
+            Some(SubagentCapabilityMode::All),
+            ctx.parent_capability_mode,
+        ),
+        Some(SubagentCapabilityMode::Execute),
+        "an All grandchild request must remain under the immediate Execute parent ceiling"
+    );
+}
+
 /// A subagent inherits the parent's `process_scope`, so an owner enrolled through it stays visible via the child.
 /// End-to-end reaping is covered by the spine's `process_scope_reclaim` tests.
 #[tokio::test]

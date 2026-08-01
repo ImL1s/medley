@@ -113,6 +113,9 @@ pub struct AgentBuilder {
     plugin_registry: Option<std::sync::Arc<crate::plugins::PluginRegistry>>,
     context_window_tokens: Option<u64>,
     api_key_provider: Option<xai_grok_tools::types::SharedApiKeyProvider>,
+    /// Final capability policy applied after every tool injection and retained
+    /// by the finalized toolset for dynamic registration/dispatch checks.
+    capability_policy: Option<xai_grok_tools::capability::CapabilityPolicy>,
     attribution_callback: Option<xai_grok_tools::SharedAttributionCallback>,
     /// Session-scoped MCP tool-result inline cap (bytes). When `Some`, seeded
     /// into the toolset's `TruncationCfg` resource after finalize, where the
@@ -250,6 +253,7 @@ impl AgentBuilder {
             plugin_registry: None,
             context_window_tokens: None,
             api_key_provider: None,
+            capability_policy: None,
             attribution_callback: None,
             mcp_max_output_bytes: None,
             system_reminder_tag: xai_grok_tools::reminders::DEFAULT_REMINDER_TAG,
@@ -509,6 +513,14 @@ impl AgentBuilder {
         provider: xai_grok_tools::types::SharedApiKeyProvider,
     ) -> Self {
         self.api_key_provider = Some(provider);
+        self
+    }
+
+    pub fn with_capability_policy(
+        mut self,
+        policy: xai_grok_tools::capability::CapabilityPolicy,
+    ) -> Self {
+        self.capability_policy = Some(policy);
         self
     }
     /// Set the 401-attribution callback for tool HTTP clients
@@ -1021,10 +1033,28 @@ impl AgentBuilder {
                 }
             }
         }
+        let capability_policy = self.capability_policy.take().unwrap_or_else(|| {
+            xai_grok_tools::capability::CapabilityPolicy::new(
+                definition
+                    .capability_mode
+                    .unwrap_or(xai_tool_types::SubagentCapabilityMode::All),
+                xai_grok_tools::capability::TrustedToolCapabilities::default(),
+            )
+        });
+        // Capability filtering must be the last tool-config transformation:
+        // default/tool-feature injection and allowlist normalization above can
+        // otherwise reintroduce tools after the definition was pre-filtered.
+        capability_policy.filter_tool_config(&mut tool_config);
+        // Always re-prune lifecycle helpers after the final gate, including
+        // unrestricted agents whose task/bash tools were removed by other
+        // configuration gates.
+        xai_grok_tools::implementations::grok_build::task::types::prune_orphaned_background_task_tools(
+            &mut tool_config,
+        );
         let use_backend_search = self.backend_search;
         let web_search_enabled = self.web_search_config.is_enabled();
         let tool_bridge = ToolBridge::finalize_builder(
-            tool_bridge_builder,
+            tool_bridge_builder.with_capability_policy(capability_policy),
             tool_config,
             SessionContext {
                 backend: self.terminal_backend,
@@ -1780,6 +1810,44 @@ mod tests {
                 )
             }
         }
+    }
+
+    #[tokio::test]
+    async fn final_builder_gate_filters_tools_injected_after_definition_resolution() {
+        use xai_grok_tools::computer::local::LocalTerminalBackend;
+        use xai_grok_tools::notification::ToolNotificationHandle;
+        use xai_tool_types::SubagentCapabilityMode;
+
+        let mut profile = crate::config::AgentDefinition::default_grok_build();
+        profile.capability_mode = Some(SubagentCapabilityMode::ReadOnly);
+        let agent = AgentBuilder::new(
+            std::env::temp_dir(),
+            Arc::new(LocalTerminalBackend::new()),
+            ToolNotificationHandle::noop(),
+        )
+        .from_definition(profile)
+        .with_subagents_enabled(true)
+        .build()
+        .await
+        .expect("restricted agent should build");
+
+        let names: Vec<String> = agent
+            .tool_definitions()
+            .await
+            .iter()
+            .map(|tool| tool.function.name.clone())
+            .collect();
+        assert!(names.iter().any(|name| name == "read_file"), "{names:?}");
+        assert!(
+            !names
+                .iter()
+                .any(|name| name == "write" || name == "search_replace"),
+            "write-capable injected tools survived final ReadOnly gate: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == "spawn_subagent"),
+            "subagent spawn survived final ReadOnly gate: {names:?}"
+        );
     }
     /// The ask_user_question params merge must run after `ensure_plan_mode_tools`:
     /// a profile that does NOT pre-declare the tool still gets the shell-resolved

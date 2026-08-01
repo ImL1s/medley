@@ -509,7 +509,7 @@ impl WorkspaceRpcHandler {
                     .get("session_id")
                     .and_then(Value::as_str)
                     .ok_or_else(|| WorkspaceError::HubError("missing session_id".into()))?;
-                let result = self.workspace.drop_session(caller, target);
+                let result = self.workspace.drop_session_and_wait(caller, target).await;
                 record_mutation_rpc("drop_session", caller, target, &result);
                 result.map(|()| Value::Null)
             }
@@ -657,38 +657,17 @@ impl WorkspaceRpcHandler {
                         .unwrap_or(Value::Array(vec![])),
                 )
                 .map_err(|e| WorkspaceError::HubError(format!("invalid mcp_servers: {e}")))?;
-                let result = async {
-                    if self.workspace.session(session_id).is_none() {
-                        tracing::info!(
-                            session_id,
-                            "workspace.configure_mcp: session not found, creating on demand"
-                        );
-                        match self
-                            .workspace
-                            .create_session_with_config(
-                                session_id,
-                                None,
-                                None,
-                                crate::capability::CapabilityMode::All,
-                                None,
-                                true,
-                            )
-                        {
-                            Ok(session) => {
-                                self.workspace.finalize_session_setup(&session).await;
-                            }
-                            Err(WorkspaceError::SessionAlreadyExists(_)) => {
-                                tracing::debug!(
-                                    session_id,
-                                    "workspace.configure_mcp: session created concurrently, using existing"
-                                );
-                            }
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    self.workspace.start_session_mcp_servers(session_id, configs).await
-                }
-                    .await;
+                // A successful bind resolver creates or revives the workspace
+                // session before this RPC becomes reachable. Missing state is
+                // therefore stale/racy identity, never authority to invent a
+                // replacement session with unrestricted capabilities.
+                let result = if self.workspace.session(session_id).is_none() {
+                    Err(WorkspaceError::SessionNotFound(session_id.to_owned()))
+                } else {
+                    self.workspace
+                        .start_session_mcp_servers(session_id, configs)
+                        .await
+                };
                 record_mutation_rpc("configure_mcp", "self", session_id, &result);
                 serde_json::to_value(&result?)
                     .map_err(|e| WorkspaceError::HubError(format!("serialize McpStartResult: {e}")))
@@ -2031,25 +2010,86 @@ mod tests {
             "the target session must survive"
         );
     }
-    /// `configure_mcp`'s on-demand session create opts into system
-    /// notifications, like every other sandbox-path creator.
+    /// A stale bound identity cannot make `configure_mcp` invent an
+    /// unrestricted workspace session.
     #[tokio::test]
-    async fn dispatch_configure_mcp_on_demand_create_enables_system_notifications() {
+    async fn dispatch_configure_mcp_missing_session_fails_closed_without_creation() {
         let handle = make_handle();
         let handler = WorkspaceRpcHandler::new(handle.clone());
-        let _ = handler
+        let result = handler
             .dispatch(
                 "workspace.configure_mcp",
                 serde_json::json!({"mcp_servers": []}),
                 Some("mcp-fresh"),
             )
             .await;
-        let session = handle
-            .session("mcp-fresh")
-            .expect("session created on demand");
         assert!(
-            session.system_notifications(),
-            "the on-demand created session must forward system notifications"
+            matches!(&result, Err(WorkspaceError::SessionNotFound(id)) if id == "mcp-fresh"),
+            "missing session must fail closed, got {result:?}"
+        );
+        assert!(
+            handle.session("mcp-fresh").is_none(),
+            "configure_mcp must never create an All-capability replacement session"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_configure_mcp_rejects_every_restricted_mode_before_teardown() {
+        let handle = make_handle();
+        let handler = WorkspaceRpcHandler::new(handle.clone());
+        for (name, mode) in [
+            ("mcp-read-only", CapabilityMode::ReadOnly),
+            ("mcp-read-write", CapabilityMode::ReadWrite),
+            ("mcp-execute", CapabilityMode::Execute),
+        ] {
+            let session = handle
+                .create_session_with_config(name, None, None, mode, None, false)
+                .expect("restricted fixture session should be created");
+            let sentinel = xai_tool_protocol::ToolId::new("sentinel__existing").unwrap();
+            session.mcp_tool_ids.lock().await.push(sentinel.clone());
+
+            let result = handler
+                .dispatch(
+                    "workspace.configure_mcp",
+                    serde_json::json!({"mcp_servers": []}),
+                    Some(name),
+                )
+                .await;
+            assert!(
+                matches!(
+                    &result,
+                    Err(WorkspaceError::CapabilityDenied {
+                        session,
+                        operation,
+                        mode: denied_mode,
+                    }) if session == name
+                        && *operation == "workspace.configure_mcp"
+                        && *denied_mode == mode
+                ),
+                "restricted {mode:?} configure_mcp must fail closed, got {result:?}"
+            );
+            assert_eq!(
+                session.mcp_tool_ids.lock().await.as_slice(),
+                &[sentinel],
+                "rejection must happen before existing MCP teardown"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_configure_mcp_all_mode_reaches_hub_boundary() {
+        let handle = make_handle();
+        let handler = WorkspaceRpcHandler::new(handle);
+        let result = handler
+            .dispatch(
+                "workspace.configure_mcp",
+                serde_json::json!({"mcp_servers": []}),
+                Some("main"),
+            )
+            .await;
+        assert!(
+            matches!(&result, Err(WorkspaceError::HubError(message)) if message.contains("no hub connection")),
+            "All mode should pass the capability gate and reach the missing-hub fixture boundary: {result:?}"
         );
     }
     #[tokio::test]

@@ -372,10 +372,24 @@ pub(crate) async fn run_shell_child(
             "Resolved runtime overrides for subagent"
         );
     }
-    effective_runtime.capability_mode = xai_grok_subagent_resolution::intersect_capability_modes(
-        effective_runtime.capability_mode,
-        definition.capability_mode,
-    );
+    effective_runtime.capability_mode =
+        xai_grok_subagent_resolution::intersect_capability_mode_ceiling(
+            effective_runtime.capability_mode,
+            definition.capability_mode,
+            ctx.parent_capability_mode,
+        );
+    definition.capability_mode = effective_runtime.capability_mode;
+    if let Some(error) =
+        agent_owned_mcp_server_admission_error(&definition, effective_runtime.capability_mode)
+    {
+        tracing::warn!(
+            subagent_id = %request.id,
+            agent = %definition.name,
+            capability_mode = ?effective_runtime.capability_mode,
+            "Rejected agent-owned MCP server startup for restricted subagent"
+        );
+        return child_run_output(failure_result(&request, error), completion_data, None);
+    }
     let child_depth = request
         .runtime_overrides
         .spawn_depth
@@ -391,8 +405,7 @@ pub(crate) async fn run_shell_child(
         tracing::info!(
             subagent_id = %request.id,
             capability_mode = ?mode,
-            tools_remaining = definition.tool_config.tools.len(),
-            "Applied capability mode filter to agent tool config"
+            "Deferred capability enforcement to the final agent tool policy"
         );
     }
     if !allow_nested_subagents && definition.tool_config.tools.len() < tools_before_policy {

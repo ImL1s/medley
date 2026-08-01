@@ -1753,6 +1753,14 @@ pub(super) async fn run_session(
                                 let _ = respond_to.send(());
                             });
                         }
+                        SessionCommand::BeginManagedGatewayAdmission { respond_to } => {
+                            session
+                                .agent
+                                .borrow()
+                                .tool_bridge()
+                                .begin_managed_gateway_admission();
+                            let _ = respond_to.send(());
+                        }
                         SessionCommand::RefreshMcpSearchIndex => {
                             session.refresh_mcp_snapshot_and_schedule_reminder().await;
                         }

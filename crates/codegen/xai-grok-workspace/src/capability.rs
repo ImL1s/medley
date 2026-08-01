@@ -34,17 +34,14 @@ impl CapabilityMode {
     /// Filter `config.tools` by capability mode, returning a copy with
     /// disallowed tools dropped.
     ///
-    /// Tools whose `kind` is `None` (baseline, e.g. ad-hoc tools
-    /// declared via `ToolConfig::simple`) are preserved across all
-    /// modes. **MCP-origin** `kind: None` tools are NOT preserved by
-    /// this method; see `resolve_session_toolset` for the asymmetric
-    /// handling.
+    /// Tools whose `kind` is `None` are unclassified and therefore rejected
+    /// by every restricted mode. `All` remains the explicit escape hatch.
     pub fn filter(self, config: &ToolServerConfig) -> ToolServerConfig {
         let kept: Vec<ToolConfig> = config
             .tools
             .iter()
             .filter(|tool| match tool.kind {
-                None => true,
+                None => matches!(self, CapabilityMode::All),
                 Some(kind) => kind_allowed(self, kind),
             })
             .cloned()
@@ -64,6 +61,28 @@ impl CapabilityMode {
             }
         }
         true
+    }
+}
+
+impl From<CapabilityMode> for xai_tool_types::SubagentCapabilityMode {
+    fn from(value: CapabilityMode) -> Self {
+        match value {
+            CapabilityMode::ReadOnly => Self::ReadOnly,
+            CapabilityMode::ReadWrite => Self::ReadWrite,
+            CapabilityMode::Execute => Self::Execute,
+            CapabilityMode::All => Self::All,
+        }
+    }
+}
+
+impl From<xai_tool_types::SubagentCapabilityMode> for CapabilityMode {
+    fn from(value: xai_tool_types::SubagentCapabilityMode) -> Self {
+        match value {
+            xai_tool_types::SubagentCapabilityMode::ReadOnly => Self::ReadOnly,
+            xai_tool_types::SubagentCapabilityMode::ReadWrite => Self::ReadWrite,
+            xai_tool_types::SubagentCapabilityMode::Execute => Self::Execute,
+            xai_tool_types::SubagentCapabilityMode::All => Self::All,
+        }
     }
 }
 
@@ -245,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_mode_baseline_kind_none_always_kept_via_filter() {
+    fn capability_mode_baseline_kind_none_fails_closed_outside_all() {
         let cfg = make_cfg(vec![
             test_support::tc("baseline.opaque", None),
             test_support::tc("baseline.also_opaque", None),
@@ -256,19 +275,23 @@ mod tests {
             CapabilityMode::ReadOnly,
             CapabilityMode::ReadWrite,
             CapabilityMode::Execute,
-            CapabilityMode::All,
         ] {
             let filtered = mode.filter(&cfg);
             let ids: Vec<&str> = filtered.tools.iter().map(|t| t.id.as_str()).collect();
             assert!(
-                ids.contains(&"baseline.opaque"),
-                "kind: None tool dropped under {mode:?}: {ids:?}"
+                !ids.contains(&"baseline.opaque"),
+                "unclassified tool survived restricted {mode:?}: {ids:?}"
             );
             assert!(
-                ids.contains(&"baseline.also_opaque"),
-                "kind: None tool dropped under {mode:?}: {ids:?}"
+                !ids.contains(&"baseline.also_opaque"),
+                "unclassified tool survived restricted {mode:?}: {ids:?}"
             );
         }
+
+        let all = CapabilityMode::All.filter(&cfg);
+        let ids: Vec<&str> = all.tools.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(&"baseline.opaque"));
+        assert!(ids.contains(&"baseline.also_opaque"));
     }
 
     #[test]

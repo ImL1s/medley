@@ -170,6 +170,13 @@ pub trait ToolServerHandler: Send + Sync + 'static {
         None
     }
 
+    /// Live publish/dispatch predicate for handlers whose authority can expire
+    /// independently of their registration. Must be fast, synchronous, and
+    /// side-effect free. The default keeps static handlers available.
+    fn is_available(&self) -> bool {
+        true
+    }
+
     /// Execute one tool call.
     ///
     /// Implementations MUST honour the [`ToolStream`] invariant: zero
@@ -205,6 +212,38 @@ pub trait ToolServerHandler: Send + Sync + 'static {
     /// server force-closes the connection. Default is a no-op.
     #[allow(unused_variables)]
     async fn handle_evict(&self, params: ToolServerEvictParams) {}
+}
+
+fn available_tool_descriptions(
+    handlers: &[Arc<dyn ToolServerHandler>],
+) -> Vec<xai_tool_protocol::ToolDescriptionWithSchema> {
+    handlers
+        .iter()
+        .filter(|handler| handler.is_available())
+        .map(|handler| xai_tool_protocol::ToolDescriptionWithSchema {
+            description: handler.description(),
+            input_schema: handler.input_schema(),
+            capabilities: None,
+            notification_schemas: None,
+        })
+        .collect()
+}
+
+fn available_bind_descriptions(handlers: &[Arc<dyn ToolServerHandler>]) -> Vec<ToolDescription> {
+    handlers
+        .iter()
+        .filter(|handler| handler.is_available())
+        .map(|handler| handler.description())
+        .collect()
+}
+
+fn find_available_handler<'a>(
+    handlers: &'a [Arc<dyn ToolServerHandler>],
+    tool_id: &ToolId,
+) -> Option<&'a Arc<dyn ToolServerHandler>> {
+    handlers
+        .iter()
+        .find(|handler| handler.tool_id() == *tool_id && handler.is_available())
 }
 
 /// Builder for [`ToolServer`]. See module docs for end-to-end usage.
@@ -542,8 +581,7 @@ impl ToolServerBuilder {
             parsed_notif_tx: Arc::new(parking_lot::Mutex::new(None)),
             session_handles: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             active_sessions,
-            dynamic_tool_mu: tokio::sync::Mutex::new(()),
-            session_bind_mu: tokio::sync::Mutex::new(()),
+            session_publication_mu: tokio::sync::Mutex::new(()),
             reconnect_notify,
             on_reconnect_settled: self.on_reconnect_settled,
             disconnect_epoch,
@@ -609,16 +647,16 @@ struct ToolServerInner {
     session_handles: Arc<parking_lot::Mutex<HashMap<SessionId, tokio::task::JoinHandle<()>>>>,
     /// All sessions currently active on this server.
     active_sessions: parking_lot::Mutex<Vec<SessionId>>,
-    /// Serializes `register_tool_dynamic` / `unregister_tool_dynamic`.
-    /// `tokio::sync::Mutex` because the critical section spans `.await`.
-    dynamic_tool_mu: tokio::sync::Mutex<()>,
-    /// Serializes session binds against each other and against
-    /// `unbind_session`, so the soft-rebind liveness decision and the
-    /// destructive full-rebind setup are atomic (no check-then-act race
-    /// between two concurrent binds, and no unbind sneaking between a
-    /// bind's liveness check and its return). Binds/unbinds are rare
-    /// lifecycle events; a global mutex is contention-free in practice.
-    session_bind_mu: tokio::sync::Mutex<()>,
+    /// Serializes every session-handler mutation with every publication of
+    /// that handler set. The critical section deliberately spans outbound
+    /// `serve` / `session.bind` writes: otherwise an older snapshot can be
+    /// built before a drop/rebind and arrive after the newer restricted
+    /// snapshot, resurrecting stale tool discoverability.
+    ///
+    /// Binds, unbinds, dynamic registration, dynamic removal, pruning and
+    /// reconnect replay are rare lifecycle operations, so one global mutex is
+    /// preferable to a cross-mutex ordering protocol that can drift.
+    session_publication_mu: tokio::sync::Mutex<()>,
     /// Signalled by the on_reconnect callback so `run()` can replay
     /// `serve` for every active session after a reconnect.
     reconnect_notify: Arc<tokio::sync::Notify>,
@@ -733,8 +771,10 @@ impl ToolServer {
     /// 2. **Publish** (`serve`): send a `serve` frame to the server with
     ///    the full tool snapshot so harnesses see the tools immediately.
     pub async fn bind_session(&self, session_id: SessionId) -> Result<(), ClientError> {
-        self.bind_session_local(session_id.clone()).await?;
-        self.serve(session_id).await
+        let _publication_guard = self.inner().session_publication_mu.lock().await;
+        self.bind_session_local_with_metadata_locked(session_id.clone(), None)
+            .await?;
+        self.serve_locked(session_id).await
     }
 
     /// Register a session on the connection, create the demux inbox,
@@ -770,9 +810,20 @@ impl ToolServer {
         session_id: SessionId,
         bind_params: Option<serde_json::Value>,
     ) -> Result<(), ClientError> {
-        // Serialized against other binds and `unbind_session` so the
-        // liveness decision below cannot race a concurrent bind/teardown.
-        let _bind_guard = self.inner().session_bind_mu.lock().await;
+        let _publication_guard = self.inner().session_publication_mu.lock().await;
+        self.bind_session_local_with_metadata_locked(session_id, bind_params)
+            .await
+    }
+
+    /// Local bind implementation. The caller must hold
+    /// `session_publication_mu` until any snapshot derived from this state has
+    /// been sent, so a newer restricted generation cannot be overwritten by a
+    /// delayed older publication.
+    async fn bind_session_local_with_metadata_locked(
+        &self,
+        session_id: SessionId,
+        bind_params: Option<serde_json::Value>,
+    ) -> Result<(), ClientError> {
         let connection = self.inner().borrow.connection();
         let sid = session_id;
 
@@ -834,7 +885,7 @@ impl ToolServer {
         // `session.bind` for a healthy session — refresh serve state only
         // (done above; the server's bind response reads `handlers_for_session`).
         // Replacing the inbox/registry/loop would cancel every in-flight
-        // tool call. `session_bind_mu` keeps a concurrent bind/unbind from
+        // tool call. `session_publication_mu` keeps a concurrent bind/unbind from
         // invalidating this check before we return; the registry check
         // additionally rejects a loop in its post-teardown exit tail
         // (`cancel_all` closes the registry before the JoinHandle finishes),
@@ -898,7 +949,7 @@ impl ToolServer {
         });
         // Replace the previous (dead) loop's handle, if any. Abort is a
         // no-op for a finished handle; with binds serialized under
-        // `session_bind_mu` no concurrent full rebind can have installed a
+        // `session_publication_mu` no concurrent full rebind can have installed a
         // live handle in between, so this never kills live work.
         if let Some(old_handle) = self.inner().session_handles.lock().insert(sid, handle) {
             old_handle.abort();
@@ -912,22 +963,19 @@ impl ToolServer {
     ///
     /// On reconnect, call `serve()` per active session to replay state.
     pub async fn serve(&self, session_id: SessionId) -> Result<(), ClientError> {
+        let _publication_guard = self.inner().session_publication_mu.lock().await;
+        self.serve_locked(session_id).await
+    }
+
+    /// Publish one snapshot while the caller holds `session_publication_mu`.
+    async fn serve_locked(&self, session_id: SessionId) -> Result<(), ClientError> {
         // Build tool descriptions while holding the read lock so the
         // handler list cannot mutate between read and serialization.
         let tools: Vec<xai_tool_protocol::ToolDescriptionWithSchema> = {
             let map = self.inner().session_handlers.read();
             let handlers = map.get(&session_id);
             handlers
-                .map(|h| {
-                    h.iter()
-                        .map(|h| xai_tool_protocol::ToolDescriptionWithSchema {
-                            description: h.description(),
-                            input_schema: h.input_schema(),
-                            capabilities: None,
-                            notification_schemas: None,
-                        })
-                        .collect()
-                })
+                .map(|handlers| available_tool_descriptions(handlers))
                 .unwrap_or_default()
         };
 
@@ -948,20 +996,32 @@ impl ToolServer {
         handler: Arc<dyn ToolServerHandler>,
         sessions: Vec<SessionId>,
     ) -> Result<(), ClientError> {
-        let _guard = self.inner().dynamic_tool_mu.lock().await;
+        let _publication_guard = self.inner().session_publication_mu.lock().await;
 
         let tool_id = handler.tool_id();
 
-        // Reject duplicates within the target sessions.
+        if !handler.is_available() {
+            return Err(ClientError::InvalidConfig(format!(
+                "tool_id {tool_id} is no longer authorized for the target session"
+            )));
+        }
+
+        // Prune expired dynamic handlers before duplicate detection. This
+        // prevents a stale generation from both remaining callable and
+        // blocking a later authorized registration for a reused session ID.
         {
-            let map = self.inner().session_handlers.read();
+            let mut map = self.inner().session_handlers.write();
             for sid in &sessions {
-                if let Some(handlers) = map.get(sid)
-                    && handlers.iter().any(|h| h.tool_id() == tool_id)
-                {
-                    return Err(ClientError::InvalidConfig(format!(
-                        "tool_id {tool_id} is already registered for session {sid}"
-                    )));
+                if let Some(handlers) = map.get_mut(sid) {
+                    handlers.retain(|existing| existing.is_available());
+                    if handlers
+                        .iter()
+                        .any(|existing| existing.tool_id() == tool_id)
+                    {
+                        return Err(ClientError::InvalidConfig(format!(
+                            "tool_id {tool_id} is already registered for session {sid}"
+                        )));
+                    }
                 }
             }
         }
@@ -977,7 +1037,7 @@ impl ToolServer {
         // Replay `serve` for each affected session so the server sees
         // the updated tool set.
         for sid in sessions {
-            self.serve(sid).await?;
+            self.serve_locked(sid).await?;
         }
 
         Ok(())
@@ -990,8 +1050,34 @@ impl ToolServer {
         tool_id: &ToolId,
         session_id: &SessionId,
     ) -> Result<bool, ClientError> {
-        let _guard = self.inner().dynamic_tool_mu.lock().await;
+        let _publication_guard = self.inner().session_publication_mu.lock().await;
+        self.unregister_tool_dynamic_locked(tool_id, session_id)
+            .await
+    }
 
+    /// Remove a dynamic handler only while its external registration
+    /// generation is still current. The predicate is evaluated under the same
+    /// publication lock as the removal and follow-up snapshot, so a stale
+    /// teardown cannot delete a newer generation's handler with the same ID.
+    pub async fn unregister_tool_dynamic_if(
+        &self,
+        tool_id: &ToolId,
+        session_id: &SessionId,
+        registration_is_current: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<bool, ClientError> {
+        let _publication_guard = self.inner().session_publication_mu.lock().await;
+        if !registration_is_current() {
+            return Ok(false);
+        }
+        self.unregister_tool_dynamic_locked(tool_id, session_id)
+            .await
+    }
+
+    async fn unregister_tool_dynamic_locked(
+        &self,
+        tool_id: &ToolId,
+        session_id: &SessionId,
+    ) -> Result<bool, ClientError> {
         // Check existence in the target session.
         {
             let map = self.inner().session_handlers.read();
@@ -1013,17 +1099,39 @@ impl ToolServer {
 
         // Replay `serve` for the affected session so the server sees the
         // tool removal.
-        self.serve(session_id.clone()).await?;
+        self.serve_locked(session_id.clone()).await?;
 
         Ok(true)
+    }
+
+    /// Remove handlers whose live authority has expired and publish the
+    /// resulting snapshot. This is generation-safe cleanup for callers that
+    /// revoke an external session before awaiting SDK teardown: a newer
+    /// generation's available handlers are preserved even when it reuses the
+    /// same session ID.
+    pub async fn prune_unavailable_tools(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<usize, ClientError> {
+        let _publication_guard = self.inner().session_publication_mu.lock().await;
+        let removed = {
+            let mut map = self.inner().session_handlers.write();
+            map.get_mut(session_id)
+                .map(|handlers| {
+                    let before = handlers.len();
+                    handlers.retain(|handler| handler.is_available());
+                    before.saturating_sub(handlers.len())
+                })
+                .unwrap_or_default()
+        };
+        self.serve_locked(session_id.clone()).await?;
+        Ok(removed)
     }
 
     /// Unbind a session: tear down the session loop, remove handlers,
     /// and unregister the session.
     pub async fn unbind_session(&self, session_id: &SessionId) -> Result<(), ClientError> {
-        // Serialized against binds (see `session_bind_mu`): an unbind must
-        // not interleave with a bind's liveness check / setup.
-        let _bind_guard = self.inner().session_bind_mu.lock().await;
+        let _publication_guard = self.inner().session_publication_mu.lock().await;
         let connection = self.inner().borrow.connection();
 
         self.inner()
@@ -1300,14 +1408,8 @@ impl ToolServer {
         let demux = connection.demux();
 
         for sid in &self.inner().initial_sessions {
-            if let Err(e) = self.bind_session_local(sid.clone()).await {
-                warn!(%sid, error = %e, "run: bind_session_local failed for builder session");
-                continue;
-            }
-            // Publish the tool snapshot so the server registers the tools
-            // for this session. bind_session_local only does local setup.
-            if let Err(e) = self.serve(sid.clone()).await {
-                warn!(%sid, error = %e, "run: serve failed for builder session");
+            if let Err(e) = self.bind_session(sid.clone()).await {
+                warn!(%sid, error = %e, "run: bind/publish failed for builder session");
             }
         }
 
@@ -1383,8 +1485,15 @@ impl ToolServer {
                         let server = Arc::clone(&server_for_notif);
                         let conn = connection_for_notif.clone();
                         tokio::spawn(async move {
+                            // Hold the same publication lock used by dynamic
+                            // registration and `serve` until the v2 bind
+                            // response is on the wire. Without this, an older
+                            // All-generation response can arrive after a
+                            // restricted rebind and resurrect stale tools.
+                            let _publication_guard =
+                                server.inner().session_publication_mu.lock().await;
                             let result = server
-                                .bind_session_local_with_metadata(sid.clone(), bind_params)
+                                .bind_session_local_with_metadata_locked(sid.clone(), bind_params)
                                 .await;
 
                             // Respond with tools on success, error on failure.
@@ -1393,11 +1502,9 @@ impl ToolServer {
                             if let Some(id) = request_id {
                                 let response = match result {
                                     Ok(()) => {
-                                        let tools: Vec<xai_tool_types::ToolDescription> = server
-                                            .handlers_for_session(&sid)
-                                            .iter()
-                                            .map(|h| h.description())
-                                            .collect();
+                                        let tools = available_bind_descriptions(
+                                            &server.handlers_for_session(&sid),
+                                        );
                                         let result = xai_tool_protocol::SessionBindResult {
                                             tools,
                                             binary_version: server.inner().binary_version.clone(),
@@ -2061,7 +2168,7 @@ async fn execute_call(
             return;
         }
     };
-    let Some(handler) = handlers.iter().find(|h| h.tool_id() == params.tool_id) else {
+    let Some(handler) = find_available_handler(handlers, &params.tool_id) else {
         crate::metrics::no_handler();
         send_error(
             connection,
@@ -2334,7 +2441,60 @@ async fn send_overloaded(connection: &Arc<HubConnection>, id: JsonRpcId, session
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
     use xai_tool_runtime::ContentBlock;
+
+    struct AvailabilityHandler {
+        id: ToolId,
+        available: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ToolServerHandler for AvailabilityHandler {
+        fn tool_id(&self) -> ToolId {
+            self.id.clone()
+        }
+
+        fn description(&self) -> ToolDescription {
+            ToolDescription::new(self.id.as_str(), "availability fixture")
+        }
+
+        fn is_available(&self) -> bool {
+            self.available.load(Ordering::Acquire)
+        }
+
+        async fn handle_call(
+            &self,
+            _ctx: ToolCallContext,
+            _args: Value,
+        ) -> ToolStream<TypedToolOutput> {
+            xai_tool_runtime::terminal_only(Err(ToolError::not_implemented("availability fixture")))
+        }
+    }
+
+    #[test]
+    fn unavailable_handlers_are_absent_from_publish_and_dispatch() {
+        let available_id = ToolId::new("available_fixture").expect("valid tool id");
+        let expired_id = ToolId::new("expired_fixture").expect("valid tool id");
+        let available: Arc<dyn ToolServerHandler> = Arc::new(AvailabilityHandler {
+            id: available_id.clone(),
+            available: Arc::new(AtomicBool::new(true)),
+        });
+        let expired: Arc<dyn ToolServerHandler> = Arc::new(AvailabilityHandler {
+            id: expired_id.clone(),
+            available: Arc::new(AtomicBool::new(false)),
+        });
+        let handlers = vec![available, expired];
+
+        let descriptions = available_tool_descriptions(&handlers);
+        assert_eq!(descriptions.len(), 1);
+        assert_eq!(descriptions[0].description.name, available_id.as_str());
+        let bind_descriptions = available_bind_descriptions(&handlers);
+        assert_eq!(bind_descriptions.len(), 1);
+        assert_eq!(bind_descriptions[0].name, available_id.as_str());
+        assert!(find_available_handler(&handlers, &available_id).is_some());
+        assert!(find_available_handler(&handlers, &expired_id).is_none());
+    }
 
     fn call_id() -> ToolCallId {
         ToolCallId::new_v7()

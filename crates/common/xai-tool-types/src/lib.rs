@@ -1,10 +1,12 @@
 //! Canonical, extensible tool types.
+pub mod capability;
 mod ext;
 mod schema_utils;
 pub mod serde_lenient;
 mod task;
 mod types;
 
+pub use capability::{ToolCapabilityDenial, ToolCapabilityDescriptor, ToolEffect};
 pub use ext::Extensions;
 pub use schema_utils::parse_arguments_from_schema_lossy;
 pub use serde_lenient::{

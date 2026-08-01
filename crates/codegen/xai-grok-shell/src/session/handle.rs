@@ -62,6 +62,9 @@ pub struct SessionHandle {
     /// Resolved turn limit for this session; lets a spawned subagent inherit
     /// the parent's limit. `None` = unlimited.
     pub max_turns: Option<usize>,
+    /// Effective capability ceiling for nested subagents. `None` means the
+    /// session is unrestricted (`All`).
+    pub capability_mode: Option<xai_tool_types::SubagentCapabilityMode>,
     /// Configured cutoff a subagent inherits, published by the session actor. `None` when unset.
     pub resolved_tool_overrides:
         std::sync::Arc<arc_swap::ArcSwapOption<xai_grok_sampling_types::ToolOverrides>>,

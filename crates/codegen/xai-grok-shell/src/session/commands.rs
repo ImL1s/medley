@@ -473,6 +473,11 @@ pub enum SessionCommand {
     RetryAuthRequiredServers {
         respond_to: oneshot::Sender<()>,
     },
+    /// Close restricted external-tool dispatch before a managed gateway
+    /// catalog fetch can change the ownership of an exact tool identity.
+    BeginManagedGatewayAdmission {
+        respond_to: oneshot::Sender<()>,
+    },
     RefreshMcpSearchIndex,
     /// Move a foreground bash command to background by tool_call_id.
     /// Unblocks the agent loop so it can continue with the next action.

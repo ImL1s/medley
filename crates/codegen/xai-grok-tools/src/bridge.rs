@@ -186,6 +186,25 @@ impl ToolBridge {
         self.registry.unregister_tool_by_name(name)
     }
 
+    pub fn reconcile_managed_gateway_identities(
+        &self,
+        bindings: &[(String, String)],
+    ) -> crate::registry::types::ManagedGatewayIdentityReconciliation {
+        self.registry.reconcile_managed_gateway_identities(bindings)
+    }
+
+    pub fn begin_managed_gateway_admission(&self) {
+        self.registry.begin_managed_gateway_admission();
+    }
+
+    pub fn disable_managed_gateway_admission(&self) {
+        self.registry.disable_managed_gateway_admission();
+    }
+
+    pub fn external_tool_is_permitted(&self, canonical_id: &str) -> bool {
+        self.registry.external_tool_is_permitted(canonical_id)
+    }
+
     /// Access the underlying `FinalizedToolset`.
     ///
     /// Used by `WorkspaceOps::bind_local_session` to install the agent's
@@ -695,6 +714,14 @@ impl ToolBridge {
             terminal: None,
         }
     }
+
+    pub fn for_test_with_capability_policy(policy: crate::capability::CapabilityPolicy) -> Self {
+        let toolset = FinalizedToolset::empty_for_test_with_capability_policy(policy);
+        Self {
+            registry: Arc::new(toolset),
+            terminal: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -762,19 +789,14 @@ mod tests {
         // PascalCase + grok_build's snake_case in one registry
         // to exercise the lookup on the literal name strings each
         // namespace ships.
-        register_fixture(&toolset, "Write", ToolKind::Write, "fixture_write");
-        register_fixture(
-            &toolset,
-            "StrReplace",
-            ToolKind::Edit,
-            "fixture_str_replace",
-        );
-        register_fixture(&toolset, "Delete", ToolKind::Delete, "fixture_delete");
+        register_fixture(&toolset, "Write", ToolKind::Write, "Write");
+        register_fixture(&toolset, "StrReplace", ToolKind::Edit, "StrReplace");
+        register_fixture(&toolset, "Delete", ToolKind::Delete, "Delete");
         register_fixture(
             &toolset,
             "run_terminal_cmd",
             ToolKind::Execute,
-            "fixture_run_terminal_cmd",
+            "run_terminal_cmd",
         );
 
         assert_eq!(bridge.tool_kind("Write"), Some(ToolKind::Write));

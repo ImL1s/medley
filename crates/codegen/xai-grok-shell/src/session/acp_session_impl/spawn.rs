@@ -752,6 +752,7 @@ pub(crate) async fn spawn_session_actor(
     let bridge_state_path =
         crate::session::persistence::session_dir(&session_info).join("tool_state.json");
     let initial_agent_name = agent_definition.name.clone();
+    let effective_capability_mode = agent_definition.capability_mode;
     let initial_agent_type = Some(initial_agent_name.clone());
     let compaction_policy = xai_grok_agent::CompactionPolicy {
         auto_compact_threshold_percent: auto_compact_threshold_percent as u32,
@@ -2100,6 +2101,7 @@ pub(crate) async fn spawn_session_actor(
             pending_interactions,
             info: session_info,
             max_turns,
+            capability_mode: effective_capability_mode,
             resolved_tool_overrides,
             hunk_tracker_handle,
             chat_state_handle: chat_state_handle_for_handle,

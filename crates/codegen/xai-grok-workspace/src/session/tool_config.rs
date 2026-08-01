@@ -68,12 +68,10 @@ pub(crate) fn resolve_session_toolset(
 /// the caller can store it on the session. The FinalizedToolset reflects
 /// MCP + hub merging and capability filtering on top of that baseline.
 ///
-/// **MCP-origin and hub-origin `kind: None` tools are dropped under
-/// every non-`All` mode.** Baseline `kind: None` tools are always kept —
-/// but before filtering, kind-less baseline entries whose id the binary's
-/// registry knows get their [`ToolKind`] backfilled (see
-/// [`backfill_tool_kinds`]), so the capability filter applies to pinned
-/// server-bind toolsets whose wire entries cannot carry a kind.
+/// **Every unclassified tool is dropped under every non-`All` mode.** Before
+/// filtering, baseline entries are overwritten from the binary's authoritative
+/// registry taxonomy (see [`backfill_tool_kinds`]). Unknown exact IDs can be
+/// migrated only through trusted metadata supplied by [`SessionContextFactory`].
 pub(crate) fn resolve_session_toolset_rebuild(
     effective_tool_config: ToolServerConfig,
     capability_mode: CapabilityMode,
@@ -89,25 +87,43 @@ pub(crate) fn resolve_session_toolset_rebuild(
     notification_handle: Option<xai_grok_tools::notification::types::ToolNotificationHandle>,
     terminal_backend: Arc<dyn xai_grok_tools::computer::types::TerminalBackend>,
 ) -> WorkspaceResult<(ToolServerConfig, Arc<FinalizedToolset>)> {
-    let mut builder = factory.registry_builder();
+    let trusted_capabilities = factory.trusted_tool_capabilities(&cwd);
+    let capability_policy = xai_grok_tools::capability::CapabilityPolicy::new(
+        capability_mode.into(),
+        trusted_capabilities,
+    );
+    let mut builder = factory
+        .registry_builder()
+        .with_capability_policy(capability_policy.clone());
     if let Some(lr) = local_registry {
         builder = builder.with_local_registry(lr);
     }
     let baseline = backfill_tool_kinds(&effective_tool_config, &builder.known_tool_kinds());
-    let filtered = merge_and_filter(
+    let filtered = merge_and_filter_with_policy(
         &baseline,
         mcp_snapshot,
         hub_snapshot,
-        capability_mode,
+        &capability_policy,
         session_id,
     );
-    let hub_ids: std::collections::HashSet<&str> =
-        hub_snapshot.iter().map(|t| t.id.as_str()).collect();
+    let baseline_ids: std::collections::HashSet<&str> =
+        baseline.tools.iter().map(|tool| tool.id.as_str()).collect();
+    let external_ids: std::collections::HashSet<&str> = mcp_snapshot
+        .iter()
+        .chain(hub_snapshot)
+        .map(|tool| tool.id.as_str())
+        // Baseline wins an exact-ID collision and remains a native tool.
+        .filter(|id| !baseline_ids.contains(id))
+        .collect();
     let finalize_config = ToolServerConfig {
         tools: filtered
             .tools
             .iter()
-            .filter(|t| !hub_ids.contains(t.id.as_str()))
+            // Snapshot tools are dispatched by their external MCP/hub
+            // boundary. They participate in capability filtering and
+            // discoverability, but are not native registry entries to
+            // instantiate during `finalize`.
+            .filter(|tool| !external_ids.contains(tool.id.as_str()))
             .cloned()
             .collect(),
         behavior_preset: filtered.behavior_preset.clone(),
@@ -135,9 +151,9 @@ pub(crate) fn resolve_session_toolset_rebuild(
 /// Backfill `kind: None` baseline entries from the binary's own registry
 /// (fully-qualified id -> declared [`ToolKind`]).
 ///
-/// Ids unknown to the registry stay `None` and keep the always-kept
-/// baseline behavior (ad-hoc `ToolConfig::simple` tools). Entries that
-/// already carry a kind are left untouched.
+/// Ids unknown to the registry stay `None` and require trusted exact-ID
+/// metadata in restricted sessions. Serialized `kind` values are advisory and
+/// are always replaced so callers cannot spoof a safer built-in category.
 fn backfill_tool_kinds(
     config: &ToolServerConfig,
     kinds: &HashMap<String, ToolKind>,
@@ -148,9 +164,7 @@ fn backfill_tool_kinds(
             .iter()
             .map(|tool| {
                 let mut tool = tool.clone();
-                if tool.kind.is_none() {
-                    tool.kind = kinds.get(&tool.id).copied();
-                }
+                tool.kind = kinds.get(&tool.id).copied();
                 tool
             })
             .collect(),
@@ -161,8 +175,9 @@ fn backfill_tool_kinds(
 ///
 /// - **Step 2** -- MCP merge: append MCP-origin tools, skipping ID/name collisions with baseline.
 /// - **Step 3** -- Hub merge: append hub-origin tools, skipping ID/name collisions with baseline or MCP.
-/// - **Step 4** -- Capability filter: drop tools whose `kind` is not allowed by the mode.
-///   External (MCP/hub) `kind: None` tools are only kept under `CapabilityMode::All`.
+/// - **Step 4** -- Capability filter: built-ins use authoritative registry
+///   taxonomy; external tools ignore serialized `kind` and require trusted
+///   exact-ID metadata in restricted modes.
 ///
 /// Priority on ID/name collision: baseline wins > MCP wins > hub is skipped.
 pub(crate) fn merge_and_filter(
@@ -172,8 +187,24 @@ pub(crate) fn merge_and_filter(
     mode: CapabilityMode,
     session_id: &str,
 ) -> ToolServerConfig {
+    let policy = xai_grok_tools::capability::CapabilityPolicy::new(
+        mode.into(),
+        xai_grok_tools::capability::TrustedToolCapabilities::default(),
+    );
+    merge_and_filter_with_policy(baseline, mcp_snapshot, hub_snapshot, &policy, session_id)
+}
+
+fn merge_and_filter_with_policy(
+    baseline: &ToolServerConfig,
+    mcp_snapshot: &[ToolConfig],
+    hub_snapshot: &[ToolConfig],
+    policy: &xai_grok_tools::capability::CapabilityPolicy,
+    session_id: &str,
+) -> ToolServerConfig {
     if mcp_snapshot.is_empty() && hub_snapshot.is_empty() {
-        return mode.filter(baseline);
+        let mut filtered = baseline.clone();
+        policy.filter_tool_config(&mut filtered);
+        return filtered;
     }
     let baseline_ids: std::collections::HashSet<&str> =
         baseline.tools.iter().map(|t| t.id.as_str()).collect();
@@ -208,7 +239,10 @@ pub(crate) fn merge_and_filter(
             continue;
         }
         mcp_tool_ids.insert(mcp_tool.id.as_str());
-        tagged.push((mcp_tool.clone(), true));
+        let mut mcp_tool = mcp_tool.clone();
+        // Remote/dynamic taxonomy is not a trusted classification source.
+        mcp_tool.kind = None;
+        tagged.push((mcp_tool, true));
     }
     for hub_tool in hub_snapshot {
         if baseline_ids.contains(hub_tool.id.as_str()) {
@@ -237,21 +271,18 @@ pub(crate) fn merge_and_filter(
             );
             continue;
         }
-        tagged.push((hub_tool.clone(), true));
+        let mut hub_tool = hub_tool.clone();
+        // Managed gateway metadata is discoverability data, not capability
+        // authority. Only trusted exact-ID metadata may classify this target.
+        hub_tool.kind = None;
+        tagged.push((hub_tool, true));
     }
-    let kept: Vec<ToolConfig> = tagged
-        .into_iter()
-        .filter(|(tool, is_external)| match tool.kind {
-            Some(k) => kind_allowed(mode, k),
-            None if !*is_external => true,
-            None => matches!(mode, CapabilityMode::All),
-        })
-        .map(|(t, _)| t)
-        .collect();
-    ToolServerConfig {
-        tools: kept,
+    let mut filtered = ToolServerConfig {
+        tools: tagged.into_iter().map(|(tool, _)| tool).collect(),
         behavior_preset: baseline.behavior_preset.clone(),
-    }
+    };
+    policy.filter_tool_config(&mut filtered);
+    filtered
 }
 /// Alias for backward compatibility.
 pub type NoopSessionContextFactory = WorkspaceSessionContextFactory;
@@ -330,6 +361,7 @@ pub struct WorkspaceSessionContextFactory {
     /// `None` disables it. Resolved once by the caller so the factory performs
     /// no per-build env reads.
     tool_state_home: Option<PathBuf>,
+    trusted_tool_capabilities: xai_grok_tools::capability::TrustedToolCapabilities,
 }
 impl Default for WorkspaceSessionContextFactory {
     fn default() -> Self {
@@ -342,6 +374,8 @@ impl WorkspaceSessionContextFactory {
             auth: None,
             api_base_url: None,
             tool_state_home: None,
+            trusted_tool_capabilities: xai_grok_tools::capability::TrustedToolCapabilities::default(
+            ),
         }
     }
     /// Factory with auth — gen tools use the provider's live token.
@@ -350,6 +384,8 @@ impl WorkspaceSessionContextFactory {
             auth: Some(auth),
             api_base_url: Some(api_base_url),
             tool_state_home: None,
+            trusted_tool_capabilities: xai_grok_tools::capability::TrustedToolCapabilities::default(
+            ),
         }
     }
     /// Enable session-keyed tool-state persistence rooted at `home`
@@ -357,6 +393,15 @@ impl WorkspaceSessionContextFactory {
     /// [`tool_state_enabled`] is `true`.
     pub fn with_tool_state_home(mut self, home: PathBuf) -> Self {
         self.tool_state_home = Some(home);
+        self
+    }
+    /// Supply locally trusted exact-ID capability metadata for kind-less tools
+    /// used by restricted workspace sessions.
+    pub fn with_trusted_tool_capabilities(
+        mut self,
+        trusted: xai_grok_tools::capability::TrustedToolCapabilities,
+    ) -> Self {
+        self.trusted_tool_capabilities = trusted;
         self
     }
     /// `<tool_state_home>/sessions/<sanitized_id>/tool_state.json`, or empty
@@ -397,6 +442,13 @@ impl WorkspaceSessionContextFactory {
     }
 }
 impl SessionContextFactory for WorkspaceSessionContextFactory {
+    fn trusted_tool_capabilities(
+        &self,
+        _cwd: &std::path::Path,
+    ) -> xai_grok_tools::capability::TrustedToolCapabilities {
+        self.trusted_tool_capabilities.clone()
+    }
+
     fn build_session_context(
         &self,
         session_id: &str,
@@ -726,7 +778,7 @@ mod tests {
         );
     }
     #[test]
-    fn backfill_tool_kinds_fills_known_kindless_ids_only() {
+    fn backfill_tool_kinds_overwrites_serialized_taxonomy_from_registry() {
         let kinds = HashMap::from([
             ("GrokBuild:search_replace".to_owned(), ToolKind::Edit),
             ("GrokBuild:read_file".to_owned(), ToolKind::Read),
@@ -735,7 +787,7 @@ mod tests {
             tools: vec![
                 test_support::tc("GrokBuild:search_replace", None),
                 test_support::tc("adhoc.opaque", None),
-                // Pre-set kinds must never be overwritten by the registry.
+                // A wire-supplied safer category must not override the registry.
                 test_support::tc("GrokBuild:read_file", Some(ToolKind::Search)),
             ],
             behavior_preset: Some("current".to_owned()),
@@ -757,8 +809,8 @@ mod tests {
         );
         assert_eq!(
             kind_of("GrokBuild:read_file"),
-            Some(ToolKind::Search),
-            "an explicit kind wins over the registry's"
+            Some(ToolKind::Read),
+            "the registry's authoritative kind must replace serialized input"
         );
         assert_eq!(backfilled.behavior_preset.as_deref(), Some("current"));
     }
@@ -815,7 +867,7 @@ mod tests {
         }
     }
     #[test]
-    fn resolve_session_toolset_mcp_edit_dropped_under_readonly() {
+    fn external_serialized_kind_cannot_self_classify_under_readonly() {
         let baseline = ToolServerConfig {
             tools: vec![test_support::tc(
                 "GrokBuild:read_file",
@@ -823,15 +875,20 @@ mod tests {
             )],
             behavior_preset: None,
         };
-        let mcp_edit = test_support::tc("mcp.editor", Some(ToolKind::Edit));
+        let mcp_claimed_read = test_support::tc("mcp.external_mutation", Some(ToolKind::Read));
         let filtered = merge_and_filter(
             &baseline,
-            &[mcp_edit],
+            &[mcp_claimed_read],
             &[],
             CapabilityMode::ReadOnly,
             "test",
         );
-        assert!(!filtered.tools.iter().any(|t| t.id == "mcp.editor"));
+        assert!(
+            !filtered
+                .tools
+                .iter()
+                .any(|t| t.id == "mcp.external_mutation")
+        );
     }
     #[tokio::test]
     async fn resolve_session_toolset_mcp_kind_none_dropped_under_readonly() {
@@ -853,8 +910,8 @@ mod tests {
         );
         let kept_ids: Vec<&str> = filtered.tools.iter().map(|t| t.id.as_str()).collect();
         assert!(
-            kept_ids.contains(&"baseline.opaque"),
-            "baseline kind: None must survive ReadOnly: {kept_ids:?}"
+            !kept_ids.contains(&"baseline.opaque"),
+            "baseline kind: None must fail closed under ReadOnly: {kept_ids:?}"
         );
         assert!(
             !kept_ids.contains(&"mcp.opaque"),
@@ -891,13 +948,7 @@ mod tests {
         let mut mcp_b = test_support::tc("mcp.tool_b", Some(ToolKind::Read));
         mcp_b.name_override = Some("shared_name".into());
         let mcp = vec![mcp_a, mcp_b];
-        let filtered = merge_and_filter(
-            &baseline,
-            &mcp,
-            &[],
-            CapabilityMode::ReadOnly,
-            "test_session",
-        );
+        let filtered = merge_and_filter(&baseline, &mcp, &[], CapabilityMode::All, "test_session");
         let ids: Vec<&str> = filtered.tools.iter().map(|t| t.id.as_str()).collect();
         assert!(ids.contains(&"mcp.tool_a"), "first wins: {ids:?}");
         assert!(
@@ -971,7 +1022,117 @@ mod tests {
             .iter()
             .find(|t| t.id == "hub:shared_tool")
             .unwrap();
-        assert_eq!(tool.kind, Some(ToolKind::Read));
+        assert_eq!(
+            tool.kind, None,
+            "remote MCP taxonomy must be discarded even when it wins deduplication"
+        );
+    }
+
+    #[test]
+    fn trusted_exact_id_metadata_migrates_restricted_workspace_tools() {
+        use xai_grok_tools::capability::{CapabilityPolicy, TrustedToolCapabilities};
+        use xai_grok_tools::types::config_source::ConfigSource;
+        use xai_tool_types::{ToolCapabilityDescriptor, ToolEffect};
+
+        let mut trusted = TrustedToolCapabilities::default();
+        for id in ["baseline.custom_read", "mcp.remote_read", "hub:remote_read"] {
+            trusted
+                .insert_classification(
+                    id,
+                    ToolCapabilityDescriptor::classified([ToolEffect::NetworkRead]),
+                    ConfigSource::Builtin,
+                )
+                .unwrap();
+        }
+        let factory =
+            WorkspaceSessionContextFactory::new().with_trusted_tool_capabilities(trusted.clone());
+        assert_eq!(
+            factory.trusted_tool_capabilities(std::path::Path::new("/workspace")),
+            trusted
+        );
+
+        let policy = CapabilityPolicy::new(CapabilityMode::ReadOnly.into(), trusted);
+        let baseline = ToolServerConfig {
+            tools: vec![test_support::tc("baseline.custom_read", None)],
+            behavior_preset: None,
+        };
+        let mcp = vec![
+            test_support::tc("mcp.remote_read", Some(ToolKind::Execute)),
+            // A snapshot collision cannot make the baseline winner look
+            // external and disappear from native finalization.
+            test_support::tc("GrokBuild:read_file", Some(ToolKind::Other)),
+        ];
+        let hub = vec![test_support::tc("hub:remote_read", Some(ToolKind::Other))];
+
+        let filtered =
+            merge_and_filter_with_policy(&baseline, &mcp, &hub, &policy, "trusted-session");
+        let ids: Vec<&str> = filtered.tools.iter().map(|tool| tool.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["baseline.custom_read", "mcp.remote_read", "hub:remote_read"]
+        );
+        assert!(
+            filtered.tools.iter().all(|tool| tool.kind.is_none()),
+            "serialized external kinds must not become capability authority"
+        );
+    }
+    #[tokio::test]
+    async fn trusted_external_snapshot_ids_survive_full_restricted_resolution() {
+        use xai_grok_tools::capability::TrustedToolCapabilities;
+        use xai_grok_tools::types::config_source::ConfigSource;
+        use xai_tool_types::{ToolCapabilityDescriptor, ToolEffect};
+
+        let mut trusted = TrustedToolCapabilities::default();
+        for id in ["mcp.remote_read", "hub:remote_read"] {
+            trusted
+                .insert_classification(
+                    id,
+                    ToolCapabilityDescriptor::classified([ToolEffect::NetworkRead]),
+                    ConfigSource::Builtin,
+                )
+                .unwrap();
+        }
+        let factory = WorkspaceSessionContextFactory::new().with_trusted_tool_capabilities(trusted);
+        let baseline = ToolServerConfig {
+            tools: vec![test_support::tc("GrokBuild:read_file", None)],
+            behavior_preset: None,
+        };
+        let mcp = vec![test_support::tc("mcp.remote_read", Some(ToolKind::Execute))];
+        let hub = vec![test_support::tc("hub:remote_read", Some(ToolKind::Other))];
+
+        let (effective, toolset, _backend) = resolve_session_toolset(
+            baseline,
+            CapabilityMode::ReadOnly,
+            &mcp,
+            &hub,
+            PathBuf::from("/tmp"),
+            empty_env(),
+            "trusted-full-resolution",
+            &factory,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("trusted external snapshot IDs must not be finalized as unknown native tools");
+
+        assert_eq!(
+            effective.tools.len(),
+            1,
+            "the stored baseline stays unchanged"
+        );
+        let names: Vec<String> = toolset
+            .tool_definitions()
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect();
+        assert!(names.iter().any(|name| name == "read_file"));
+        assert!(
+            names
+                .iter()
+                .all(|name| name != "mcp.remote_read" && name != "hub:remote_read"),
+            "external snapshot tools must stay on their MCP/hub dispatch boundary: {names:?}"
+        );
     }
     #[test]
     fn hub_tool_name_collision_with_baseline_skipped() {

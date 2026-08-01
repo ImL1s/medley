@@ -1264,6 +1264,7 @@ fn make_test_handle(
             cwd: "/tmp".to_string(),
         },
         max_turns: None,
+        capability_mode: None,
         resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         hunk_tracker_handle,
         chat_state_handle: xai_chat_state::ChatStateHandle::noop(),
@@ -1716,11 +1717,19 @@ async fn ext_method_routes_auth_cleared_and_refreshes_resident_sessions() {
                 ))
                 .await
                 .expect("auth_cleared must route through session-admin");
-            let cmd = tokio::time::timeout(std::time::Duration::from_secs(1), cmd_rx.recv())
+            let barrier = tokio::time::timeout(std::time::Duration::from_secs(1), cmd_rx.recv())
                 .await
-                .expect("refresh command should be sent")
+                .expect("admission barrier should be sent")
                 .expect("channel should stay open until command is received");
-            assert!(matches!(cmd, SessionCommand::RefreshMcpSearchIndex));
+            let SessionCommand::BeginManagedGatewayAdmission { respond_to } = barrier else {
+                panic!("expected gateway admission barrier before disable");
+            };
+            respond_to.send(()).expect("barrier acknowledgement");
+            let refresh = tokio::time::timeout(std::time::Duration::from_secs(1), cmd_rx.recv())
+                .await
+                .expect("refresh command should follow barrier")
+                .expect("channel should stay open until command is received");
+            assert!(matches!(refresh, SessionCommand::RefreshMcpSearchIndex));
             assert!(!agent.managed_mcp_cache.lock().await.gateway_tools_active);
         })
         .await;
@@ -1795,6 +1804,220 @@ async fn refresh_mcp_search_index_broadcasts_to_sessions() {
         .expect("RefreshMcpSearchIndex should be sent")
         .expect("channel should stay open");
     assert!(matches!(cmd, SessionCommand::RefreshMcpSearchIndex));
+}
+/// Live gateway enablement must close restricted external dispatch before the
+/// asynchronous auth refresh or catalog fetch can yield.
+#[tokio::test(flavor = "current_thread")]
+async fn gateway_catalog_fetch_begins_session_admission_synchronously() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let agent = build_agent_with_auth(crate::auth::GrokAuth {
+                key: "eligible".into(),
+                auth_mode: crate::auth::AuthMode::WebLogin,
+                ..crate::auth::GrokAuth::test_default()
+            });
+            agent.cfg.borrow_mut().managed_mcp_gateway_tools_enabled = true;
+            let sid = acp::SessionId::new("sess-gateway-admission");
+            let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
+            agent.sessions.borrow_mut().insert(sid, handle);
+
+            agent.spawn_managed_gateway_tool_catalog_fetch();
+
+            let first = cmd_rx
+                .recv()
+                .await
+                .expect("gateway admission command should be queued");
+            let SessionCommand::BeginManagedGatewayAdmission { respond_to } = first else {
+                panic!("expected BeginManagedGatewayAdmission first");
+            };
+            assert!(
+                !agent.managed_mcp_cache.lock().await.gateway_tools_active,
+                "catalog activation/fetch must wait until every session applies the barrier"
+            );
+            respond_to
+                .send(())
+                .expect("test barrier acknowledgement should be received");
+        })
+        .await;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn warm_gateway_catalog_does_not_reopen_session_admission() {
+    let agent = build_agent_with_auth(crate::auth::GrokAuth {
+        key: "eligible".into(),
+        auth_mode: crate::auth::AuthMode::WebLogin,
+        ..crate::auth::GrokAuth::test_default()
+    });
+    agent.cfg.borrow_mut().managed_mcp_gateway_tools_enabled = true;
+    {
+        let mut state = agent.managed_mcp_cache.lock().await;
+        state.enable_gateway_tools();
+        let epoch = state.start_gateway_tool_fetch().unwrap();
+        assert!(state.complete_gateway_tool_fetch(
+            epoch,
+            crate::session::managed_mcp::GatewayToolCatalog {
+                tools: vec![],
+                total_tools: 0,
+                connectors_needing_reauth: vec![],
+            },
+        ));
+    }
+    let sid = acp::SessionId::new("sess-warm-gateway");
+    let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
+    agent.sessions.borrow_mut().insert(sid, handle);
+
+    assert!(
+        agent
+            .get_managed_mcp_gateway_tool_catalog()
+            .await
+            .is_some(),
+        "ready gateway catalog should use the warm cache"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(25), cmd_rx.recv())
+            .await
+            .is_err(),
+        "a warm cache read must not queue a barrier with no matching refresh"
+    );
+}
+#[tokio::test(flavor = "current_thread")]
+async fn explicit_gateway_cache_invalidation_waits_for_all_session_admissions() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let agent = std::rc::Rc::new(build_agent_with_auth(crate::auth::GrokAuth {
+                key: "eligible".into(),
+                auth_mode: crate::auth::AuthMode::WebLogin,
+                ..crate::auth::GrokAuth::test_default()
+            }));
+            agent.cfg.borrow_mut().managed_mcp_gateway_tools_enabled = true;
+            {
+                let mut state = agent.managed_mcp_cache.lock().await;
+                state.enable_gateway_tools();
+                let epoch = state.start_gateway_tool_fetch().unwrap();
+                assert!(state.complete_gateway_tool_fetch(
+                    epoch,
+                    crate::session::managed_mcp::GatewayToolCatalog {
+                        tools: vec![],
+                        total_tools: 0,
+                        connectors_needing_reauth: vec![],
+                    },
+                ));
+            }
+            let sid = acp::SessionId::new("sess-explicit-gateway-refresh");
+            let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
+            agent.sessions.borrow_mut().insert(sid, handle);
+
+            let cache = agent.managed_mcp_cache.clone();
+            let invalidate_agent = agent.clone();
+            let invalidate = tokio::task::spawn_local(async move {
+                invalidate_agent
+                    .invalidate_gateway_tool_cache_after_session_admission()
+                    .await
+            });
+
+            let first = tokio::time::timeout(std::time::Duration::from_secs(1), cmd_rx.recv())
+                .await
+                .expect("first admission must be queued before cache invalidation")
+                .expect("session command channel must remain open");
+            let SessionCommand::BeginManagedGatewayAdmission {
+                respond_to: first_ack,
+            } = first
+            else {
+                panic!("expected first gateway admission barrier");
+            };
+            assert!(!invalidate.is_finished());
+            {
+                let state = cache.lock().await;
+                assert!(state.gateway_refresh_in_progress);
+                assert!(matches!(
+                    &state.gateway_tool_cache,
+                    crate::session::managed_mcp::GatewayToolCatalogCache::Ready(_)
+                ));
+            }
+
+            let sid_second = acp::SessionId::new("sess-explicit-gateway-refresh-late");
+            let (second_handle, _second_tx, mut second_rx) =
+                make_live_session_handle(&sid_second, None);
+            agent.sessions.borrow_mut().insert(sid_second, second_handle);
+            first_ack.send(()).expect("first barrier receiver remains live");
+
+            let second = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                second_rx.recv(),
+            )
+            .await
+            .expect("session added during the wait must receive admission")
+            .expect("second session command channel must remain open");
+            let SessionCommand::BeginManagedGatewayAdmission {
+                respond_to: second_ack,
+            } = second
+            else {
+                panic!("expected second gateway admission barrier");
+            };
+            assert!(!invalidate.is_finished());
+            {
+                let state = cache.lock().await;
+                assert!(state.gateway_refresh_in_progress);
+                assert!(matches!(
+                    &state.gateway_tool_cache,
+                    crate::session::managed_mcp::GatewayToolCatalogCache::Ready(_)
+                ));
+            }
+            second_ack
+                .send(())
+                .expect("second barrier receiver remains live");
+
+            invalidate.await.expect("cache invalidation task must finish");
+            let state = cache.lock().await;
+            assert!(state.gateway_refresh_in_progress);
+            assert!(matches!(
+                &state.gateway_tool_cache,
+                crate::session::managed_mcp::GatewayToolCatalogCache::NotFetched
+            ));
+        })
+        .await;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn ineligible_gateway_auth_queues_barrier_before_revoking_catalog() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
+            agent.cfg.borrow_mut().managed_mcp_gateway_tools_enabled = true;
+            {
+                let mut state = agent.managed_mcp_cache.lock().await;
+                state.enable_gateway_tools();
+                let epoch = state.start_gateway_tool_fetch().unwrap();
+                assert!(state.complete_gateway_tool_fetch(
+                    epoch,
+                    crate::session::managed_mcp::GatewayToolCatalog {
+                        tools: vec![],
+                        total_tools: 0,
+                        connectors_needing_reauth: vec![],
+                    },
+                ));
+            }
+            let sid = acp::SessionId::new("sess-ineligible-gateway");
+            let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
+            agent.sessions.borrow_mut().insert(sid, handle);
+
+            assert!(
+                agent
+                    .get_managed_mcp_gateway_tool_catalog()
+                    .await
+                    .is_none(),
+                "API-key auth is not eligible for managed gateway tools"
+            );
+            let barrier = cmd_rx.recv().await.expect("revocation barrier");
+            let SessionCommand::BeginManagedGatewayAdmission { respond_to } = barrier else {
+                panic!("expected gateway admission barrier before revocation");
+            };
+            respond_to.send(()).expect("barrier acknowledgement");
+            assert!(matches!(
+                cmd_rx.recv().await,
+                Some(SessionCommand::RefreshMcpSearchIndex)
+            ));
+            assert!(!agent.managed_mcp_cache.lock().await.gateway_tools_active);
+        })
+        .await;
 }
 /// Build a minimal MvpAgent suitable for testing extension methods.
 fn build_minimal_agent_for_tests() -> MvpAgent {

@@ -125,6 +125,9 @@ pub(crate) struct SubagentSpawnContext {
     pub auth: Option<crate::auth::GrokAuth>,
     pub parent_cwd: PathBuf,
     pub parent_session_id: String,
+    /// Effective capability ceiling inherited from the immediate parent.
+    /// `None` represents an unrestricted parent.
+    pub parent_capability_mode: Option<xai_tool_types::SubagentCapabilityMode>,
     /// The parent's cutoff at spawn, applied to the child's first turn. `None` if unset.
     pub inherited_tool_overrides: Option<xai_grok_sampling_types::ToolOverrides>,
     pub yolo_mode: bool,
@@ -1489,6 +1492,25 @@ fn filter_pool_by_inheritance(
             Some(pool)
         }
     }
+}
+/// Reject agent-owned MCP server startup before session construction when the
+/// child has any restricted capability mode. Starting a server can execute a
+/// process, open a network connection, or trigger OAuth before its handlers
+/// reach the final tool capability filter.
+fn agent_owned_mcp_server_admission_error(
+    definition: &xai_grok_agent::config::AgentDefinition,
+    capability_mode: Option<xai_tool_types::SubagentCapabilityMode>,
+) -> Option<&'static str> {
+    if definition.plugin_name.is_some() || definition.mcp_servers.is_empty() {
+        return None;
+    }
+    (!matches!(
+        capability_mode,
+        None | Some(xai_tool_types::SubagentCapabilityMode::All)
+    ))
+    .then_some(
+        "agent-owned mcpServers require capability mode All; remove mcpServers or run unrestricted",
+    )
 }
 /// Whether a subagent may declare its own agent-owned `mcpServers`.
 ///

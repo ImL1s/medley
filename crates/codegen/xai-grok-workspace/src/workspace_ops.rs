@@ -1345,13 +1345,14 @@ impl WorkspaceOps {
         let Self::Local { handle } = self else {
             return Ok(());
         };
+        let capability_mode = toolset.capability_policy().mode().into();
         if handle.session(session_id).is_none() {
             handle.create_session_with_tracker_and_viewer_ctx(
                 session_id,
                 cwd,
                 hunk_tracker,
                 None,
-                crate::capability::CapabilityMode::All,
+                capability_mode,
                 viewer_ctx,
                 false,
             )?;
@@ -1689,6 +1690,61 @@ mod tests {
             weak.upgrade().is_none(),
             "end_local_session must drop the toolset (no leaked holder)"
         );
+    }
+    #[tokio::test]
+    async fn bind_local_session_preserves_restricted_capability_for_forks() {
+        let ops = WorkspaceOps::for_test();
+        let WorkspaceOps::Local { handle } = &ops else {
+            unreachable!("for_test builds a local handle");
+        };
+        let cwd = handle.root_cwd().unwrap();
+        let factory = crate::session::tool_config::WorkspaceSessionContextFactory::new();
+        let (_, toolset, _backend) = crate::session::tool_config::resolve_session_toolset(
+            xai_grok_tools::registry::types::ToolServerConfig::default(),
+            crate::capability::CapabilityMode::ReadOnly,
+            &[],
+            &[],
+            cwd.clone(),
+            std::sync::Arc::new(std::collections::HashMap::new()),
+            "restricted-local",
+            &factory,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("restricted fixture toolset should resolve");
+
+        ops.bind_local_session(
+            "restricted-local",
+            cwd,
+            xai_hunk_tracker::HunkTrackerHandle::noop(),
+            toolset,
+            None,
+        )
+        .expect("local bind should succeed");
+        assert_eq!(
+            handle
+                .session("restricted-local")
+                .expect("bound session exists")
+                .capability_mode(),
+            crate::capability::CapabilityMode::ReadOnly
+        );
+
+        let mut child = crate::config::AgentSessionConfig::new("widened-child");
+        child.parent_session_id = Some("restricted-local".to_string());
+        child.capability_mode = crate::capability::CapabilityMode::All;
+        let err = handle
+            .fork_session(child)
+            .await
+            .expect_err("a local-bound restricted parent must not be recorded as All");
+        assert!(matches!(
+            err,
+            crate::error::WorkspaceError::CapabilityWidening {
+                parent: crate::capability::CapabilityMode::ReadOnly,
+                child: crate::capability::CapabilityMode::All,
+            }
+        ));
     }
     /// Round-trip serde for HunkActionResponse.
     #[test]
