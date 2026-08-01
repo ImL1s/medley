@@ -1092,12 +1092,19 @@ enum WriterControl<S> {
 }
 /// Outcome of racing a sink write against writer ctl/stop.
 enum SendOrPreempt<S> {
-    Sent(Result<(), String>),
+    Flushed,
+    Failed {
+        error: String,
+        /// The exact frame whose flush did not complete. Replaying the same
+        /// serialized JSON preserves its request id / notification sequence
+        /// so the receiver can deduplicate an ambiguous prior delivery.
+        pending: Message,
+    },
     Ctl {
         ctl: WriterControl<S>,
-        /// Present only when control won before `start_send`, so retrying
-        /// cannot duplicate a frame already committed to the sink.
-        unsent: Option<Message>,
+        /// Retained until `poll_flush` succeeds. `start_send` alone does not
+        /// establish delivery under the `Sink` contract.
+        pending: Message,
     },
     Stop,
 }
@@ -1111,36 +1118,48 @@ where
     S: futures::Sink<Message> + Unpin,
     S::Error: std::fmt::Display,
 {
-    // Keep ownership through poll_ready so a control preemption can return
-    // an unquestionably unsent frame. After start_send, only flush remains;
-    // returning the frame then could duplicate a write accepted by the sink.
+    // Keep ownership until poll_flush succeeds. Once start_send accepts a
+    // frame, delivery is ambiguous until flush completes, so a control
+    // preemption must replay the identical frame on the replacement sink.
     let ready = tokio::select! {
         biased;
         _ = writer_stop_rx.recv() => return SendOrPreempt::Stop,
         ctl = writer_ctl_rx.recv() => match ctl {
             Some(ctl) => return SendOrPreempt::Ctl {
                 ctl,
-                unsent: Some(msg),
+                pending: msg,
             },
             None => return SendOrPreempt::Stop,
         },
         result = futures::future::poll_fn(|cx| std::pin::Pin::new(&mut *sink).poll_ready(cx)) => result,
     };
     if let Err(e) = ready {
-        return SendOrPreempt::Sent(Err(e.to_string()));
+        return SendOrPreempt::Failed {
+            error: e.to_string(),
+            pending: msg,
+        };
     }
-    if let Err(e) = std::pin::Pin::new(&mut *sink).start_send(msg) {
-        return SendOrPreempt::Sent(Err(e.to_string()));
+    if let Err(e) = std::pin::Pin::new(&mut *sink).start_send(msg.clone()) {
+        return SendOrPreempt::Failed {
+            error: e.to_string(),
+            pending: msg,
+        };
     }
     tokio::select! {
         biased;
         _ = writer_stop_rx.recv() => SendOrPreempt::Stop,
         ctl = writer_ctl_rx.recv() => match ctl {
-            Some(ctl) => SendOrPreempt::Ctl { ctl, unsent: None },
+            Some(ctl) => SendOrPreempt::Ctl { ctl, pending: msg },
             None => SendOrPreempt::Stop,
         },
         result = futures::future::poll_fn(|cx| std::pin::Pin::new(&mut *sink).poll_flush(cx)) => {
-            SendOrPreempt::Sent(result.map_err(|e| e.to_string()))
+            match result {
+                Ok(()) => SendOrPreempt::Flushed,
+                Err(e) => SendOrPreempt::Failed {
+                    error: e.to_string(),
+                    pending: msg,
+                },
+            }
         },
     }
 }
@@ -1207,18 +1226,21 @@ async fn run_writer<S>(
                 .await
                 {
                     SendOrPreempt::Stop => break,
-                    SendOrPreempt::Ctl { ctl, unsent } => {
-                        if is_outbound && let Some(Message::Text(text)) = unsent {
+                    SendOrPreempt::Ctl { ctl, pending } => {
+                        if is_outbound && let Message::Text(text) = pending {
                             pending_outbound = Some(text.as_str().to_owned());
                         }
                         pending_ctl = Some(ctl);
                     }
-                    SendOrPreempt::Sent(Err(e)) => {
-                        *write_error.lock() = Some(format!("frame send failed: {e}"));
+                    SendOrPreempt::Failed { error, pending } => {
+                        if is_outbound && let Message::Text(text) = pending {
+                            pending_outbound = Some(text.as_str().to_owned());
+                        }
+                        *write_error.lock() = Some(format!("frame send failed: {error}"));
                         crate::metrics::writer_sink_send_error();
                         live = false;
                     }
-                    SendOrPreempt::Sent(Ok(())) => {}
+                    SendOrPreempt::Flushed => {}
                 }
             }
             if live
@@ -1235,12 +1257,12 @@ async fn run_writer<S>(
                 {
                     SendOrPreempt::Stop => break,
                     SendOrPreempt::Ctl { ctl, .. } => pending_ctl = Some(ctl),
-                    SendOrPreempt::Sent(Err(e)) => {
-                        *write_error.lock() = Some(format!("app ping send failed: {e}"));
+                    SendOrPreempt::Failed { error, .. } => {
+                        *write_error.lock() = Some(format!("app ping send failed: {error}"));
                         crate::metrics::writer_sink_send_error();
                         live = false;
                     }
-                    SendOrPreempt::Sent(Ok(())) => {}
+                    SendOrPreempt::Flushed => {}
                 }
             }
             while let Some(ctl) = pending_ctl.take() {
@@ -1311,13 +1333,13 @@ async fn run_writer<S>(
                 ).await {
                     SendOrPreempt::Stop => break,
                     SendOrPreempt::Ctl { ctl, .. } => Some(ctl),
-                    SendOrPreempt::Sent(Err(e)) => {
-                        *write_error.lock() = Some(format!("ping send failed: {e}"));
+                    SendOrPreempt::Failed { error, .. } => {
+                        *write_error.lock() = Some(format!("ping send failed: {error}"));
                         crate::metrics::writer_sink_send_error();
                         live = false;
                         None
                     }
-                    SendOrPreempt::Sent(Ok(())) => {
+                    SendOrPreempt::Flushed => {
                         // App ping survives proxies that eat WS control frames.
                         pending_app_ping = true;
                         None
@@ -1333,13 +1355,13 @@ async fn run_writer<S>(
                 ).await {
                     SendOrPreempt::Stop => break,
                     SendOrPreempt::Ctl { ctl, .. } => Some(ctl),
-                    SendOrPreempt::Sent(Err(e)) => {
-                        *write_error.lock() = Some(format!("priority send failed: {e}"));
+                    SendOrPreempt::Failed { error, .. } => {
+                        *write_error.lock() = Some(format!("priority send failed: {error}"));
                         crate::metrics::writer_sink_send_error();
                         live = false;
                         None
                     }
-                    SendOrPreempt::Sent(Ok(())) => None,
+                    SendOrPreempt::Flushed => None,
                 },
                 None => break,
             },
@@ -1356,19 +1378,22 @@ async fn run_writer<S>(
                     &mut writer_stop_rx,
                 ).await {
                     SendOrPreempt::Stop => break,
-                    SendOrPreempt::Ctl { ctl, unsent } => {
-                        if let Some(Message::Text(text)) = unsent {
+                    SendOrPreempt::Ctl { ctl, pending } => {
+                        if let Message::Text(text) = pending {
                             pending_outbound = Some(text.as_str().to_owned());
                         }
                         Some(ctl)
                     }
-                    SendOrPreempt::Sent(Err(e)) => {
-                        *write_error.lock() = Some(format!("frame send failed: {e}"));
+                    SendOrPreempt::Failed { error, pending } => {
+                        if let Message::Text(text) = pending {
+                            pending_outbound = Some(text.as_str().to_owned());
+                        }
+                        *write_error.lock() = Some(format!("frame send failed: {error}"));
                         crate::metrics::writer_sink_send_error();
                         live = false;
                         None
                     }
-                    SendOrPreempt::Sent(Ok(())) => None,
+                    SendOrPreempt::Flushed => None,
                 },
                 None => break,
             },
@@ -2444,6 +2469,125 @@ mod tests {
         stop_tx.send(()).await.expect("stop");
         writer.await.expect("writer task joins");
     }
+    /// Sink that accepts a frame in `start_send` but can hold its flush
+    /// pending. This models the ambiguous delivery window where the peer may
+    /// have received the bytes even though the `Sink` contract has not yet
+    /// confirmed the write.
+    struct FlushBlockingSink {
+        recorded: Arc<std::sync::Mutex<Vec<String>>>,
+        flush_pending: bool,
+        started_tx: mpsc::UnboundedSender<()>,
+    }
+    impl FlushBlockingSink {
+        fn new(flush_pending: bool) -> (Self, mpsc::UnboundedReceiver<()>) {
+            let (started_tx, started_rx) = mpsc::unbounded_channel();
+            (
+                Self {
+                    recorded: Arc::new(std::sync::Mutex::new(Vec::new())),
+                    flush_pending,
+                    started_tx,
+                },
+                started_rx,
+            )
+        }
+        fn recorded(&self) -> Arc<std::sync::Mutex<Vec<String>>> {
+            self.recorded.clone()
+        }
+    }
+    impl futures::Sink<Message> for FlushBlockingSink {
+        type Error = std::io::Error;
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+            if let Message::Text(text) = item {
+                self.recorded
+                    .lock()
+                    .expect("recorded lock")
+                    .push(text.as_str().to_owned());
+                let _ = self.started_tx.send(());
+            }
+            Ok(())
+        }
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            if self.flush_pending {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    #[tokio::test]
+    async fn writer_replays_frame_preempted_while_flush_is_pending() {
+        let (sink, mut started_rx) = FlushBlockingSink::new(true);
+        let old_recorded = sink.recorded();
+        let (out_tx, out_rx) = mpsc::channel::<String>(8);
+        let (ctl_tx, ctl_rx) = mpsc::channel::<WriterControl<FlushBlockingSink>>(4);
+        let (stop_tx, stop_rx) = mpsc::channel::<()>(1);
+        let (_prio_tx, prio_rx) = mpsc::channel::<String>(4);
+        let writer = tokio::spawn(run_writer(
+            sink,
+            out_rx,
+            prio_rx,
+            ctl_rx,
+            stop_rx,
+            None,
+            idle_write_error_slot(),
+            None,
+        ));
+        let response = r#"{"jsonrpc":"2.0","id":"rpc-1","result":{"ok":true}}"#;
+        out_tx.send(response.to_owned()).await.expect("response");
+        out_tx.send("after".to_owned()).await.expect("queued data");
+        started_rx
+            .recv()
+            .await
+            .expect("old sink accepted response before flush");
+        assert_eq!(
+            *old_recorded.lock().expect("lock"),
+            vec![response.to_owned()],
+            "the old sink accepted the frame before its flush stalled"
+        );
+
+        ctl_tx.send(WriterControl::Pause).await.expect("pause");
+        let (fresh, _fresh_started_rx) = FlushBlockingSink::new(false);
+        let fresh_recorded = fresh.recorded();
+        ctl_tx
+            .send(WriterControl::Resume(fresh))
+            .await
+            .expect("resume");
+        wait_until(
+            || {
+                fresh_recorded
+                    .lock()
+                    .expect("lock")
+                    .iter()
+                    .any(|f| f == "after")
+            },
+            "queued data reaches the fresh sink",
+        )
+        .await;
+        assert_eq!(
+            *fresh_recorded.lock().expect("lock"),
+            vec![response.to_owned(), "after".to_owned()],
+            "the identical response id must be replayed before later queued data"
+        );
+
+        drop(out_tx);
+        stop_tx.send(()).await.expect("stop");
+        writer.await.expect("writer task joins");
+    }
     /// Accepts frames (records them) but never completes flush — models a
     /// half-open TCP sndbuf so Close can be observed then time out.
     #[tokio::test]
@@ -2874,7 +3018,7 @@ mod tests {
         writer.await.expect("writer task joins");
     }
     #[tokio::test]
-    async fn writer_send_error_pauses_until_resume_without_multi_frame_loss() {
+    async fn writer_send_error_replays_failed_frame_after_resume() {
         let failing = RecordingSink::new();
         let failing_log = failing.recorded();
         let fail_flag = failing.fail_flag();
@@ -2929,14 +3073,14 @@ mod tests {
             .await
             .expect("resume");
         wait_until(
-            || outbound_data_frames(&fresh_log).len() == 2,
-            "buffered post-failure frames flush after resume",
+            || outbound_data_frames(&fresh_log).len() == 3,
+            "failed and buffered frames flush after resume",
         )
         .await;
         assert_eq!(
             outbound_data_frames(&fresh_log),
-            vec!["kept1".to_owned(), "kept2".to_owned()],
-            "post-failure frames survive; only the in-flight 'lost' frame is gone"
+            vec!["lost".to_owned(), "kept1".to_owned(), "kept2".to_owned()],
+            "the failed frame and later buffered frames survive in order"
         );
         stop_tx.send(()).await.expect("stop");
         writer.await.expect("writer task joins");
