@@ -127,4 +127,5 @@ workspace = true
 default-bazel = ["serde"]
 default = ["serde"]
 serde = []
+pi = []
 dhat-heap = ["dep:dhat"]
