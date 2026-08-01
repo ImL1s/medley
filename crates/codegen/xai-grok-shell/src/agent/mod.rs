@@ -27,7 +27,7 @@ pub(crate) mod update_chunk_merge;
 
 pub use mvp_agent::MvpAgent;
 pub use relay::{RelayConfig, RelayHandle, spawn_relay_connection};
-pub use server::{ServerConfig, run_agent_server};
+pub use server::{MIN_REMOTE_SECRET_BYTES, ServerConfig, run_agent_server};
 
 #[cfg(test)]
 mod storage_client_tests;

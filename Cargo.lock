@@ -13936,6 +13936,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "constant_time_eq",
  "criterion",
  "ctor",
  "dashmap",
