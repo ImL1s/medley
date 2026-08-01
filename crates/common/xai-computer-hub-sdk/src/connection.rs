@@ -1093,7 +1093,12 @@ enum WriterControl<S> {
 /// Outcome of racing a sink write against writer ctl/stop.
 enum SendOrPreempt<S> {
     Sent(Result<(), String>),
-    Ctl(WriterControl<S>),
+    Ctl {
+        ctl: WriterControl<S>,
+        /// Present only when control won before `start_send`, so retrying
+        /// cannot duplicate a frame already committed to the sink.
+        unsent: Option<Message>,
+    },
     Stop,
 }
 async fn send_or_preempt<S>(
@@ -1106,14 +1111,37 @@ where
     S: futures::Sink<Message> + Unpin,
     S::Error: std::fmt::Display,
 {
+    // Keep ownership through poll_ready so a control preemption can return
+    // an unquestionably unsent frame. After start_send, only flush remains;
+    // returning the frame then could duplicate a write accepted by the sink.
+    let ready = tokio::select! {
+        biased;
+        _ = writer_stop_rx.recv() => return SendOrPreempt::Stop,
+        ctl = writer_ctl_rx.recv() => match ctl {
+            Some(ctl) => return SendOrPreempt::Ctl {
+                ctl,
+                unsent: Some(msg),
+            },
+            None => return SendOrPreempt::Stop,
+        },
+        result = futures::future::poll_fn(|cx| std::pin::Pin::new(&mut *sink).poll_ready(cx)) => result,
+    };
+    if let Err(e) = ready {
+        return SendOrPreempt::Sent(Err(e.to_string()));
+    }
+    if let Err(e) = std::pin::Pin::new(&mut *sink).start_send(msg) {
+        return SendOrPreempt::Sent(Err(e.to_string()));
+    }
     tokio::select! {
         biased;
         _ = writer_stop_rx.recv() => SendOrPreempt::Stop,
         ctl = writer_ctl_rx.recv() => match ctl {
-            Some(ctl) => SendOrPreempt::Ctl(ctl),
+            Some(ctl) => SendOrPreempt::Ctl { ctl, unsent: None },
             None => SendOrPreempt::Stop,
         },
-        result = sink.send(msg) => SendOrPreempt::Sent(result.map_err(|e| e.to_string())),
+        result = futures::future::poll_fn(|cx| std::pin::Pin::new(&mut *sink).poll_flush(cx)) => {
+            SendOrPreempt::Sent(result.map_err(|e| e.to_string()))
+        },
     }
 }
 /// Dedicated writer task: owns the sink, drains `outbound_rx`, and fires
@@ -1148,17 +1176,18 @@ async fn run_writer<S>(
     let mut live = true;
     let mut ready = ready;
     let mut pending_app_ping = false;
+    let mut pending_outbound = None;
     loop {
         if let Some(tx) = ready.take() {
             let _ = tx.send(());
         }
-        if live && pending_app_ping {
+        if live && pending_app_ping && pending_outbound.is_none() {
             pending_app_ping = false;
             let queued = match priority_rx.try_recv() {
-                Ok(text) => Some(text),
+                Ok(text) => Some((text, false)),
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
                     match outbound_rx.try_recv() {
-                        Ok(text) => Some(text),
+                        Ok(text) => Some((text, true)),
                         Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
                         Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                             break;
@@ -1168,7 +1197,7 @@ async fn run_writer<S>(
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
             };
             let mut pending_ctl: Option<WriterControl<S>> = None;
-            if let Some(text) = queued {
+            if let Some((text, is_outbound)) = queued {
                 match send_or_preempt(
                     &mut sink,
                     Message::Text(text.into()),
@@ -1178,7 +1207,12 @@ async fn run_writer<S>(
                 .await
                 {
                     SendOrPreempt::Stop => break,
-                    SendOrPreempt::Ctl(ctl) => pending_ctl = Some(ctl),
+                    SendOrPreempt::Ctl { ctl, unsent } => {
+                        if is_outbound && let Some(Message::Text(text)) = unsent {
+                            pending_outbound = Some(text.as_str().to_owned());
+                        }
+                        pending_ctl = Some(ctl);
+                    }
                     SendOrPreempt::Sent(Err(e)) => {
                         *write_error.lock() = Some(format!("frame send failed: {e}"));
                         crate::metrics::writer_sink_send_error();
@@ -1200,7 +1234,7 @@ async fn run_writer<S>(
                 .await
                 {
                     SendOrPreempt::Stop => break,
-                    SendOrPreempt::Ctl(ctl) => pending_ctl = Some(ctl),
+                    SendOrPreempt::Ctl { ctl, .. } => pending_ctl = Some(ctl),
                     SendOrPreempt::Sent(Err(e)) => {
                         *write_error.lock() = Some(format!("app ping send failed: {e}"));
                         crate::metrics::writer_sink_send_error();
@@ -1276,7 +1310,7 @@ async fn run_writer<S>(
                     &mut writer_stop_rx,
                 ).await {
                     SendOrPreempt::Stop => break,
-                    SendOrPreempt::Ctl(ctl) => Some(ctl),
+                    SendOrPreempt::Ctl { ctl, .. } => Some(ctl),
                     SendOrPreempt::Sent(Err(e)) => {
                         *write_error.lock() = Some(format!("ping send failed: {e}"));
                         crate::metrics::writer_sink_send_error();
@@ -1298,7 +1332,7 @@ async fn run_writer<S>(
                     &mut writer_stop_rx,
                 ).await {
                     SendOrPreempt::Stop => break,
-                    SendOrPreempt::Ctl(ctl) => Some(ctl),
+                    SendOrPreempt::Ctl { ctl, .. } => Some(ctl),
                     SendOrPreempt::Sent(Err(e)) => {
                         *write_error.lock() = Some(format!("priority send failed: {e}"));
                         crate::metrics::writer_sink_send_error();
@@ -1309,7 +1343,12 @@ async fn run_writer<S>(
                 },
                 None => break,
             },
-            outbound = outbound_rx.recv(), if live => match outbound {
+            outbound = async {
+                match pending_outbound.take() {
+                    Some(text) => Some(text),
+                    None => outbound_rx.recv().await,
+                }
+            }, if live => match outbound {
                 Some(text) => match send_or_preempt(
                     &mut sink,
                     Message::Text(text.into()),
@@ -1317,7 +1356,12 @@ async fn run_writer<S>(
                     &mut writer_stop_rx,
                 ).await {
                     SendOrPreempt::Stop => break,
-                    SendOrPreempt::Ctl(ctl) => Some(ctl),
+                    SendOrPreempt::Ctl { ctl, unsent } => {
+                        if let Some(Message::Text(text)) = unsent {
+                            pending_outbound = Some(text.as_str().to_owned());
+                        }
+                        Some(ctl)
+                    }
                     SendOrPreempt::Sent(Err(e)) => {
                         *write_error.lock() = Some(format!("frame send failed: {e}"));
                         crate::metrics::writer_sink_send_error();
@@ -2352,6 +2396,7 @@ mod tests {
             None,
         ));
         out_tx.send("stuck".to_owned()).await.expect("data");
+        out_tx.send("after".to_owned()).await.expect("queued data");
         tokio::time::sleep(Duration::from_millis(20)).await;
         ctl_tx
             .send(WriterControl::Close {
@@ -2377,6 +2422,23 @@ mod tests {
         assert!(
             !recorded.lock().expect("lock").iter().any(|f| f == "stuck"),
             "blocked data must not be written after Close preempt"
+        );
+        let fresh = BlockingSink::new();
+        let fresh_recorded = fresh.recorded();
+        fresh.release();
+        ctl_tx
+            .send(WriterControl::Resume(fresh))
+            .await
+            .expect("resume");
+        wait_until(
+            || fresh_recorded.lock().expect("lock").len() == 2,
+            "preempted and queued data flush on the fresh sink",
+        )
+        .await;
+        assert_eq!(
+            *fresh_recorded.lock().expect("lock"),
+            vec!["stuck".to_owned(), "after".to_owned()],
+            "the unsent preempted frame must be retried exactly once before later queued data"
         );
         drop(out_tx);
         stop_tx.send(()).await.expect("stop");
