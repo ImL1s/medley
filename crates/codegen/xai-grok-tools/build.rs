@@ -10,7 +10,6 @@ use std::path::PathBuf;
 const RG_VER: &str = "15.0.0";
 const BFS_VER: &str = "4.1";
 const UGREP_VER: &str = "7.7.0";
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     bundle_rg()?;
     // bfs/ugrep back the bash-harness find/grep shadows (embedded_search_tools).

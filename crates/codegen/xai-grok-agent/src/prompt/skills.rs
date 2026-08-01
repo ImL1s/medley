@@ -215,15 +215,8 @@ pub fn collect_skill_config_dirs(
     }
 
     // Priority 4: Config paths (skills.paths entries).
-    for raw in config_paths {
-        let expanded = expand_tilde(raw);
-        if expanded.is_dir() {
-            try_add(expanded);
-        } else if expanded.is_file()
-            && let Some(parent) = expanded.parent()
-        {
-            try_add(parent.to_path_buf());
-        }
+    for resolved in resolve_skill_config_paths(config_paths) {
+        try_add(resolved.watch_root().to_path_buf());
     }
 
     dirs
@@ -342,6 +335,46 @@ fn expand_tilde(raw: &str) -> PathBuf {
     PathBuf::from(raw)
 }
 
+/// A configured skill path resolved to the same filesystem object used by
+/// discovery and by the skills file watcher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedSkillConfigPath {
+    SkillFile(PathBuf),
+    Directory(PathBuf),
+}
+
+impl ResolvedSkillConfigPath {
+    /// Directory that must be watched recursively for changes to this entry.
+    pub fn watch_root(&self) -> &Path {
+        match self {
+            Self::SkillFile(path) => path.parent().unwrap_or(path),
+            Self::Directory(path) => path,
+        }
+    }
+}
+
+/// Resolve `[skills].paths` entries, including tilde expansion and direct
+/// `SKILL.md` files. Invalid or missing entries are omitted.
+pub fn resolve_skill_config_paths(config_paths: &[String]) -> Vec<ResolvedSkillConfigPath> {
+    config_paths
+        .iter()
+        .filter_map(|raw| {
+            let expanded = expand_tilde(raw);
+            if expanded.is_file() && expanded.file_name().is_some_and(|n| n == "SKILL.md") {
+                Some(ResolvedSkillConfigPath::SkillFile(expanded))
+            } else if expanded.is_dir() {
+                Some(ResolvedSkillConfigPath::Directory(expanded))
+            } else {
+                tracing::warn!(
+                    path = %expanded.display(),
+                    "config path does not exist or is not a SKILL.md file/directory"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
 /// Collect and parse skills from `SkillsConfig.paths` entries.
 ///
 /// Each entry is either a direct SKILL.md file or a directory to walk recursively.
@@ -351,28 +384,25 @@ fn collect_config_skills(config_paths: &[String], git_root: Option<&Path>) -> Ve
     let mut skill_files: Vec<(PathBuf, SkillScope)> = Vec::new();
     let mut seen = HashSet::new();
 
-    for raw in config_paths {
-        let expanded = expand_tilde(raw);
+    for resolved in resolve_skill_config_paths(config_paths) {
+        let expanded = match &resolved {
+            ResolvedSkillConfigPath::SkillFile(path) | ResolvedSkillConfigPath::Directory(path) => {
+                path
+            }
+        };
         let scope = match git_root {
             Some(root) if expanded.starts_with(root) => SkillScope::Repo,
             _ => SkillScope::User,
         };
 
-        if expanded.is_file() && expanded.file_name().is_some_and(|n| n == "SKILL.md") {
-            collect_discovered_paths(
-                std::iter::once(expanded),
-                scope,
-                &mut seen,
-                &mut skill_files,
-            );
-        } else if expanded.is_dir() {
-            let dir_paths = find_skill_md_paths(&expanded);
-            collect_discovered_paths(dir_paths, scope, &mut seen, &mut skill_files);
-        } else {
-            tracing::warn!(
-                path = %expanded.display(),
-                "config path does not exist or is not a SKILL.md file/directory"
-            );
+        match resolved {
+            ResolvedSkillConfigPath::SkillFile(path) => {
+                collect_discovered_paths(std::iter::once(path), scope, &mut seen, &mut skill_files)
+            }
+            ResolvedSkillConfigPath::Directory(path) => {
+                let dir_paths = find_skill_md_paths(&path);
+                collect_discovered_paths(dir_paths, scope, &mut seen, &mut skill_files);
+            }
         }
     }
 

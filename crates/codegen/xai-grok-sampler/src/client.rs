@@ -25,8 +25,8 @@ use xai_grok_sampling_types::error::{try_parse_stream_error, user_facing_api_err
 use xai_grok_sampling_types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ConversationRequest,
     ConversationResponse, CreateResponseWrapper, DOOM_LOOP_CHECK_HEADER, MessagesRequestWrapper,
-    ResponseModelMetadata, Result, SamplingError, build_messages_request, is_check_event, messages,
-    rs,
+    ResponseModelMetadata, Result, SamplingError, SentCredential, build_messages_request,
+    is_check_event, messages, rs,
 };
 
 use crate::config::{AuthScheme, OriginClientInfo, SamplerConfig};
@@ -576,6 +576,18 @@ pub fn user_agent_string_for(origin: &OriginClientInfo) -> String {
     }
 }
 
+/// Build a structured authentication failure from the request-local credential
+/// capture without exposing any credential bytes.
+fn auth_rejected(
+    message: impl Into<String>,
+    final_credential: &FinalRequestCredential,
+) -> SamplingError {
+    SamplingError::Auth {
+        message: message.into(),
+        credential: SentCredential::from_sent_fragment(final_credential.0.as_deref()),
+    }
+}
+
 // =============================================================================
 // SamplingClient
 // =============================================================================
@@ -595,9 +607,8 @@ impl SamplingClient {
                 AuthScheme::XApiKey => {
                     let header_value = HeaderValue::from_str(api_key).map_err(|_| {
                         tracing::debug!("Invalid api_key HTTP header value");
-                        SamplingError::Auth(
-                            "Invalid api_key: cannot be converted to a valid HTTP header"
-                                .to_string(),
+                        SamplingError::auth_unknown(
+                            "Invalid api_key: cannot be converted to a valid HTTP header",
                         )
                     })?;
                     headers.insert(HeaderName::from_static("x-api-key"), header_value);
@@ -606,9 +617,8 @@ impl SamplingClient {
                     let bearer = format!("Bearer {}", api_key);
                     let header_value = HeaderValue::from_str(&bearer).map_err(|_| {
                         tracing::debug!("Invalid Authorization header value");
-                        SamplingError::Auth(
-                            "Invalid api_key: cannot be converted to a valid HTTP Authorization header"
-                                .to_string(),
+                        SamplingError::auth_unknown(
+                            "Invalid api_key: cannot be converted to a valid HTTP Authorization header",
                         )
                     })?;
                     headers.insert(AUTHORIZATION, header_value);
@@ -960,7 +970,11 @@ impl SamplingClient {
                     crate::attribution::SamplingConsumer::ChatCompletions,
                     &final_credential,
                 );
-                return Err(SamplingError::Auth("Unauthorized (401)".to_string()));
+                let server_message = user_facing_api_error_message(status, bytes.as_ref());
+                return Err(auth_rejected(
+                    format!("Unauthorized (401): {server_message}"),
+                    &final_credential,
+                ));
             }
             let message = user_facing_api_error_message(status, bytes.as_ref());
             return Err(SamplingError::Api {
@@ -1098,7 +1112,12 @@ impl SamplingClient {
                     crate::attribution::SamplingConsumer::ChatCompletionsStream,
                     &final_credential,
                 );
-                return Err(SamplingError::Auth("Unauthorized (401)".to_string()));
+                let body = response.bytes().await.unwrap_or_default();
+                let server_message = user_facing_api_error_message(status, body.as_ref());
+                return Err(auth_rejected(
+                    format!("Unauthorized (401): {server_message}"),
+                    &final_credential,
+                ));
             }
 
             let bytes = response.bytes().await?;
@@ -1282,7 +1301,11 @@ impl SamplingClient {
                     crate::attribution::SamplingConsumer::Responses,
                     &final_credential,
                 );
-                return Err(SamplingError::Auth("Unauthorized (401)".to_string()));
+                let server_message = user_facing_api_error_message(status, bytes.as_ref());
+                return Err(auth_rejected(
+                    format!("Unauthorized (401): {server_message}"),
+                    &final_credential,
+                ));
             }
 
             let message = user_facing_api_error_message(status, bytes.as_ref());
@@ -1429,7 +1452,12 @@ impl SamplingClient {
                     crate::attribution::SamplingConsumer::ResponsesStream,
                     &final_credential,
                 );
-                return Err(SamplingError::Auth("Unauthorized (401)".to_string()));
+                let body = response.bytes().await.unwrap_or_default();
+                let server_message = user_facing_api_error_message(status, body.as_ref());
+                return Err(auth_rejected(
+                    format!("Unauthorized (401): {server_message}"),
+                    &final_credential,
+                ));
             }
             let model_metadata = extract_model_metadata(response.headers());
             let retry_after_secs = extract_retry_after(response.headers());
@@ -1598,7 +1626,11 @@ impl SamplingClient {
                     crate::attribution::SamplingConsumer::Messages,
                     &final_credential,
                 );
-                return Err(SamplingError::Auth("Unauthorized (401)".to_string()));
+                let server_message = user_facing_api_error_message(status, bytes.as_ref());
+                return Err(auth_rejected(
+                    format!("Unauthorized (401): {server_message}"),
+                    &final_credential,
+                ));
             }
 
             let message = user_facing_api_error_message(status, bytes.as_ref());
@@ -1706,7 +1738,12 @@ impl SamplingClient {
                     crate::attribution::SamplingConsumer::MessagesStream,
                     &final_credential,
                 );
-                return Err(SamplingError::Auth("Unauthorized (401)".to_string()));
+                let body = response.bytes().await.unwrap_or_default();
+                let server_message = user_facing_api_error_message(status, body.as_ref());
+                return Err(auth_rejected(
+                    format!("Unauthorized (401): {server_message}"),
+                    &final_credential,
+                ));
             }
             let model_metadata = extract_model_metadata(response.headers());
             let retry_after_secs = extract_retry_after(response.headers());
@@ -2866,7 +2903,7 @@ mod tests {
         let mut config = minimal_config();
         config.header_injector = Some(std::sync::Arc::new(TestInjector));
         let client = SamplingClient::new(config).expect("build");
-        let (builder, _sent) = client.post("http://localhost/test");
+        let (builder, _final_credential) = client.post("http://localhost/test");
         let req = builder.build().expect("build request");
         assert!(
             req.headers().contains_key("traceparent"),
@@ -3034,7 +3071,7 @@ mod tests {
             ..minimal_config()
         };
         let client = SamplingClient::new(cfg).expect("client should build");
-        let (builder, _sent) = client.post("https://example.test/v1/messages");
+        let (builder, _final_credential) = client.post("https://example.test/v1/messages");
         let request = builder.build().expect("request should build");
         let auth = request
             .headers()
@@ -3060,7 +3097,7 @@ mod tests {
             ..minimal_config()
         };
         let client = SamplingClient::new(cfg).expect("client should build");
-        let (builder, _sent) = client.post("https://example.test/v1/responses");
+        let (builder, _final_credential) = client.post("https://example.test/v1/responses");
         let request = builder.build().expect("request should build");
         let auth_count = request.headers().get_all(AUTHORIZATION).iter().count();
         assert_eq!(
@@ -3086,7 +3123,7 @@ mod tests {
             ..minimal_config()
         };
         let client = SamplingClient::new(cfg).expect("client should build");
-        let (builder, _sent) = client.post("https://example.test/v1/messages");
+        let (builder, _final_credential) = client.post("https://example.test/v1/messages");
         let request = builder.build().expect("request should build");
         let api_key = request
             .headers()
@@ -3206,7 +3243,7 @@ mod tests {
         let client = SamplingClient::new(cfg).expect("client should build");
 
         // Build a request to inspect the final headers.
-        let (builder, _sent) = client.post("https://example.test/v1/responses");
+        let (builder, _final_credential) = client.post("https://example.test/v1/responses");
         let request = builder.body("").build().expect("request should build");
 
         let auth_values: Vec<_> = request.headers().get_all(AUTHORIZATION).iter().collect();
