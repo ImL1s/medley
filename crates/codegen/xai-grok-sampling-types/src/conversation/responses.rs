@@ -187,10 +187,13 @@ pub fn patch_codex_instructions(body: &mut serde_json::Value) {
         if item.get("role").and_then(serde_json::Value::as_str) != Some("system") {
             return true;
         }
-        if let Some(content) = item.get("content").and_then(serde_json::Value::as_str) {
-            system_text.push(content.to_owned());
+        if let Some(content) = item.get("content").and_then(codex_instruction_text) {
+            system_text.push(content);
+            return false;
         }
-        false
+        // Do not silently discard a valid-but-unsupported content shape.
+        // Leaving it in `input` is safer than stripping system guidance.
+        true
     });
 
     if system_text.is_empty() {
@@ -204,6 +207,24 @@ pub fn patch_codex_instructions(body: &mut serde_json::Value) {
         system_text.insert(0, existing.to_owned());
     }
     body["instructions"] = serde_json::Value::String(system_text.join("\n\n"));
+}
+
+fn codex_instruction_text(content: &serde_json::Value) -> Option<String> {
+    match content {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Array(parts) if !parts.is_empty() => {
+            let mut text = Vec::with_capacity(parts.len());
+            for part in parts {
+                let kind = part.get("type").and_then(serde_json::Value::as_str);
+                if !matches!(kind, Some("input_text" | "output_text")) {
+                    return None;
+                }
+                text.push(part.get("text")?.as_str()?.to_owned());
+            }
+            Some(text.join("\n\n"))
+        }
+        _ => None,
+    }
 }
 
 /// Inject the `type: "reasoning_text"` discriminator the API requires.

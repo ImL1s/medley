@@ -25,6 +25,51 @@ fn test_conversation_request_to_responses_api() {
 }
 
 #[test]
+fn codex_instructions_flatten_list_form_system_text() {
+    let mut body = serde_json::json!({
+        "instructions": "existing guidance",
+        "input": [
+            {
+                "type": "message",
+                "role": "system",
+                "content": [
+                    {"type": "input_text", "text": "first"},
+                    {"type": "input_text", "text": "second"}
+                ]
+            },
+            {"type": "message", "role": "user", "content": "hello"}
+        ]
+    });
+
+    patch_codex_instructions(&mut body);
+
+    assert_eq!(body["instructions"], "existing guidance\n\nfirst\n\nsecond");
+    assert_eq!(body["input"].as_array().unwrap().len(), 1);
+    assert_eq!(body["input"][0]["role"], "user");
+}
+
+#[test]
+fn codex_instructions_preserve_unsupported_system_content() {
+    let original = serde_json::json!({
+        "input": [
+            {
+                "type": "message",
+                "role": "system",
+                "content": [
+                    {"type": "input_text", "text": "describe this"},
+                    {"type": "input_image", "image_url": "https://example.test/image.png"}
+                ]
+            }
+        ]
+    });
+    let mut body = original.clone();
+
+    patch_codex_instructions(&mut body);
+
+    assert_eq!(body, original);
+}
+
+#[test]
 fn function_tool_colliding_with_hosted_web_search_is_dropped() {
     let mut req =
         ConversationRequest::from_items(vec![ConversationItem::user("hi")]).with_tools(vec![

@@ -3278,7 +3278,11 @@ mod tests {
             rs::InputItem::EasyMessage(rs::EasyInputMessage {
                 r#type: rs::MessageType::Message,
                 role: rs::Role::System,
-                content: rs::EasyInputContent::Text("system guidance".to_owned()),
+                content: rs::EasyInputContent::ContentList(vec![rs::InputContent::InputText(
+                    rs::InputTextContent {
+                        text: "system guidance".to_owned(),
+                    },
+                )]),
             }),
             rs::InputItem::EasyMessage(rs::EasyInputMessage {
                 r#type: rs::MessageType::Message,
