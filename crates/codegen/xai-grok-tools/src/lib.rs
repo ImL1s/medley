@@ -18,6 +18,8 @@ pub use util::mcp_truncate::{
 
 pub mod attribution;
 
+pub mod capability;
+
 pub mod bridge;
 pub mod computer;
 pub mod gitignore;

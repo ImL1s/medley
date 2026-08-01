@@ -1,4 +1,5 @@
 use crate::{
+    capability::{CapabilityPolicy, ResolvedToolCapability},
     computer::types::{AsyncFileSystem, TerminalBackend},
     implementations::{
         codex, grok_build, grok_build_concise, grok_build_hashline, opencode,
@@ -412,6 +413,9 @@ struct ReminderEntry {
 }
 /// A tool ready for dispatch, with pre-built client-facing definition.
 struct FinalizedTool {
+    /// Stable ID used for capability classification. Presentation aliases do
+    /// not change this identity.
+    canonical_id: String,
     namespace: String,
     id: String,
     /// The key under which this tool is stored in the `LocalRegistry`.
@@ -445,6 +449,7 @@ struct FinalizedTool {
     /// `"legacy-0.4.10"`). `None` for unmanaged tools and dynamically
     /// registered (MCP) tools.
     contract_version: Option<String>,
+    capability: ResolvedToolCapability,
 }
 /// Toolset produced by `ToolRegistryBuilder::finalize()`.
 ///
@@ -469,6 +474,7 @@ pub struct FinalizedToolset {
     /// Per-user feature-flag bag stamped on every dispatch ctx by
     /// `prepare_dispatch`. `None` outside a workspace bind.
     workspace_viewer_ctx: Option<xai_tool_runtime::WorkspaceViewerContext>,
+    capability_policy: CapabilityPolicy,
 }
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RequirementError {
@@ -537,6 +543,7 @@ pub struct ToolRegistryBuilder {
     /// behavior); the tools server sets it from
     /// `FinalizeToolServerConfigRequest.system_reminders_enabled`.
     system_reminders_enabled: bool,
+    capability_policy: CapabilityPolicy,
 }
 impl Default for ToolRegistryBuilder {
     fn default() -> Self {
@@ -677,6 +684,7 @@ impl ToolRegistryBuilder {
             reminders: Vec::new(),
             shared_local_registry: None,
             system_reminders_enabled: true,
+            capability_policy: CapabilityPolicy::unrestricted(),
         };
         b.register_with_params::<grok_build::BashTool, grok_build::bash::BashParams>();
         b.register_with_params::<grok_build::ReadFileTool, grok_build::read_file::ReadFileParams>();
@@ -765,6 +773,10 @@ impl ToolRegistryBuilder {
     }
     pub fn with_local_registry(mut self, registry: xai_computer_hub_sdk::LocalRegistry) -> Self {
         self.shared_local_registry = Some(registry);
+        self
+    }
+    pub fn with_capability_policy(mut self, policy: CapabilityPolicy) -> Self {
+        self.capability_policy = policy;
         self
     }
     /// Dump tools manifest as JSON for the client.
@@ -958,11 +970,15 @@ impl ToolRegistryBuilder {
     /// `workspace_viewer_ctx` is `None` outside a workspace bind.
     pub fn finalize_with_trunc_config(
         mut self,
-        config: ToolServerConfig,
+        mut config: ToolServerConfig,
         ctx: SessionContext,
         truncation_config: crate::types::context::TruncationConfig,
         workspace_viewer_ctx: Option<xai_tool_runtime::WorkspaceViewerContext>,
     ) -> Result<FinalizedToolset, Vec<RequirementError>> {
+        self.capability_policy.filter_tool_config(&mut config);
+        crate::implementations::grok_build::task::types::prune_orphaned_background_task_tools(
+            &mut config,
+        );
         let errors = self.validate_config(&config);
         if !errors.is_empty() {
             return Err(errors);
@@ -1121,6 +1137,10 @@ impl ToolRegistryBuilder {
         let local_registry = self.shared_local_registry.take().unwrap_or_default();
         for tool_config in &config.tools {
             let entry = self.tools.remove(&tool_config.id).unwrap();
+            let canonical_id = tool_config.id.clone();
+            let capability = self
+                .capability_policy
+                .resolve_builtin(&canonical_id, entry.kind);
             (entry.register_in_local)(&local_registry);
             let contract_version = crate::versions::resolve_version(
                 preset_name,
@@ -1174,6 +1194,7 @@ impl ToolRegistryBuilder {
             );
             (entry.apply_params)(&effective_params, &mut resources);
             tools.push(FinalizedTool {
+                canonical_id,
                 namespace: entry.namespace,
                 registry_id: entry.id.clone(),
                 id: entry.id,
@@ -1186,6 +1207,7 @@ impl ToolRegistryBuilder {
                 reverse_params,
                 parse_input: Arc::from(entry.parse_input),
                 contract_version,
+                capability,
             });
         }
         let native_tool_names: std::collections::HashSet<String> = tools
@@ -1257,6 +1279,7 @@ impl ToolRegistryBuilder {
             renderer: renderer_arc,
             system_reminder_tag: ctx.system_reminder_tag,
             workspace_viewer_ctx,
+            capability_policy: self.capability_policy,
         })
     }
 }
@@ -1325,10 +1348,14 @@ impl FinalizedToolset {
             )),
             system_reminder_tag: "system-reminder",
             workspace_viewer_ctx: None,
+            capability_policy: CapabilityPolicy::unrestricted(),
         }
     }
     pub fn local_registry(&self) -> &xai_computer_hub_sdk::LocalRegistry {
         &self.local_registry
+    }
+    pub fn capability_policy(&self) -> &CapabilityPolicy {
+        &self.capability_policy
     }
     /// Whether the server must await this tool's in-process cancellation cleanup.
     pub fn cooperative_cancellation(&self, tool_name: &str) -> bool {
@@ -1474,18 +1501,22 @@ impl FinalizedToolset {
         tool_args: serde_json::Value,
         parent_ctx: xai_tool_runtime::ToolCallContext,
     ) -> Result<crate::types::output::ToolOutput, xai_tool_runtime::ToolError> {
-        let (registry_id, output_converter, reverse_params) = {
+        let (canonical_id, capability, registry_id, output_converter, reverse_params) = {
             let tools = self.tools.read();
             let entry = tools
                 .iter()
                 .find(|t| t.client_name == tool_name)
                 .ok_or_else(|| Self::tool_not_found_error(tool_name))?;
             (
+                entry.canonical_id.clone(),
+                entry.capability.clone(),
                 entry.registry_id.clone(),
                 entry.output_converter.clone(),
                 entry.reverse_params.clone(),
             )
         };
+        self.capability_policy
+            .authorize(&canonical_id, &capability)?;
         let canonical_params = if reverse_params.is_empty() {
             tool_args
         } else {
@@ -1657,18 +1688,22 @@ impl FinalizedToolset {
         cwd_override: Option<std::path::PathBuf>,
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<DispatchParts, xai_tool_runtime::ToolError> {
-        let (registry_id, output_converter, reverse_params) = {
+        let (canonical_id, capability, registry_id, output_converter, reverse_params) = {
             let tools = self.tools.read();
             let entry = tools
                 .iter()
                 .find(|t| t.client_name == tool_name)
                 .ok_or_else(|| Self::tool_not_found_error(tool_name))?;
             (
+                entry.canonical_id.clone(),
+                entry.capability.clone(),
                 entry.registry_id.clone(),
                 entry.output_converter.clone(),
                 entry.reverse_params.clone(),
             )
         };
+        self.capability_policy
+            .authorize(&canonical_id, &capability)?;
         let canonical_params = if reverse_params.is_empty() {
             tool_args
         } else {
@@ -1825,6 +1860,8 @@ impl FinalizedToolset {
         T: xai_tool_runtime::Tool + ToolMetadata + std::fmt::Debug + Send + Sync + 'static,
         T::Output: serde::Serialize,
     {
+        let capability = self.capability_policy.resolve_external(&name);
+        self.capability_policy.authorize(&name, &capability)?;
         let mut tools = self.tools.write();
         if tools.iter().any(|t| t.client_name == name) {
             return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
@@ -1838,6 +1875,7 @@ impl FinalizedToolset {
         let definition = ToolDefinition::function(&name, Some(&description), input_schema.clone());
         self.local_registry.register(tool);
         tools.push(FinalizedTool {
+            canonical_id: name.clone(),
             namespace: ToolNamespace::MCP.to_string(),
             id: name.clone(),
             registry_id,
@@ -1863,6 +1901,7 @@ impl FinalizedToolset {
                 }))
             }),
             contract_version: None,
+            capability,
         });
         Ok(())
     }
