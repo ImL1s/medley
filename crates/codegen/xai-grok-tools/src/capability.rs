@@ -326,11 +326,9 @@ pub fn descriptor_for_kind(kind: ToolKind) -> ToolCapabilityDescriptor {
         Read | ListDir | Search | Lsp | List | MemorySearch | MemoryGet | Skill => {
             ToolCapabilityDescriptor::classified([Effect::LocalRead])
         }
-        WebSearch | WebFetch | Monitor => {
-            ToolCapabilityDescriptor::classified([Effect::NetworkRead])
-        }
+        WebSearch | WebFetch => ToolCapabilityDescriptor::classified([Effect::NetworkRead]),
         Edit | Delete | Write | Move => ToolCapabilityDescriptor::classified([Effect::LocalWrite]),
-        Execute | BackgroundTaskAction | WaitTasksAction | KillTaskAction => {
+        Execute | BackgroundTaskAction | WaitTasksAction | KillTaskAction | Monitor => {
             ToolCapabilityDescriptor::classified([Effect::Execute])
         }
         ImageGen | VideoGen | ImageToVideo | ReferenceToVideo | DeployApp => {

@@ -975,6 +975,14 @@ impl ToolRegistryBuilder {
         truncation_config: crate::types::context::TruncationConfig,
         workspace_viewer_ctx: Option<xai_tool_runtime::WorkspaceViewerContext>,
     ) -> Result<FinalizedToolset, Vec<RequirementError>> {
+        // Client/session configs may omit `kind` even for built-ins. Resolve
+        // those from the registry's trusted static taxonomy before applying
+        // the fail-closed policy; unknown dynamic IDs remain unclassified.
+        for tool in &mut config.tools {
+            if tool.kind.is_none() {
+                tool.kind = self.tools.get(&tool.id).map(|entry| entry.kind);
+            }
+        }
         self.capability_policy.filter_tool_config(&mut config);
         crate::implementations::grok_build::task::types::prune_orphaned_background_task_tools(
             &mut config,
@@ -3184,6 +3192,157 @@ mod tests {
             Ok("ok".into())
         }
     }
+
+    fn restricted_policy(mode: xai_tool_types::SubagentCapabilityMode) -> CapabilityPolicy {
+        CapabilityPolicy::new(mode, crate::capability::TrustedToolCapabilities::default())
+    }
+
+    #[tokio::test]
+    async fn restricted_finalize_backfills_builtin_kinds_and_rejects_alias_bypasses() {
+        let tmp = TempDir::new().unwrap();
+        let builder = ToolRegistryBuilder::new().with_capability_policy(restricted_policy(
+            xai_tool_types::SubagentCapabilityMode::ReadOnly,
+        ));
+        let mut aliased_write = ToolConfig::for_tool::<codex::apply_patch::ApplyPatchTool>();
+        aliased_write.name_override = Some("harmless_read".to_owned());
+        let config = ToolServerConfig {
+            tools: vec![
+                ToolConfig::for_tool::<grok_build::ReadFileTool>(),
+                aliased_write,
+                ToolConfig::from_id("malicious__opaque"),
+            ],
+            behavior_preset: None,
+        };
+
+        let toolset = builder
+            .finalize(config, test_session_context(&tmp))
+            .expect("restricted finalization should drop denied tools before validation");
+        let names: Vec<String> = toolset
+            .tool_definitions()
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect();
+        assert_eq!(names, vec!["read_file"]);
+    }
+
+    #[tokio::test]
+    async fn dynamic_registration_requires_trusted_exact_id_capability() {
+        let tmp = TempDir::new().unwrap();
+        let toolset = ToolRegistryBuilder::new()
+            .with_capability_policy(restricted_policy(
+                xai_tool_types::SubagentCapabilityMode::ReadOnly,
+            ))
+            .finalize(
+                ToolServerConfig {
+                    tools: vec![ToolConfig::for_tool::<grok_build::ReadFileTool>()],
+                    behavior_preset: None,
+                },
+                test_session_context(&tmp),
+            )
+            .unwrap();
+        let error = toolset
+            .register_tool(
+                "malicious__opaque".to_owned(),
+                FakeMcpTool {
+                    description: "mutates an external system".into(),
+                },
+                None,
+            )
+            .expect_err("unclassified dynamic tools must fail closed");
+        assert!(error.to_string().contains("not permitted"), "{error}");
+
+        let source = crate::types::config_source::ConfigSource::User {
+            path: tmp.path().join("config.toml"),
+        };
+        let mut trusted = crate::capability::TrustedToolCapabilities::default();
+        trusted
+            .insert_classification(
+                "github__get_issue",
+                xai_tool_types::ToolCapabilityDescriptor::classified([
+                    xai_tool_types::ToolEffect::NetworkRead,
+                ]),
+                source,
+            )
+            .unwrap();
+        let safe_toolset = ToolRegistryBuilder::new()
+            .with_capability_policy(CapabilityPolicy::new(
+                xai_tool_types::SubagentCapabilityMode::ReadOnly,
+                trusted,
+            ))
+            .finalize(
+                ToolServerConfig {
+                    tools: vec![],
+                    behavior_preset: None,
+                },
+                test_session_context(&tmp),
+            )
+            .unwrap();
+        safe_toolset
+            .register_tool(
+                "github__get_issue".to_owned(),
+                FakeMcpTool {
+                    description: "read one issue".into(),
+                },
+                None,
+            )
+            .expect("trusted read-only dynamic tool should remain available");
+        assert_eq!(safe_toolset.tool_definitions().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn nested_use_tool_dispatch_rechecks_target_capability() {
+        let tmp = TempDir::new().unwrap();
+        let use_tool_config = ToolConfig::for_tool::<crate::implementations::use_tool::UseTool>();
+        let mut toolset = ToolRegistryBuilder::new()
+            .finalize(
+                ToolServerConfig {
+                    tools: vec![use_tool_config.clone()],
+                    behavior_preset: None,
+                },
+                test_session_context(&tmp),
+            )
+            .unwrap();
+        toolset
+            .register_tool(
+                "malicious__opaque".to_owned(),
+                FakeMcpTool {
+                    description: "mutates an external system".into(),
+                },
+                None,
+            )
+            .unwrap();
+
+        // Model a toolset that survived a policy/config refresh. The wrapper
+        // itself is explicitly audited, but its unclassified target is not.
+        let mut trusted = crate::capability::TrustedToolCapabilities::default();
+        trusted
+            .insert_unclassified_override(
+                use_tool_config.id,
+                crate::capability::UnclassifiedToolOverride {
+                    modes: vec![xai_tool_types::SubagentCapabilityMode::ReadOnly],
+                    reason: "audited wrapper; targets still require their own capability".into(),
+                    source: crate::types::config_source::ConfigSource::Builtin,
+                },
+            )
+            .unwrap();
+        toolset.capability_policy =
+            CapabilityPolicy::new(xai_tool_types::SubagentCapabilityMode::ReadOnly, trusted);
+
+        let error = Arc::new(toolset)
+            .call(
+                "use_tool",
+                serde_json::json!({
+                    "tool_name": "malicious__opaque",
+                    "tool_input": {}
+                }),
+                "call-restricted-wrapper",
+                None,
+            )
+            .await
+            .expect_err("nested dispatch must not bypass the target capability gate");
+        assert!(error.to_string().contains("not permitted"), "{error}");
+    }
+
     #[tokio::test]
     async fn call_sets_effective_tool_name_for_use_tool_dispatch() {
         let tmp = TempDir::new().unwrap();
