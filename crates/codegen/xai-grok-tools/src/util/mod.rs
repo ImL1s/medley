@@ -2,8 +2,6 @@ pub mod base64_images;
 pub mod binary;
 pub mod command_display;
 pub mod env;
-#[cfg(feature = "pi")]
-pub mod fd;
 pub mod fs;
 pub mod git_detect;
 pub mod grok_home;
@@ -25,8 +23,6 @@ pub use command_display::strip_redundant_session_cd;
 pub use env::detach_from_tty;
 pub use env::substitute_plugin_tokens;
 pub use env::{GROK_AGENT_ENV, GROK_AGENT_ENV_VALUE, apply_grok_agent_marker, pager_env};
-#[cfg(feature = "pi")]
-pub use fd::fd_path;
 pub use fs::{UnicodePathMatch, canonicalize_with_timeout, try_resolve_unicode_filename};
 pub use grok_home::{grok_application, grok_home};
 pub use path_suggestions::format_not_found_error;
