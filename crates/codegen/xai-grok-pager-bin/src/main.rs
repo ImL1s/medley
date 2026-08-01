@@ -178,6 +178,21 @@ fn preflight_agent_serve(
         _ => Ok(None),
     }
 }
+
+/// Gate the entire normal CLI startup continuation behind agent-serve
+/// preflight. The continuation contains all persistent, network, tracing,
+/// update, runtime, and background-task initialization.
+fn dispatch_after_cli_preflight<T>(
+    args: PagerArgs,
+    stderr_is_terminal: bool,
+    continuation: impl FnOnce(PagerArgs, Option<PreparedServe>) -> T,
+) -> Result<T> {
+    let prepared_serve = match &args.command {
+        Some(Command::Agent(agent_args)) => preflight_agent_serve(agent_args, stderr_is_terminal)?,
+        _ => None,
+    };
+    Ok(continuation(args, prepared_serve))
+}
 /// Entrypoint tag for `grok -p`; keys the quiet stderr default in `init_tracing_simple`.
 const HEADLESS_ENTRYPOINT: &str = "headless";
 /// Initialize simple tracing for non-TUI agent modes.
@@ -1107,12 +1122,8 @@ async fn run_agent_command(
     no_auto_update: bool,
     disable_web_search: bool,
     update_config: &UpdateConfig,
+    prepared_serve: Option<PreparedServe>,
 ) -> Result<()> {
-    // Keep this as the first operation: rejected remote exposure must not grant
-    // folder trust, start prefetch/update traffic, initialise tracing, or spawn
-    // any background work.
-    let prepared_serve = preflight_agent_serve(&agent_args, std::io::stderr().is_terminal())?;
-
     let _signal_flush = tokio::spawn(async {
         #[cfg(unix)]
         {
@@ -1945,6 +1956,17 @@ fn main() {
         std::process::exit(code);
     }
     let args = PagerArgs::parse_cli();
+    if let Err(error) = dispatch_after_cli_preflight(
+        args,
+        std::io::stderr().is_terminal(),
+        run_after_cli_preflight,
+    ) {
+        eprintln!("Error: {error:#}");
+        std::process::exit(1);
+    }
+}
+
+fn run_after_cli_preflight(args: PagerArgs, prepared_serve: Option<PreparedServe>) {
     if dispatch_version_if_requested(&args) || dispatch_doctor_if_requested(&args) {
         return;
     }
@@ -2014,7 +2036,11 @@ fn main() {
             eprintln!("grok: failed to start tokio runtime with {workers} workers: {e}");
             shutdown_and_flush_telemetry(1);
         });
-    let result = run_and_shutdown(runtime, async_main(args), RUNTIME_SHUTDOWN_GRACE);
+    let result = run_and_shutdown(
+        runtime,
+        async_main(args, prepared_serve),
+        RUNTIME_SHUTDOWN_GRACE,
+    );
     xai_grok_telemetry::debug_log::flush();
     if let Err(e) = result {
         xai_tty_utils::restore_native_stderr();
@@ -2023,7 +2049,7 @@ fn main() {
         std::process::exit(1);
     }
 }
-async fn async_main(args: PagerArgs) -> Result<()> {
+async fn async_main(args: PagerArgs, prepared_serve: Option<PreparedServe>) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut args = args.apply_cwd()?;
     if let Some(ref mode) = args.compaction_mode {
@@ -2128,6 +2154,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                     args.no_auto_update,
                     args.disable_web_search,
                     &update_config,
+                    prepared_serve,
                 )
                 .await;
             }
@@ -2864,7 +2891,7 @@ mod tests {
     }
 
     #[test]
-    fn issue8_agent_serve_security_command_preflight_rejects_remote_before_dispatch() {
+    fn issue8_agent_serve_security_entrypoint_preflight_blocks_startup_side_effects() {
         let parsed = PagerArgs::try_parse_from([
             "grok",
             "agent",
@@ -2875,17 +2902,16 @@ mod tests {
             "client-configured-secret-Q7w5E3r1T9y7",
         ])
         .unwrap();
-        let Some(Command::Agent(agent_args)) = parsed.command else {
-            panic!("expected agent command");
-        };
+        let continuation_ran = std::cell::Cell::new(false);
 
         assert_eq!(
-            preflight_agent_serve(&agent_args, true)
+            dispatch_after_cli_preflight(parsed, true, |_, _| continuation_ran.set(true))
                 .err()
-                .expect("remote serve must fail before command dispatch")
+                .expect("remote serve must fail before startup continuation")
                 .to_string(),
             SERVE_REMOTE_ACK_REQUIRED
         );
+        assert!(!continuation_ran.get());
     }
 
     #[test]
