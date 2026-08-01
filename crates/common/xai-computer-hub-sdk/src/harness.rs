@@ -162,6 +162,25 @@ impl LocalRegistry {
         self.inner.entries.write().insert(id, handle)
     }
 
+    /// Atomically register a typed [`Tool`] only when its id is vacant.
+    ///
+    /// Returns `false` on collision and leaves the existing handle unchanged.
+    /// Dynamic registries should prefer this over [`register`](Self::register)
+    /// so concurrent registration cannot replace an already-authorized tool.
+    pub fn try_register<T>(&self, tool: T) -> bool
+    where
+        T: Tool + std::fmt::Debug + 'static,
+    {
+        let id = tool.id();
+        let handle: Arc<dyn ToolHandle> = Arc::new(ErasedTool::new(tool));
+        let mut entries = self.inner.entries.write();
+        if entries.contains_key(&id) {
+            return false;
+        }
+        entries.insert(id, handle);
+        true
+    }
+
     /// Resolve `tool_id` to its in-process handle, if registered.
     /// Returns a clone of the `Arc<dyn ToolHandle>` so the
     /// caller can read without holding the lock across an await point.
@@ -2570,6 +2589,20 @@ mod tests {
             "second register on same id must return the displaced handle"
         );
         assert_eq!(registry.len(), 1, "id remains unique");
+    }
+
+    #[test]
+    fn local_registry_try_register_rejects_collision_without_replacing() {
+        let registry = LocalRegistry::new();
+        let id = ToolId::new("echo").expect("valid");
+        assert!(registry.try_register(EchoTool { id: id.clone() }));
+        let original = registry.find(&id).expect("first tool resolves");
+
+        assert!(!registry.try_register(EchoTool { id: id.clone() }));
+        let after_collision = registry.find(&id).expect("original tool remains");
+
+        assert!(Arc::ptr_eq(&original, &after_collision));
+        assert_eq!(registry.len(), 1);
     }
 
     #[test]

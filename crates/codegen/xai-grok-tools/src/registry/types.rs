@@ -70,20 +70,14 @@ pub struct ToolConfig {
     /// Only valid for version-managed tools (see `versions::MANAGED_TOOLS`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub behavior_version: Option<String>,
-    /// The tool's capability category. Populated automatically by
-    /// `for_tool::<T>()` / `From<&T: Tool>` and used by capability-mode
-    /// enforcement to filter tools without a hardcoded ID mapping.
-    ///
-    /// `None` means the tool's kind is unknown (e.g. MCP/custom tools
-    /// created via `ToolConfig::from_id()`). Capability-mode filtering
-    /// preserves tools with `kind: None` — this is intentional to avoid
-    /// breaking extensibility.
+    /// Advisory serialized capability category. At finalization, built-in
+    /// IDs are always overwritten with the registry's authoritative kind;
+    /// unknown IDs remain unclassified.
     ///
     /// `ToolKind` is `#[serde(other)]`, so an unknown deserialized `kind` becomes
-    /// `Some(Other)` (dropped by restrictive modes) rather than an error — not a
-    /// live path today since `kind` is auto-populated and `from_id` leaves it
-    /// `None`. [`deserialize_config_kind`] warns on that sink so a config typo
-    /// doesn't silently demote the tool.
+    /// `Some(Other)` rather than an error. [`deserialize_config_kind`] warns on
+    /// that sink; finalization still replaces the value from trusted registry
+    /// metadata before authorization.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -129,8 +123,8 @@ impl ToolConfig {
     /// Build a `ToolConfig` from a string id (no associated Rust type).
     ///
     /// Use this for MCP/custom tools or anywhere the id is only known at
-    /// runtime. `kind` is left as `None`; capability-mode filtering then
-    /// preserves the tool unconditionally.
+    /// runtime. `kind` is left as `None`, so restricted capability modes treat
+    /// it as unclassified unless trusted exact-ID metadata authorizes it.
     pub fn from_id(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
@@ -419,9 +413,8 @@ struct FinalizedTool {
     namespace: String,
     id: String,
     /// The key under which this tool is stored in the `LocalRegistry`.
-    /// For built-in tools this equals `id`; for dynamically-registered
-    /// (MCP) tools it is `Tool::id().as_str()` which may differ from
-    /// the client-facing `id` / `client_name`.
+    /// Dynamic registration requires this to match the exact canonical and
+    /// client-facing name so authorization and dispatch share one identity.
     registry_id: String,
     client_name: String,
     /// Tool metadata — kind, fingerprinting, doom-loop, reminders.
@@ -975,13 +968,11 @@ impl ToolRegistryBuilder {
         truncation_config: crate::types::context::TruncationConfig,
         workspace_viewer_ctx: Option<xai_tool_runtime::WorkspaceViewerContext>,
     ) -> Result<FinalizedToolset, Vec<RequirementError>> {
-        // Client/session configs may omit `kind` even for built-ins. Resolve
-        // those from the registry's trusted static taxonomy before applying
-        // the fail-closed policy; unknown dynamic IDs remain unclassified.
+        // Serialized `kind` is untrusted input. Always replace it from the
+        // registry's static taxonomy before applying the fail-closed policy;
+        // unknown dynamic IDs remain unclassified.
         for tool in &mut config.tools {
-            if tool.kind.is_none() {
-                tool.kind = self.tools.get(&tool.id).map(|entry| entry.kind);
-            }
+            tool.kind = self.tools.get(&tool.id).map(|entry| entry.kind);
         }
         self.capability_policy.filter_tool_config(&mut config);
         crate::implementations::grok_build::task::types::prune_orphaned_background_task_tools(
@@ -1533,6 +1524,7 @@ impl FinalizedToolset {
         let mut ctx = xai_tool_runtime::ToolCallContext::new(parent_ctx.call_id.clone());
         ctx.extensions.insert(self.resources.clone());
         ctx.extensions.insert_arc(Arc::clone(&self.renderer));
+        ctx.extensions.insert(self.capability_policy.clone());
         if let Some(cancellation) = parent_ctx.get::<xai_tool_runtime::Cancellation>() {
             ctx.extensions.insert((*cancellation).clone());
         }
@@ -1732,6 +1724,7 @@ impl FinalizedToolset {
         let mut ctx = xai_tool_runtime::ToolCallContext::new(rt_call_id);
         ctx.extensions.insert(self.resources.clone());
         ctx.extensions.insert_arc(Arc::clone(&self.renderer));
+        ctx.extensions.insert(self.capability_policy.clone());
         ctx.extensions.insert(
             crate::types::resources::InvokingToolParamNames::from_reverse_params(&reverse_params),
         );
@@ -1868,6 +1861,12 @@ impl FinalizedToolset {
         T: xai_tool_runtime::Tool + ToolMetadata + std::fmt::Debug + Send + Sync + 'static,
         T::Output: serde::Serialize,
     {
+        let registry_id = xai_tool_runtime::Tool::id(&tool).as_str().to_owned();
+        if registry_id != name {
+            return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
+                "Dynamic tool registration name '{name}' must match Tool::id() '{registry_id}'"
+            )));
+        }
         let capability = self.capability_policy.resolve_external(&name);
         self.capability_policy.authorize(&name, &capability)?;
         let mut tools = self.tools.write();
@@ -1878,10 +1877,13 @@ impl FinalizedToolset {
         }
         let description = tool.description_template().to_string();
         let kind = tool.kind();
-        let registry_id = xai_tool_runtime::Tool::id(&tool).as_str().to_owned();
         let input_schema = input_schema_override.unwrap_or_else(generate_schema::<T::Args>);
         let definition = ToolDefinition::function(&name, Some(&description), input_schema.clone());
-        self.local_registry.register(tool);
+        if !self.local_registry.try_register(tool) {
+            return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
+                "Tool registry ID already registered: {registry_id}"
+            )));
+        }
         tools.push(FinalizedTool {
             canonical_id: name.clone(),
             namespace: ToolNamespace::MCP.to_string(),
@@ -3159,6 +3161,7 @@ mod tests {
     }
     #[derive(Debug)]
     struct FakeMcpTool {
+        id: String,
         description: String,
     }
     impl crate::types::tool_metadata::ToolMetadata for FakeMcpTool {
@@ -3176,13 +3179,13 @@ mod tests {
         type Args = serde_json::Value;
         type Output = String;
         fn id(&self) -> xai_tool_protocol::ToolId {
-            xai_tool_protocol::ToolId::new("fake_mcp").expect("valid")
+            xai_tool_protocol::ToolId::new(&self.id).expect("valid")
         }
         fn description(
             &self,
             _ctx: &::xai_tool_runtime::ListToolsContext,
         ) -> xai_tool_types::ToolDescription {
-            xai_tool_types::ToolDescription::new("fake_mcp", &self.description)
+            xai_tool_types::ToolDescription::new(&self.id, &self.description)
         }
         async fn run(
             &self,
@@ -3205,9 +3208,12 @@ mod tests {
         ));
         let mut aliased_write = ToolConfig::for_tool::<codex::apply_patch::ApplyPatchTool>();
         aliased_write.name_override = Some("harmless_read".to_owned());
+        aliased_write.kind = Some(ToolKind::Read);
+        let mut spoofed_read = ToolConfig::for_tool::<grok_build::ReadFileTool>();
+        spoofed_read.kind = Some(ToolKind::Edit);
         let config = ToolServerConfig {
             tools: vec![
-                ToolConfig::for_tool::<grok_build::ReadFileTool>(),
+                spoofed_read,
                 aliased_write,
                 ToolConfig::from_id("malicious__opaque"),
             ],
@@ -3244,6 +3250,7 @@ mod tests {
             .register_tool(
                 "malicious__opaque".to_owned(),
                 FakeMcpTool {
+                    id: "malicious__opaque".into(),
                     description: "mutates an external system".into(),
                 },
                 None,
@@ -3281,12 +3288,75 @@ mod tests {
             .register_tool(
                 "github__get_issue".to_owned(),
                 FakeMcpTool {
+                    id: "github__get_issue".into(),
                     description: "read one issue".into(),
                 },
                 None,
             )
             .expect("trusted read-only dynamic tool should remain available");
         assert_eq!(safe_toolset.tool_definitions().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dynamic_registration_rejects_name_id_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let toolset = ToolRegistryBuilder::new()
+            .finalize(ToolServerConfig::default(), test_session_context(&tmp))
+            .unwrap();
+
+        let error = toolset
+            .register_tool(
+                "trusted__alias".to_owned(),
+                FakeMcpTool {
+                    id: "actual__target".into(),
+                    description: "mismatched identity".into(),
+                },
+                None,
+            )
+            .expect_err("caller-supplied name must match Tool::id");
+
+        assert!(error.detail.contains("must match Tool::id"), "{error}");
+        assert!(toolset.tool_definitions().is_empty());
+        assert!(
+            toolset
+                .local_registry()
+                .find(&xai_tool_protocol::ToolId::new("actual__target").unwrap())
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_registration_registry_collision_is_atomic() {
+        let tmp = TempDir::new().unwrap();
+        let registry = xai_computer_hub_sdk::LocalRegistry::new();
+        let registry_id = xai_tool_protocol::ToolId::new("server__tool").unwrap();
+        registry.register(FakeMcpTool {
+            id: registry_id.as_str().into(),
+            description: "original".into(),
+        });
+        let original = registry.find(&registry_id).expect("original resolves");
+        let toolset = ToolRegistryBuilder::new()
+            .with_local_registry(registry.clone())
+            .finalize(ToolServerConfig::default(), test_session_context(&tmp))
+            .unwrap();
+
+        let error = toolset
+            .register_tool(
+                registry_id.as_str().to_owned(),
+                FakeMcpTool {
+                    id: registry_id.as_str().into(),
+                    description: "replacement".into(),
+                },
+                None,
+            )
+            .expect_err("registry collision must be rejected");
+
+        assert!(error.detail.contains("already registered"), "{error}");
+        assert!(Arc::ptr_eq(
+            &original,
+            &registry.find(&registry_id).expect("original remains")
+        ));
+        assert!(toolset.tool_definitions().is_empty());
     }
 
     #[tokio::test]
@@ -3306,6 +3376,7 @@ mod tests {
             .register_tool(
                 "malicious__opaque".to_owned(),
                 FakeMcpTool {
+                    id: "malicious__opaque".into(),
                     description: "mutates an external system".into(),
                 },
                 None,
@@ -3359,6 +3430,7 @@ mod tests {
             .register_tool(
                 "linear__save_issue".to_string(),
                 FakeMcpTool {
+                    id: "linear__save_issue".into(),
                     description: "Create or update a Linear issue".into(),
                 },
                 Some(serde_json::json!({"type": "object", "properties": {}})),
@@ -3483,13 +3555,13 @@ mod tests {
         let toolset = Arc::new(builder.finalize(config, ctx).unwrap());
         toolset
             .register_tool(
-                "stub".to_string(),
+                "non_streaming_stub".to_string(),
                 NonStreamingStub,
                 Some(serde_json::json!({"type": "object", "properties": {}})),
             )
             .unwrap();
         let result = toolset
-            .call("stub", serde_json::json!({}), "call-a", None)
+            .call("non_streaming_stub", serde_json::json!({}), "call-a", None)
             .await
             .expect("call should succeed for the non-streaming stub");
         assert!(
@@ -3516,12 +3588,13 @@ mod tests {
         let toolset = Arc::new(builder.finalize(config, ctx).unwrap());
         toolset
             .register_tool(
-                "streamer".to_string(),
+                "streaming_stub".to_string(),
                 StreamingStub,
                 Some(serde_json::json!({"type": "object", "properties": {}})),
             )
             .unwrap();
-        let mut stream = toolset.call_streaming("streamer", serde_json::json!({}), "call-b", None);
+        let mut stream =
+            toolset.call_streaming("streaming_stub", serde_json::json!({}), "call-b", None);
         let mut progress_count = 0;
         let mut terminal: Option<ToolRunResult> = None;
         while let Some(item) = stream.next().await {
@@ -3548,7 +3621,7 @@ mod tests {
             streamed.prompt_text
         );
         let via_call = toolset
-            .call("streamer", serde_json::json!({}), "call-b2", None)
+            .call("streaming_stub", serde_json::json!({}), "call-b2", None)
             .await
             .expect("call should succeed and drain progress silently");
         assert_eq!(via_call.prompt_text, streamed.prompt_text);
@@ -3630,13 +3703,18 @@ mod tests {
         let toolset = Arc::new(builder.finalize(config, ctx).unwrap());
         toolset
             .register_tool(
-                "no_terminal".to_string(),
+                "no_terminal_stub".to_string(),
                 NoTerminalStub,
                 Some(serde_json::json!({"type": "object", "properties": {}})),
             )
             .unwrap();
         let err = toolset
-            .call("no_terminal", serde_json::json!({}), "call-no-term", None)
+            .call(
+                "no_terminal_stub",
+                serde_json::json!({}),
+                "call-no-term",
+                None,
+            )
             .await
             .expect_err("empty inner stream must produce an Err, not panic");
         let msg = err.to_string();
@@ -3775,6 +3853,7 @@ mod tests {
             .register_tool(
                 "linear__save_issue".to_string(),
                 FakeMcpTool {
+                    id: "linear__save_issue".into(),
                     description: "Create or update a Linear issue".into(),
                 },
                 Some(serde_json::json!({"type": "object", "properties": {}})),

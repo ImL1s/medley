@@ -173,6 +173,25 @@ async fn gateway_lookup(
     (source, client)
 }
 
+fn authorize_gateway_target(
+    ctx: &xai_tool_runtime::ToolCallContext,
+    tool_name: &str,
+) -> Result<(), xai_tool_runtime::ToolError> {
+    let policy = ctx
+        .extensions
+        .get::<crate::capability::CapabilityPolicy>()
+        .ok_or_else(|| {
+            xai_tool_runtime::ToolError::custom(
+                "tool_capability_denied",
+                format!(
+                    "Managed gateway tool {tool_name} is not permitted without a capability authorizer"
+                ),
+            )
+        })?;
+    let capability = policy.resolve_external(tool_name);
+    policy.authorize(tool_name, &capability)
+}
+
 fn gateway_response_to_output(
     tool_name: &str,
     source: crate::types::resources::ManagedGatewayToolSource,
@@ -234,6 +253,8 @@ pub async fn dispatch_mcp_tool(
                 Err(_) => {}
             }
         }
+
+        authorize_gateway_target(ctx, tool_name)?;
 
         let Some(client) = gateway_client else {
             return Err(xai_tool_runtime::ToolError::custom(
@@ -729,6 +750,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gateway_target_without_capability_authorizer_fails_closed() {
+        let captured: SharedArgs = Arc::new(std::sync::Mutex::new(None));
+        let mut ctx = new_ctx();
+        ctx.extensions
+            .insert(InnerDispatch(Arc::new(NotFoundDispatch)));
+        ctx.extensions.insert(gateway_resources(
+            Arc::clone(&captured),
+            serde_json::json!("must not run"),
+        ));
+
+        let error = xai_tool_runtime::Tool::run(
+            &UseTool,
+            ctx,
+            UseToolInput {
+                tool_name: "grafana__search_dashboards".into(),
+                tool_input: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect_err("gateway dispatch without an authorizer must fail closed");
+
+        assert_eq!(error.kind, xai_tool_runtime::ToolErrorKind::Custom);
+        assert!(error.detail.contains("capability authorizer"), "{error}");
+        assert!(captured.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn readonly_gateway_target_requires_trusted_read_classification() {
+        let target = "grafana__search_dashboards";
+        let mut trusted = crate::capability::TrustedToolCapabilities::default();
+        trusted
+            .insert_classification(
+                target,
+                xai_tool_types::ToolCapabilityDescriptor::classified([
+                    xai_tool_types::ToolEffect::NetworkRead,
+                ]),
+                crate::types::config_source::ConfigSource::Builtin,
+            )
+            .unwrap();
+        let policy = crate::capability::CapabilityPolicy::new(
+            xai_tool_types::SubagentCapabilityMode::ReadOnly,
+            trusted,
+        );
+        let captured: SharedArgs = Arc::new(std::sync::Mutex::new(None));
+        let mut ctx = ctx_with_dispatch_and_resources(
+            NotFoundDispatch,
+            gateway_resources(Arc::clone(&captured), serde_json::json!("ok")),
+        );
+        ctx.extensions.insert(policy);
+
+        xai_tool_runtime::Tool::run(
+            &UseTool,
+            ctx,
+            UseToolInput {
+                tool_name: target.into(),
+                tool_input: serde_json::json!({"query": "prod"}),
+            },
+        )
+        .await
+        .expect("trusted read-only gateway target should be allowed");
+
+        assert_eq!(captured.lock().unwrap().clone().unwrap()["query"], "prod");
+    }
+
+    #[tokio::test]
+    async fn readonly_gateway_target_rejects_unclassified_and_external_mutation() {
+        for capability in [
+            None,
+            Some(xai_tool_types::ToolCapabilityDescriptor::classified([
+                xai_tool_types::ToolEffect::ExternalMutation,
+            ])),
+        ] {
+            let target = "grafana__search_dashboards";
+            let mut trusted = crate::capability::TrustedToolCapabilities::default();
+            if let Some(capability) = capability {
+                trusted
+                    .insert_classification(
+                        target,
+                        capability,
+                        crate::types::config_source::ConfigSource::Builtin,
+                    )
+                    .unwrap();
+            }
+            let captured: SharedArgs = Arc::new(std::sync::Mutex::new(None));
+            let mut ctx = ctx_with_dispatch_and_resources(
+                NotFoundDispatch,
+                gateway_resources(Arc::clone(&captured), serde_json::json!("must not run")),
+            );
+            ctx.extensions
+                .insert(crate::capability::CapabilityPolicy::new(
+                    xai_tool_types::SubagentCapabilityMode::ReadOnly,
+                    trusted,
+                ));
+
+            let error = xai_tool_runtime::Tool::run(
+                &UseTool,
+                ctx,
+                UseToolInput {
+                    tool_name: target.into(),
+                    tool_input: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect_err("restricted gateway target must be denied");
+
+            assert!(error.detail.contains("not permitted"), "{error}");
+            assert!(captured.lock().unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn all_mode_allows_unclassified_gateway_target() {
+        let captured: SharedArgs = Arc::new(std::sync::Mutex::new(None));
+        let ctx = ctx_with_dispatch_and_resources(
+            NotFoundDispatch,
+            gateway_resources(Arc::clone(&captured), serde_json::json!("ok")),
+        );
+
+        xai_tool_runtime::Tool::run(
+            &UseTool,
+            ctx,
+            UseToolInput {
+                tool_name: "grafana__search_dashboards".into(),
+                tool_input: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("all mode should allow an unclassified gateway target");
+
+        assert!(captured.lock().unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn gateway_error_result_maps_to_mcp_error() {
         let captured: SharedArgs = Arc::new(std::sync::Mutex::new(None));
         let ctx = ctx_with_dispatch_and_resources(
@@ -1012,6 +1166,8 @@ mod tests {
         let mut ctx = new_ctx();
         ctx.extensions.insert(InnerDispatch(Arc::new(dispatch)));
         ctx.extensions.insert(resources);
+        ctx.extensions
+            .insert(crate::capability::CapabilityPolicy::unrestricted());
         ctx
     }
 
