@@ -73,6 +73,9 @@ pub struct InspectReport {
     pub lsp_servers: Vec<LspServerEntry>,
     pub config_sources: ConfigSources,
     pub external_compat: ExternalCompatReport,
+    /// Trusted exact-ID capability descriptors and deliberate unclassified
+    /// exceptions. Remote tool metadata is never included here.
+    pub tool_capabilities: crate::config::tool_capabilities::ResolvedTrustedToolCapabilities,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub config_warnings: Vec<crate::agent::config_model_override_parse::ConfigWarning>,
     /// Invalid or ignored `[mcp_servers.*]` entries.
@@ -381,6 +384,8 @@ async fn build_report(cwd: &Path) -> InspectReport {
     }
     let lsp = list_lsp_servers(cwd, &discovered_plugins);
     let configs = list_config_sources(cwd);
+    let tool_capabilities =
+        crate::config::tool_capabilities::load_trusted_tool_capabilities(cwd, project_trusted);
     let config_warnings = parsed_config
         .as_ref()
         .map(|c| c.config_warnings.clone())
@@ -407,6 +412,7 @@ async fn build_report(cwd: &Path) -> InspectReport {
         lsp_servers: lsp,
         config_sources: configs,
         external_compat,
+        tool_capabilities,
         config_warnings,
         mcp_config_problems,
     }
@@ -1254,6 +1260,93 @@ fn render_config_warnings(
     out
 }
 
+fn render_tool_capabilities(
+    capabilities: &crate::config::tool_capabilities::ResolvedTrustedToolCapabilities,
+) -> String {
+    use std::fmt::Write as _;
+
+    if capabilities.trusted.classifications.is_empty()
+        && capabilities.trusted.unclassified_overrides.is_empty()
+        && capabilities.diagnostics.is_empty()
+    {
+        return String::new();
+    }
+
+    let mut out = String::from("\n  Trusted Tool Capabilities\n");
+    let _ = writeln!(
+        out,
+        "  {TREE} {} descriptor(s), {} unclassified override(s)",
+        capabilities.trusted.classifications.len(),
+        capabilities.trusted.unclassified_overrides.len()
+    );
+    let mut classifications = capabilities
+        .trusted
+        .classifications
+        .iter()
+        .collect::<Vec<_>>();
+    classifications.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (tool_id, capability) in classifications {
+        let effects = capability
+            .descriptor
+            .effects()
+            .map(|effects| {
+                effects
+                    .iter()
+                    .map(|effect| match effect {
+                        xai_tool_types::capability::ToolEffect::LocalRead => "local-read",
+                        xai_tool_types::capability::ToolEffect::LocalWrite => "local-write",
+                        xai_tool_types::capability::ToolEffect::Execute => "execute",
+                        xai_tool_types::capability::ToolEffect::NetworkRead => "network-read",
+                        xai_tool_types::capability::ToolEffect::ExternalMutation => {
+                            "external-mutation"
+                        }
+                        xai_tool_types::capability::ToolEffect::SecretAccess => "secret-access",
+                        xai_tool_types::capability::ToolEffect::SubagentSpawn => "subagent-spawn",
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_else(|| "unclassified".to_owned());
+        let _ = writeln!(out, "    {TREE} {tool_id}: {effects}");
+    }
+    let mut overrides = capabilities
+        .trusted
+        .unclassified_overrides
+        .iter()
+        .collect::<Vec<_>>();
+    overrides.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (tool_id, override_entry) in overrides {
+        let modes = override_entry
+            .modes
+            .iter()
+            .map(xai_tool_types::SubagentCapabilityMode::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            out,
+            "    {TREE} WARNING override {tool_id} [{modes}] — {} ({})",
+            override_entry.reason,
+            override_entry.source.display_short()
+        );
+    }
+    for diagnostic in &capabilities.diagnostics {
+        if matches!(
+            diagnostic.kind,
+            crate::config::tool_capabilities::ToolCapabilityConfigDiagnosticKind::UnclassifiedOverrideActive
+        ) {
+            continue;
+        }
+        let _ = writeln!(
+            out,
+            "    {TREE} WARNING [{}] {} — {}",
+            diagnostic.source.display_short(),
+            diagnostic.path,
+            diagnostic.reason
+        );
+    }
+    out
+}
+
 fn render_mcp_config_problems(problems: &[crate::util::config::McpServerConfigProblem]) -> String {
     use crate::util::config::McpServerProblemSeverity;
     use std::fmt::Write as _;
@@ -1544,6 +1637,7 @@ fn print_human(r: &InspectReport) {
     }
 
     print!("{}", render_config_warnings(&r.config_warnings));
+    print!("{}", render_tool_capabilities(&r.tool_capabilities));
     print!("{}", render_mcp_config_problems(&r.mcp_config_problems));
 
     print!("{}", render_harness_compatibility(&r.external_compat));
@@ -1921,6 +2015,54 @@ mod tests {
             alias_warning["reason"]
                 .as_str()
                 .is_some_and(|r| !r.is_empty())
+        );
+    }
+
+    #[test]
+    fn subagent_trusted_tool_capabilities_render_in_human_and_json_views() {
+        let raw: toml::Value = toml::from_str(
+            r#"
+            [subagents.tool_capabilities."mcp__docs__read"]
+            classification = "classified"
+            effects = ["network-read"]
+
+            [subagents.unclassified_tool_overrides."mcp__legacy__read"]
+            modes = ["read-only"]
+            reason = "Temporarily audited connector"
+            "#,
+        )
+        .unwrap();
+        let capabilities =
+            crate::config::tool_capabilities::resolve_trusted_tool_capabilities_from_values(
+                &raw,
+                ConfigSource::ConfigToml {
+                    path: "/home/test/.grok/config.toml".into(),
+                },
+                std::iter::empty::<(ConfigSource, &toml::Value)>(),
+                false,
+            );
+
+        let human = render_tool_capabilities(&capabilities);
+        assert!(human.contains("Trusted Tool Capabilities"), "{human}");
+        assert!(human.contains("mcp__docs__read"), "{human}");
+        assert!(
+            human.contains("WARNING override mcp__legacy__read [read-only]"),
+            "{human}"
+        );
+        assert!(human.contains("Temporarily audited connector"), "{human}");
+
+        let json = serde_json::to_value(&capabilities).unwrap();
+        assert_eq!(
+            json["classifications"]["mcp__docs__read"]["descriptor"]["classification"],
+            "classified"
+        );
+        assert_eq!(
+            json["unclassifiedOverrides"]["mcp__legacy__read"]["modes"][0],
+            "read-only"
+        );
+        assert_eq!(
+            json["unclassifiedOverrides"]["mcp__legacy__read"]["reason"],
+            "Temporarily audited connector"
         );
     }
 

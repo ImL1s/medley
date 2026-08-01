@@ -1725,6 +1725,36 @@ instructions = "Be extremely concise. No filler words."
 
 Both are also discovered from `.grok/roles/*.toml` and `.grok/personas/*.toml` files respectively. If a requested persona is not found, the spawn fails (fail-closed).
 
+### External Tool Capability Metadata
+
+Restricted subagents fail closed for MCP/custom tools without capability
+metadata. Classify a trusted tool by its exact runtime ID (for example,
+`mcp__server__tool`):
+
+```toml
+[subagents.tool_capabilities."mcp__docs__read"]
+classification = "classified"
+effects = ["network-read"]
+```
+
+Supported effects are `local-read`, `local-write`, `execute`, `network-read`,
+`external-mutation`, `secret-access`, and `subagent-spawn`. Every declared
+effect must be permitted by the child's capability mode.
+
+For a temporary, audited migration of a still-unclassified tool, an exact-ID
+exception must name restricted modes and include a non-empty reason:
+
+```toml
+[subagents.unclassified_tool_overrides."mcp__legacy__read"]
+modes = ["read-only"]
+reason = "Audited read-only connector pending descriptor support"
+```
+
+Exceptions emit a warning and appear in both `grok inspect` views. Capability
+metadata is accepted only from local trusted config layers; project
+`.grok/config.toml` entries require folder trust. Remote MCP `_meta`, remote
+settings, and remote campaign patches are never treated as capability authority.
+
 ---
 
 ## Plugins
@@ -2305,6 +2335,7 @@ The output shows all loaded configuration organized by type:
 - **LSP Servers** — language servers from `lsp.json` and plugins
 - **Hooks** — project and plugin hooks
 - **Permissions, Config Sources** — which config files are active
+- **Trusted Tool Capabilities** — exact-ID descriptors, active unclassified overrides, and warnings
 
 Plugin-provided components appear in their respective sections with a `[plugin: name]` tag, so you can see at a glance where each skill, MCP server, or agent originates.
 

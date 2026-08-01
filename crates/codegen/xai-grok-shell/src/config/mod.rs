@@ -1,4 +1,5 @@
 pub mod reloader;
+pub mod tool_capabilities;
 pub mod watcher;
 use crate::bundle;
 use serde::Deserialize;
