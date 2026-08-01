@@ -211,6 +211,13 @@ impl xai_grok_sampler::BearerResolver for AuthProviderRef {
             })
         })
     }
+
+    fn recover_rejected_credential_async<'a>(
+        &'a self,
+        rejected_bearer: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move { self.recover_rejected_token(rejected_bearer).await.is_some() })
+    }
 }
 
 /// Ignores the slot; a deserialized ref compares unequal until resolution

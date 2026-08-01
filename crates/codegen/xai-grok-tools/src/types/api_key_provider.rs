@@ -3,6 +3,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use xai_grok_auth::CredentialComparison;
 
+/// Structured tool-error detail indicating that provider-scoped auth already
+/// owned its bounded recovery attempt. Session-wide auth retry layers must not
+/// substitute an unrelated credential after this marker is set.
+pub const PROVIDER_AUTH_RETRY_HANDLED_DETAILS_KEY: &str = "provider_auth_retry_handled";
+
 /// Transport contract associated with a provider-scoped tool credential.
 ///
 /// Credentials and wire semantics must move together: the ChatGPT Codex
@@ -70,6 +75,16 @@ pub trait ApiKeyProvider: Send + Sync + 'static {
         })
     }
 
+    /// Recover a provider-scoped credential after the remote endpoint rejects
+    /// the bearer that was actually sent. Static providers fail closed; live
+    /// providers may rotate or refresh their own credential source.
+    fn recover_rejected_credential_async<'a>(
+        &'a self,
+        _rejected_bearer: &'a str,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        Box::pin(std::future::ready(false))
+    }
+
     /// Compare against the same async resolution ladder used to build tool
     /// requests. This matters when session refresh fails and resolution falls
     /// through to a static key that differs from the sync cached candidate.
@@ -116,6 +131,16 @@ pub(crate) async fn compare_sent_bearer(
     match provider {
         Some(provider) => provider.compare_sent_credential(sent).await,
         None => CredentialComparison::compare(sent, None),
+    }
+}
+
+pub(crate) async fn recover_rejected_bearer(
+    provider: Option<&SharedApiKeyProvider>,
+    rejected: &str,
+) -> bool {
+    match provider {
+        Some(provider) => provider.recover_rejected_credential_async(rejected).await,
+        None => false,
     }
 }
 

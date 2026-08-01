@@ -127,6 +127,57 @@ impl WebSearchClient {
         );
     }
 
+    async fn execute_authenticated<T: serde::Serialize + ?Sized>(
+        &self,
+        url: &str,
+        body: &T,
+    ) -> Result<reqwest::Response, xai_tool_runtime::ToolError> {
+        let mut recovered_once = false;
+        loop {
+            let request = self.build_authenticated_request(url, body).await?;
+            let sent_bearer = crate::types::api_key_provider::request_credential(&request);
+            let response = self.http.execute(request).await.map_err(|_| {
+                xai_tool_runtime::ToolError::execution(
+                    xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+                    "Responses API transport failed.".to_string(),
+                )
+            })?;
+            let status = response.status();
+            if !crate::types::api_key_provider::is_auth_failure(status) {
+                return Ok(response);
+            }
+
+            let comparison = self.compare_sent_credential(sent_bearer.as_deref()).await;
+            self.record_401_attribution(comparison);
+            drop(response);
+
+            let provider_owns_auth_retry = status == reqwest::StatusCode::UNAUTHORIZED
+                && self.provider_scoped
+                && self.transport_profile == ApiTransportProfile::CodexResponses;
+            if !recovered_once
+                && provider_owns_auth_retry
+                && let Some(rejected_bearer) = sent_bearer.as_deref()
+                && crate::types::api_key_provider::recover_rejected_bearer(
+                    self.api_key_provider.as_ref(),
+                    rejected_bearer,
+                )
+                .await
+            {
+                recovered_once = true;
+                continue;
+            }
+
+            return Err(xai_tool_runtime::ToolError::unauthorized(format!(
+                "Responses API authentication failed (HTTP {status})."
+            ))
+            .with_details(serde_json::json!({
+                "tool_id": "web_search",
+                "status": status.as_u16(),
+                (crate::types::PROVIDER_AUTH_RETRY_HANDLED_DETAILS_KEY): provider_owns_auth_retry,
+            })));
+        }
+    }
+
     async fn build_authenticated_request<T: serde::Serialize + ?Sized>(
         &self,
         url: &str,
@@ -205,26 +256,8 @@ impl WebSearchClient {
             )
         })?;
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
-        let request = self.build_authenticated_request(&url, &request).await?;
-        let sent_bearer = crate::types::api_key_provider::request_credential(&request);
-        let response = self.http.execute(request).await.map_err(|_| {
-            xai_tool_runtime::ToolError::execution(
-                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                "Responses API transport failed.".to_string(),
-            )
-        })?;
+        let response = self.execute_authenticated(&url, &request).await?;
         let status = response.status();
-        if crate::types::api_key_provider::is_auth_failure(status) {
-            let comparison = self.compare_sent_credential(sent_bearer.as_deref()).await;
-            self.record_401_attribution(comparison);
-            return Err(xai_tool_runtime::ToolError::unauthorized(format!(
-                "Responses API authentication failed (HTTP {status})."
-            ))
-            .with_details(serde_json::json!({
-                "tool_id": "web_search",
-                "status": status.as_u16(),
-            })));
-        }
         if !status.is_success() {
             return Err(xai_tool_runtime::ToolError::execution(
                 xai_tool_protocol::ToolId::new("web_search").expect("valid"),
@@ -287,26 +320,8 @@ impl WebSearchClient {
             )
         })?;
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
-        let request = self.build_authenticated_request(&url, &request).await?;
-        let sent_bearer = crate::types::api_key_provider::request_credential(&request);
-        let response = self.http.execute(request).await.map_err(|_| {
-            xai_tool_runtime::ToolError::execution(
-                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                "Responses API transport failed.".to_string(),
-            )
-        })?;
+        let response = self.execute_authenticated(&url, &request).await?;
         let status = response.status();
-        if crate::types::api_key_provider::is_auth_failure(status) {
-            let comparison = self.compare_sent_credential(sent_bearer.as_deref()).await;
-            self.record_401_attribution(comparison);
-            return Err(xai_tool_runtime::ToolError::unauthorized(format!(
-                "Responses API authentication failed (HTTP {status})."
-            ))
-            .with_details(serde_json::json!({
-                "tool_id": "web_search",
-                "status": status.as_u16(),
-            })));
-        }
         if !status.is_success() {
             return Err(xai_tool_runtime::ToolError::execution(
                 xai_tool_protocol::ToolId::new("web_search").expect("valid"),
@@ -704,6 +719,59 @@ mod tests {
             })))
         }
     }
+
+    #[derive(Default)]
+    struct RecoveringCodexProvider {
+        recovered: std::sync::atomic::AtomicBool,
+        recovery_calls: std::sync::atomic::AtomicUsize,
+    }
+    impl RecoveringCodexProvider {
+        fn credential(&self) -> ApiCredential {
+            if self.recovered.load(std::sync::atomic::Ordering::SeqCst) {
+                ApiCredential {
+                    access_token: "fresh-codex-key".to_string(),
+                    account_id: Some("fresh-codex-account".to_string()),
+                }
+            } else {
+                ApiCredential {
+                    access_token: "rejected-codex-key".to_string(),
+                    account_id: Some("rejected-codex-account".to_string()),
+                }
+            }
+        }
+    }
+    impl crate::types::ApiKeyProvider for RecoveringCodexProvider {
+        fn current_api_key(&self) -> Option<String> {
+            Some(self.credential().access_token)
+        }
+
+        fn transport_profile(&self) -> ApiTransportProfile {
+            ApiTransportProfile::CodexResponses
+        }
+
+        fn current_credential_async(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<ApiCredential>> + Send + '_>>
+        {
+            Box::pin(std::future::ready(Some(self.credential())))
+        }
+
+        fn recover_rejected_credential_async<'a>(
+            &'a self,
+            rejected_bearer: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            Box::pin(async move {
+                self.recovery_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if rejected_bearer != "rejected-codex-key" {
+                    return false;
+                }
+                !self
+                    .recovered
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            })
+        }
+    }
     struct GenericScopedProvider;
     impl crate::types::ApiKeyProvider for GenericScopedProvider {
         fn current_api_key(&self) -> Option<String> {
@@ -777,6 +845,124 @@ mod tests {
                 "Codex request must omit top_p: {body}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn codex_web_search_recovers_scoped_401_for_both_entry_points() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for with_titles in [false, true] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/responses"))
+                .and(header("Authorization", "Bearer rejected-codex-key"))
+                .and(header("chatgpt-account-id", "rejected-codex-account"))
+                .respond_with(ResponseTemplate::new(401))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/responses"))
+                .and(header("Authorization", "Bearer fresh-codex-key"))
+                .and(header("chatgpt-account-id", "fresh-codex-account"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(successful_search_response("recovered result")),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let provider = std::sync::Arc::new(RecoveringCodexProvider::default());
+            let scoped: SharedApiKeyProvider = provider.clone();
+            let config = WebSearchConfig::Enabled {
+                api_key: "snapshot-codex-key".to_string(),
+                base_url: server.uri(),
+                model: "codex-model".to_string(),
+                extra_headers: IndexMap::new(),
+                alpha_test_key: None,
+                api_key_provider: Some(scoped),
+            };
+            let client = WebSearchClient::new(&config, None).expect("client should build");
+
+            let content = if with_titles {
+                client
+                    .search_with_titles("query", None)
+                    .await
+                    .expect("titled search should recover")
+                    .0
+            } else {
+                client
+                    .search("query", None)
+                    .await
+                    .expect("search should recover")
+                    .0
+            };
+            assert_eq!(content, "recovered result");
+            assert_eq!(
+                provider
+                    .recovery_calls
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_web_search_scoped_401_recovery_retries_only_once() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("Authorization", "Bearer rejected-codex-key"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("Authorization", "Bearer fresh-codex-key"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = std::sync::Arc::new(RecoveringCodexProvider::default());
+        let scoped: SharedApiKeyProvider = provider.clone();
+        let config = WebSearchConfig::Enabled {
+            api_key: "snapshot-codex-key".to_string(),
+            base_url: server.uri(),
+            model: "codex-model".to_string(),
+            extra_headers: IndexMap::new(),
+            alpha_test_key: None,
+            api_key_provider: Some(scoped),
+        };
+        let client = WebSearchClient::new(&config, None).expect("client should build");
+
+        let error = client.search("query", None).await.unwrap_err();
+        assert!(error.to_string().contains("HTTP 401"));
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(
+                    |details| details.get(crate::types::PROVIDER_AUTH_RETRY_HANDLED_DETAILS_KEY)
+                )
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "session-wide auth retry must not replace the exhausted scoped credential"
+        );
+        assert_eq!(
+            provider
+                .recovery_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
     #[tokio::test]

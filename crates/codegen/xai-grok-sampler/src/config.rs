@@ -231,6 +231,16 @@ pub trait BearerResolver: Send + Sync + std::fmt::Debug {
         Box::pin(std::future::ready(self.current_credential()))
     }
 
+    /// Replace a credential rejected by the provider and make the replacement
+    /// available to the next request. Cache-only resolvers fail closed by
+    /// default; refresh-capable provider resolvers override this hook.
+    fn recover_rejected_credential_async<'a>(
+        &'a self,
+        _rejected_bearer: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(std::future::ready(false))
+    }
+
     fn compare_sent_credential(&self, sent: Option<&str>) -> CredentialComparison {
         let current = self.current_bearer();
         CredentialComparison::compare(sent, current.as_deref())

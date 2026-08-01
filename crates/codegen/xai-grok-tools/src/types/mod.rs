@@ -22,7 +22,8 @@ pub mod tool_index;
 pub mod tool_io;
 pub mod tool_metadata;
 pub use api_key_provider::{
-    ApiCredential, ApiKeyProvider, ApiTransportProfile, SharedApiKeyProvider,
+    ApiCredential, ApiKeyProvider, ApiTransportProfile, PROVIDER_AUTH_RETRY_HANDLED_DETAILS_KEY,
+    SharedApiKeyProvider,
 };
 pub use claude_alias::{claude_names_for, grok_names, grok_names_for, kind_for};
 pub use compat::{

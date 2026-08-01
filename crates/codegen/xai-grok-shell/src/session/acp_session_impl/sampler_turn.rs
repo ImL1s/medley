@@ -14,12 +14,20 @@ use super::*;
 /// going through the structured `HttpFailure` path (e.g. JSON-only
 /// `invalid_token` payloads, BYOK key-validation messages).
 pub(super) fn is_auth_tool_error(err: &xai_tool_runtime::ToolError) -> bool {
-    if let Some(details) = &err.details
-        && let Some(status) = details
+    if let Some(details) = &err.details {
+        if details
+            .get(xai_grok_tools::types::PROVIDER_AUTH_RETRY_HANDLED_DETAILS_KEY)
+            .and_then(|handled| handled.as_bool())
+            == Some(true)
+        {
+            return false;
+        }
+        if let Some(status) = details
             .get(HTTP_STATUS_DETAILS_KEY)
             .and_then(|s| s.as_u64())
-    {
-        return status == 401;
+        {
+            return status == 401;
+        }
     }
     let lower = err.to_string().to_ascii_lowercase();
     lower.contains("unauthorized")

@@ -87,6 +87,14 @@ impl xai_grok_tools::types::ApiKeyProvider for ProviderScopedToolKeyProvider {
                 })
         })
     }
+
+    fn recover_rejected_credential_async<'a>(
+        &'a self,
+        rejected_bearer: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        self.resolver
+            .recover_rejected_credential_async(rejected_bearer)
+    }
 }
 /// Production impl: wraps the live `AuthManager`. 401 recovery
 /// delegates to `AuthManager::unauthorized_recovery`.
@@ -744,6 +752,14 @@ mod tests {
                     },
                 )))
             }
+
+            fn recover_rejected_credential_async<'a>(
+                &'a self,
+                rejected_bearer: &'a str,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>
+            {
+                Box::pin(std::future::ready(rejected_bearer == "stale-snapshot"))
+            }
         }
 
         let provider = ProviderScopedToolKeyProvider::shared(
@@ -768,6 +784,12 @@ mod tests {
             .expect("provider credential");
         assert_eq!(credential.access_token, "refreshed-provider-token");
         assert_eq!(credential.account_id.as_deref(), Some("provider-account"));
+        assert!(
+            provider
+                .recover_rejected_credential_async("stale-snapshot")
+                .await,
+            "provider-scoped tool adapter must delegate server-rejected recovery"
+        );
     }
     /// `apply()` and `snapshot()` agree (snapshot==wire invariant) when the
     /// in-memory token is fresh.
