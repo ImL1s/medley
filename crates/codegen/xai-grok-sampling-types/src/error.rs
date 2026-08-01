@@ -478,6 +478,7 @@ const SAFE_CONTEXT_LENGTH_MESSAGE: &str = "The prompt is too long for this model
 const SAFE_ENCRYPTED_CONTENT_MESSAGE: &str = "encrypted_content from another model family";
 const SAFE_IMAGE_PROCESSING_MESSAGE: &str = "Could not process image";
 const SAFE_CREDIT_BLOCK_MESSAGE: &str = "provider credit balance exhausted";
+const SAFE_OVERLOADED_MESSAGE: &str = "overloaded_error";
 const SAFE_STREAM_ERROR_MESSAGE: &str = "upstream stream error";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -487,6 +488,7 @@ enum ProviderErrorClass {
     EncryptedContent,
     ImageProcessing,
     CreditBlock,
+    Overloaded,
     Generic,
 }
 
@@ -518,6 +520,17 @@ fn classify_provider_error(parsed: &ParsedProviderError) -> SafeProviderError {
             error_type: FREE_USAGE_EXHAUSTED_CODE,
             message: FREE_USAGE_EXHAUSTED_CODE,
             class: ProviderErrorClass::FreeUsageExhausted,
+        };
+    }
+    if [parsed.code.as_deref(), parsed.kind.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|value| matches!(value, "overloaded_error" | "service_unavailable_error"))
+    {
+        return SafeProviderError {
+            error_type: "overloaded_error",
+            message: SAFE_OVERLOADED_MESSAGE,
+            class: ProviderErrorClass::Overloaded,
         };
     }
     if typed_value == Some("context_length_exceeded") || is_context_length_error(&parsed.message) {
@@ -598,7 +611,8 @@ pub fn parse_error_bytes(bytes: &[u8]) -> String {
             | ProviderErrorClass::ContextLength
             | ProviderErrorClass::EncryptedContent
             | ProviderErrorClass::ImageProcessing
-            | ProviderErrorClass::CreditBlock => safe.message,
+            | ProviderErrorClass::CreditBlock
+            | ProviderErrorClass::Overloaded => safe.message,
             ProviderErrorClass::Generic => "upstream error",
         })
         .unwrap_or("upstream error")
@@ -620,6 +634,7 @@ pub fn user_facing_api_error_message(status: StatusCode, bytes: &[u8]) -> String
                     | ProviderErrorClass::EncryptedContent
                     | ProviderErrorClass::ImageProcessing
                     | ProviderErrorClass::CreditBlock
+                    | ProviderErrorClass::Overloaded
             ) =>
         {
             safe.message.to_string()
@@ -1009,6 +1024,29 @@ mod tests {
         let bytes = br#"{"error":{"message":"rate limit exceeded","type":"rate_limit_error"}}"#;
         let msg = user_facing_api_error_message(StatusCode::TOO_MANY_REQUESTS, bytes);
         assert_eq!(msg, status_user_message(StatusCode::TOO_MANY_REQUESTS));
+    }
+
+    #[test]
+    fn proxy_wrapped_overload_preserves_safe_classification_marker() {
+        const SENTINEL: &str = "GB002-overload-secret-0123456789abcdef";
+        let bytes = format!(
+            r#"{{"error":{{"message":"Overloaded: {SENTINEL}","type":"overloaded_error"}}}}"#
+        );
+        let message =
+            user_facing_api_error_message(StatusCode::INTERNAL_SERVER_ERROR, bytes.as_bytes());
+
+        assert_eq!(message, SAFE_OVERLOADED_MESSAGE);
+        assert!(!message.contains(SENTINEL));
+        assert!(
+            SamplingError::Api {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message,
+                model_metadata: None,
+                retry_after_secs: None,
+                should_retry: None,
+            }
+            .is_overloaded()
+        );
     }
 
     #[test]
