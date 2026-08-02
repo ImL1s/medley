@@ -52,6 +52,13 @@ fn strip_codex_routing_headers(headers: &mut HeaderMap) {
     headers.remove(ORIGINATOR);
 }
 
+fn should_follow_redirect_with_dynamic_credential(
+    _previous: &reqwest::Url,
+    _next: &reqwest::Url,
+) -> bool {
+    false
+}
+
 fn grok_build_user_agent() -> Result<HeaderValue, &'static str> {
     HeaderValue::from_str(&format!("xai-grok-build/{}", xai_grok_version::VERSION))
         .map_err(|_| "Grok Build version produced an invalid user agent.")
@@ -216,12 +223,28 @@ impl WebSearchClient {
         } else {
             strip_codex_routing_headers(&mut headers);
         }
+        let request_api_key_provider = api_key_provider.clone().or_else(|| {
+            if accepts_xai_session_provider(&base_url) {
+                default_api_key_provider
+            } else {
+                None
+            }
+        });
         let mut http_builder = reqwest::Client::builder().default_headers(headers);
-        if provider_scoped {
-            // A provider-scoped credential is valid only for the configured
-            // Responses endpoint. Do not let bearer/account headers follow a
-            // same-origin path redirect or escape to another origin.
-            http_builder = http_builder.redirect(reqwest::redirect::Policy::none());
+        if request_api_key_provider.is_some() {
+            // A dynamic credential is valid only for the configured Responses
+            // endpoint. Do not let bearer/account headers follow a same-origin
+            // path redirect, downgrade to cleartext, or escape to another origin.
+            http_builder = http_builder.redirect(reqwest::redirect::Policy::custom(|attempt| {
+                let Some(previous) = attempt.previous().last() else {
+                    return attempt.stop();
+                };
+                if should_follow_redirect_with_dynamic_credential(previous, attempt.url()) {
+                    attempt.follow()
+                } else {
+                    attempt.stop()
+                }
+            }));
         }
         let http = xai_grok_extra_ca::with_extra_root_certificates(http_builder)
             .build()
@@ -231,13 +254,6 @@ impl WebSearchClient {
                     "Failed to build HTTP client.".to_string(),
                 )
             })?;
-        let request_api_key_provider = api_key_provider.clone().or_else(|| {
-            if accepts_xai_session_provider(&base_url) {
-                default_api_key_provider
-            } else {
-                None
-            }
-        });
         Ok(Self {
             http,
             base_url,
@@ -1412,6 +1428,86 @@ mod tests {
         assert_eq!(
             request.headers().get(AUTHORIZATION).unwrap(),
             "Bearer fresh-xai-session-key"
+        );
+    }
+
+    struct AmbientRedirectProvider;
+    impl crate::types::ApiKeyProvider for AmbientRedirectProvider {
+        fn current_api_key(&self) -> Option<String> {
+            Some("ambient-xai-session-key".to_string())
+        }
+    }
+
+    fn production_proxy_client_with_local_transport(base_url: String) -> WebSearchClient {
+        let config = WebSearchConfig::Enabled {
+            api_key: "stale-static-key".to_string(),
+            base_url: xai_grok_env::PROD_CLI_CHAT_PROXY_BASE_URL.to_string(),
+            model: "test-model".to_string(),
+            extra_headers: IndexMap::new(),
+            alpha_test_key: None,
+            api_key_provider: None,
+        };
+        let provider: SharedApiKeyProvider = std::sync::Arc::new(AmbientRedirectProvider);
+        let mut client =
+            WebSearchClient::new(&config, Some(provider)).expect("production client should build");
+        // Keep the redirect policy selected for the validated production proxy,
+        // but route the request through an in-process server for determinism.
+        client.base_url = base_url;
+        client
+    }
+
+    #[tokio::test]
+    async fn ambient_provider_blocks_same_host_production_proxy_path_redirect_with_bearer() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/responses"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer ambient-xai-session-key",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(307)
+                    .insert_header("Location", "/v1/redirected-responses"),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/redirected-responses"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer ambient-xai-session-key",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(successful_search_response("redirected result")),
+            )
+            .mount(&server)
+            .await;
+
+        let client = production_proxy_client_with_local_transport(server.uri());
+        let error = client.search("test query", None).await.unwrap_err();
+        assert!(error.to_string().contains("HTTP 307"));
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "an ambient bearer must never reach a redirected proxy path"
+        );
+    }
+
+    #[test]
+    fn dynamic_credential_policy_blocks_https_to_http_same_host_443_redirect() {
+        let secure = reqwest::Url::parse("https://cli-chat-proxy.grok.com/v1/responses").unwrap();
+        let cleartext =
+            reqwest::Url::parse("http://cli-chat-proxy.grok.com:443/v1/capture").unwrap();
+        assert_eq!(secure.host_str(), cleartext.host_str());
+        assert_eq!(
+            secure.port_or_known_default(),
+            cleartext.port_or_known_default()
+        );
+        assert_ne!(secure.scheme(), cleartext.scheme());
+        assert!(
+            !should_follow_redirect_with_dynamic_credential(&secure, &cleartext),
+            "a dynamic credential must not follow an HTTPS-to-HTTP redirect"
         );
     }
 
