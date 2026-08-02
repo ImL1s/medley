@@ -517,6 +517,14 @@ otel_log_tool_details = false                             # content gate (admins
 
 ### Version pinning
 
+> **Fork note (Medley).** The updater described here targets xAI's official
+> release channel. On a [Medley](https://github.com/ImL1s/grok-build) build,
+> letting it run replaces the fork with an official Grok Build binary and drops
+> its multi-provider features, and the version bounds below are compared against
+> upstream's version numbers. Set `auto_update = false` under `[cli]` and update
+> Medley by rebuilding from source. Fork release artifacts are tracked in
+> [#29](https://github.com/ImL1s/grok-build/issues/29).
+
 Control which versions the CLI may auto-update to and which versions may run. Set
 these in `[cli]`, or in a managed layer for fleet-wide policy. Each has an
 environment override that can only tighten the bound, for CI and testing.

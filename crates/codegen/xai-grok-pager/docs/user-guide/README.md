@@ -2,6 +2,15 @@
 
 Learn how to install, configure, and extend Grok Build, the terminal-based AI coding assistant from SpaceXAI.
 
+> **Fork note (Medley).** You are reading the user guide as it ships inside
+> [Medley](https://github.com/ImL1s/grok-build), a community fork that is not affiliated with
+> or endorsed by xAI. These pages are carried over from upstream and describe the
+> official build, so installation, update, and support instructions here do not
+> apply to Medley. Fork-specific behaviour is called out in
+> [Authentication](02-authentication.md) and [Custom Models](11-custom-models.md);
+> everything still runs as the `grok` command. Fork-specific installer docs are
+> tracked in [#28](https://github.com/ImL1s/grok-build/issues/28).
+
 ---
 
 ## Tier 1: Essential User Docs
