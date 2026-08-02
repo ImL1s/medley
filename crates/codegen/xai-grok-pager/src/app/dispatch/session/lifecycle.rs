@@ -348,13 +348,23 @@ pub(in crate::app::dispatch) fn open_agent_type_mismatch_question(
     use xai_grok_tools::implementations::grok_build::ask_user_question::{
         Question, QuestionOption,
     };
-    let Some(agent) = app.agents.get_mut(&agent_id) else {
+    let Some(has_existing_question) = app
+        .agents
+        .get(&agent_id)
+        .map(|agent| agent.question_view.is_some())
+    else {
         return vec![];
     };
-    if agent.question_view.is_some() {
-        agent.session.model_switch_pending = false;
-        agent.session.model_switch_request_id = None;
-        agent.session.model_switch_rollback = None;
+    if has_existing_question {
+        // The existing question prevents this transaction's decision modal
+        // from opening, so close the app-owned transaction as well as the
+        // session-local gate. Leaving the global admission slot behind would
+        // block every later ordinary/default model switch until restart.
+        abort_model_switch_transaction(app, agent_id);
+        let agent = app
+            .agents
+            .get_mut(&agent_id)
+            .expect("agent presence checked above");
         agent.show_toast("Finish answering the current question first");
         let drain = maybe_drain_queue(agent);
         let page_flip_entry = drain.page_flip_entry;

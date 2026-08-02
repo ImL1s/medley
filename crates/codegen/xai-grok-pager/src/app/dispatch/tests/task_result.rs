@@ -17,6 +17,28 @@ fn doctor_target(app: &AppView, id: AgentId) -> crate::app::actions::DoctorFixTa
     }
 }
 
+/// Start a model switch through the production router so completion tests
+/// exercise both the session-local request correlation and the app-owned
+/// transaction gate introduced for atomic cross-session ordering.
+fn start_test_model_switch(
+    app: &mut AppView,
+    agent_id: AgentId,
+    model_id: acp::ModelId,
+    effort: Option<xai_grok_shell::sampling::types::ReasoningEffort>,
+) -> u64 {
+    if !app.agents[&agent_id]
+        .session
+        .models
+        .available
+        .contains_key(&model_id)
+    {
+        insert_ready_model(app, agent_id, &model_id);
+    }
+    assert_eq!(app.active_view, ActiveView::Agent(agent_id));
+    let effects = dispatch(Action::SwitchModel { model_id, effort }, app);
+    switch_model_request_id(&effects)
+}
+
 #[test]
 fn doctor_planning_promotes_initial_session_binding() {
     let temp = tempfile::tempdir().unwrap();
@@ -1003,16 +1025,7 @@ fn switch_model_complete_success_updates_model_and_pushes_message() {
             model_id.clone(),
             acp::ModelInfo::new(model_id.clone(), "Grok 4.5".to_string()),
         );
-    app.agents
-        .get_mut(&id)
-        .unwrap()
-        .session
-        .model_switch_pending = true;
-    app.agents
-        .get_mut(&id)
-        .unwrap()
-        .session
-        .model_switch_request_id = Some(0);
+    let request_id = start_test_model_switch(&mut app, id, model_id.clone(), None);
 
     let initial_scrollback = app.agents[&id].scrollback.len();
 
@@ -1021,7 +1034,7 @@ fn switch_model_complete_success_updates_model_and_pushes_message() {
             agent_id: id,
             model_id: model_id.clone(),
             effort: None,
-            request_id: 0,
+            request_id,
             result: Ok(()),
             prev_model_id: None,
         }),
@@ -1051,8 +1064,8 @@ fn switch_model_complete_without_exact_request_id_is_ignored() {
     let id = AgentId(0);
     let original = app.agents[&id].session.models.current.clone();
     let next = acp::ModelId::new("late-model");
+    let request_id = start_test_model_switch(&mut app, id, next.clone(), None);
     let agent = app.agents.get_mut(&id).unwrap();
-    agent.session.model_switch_pending = true;
     agent.session.model_switch_request_id = None;
 
     let effects = dispatch(
@@ -1060,7 +1073,7 @@ fn switch_model_complete_without_exact_request_id_is_ignored() {
             agent_id: id,
             model_id: next,
             effort: None,
-            request_id: 0,
+            request_id,
             result: Ok(()),
             prev_model_id: None,
         }),
@@ -1085,8 +1098,7 @@ fn switch_model_complete_skips_message_and_persist_when_unchanged() {
     );
     agent.session.models.current = Some(model_id.clone());
     agent.session.models.reasoning_effort = None;
-    agent.session.model_switch_pending = true;
-    agent.session.model_switch_request_id = Some(0);
+    let request_id = start_test_model_switch(&mut app, id, model_id.clone(), None);
 
     let before = app.agents[&id].scrollback.len();
     let effects = dispatch(
@@ -1094,7 +1106,7 @@ fn switch_model_complete_skips_message_and_persist_when_unchanged() {
             agent_id: id,
             model_id: model_id.clone(),
             effort: None,
-            request_id: 0,
+            request_id,
             result: Ok(()),
             prev_model_id: None,
         }),
@@ -1138,23 +1150,14 @@ fn switch_model_complete_persists_resolved_effort_from_catalog_meta() {
             acp::ModelInfo::new(model_id.clone(), "BYOK Model 4.7".to_string())
                 .meta(serde_json::Value::Object(meta).as_object().cloned()),
         );
-    app.agents
-        .get_mut(&id)
-        .unwrap()
-        .session
-        .model_switch_pending = true;
-    app.agents
-        .get_mut(&id)
-        .unwrap()
-        .session
-        .model_switch_request_id = Some(0);
+    let request_id = start_test_model_switch(&mut app, id, model_id.clone(), None);
 
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SwitchModelComplete {
             agent_id: id,
             model_id: model_id.clone(),
             effort: None, // user typed `/model Blackbox 4.7` with no effort
-            request_id: 0,
+            request_id,
             result: Ok(()),
             prev_model_id: None,
         }),
@@ -1210,23 +1213,14 @@ fn switch_to_non_reasoning_model_clears_persisted_effort() {
             model_id.clone(),
             acp::ModelInfo::new(model_id.clone(), "Grok Build".to_string()),
         );
-    app.agents
-        .get_mut(&id)
-        .unwrap()
-        .session
-        .model_switch_pending = true;
-    app.agents
-        .get_mut(&id)
-        .unwrap()
-        .session
-        .model_switch_request_id = Some(0);
+    let request_id = start_test_model_switch(&mut app, id, model_id.clone(), None);
 
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SwitchModelComplete {
             agent_id: id,
             model_id: model_id.clone(),
             effort: None,
-            request_id: 0,
+            request_id,
             result: Ok(()),
             prev_model_id: None,
         }),
@@ -1257,17 +1251,7 @@ fn switch_model_complete_failure_pushes_error_and_clears_pending() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
     let model_id = acp::ModelId::new(std::sync::Arc::from("bad-model"));
-
-    app.agents
-        .get_mut(&id)
-        .unwrap()
-        .session
-        .model_switch_pending = true;
-    app.agents
-        .get_mut(&id)
-        .unwrap()
-        .session
-        .model_switch_request_id = Some(0);
+    let request_id = start_test_model_switch(&mut app, id, model_id.clone(), None);
     let old_current = app.agents[&id].session.models.current.clone();
     let initial_scrollback = app.agents[&id].scrollback.len();
 
@@ -1276,7 +1260,7 @@ fn switch_model_complete_failure_pushes_error_and_clears_pending() {
             agent_id: id,
             model_id,
             effort: None,
-            request_id: 0,
+            request_id,
             result: Err(SwitchModelError::Other("model not found".into())),
             prev_model_id: None,
         }),
@@ -1297,17 +1281,7 @@ fn switch_model_incompatible_agent_shows_question_modal() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
     let model_id = acp::ModelId::new(std::sync::Arc::from("cursor-model"));
-
-    app.agents
-        .get_mut(&id)
-        .unwrap()
-        .session
-        .model_switch_pending = true;
-    app.agents
-        .get_mut(&id)
-        .unwrap()
-        .session
-        .model_switch_request_id = Some(0);
+    let request_id = start_test_model_switch(&mut app, id, model_id.clone(), None);
     let initial_scrollback = app.agents[&id].scrollback.len();
 
     let err = xai_grok_shell::agent::config::ModelSwitchIncompatibleAgentError {
@@ -1322,7 +1296,7 @@ fn switch_model_incompatible_agent_shows_question_modal() {
             agent_id: id,
             model_id,
             effort: None,
-            request_id: 0,
+            request_id,
             result: Err(SwitchModelError::IncompatibleAgent {
                 error: err,
                 prev_model_id: None,
@@ -1351,17 +1325,21 @@ fn switch_model_incompatible_agent_shows_question_modal() {
 fn incompatible_model_switch_opens_question_on_originating_session() {
     let mut app = test_app_with_agent();
     let source_id = AgentId(0);
+    let model_id = acp::ModelId::new("cursor-model");
+    insert_ready_model(&mut app, source_id, &model_id);
+    let switch_effects = dispatch(
+        Action::SwitchModel {
+            model_id: model_id.clone(),
+            effort: None,
+        },
+        &mut app,
+    );
+    let request_id = switch_model_request_id(&switch_effects);
     let (other_id, _) =
         crate::app::dispatch::session::lifecycle::dispatch_new_session_inner_with_id(
             &mut app, None,
         );
     assert_eq!(app.active_view, ActiveView::Agent(other_id));
-    {
-        let source = app.agents.get_mut(&source_id).unwrap();
-        source.session.model_switch_pending = true;
-        source.session.model_switch_request_id = Some(7);
-    }
-    let model_id = acp::ModelId::new("cursor-model");
     let error = xai_grok_shell::agent::config::ModelSwitchIncompatibleAgentError {
         code: "MODEL_SWITCH_INCOMPATIBLE_AGENT".into(),
         active_agent_type: "grok-build".into(),
@@ -1375,7 +1353,7 @@ fn incompatible_model_switch_opens_question_on_originating_session() {
             agent_id: source_id,
             model_id,
             effort: None,
-            request_id: 7,
+            request_id,
             result: Err(SwitchModelError::IncompatibleAgent {
                 error,
                 prev_model_id: None,
@@ -1425,14 +1403,23 @@ fn incompatible_model_switch_opens_question_on_originating_session() {
 fn incompatible_model_switch_releases_queue_when_origin_has_an_existing_question() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
+    let model_id = acp::ModelId::new("cursor-model");
+    let follow_on_model = acp::ModelId::new("follow-on-model");
+    insert_ready_model(&mut app, id, &model_id);
+    insert_ready_model(&mut app, id, &follow_on_model);
     crate::app::dispatch::session::lifecycle::open_new_session_question(&mut app);
+    let switch_effects = dispatch(
+        Action::SwitchModel {
+            model_id: model_id.clone(),
+            effort: None,
+        },
+        &mut app,
+    );
+    let request_id = switch_model_request_id(&switch_effects);
     {
         let agent = app.agents.get_mut(&id).unwrap();
-        agent.session.model_switch_pending = true;
-        agent.session.model_switch_request_id = Some(11);
         agent.session.enqueue_prompt("queued prompt".into());
     }
-    let model_id = acp::ModelId::new("cursor-model");
     let error = xai_grok_shell::agent::config::ModelSwitchIncompatibleAgentError {
         code: "MODEL_SWITCH_INCOMPATIBLE_AGENT".into(),
         active_agent_type: "grok-build".into(),
@@ -1446,7 +1433,7 @@ fn incompatible_model_switch_releases_queue_when_origin_has_an_existing_question
             agent_id: id,
             model_id,
             effort: None,
-            request_id: 11,
+            request_id,
             result: Err(SwitchModelError::IncompatibleAgent {
                 error,
                 prev_model_id: None,
@@ -1462,6 +1449,24 @@ fn incompatible_model_switch_releases_queue_when_origin_has_an_existing_question
     assert!(!app.agents[&id].session.model_switch_pending);
     assert!(app.agents[&id].session.model_switch_request_id.is_none());
     assert!(app.agents[&id].session.model_switch_rollback.is_none());
+    assert!(
+        app.model_switch_transaction.is_none(),
+        "the blocked mismatch modal must release app-global admission"
+    );
+
+    let follow_on = dispatch(
+        Action::SwitchModel {
+            model_id: follow_on_model,
+            effort: None,
+        },
+        &mut app,
+    );
+    assert!(
+        follow_on
+            .iter()
+            .any(|effect| matches!(effect, Effect::SwitchModel { .. })),
+        "a later model switch must not remain wedged behind the closed transaction"
+    );
 }
 
 #[test]
@@ -1469,10 +1474,9 @@ fn incompatible_model_switch_holds_queue_until_declined() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
     let model_id = acp::ModelId::new("cursor-model");
+    let request_id = start_test_model_switch(&mut app, id, model_id.clone(), None);
     {
         let agent = app.agents.get_mut(&id).unwrap();
-        agent.session.model_switch_pending = true;
-        agent.session.model_switch_request_id = Some(0);
         agent.session.enqueue_prompt("queued prompt".into());
     }
     let err = xai_grok_shell::agent::config::ModelSwitchIncompatibleAgentError {
@@ -1487,7 +1491,7 @@ fn incompatible_model_switch_holds_queue_until_declined() {
             agent_id: id,
             model_id,
             effort: None,
-            request_id: 0,
+            request_id,
             result: Err(SwitchModelError::IncompatibleAgent {
                 error: err,
                 prev_model_id: None,
@@ -1533,10 +1537,17 @@ fn incompatible_model_switch_cancel_keys_decline_and_release_queue() {
         let mut app = test_app_with_agent();
         let id = AgentId(0);
         let model_id = acp::ModelId::new("cursor-model");
+        insert_ready_model(&mut app, id, &model_id);
+        let switch_effects = dispatch(
+            Action::SwitchModel {
+                model_id: model_id.clone(),
+                effort: None,
+            },
+            &mut app,
+        );
+        let request_id = switch_model_request_id(&switch_effects);
         {
             let agent = app.agents.get_mut(&id).unwrap();
-            agent.session.model_switch_pending = true;
-            agent.session.model_switch_request_id = Some(0);
             agent.session.enqueue_prompt("queued prompt".into());
         }
         let error = xai_grok_shell::agent::config::ModelSwitchIncompatibleAgentError {
@@ -1551,7 +1562,7 @@ fn incompatible_model_switch_cancel_keys_decline_and_release_queue() {
                 agent_id: id,
                 model_id: model_id.clone(),
                 effort: None,
-                request_id: 0,
+                request_id,
                 result: Err(SwitchModelError::IncompatibleAgent {
                     error,
                     prev_model_id: None,
@@ -1599,10 +1610,14 @@ fn incompatible_model_switch_hands_queue_to_replacement_until_target_switch_succ
         model_id.clone(),
         acp::ModelInfo::new(model_id.clone(), model_id.0.to_string()),
     );
+    let source_request_id = start_test_model_switch(
+        &mut app,
+        source_id,
+        model_id.clone(),
+        Some(ReasoningEffort::High),
+    );
     {
         let source = app.agents.get_mut(&source_id).unwrap();
-        source.session.model_switch_pending = true;
-        source.session.model_switch_request_id = Some(0);
         source.session.enqueue_prompt("first".into());
         source.session.enqueue_prompt("second".into());
     }
@@ -1618,7 +1633,7 @@ fn incompatible_model_switch_hands_queue_to_replacement_until_target_switch_succ
             agent_id: source_id,
             model_id: model_id.clone(),
             effort: Some(ReasoningEffort::High),
-            request_id: 0,
+            request_id: source_request_id,
             result: Err(SwitchModelError::IncompatibleAgent {
                 error: err,
                 prev_model_id: None,
@@ -1733,10 +1748,14 @@ fn handed_queue_stays_gated_when_deferred_target_switch_fails() {
             model_id.clone(),
             acp::ModelInfo::new(model_id.clone(), model_id.0.to_string()),
         );
+        let source_request_id = start_test_model_switch(
+            &mut app,
+            source_id,
+            model_id.clone(),
+            Some(ReasoningEffort::High),
+        );
         {
             let source = app.agents.get_mut(&source_id).unwrap();
-            source.session.model_switch_pending = true;
-            source.session.model_switch_request_id = Some(0);
             source.session.enqueue_prompt("must stay gated".into());
         }
         let incompatible = xai_grok_shell::agent::config::ModelSwitchIncompatibleAgentError {
@@ -1751,7 +1770,7 @@ fn handed_queue_stays_gated_when_deferred_target_switch_fails() {
                 agent_id: source_id,
                 model_id: model_id.clone(),
                 effort: Some(ReasoningEffort::High),
-                request_id: 0,
+                request_id: source_request_id,
                 result: Err(SwitchModelError::IncompatibleAgent {
                     error: incompatible,
                     prev_model_id: None,
@@ -1846,10 +1865,14 @@ fn failed_deferred_target_preflight_aborts_transaction_and_restores_source_queue
             model_id.clone(),
             acp::ModelInfo::new(model_id.clone(), model_id.0.to_string()),
         );
+        let source_request_id = start_test_model_switch(
+            &mut app,
+            source_id,
+            model_id.clone(),
+            Some(ReasoningEffort::High),
+        );
         {
             let source = app.agents.get_mut(&source_id).unwrap();
-            source.session.model_switch_pending = true;
-            source.session.model_switch_request_id = Some(0);
             source.session.enqueue_prompt("must stay gated".into());
         }
         let error = xai_grok_shell::agent::config::ModelSwitchIncompatibleAgentError {
@@ -1864,7 +1887,7 @@ fn failed_deferred_target_preflight_aborts_transaction_and_restores_source_queue
                 agent_id: source_id,
                 model_id: model_id.clone(),
                 effort: Some(ReasoningEffort::High),
-                request_id: 0,
+                request_id: source_request_id,
                 result: Err(SwitchModelError::IncompatibleAgent {
                     error,
                     prev_model_id: None,
@@ -1938,10 +1961,9 @@ fn failed_replacement_restores_and_drains_handed_queue_before_new_source_prompts
     let mut app = test_app_with_agent();
     let source_id = AgentId(0);
     let model_id = acp::ModelId::new("cursor-model");
+    let source_request_id = start_test_model_switch(&mut app, source_id, model_id.clone(), None);
     {
         let source = app.agents.get_mut(&source_id).unwrap();
-        source.session.model_switch_pending = true;
-        source.session.model_switch_request_id = Some(0);
         source.session.enqueue_prompt("handed first".into());
         source.session.enqueue_prompt("handed second".into());
     }
@@ -1957,7 +1979,7 @@ fn failed_replacement_restores_and_drains_handed_queue_before_new_source_prompts
             agent_id: source_id,
             model_id: model_id.clone(),
             effort: None,
-            request_id: 0,
+            request_id: source_request_id,
             result: Err(SwitchModelError::IncompatibleAgent {
                 error: err,
                 prev_model_id: None,
@@ -2035,22 +2057,33 @@ fn incompatible_agent_rollback_restores_previous_model() {
     let prev_model = acp::ModelId::new(std::sync::Arc::from("original-model"));
     let new_model = acp::ModelId::new(std::sync::Arc::from("cursor-model"));
 
-    // Set up catalog with both models.
-    let agent = app.agents.get_mut(&id).unwrap();
-    agent.session.models.available.insert(
-        prev_model.clone(),
-        acp::ModelInfo::new(prev_model.clone(), "Original".to_string()),
-    );
-    agent.session.models.available.insert(
-        new_model.clone(),
-        acp::ModelInfo::new(new_model.clone(), "Cursor".to_string()),
-    );
-    // Simulate the optimistic update that set_default_model_inner does.
-    agent.session.models.set_current(new_model.clone(), None);
-    agent.session.model_switch_pending = true;
-    agent.session.model_switch_request_id = Some(0);
+    // Set up both mirrors, then enter through the real optimistic default path.
+    for (model_id, name) in [
+        (prev_model.clone(), "Original"),
+        (new_model.clone(), "Cursor"),
+    ] {
+        let info = acp::ModelInfo::new(model_id.clone(), name);
+        app.agents[&id]
+            .session
+            .models
+            .available
+            .insert(model_id.clone(), info.clone());
+        app.models.available.insert(model_id, info);
+    }
+    app.agents
+        .get_mut(&id)
+        .unwrap()
+        .session
+        .models
+        .set_current(prev_model.clone(), None);
+    app.models.set_current(prev_model.clone(), None);
+    let switch_effects = dispatch(Action::SetDefaultModel(new_model.clone()), &mut app);
+    let request_id = switch_model_request_id(&switch_effects);
 
-    assert_eq!(agent.session.models.current, Some(new_model.clone()));
+    assert_eq!(
+        app.agents[&id].session.models.current,
+        Some(new_model.clone())
+    );
 
     let err = xai_grok_shell::agent::config::ModelSwitchIncompatibleAgentError {
         code: "MODEL_SWITCH_INCOMPATIBLE_AGENT".into(),
@@ -2064,7 +2097,7 @@ fn incompatible_agent_rollback_restores_previous_model() {
             agent_id: id,
             model_id: new_model,
             effort: None,
-            request_id: 0,
+            request_id,
             result: Err(SwitchModelError::IncompatibleAgent {
                 error: err,
                 prev_model_id: Some(prev_model.clone()),
@@ -2797,6 +2830,7 @@ fn incompatible_agent_closes_active_modal() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
     let model_id = acp::ModelId::new(std::sync::Arc::from("cursor-model"));
+    let request_id = start_test_model_switch(&mut app, id, model_id.clone(), None);
 
     // Open any modal to verify it gets closed.
     let agent = app.agents.get_mut(&id).unwrap();
@@ -2805,8 +2839,6 @@ fn incompatible_agent_closes_active_modal() {
         state: crate::views::picker::PickerState::input_active(),
         window: crate::views::modal_window::ModalWindowState::new(),
     });
-    agent.session.model_switch_pending = true;
-    agent.session.model_switch_request_id = Some(0);
 
     let err = xai_grok_shell::agent::config::ModelSwitchIncompatibleAgentError {
         code: "MODEL_SWITCH_INCOMPATIBLE_AGENT".into(),
@@ -2820,7 +2852,7 @@ fn incompatible_agent_closes_active_modal() {
             agent_id: id,
             model_id,
             effort: None,
-            request_id: 0,
+            request_id,
             result: Err(SwitchModelError::IncompatibleAgent {
                 error: err,
                 prev_model_id: None,
@@ -2862,8 +2894,7 @@ fn same_agent_type_switch_no_modal() {
         model_b.clone(),
         acp::ModelInfo::new(model_b.clone(), "Grok Build B".to_string()),
     );
-    agent.session.model_switch_pending = true;
-    agent.session.model_switch_request_id = Some(0);
+    let request_id = start_test_model_switch(&mut app, id, model_b.clone(), None);
 
     // Shell returns Ok (same agent type, no mismatch).
     let effects = dispatch(
@@ -2871,7 +2902,7 @@ fn same_agent_type_switch_no_modal() {
             agent_id: id,
             model_id: model_b.clone(),
             effort: None,
-            request_id: 0,
+            request_id,
             result: Ok(()),
             prev_model_id: None,
         }),
