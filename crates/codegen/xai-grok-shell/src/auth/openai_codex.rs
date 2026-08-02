@@ -13,7 +13,7 @@ use axum::{Router, extract::Query, http::StatusCode, response::Html, routing::ge
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{Duration, TimeZone, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -26,6 +26,7 @@ pub const AUTH_SCOPE: &str = "openai::codex";
 pub const ISSUER: &str = "https://auth.openai.com";
 pub const AUTHORIZE_ENDPOINT: &str = "https://auth.openai.com/oauth/authorize";
 pub const TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
+pub const REVOKE_ENDPOINT: &str = "https://auth.openai.com/oauth/revoke";
 pub const CODEX_API_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const SCOPES: &str =
@@ -33,11 +34,11 @@ pub const SCOPES: &str =
 pub const ORIGINATOR: &str = "grok_build";
 pub const CALLBACK_PORTS: &[u16] = &[1455, 1457];
 pub const AUTH_CLAIM_NAMESPACE: &str = "https://api.openai.com/auth";
-pub const ACCOUNT_ID_CLAIM: &str = "https://api.openai.com/auth/chatgpt_account_id";
 
 const CALLBACK_PATH: &str = "/auth/callback";
 const CALLBACK_TIMEOUT: StdDuration = StdDuration::from_secs(600);
 const REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(20);
+const REVOKE_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const EXPIRY_FALLBACK_SECONDS: i64 = 8 * 24 * 60 * 60;
 
 #[derive(Debug, thiserror::Error)]
@@ -120,6 +121,45 @@ struct RefreshTokenResponse {
     id_token: Option<String>,
     #[serde(default)]
     expires_in: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CodexWorkspaceClaims {
+    account_id: Option<String>,
+    is_fedramp: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RevokeTokenKind {
+    Access,
+    Refresh,
+}
+
+impl RevokeTokenKind {
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Access => "access_token",
+            Self::Refresh => "refresh_token",
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct RevokeTokenRequest<'a> {
+    token: &'a str,
+    token_type_hint: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_id: Option<&'static str>,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+enum RevokeError {
+    #[error("Codex OAuth revocation timed out")]
+    Timeout,
+    #[error("Codex OAuth revocation request failed")]
+    Network,
+    #[error("Codex OAuth revocation failed: HTTP {status}")]
+    Http { status: u16 },
 }
 
 impl std::fmt::Debug for RefreshTokenResponse {
@@ -463,29 +503,80 @@ async fn refresh_at(
     decode_token_response(resp).await
 }
 
-fn account_id_from_jwt(token: &str) -> Option<String> {
+fn revocable_token(auth: &GrokAuth) -> Option<(&str, RevokeTokenKind)> {
+    if !is_codex_credential(auth) {
+        return None;
+    }
+    auth.refresh_token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+        .map(|token| (token, RevokeTokenKind::Refresh))
+        .or_else(|| (!auth.key.is_empty()).then_some((auth.key.as_str(), RevokeTokenKind::Access)))
+}
+
+async fn revoke_at(
+    endpoint: &str,
+    auth: &GrokAuth,
+    timeout: StdDuration,
+) -> Result<(), RevokeError> {
+    let Some((token, kind)) = revocable_token(auth) else {
+        return Ok(());
+    };
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(timeout)
+        .build()
+        .map_err(|_| RevokeError::Network)?;
+    let request = RevokeTokenRequest {
+        token,
+        token_type_hint: kind.hint(),
+        client_id: (kind == RevokeTokenKind::Refresh).then_some(CLIENT_ID),
+    };
+    let response = client
+        .post(endpoint)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                RevokeError::Timeout
+            } else {
+                RevokeError::Network
+            }
+        })?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(RevokeError::Http {
+            status: response.status().as_u16(),
+        })
+    }
+}
+
+fn workspace_claims_from_jwt(token: &str) -> Option<CodexWorkspaceClaims> {
     let payload = token.split('.').nth(1)?;
     let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
     let claims: HashMap<String, serde_json::Value> = serde_json::from_slice(&bytes).ok()?;
-    let nested = claims
+    let auth = claims
         .get(AUTH_CLAIM_NAMESPACE)
-        .and_then(serde_json::Value::as_object)
+        .and_then(serde_json::Value::as_object);
+    let account_id = auth
         .and_then(|auth| auth.get("chatgpt_account_id"))
         .and_then(serde_json::Value::as_str)
         .filter(|value| valid_account_id(value))
         .map(str::to_owned);
-    if nested.is_some() {
-        return nested;
-    }
-    [ACCOUNT_ID_CLAIM, "chatgpt_account_id", "account_id"]
-        .into_iter()
-        .find_map(|key| {
-            claims
-                .get(key)?
-                .as_str()
-                .filter(|value| valid_account_id(value))
-        })
-        .map(str::to_owned)
+    let is_fedramp = auth
+        .and_then(|auth| auth.get("chatgpt_account_is_fedramp"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    Some(CodexWorkspaceClaims {
+        account_id,
+        is_fedramp,
+    })
+}
+
+fn account_id_from_jwt(token: &str) -> Option<String> {
+    workspace_claims_from_jwt(token)?.account_id
 }
 
 fn expiry_from_access_token(token: &str) -> Option<chrono::DateTime<Utc>> {
@@ -538,8 +629,7 @@ fn build_login_auth(tokens: AuthCodeTokenResponse) -> Result<GrokAuth, CodexOAut
     }
     let now = Utc::now();
     let expires_at = token_expiry(&tokens.access_token, tokens.expires_in, now)?;
-    let account_id =
-        account_id_from_jwt(&tokens.id_token).or_else(|| account_id_from_jwt(&tokens.access_token));
+    let workspace = workspace_claims_from_jwt(&tokens.id_token).unwrap_or_default();
     Ok(GrokAuth {
         key: tokens.access_token,
         auth_mode: AuthMode::OpenAiCodex,
@@ -550,7 +640,8 @@ fn build_login_auth(tokens: AuthCodeTokenResponse) -> Result<GrokAuth, CodexOAut
         oidc_issuer: Some(ISSUER.to_owned()),
         oidc_client_id: Some(CLIENT_ID.to_owned()),
         id_token: Some(tokens.id_token),
-        account_id,
+        account_id: workspace.account_id,
+        chatgpt_account_is_fedramp: workspace.is_fedramp,
         ..GrokAuth::default()
     })
 }
@@ -574,11 +665,10 @@ fn merge_refresh_auth(
     }
 
     let now = Utc::now();
-    let new_account_id = tokens
+    let new_workspace = tokens
         .id_token
         .as_deref()
-        .and_then(account_id_from_jwt)
-        .or_else(|| tokens.access_token.as_deref().and_then(account_id_from_jwt));
+        .map(|token| workspace_claims_from_jwt(token).unwrap_or_default());
     let mut merged = previous.clone();
     if let Some(access_token) = tokens.access_token {
         merged.expires_at = Some(token_expiry(&access_token, tokens.expires_in, now)?);
@@ -591,8 +681,9 @@ fn merge_refresh_auth(
     if let Some(id_token) = tokens.id_token {
         merged.id_token = Some(id_token);
     }
-    if let Some(account_id) = new_account_id {
-        merged.account_id = Some(account_id);
+    if let Some(workspace) = new_workspace {
+        merged.account_id = workspace.account_id;
+        merged.chatgpt_account_is_fedramp = workspace.is_fedramp;
     }
     Ok(merged)
 }
@@ -602,6 +693,19 @@ pub(crate) fn is_codex_credential(auth: &GrokAuth) -> bool {
         && auth.oidc_issuer.as_deref() == Some(ISSUER)
         && auth.oidc_client_id.as_deref() == Some(CLIENT_ID)
         && !auth.key.is_empty()
+}
+
+/// Re-derive routing metadata from the namespaced ID-token contract instead of
+/// trusting independently persisted `account_id` / FedRAMP fields. This also
+/// clears metadata written by older builds from generic top-level claims.
+pub(crate) fn normalize_workspace_metadata(auth: &mut GrokAuth) {
+    let workspace = auth
+        .id_token
+        .as_deref()
+        .and_then(workspace_claims_from_jwt)
+        .unwrap_or_default();
+    auth.account_id = workspace.account_id;
+    auth.chatgpt_account_is_fedramp = workspace.is_fedramp;
 }
 
 /// Run browser/headless Codex OAuth and persist the resulting provider scope.
@@ -700,6 +804,7 @@ pub fn credential_snapshot(manager: &AuthManager) -> Option<ProviderCredentialSn
         access_token: auth.key,
         expires_at: auth.expires_at,
         account_id: auth.account_id,
+        chatgpt_account_is_fedramp: auth.chatgpt_account_is_fedramp,
         issuer: auth.oidc_issuer,
     })
 }
@@ -719,8 +824,23 @@ async fn logout_with_timeout(
     manager: &AuthManager,
     timeout: StdDuration,
 ) -> Result<(), CodexOAuthError> {
+    logout_with_revoke_endpoint(manager, timeout, REVOKE_ENDPOINT).await
+}
+
+async fn logout_with_revoke_endpoint(
+    manager: &AuthManager,
+    timeout: StdDuration,
+    revoke_endpoint: &str,
+) -> Result<(), CodexOAuthError> {
     manager
-        .clear_durable(timeout)
+        .clear_durable_with_current_scope(timeout, |auth| async move {
+            if let Some(auth) = auth
+                && let Err(error) =
+                    revoke_at(revoke_endpoint, &auth, timeout.min(REVOKE_TIMEOUT)).await
+            {
+                tracing::warn!(error = %error, "Codex OAuth remote revocation failed; continuing local logout");
+            }
+        })
         .await
         .map_err(|error| match error.kind() {
             std::io::ErrorKind::WouldBlock => CodexOAuthError::StoreBusy,
@@ -822,7 +942,14 @@ mod tests {
                 expires_at: Some(Utc::now() + Duration::hours(1)),
                 oidc_issuer: Some(ISSUER.into()),
                 oidc_client_id: Some(CLIENT_ID.into()),
+                id_token: Some(jwt(serde_json::json!({
+                    AUTH_CLAIM_NAMESPACE: {
+                        "chatgpt_account_id": "rotated-account",
+                        "chatgpt_account_is_fedramp": true
+                    }
+                }))),
                 account_id: Some("rotated-account".into()),
+                chatgpt_account_is_fedramp: true,
                 ..GrokAuth::default()
             }))
         }
@@ -863,8 +990,14 @@ mod tests {
             expires_at: Some(Utc.with_ymd_and_hms(2026, 8, 2, 0, 0, 0).unwrap()),
             oidc_issuer: Some(ISSUER.into()),
             oidc_client_id: Some(CLIENT_ID.into()),
-            id_token: Some("old-id".into()),
+            id_token: Some(jwt(serde_json::json!({
+                AUTH_CLAIM_NAMESPACE: {
+                    "chatgpt_account_id": "old-account",
+                    "chatgpt_account_is_fedramp": true
+                }
+            }))),
             account_id: Some("old-account".into()),
+            chatgpt_account_is_fedramp: true,
             ..GrokAuth::default()
         }
     }
@@ -1057,6 +1190,24 @@ mod tests {
     #[tokio::test]
     async fn logout_does_not_clear_memory_or_report_success_while_store_is_locked() {
         let dir = tempfile::tempdir().unwrap();
+        let revoke_calls = Arc::new(AtomicUsize::new(0));
+        let captured_calls = Arc::clone(&revoke_calls);
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = Router::new().route(
+            "/revoke",
+            axum::routing::post(move || {
+                let captured_calls = Arc::clone(&captured_calls);
+                async move {
+                    captured_calls.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let revoke_endpoint = format!("http://{addr}/revoke");
         let manager = manager(dir.path());
         manager
             .save_without_enrichment(GrokAuth {
@@ -1074,9 +1225,15 @@ mod tests {
             .expect("test lock acquired");
 
         assert!(matches!(
-            logout_with_timeout(&manager, StdDuration::from_millis(20)).await,
+            logout_with_revoke_endpoint(&manager, StdDuration::from_millis(20), &revoke_endpoint,)
+                .await,
             Err(CodexOAuthError::StoreBusy)
         ));
+        assert_eq!(
+            revoke_calls.load(Ordering::SeqCst),
+            0,
+            "logout must not revoke a cached credential before acquiring the durable-store lock"
+        );
         assert!(status(&manager).signed_in, "memory must remain coherent");
         assert!(
             status(&AuthManager::new_openai_codex(dir.path())).signed_in,
@@ -1084,11 +1241,292 @@ mod tests {
         );
 
         drop(held_lock);
-        logout_with_timeout(&manager, StdDuration::from_secs(1))
+        logout_with_revoke_endpoint(&manager, StdDuration::from_secs(1), &revoke_endpoint)
             .await
             .unwrap();
         assert!(!status(&manager).signed_in);
         assert!(!status(&AuthManager::new_openai_codex(dir.path())).signed_in);
+        assert_eq!(revoke_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn logout_revokes_disk_current_generation_while_holding_store_lock() {
+        use axum::extract::Json;
+        use tokio::sync::{Barrier, Mutex, Notify};
+
+        let dir = tempfile::tempdir().unwrap();
+        let xai = GrokAuth {
+            key: "xai-secret".into(),
+            auth_mode: AuthMode::Oidc,
+            ..GrokAuth::default()
+        };
+        super::super::storage::write_auth_json(
+            &dir.path().join("auth.json"),
+            &std::collections::BTreeMap::from([("xai::scope".to_owned(), xai)]),
+        )
+        .unwrap();
+
+        let logout_manager = manager(dir.path());
+        logout_manager
+            .save_without_enrichment(previous_codex_auth())
+            .await
+            .unwrap();
+        let rotating_manager = manager(dir.path());
+
+        let rotation_barrier = Arc::new(Barrier::new(2));
+        let rotating_task = {
+            let rotating_manager = Arc::clone(&rotating_manager);
+            let rotation_barrier = Arc::clone(&rotation_barrier);
+            tokio::spawn(async move {
+                rotation_barrier.wait().await;
+                let rotation_lock = rotating_manager
+                    .try_lock_auth_file_async(StdDuration::from_secs(1))
+                    .await
+                    .expect("rotating manager must acquire the shared auth-file lock");
+                let mut rotated = previous_codex_auth();
+                rotated.key = "rotated-access".into();
+                rotated.refresh_token = Some("rotated-refresh".into());
+                rotated.account_id = Some("rotated-account".into());
+                rotating_manager
+                    .save_without_enrichment(rotated)
+                    .await
+                    .unwrap();
+                drop(rotation_lock);
+            })
+        };
+        rotation_barrier.wait().await;
+        tokio::time::timeout(StdDuration::from_secs(5), rotating_task)
+            .await
+            .expect("credential rotation must not deadlock")
+            .unwrap();
+        assert_eq!(
+            logout_manager
+                .current_or_expired()
+                .unwrap()
+                .refresh_token
+                .as_deref(),
+            Some("old-refresh"),
+            "logout manager must retain the deliberately stale cached generation"
+        );
+
+        let captured_bodies = Arc::new(Mutex::new(Vec::new()));
+        let revoke_started = Arc::new(Notify::new());
+        let release_revoke = Arc::new(Notify::new());
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = Router::new().route(
+            "/revoke",
+            axum::routing::post({
+                let captured_bodies = Arc::clone(&captured_bodies);
+                let revoke_started = Arc::clone(&revoke_started);
+                let release_revoke = Arc::clone(&release_revoke);
+                move |Json(body): Json<serde_json::Value>| {
+                    let captured_bodies = Arc::clone(&captured_bodies);
+                    let revoke_started = Arc::clone(&revoke_started);
+                    let release_revoke = Arc::clone(&release_revoke);
+                    async move {
+                        captured_bodies.lock().await.push(body);
+                        revoke_started.notify_one();
+                        release_revoke.notified().await;
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let revoke_endpoint = format!("http://{addr}/revoke");
+        let logout_task = {
+            let logout_manager = Arc::clone(&logout_manager);
+            tokio::spawn(async move {
+                logout_with_revoke_endpoint(
+                    &logout_manager,
+                    StdDuration::from_secs(1),
+                    &revoke_endpoint,
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(StdDuration::from_secs(5), revoke_started.notified())
+            .await
+            .expect("logout must reach remote revocation without deadlocking");
+
+        let bodies = captured_bodies.lock().await;
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(
+            bodies[0]["token"], "rotated-refresh",
+            "logout must revoke the generation reread from disk under lock"
+        );
+        drop(bodies);
+        assert!(
+            rotating_manager
+                .try_lock_auth_file_async(StdDuration::from_millis(20))
+                .await
+                .is_none(),
+            "the auth-file lock must remain held while remote revocation is in flight"
+        );
+
+        release_revoke.notify_one();
+        tokio::time::timeout(StdDuration::from_secs(5), logout_task)
+            .await
+            .expect("logout must finish after revocation is released")
+            .unwrap()
+            .unwrap();
+        assert!(!status(&logout_manager).signed_in);
+        let store = super::super::storage::read_auth_json(&dir.path().join("auth.json")).unwrap();
+        assert!(!store.contains_key(AUTH_SCOPE));
+        assert_eq!(store.get("xai::scope").unwrap().key, "xai-secret");
+    }
+
+    #[tokio::test]
+    async fn revoke_prefers_refresh_then_falls_back_to_access() {
+        use axum::extract::Json;
+        let bodies = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&bodies);
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = Router::new().route(
+            "/revoke",
+            axum::routing::post(move |Json(body): Json<serde_json::Value>| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    captured.lock().await.push(body);
+                    StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let endpoint = format!("http://{addr}/revoke");
+
+        let refresh = previous_codex_auth();
+        revoke_at(&endpoint, &refresh, StdDuration::from_secs(1))
+            .await
+            .unwrap();
+        let access = GrokAuth {
+            key: "access-only-secret".into(),
+            refresh_token: None,
+            auth_mode: AuthMode::OpenAiCodex,
+            oidc_issuer: Some(ISSUER.into()),
+            oidc_client_id: Some(CLIENT_ID.into()),
+            ..GrokAuth::default()
+        };
+        revoke_at(&endpoint, &access, StdDuration::from_secs(1))
+            .await
+            .unwrap();
+
+        let bodies = bodies.lock().await;
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0]["token"], "old-refresh");
+        assert_eq!(bodies[0]["token_type_hint"], "refresh_token");
+        assert_eq!(bodies[0]["client_id"], CLIENT_ID);
+        assert_eq!(bodies[1]["token"], "access-only-secret");
+        assert_eq!(bodies[1]["token_type_hint"], "access_token");
+        assert!(bodies[1].get("client_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn revoke_timeout_and_http_errors_are_secret_safe() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = Router::new()
+            .route(
+                "/slow",
+                axum::routing::post(|| async {
+                    tokio::time::sleep(StdDuration::from_secs(1)).await;
+                    StatusCode::NO_CONTENT
+                }),
+            )
+            .route(
+                "/failure",
+                axum::routing::post(|| async {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "server-body-SENTINEL")
+                }),
+            );
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let auth = GrokAuth {
+            key: "access-SENTINEL".into(),
+            refresh_token: Some("refresh-SENTINEL".into()),
+            auth_mode: AuthMode::OpenAiCodex,
+            oidc_issuer: Some(ISSUER.into()),
+            oidc_client_id: Some(CLIENT_ID.into()),
+            ..GrokAuth::default()
+        };
+
+        let timeout = revoke_at(
+            &format!("http://{addr}/slow"),
+            &auth,
+            StdDuration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(timeout, RevokeError::Timeout);
+        let http = revoke_at(
+            &format!("http://{addr}/failure"),
+            &auth,
+            StdDuration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(http, RevokeError::Http { status: 500 });
+        let rendered = format!("{timeout:?} {timeout} {http:?} {http}");
+        for secret in [
+            "access-SENTINEL",
+            "refresh-SENTINEL",
+            "server-body-SENTINEL",
+        ] {
+            assert!(!rendered.contains(secret), "revoke error leaked {secret}");
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_revoke_failure_never_blocks_provider_scoped_local_logout() {
+        let dir = tempfile::tempdir().unwrap();
+        let xai = GrokAuth {
+            key: "xai-secret".into(),
+            auth_mode: AuthMode::Oidc,
+            ..GrokAuth::default()
+        };
+        super::super::storage::write_auth_json(
+            &dir.path().join("auth.json"),
+            &std::collections::BTreeMap::from([("xai::scope".to_owned(), xai)]),
+        )
+        .unwrap();
+        let manager = manager(dir.path());
+        manager
+            .save_without_enrichment(previous_codex_auth())
+            .await
+            .unwrap();
+
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = Router::new().route(
+            "/revoke",
+            axum::routing::post(|| async {
+                (StatusCode::BAD_GATEWAY, "refresh-SENTINEL must stay secret")
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        logout_with_revoke_endpoint(
+            &manager,
+            StdDuration::from_secs(1),
+            &format!("http://{addr}/revoke"),
+        )
+        .await
+        .unwrap();
+
+        assert!(!status(&manager).signed_in);
+        let store = super::super::storage::read_auth_json(&dir.path().join("auth.json")).unwrap();
+        assert!(!store.contains_key(AUTH_SCOPE));
+        assert_eq!(store.get("xai::scope").unwrap().key, "xai-secret");
     }
 
     #[test]
@@ -1204,14 +1642,68 @@ mod tests {
     }
 
     #[test]
-    fn account_claim_is_compatibility_metadata_only() {
+    fn workspace_claims_require_the_namespaced_typed_contract() {
         let token = jwt(serde_json::json!({
-            AUTH_CLAIM_NAMESPACE: { "chatgpt_account_id": "acct-123" }
+            AUTH_CLAIM_NAMESPACE: {
+                "chatgpt_account_id": "acct-123",
+                "chatgpt_account_is_fedramp": true
+            }
         }));
-        assert_eq!(account_id_from_jwt(&token).as_deref(), Some("acct-123"));
-        let fallback = jwt(serde_json::json!({ ACCOUNT_ID_CLAIM: "acct-flat" }));
-        assert_eq!(account_id_from_jwt(&fallback).as_deref(), Some("acct-flat"));
-        assert_eq!(account_id_from_jwt("not-a-jwt"), None);
+        assert_eq!(
+            workspace_claims_from_jwt(&token),
+            Some(CodexWorkspaceClaims {
+                account_id: Some("acct-123".into()),
+                is_fedramp: true,
+            })
+        );
+
+        for generic in [
+            serde_json::json!({"account_id": "acct-generic"}),
+            serde_json::json!({"chatgpt_account_id": "acct-flat"}),
+            serde_json::json!({
+                "https://api.openai.com/auth/chatgpt_account_id": "acct-slash"
+            }),
+        ] {
+            let claims = workspace_claims_from_jwt(&jwt(generic)).unwrap();
+            assert_eq!(claims.account_id, None);
+            assert!(!claims.is_fedramp);
+        }
+        assert_eq!(workspace_claims_from_jwt("not-a-jwt"), None);
+    }
+
+    #[test]
+    fn fedramp_claim_accepts_only_a_namespaced_json_boolean() {
+        for value in [
+            serde_json::json!("true"),
+            serde_json::json!(1),
+            serde_json::Value::Null,
+        ] {
+            let token = jwt(serde_json::json!({
+                AUTH_CLAIM_NAMESPACE: { "chatgpt_account_is_fedramp": value }
+            }));
+            assert!(!workspace_claims_from_jwt(&token).unwrap().is_fedramp);
+        }
+
+        let generic = jwt(serde_json::json!({"chatgpt_account_is_fedramp": true}));
+        assert!(!workspace_claims_from_jwt(&generic).unwrap().is_fedramp);
+    }
+
+    #[test]
+    fn persisted_workspace_metadata_is_rederived_and_legacy_generic_values_are_cleared() {
+        let mut auth = GrokAuth {
+            id_token: Some(jwt(serde_json::json!({
+                "account_id": "legacy-generic",
+                "chatgpt_account_is_fedramp": true
+            }))),
+            account_id: Some("persisted-untrusted".into()),
+            chatgpt_account_is_fedramp: true,
+            ..previous_codex_auth()
+        };
+
+        normalize_workspace_metadata(&mut auth);
+
+        assert!(auth.account_id.is_none());
+        assert!(!auth.chatgpt_account_is_fedramp);
     }
 
     #[test]
@@ -1287,6 +1779,7 @@ mod tests {
         assert!(auth.coding_data_retention_opt_out);
         assert!(auth.id_token.is_none());
         assert!(auth.account_id.is_none());
+        assert!(!auth.chatgpt_account_is_fedramp);
 
         manager.save_without_enrichment(auth).await.unwrap();
         let migrated: serde_json::Value =
@@ -1294,6 +1787,11 @@ mod tests {
         assert_eq!(migrated[AUTH_SCOPE]["coding_data_retention_opt_out"], true);
         assert_eq!(migrated[AUTH_SCOPE]["auth_mode"], "open_ai_codex");
         assert!(migrated[AUTH_SCOPE].get("account_id").is_none());
+        assert!(
+            migrated[AUTH_SCOPE]
+                .get("chatgpt_account_is_fedramp")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1336,6 +1834,7 @@ mod tests {
         assert_eq!(persisted.key, "rotated-access");
         assert_eq!(persisted.refresh_token.as_deref(), Some("rotated-refresh"));
         assert_eq!(persisted.account_id.as_deref(), Some("rotated-account"));
+        assert!(persisted.chatgpt_account_is_fedramp);
     }
 
     #[tokio::test]
@@ -1553,12 +2052,16 @@ mod tests {
         assert_eq!(merged.refresh_token.as_deref(), Some("rotated-refresh"));
         assert_eq!(merged.id_token, previous.id_token);
         assert_eq!(merged.account_id, previous.account_id);
+        assert_eq!(
+            merged.chatgpt_account_is_fedramp,
+            previous.chatgpt_account_is_fedramp
+        );
         assert_eq!(merged.expires_at, previous.expires_at);
         assert_eq!(merged.create_time, previous.create_time);
     }
 
     #[tokio::test]
-    async fn access_token_only_refresh_atomically_persists_merged_credential() {
+    async fn access_token_only_refresh_preserves_id_token_workspace_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
         let previous = previous_codex_auth();
@@ -1572,7 +2075,10 @@ mod tests {
             .unwrap();
         let access_token = jwt(serde_json::json!({
             "exp": expiry.timestamp(),
-            AUTH_CLAIM_NAMESPACE: { "chatgpt_account_id": "new-account" }
+            AUTH_CLAIM_NAMESPACE: {
+                "chatgpt_account_id": "new-account",
+                "chatgpt_account_is_fedramp": true
+            }
         }));
         let response_access_token = access_token.clone();
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -1599,7 +2105,8 @@ mod tests {
         assert_eq!(persisted.key, access_token);
         assert_eq!(persisted.refresh_token, previous.refresh_token);
         assert_eq!(persisted.id_token, previous.id_token);
-        assert_eq!(persisted.account_id.as_deref(), Some("new-account"));
+        assert_eq!(persisted.account_id.as_deref(), Some("old-account"));
+        assert!(persisted.chatgpt_account_is_fedramp);
         assert_eq!(persisted.expires_at, Some(expiry));
     }
 

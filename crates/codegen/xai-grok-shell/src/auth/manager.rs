@@ -4,6 +4,7 @@
 
 use chrono::{Duration, Utc};
 use parking_lot::RwLock;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -17,7 +18,7 @@ pub(super) mod lock;
 #[path = "manager/sleep_gate.rs"]
 mod sleep_gate;
 
-use lock::try_lock_auth_file_async;
+use lock::{try_lock_auth_file_async, try_lock_auth_file_async_with_heartbeat};
 use sleep_gate::{InFlightGuard, SleepGate};
 
 use crate::util::dual_clock::DualClock;
@@ -35,8 +36,9 @@ use super::model::{
 };
 use super::refresh::{RefreshOutcome, TokenRefresher, resolve_refresh_credential};
 use super::storage::{
-    AuthFileLock, read_auth_json, read_auth_json_or_empty_recovering_corrupt, write_auth_json,
-    write_auth_json_strict,
+    AuthFileLock, ensure_auth_json_owner_only, read_auth_json,
+    read_auth_json_or_empty_recovering_corrupt, read_auth_json_owner_only,
+    read_auth_json_owner_only_or_empty_recovering_corrupt, write_auth_json, write_auth_json_strict,
 };
 
 use super::storage::read_auth_json_or_empty;
@@ -412,12 +414,16 @@ impl AuthManager {
             .map(PathBuf::from)
             .unwrap_or_else(|_| grok_home.join("auth.json"));
         let scope = crate::auth::openai_codex::AUTH_SCOPE.to_owned();
-        let (auth, disk_state) = match read_auth_json(&path) {
+        let (auth, disk_state) = match read_auth_json_owner_only(&path) {
             Ok(map) => {
                 let auth = map
                     .get(&scope)
                     .filter(|auth| crate::auth::openai_codex::is_codex_credential(auth))
-                    .cloned();
+                    .cloned()
+                    .map(|mut auth| {
+                        crate::auth::openai_codex::normalize_workspace_metadata(&mut auth);
+                        auth
+                    });
                 let state = if auth.is_some() {
                     DiskAuthState::Ok
                 } else {
@@ -490,6 +496,25 @@ impl AuthManager {
         }
     }
 
+    /// Codex credentials are usable only while their backing store is proven
+    /// owner-only. xAI keeps its historical best-effort repair policy.
+    fn credential_store_is_safe(&self) -> bool {
+        if self.xai_session {
+            return true;
+        }
+        match ensure_auth_json_owner_only(&self.path) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    error = %error,
+                    "auth: Codex credential hidden because auth.json permissions are unsafe"
+                );
+                false
+            }
+        }
+    }
+
     /// Clear the disk-loaded token if it violates the team pin (startup only;
     /// the read/dispense gates cover everything cached afterwards).
     fn enforce_pin_on_loaded_token(&self) {
@@ -517,7 +542,28 @@ impl AuthManager {
     /// auth-file lock. Unlike [`Self::clear`], this never reports success or
     /// clears memory while the on-disk credential may still be present.
     pub(crate) async fn clear_durable(&self, timeout: StdDuration) -> std::io::Result<()> {
-        let Some(lock) = self.try_lock_auth_file_async(timeout).await else {
+        self.clear_durable_with_current_scope(timeout, |_| async {})
+            .await
+    }
+
+    /// Durably remove the current scope as one auth-file transaction.
+    ///
+    /// The callback receives the current durable scoped credential, not a
+    /// potentially stale in-memory snapshot. The auth-file lock remains held
+    /// (with a heartbeat) across the callback so a sibling process cannot
+    /// rotate the credential between remote revocation and durable removal.
+    /// Memory is cleared only after the lock is revalidated and disk removal
+    /// succeeds.
+    pub(crate) async fn clear_durable_with_current_scope<F, Fut>(
+        &self,
+        timeout: StdDuration,
+        before_remove: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(Option<GrokAuth>) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let Some(lock) = try_lock_auth_file_async_with_heartbeat(&self.path, timeout).await else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "auth credential store is busy",
@@ -527,6 +573,20 @@ impl AuthManager {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "auth credential store lock is no longer live",
+            ));
+        }
+
+        let current_auth = match self.read_auth_store() {
+            Ok(store) => self.lookup_scoped_auth(&store),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        before_remove(current_auth).await;
+
+        if !lock.still_live(&self.path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "auth credential store lock was lost during durable removal",
             ));
         }
 
@@ -599,7 +659,15 @@ impl AuthManager {
     /// already-logged-out success, while unreadable data and write failures
     /// are surfaced so memory cannot diverge from durable state.
     fn write_scope_removal_durable(&self, scope: &str) -> std::io::Result<ScopeRemoval> {
-        let mut auth_store = read_auth_json_or_empty(&self.path)?;
+        let mut auth_store = if self.xai_session {
+            read_auth_json_or_empty(&self.path)?
+        } else {
+            match read_auth_json_owner_only(&self.path) {
+                Ok(store) => store,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => AuthStore::new(),
+                Err(error) => return Err(error),
+            }
+        };
         auth_store.remove(scope);
         if auth_store.is_empty() {
             match std::fs::remove_file(&self.path) {
@@ -609,7 +677,11 @@ impl AuthManager {
             }
             Ok(ScopeRemoval::FileDeleted)
         } else {
-            write_auth_json(&self.path, &auth_store)?;
+            if self.xai_session {
+                write_auth_json(&self.path, &auth_store)?;
+            } else {
+                write_auth_json_strict(&self.path, &auth_store)?;
+            }
             Ok(ScopeRemoval::EntryRemoved)
         }
     }
@@ -810,6 +882,9 @@ impl AuthManager {
 
     /// Cached in-memory token if outside the early-invalidation buffer.
     pub(crate) fn current(&self) -> Option<GrokAuth> {
+        if !self.credential_store_is_safe() {
+            return None;
+        }
         let auth = self
             .inner
             .read()
@@ -836,6 +911,9 @@ impl AuthManager {
 
     /// Returns true if credentials exist but have expired.
     pub(crate) fn is_expired(&self) -> bool {
+        if !self.credential_store_is_safe() {
+            return false;
+        }
         self.inner
             .read()
             .as_ref()
@@ -852,6 +930,9 @@ impl AuthManager {
     /// ignoring the early-invalidation buffer. For sync callers that cannot
     /// refresh and must not demote a still-accepted token.
     pub(crate) fn current_wire_valid(&self) -> Option<GrokAuth> {
+        if !self.credential_store_is_safe() {
+            return None;
+        }
         let auth = self
             .inner
             .read()
@@ -886,6 +967,9 @@ impl AuthManager {
 
     /// Expired in-memory entry (for its `refresh_token`).
     pub(crate) fn expired_auth(&self) -> Option<GrokAuth> {
+        if !self.credential_store_is_safe() {
+            return None;
+        }
         let auth = self
             .inner
             .read()
@@ -1059,9 +1143,10 @@ impl AuthManager {
     /// Persist a rotating provider credential atomically before publishing it
     /// to memory. No ENOSPC in-place fallback is permitted because losing a
     /// rotated refresh token can invalidate the whole token family.
-    async fn save_provider_strict(&self, auth: GrokAuth) -> std::io::Result<GrokAuth> {
+    async fn save_provider_strict(&self, mut auth: GrokAuth) -> std::io::Result<GrokAuth> {
         debug_assert!(!self.xai_session);
-        let mut map = read_auth_json_or_empty_recovering_corrupt(&self.path)?;
+        crate::auth::openai_codex::normalize_workspace_metadata(&mut auth);
+        let mut map = read_auth_json_owner_only_or_empty_recovering_corrupt(&self.path)?;
         map.insert(self.scope.clone(), auth.clone());
         write_auth_json_strict(&self.path, &map)?;
         *self.permanent_failure.write() = None;
@@ -1287,9 +1372,17 @@ impl AuthManager {
     /// getters like [`Self::attempted_verdict_key`]; prefer [`Self::read_disk_auth`]
     /// when the read should drive transition logging.
     fn read_disk_auth_silent(&self) -> Option<GrokAuth> {
-        read_auth_json(&self.path)
+        self.read_auth_store()
             .ok()
             .and_then(|map| self.lookup_scoped_auth(&map))
+    }
+
+    fn read_auth_store(&self) -> std::io::Result<AuthStore> {
+        if self.xai_session {
+            read_auth_json(&self.path)
+        } else {
+            read_auth_json_owner_only(&self.path)
+        }
     }
 
     fn lookup_scoped_auth(&self, map: &AuthStore) -> Option<GrokAuth> {
@@ -1299,6 +1392,10 @@ impl AuthManager {
             map.get(&self.scope)
                 .filter(|auth| crate::auth::openai_codex::is_codex_credential(auth))
                 .cloned()
+                .map(|mut auth| {
+                    crate::auth::openai_codex::normalize_workspace_metadata(&mut auth);
+                    auth
+                })
         }
     }
 
@@ -1325,7 +1422,7 @@ impl AuthManager {
     /// a genuine logout (`EntryMissing`). Observes the state for transition
     /// logging, exactly like `read_disk_auth`.
     pub(crate) fn read_disk_auth_with_state(&self) -> (Option<GrokAuth>, DiskAuthState) {
-        let (auth, state, err_detail) = match read_auth_json(&self.path) {
+        let (auth, state, err_detail) = match self.read_auth_store() {
             Ok(map) => {
                 let found = self.lookup_scoped_auth(&map);
                 let state = if found.is_some() {
@@ -1487,6 +1584,9 @@ impl AuthManager {
     }
 
     async fn auth_dispatch(self: &Arc<Self>) -> Result<GrokAuth, AuthError> {
+        if !self.credential_store_is_safe() {
+            return Err(AuthError::NotLoggedIn);
+        }
         // Snapshot inner ONCE for dispatch atomicity (closes a TOCTOU
         // where a concurrent `clear()` raced `token_type()` + `inner.read()`).
         let snapshot: Option<GrokAuth> = self.with_inner_read(|inner| inner.cloned());
@@ -1713,6 +1813,9 @@ impl AuthManager {
         token_type: TokenType,
         reason: RefreshReason,
     ) -> Result<GrokAuth, AuthError> {
+        if !self.credential_store_is_safe() {
+            return Err(AuthError::NotLoggedIn);
+        }
         // 0. Sticky permanent-failure short-circuit, checked BEFORE acquiring
         //    the refresh lock so a backed-off chain doesn't block concurrent
         //    traffic. Mirrors `auth()` so callers routing through
@@ -2179,7 +2282,7 @@ impl AuthManager {
     /// all along, and made the proactive-refresh log actively misleading when
     /// reconstructing a rotation chain after an incident.
     pub(crate) fn pick_up_sibling_token(&self) -> bool {
-        let auth = match read_auth_json(&self.path) {
+        let auth = match self.read_auth_store() {
             Ok(map) => self.lookup_scoped_auth(&map),
             _ => None,
         };
@@ -2381,6 +2484,7 @@ impl AuthManager {
         rejected: Option<GrokAuth>,
         source: crate::auth::recovery::RecoverySource,
     ) -> crate::auth::recovery::UnauthorizedRecovery {
+        let rejected = rejected.filter(|_| self.credential_store_is_safe());
         crate::auth::recovery::UnauthorizedRecovery::new(self.clone(), rejected, source)
     }
 
@@ -2402,7 +2506,11 @@ impl AuthManager {
         /// `Other`.
         const MAX_TRANSIENT_ATTEMPTS: u32 = 2;
 
-        let cached = self.with_inner_read(|inner| inner.cloned());
+        let cached = if self.xai_session {
+            self.with_inner_read(|inner| inner.cloned())
+        } else {
+            self.current_or_expired()
+        };
         let mut delay = StdDuration::from_millis(500);
         for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
             match self

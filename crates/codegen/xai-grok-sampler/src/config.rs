@@ -265,6 +265,7 @@ pub trait BearerResolver: Send + Sync + std::fmt::Debug {
 pub struct ProviderCredentialSnapshot {
     pub access_token: String,
     pub account_id: Option<String>,
+    pub chatgpt_account_is_fedramp: bool,
 }
 
 impl ProviderCredentialSnapshot {
@@ -272,6 +273,7 @@ impl ProviderCredentialSnapshot {
         Self {
             access_token,
             account_id: None,
+            chatgpt_account_is_fedramp: false,
         }
     }
 }
@@ -281,6 +283,10 @@ impl std::fmt::Debug for ProviderCredentialSnapshot {
         f.debug_struct("ProviderCredentialSnapshot")
             .field("access_token_configured", &!self.access_token.is_empty())
             .field("account_id_configured", &self.account_id.is_some())
+            .field(
+                "chatgpt_account_is_fedramp",
+                &self.chatgpt_account_is_fedramp,
+            )
             .finish()
     }
 }
@@ -372,11 +378,13 @@ mod tests {
         let snapshot = ProviderCredentialSnapshot {
             access_token: "access-secret-sentinel".to_owned(),
             account_id: Some("account-secret-sentinel".to_owned()),
+            chatgpt_account_is_fedramp: true,
         };
 
         let rendered = format!("{snapshot:?}");
         assert!(rendered.contains("access_token_configured: true"));
         assert!(rendered.contains("account_id_configured: true"));
+        assert!(rendered.contains("chatgpt_account_is_fedramp: true"));
         assert!(!rendered.contains("access-secret-sentinel"));
         assert!(!rendered.contains("account-secret-sentinel"));
     }

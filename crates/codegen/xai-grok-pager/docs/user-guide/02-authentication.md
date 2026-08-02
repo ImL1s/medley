@@ -64,8 +64,10 @@ grok auth status --provider openai-codex --json
 grok logout --provider openai-codex
 ```
 
-Login uses the official Codex-compatible browser OAuth flow with PKCE. Grok
-prints the authorization URL even when opening a browser fails. Over SSH, open
+Login uses a Codex-compatible browser OAuth flow with PKCE. The consent page
+identifies the registered Codex public client; completing that consent does not
+make Grok Build an OpenAI product or imply OpenAI endorsement. Grok prints the
+authorization URL even when opening a browser fails. Over SSH, open
 both possible callback ports from the machine running the browser before
 starting Grok:
 
@@ -83,12 +85,39 @@ The credential is stored under its own `openai::codex` scope in
 `~/.grok/auth.json`. Access-token refresh and refresh-token rotation happen
 before a Codex request, and a rejected request is refreshed/retried at most
 once. If the refreshed credential is rejected, run the login command again.
-Signing out removes only Grok's `openai::codex` entry; it leaves the xAI login
-and any credential owned by the official Codex CLI untouched.
+Signing out first makes a short best-effort request to revoke the refresh token
+(or the access token when no refresh token exists), then removes only Grok's
+`openai::codex` entry even if the remote revoke fails. It leaves the xAI login
+and any credential owned by the official Codex CLI untouched. On Unix, an
+existing Codex credential file with unsafe permissions is repaired to
+owner-only access; if that repair fails, the Codex credential is rejected
+rather than sent.
 
 Codex-backed models appear ready only when this scoped credential is usable or
 refreshable. Account entitlements, workspace policy, rate limits, and model
 availability are still enforced by OpenAI.
+
+### Compatibility and live-proof boundary
+
+This integration is compatibility code pinned and reviewed against public
+OpenAI Codex source snapshot
+[`2b5bdcf67547860f2e5c5a605009a70026796b2b`](https://github.com/openai/codex/tree/2b5bdcf67547860f2e5c5a605009a70026796b2b).
+The ChatGPT Codex backend is separate from the
+OpenAI Platform API, is not documented here as a guaranteed stable public API,
+and may change independently. Your ChatGPT account or workspace policy and the
+applicable OpenAI terms govern whether the login and backend are available.
+
+Automated PKCE, token-isolation, refresh, routing-header, and endpoint-allowlist
+tests do **not** prove that a particular account can use the live service. A
+release that claims live compatibility must record a separate credential-gated
+check at the exact commit being released:
+
+1. `grok auth status --provider openai-codex --json` reports the scoped provider
+   ready without printing credentials.
+2. One short Codex-backed turn reaches `/backend-api/codex/responses` and
+   completes successfully.
+3. The record includes only commit, date, status, and pass/fail result. Never
+   record tokens, authorization URLs, account IDs, or response content.
 
 ---
 

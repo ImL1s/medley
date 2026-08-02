@@ -84,6 +84,82 @@ pub fn read_auth_json(auth_file: &Path) -> std::io::Result<AuthStore> {
     Ok(map)
 }
 
+/// Read `auth.json` only after its permissions are proven owner-only.
+///
+/// Provider credentials use this stricter policy because a failed repair of a
+/// world-readable credential store must make the credential unavailable. The
+/// legacy xAI reader remains best-effort for backwards compatibility.
+pub(crate) fn read_auth_json_owner_only(auth_file: &Path) -> std::io::Result<AuthStore> {
+    ensure_auth_json_owner_only(auth_file)?;
+
+    let mut file = File::open(auth_file)?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        return Ok(AuthStore::new());
+    }
+
+    serde_json::from_str(trimmed)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+/// Path-scoped, test-only fault for deterministic strict-permission failures.
+/// The production repair still delegates to the cross-platform secure-file
+/// implementation.
+#[cfg(test)]
+pub(super) static PERMISSION_REPAIR_FAULT_PATHS: std::sync::Mutex<Vec<PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn ensure_auth_json_owner_only(auth_file: &Path) -> std::io::Result<()> {
+    #[cfg(all(test, unix))]
+    let injected_repair_failure = {
+        use std::os::unix::fs::PermissionsExt;
+        PERMISSION_REPAIR_FAULT_PATHS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .any(|path| path == auth_file)
+            && std::fs::metadata(auth_file)
+                .map(|metadata| metadata.permissions().mode() & 0o777 != 0o600)
+                .unwrap_or(false)
+    };
+    #[cfg(all(test, not(unix)))]
+    let injected_repair_failure = PERMISSION_REPAIR_FAULT_PATHS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .any(|path| path == auth_file);
+    #[cfg(test)]
+    if injected_repair_failure {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected owner-only permission repair failure",
+        ));
+    }
+
+    crate::util::secure_file::ensure_owner_only_permissions(auth_file)
+}
+
+/// Strict provider counterpart to
+/// [`read_auth_json_or_empty_recovering_corrupt`]. Permission repair failures
+/// are never converted into an empty store, so a login/rotation cannot read or
+/// overwrite sibling scopes from an unsafe credential file.
+pub(crate) fn read_auth_json_owner_only_or_empty_recovering_corrupt(
+    auth_file: &Path,
+) -> std::io::Result<AuthStore> {
+    match read_auth_json_owner_only(auth_file) {
+        Ok(map) => Ok(map),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(AuthStore::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            let _ = backup_corrupt_auth_file(auth_file);
+            Ok(AuthStore::new())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Read auth.json, returning an empty map if the file does not exist.
 ///
 /// Non-empty corrupt JSON, permission errors, etc. are returned as errors
@@ -214,12 +290,16 @@ pub(super) fn write_auth_json(auth_file: &Path, auth_store: &AuthStore) -> std::
 /// Crash-safe writer for rotating provider credentials. Unlike the legacy
 /// session writer, this never falls back to a truncating in-place rewrite on
 /// ENOSPC: a rotated refresh token is not published unless atomic persistence
-/// completed successfully.
+/// and an owner-only proof on the temp file completed successfully.
 pub(super) fn write_auth_json_strict(
     auth_file: &Path,
     auth_store: &AuthStore,
 ) -> std::io::Result<()> {
-    write_auth_json_atomic(auth_file, auth_store)
+    write_auth_json_atomic_with_permission_check(
+        auth_file,
+        auth_store,
+        Some(crate::util::secure_file::ensure_owner_only_permissions_for_file),
+    )
 }
 
 /// Dispatch helper: run `atomic`, and on `StorageFull` fall back to an
@@ -266,6 +346,25 @@ fn write_store_to(path: &Path, auth_store: &AuthStore) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let file = open_secure_file(path)?;
+    write_store(file, auth_store)?;
+    // `open_secure_file` mode bits apply only on create; tighten existing paths.
+    // Best-effort after durable content: a chmod-only failure must not look
+    // like a failed write. The in-place fallback restores the prior snapshot
+    // on any `write_store_to` Err, which would discard freshly written tokens.
+    // Load path re-tightens on next read. Strict atomic callers perform a
+    // mandatory permission proof before writing credential bytes.
+    if let Err(e) = crate::util::secure_file::ensure_owner_only_permissions(path) {
+        tracing::warn!(
+            error = %e,
+            path = %path.display(),
+            "auth: failed to ensure owner-only permissions after write"
+        );
+    }
+    Ok(())
+}
+
+/// Serialize and durably flush an already-open credential file.
+fn write_store(file: File, auth_store: &AuthStore) -> std::io::Result<()> {
     let mut writer = std::io::BufWriter::new(file);
     serde_json::to_writer_pretty(&mut writer, auth_store)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -274,18 +373,6 @@ fn write_store_to(path: &Path, auth_store: &AuthStore) -> std::io::Result<()> {
         .into_inner()
         .map_err(|e| e.into_error())?
         .sync_all()?;
-    // `open_secure_file` mode bits apply only on create; tighten existing paths.
-    // Best-effort after durable content: a chmod-only failure must not look
-    // like a failed write. The in-place fallback restores the prior snapshot
-    // on any `write_store_to` Err, which would discard freshly written tokens.
-    // Load path re-tightens on next read.
-    if let Err(e) = crate::util::secure_file::ensure_owner_only_permissions(path) {
-        tracing::warn!(
-            error = %e,
-            path = %path.display(),
-            "auth: failed to ensure owner-only permissions after write"
-        );
-    }
     Ok(())
 }
 
@@ -301,6 +388,18 @@ pub(super) static WRITE_STORAGE_FULL_FAULT_PATH: std::sync::Mutex<Option<PathBuf
 /// Atomic write: tmp + rename. Unix `rename(2)` replaces atomically;
 /// Windows `rename` requires removing the target first.
 fn write_auth_json_atomic(auth_file: &Path, auth_store: &AuthStore) -> std::io::Result<()> {
+    write_auth_json_atomic_with_permission_check(auth_file, auth_store, None)
+}
+
+/// Atomic write core with a pre-write permission proof. Legacy xAI writes
+/// skip the proof because their owner-only repair remains best-effort; strict
+/// provider writes use an object-handle proof and do not write any credential
+/// bytes until the newly-created temp file is proven private.
+fn write_auth_json_atomic_with_permission_check(
+    auth_file: &Path,
+    auth_store: &AuthStore,
+    prove_owner_only: Option<fn(&File) -> std::io::Result<()>>,
+) -> std::io::Result<()> {
     #[cfg(test)]
     if WRITE_STORAGE_FULL_FAULT_PATH
         .lock()
@@ -322,14 +421,12 @@ fn write_auth_json_atomic(auth_file: &Path, auth_store: &AuthStore) -> std::io::
             "injected write fault (WRITE_FAULT_PATH)",
         ));
     }
-    // Unique per write (pid + monotonic seq): two concurrent in-process writers
-    // (e.g. background mint + proactive refresher) must not share one tmp path.
-    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-    let tmp = auth_file.with_extension(format!(
-        "json.{}.{}.tmp",
-        std::process::id(),
-        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
+    let (tmp, strict_file) = if prove_owner_only.is_some() {
+        let (tmp, file) = create_strict_atomic_temp(auth_file)?;
+        (tmp, Some(file))
+    } else {
+        (next_auth_temp_path(auth_file), None)
+    };
 
     // Reclaim the temp file on any early return (write/sync/rename failure); the
     // unique name otherwise accumulates one orphan per failed write.
@@ -343,7 +440,12 @@ fn write_auth_json_atomic(auth_file: &Path, auth_store: &AuthStore) -> std::io::
     }
     let mut tmp_reclaim = TmpReclaim(Some(&tmp));
 
-    write_store_to(&tmp, auth_store)?;
+    if let Some(file) = strict_file {
+        prove_owner_only.expect("strict temp file requires a permission proof")(&file)?;
+        write_store(file, auth_store)?;
+    } else {
+        write_store_to(&tmp, auth_store)?;
+    }
     #[cfg(windows)]
     {
         let _ = std::fs::remove_file(auth_file);
@@ -360,6 +462,58 @@ fn write_auth_json_atomic(auth_file: &Path, auth_store: &AuthStore) -> std::io::
         );
     }
     Ok(())
+}
+
+fn next_auth_temp_path(auth_file: &Path) -> PathBuf {
+    // Unique per write (pid + monotonic seq): two concurrent in-process writers
+    // (e.g. background mint + proactive refresher) must not share one tmp path.
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    auth_file.with_extension(format!(
+        "json.{}.{}.tmp",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// Create an empty temp file exclusively. Windows keeps the creator handle
+/// non-shareable and grants it `WRITE_DAC`, allowing the caller to install an
+/// owner-only DACL on that exact object before serializing credential bytes.
+/// Exclusive creation also prevents a predictable stale path or symlink from
+/// being truncated and reused.
+fn create_strict_atomic_temp(auth_file: &Path) -> std::io::Result<(PathBuf, File)> {
+    if let Some(parent) = auth_file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    for _ in 0..128 {
+        let tmp = next_auth_temp_path(auth_file);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows::Win32::Storage::FileSystem::{FILE_GENERIC_WRITE, WRITE_DAC};
+
+            options
+                .access_mode(FILE_GENERIC_WRITE.0 | WRITE_DAC.0)
+                .share_mode(0);
+        }
+        match options.open(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique strict auth temp file",
+    ))
 }
 
 /// Non-atomic fallback: truncate and rewrite `auth.json` in place.
@@ -499,6 +653,18 @@ mod write_fallback_tests {
         Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
     }
 
+    fn fake_owner_only_proof_failure(file: &File) -> std::io::Result<()> {
+        assert_eq!(
+            file.metadata().unwrap().len(),
+            0,
+            "strict permission proof must happen before credential bytes are written"
+        );
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected owner-only proof failure",
+        ))
+    }
+
     /// Simulates an in-place write that truncates the file (destroying the
     /// old content, as `open_secure_file` does) and then fails partway — the
     /// torn-write case the rollback must recover from.
@@ -524,6 +690,19 @@ mod write_fallback_tests {
         write_auth_json_in_place(&path, &sample_store()).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "in-place write must stay 0o600");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_atomic_write_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+
+        write_auth_json_strict(&path, &sample_store()).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "strict write must stay 0o600");
     }
 
     #[cfg(unix)]
@@ -622,6 +801,43 @@ mod write_fallback_tests {
         assert!(
             orphans.is_empty(),
             "TmpReclaim must remove the temp file on failure: {orphans:?}"
+        );
+    }
+
+    /// A strict credential write must prove the empty temp file is owner-only
+    /// before writing secrets. If that proof fails, the prior durable
+    /// credential stays in place and the rejected temp file is reclaimed.
+    #[test]
+    fn strict_atomic_permission_failure_preserves_prior_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        write_auth_json_atomic(&path, &sample_store()).unwrap();
+        let prior = std::fs::read(&path).unwrap();
+
+        let mut replacement = sample_store();
+        replacement.get_mut(API_KEY_SCOPE).unwrap().key = "replacement-key".into();
+
+        let err = write_auth_json_atomic_with_permission_check(
+            &path,
+            &replacement,
+            Some(fake_owner_only_proof_failure),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            prior,
+            "permission failure must not replace the prior durable credential"
+        );
+        let orphans: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(
+            orphans.is_empty(),
+            "rejected strict temp file must be reclaimed: {orphans:?}"
         );
     }
 

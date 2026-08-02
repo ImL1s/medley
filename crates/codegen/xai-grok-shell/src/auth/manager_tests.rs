@@ -7,6 +7,145 @@ use crate::auth::error::RefreshTokenError;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
+#[cfg(unix)]
+fn codex_auth(key: &str) -> GrokAuth {
+    GrokAuth {
+        key: key.into(),
+        auth_mode: AuthMode::OpenAiCodex,
+        refresh_token: Some(format!("{key}-refresh")),
+        expires_at: Some(Utc::now() + Duration::hours(1)),
+        oidc_issuer: Some(crate::auth::openai_codex::ISSUER.into()),
+        oidc_client_id: Some(crate::auth::openai_codex::CLIENT_ID.into()),
+        ..GrokAuth::test_default()
+    }
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[cfg(unix)]
+fn mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+#[cfg(unix)]
+struct PermissionRepairFault(PathBuf);
+
+#[cfg(unix)]
+impl PermissionRepairFault {
+    fn install(path: &Path) -> Self {
+        crate::auth::storage::PERMISSION_REPAIR_FAULT_PATHS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(path.to_owned());
+        Self(path.to_owned())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PermissionRepairFault {
+    fn drop(&mut self) {
+        let mut faults = crate::auth::storage::PERMISSION_REPAIR_FAULT_PATHS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        faults.retain(|path| path != &self.0);
+    }
+}
+
+#[cfg(unix)]
+fn write_mixed_auth_store(path: &Path) {
+    let xai_scope = GrokComConfig::default().auth_scope();
+    let mut store = AuthStore::new();
+    store.insert(
+        crate::auth::openai_codex::AUTH_SCOPE.into(),
+        codex_auth("codex-secret"),
+    );
+    store.insert(
+        xai_scope.clone(),
+        GrokAuth {
+            key: "xai-secret".into(),
+            expires_at: Some(Utc::now() + Duration::hours(1)),
+            ..GrokAuth::test_default()
+        },
+    );
+    write_auth_json(path, &store).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_load_repairs_world_readable_store_before_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("auth.json");
+    write_mixed_auth_store(&path);
+    set_mode(&path, 0o644);
+
+    let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+
+    assert_eq!(mode(&path), 0o600, "Codex load must repair auth.json");
+    assert_eq!(manager.current().unwrap().key, "codex-secret");
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_load_fails_closed_when_permission_repair_fails_but_xai_is_compatible() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("auth.json");
+    write_mixed_auth_store(&path);
+    set_mode(&path, 0o644);
+    let _fault = PermissionRepairFault::install(&path);
+
+    let codex = AuthManager::new_openai_codex(dir.path());
+    assert!(codex.current_or_expired().is_none());
+    assert!(codex.read_disk_auth().is_none());
+
+    let xai = AuthManager::new(dir.path(), GrokComConfig::default());
+    assert_eq!(
+        xai.current().map(|auth| auth.key),
+        Some("xai-secret".into()),
+        "xAI keeps the legacy best-effort permission policy"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_reload_and_sibling_adoption_cannot_bypass_permission_repair_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("auth.json");
+    write_mixed_auth_store(&path);
+    let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+    assert_eq!(manager.current().unwrap().key, "codex-secret");
+
+    set_mode(&path, 0o644);
+    let _fault = PermissionRepairFault::install(&path);
+
+    assert!(
+        manager.current_or_expired().is_none(),
+        "cached Codex credentials must be hidden after a strict permission failure"
+    );
+    assert!(!crate::auth::openai_codex::status(&manager).signed_in);
+    assert!(crate::auth::openai_codex::credential_snapshot(&manager).is_none());
+    assert!(matches!(manager.auth().await, Err(AuthError::NotLoggedIn)));
+    let mut recovery = manager.unauthorized_recovery(
+        Some(codex_auth("rejected-codex")),
+        crate::auth::recovery::RecoverySource::Background,
+    );
+    assert!(recovery.next().await.is_err());
+    assert!(!manager.pick_up_sibling_token());
+    manager.force_reload_from_disk_with(1, StdDuration::ZERO);
+    assert!(manager.current_or_expired().is_none());
+
+    drop(_fault);
+    set_mode(&path, 0o600);
+    assert!(
+        manager.current_or_expired().is_none(),
+        "failed reload must discard rather than retain the blocked cached credential"
+    );
+}
+
 fn make_auth(expires_at: Option<DateTime<Utc>>, create_time: DateTime<Utc>) -> GrokAuth {
     GrokAuth {
         auth_mode: AuthMode::External,

@@ -186,6 +186,7 @@ impl xai_grok_sampler::BearerResolver for AuthProviderRef {
             xai_grok_sampler::config::ProviderCredentialSnapshot {
                 access_token: credential.access_token,
                 account_id: credential.account_id,
+                chatgpt_account_is_fedramp: credential.chatgpt_account_is_fedramp,
             }
         })
     }
@@ -207,6 +208,7 @@ impl xai_grok_sampler::BearerResolver for AuthProviderRef {
                 xai_grok_sampler::config::ProviderCredentialSnapshot {
                     access_token: credential.access_token,
                     account_id: credential.account_id,
+                    chatgpt_account_is_fedramp: credential.chatgpt_account_is_fedramp,
                 }
             })
         })
@@ -536,6 +538,7 @@ pub struct ProviderCredentialSnapshot {
     pub access_token: String,
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub account_id: Option<String>,
+    pub chatgpt_account_is_fedramp: bool,
     pub issuer: Option<String>,
 }
 
@@ -545,6 +548,10 @@ impl std::fmt::Debug for ProviderCredentialSnapshot {
             .field("access_token_present", &!self.access_token.is_empty())
             .field("expires_at", &self.expires_at)
             .field("account_id_present", &self.account_id.is_some())
+            .field(
+                "chatgpt_account_is_fedramp",
+                &self.chatgpt_account_is_fedramp,
+            )
             .field("issuer_present", &self.issuer.is_some())
             .finish()
     }
@@ -617,6 +624,7 @@ impl AuthProviderRef {
                 access_token: auth.key,
                 expires_at: auth.expires_at,
                 account_id: auth.account_id,
+                chatgpt_account_is_fedramp: auth.chatgpt_account_is_fedramp,
                 issuer: auth.oidc_issuer,
             });
         }
@@ -639,6 +647,7 @@ impl AuthProviderRef {
                 access_token: m.token.clone(),
                 expires_at: m.expires_at,
                 account_id: m.account_id.clone(),
+                chatgpt_account_is_fedramp: false,
                 issuer: m.issuer.clone(),
             })
     }

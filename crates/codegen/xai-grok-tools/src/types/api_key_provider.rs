@@ -27,6 +27,7 @@ pub enum ApiTransportProfile {
 pub struct ApiCredential {
     pub access_token: String,
     pub account_id: Option<String>,
+    pub chatgpt_account_is_fedramp: bool,
 }
 
 impl ApiCredential {
@@ -34,6 +35,7 @@ impl ApiCredential {
         Self {
             access_token,
             account_id: None,
+            chatgpt_account_is_fedramp: false,
         }
     }
 }
@@ -43,6 +45,10 @@ impl std::fmt::Debug for ApiCredential {
         f.debug_struct("ApiCredential")
             .field("access_token_configured", &!self.access_token.is_empty())
             .field("account_id_configured", &self.account_id.is_some())
+            .field(
+                "chatgpt_account_is_fedramp",
+                &self.chatgpt_account_is_fedramp,
+            )
             .finish()
     }
 }
@@ -180,12 +186,14 @@ mod tests {
         let credential = ApiCredential {
             access_token: "secret-access-token-0123456789".to_string(),
             account_id: Some("secret-account-9876543210".to_string()),
+            chatgpt_account_is_fedramp: true,
         };
         let rendered = format!("{credential:?}");
         assert!(!rendered.contains("secret-access-token"));
         assert!(!rendered.contains("secret-account"));
         assert!(rendered.contains("access_token_configured: true"));
         assert!(rendered.contains("account_id_configured: true"));
+        assert!(rendered.contains("chatgpt_account_is_fedramp: true"));
     }
 
     #[test]

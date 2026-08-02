@@ -48,6 +48,9 @@ const AGENT_PRODUCT: &str = "grok-shell";
 const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 128_000;
 const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const CHATGPT_ACCOUNT_ID: HeaderName = HeaderName::from_static("chatgpt-account-id");
+const OPENAI_FEDRAMP: HeaderName = HeaderName::from_static("x-openai-fedramp");
+const ORIGINATOR: HeaderName = HeaderName::from_static("originator");
+const GROK_BUILD_ORIGINATOR: HeaderValue = HeaderValue::from_static("grok_build");
 
 fn should_send_xai_identity_headers(auth_scheme: AuthScheme, base_url: &str) -> bool {
     !matches!(auth_scheme, AuthScheme::None) && crate::util::is_xai_api_url(base_url)
@@ -56,6 +59,12 @@ fn should_send_xai_identity_headers(auth_scheme: AuthScheme, base_url: &str) -> 
 fn strip_xai_identity_headers(headers: &mut HeaderMap) {
     headers.remove(HeaderName::from_static("x-grok-deployment-id"));
     headers.remove(HeaderName::from_static("x-grok-user-id"));
+}
+
+fn strip_codex_routing_headers(headers: &mut HeaderMap) {
+    headers.remove(CHATGPT_ACCOUNT_ID);
+    headers.remove(OPENAI_FEDRAMP);
+    headers.remove(ORIGINATOR);
 }
 
 /// Resolve the endpoint trust class: explicit config wins, then xAI-operated
@@ -193,14 +202,15 @@ fn retain_codex_headers(
     headers: &mut HeaderMap,
     authorization: Option<HeaderValue>,
     account_id: Option<&str>,
+    chatgpt_account_is_fedramp: bool,
+    trusted_user_agent: Option<HeaderValue>,
 ) {
     let content_type = headers.get(CONTENT_TYPE).cloned();
-    let user_agent = headers.get(USER_AGENT).cloned();
     headers.clear();
     if let Some(value) = content_type {
         headers.insert(CONTENT_TYPE, value);
     }
-    if let Some(value) = user_agent {
+    if let Some(value) = trusted_user_agent {
         headers.insert(USER_AGENT, value);
     }
     if let Some(value) = authorization {
@@ -211,6 +221,10 @@ fn retain_codex_headers(
     {
         headers.insert(CHATGPT_ACCOUNT_ID, value);
     }
+    if chatgpt_account_is_fedramp {
+        headers.insert(OPENAI_FEDRAMP, HeaderValue::from_static("true"));
+    }
+    headers.insert(ORIGINATOR, GROK_BUILD_ORIGINATOR);
 }
 
 /// Per-request `x-grok-*` headers. Optional fields are skipped when empty/`None`.
@@ -744,6 +758,13 @@ pub fn user_agent_string_for(origin: &OriginClientInfo) -> String {
     }
 }
 
+fn grok_build_user_agent_string() -> String {
+    user_agent_string_for(&OriginClientInfo {
+        product: AGENT_PRODUCT.to_string(),
+        version: Some(agent_version()),
+    })
+}
+
 /// Build a structured authentication failure from the secret-free comparison
 /// captured at the 401 response boundary. Raw request credentials stay local
 /// to [`FinalRequestCredential`] and never enter the error/event metadata.
@@ -888,11 +909,16 @@ impl SamplingClient {
             }
         }
 
-        // Always set User-Agent: per-session origin for first-party endpoints;
-        // a minimal, non-identifying product string (no version, platform, or
-        // frontend origin) for external and local providers.
+        // User-Agent policy: Codex traffic truthfully identifies this
+        // product with a fixed Grok Build string — public per-session
+        // `origin_client` must never impersonate the official Codex CLI
+        // (#42). Other first-party endpoints send the per-session origin;
+        // external and local providers get the minimal, non-identifying
+        // product string (#6).
         {
-            let ua_string = if is_first_party {
+            let ua_string = if is_codex {
+                grok_build_user_agent_string()
+            } else if is_first_party {
                 match config.origin_client.as_ref() {
                     Some(origin) => user_agent_string_for(origin),
                     None => user_agent_string_for(&OriginClientInfo {
@@ -1016,6 +1042,10 @@ impl SamplingClient {
             .is_codex()
             .then(|| headers.get(AUTHORIZATION).cloned())
             .flatten();
+        let codex_user_agent = self
+            .is_codex()
+            .then(|| headers.get(USER_AGENT).cloned())
+            .flatten();
         if let Some(injector) = &self.header_injector {
             injector.inject(&mut headers);
         }
@@ -1038,7 +1068,13 @@ impl SamplingClient {
                 live_credential
                     .as_ref()
                     .and_then(|credential| credential.account_id.as_deref()),
+                live_credential
+                    .as_ref()
+                    .is_some_and(|credential| credential.chatgpt_account_is_fedramp),
+                codex_user_agent,
             );
+        } else {
+            strip_codex_routing_headers(&mut headers);
         }
         let final_credential = FinalRequestCredential(
             Self::sent_credential_from_headers(&headers, self.defaults.auth_scheme)
@@ -3071,6 +3107,30 @@ mod tests {
     }
 
     #[test]
+    fn xai_transport_strips_codex_only_routing_headers() {
+        let mut cfg = minimal_config();
+        for (name, value) in [
+            ("chatgpt-account-id", "must-not-leak"),
+            ("x-openai-fedramp", "true"),
+            ("originator", "codex_cli_rs"),
+        ] {
+            cfg.extra_headers.insert(name.to_owned(), value.to_owned());
+        }
+        let client = SamplingClient::new(cfg).expect("xAI client should build");
+        let request = client
+            .post("https://api.x.ai/v1/chat/completions")
+            .0
+            .build()
+            .expect("xAI request should build");
+        for name in ["chatgpt-account-id", "x-openai-fedramp", "originator"] {
+            assert!(
+                request.headers().get(name).is_none(),
+                "Codex-only routing header leaked to xAI: {name}"
+            );
+        }
+    }
+
+    #[test]
     fn third_party_base_url_strips_identity_headers_from_extra_headers() {
         let mut cfg = SamplerConfig {
             base_url: "https://api.anthropic.com/v1".to_string(),
@@ -3447,6 +3507,7 @@ mod tests {
             Some(crate::config::ProviderCredentialSnapshot {
                 access_token: "live-codex-token".to_owned(),
                 account_id: Some("workspace-123".to_owned()),
+                chatgpt_account_is_fedramp: true,
             })
         }
     }
@@ -3461,6 +3522,9 @@ mod tests {
                 HeaderName::from_static("chatgpt-account-id"),
                 HeaderValue::from_static("wrong-account"),
             );
+            headers.insert(OPENAI_FEDRAMP, HeaderValue::from_static("false"));
+            headers.insert(ORIGINATOR, HeaderValue::from_static("codex_cli_rs"));
+            headers.insert(USER_AGENT, HeaderValue::from_static("codex_cli_rs/0.0.0"));
             for name in [
                 "x-api-key",
                 "x-xai-token-auth",
@@ -3488,6 +3552,10 @@ mod tests {
             api_key: Some("stale-xai-token".to_owned()),
             base_url: "https://chatgpt.com/backend-api/codex/".to_owned(),
             api_backend: ApiBackend::CodexResponses,
+            origin_client: Some(OriginClientInfo {
+                product: "codex_cli_rs".to_owned(),
+                version: Some("999.0.0".to_owned()),
+            }),
             bearer_resolver: Some(resolver.clone()),
             header_injector: Some(std::sync::Arc::new(HostileCodexInjector)),
             ..minimal_config()
@@ -3508,6 +3576,13 @@ mod tests {
         assert_eq!(resolver.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(request.headers()[AUTHORIZATION], "Bearer live-codex-token");
         assert_eq!(request.headers()[CHATGPT_ACCOUNT_ID], "workspace-123");
+        assert_eq!(request.headers()[OPENAI_FEDRAMP], "true");
+        assert_eq!(request.headers()[ORIGINATOR], "grok_build");
+        assert_eq!(
+            request.headers()[USER_AGENT],
+            grok_build_user_agent_string(),
+            "neither origin_client nor hostile headers may spoof the Codex user agent"
+        );
         for name in [
             "x-api-key",
             "x-xai-token-auth",
@@ -3531,7 +3606,9 @@ mod tests {
                         | "chatgpt-account-id"
                         | "content-type"
                         | "accept"
+                        | "originator"
                         | "user-agent"
+                        | "x-openai-fedramp"
                 ),
                 "unexpected Codex header {name}"
             );
@@ -3616,16 +3693,53 @@ mod tests {
 
     #[test]
     fn platform_responses_transport_is_not_rerouted_to_codex() {
-        let client = SamplingClient::new(SamplerConfig {
+        let mut config = SamplerConfig {
             base_url: "https://api.openai.com/v1".to_owned(),
             api_backend: ApiBackend::Responses,
             ..minimal_config()
-        })
-        .expect("Platform Responses client should build");
+        };
+        for (name, value) in [
+            ("chatgpt-account-id", "attacker-account"),
+            ("x-openai-fedramp", "true"),
+            ("originator", "codex_cli_rs"),
+        ] {
+            config
+                .extra_headers
+                .insert(name.to_owned(), value.to_owned());
+        }
+        config.header_injector = Some(std::sync::Arc::new(HostileCodexInjector));
+        let client = SamplingClient::new(config).expect("Platform Responses client should build");
         assert_eq!(
             client.endpoint("responses"),
             "https://api.openai.com/v1/responses"
         );
+        let request = client
+            .post(client.endpoint("responses"))
+            .0
+            .build()
+            .expect("Platform Responses request should build");
+        for name in ["chatgpt-account-id", "x-openai-fedramp", "originator"] {
+            assert!(
+                request.headers().get(name).is_none(),
+                "Codex-only routing header leaked to Platform Responses: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_transport_omits_fedramp_header_for_untrusted_snapshot() {
+        let mut headers = HeaderMap::new();
+        headers.insert(OPENAI_FEDRAMP, HeaderValue::from_static("true"));
+        retain_codex_headers(
+            &mut headers,
+            None,
+            Some("workspace-123"),
+            false,
+            Some(HeaderValue::from_static("grok-shell/test")),
+        );
+        assert!(headers.get(OPENAI_FEDRAMP).is_none());
+        assert_eq!(headers[ORIGINATOR], "grok_build");
+        assert_eq!(headers[USER_AGENT], "grok-shell/test");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3762,6 +3876,7 @@ mod tests {
                 Some(crate::config::ProviderCredentialSnapshot {
                     access_token: LIVE_PROVIDER_B.to_owned(),
                     account_id: Some("workspace-123".to_owned()),
+                    chatgpt_account_is_fedramp: false,
                 })
             }
         }
