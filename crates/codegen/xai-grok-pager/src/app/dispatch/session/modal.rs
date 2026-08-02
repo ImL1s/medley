@@ -6,11 +6,16 @@ use crate::app::actions::Effect;
 use crate::app::agent::AgentId;
 use crate::app::app_view::{ActiveView, AppView};
 use crate::app::dispatch::ctx::{SwitchCause, show_welcome, switch_to_agent};
+use crate::app::dispatch::queue::{maybe_drain_queue, note_peek_page_flip};
 use crate::app::dispatch::task_result::unregister_session_effect;
-/// Remove an agent and clean up all references to it:
-/// `forked_from` pointers on surviving agents.
-pub(in crate::app::dispatch) fn remove_agent_and_cleanup(app: &mut AppView, agent_id: AgentId) {
+/// Remove an agent and clean up all references to it, including draining any
+/// source queue restored from a failed replacement placeholder.
+pub(in crate::app::dispatch) fn remove_agent_and_cleanup(
+    app: &mut AppView,
+    agent_id: AgentId,
+) -> Vec<Effect> {
     let mut removed = app.agents.shift_remove(&agent_id);
+    let mut drain = None;
     if let Some(removed) = removed.as_mut()
         && let Some(source_id) = removed.session.model_switch_queue_handoff_from.take()
         && let Some(source) = app.agents.get_mut(&source_id)
@@ -19,6 +24,7 @@ pub(in crate::app::dispatch) fn remove_agent_and_cleanup(app: &mut AppView, agen
         source.session.prepend_pending_prompts(handed_off);
         source.session.model_switch_pending = false;
         source.session.model_switch_request_id = None;
+        drain = Some((source_id, maybe_drain_queue(source)));
     }
     for agent in app.agents.values_mut() {
         if agent.session.forked_from == Some(agent_id) {
@@ -28,6 +34,12 @@ pub(in crate::app::dispatch) fn remove_agent_and_cleanup(app: &mut AppView, agen
     if removed.is_some() {
         drop(removed);
         crate::memory_release::release_retained_memory_with("agent-close");
+    }
+    if let Some((source_id, drain)) = drain {
+        note_peek_page_flip(app, source_id, drain.page_flip_entry);
+        drain.effects
+    } else {
+        vec![]
     }
 }
 /// Close (drop from this pager's in-memory list) the given agent.
@@ -69,12 +81,12 @@ pub(in crate::app::dispatch) fn dispatch_sessions_confirm_close(
             show_welcome(app);
         }
     }
-    let effects = unregister_session_effect(
+    let mut effects = unregister_session_effect(
         app.agents
             .get(&closed_id)
             .and_then(|a| a.session.session_id.clone()),
     );
-    remove_agent_and_cleanup(app, closed_id);
+    effects.extend(remove_agent_and_cleanup(app, closed_id));
     effects
 }
 /// Rename the current session via x.ai/session/rename.

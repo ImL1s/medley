@@ -1821,7 +1821,7 @@ fn handed_queue_stays_gated_when_deferred_target_fails_hydrate_preflight() {
 }
 
 #[test]
-fn failed_replacement_restores_handed_queue_before_new_source_prompts() {
+fn failed_replacement_restores_and_drains_handed_queue_before_new_source_prompts() {
     let mut app = test_app_with_agent();
     let source_id = AgentId(0);
     let model_id = acp::ModelId::new("cursor-model");
@@ -1869,7 +1869,7 @@ fn failed_replacement_restores_handed_queue_before_new_source_prompts() {
         .session
         .enqueue_prompt("queued later on source".into());
 
-    dispatch(
+    let effects = dispatch(
         Action::TaskComplete(TaskResult::SessionFailed {
             agent_id: replacement_id,
             error: "startup failed".into(),
@@ -1879,19 +1879,36 @@ fn failed_replacement_restores_handed_queue_before_new_source_prompts() {
 
     assert!(!app.agents.contains_key(&replacement_id));
     assert_eq!(app.active_view, ActiveView::Agent(source_id));
+    let sent = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::SendPrompt { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
-        app.agents[&source_id]
-            .session
-            .pending_prompts
-            .iter()
-            .map(|prompt| (prompt.id, prompt.text.as_str()))
-            .collect::<Vec<_>>(),
-        vec![
-            (0, "handed first"),
-            (1, "handed second"),
-            (2, "queued later on source"),
-        ],
+        sent.len(),
+        1,
+        "cleanup must drain exactly once: {effects:?}"
     );
+    assert!(
+        matches!(
+            sent.as_slice(),
+            ["handed first"] | ["handed first\n\nhanded second\n\nqueued later on source"]
+        ),
+        "restored FIFO must start with the oldest handed-off prompt: {sent:?}"
+    );
+    let remaining = app.agents[&source_id]
+        .session
+        .pending_prompts
+        .iter()
+        .map(|prompt| prompt.text.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        remaining.is_empty() || remaining == vec!["handed second", "queued later on source"],
+        "only the first FIFO entry may drain when combining is disabled: {remaining:?}"
+    );
+    assert!(!app.agents[&source_id].session.model_switch_pending);
 }
 
 #[test]

@@ -1104,6 +1104,24 @@ pub(crate) fn harnesses_are_compatible(
     !active.is_strict_harness() && !required.is_strict_harness()
 }
 
+/// Apply the main session's authoritative CLI clamps to a freshly discovered
+/// model-required definition.
+///
+/// The active agent was built after these overrides were applied. Model-switch
+/// compatibility and a possible zero-turn rebuild must therefore use the same
+/// effective definition: comparing against, or rebuilding from, the raw
+/// discovered definition would either report a false mismatch or drop the
+/// operator's tool and permission restrictions.
+pub(crate) fn apply_session_cli_clamps(
+    definition: Option<xai_grok_agent::AgentDefinition>,
+    overrides: &crate::agent::config::CliAgentOverrides,
+) -> Option<xai_grok_agent::AgentDefinition> {
+    definition.map(|mut definition| {
+        overrides.apply_to_definition(&mut definition);
+        definition
+    })
+}
+
 fn definitions_have_same_runtime_contract(
     active: &xai_grok_agent::AgentDefinition,
     required: &xai_grok_agent::AgentDefinition,

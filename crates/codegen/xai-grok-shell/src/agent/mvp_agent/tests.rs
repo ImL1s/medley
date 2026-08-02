@@ -1344,6 +1344,57 @@ fn harnesses_are_compatible_rejects_changed_external_runtime_contract() {
 }
 
 #[test]
+fn model_switch_cli_clamps_do_not_false_mismatch_external_harness() {
+    let mut raw = xai_grok_agent::AgentDefinition::default_grok_build();
+    raw.name = "reviewer".to_owned();
+    raw.plugin_name = Some("plugin-one".to_owned());
+    raw.source_path = Some(std::path::PathBuf::from(
+        "/plugins/plugin-one/agents/reviewer.md",
+    ));
+    raw.prompt_body = Some("Review from plugin one".to_owned());
+
+    let overrides = crate::agent::config::CliAgentOverrides {
+        tools: Some(vec!["Read".to_owned(), "Grep".to_owned()]),
+        disallowed_tools: Some(vec!["Bash".to_owned()]),
+        permission_mode: Some(xai_grok_agent::config::PermissionMode::DontAsk),
+        ..Default::default()
+    };
+    let mut active = raw.clone();
+    overrides.apply_to_definition(&mut active);
+    let required = apply_session_cli_clamps(Some(raw), &overrides).unwrap();
+
+    assert!(harnesses_are_compatible(
+        &active,
+        "plugin-one:reviewer",
+        Some(&required),
+    ));
+}
+
+#[test]
+fn model_switch_rebuilt_definition_retains_session_cli_clamps() {
+    let mut raw = xai_grok_agent::AgentDefinition::codex();
+    raw.tools = vec!["HarnessOwnedTool".to_owned()];
+    raw.disallowed_tools = vec!["HarnessOwnedDeny".to_owned()];
+    raw.permission_mode = xai_grok_agent::config::PermissionMode::Default;
+    let overrides = crate::agent::config::CliAgentOverrides {
+        tools: Some(vec!["Read".to_owned()]),
+        disallowed_tools: Some(vec!["Bash".to_owned(), "Write".to_owned()]),
+        permission_mode: Some(xai_grok_agent::config::PermissionMode::Plan),
+        ..Default::default()
+    };
+
+    let rebuilt = apply_session_cli_clamps(Some(raw), &overrides).unwrap();
+
+    assert_eq!(rebuilt.tools, vec!["Read"]);
+    assert_eq!(rebuilt.disallowed_tools, vec!["Bash", "Write"]);
+    assert_eq!(
+        rebuilt.permission_mode,
+        xai_grok_agent::config::PermissionMode::Plan
+    );
+    assert_eq!(rebuilt.name, "codex", "harness identity must be preserved");
+}
+
+#[test]
 fn harnesses_are_compatible_rejects_changed_strict_system_prompt() {
     let active = xai_grok_agent::AgentDefinition::codex();
     let mut required = active.clone();

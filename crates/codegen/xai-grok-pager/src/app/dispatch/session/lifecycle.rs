@@ -1099,10 +1099,13 @@ pub(in crate::app::dispatch) fn dispatch_new_session_with_id(
 }
 /// Tear down a placeholder agent that must not proceed under sticky `--chat`
 /// (local Build refuse). Never leave a half-loaded slot with a bound session id.
-pub(in crate::app::dispatch) fn refuse_chat_mode_build_agent(app: &mut AppView, agent_id: AgentId) {
+pub(in crate::app::dispatch) fn refuse_chat_mode_build_agent(
+    app: &mut AppView,
+    agent_id: AgentId,
+) -> Vec<Effect> {
     app.show_toast(crate::app::session_startup::CHAT_MODE_LOCAL_BUILD_REFUSAL);
     let fallback = app.agents.keys().copied().find(|id| *id != agent_id);
-    remove_agent_and_cleanup(app, agent_id);
+    let effects = remove_agent_and_cleanup(app, agent_id);
     if let Some(target) = fallback {
         switch_to_agent(app, target, SwitchCause::Picker);
     } else {
@@ -1122,6 +1125,7 @@ pub(in crate::app::dispatch) fn refuse_chat_mode_build_agent(app: &mut AppView, 
             });
         }
     }
+    effects
 }
 /// Dismiss the project picker and create a session in the current directory.
 pub(in crate::app::dispatch) fn skip_picker_and_create_session(
@@ -1466,10 +1470,11 @@ pub(in crate::app::dispatch) fn handle_session_failed(
         .agents
         .get(&agent_id)
         .is_some_and(|a| a.session.session_id.is_none() && a.session.forked_from.is_none());
+    let mut effects = vec![];
     if is_orphan {
         let failed_was_active = matches!(app.active_view, ActiveView::Agent(id) if id == agent_id);
         let fallback = app.agents.keys().copied().find(|id| *id != agent_id);
-        remove_agent_and_cleanup(app, agent_id);
+        effects = remove_agent_and_cleanup(app, agent_id);
         if let Some(target) = fallback {
             if failed_was_active {
                 switch_to_agent(app, target, SwitchCause::Picker);
@@ -1506,7 +1511,7 @@ pub(in crate::app::dispatch) fn handle_session_failed(
                 elapsed,
             }));
     }
-    vec![]
+    effects
 }
 pub(in crate::app::dispatch) fn handle_worktree_session_failed(
     app: &mut AppView,
@@ -1518,9 +1523,10 @@ pub(in crate::app::dispatch) fn handle_worktree_session_failed(
         .agents
         .get(&agent_id)
         .is_some_and(|a| a.session.session_id.is_none() && a.session.forked_from.is_none());
+    let mut effects = vec![];
     if is_orphan {
         let fallback = app.agents.keys().copied().find(|id| *id != agent_id);
-        remove_agent_and_cleanup(app, agent_id);
+        effects = remove_agent_and_cleanup(app, agent_id);
         if let Some(target) = fallback {
             switch_to_agent(app, target, SwitchCause::Picker);
         } else {
@@ -1556,7 +1562,7 @@ pub(in crate::app::dispatch) fn handle_worktree_session_failed(
                 elapsed,
             }));
     }
-    vec![]
+    effects
 }
 fn restore_model_switch_mirrors(
     agent: &mut AgentView,

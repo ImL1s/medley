@@ -525,8 +525,7 @@ pub(in crate::app::dispatch) fn handle_worktree_forked(
         &session_id_str,
         &app.cwd,
     ) {
-        refuse_chat_mode_build_agent(app, agent_id);
-        return vec![];
+        return refuse_chat_mode_build_agent(app, agent_id);
     }
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         supersede_open_reload_window(agent, agent_id, "WorktreeForked");
@@ -585,8 +584,7 @@ pub(in crate::app::dispatch) fn handle_fork_session_ready(
         &session_id_str,
         &app.cwd,
     ) {
-        refuse_chat_mode_build_agent(app, agent_id);
-        return vec![];
+        return refuse_chat_mode_build_agent(app, agent_id);
     }
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         supersede_open_reload_window(agent, agent_id, "ForkSessionReady");

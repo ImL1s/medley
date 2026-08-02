@@ -6,7 +6,8 @@
 //! unready model (e.g. invalid `auth_scheme` fail-open → ambient Bearer).
 use crate::agent::config;
 use crate::agent::mvp_agent::{
-    MvpAgent, agent_name_after_model_switch, harnesses_are_compatible, resolve_required_agent_type,
+    MvpAgent, agent_name_after_model_switch, apply_session_cli_clamps, harnesses_are_compatible,
+    resolve_required_agent_type,
 };
 use crate::session::SessionCommand;
 use agent_client_protocol::{self as acp};
@@ -166,7 +167,7 @@ pub(crate) async fn apply(
     // Always resolve the required definition. Equal canonical names are not
     // sufficient for plugin/file-backed harnesses because their prompt/source
     // identity can differ while the display name remains unchanged.
-    let required_definition = xai_grok_agent::discovery::by_name_in_cwd_with_plugins(
+    let raw_required_definition = xai_grok_agent::discovery::by_name_in_cwd_with_plugins(
         &required_agent_type,
         handle.tool_context.cwd.as_path(),
         agent.plugin_registry_handle.snapshot().as_deref(),
@@ -184,7 +185,7 @@ pub(crate) async fn apply(
     let is_mismatch = !harnesses_are_compatible(
         &observed_definition,
         &required_agent_type,
-        required_definition.as_ref(),
+        raw_required_definition.as_ref(),
     );
     tracing::info!(
         session_id = %session_id.0,
@@ -192,9 +193,17 @@ pub(crate) async fn apply(
         ?required_agent_type,
         active_agent_type = %observed_active_agent_type,
         is_mismatch,
-        definition_resolved = required_definition.is_some(),
+        definition_resolved = raw_required_definition.is_some(),
         "set_session_model: prepared actor-owned model switch"
     );
+    // The active agent already carries the main session's authoritative CLI
+    // clamps. Apply the same clamps to the target before the actor compares or
+    // rebuilds it; otherwise --tools/--disallowed-tools/--permission-mode can
+    // cause a false mismatch and a zero-turn rebuild can silently drop them.
+    let required_definition = {
+        let cfg = agent.cfg.borrow();
+        apply_session_cli_clamps(raw_required_definition, &cfg.cli_agent_overrides)
+    };
     let mut model_sampling =
         agent.prepare_sampling_config_for_model(&model, handle.origin_client.clone());
     if let Some(eff) = effort_override {
