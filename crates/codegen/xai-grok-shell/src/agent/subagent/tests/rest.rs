@@ -2011,6 +2011,21 @@ fn explicit_subagent_model_rejects_incompatible_resolved_harness() {
 }
 
 #[test]
+fn explicit_subagent_model_resolves_and_rejects_same_named_external_harness() {
+    let mut active = xai_grok_agent::AgentDefinition::default_grok_build();
+    active.plugin_name = Some("plugin-one".to_owned());
+    active.source_path = Some(std::path::PathBuf::from(
+        "/plugins/plugin-one/agents/grok-build.md",
+    ));
+    active.prompt_body = Some("Plugin-owned grok-build prompt".to_owned());
+    let cwd = tempfile::tempdir().unwrap();
+    assert_eq!(
+        resolve_and_validate_subagent_model_harness(&active, "grok-build", cwd.path(), None),
+        Err(SubagentModelHarnessError::Incompatible),
+    );
+}
+
+#[test]
 fn explicit_subagent_model_accepts_exact_or_stock_compatible_harness() {
     let active = xai_grok_agent::AgentDefinition::codex();
     assert_eq!(

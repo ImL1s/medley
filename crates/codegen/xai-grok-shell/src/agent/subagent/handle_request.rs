@@ -81,10 +81,17 @@ pub(crate) async fn run_shell_child(
             None,
         );
     }
-    let Some(mut definition) = resolve_agent_definition(&request.subagent_type, &ctx) else {
+    let Some(selected_harness_definition) =
+        resolve_agent_definition_without_session_cli_overrides(&request.subagent_type, &ctx)
+    else {
         let msg = format!("Unknown subagent type: {}", request.subagent_type);
         return child_run_output(failure_result(&request, &msg), completion_data, None);
     };
+    // Model compatibility compares the raw resolved harness identities. The
+    // session CLI clamp is enforced independently on the definition that
+    // actually runs and must not create a false harness mismatch.
+    let mut definition = selected_harness_definition.clone();
+    ctx.apply_session_cli_overrides(&mut definition);
     match gate_subagent_type(&request.subagent_type, &ctx) {
         SubagentValidateTypeOutcome::Disabled => {
             let msg = format!(
@@ -521,37 +528,31 @@ pub(crate) async fn run_shell_child(
             return child_run_output(failure_result(&request, &msg), completion_data, None);
         };
         let required_agent_type = effective_model_entry.info().agent_type.as_str();
-        if definition.name != required_agent_type {
-            let required_definition = xai_grok_agent::discovery::by_name_in_cwd_with_plugins(
-                required_agent_type,
-                &ctx.parent_cwd,
-                ctx.plugin_registry.as_deref(),
+        if let Err(harness_error) = resolve_and_validate_subagent_model_harness(
+            &selected_harness_definition,
+            required_agent_type,
+            &ctx.parent_cwd,
+            ctx.plugin_registry.as_deref(),
+        ) {
+            let detail = match harness_error {
+                SubagentModelHarnessError::Unavailable => "is unavailable",
+                SubagentModelHarnessError::Incompatible => {
+                    "is incompatible with the selected subagent harness"
+                }
+            };
+            let msg = format!(
+                "Cannot spawn subagent '{}' with model '{}': required harness '{}' {}.",
+                request.subagent_type, effective_model_id.0, required_agent_type, detail,
             );
-            if let Err(harness_error) = validate_subagent_model_harness(
-                &definition,
+            tracing::warn!(
+                subagent_id = %request.id,
+                subagent_type = %request.subagent_type,
+                model_id = %effective_model_id.0,
                 required_agent_type,
-                required_definition.as_ref(),
-            ) {
-                let detail = match harness_error {
-                    SubagentModelHarnessError::Unavailable => "is unavailable",
-                    SubagentModelHarnessError::Incompatible => {
-                        "is incompatible with the selected subagent harness"
-                    }
-                };
-                let msg = format!(
-                    "Cannot spawn subagent '{}' with model '{}': required harness '{}' {}.",
-                    request.subagent_type, effective_model_id.0, required_agent_type, detail,
-                );
-                tracing::warn!(
-                    subagent_id = %request.id,
-                    subagent_type = %request.subagent_type,
-                    model_id = %effective_model_id.0,
-                    required_agent_type,
-                    active_agent_type = %definition.name,
-                    "subagent model override rejected by harness preflight"
-                );
-                return child_run_output(failure_result(&request, &msg), completion_data, None);
-            }
+                active_agent_type = %selected_harness_definition.name,
+                "subagent model override rejected by harness preflight"
+            );
+            return child_run_output(failure_result(&request, &msg), completion_data, None);
         }
     }
     if let Some(raw) = effective_runtime.reasoning_effort.as_deref()
