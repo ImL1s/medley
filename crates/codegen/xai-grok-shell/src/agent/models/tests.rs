@@ -2076,13 +2076,11 @@ fn filtered_out_codex_model_does_not_count_as_selectable() {
         account_id: Some("account".to_owned()),
         ..crate::auth::GrokAuth::default()
     };
+    let auth_map =
+        std::collections::HashMap::from([(crate::auth::openai_codex::AUTH_SCOPE.to_owned(), auth)]);
     std::fs::write(
         auth_home.join("auth.json"),
-        serde_json::to_vec(&std::collections::HashMap::from([(
-            crate::auth::openai_codex::AUTH_SCOPE.to_owned(),
-            auth,
-        )]))
-        .unwrap(),
+        serde_json::to_vec(&auth_map).unwrap(),
     )
     .unwrap();
 
