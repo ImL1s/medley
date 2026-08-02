@@ -217,6 +217,7 @@ impl ShellToolsetConfig {
             max_completion_tokens: None,
             temperature: None,
             top_p: None,
+            endpoint_trust: None,
             api_backend: Default::default(),
             auth_scheme: Default::default(),
             extra_headers: indexmap::IndexMap::new(),

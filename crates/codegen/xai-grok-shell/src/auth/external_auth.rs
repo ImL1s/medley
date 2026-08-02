@@ -38,6 +38,7 @@ pub(crate) fn parse_output(output: &std::process::Output) -> anyhow::Result<Grok
         oidc_client_id: None,
         id_token: None,
         account_id: parsed.account_id,
+        chatgpt_account_is_fedramp: false,
     })
 }
 

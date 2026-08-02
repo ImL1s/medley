@@ -6,6 +6,7 @@ edition.workspace = true
 description = "Actor-based sampling/inference layer for xAI grok (HTTP streaming + retry, no shell coupling)"
 
 [dependencies]
+sha2.workspace = true
 # Internal
 xai-grok-env = { workspace = true }
 xai-grok-auth = { path = "../xai-grok-auth" }

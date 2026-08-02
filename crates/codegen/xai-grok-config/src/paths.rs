@@ -11,50 +11,57 @@ const CLAUDE_MANAGED_SETTINGS_PATH: &str =
 #[cfg(target_os = "linux")]
 const CLAUDE_MANAGED_SETTINGS_PATH: &str = "/etc/claude-code/managed-settings.json";
 
-/// The default user grok directory (`~/.grok`, canonicalized) used when
-/// `GROK_HOME` is unset. Exposed so callers (e.g. display helpers) can detect
-/// whether [`grok_home()`] is the default without duplicating the computation.
+/// The home-anchored state directory, ignoring both environment overrides.
+/// Exposed so callers (e.g. display helpers) can detect whether [`grok_home()`]
+/// is the default without duplicating the precedence in [`crate::state_dir`].
 ///
-/// Uses [`dunce::canonicalize`] instead of [`std::fs::canonicalize`]: on
-/// Windows, std returns a verbatim path (`\\?\C:\Users\...`) which external
-/// tools choke on — e.g. `git clone` rejects `\\?\` destinations with
-/// "Invalid argument", breaking marketplace cache clones under
-/// `~/.grok/marketplace-cache`. `dunce` strips the prefix whenever the path
-/// is safely representable in legacy form; on non-Windows it is identical to
-/// `std::fs::canonicalize`.
-///
-/// Keep the dunce canonicalization in sync with the hand-rolled duplicate in
-/// `xai_fast_worktree::db::resolve_grok_home` (deliberately standalone crate).
+/// Normally `~/.medley`; `~/.grok` while a legacy install is still in use.
 pub fn default_grok_home() -> PathBuf {
-    #[allow(deprecated)]
-    let home = std::env::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    dunce::canonicalize(&home).unwrap_or(home).join(".grok")
+    crate::state_dir::default_state_dir().path
 }
 
-/// Per-user config directory: `$GROK_HOME` or `~/.grok`. Created if needed.
+/// Per-user state directory. Created if needed.
+///
+/// Resolved once per process by [`crate::state_dir::resolve`]; see that module
+/// for the precedence. [`pin_grok_home`] can fix the value up front, which the
+/// startup migration uses so the whole process agrees on one directory.
 pub fn grok_home() -> PathBuf {
     GROK_HOME
         .get_or_init(|| {
-            let grok_home = if let Ok(v) = std::env::var("GROK_HOME") {
-                PathBuf::from(v)
-            } else {
-                default_grok_home()
-            };
-            let _ = std::fs::create_dir_all(&grok_home);
-            grok_home
+            let resolved = crate::state_dir::resolve();
+            if resolved.source.migration_pending() {
+                // One line per process: a non-interactive run cannot prompt, so
+                // it keeps using the legacy directory silently otherwise.
+                tracing::info!(
+                    path = %resolved.path.display(),
+                    "using the legacy state directory shared with Grok Build; \
+                     start an interactive session to copy it to ~/.medley"
+                );
+            }
+            let _ = std::fs::create_dir_all(&resolved.path);
+            resolved.path
         })
         .clone()
 }
 
-/// The user-global grok home, but only when one genuinely resolves: `Some` when
-/// `$GROK_HOME` is set or a home directory is found, `None` otherwise. Unlike
-/// [`grok_home()`], this never falls back to a cwd-relative `.grok`, so callers
-/// that *scan* user-global grok resources (hooks, marketplace sources, ...) don't
-/// mistake a project's `.grok` tree for the user-global one when no home resolves.
+/// Fix the process state directory before anything resolves it.
+///
+/// Returns `Err` with the rejected path when [`grok_home()`] has already been
+/// called — the caller must then avoid acting as though the new directory is
+/// live, because paths derived from the old one are already in flight.
+pub fn pin_grok_home(path: PathBuf) -> Result<(), PathBuf> {
+    let _ = std::fs::create_dir_all(&path);
+    GROK_HOME.set(path)
+}
+
+/// The user-global state directory, but only when one genuinely resolves:
+/// `Some` when an environment override is set or a home directory is found,
+/// `None` otherwise. Unlike [`grok_home()`], this never falls back to a
+/// cwd-relative directory, so callers that *scan* user-global resources (hooks,
+/// marketplace sources, ...) don't mistake a project's `.grok` tree for the
+/// user-global one when no home resolves.
 pub fn user_grok_home() -> Option<PathBuf> {
-    #[allow(deprecated)]
-    let resolvable = std::env::var_os("GROK_HOME").is_some() || std::env::home_dir().is_some();
-    resolvable.then(grok_home)
+    crate::state_dir::resolve_user().is_some().then(grok_home)
 }
 
 /// Canonical grok application path: `$GROK_HOME/bin/grok` (Unix) or `grok.exe` (Windows).
@@ -312,7 +319,14 @@ mod tests {
         // canonicalization must yield a plain path. No-op assertion on Unix.
         let home = default_grok_home();
         assert!(!home.to_string_lossy().starts_with(r"\\?\"));
-        assert!(home.ends_with(".grok"));
+        // Either state directory name is valid here: the default follows the
+        // legacy directory while an un-migrated install still has one.
+        assert!(
+            home.ends_with(crate::state_dir::STATE_DIR_NAME)
+                || home.ends_with(crate::state_dir::LEGACY_STATE_DIR_NAME),
+            "unexpected default state dir: {}",
+            home.display()
+        );
     }
 
     #[test]

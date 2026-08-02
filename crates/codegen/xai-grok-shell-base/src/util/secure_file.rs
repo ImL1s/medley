@@ -100,6 +100,34 @@ pub fn ensure_owner_only_permissions(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Ensure the object referenced by an already-open file handle is owner-only.
+///
+/// Strict credential writers use this after exclusive creation and before
+/// writing any secret bytes. Using the handle avoids proving permissions on a
+/// different object if the path is replaced between creation and validation.
+pub fn ensure_owner_only_permissions_for_file(file: &File) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let metadata = file.metadata()?;
+        let mode = metadata.permissions().mode();
+        if mode & 0o777 != 0o600 {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(0o600);
+            file.set_permissions(permissions)?;
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        set_windows_secure_permissions_for_file(file)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Ok(())
+    }
+}
+
 fn ensure_owner_only_permissions_inner(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -133,17 +161,68 @@ fn ensure_owner_only_permissions_inner(path: &Path) -> io::Result<()> {
 #[cfg(windows)]
 pub fn set_windows_secure_permissions(path: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
+    use windows::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    use windows::core::PCWSTR;
+
+    let wide_path: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    with_windows_owner_only_acl(|new_acl| unsafe {
+        SetNamedSecurityInfoW(
+            PCWSTR::from_raw(wide_path.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(new_acl),
+            None,
+        )
+    })
+}
+
+#[cfg(windows)]
+fn set_windows_secure_permissions_for_file(file: &File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
+    use windows::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    let handle = HANDLE(file.as_raw_handle());
+    with_windows_owner_only_acl(|new_acl| unsafe {
+        SetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(new_acl),
+            None,
+        )
+    })
+}
+
+#[cfg(windows)]
+fn with_windows_owner_only_acl(
+    apply_acl: impl FnOnce(
+        *mut windows::Win32::Security::ACL,
+    ) -> windows::Win32::Foundation::WIN32_ERROR,
+) -> io::Result<()> {
     use windows::Win32::Foundation::{CloseHandle, HLOCAL, LocalFree};
     use windows::Win32::Security::Authorization::{
-        EXPLICIT_ACCESS_W, SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW, SetNamedSecurityInfoW,
-        TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+        EXPLICIT_ACCESS_W, SET_ACCESS, SetEntriesInAclW, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
     };
     use windows::Win32::Security::{
-        ACE_FLAGS, ACL, DACL_SECURITY_INFORMATION, GetTokenInformation,
-        PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        ACE_FLAGS, ACL, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    use windows::core::PCWSTR;
 
     unsafe {
         // Get current process token
@@ -197,23 +276,7 @@ pub fn set_windows_secure_permissions(path: &Path) -> io::Result<()> {
             return Err(io::Error::from_raw_os_error(result.0 as i32));
         }
 
-        // Convert path to wide string for Windows API
-        let wide_path: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-
-        // Set the new DACL on the file, removing inherited permissions
-        let result = SetNamedSecurityInfoW(
-            PCWSTR::from_raw(wide_path.as_ptr()),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            None, // psidOwner: not changing the owner
-            None, // psidGroup: not changing the primary group
-            Some(new_acl),
-            None,
-        );
+        let result = apply_acl(new_acl);
 
         // Clean up
         let _ = LocalFree(Some(HLOCAL(new_acl as *mut _)));
@@ -287,6 +350,22 @@ mod tests {
             fs::metadata(&file_path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_owner_only_for_open_file_tightens_same_object() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("loose-handle.txt");
+        fs::write(&file_path, b"secret").unwrap();
+        let mut loose = fs::metadata(&file_path).unwrap().permissions();
+        loose.set_mode(0o644);
+        fs::set_permissions(&file_path, loose).unwrap();
+
+        let file = OpenOptions::new().write(true).open(&file_path).unwrap();
+        ensure_owner_only_permissions_for_file(&file).unwrap();
+
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[cfg(unix)]

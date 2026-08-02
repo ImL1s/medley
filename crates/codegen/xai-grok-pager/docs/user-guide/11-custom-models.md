@@ -2,6 +2,15 @@
 
 Grok connects to custom model endpoints for alternative providers, self-hosted models, and overriding built-in settings. This guide explains how to select models, configure endpoints, and integrate third-party providers.
 
+> **Fork note (Medley).** Several capabilities on this page —
+> `auth_scheme = "none"` for keyless local servers, the fail-closed handling of an
+> invalid `auth_scheme`, and the `openai-codex` provider — ship in
+> [Medley](https://github.com/ImL1s/grok-build), a community fork that is not
+> affiliated with or endorsed by xAI. Provider and model names below are the
+> trademarks of their owners and appear only to identify the endpoints you can
+> point Medley at; connecting to any of them is governed by that provider's terms,
+> not by this project.
+
 ---
 
 ## Default Models
@@ -301,13 +310,23 @@ name = "OpenAI Codex"
 context_window = 200000 # example only; use metadata accurate for the model
 ```
 
-The `openai-codex` provider fixes the transport to
+The `openai-codex` provider is compatibility code for pinned public Codex
+source snapshot
+[`2b5bdcf67547860f2e5c5a605009a70026796b2b`](https://github.com/openai/codex/tree/2b5bdcf67547860f2e5c5a605009a70026796b2b);
+it is not an OpenAI endorsement or a promise that the ChatGPT backend is a
+stable public API. The OAuth consent page identifies the registered Codex
+public client, and the user's account/workspace policy and applicable OpenAI
+terms govern use.
+
+The provider fixes the transport to
 `https://chatgpt.com/backend-api/codex/responses` and supplies the live bearer
-and ChatGPT account ID from one provider-scoped credential snapshot. It rejects
-custom origins, query parameters, and attempts to override the reserved
+and trusted ChatGPT workspace-routing metadata from one provider-scoped
+credential snapshot. Grok Build sends its own truthful transport identity and
+does not impersonate the official Codex CLI. It rejects custom origins, query
+parameters, arbitrary routing headers, and attempts to override the reserved
 provider. Do not add `api_key`, `env_key`, `base_url`, `extra_headers`, or
 `api_backend` to a Codex-backed model; use `OPENAI_API_KEY` with the normal
-OpenAI examples above for Platform API traffic.
+OpenAI examples above for the separate OpenAI Platform API transport.
 
 ### Gemini (OpenAI-compatible)
 

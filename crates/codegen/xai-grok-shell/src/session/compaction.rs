@@ -2295,6 +2295,7 @@ mod inline_auto_compact_flow_tests {
                 max_completion_tokens: None,
                 temperature: None,
                 top_p: None,
+                endpoint_trust: None,
                 api_backend: Default::default(),
                 extra_headers: Default::default(),
                 query_params: Default::default(),

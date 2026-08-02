@@ -504,6 +504,7 @@ async fn build_auth(
         oidc_client_id: Some(client_id.to_owned()),
         id_token: None,
         account_id: None,
+        chatgpt_account_is_fedramp: false,
     };
 
     auth_manager.enrich_auth_inline(&mut auth).await;

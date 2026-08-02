@@ -5719,6 +5719,7 @@ pub fn sampling_config_for_model(
         max_completion_tokens,
         temperature,
         top_p,
+        endpoint_trust: None,
         api_backend,
         auth_scheme: credentials.auth_scheme,
         extra_headers,
@@ -6319,6 +6320,7 @@ impl ModelSwitchIncompatibleAgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
     use serial_test::serial;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -6401,6 +6403,21 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    fn codex_test_id_token(account_id: &str, is_fedramp: bool) -> String {
+        let encoder = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let header = encoder.encode(br#"{"alg":"none"}"#);
+        let payload = encoder.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": account_id,
+                    "chatgpt_account_is_fedramp": is_fedramp,
+                }
+            }))
+            .expect("serialize Codex test claims"),
+        );
+        format!("{header}.{payload}.")
+    }
+
     #[async_trait::async_trait]
     impl crate::auth::refresh::TokenRefresher for RotatingCodexAuxRefresher {
         async fn refresh(
@@ -6416,6 +6433,11 @@ mod tests {
                 oidc_issuer: Some(crate::auth::openai_codex::ISSUER.to_owned()),
                 oidc_client_id: Some(crate::auth::openai_codex::CLIENT_ID.to_owned()),
                 account_id: Some(format!("rotated-account-{call}")),
+                chatgpt_account_is_fedramp: true,
+                id_token: Some(codex_test_id_token(
+                    &format!("rotated-account-{call}"),
+                    true,
+                )),
                 ..crate::auth::GrokAuth::default()
             }))
         }
@@ -7215,6 +7237,7 @@ reasoning_effort = "low"
             oidc_issuer: Some(crate::auth::openai_codex::ISSUER.to_owned()),
             oidc_client_id: Some(crate::auth::openai_codex::CLIENT_ID.to_owned()),
             account_id: Some("stale-account".to_owned()),
+            id_token: Some(codex_test_id_token("stale-account", false)),
             ..crate::auth::GrokAuth::default()
         };
         manager.hot_swap(near_expiry("near-expiry-token-1"));

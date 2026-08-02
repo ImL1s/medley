@@ -84,6 +84,7 @@ impl xai_grok_tools::types::ApiKeyProvider for ProviderScopedToolKeyProvider {
                 .map(|credential| xai_grok_tools::types::ApiCredential {
                     access_token: credential.access_token,
                     account_id: credential.account_id,
+                    chatgpt_account_is_fedramp: credential.chatgpt_account_is_fedramp,
                 })
         })
     }
@@ -749,6 +750,7 @@ mod tests {
                     xai_grok_sampler::config::ProviderCredentialSnapshot {
                         access_token: "refreshed-provider-token".to_string(),
                         account_id: Some("provider-account".to_string()),
+                        chatgpt_account_is_fedramp: true,
                     },
                 )))
             }
@@ -784,6 +786,7 @@ mod tests {
             .expect("provider credential");
         assert_eq!(credential.access_token, "refreshed-provider-token");
         assert_eq!(credential.account_id.as_deref(), Some("provider-account"));
+        assert!(credential.chatgpt_account_is_fedramp);
         assert!(
             provider
                 .recover_rejected_credential_async("stale-snapshot")

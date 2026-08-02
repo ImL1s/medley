@@ -106,6 +106,7 @@ chrono = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
 xai-grok-tools = { workspace = true }
+xai-grok-tools-api = { workspace = true }
 xai-grok-agent = { workspace = true }
 xai-grok-plugin-marketplace = { path = "../xai-grok-plugin-marketplace" }
 xai-hooks-plugins-types = { path = "../xai-hooks-plugins-types" }

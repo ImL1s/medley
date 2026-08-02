@@ -117,6 +117,11 @@ pub struct GrokAuth {
     /// remains authoritative for access control.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
+
+    /// Trusted workspace-routing metadata parsed from the namespaced Codex
+    /// OAuth claim. Missing or non-boolean values fail closed to `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub chatgpt_account_is_fedramp: bool,
 }
 
 impl std::fmt::Debug for GrokAuth {
@@ -131,6 +136,10 @@ impl std::fmt::Debug for GrokAuth {
             .field("oidc_client_id_present", &self.oidc_client_id.is_some())
             .field("id_token_present", &self.id_token.is_some())
             .field("account_id_present", &self.account_id.is_some())
+            .field(
+                "chatgpt_account_is_fedramp",
+                &self.chatgpt_account_is_fedramp,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -249,6 +258,7 @@ impl Default for GrokAuth {
             oidc_client_id: None,
             id_token: None,
             account_id: None,
+            chatgpt_account_is_fedramp: false,
         }
     }
 }
@@ -426,6 +436,7 @@ mod tests {
             oidc_client_id: None,
             id_token: None,
             account_id: None,
+            chatgpt_account_is_fedramp: false,
         }
     }
 

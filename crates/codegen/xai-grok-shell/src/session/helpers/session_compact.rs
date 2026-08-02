@@ -1719,6 +1719,7 @@ mod reasoning_compaction_regression_tests {
             max_completion_tokens: Some(1000),
             temperature: Some(0.7),
             top_p: None,
+            endpoint_trust: None,
             api_backend: ApiBackend::ChatCompletions,
             auth_scheme: Default::default(),
             extra_headers: Default::default(),

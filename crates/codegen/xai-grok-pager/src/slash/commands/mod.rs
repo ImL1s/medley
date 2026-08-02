@@ -34,6 +34,7 @@ pub mod home;
 pub mod imagine;
 pub mod imagine_video;
 pub mod import_claude;
+pub mod init;
 pub mod jump;
 pub mod login;
 pub mod logout;
@@ -139,6 +140,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(login::LoginCommand),
         Arc::new(logout::LogoutCommand),
         Arc::new(import_claude::ImportClaudeCommand),
+        Arc::new(init::InitCommand),
         Arc::new(usage::UsageCommand),
         Arc::new(queue::QueueCommand),
         Arc::new(tasks::TasksCommand),
@@ -289,6 +291,7 @@ mod tests {
             "imagine",
             "imagine-video",
             "import-claude",
+            "init",
             "jump",
             "login",
             "logout",
@@ -712,6 +715,14 @@ mod tests {
             run_usage_gated("", true, false),
             CommandResult::Error(msg) if msg.contains("not available")
         ));
+    }
+    #[test]
+    fn init_registered_in_builtin_commands() {
+        let reg = CommandRegistry::new(builtin_commands());
+        assert!(
+            reg.get("init").is_some(),
+            "/init should be registered in builtins"
+        );
     }
     #[test]
     fn cd_registered_in_builtin_commands() {
