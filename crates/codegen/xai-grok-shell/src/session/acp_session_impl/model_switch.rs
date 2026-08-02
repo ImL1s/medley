@@ -474,6 +474,9 @@ impl SessionActor {
         &self,
         conversation: Vec<ConversationItem>,
     ) -> Result<(), &'static str> {
+        if self.notifications.persistence_is_noop {
+            return Ok(());
+        }
         let (respond_to, acknowledgement) = tokio::sync::oneshot::channel();
         self.notifications
             .persistence_tx
@@ -495,6 +498,9 @@ impl SessionActor {
         agent_type: &str,
         reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
     ) -> Result<(), &'static str> {
+        if self.notifications.persistence_is_noop {
+            return Ok(());
+        }
         let (respond_to, acknowledgement) = tokio::sync::oneshot::channel();
         self.notifications
             .persistence_tx
@@ -1182,6 +1188,82 @@ mod model_switch_transaction_tests {
                 assert!(
                     !actor.compaction.prefire.has_cache(),
                     "a successful model switch must invalidate the old-model prefire cache"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn noop_persistence_allows_live_model_switch_without_durable_writes() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let persistence = crate::session::persistence::PersistenceHandle::noop();
+                let (mut actor, _event_rx) =
+                    create_test_actor_ex(0, 256_000, 85, gateway_tx, persistence.tx.clone()).await;
+                actor.notifications.persistence_is_noop = persistence.is_noop();
+                *actor.active_agent_type.lock() = Some("grok-build".to_owned());
+
+                let receipt = actor
+                    .handle_apply_model_switch(prepared_switch("grok-build", None))
+                    .await
+                    .expect("an explicitly no-op persistence handle must not block a live switch");
+
+                assert!(!receipt.did_rebuild);
+                assert_eq!(receipt.catalog_model_id.0.as_ref(), "target-model");
+                assert_eq!(catalog_model_id(&actor), "target-model");
+                assert_eq!(
+                    actor
+                        .chat_state_handle
+                        .get_sampling_config()
+                        .await
+                        .expect("sampling state")
+                        .model,
+                    "target-wire-model"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closed_real_persistence_channel_still_rejects_live_model_switch() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+                drop(persistence_rx);
+                let (actor, _event_rx) =
+                    create_test_actor_ex(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                *actor.active_agent_type.lock() = Some("grok-build".to_owned());
+                let previous_chat = actor.chat_state_handle.snapshot().await.expect("snapshot");
+
+                assert_eq!(
+                    actor
+                        .persist_model_switch_conversation(previous_chat.conversation.clone())
+                        .await,
+                    Err("chat_persistence_channel_closed"),
+                    "a dropped real receiver must not be treated as explicit no-op persistence"
+                );
+
+                let error = actor
+                    .handle_apply_model_switch(prepared_switch("grok-build", None))
+                    .await
+                    .expect_err("a closed real persistence channel must fail closed");
+                let payload = config::ModelSwitchHarnessError::from_acp_error(&error)
+                    .expect("structured model switch error");
+
+                assert_eq!(payload.reason, "persistence_rollback_failed");
+                assert_eq!(catalog_model_id(&actor), "test");
+                assert_eq!(
+                    actor
+                        .chat_state_handle
+                        .get_sampling_config()
+                        .await
+                        .expect("sampling state")
+                        .model,
+                    previous_chat.sampling_config.model
                 );
             })
             .await;

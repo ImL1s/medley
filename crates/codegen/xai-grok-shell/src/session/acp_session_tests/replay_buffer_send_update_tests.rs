@@ -87,6 +87,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
             gateway,
             gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             persistence_tx,
+            persistence_is_noop: false,
         },
         permissions: PermissionHandle::allow_all(),
         tool_context,
