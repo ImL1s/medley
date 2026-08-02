@@ -259,6 +259,7 @@ pub(in crate::app::dispatch) fn open_new_session_question(app: &mut AppView) -> 
 /// [`dispatch_new_session_inner`] with a deferred model switch.
 pub(in crate::app::dispatch) fn open_agent_type_mismatch_question(
     app: &mut AppView,
+    agent_id: AgentId,
     model_id: acp::ModelId,
     effort: Option<xai_grok_shell::sampling::types::ReasoningEffort>,
     model_name: &str,
@@ -267,15 +268,19 @@ pub(in crate::app::dispatch) fn open_agent_type_mismatch_question(
     use xai_grok_tools::implementations::grok_build::ask_user_question::{
         Question, QuestionOption,
     };
-    let ActiveView::Agent(id) = app.active_view else {
-        return vec![];
-    };
-    let Some(agent) = app.agents.get_mut(&id) else {
+    let Some(agent) = app.agents.get_mut(&agent_id) else {
         return vec![];
     };
     if agent.question_view.is_some() {
-        app.show_toast("Finish answering the current question first");
-        return vec![];
+        agent.session.model_switch_pending = false;
+        agent.session.model_switch_request_id = None;
+        agent.session.model_switch_rollback = None;
+        agent.show_toast("Finish answering the current question first");
+        let drain = maybe_drain_queue(agent);
+        let page_flip_entry = drain.page_flip_entry;
+        let effects = drain.effects;
+        note_peek_page_flip(app, agent_id, page_flip_entry);
+        return effects;
     }
     let question = Question {
         question: format!("Switching to {model_name} requires starting a new session. Continue?"),
@@ -296,14 +301,21 @@ pub(in crate::app::dispatch) fn open_agent_type_mismatch_question(
         ],
         multi_select: Some(false),
     };
-    let agent = app.agents.get_mut(&id).expect("agent present (re-borrow)");
+    let agent = app
+        .agents
+        .get_mut(&agent_id)
+        .expect("agent present (re-borrow)");
     let stashed = agent.prompt.stash();
     let state = QuestionViewState::new(
         format!("agent-type-mismatch-{}", uuid::Uuid::new_v4()),
         vec![question],
         stashed,
     )
-    .with_local_kind(LocalQuestionKind::AgentTypeMismatch { model_id, effort })
+    .with_local_kind(LocalQuestionKind::AgentTypeMismatch {
+        source_id: agent_id,
+        model_id,
+        effort,
+    })
     .with_no_freeform();
     agent.question_view = Some(state);
     agent.prompt.set_text("");
@@ -1175,6 +1187,7 @@ pub(in crate::app::dispatch) fn handle_session_created(
     scheduler_background_loops: Option<bool>,
 ) -> Vec<Effect> {
     let agent_count = app.agents.len();
+    let app_chat_mode = app.chat_mode;
     let switch_hint =
         crate::views::dashboard::session_switch_hint_command(app.screen_mode.is_minimal());
     if let Some(agent) = app.agents.get_mut(&agent_id) {
@@ -1202,6 +1215,29 @@ pub(in crate::app::dispatch) fn handle_session_created(
         let handoff_requires_deferred_switch =
             agent.session.model_switch_queue_handoff_from.is_some()
                 && agent.session.deferred_model_switch.is_some();
+        // An incompatible default-model switch can be adopted by the model
+        // chosen in CreateSession itself. Preserve that confirmed default
+        // intent before `apply_deferred_model_switch` clears the rollback;
+        // unlike an effort override, this path must not issue a redundant ACP
+        // switch merely to obtain a persistence receipt.
+        let replacement_default = (!app_chat_mode
+            && !agent.chat_kind
+            && !agent.app_chat_mode
+            && agent.session.deferred_model_switch.is_none()
+            && agent
+                .session
+                .model_switch_rollback
+                .as_ref()
+                .is_some_and(|rollback| rollback.app_models_optimistic))
+        .then(|| {
+            agent
+                .session
+                .models
+                .current
+                .clone()
+                .map(|model_id| (model_id, agent.session.models.reasoning_effort))
+        })
+        .flatten();
         let deferred = apply_deferred_model_switch(agent, app.cli_effort_token.as_deref());
         let deferred_mode = agent.deferred_session_mode.take();
         let cwd = agent.session.cwd.clone();
@@ -1225,6 +1261,16 @@ pub(in crate::app::dispatch) fn handle_session_created(
             maybe_drain_queue(agent)
         };
         let mut effects = std::mem::take(&mut drain.effects);
+        if let Some((model_id, reasoning_effort)) = replacement_default {
+            agent.session.user_model_preference = Some(model_id.clone());
+            if app.models.available.contains_key(&model_id) {
+                app.models.set_current(model_id.clone(), reasoning_effort);
+            }
+            effects.push(Effect::PersistPreferredModel {
+                model_id,
+                reasoning_effort,
+            });
+        }
         agent.session.prompt_history_loading = true;
         effects.push(Effect::FetchPromptHistory {
             agent_id,
@@ -1544,7 +1590,9 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
     result: Result<(), SwitchModelError>,
     prev_model_id: Option<acp::ModelId>,
 ) -> Vec<Effect> {
+    let app_chat_mode = app.chat_mode;
     if let Some(agent) = app.agents.get_mut(&agent_id) {
+        let persist_preferred_model = !app_chat_mode && !agent.chat_kind && !agent.app_chat_mode;
         if !agent.session.model_switch_pending {
             tracing::debug!(
                 agent = ?agent_id,
@@ -1627,7 +1675,7 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                     };
                     agent.show_toast(&toast);
                 }
-                if unchanged {
+                if unchanged || !persist_preferred_model {
                     vec![]
                 } else {
                     vec![Effect::PersistPreferredModel {
@@ -1646,9 +1694,16 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                 // the queue gated until the user either declines (drain here)
                 // or accepts (handoff to the replacement placeholder).
                 agent.session.model_switch_pending = true;
+                agent.session.model_switch_rollback = rollback.clone();
                 agent.active_modal = None;
                 let display_name = agent.session.models.display_name_for(&model_id);
-                return open_agent_type_mismatch_question(app, model_id, effort, &display_name);
+                return open_agent_type_mismatch_question(
+                    app,
+                    agent_id,
+                    model_id,
+                    effort,
+                    &display_name,
+                );
             }
             Err(SwitchModelError::HarnessUnavailable {
                 error,
@@ -1686,16 +1741,15 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
 }
 pub(in crate::app::dispatch) fn dispatch_agent_type_mismatch_answered(
     app: &mut AppView,
+    source_id: AgentId,
     start_new: bool,
     model_id: acp::ModelId,
     effort: Option<ReasoningEffort>,
 ) -> Vec<Effect> {
-    let ActiveView::Agent(source_id) = app.active_view else {
-        return vec![];
-    };
     let Some(source) = app.agents.get_mut(&source_id) else {
         return vec![];
     };
+    let carried_rollback = source.session.model_switch_rollback.take();
     source.session.model_switch_pending = false;
     source.session.model_switch_request_id = None;
 
@@ -1703,6 +1757,10 @@ pub(in crate::app::dispatch) fn dispatch_agent_type_mismatch_answered(
         let handed_off = std::mem::take(&mut source.session.pending_prompts);
         let (new_aid, effects) = dispatch_new_session_inner_with_id(app, Some(model_id.clone()));
         if let Some(agent) = app.agents.get_mut(&new_aid) {
+            agent.session.model_switch_rollback = carried_rollback.map(|mut rollback| {
+                rollback.request_id = None;
+                rollback
+            });
             if !handed_off.is_empty() {
                 agent.session.replace_pending_prompts(handed_off);
                 agent.session.model_switch_queue_handoff_from = Some(source_id);

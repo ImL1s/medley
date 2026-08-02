@@ -1240,6 +1240,7 @@ fn agent_type_mismatch_cancel_is_noop() {
     let agent_count_before = app.agents.len();
     let effects = dispatch(
         Action::AgentTypeMismatchAnswered {
+            source_id: id,
             start_new: false,
             model_id,
             effort: None,
@@ -1258,6 +1259,7 @@ fn agent_type_mismatch_with_effort_stashes_deferred_switch() {
     let effort = Some(ReasoningEffort::High);
     let effects = dispatch(
         Action::AgentTypeMismatchAnswered {
+            source_id: AgentId(0),
             start_new: true,
             model_id: model_id.clone(),
             effort,

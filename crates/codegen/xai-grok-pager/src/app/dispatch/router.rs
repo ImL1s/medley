@@ -1311,10 +1311,11 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             vec![]
         }
         Action::AgentTypeMismatchAnswered {
+            source_id,
             start_new,
             model_id,
             effort,
-        } => dispatch_agent_type_mismatch_answered(app, start_new, model_id, effort),
+        } => dispatch_agent_type_mismatch_answered(app, source_id, start_new, model_id, effort),
         Action::AuthClassSwitchAnswered {
             proceed,
             model_id,

@@ -50,6 +50,14 @@ impl SessionActor {
             self.catalog_model_id.set(value.clone());
             acp::ModelId::new(value)
         };
+        if self.state.lock().await.running_task.is_some() {
+            return Err(model_switch_harness_error(
+                &catalog_model_id,
+                &active_agent_type,
+                &required_agent_type,
+                "turn_in_flight",
+            ));
+        }
         let model_unchanged = previous_model_id == catalog_model_id;
         let definition_is_compatible = harnesses_are_compatible(
             self.agent.borrow().definition(),
@@ -830,7 +838,7 @@ fn definition_matches_required_identity(
 
 #[cfg(test)]
 mod model_switch_transaction_tests {
-    use super::super::support::create_test_actor_ex;
+    use super::super::support::{create_test_actor_ex, running_task_stub};
     use super::*;
 
     fn switch_sampling_config(model: &str) -> xai_grok_sampler::SamplerConfig {
@@ -1076,6 +1084,49 @@ mod model_switch_transaction_tests {
                     previous_sampling.model
                 );
                 assert!(persistence_rx.try_recv().is_err());
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_harness_switch_rejects_while_turn_is_in_flight() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (persistence_tx, mut persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (actor, _event_rx) =
+                    create_test_actor_ex(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                *actor.active_agent_type.lock() = Some("grok-build".to_owned());
+                actor.state.lock().await.running_task = Some(running_task_stub("running-turn"));
+                let previous_sampling = actor
+                    .chat_state_handle
+                    .get_sampling_config()
+                    .await
+                    .expect("sampling state");
+
+                let err = actor
+                    .handle_apply_model_switch(prepared_switch("grok-build", None))
+                    .await
+                    .expect_err("a live turn must keep its model snapshot stable");
+                let payload = config::ModelSwitchHarnessError::from_acp_error(&err)
+                    .expect("structured switch error");
+                assert_eq!(payload.reason, "turn_in_flight");
+                assert_eq!(catalog_model_id(&actor), "test");
+                assert_eq!(
+                    actor
+                        .chat_state_handle
+                        .get_sampling_config()
+                        .await
+                        .expect("sampling state")
+                        .model,
+                    previous_sampling.model
+                );
+                assert_eq!(actor.compaction.threshold_percent.get(), 85);
+                assert!(
+                    persistence_rx.try_recv().is_err(),
+                    "the rejected switch must not enqueue persistence"
+                );
             })
             .await;
     }

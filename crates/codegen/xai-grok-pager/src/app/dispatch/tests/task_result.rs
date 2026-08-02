@@ -1348,6 +1348,123 @@ fn switch_model_incompatible_agent_shows_question_modal() {
 }
 
 #[test]
+fn incompatible_model_switch_opens_question_on_originating_session() {
+    let mut app = test_app_with_agent();
+    let source_id = AgentId(0);
+    let (other_id, _) =
+        crate::app::dispatch::session::lifecycle::dispatch_new_session_inner_with_id(
+            &mut app, None,
+        );
+    assert_eq!(app.active_view, ActiveView::Agent(other_id));
+    {
+        let source = app.agents.get_mut(&source_id).unwrap();
+        source.session.model_switch_pending = true;
+        source.session.model_switch_request_id = Some(7);
+    }
+    let model_id = acp::ModelId::new("cursor-model");
+    let error = xai_grok_shell::agent::config::ModelSwitchIncompatibleAgentError {
+        code: "MODEL_SWITCH_INCOMPATIBLE_AGENT".into(),
+        active_agent_type: "grok-build".into(),
+        required_agent_type: "cursor".into(),
+        model_id: model_id.0.to_string(),
+        suggestion: "start_new_session".into(),
+    };
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id: source_id,
+            model_id,
+            effort: None,
+            request_id: 7,
+            result: Err(SwitchModelError::IncompatibleAgent {
+                error,
+                prev_model_id: None,
+            }),
+            prev_model_id: None,
+        }),
+        &mut app,
+    );
+
+    assert!(effects.is_empty());
+    assert!(app.agents[&source_id].question_view.is_some());
+    assert!(app.agents[&source_id].session.model_switch_pending);
+    assert!(app.agents[&other_id].question_view.is_none());
+    assert_eq!(app.active_view, ActiveView::Agent(other_id));
+
+    let source_question = app.agents[&source_id]
+        .question_view
+        .as_ref()
+        .expect("source question")
+        .local_kind
+        .clone()
+        .expect("local mismatch kind");
+    let source_qv = app.agents[&source_id]
+        .question_view
+        .as_ref()
+        .expect("source question");
+    let outcome =
+        crate::app::agent_view::translate_local_submit_for_test(source_qv, source_question, true);
+    let crate::app::app_view::InputOutcome::Action(action) = outcome else {
+        panic!("skipping the source modal must produce a decline action");
+    };
+    assert!(matches!(
+        &action,
+        Action::AgentTypeMismatchAnswered {
+            source_id: answer_source,
+            start_new: false,
+            ..
+        } if *answer_source == source_id
+    ));
+    let effects = dispatch(action, &mut app);
+    assert!(effects.is_empty());
+    assert!(!app.agents[&source_id].session.model_switch_pending);
+    assert_eq!(app.active_view, ActiveView::Agent(other_id));
+}
+
+#[test]
+fn incompatible_model_switch_releases_queue_when_origin_has_an_existing_question() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    crate::app::dispatch::session::lifecycle::open_new_session_question(&mut app);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.model_switch_pending = true;
+        agent.session.model_switch_request_id = Some(11);
+        agent.session.enqueue_prompt("queued prompt".into());
+    }
+    let model_id = acp::ModelId::new("cursor-model");
+    let error = xai_grok_shell::agent::config::ModelSwitchIncompatibleAgentError {
+        code: "MODEL_SWITCH_INCOMPATIBLE_AGENT".into(),
+        active_agent_type: "grok-build".into(),
+        required_agent_type: "cursor".into(),
+        model_id: model_id.0.to_string(),
+        suggestion: "start_new_session".into(),
+    };
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id: id,
+            model_id,
+            effort: None,
+            request_id: 11,
+            result: Err(SwitchModelError::IncompatibleAgent {
+                error,
+                prev_model_id: None,
+            }),
+            prev_model_id: None,
+        }),
+        &mut app,
+    );
+
+    assert!(effects.iter().any(
+        |effect| matches!(effect, Effect::SendPrompt { text, .. } if text == "queued prompt")
+    ));
+    assert!(!app.agents[&id].session.model_switch_pending);
+    assert!(app.agents[&id].session.model_switch_request_id.is_none());
+    assert!(app.agents[&id].session.model_switch_rollback.is_none());
+}
+
+#[test]
 fn incompatible_model_switch_holds_queue_until_declined() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
@@ -1390,6 +1507,7 @@ fn incompatible_model_switch_holds_queue_until_declined() {
 
     let decline_effects = dispatch(
         Action::AgentTypeMismatchAnswered {
+            source_id: id,
             start_new: false,
             model_id: acp::ModelId::new("cursor-model"),
             effort: None,
@@ -1512,6 +1630,7 @@ fn incompatible_model_switch_hands_queue_to_replacement_until_target_switch_succ
 
     let create_effects = dispatch(
         Action::AgentTypeMismatchAnswered {
+            source_id,
             start_new: true,
             model_id: model_id.clone(),
             effort: Some(ReasoningEffort::High),
@@ -1643,6 +1762,7 @@ fn handed_queue_stays_gated_when_deferred_target_fails_hydrate_preflight() {
         );
         dispatch(
             Action::AgentTypeMismatchAnswered {
+                source_id,
                 start_new: true,
                 model_id: model_id.clone(),
                 effort: Some(ReasoningEffort::High),
@@ -1735,6 +1855,7 @@ fn failed_replacement_restores_handed_queue_before_new_source_prompts() {
     );
     dispatch(
         Action::AgentTypeMismatchAnswered {
+            source_id,
             start_new: true,
             model_id,
             effort: None,
@@ -2008,6 +2129,148 @@ fn confirmed_default_model_switch_persists_after_optimistic_mirror_update() {
             .as_ref()
             .is_some_and(|(message, _)| message.contains("Switched to Next")),
         "the confirmed switch should surface its success toast",
+    );
+}
+
+#[test]
+fn replacement_session_persists_confirmed_default_after_creation() {
+    let mut app = test_app_with_agent();
+    let source_id = AgentId(0);
+    let previous = acp::ModelId::new("original-model");
+    let target = acp::ModelId::new("cursor-model");
+    for (model_id, name) in [(previous.clone(), "Original"), (target.clone(), "Cursor")] {
+        let info = acp::ModelInfo::new(model_id.clone(), name);
+        app.agents[&source_id]
+            .session
+            .models
+            .available
+            .insert(model_id.clone(), info.clone());
+        app.models.available.insert(model_id, info);
+    }
+    app.agents
+        .get_mut(&source_id)
+        .unwrap()
+        .session
+        .models
+        .set_current(previous.clone(), None);
+    app.models.set_current(previous.clone(), None);
+
+    let initial = dispatch(Action::SetDefaultModel(target.clone()), &mut app);
+    let initial_request_id = switch_model_request_id(&initial);
+    let error = xai_grok_shell::agent::config::ModelSwitchIncompatibleAgentError {
+        code: "MODEL_SWITCH_INCOMPATIBLE_AGENT".into(),
+        active_agent_type: "grok-build".into(),
+        required_agent_type: "cursor".into(),
+        model_id: target.0.to_string(),
+        suggestion: "start_new_session".into(),
+    };
+    dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id: source_id,
+            model_id: target.clone(),
+            effort: None,
+            request_id: initial_request_id,
+            result: Err(SwitchModelError::IncompatibleAgent {
+                error,
+                prev_model_id: Some(previous.clone()),
+            }),
+            prev_model_id: Some(previous),
+        }),
+        &mut app,
+    );
+    dispatch(
+        Action::AgentTypeMismatchAnswered {
+            source_id,
+            start_new: true,
+            model_id: target.clone(),
+            effort: None,
+        },
+        &mut app,
+    );
+    let ActiveView::Agent(replacement_id) = app.active_view else {
+        panic!("replacement must become active");
+    };
+    let created = dispatch(
+        Action::TaskComplete(TaskResult::SessionCreated {
+            agent_id: replacement_id,
+            session_id: "replacement-default".into(),
+            models: None,
+            scheduler_background_loops: None,
+        }),
+        &mut app,
+    );
+    assert!(
+        !created
+            .iter()
+            .any(|effect| matches!(effect, Effect::SwitchModel { .. })),
+        "CreateSession already selected the no-effort target"
+    );
+    let persisted = created
+        .iter()
+        .filter(|effect| {
+            matches!(
+                effect,
+                Effect::PersistPreferredModel {
+                    model_id,
+                    reasoning_effort: None,
+                } if model_id == &target
+            )
+        })
+        .count();
+    assert_eq!(persisted, 1, "confirmed replacement default persists once");
+    assert_eq!(app.models.current.as_ref(), Some(&target));
+    assert_eq!(
+        app.agents[&replacement_id]
+            .session
+            .user_model_preference
+            .as_ref(),
+        Some(&target)
+    );
+}
+
+#[test]
+fn chat_mode_default_switch_does_not_persist_build_default() {
+    let mut app = test_app_with_agent();
+    app.chat_mode = true;
+    let id = AgentId(0);
+    let previous = acp::ModelId::new("chat-old");
+    let target = acp::ModelId::new("chat-opaque-mode");
+    for (model_id, name) in [(previous.clone(), "Old"), (target.clone(), "Target")] {
+        let info = acp::ModelInfo::new(model_id.clone(), name);
+        app.agents[&id]
+            .session
+            .models
+            .available
+            .insert(model_id.clone(), info.clone());
+        app.models.available.insert(model_id, info);
+    }
+    app.agents
+        .get_mut(&id)
+        .unwrap()
+        .session
+        .models
+        .set_current(previous.clone(), None);
+    app.models.set_current(previous.clone(), None);
+
+    let initial = dispatch(Action::SetDefaultModel(target.clone()), &mut app);
+    let request_id = switch_model_request_id(&initial);
+    let completed = dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id: id,
+            model_id: target,
+            effort: None,
+            request_id,
+            result: Ok(()),
+            prev_model_id: Some(previous),
+        }),
+        &mut app,
+    );
+
+    assert!(
+        !completed
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistPreferredModel { .. })),
+        "chat catalog IDs must not overwrite the Build default"
     );
 }
 

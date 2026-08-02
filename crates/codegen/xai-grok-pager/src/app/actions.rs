@@ -783,6 +783,8 @@ pub enum Action {
     /// the shell rejects a model switch because the target model requires
     /// a different agent harness.
     AgentTypeMismatchAnswered {
+        /// Session that owns the gated model-switch transaction.
+        source_id: AgentId,
         /// `true` = start a new session with the target model.
         /// `false` = cancel, return to current session.
         start_new: bool,

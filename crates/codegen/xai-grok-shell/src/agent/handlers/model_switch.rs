@@ -111,15 +111,19 @@ pub(crate) async fn apply(
     // Armed until the complete actor receipt and outer mirrors have committed.
     // Every early return therefore emits exactly one sanitized failure event.
     let mut failure_telemetry = FailureTelemetry::new(&session_id, &model_id);
-    // Serialize the complete prepare/actor-commit/outer-handle sequence with
-    // prompt intake and other model switches. Without this guard two actor
-    // receipts can be observed out of order and regress the outer handle.
-    let dispatch_lock = agent.dispatch_lock(&session_id);
-    let _dispatch_guard = dispatch_lock.lock().await;
     let handle = agent
         .session_handle_waiting_for_load(&session_id)
         .await
         .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))?;
+    // Resolve an in-flight load before taking the per-session dispatch lock.
+    // `load_session` applies its restored model while its load guard is alive;
+    // holding this lock while waiting for that guard would deadlock the restore
+    // path until the bounded load wait expired.
+    //
+    // Once the session exists, serialize the complete prepare/actor-commit/
+    // outer-handle sequence with prompt intake and other model switches.
+    let dispatch_lock = agent.dispatch_lock(&session_id);
+    let _dispatch_guard = dispatch_lock.lock().await;
     let model = agent.resolve_model_id(&model_id)?;
     let (ready, reason) = config::model_readiness(&model);
     if !ready {

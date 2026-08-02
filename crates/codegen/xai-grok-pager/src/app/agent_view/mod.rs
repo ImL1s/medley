@@ -1674,13 +1674,16 @@ fn translate_local_submit(
     }
     if skipped {
         return match kind {
-            LocalQuestionKind::AgentTypeMismatch { model_id, effort } => {
-                InputOutcome::Action(Action::AgentTypeMismatchAnswered {
-                    start_new: false,
-                    model_id,
-                    effort,
-                })
-            }
+            LocalQuestionKind::AgentTypeMismatch {
+                source_id,
+                model_id,
+                effort,
+            } => InputOutcome::Action(Action::AgentTypeMismatchAnswered {
+                source_id,
+                start_new: false,
+                model_id,
+                effort,
+            }),
             _ => InputOutcome::Changed,
         };
     }
@@ -1740,9 +1743,14 @@ fn translate_local_submit(
             );
             InputOutcome::Action(Action::OpenUrl(url.to_string()))
         }
-        LocalQuestionKind::AgentTypeMismatch { model_id, effort } => {
+        LocalQuestionKind::AgentTypeMismatch {
+            source_id,
+            model_id,
+            effort,
+        } => {
             let start_new = *idx == 0;
             InputOutcome::Action(Action::AgentTypeMismatchAnswered {
+                source_id,
                 start_new,
                 model_id: model_id.clone(),
                 effort,

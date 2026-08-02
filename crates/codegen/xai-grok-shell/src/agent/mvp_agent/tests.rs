@@ -2688,6 +2688,52 @@ async fn wait_for_in_flight_load_blocks_until_load_completes() {
         })
         .await;
 }
+
+/// A racing model switch must not hold the per-session dispatch lock while it
+/// waits for `session/load`. The load path applies its restored model before its
+/// RAII load guard drops, so taking the lock first creates a lock-order cycle.
+#[tokio::test]
+async fn model_switch_waits_for_load_before_taking_dispatch_lock() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let agent = std::rc::Rc::new(build_minimal_agent_for_tests());
+            let sid = acp::SessionId::new("sess-loading-model-switch");
+            let guard = agent.begin_session_load(&sid);
+            let waiter_agent = agent.clone();
+            let waiter_sid = sid.clone();
+            let waiter = tokio::task::spawn_local(async move {
+                crate::agent::handlers::model_switch::apply(
+                    &waiter_agent,
+                    acp::SetSessionModelRequest::new(
+                        waiter_sid,
+                        acp::ModelId::new("test-model"),
+                    ),
+                )
+                .await
+            });
+
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert!(
+                !waiter.is_finished(),
+                "the racing switch must be waiting for the in-flight load"
+            );
+            let dispatch_lock = agent.dispatch_lock(&sid);
+            let dispatch_guard = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                dispatch_lock.lock(),
+            )
+            .await
+            .expect("session/load must be able to take the dispatch lock");
+            drop(dispatch_guard);
+
+            waiter.abort();
+            drop(guard);
+            let _ = waiter.await;
+        })
+        .await;
+}
+
 /// A failed load (guard dropped WITHOUT registering the session) also
 /// wakes waiters — they re-check, find nothing, and the caller surfaces
 /// the regular "unknown session id" error rather than hanging.

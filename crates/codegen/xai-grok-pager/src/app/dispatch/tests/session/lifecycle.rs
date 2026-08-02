@@ -759,6 +759,7 @@ fn agent_type_mismatch_start_new_creates_session_with_model_id() {
     let model_id = acp::ModelId::new(std::sync::Arc::from("cursor-model"));
     let effects = dispatch(
         Action::AgentTypeMismatchAnswered {
+            source_id: AgentId(0),
             start_new: true,
             model_id: model_id.clone(),
             effort: None,
