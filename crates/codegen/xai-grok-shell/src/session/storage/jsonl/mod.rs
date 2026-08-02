@@ -296,14 +296,6 @@ impl JsonlStorageAdapter {
     /// the torn record is terminated as its own (single) corrupt line. This
     /// bounds the damage of any torn write to exactly one record, which the
     /// lenient readers (e.g. [`Self::read_chat_history_sync`]) then skip.
-    async fn sync_file_path_durable(path: PathBuf) -> io::Result<()> {
-        tokio::task::spawn_blocking(move || {
-            let file = OpenOptions::new().read(true).open(&path)?;
-            Self::sync_file_durable(&file)
-        })
-        .await
-        .map_err(io::Error::other)?
-    }
     fn append_jsonl_line_sync(
         path: &Path,
         line: Vec<u8>,
@@ -377,40 +369,39 @@ impl JsonlStorageAdapter {
                     "working-directory switch item must carry a nonzero generation",
                 ))
             })?;
-        let disposition = tokio::task::spawn_blocking(move || {
-            Self::append_cwd_switch_line_sync_with(
+        let adapter = self.clone();
+        let info = info.clone();
+        tokio::task::spawn_blocking(move || {
+            let _model_switch_gate = adapter
+                .lock_model_switch_mutation_sync(&info)
+                .map_err(super::AppendCwdSwitchError::NotCommitted)?;
+            let disposition = Self::append_cwd_switch_line_sync_with(
                 &path,
                 line,
                 generation,
                 Self::sync_file_durable,
                 || Self::sync_parent_directory(&path),
+            )?;
+            super::summary_write::apply_patch_locked_durable(
+                &adapter.summary_file(&info),
+                &adapter.summary_lock_file(&info),
+                &super::summary_write::SummaryPatch {
+                    record_activity: matches!(&disposition, StrictAppendAck::Appended),
+                    chat_messages: matches!(&disposition, StrictAppendAck::Appended)
+                        .then_some(super::summary_write::CounterOp::Increment(1)),
+                    chat_format_version: Some(CHAT_FORMAT_VERSION),
+                    cwd_switch_bookkeeping_generation: Some(generation),
+                    ..Default::default()
+                },
             )
-        })
-        .await
-        .map_err(|error| super::AppendCwdSwitchError::NotCommitted(io::Error::other(error)))??;
-        self.apply_summary_patch(
-            info,
-            super::summary_write::SummaryPatch {
-                record_activity: matches!(&disposition, StrictAppendAck::Appended),
-                chat_messages: matches!(&disposition, StrictAppendAck::Appended)
-                    .then_some(super::summary_write::CounterOp::Increment(1)),
-                chat_format_version: Some(CHAT_FORMAT_VERSION),
-                cwd_switch_bookkeeping_generation: Some(generation),
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|source| super::AppendCwdSwitchError::Committed {
-            acknowledgement: disposition.clone(),
-            source,
-        })?;
-        Self::sync_file_path_durable(self.summary_file(info))
-            .await
             .map_err(|source| super::AppendCwdSwitchError::Committed {
                 acknowledgement: disposition.clone(),
                 source,
             })?;
-        Ok(disposition)
+            Ok(disposition)
+        })
+        .await
+        .map_err(|error| super::AppendCwdSwitchError::NotCommitted(io::Error::other(error)))?
     }
     fn find_cwd_switch_generation(
         path: &Path,
@@ -1475,17 +1466,29 @@ impl StorageAdapter for JsonlStorageAdapter {
             .await
     }
     async fn append_chat_message(&self, info: &Info, message: &ConversationItem) -> io::Result<()> {
-        self.append_jsonl(self.chat_file(info), message).await?;
-        self.apply_summary_patch(
-            info,
-            super::summary_write::SummaryPatch {
-                record_activity: true,
-                chat_messages: Some(super::summary_write::CounterOp::Increment(1)),
-                chat_format_version: Some(CHAT_FORMAT_VERSION),
-                ..Default::default()
-            },
-        )
+        let adapter = self.clone();
+        let info = info.clone();
+        let path = adapter.chat_file(&info);
+        let mut line = serde_json::to_vec(message)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        line.push(b'\n');
+        tokio::task::spawn_blocking(move || {
+            let _model_switch_gate = adapter.lock_model_switch_mutation_sync(&info)?;
+            Self::append_jsonl_line_sync(&path, line, AppendDurability::Buffered)?;
+            super::summary_write::apply_patch_locked(
+                &adapter.summary_file(&info),
+                &adapter.summary_lock_file(&info),
+                &super::summary_write::SummaryPatch {
+                    record_activity: true,
+                    chat_messages: Some(super::summary_write::CounterOp::Increment(1)),
+                    chat_format_version: Some(CHAT_FORMAT_VERSION),
+                    ..Default::default()
+                },
+            )?;
+            Ok(())
+        })
         .await
+        .map_err(io::Error::other)?
     }
     async fn append_cwd_switch_commit_aware(
         &self,
@@ -1501,18 +1504,28 @@ impl StorageAdapter for JsonlStorageAdapter {
         agent_name: Option<&str>,
         reasoning_effort: Option<Option<xai_grok_sampling_types::ReasoningEffort>>,
     ) -> io::Result<()> {
-        self.apply_summary_patch(
-            info,
-            super::summary_write::SummaryPatch {
-                model: Some(super::summary_write::ModelPatch {
-                    model_id: model_id.clone(),
-                    agent_name: agent_name.map(String::from),
-                    reasoning_effort,
-                }),
-                ..Default::default()
-            },
-        )
+        let adapter = self.clone();
+        let info = info.clone();
+        let model_id = model_id.clone();
+        let agent_name = agent_name.map(String::from);
+        tokio::task::spawn_blocking(move || {
+            let _model_switch_gate = adapter.lock_model_switch_mutation_sync(&info)?;
+            super::summary_write::apply_patch_locked(
+                &adapter.summary_file(&info),
+                &adapter.summary_lock_file(&info),
+                &super::summary_write::SummaryPatch {
+                    model: Some(super::summary_write::ModelPatch {
+                        model_id,
+                        agent_name,
+                        reasoning_effort,
+                    }),
+                    ..Default::default()
+                },
+            )?;
+            Ok(())
+        })
         .await
+        .map_err(io::Error::other)?
     }
     async fn commit_model_switch(
         &self,
@@ -1886,23 +1899,36 @@ impl StorageAdapter for JsonlStorageAdapter {
         info: &Info,
         messages: &[ConversationItem],
     ) -> io::Result<()> {
-        self.write_jsonl(self.chat_file(info), messages).await?;
+        let adapter = self.clone();
+        let info = info.clone();
+        let messages = messages.to_vec();
         let new_count = messages.len();
         let cwd_switch_bookkeeping_generation = messages
             .iter()
             .filter_map(ConversationItem::working_directory_switch_generation)
             .max()
             .unwrap_or(0);
-        self.apply_summary_patch(
-            info,
-            super::summary_write::SummaryPatch {
-                chat_messages: Some(super::summary_write::CounterOp::Set(new_count)),
-                chat_format_version: Some(CHAT_FORMAT_VERSION),
-                cwd_switch_bookkeeping_generation: Some(cwd_switch_bookkeeping_generation),
-                ..Default::default()
-            },
-        )
+        tokio::task::spawn_blocking(move || {
+            let _model_switch_gate = adapter.lock_model_switch_mutation_sync(&info)?;
+            let chat_path = adapter.chat_file(&info);
+            let chat_lock = Self::lock_append(&chat_path)?;
+            let write_result = super::write_jsonl_atomic(&chat_path, &messages);
+            let _ = chat_lock.unlock();
+            write_result?;
+            super::summary_write::apply_patch_locked(
+                &adapter.summary_file(&info),
+                &adapter.summary_lock_file(&info),
+                &super::summary_write::SummaryPatch {
+                    chat_messages: Some(super::summary_write::CounterOp::Set(new_count)),
+                    chat_format_version: Some(CHAT_FORMAT_VERSION),
+                    cwd_switch_bookkeeping_generation: Some(cwd_switch_bookkeeping_generation),
+                    ..Default::default()
+                },
+            )?;
+            Ok(())
+        })
         .await
+        .map_err(io::Error::other)?
     }
     async fn copy_session_data(
         &self,

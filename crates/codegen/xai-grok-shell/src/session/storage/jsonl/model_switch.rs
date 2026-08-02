@@ -84,6 +84,19 @@ impl JsonlStorageAdapter {
         result
     }
 
+    /// Serialize an ordinary chat/model mutation with model-switch recovery.
+    /// The returned file keeps the per-session gate locked until it is dropped.
+    pub(super) fn lock_model_switch_mutation_sync(&self, info: &Info) -> io::Result<std::fs::File> {
+        let session_dir = self.session_dir(info);
+        let lock = self.open_model_switch_lock(&session_dir)?;
+        lock.lock_exclusive()?;
+        if let Err(error) = self.recover_model_switch_locked(&session_dir) {
+            let _ = lock.unlock();
+            return Err(error);
+        }
+        Ok(lock)
+    }
+
     fn recover_model_switch_locked(&self, session_dir: &Path) -> io::Result<()> {
         let journal = session_dir.join(MODEL_SWITCH_JOURNAL_FILE);
         let bytes = match std::fs::read(&journal) {
@@ -108,10 +121,11 @@ impl JsonlStorageAdapter {
         intent: &ModelSwitchIntent,
     ) -> io::Result<()> {
         let chat_bytes = super::super::to_jsonl_bytes(&intent.messages)?;
-        super::super::write_bytes_atomic_durable(
-            &session_dir.join(super::super::CHAT_HISTORY_FILE),
-            &chat_bytes,
-        )?;
+        let chat_path = session_dir.join(super::super::CHAT_HISTORY_FILE);
+        let chat_lock = Self::lock_append(&chat_path)?;
+        let chat_result = super::super::write_bytes_atomic_durable(&chat_path, &chat_bytes);
+        let _ = chat_lock.unlock();
+        chat_result?;
         self.probe_model_switch(ModelSwitchCommitStep::Chat)?;
 
         let cwd_switch_bookkeeping_generation = intent

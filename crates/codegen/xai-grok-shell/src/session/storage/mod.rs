@@ -61,13 +61,72 @@ pub(crate) fn write_bytes_atomic_durable(path: &Path, bytes: &[u8]) -> io::Resul
         file.write_all(bytes)?;
         sync_file_durable(&file)?;
         drop(file);
-        std::fs::rename(&tmp, path)?;
+        replace_file_atomic_durable(&tmp, path)?;
         sync_parent_directory(path)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomic_durable(tmp: &Path, path: &Path) -> io::Result<()> {
+    std::fs::rename(tmp, path)
+}
+
+#[cfg(windows)]
+const DURABLE_REPLACE_FLAGS: windows::Win32::Storage::FileSystem::MOVE_FILE_FLAGS =
+    windows::Win32::Storage::FileSystem::MOVE_FILE_FLAGS(1 | 8);
+
+#[cfg(windows)]
+fn windows_extended_path(path: &Path) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let absolute = std::path::absolute(path)?;
+    let mut wide = absolute.as_os_str().encode_wide().collect::<Vec<_>>();
+    if wide.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path contains NUL",
+        ));
+    }
+    const BACKSLASH: u16 = b'\\' as u16;
+    const QUESTION: u16 = b'?' as u16;
+    if wide.starts_with(&[BACKSLASH, BACKSLASH, QUESTION, BACKSLASH]) {
+        wide.push(0);
+        Ok(wide)
+    } else {
+        let unc = wide.starts_with(&[BACKSLASH, BACKSLASH]);
+        let mut extended = if unc { r"\\?\UNC\" } else { r"\\?\" }
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        if unc {
+            wide.drain(..2);
+        }
+        extended.extend(wide);
+        extended.push(0);
+        Ok(extended)
+    }
+}
+
+#[cfg(windows)]
+fn replace_file_atomic_durable(tmp: &Path, path: &Path) -> io::Result<()> {
+    use windows::Win32::Storage::FileSystem::MoveFileExW;
+    use windows::core::PCWSTR;
+
+    let from = windows_extended_path(tmp)?;
+    let to = windows_extended_path(path)?;
+    // Rust's Windows rename already replaces an existing file. Use MoveFileExW
+    // here specifically to add WRITE_THROUGH to the durable transaction path.
+    unsafe {
+        MoveFileExW(
+            PCWSTR(from.as_ptr()),
+            PCWSTR(to.as_ptr()),
+            DURABLE_REPLACE_FLAGS,
+        )
+    }
+    .map_err(io::Error::other)
 }
 
 #[cfg(unix)]
@@ -2468,6 +2527,29 @@ pub(crate) fn parse_prompt_extract_event(line: &str) -> PromptExtractEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn durable_windows_replace_requests_replacement_and_write_through() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+        use windows::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+
+        assert_eq!(
+            DURABLE_REPLACE_FLAGS.0,
+            MOVEFILE_REPLACE_EXISTING.0 | MOVEFILE_WRITE_THROUGH.0
+        );
+
+        let malformed =
+            OsString::from_wide(&[b'C' as u16, b':' as u16, b'\\' as u16, 0xD800, b'x' as u16]);
+        let extended = windows_extended_path(Path::new(&malformed)).unwrap();
+        assert!(
+            extended.contains(&0xD800),
+            "extended-path conversion must preserve unpaired UTF-16 surrogates"
+        );
+    }
 
     // ── helpers ──────────────────────────────────────────────────────────────
 

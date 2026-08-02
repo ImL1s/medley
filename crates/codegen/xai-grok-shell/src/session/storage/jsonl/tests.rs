@@ -177,6 +177,116 @@ async fn model_switch_recovers_pending_intent_before_installing_next_intent() {
         serde_json::to_value([ConversationItem::user("second-chat")]).unwrap()
     );
 }
+
+#[tokio::test]
+async fn ordinary_chat_append_recovers_committed_model_switch_before_writing() {
+    let temp_dir = TempDir::new().unwrap();
+    let info = create_test_info();
+    let base = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    base.init_session(&info, acp::ModelId::new("old-model"))
+        .await
+        .unwrap();
+    base.replace_chat_history(&info, &[ConversationItem::user("old-chat")])
+        .await
+        .unwrap();
+
+    let crashing = JsonlStorageAdapter::with_model_switch_probe(
+        temp_dir.path().to_path_buf(),
+        |step| {
+            if step == ModelSwitchCommitStep::Intent {
+                Err(std::io::Error::other("leave committed intent pending"))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(
+        crashing
+            .commit_model_switch(
+                &info,
+                &[ConversationItem::user("switched-chat")],
+                &acp::ModelId::new("switched-model"),
+                Some("switched-agent"),
+                None,
+            )
+            .await
+            .expect_err("the committed intent must remain pending")
+            .is_committed()
+    );
+
+    base.append_chat_message(&info, &ConversationItem::assistant("ordinary-after-switch"))
+        .await
+        .unwrap();
+    assert!(
+        !base.model_switch_journal_file(&info).exists(),
+        "ordinary chat mutation must recover and clear the pending intent first"
+    );
+
+    let loaded = base.load_session_without_updates(&info).await.unwrap();
+    assert_eq!(loaded.summary.current_model_id.0.as_ref(), "switched-model");
+    assert_eq!(loaded.summary.agent_name.as_deref(), Some("switched-agent"));
+    assert_eq!(loaded.summary.num_chat_messages, 2);
+    assert_eq!(
+        serde_json::to_value(loaded.chat_history).unwrap(),
+        serde_json::to_value([
+            ConversationItem::user("switched-chat"),
+            ConversationItem::assistant("ordinary-after-switch"),
+        ])
+        .unwrap(),
+        "later recovery must not replay the old intent over the ordinary append"
+    );
+}
+
+#[tokio::test]
+async fn ordinary_model_update_recovers_committed_model_switch_before_writing() {
+    let temp_dir = TempDir::new().unwrap();
+    let info = create_test_info();
+    let base = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    base.init_session(&info, acp::ModelId::new("old-model"))
+        .await
+        .unwrap();
+
+    let crashing = JsonlStorageAdapter::with_model_switch_probe(
+        temp_dir.path().to_path_buf(),
+        |step| {
+            if step == ModelSwitchCommitStep::Intent {
+                Err(std::io::Error::other("leave committed intent pending"))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(
+        crashing
+            .commit_model_switch(
+                &info,
+                &[],
+                &acp::ModelId::new("pending-model"),
+                Some("pending-agent"),
+                None,
+            )
+            .await
+            .expect_err("the committed intent must remain pending")
+            .is_committed()
+    );
+
+    base.update_current_model_and_agent(
+        &info,
+        &acp::ModelId::new("ordinary-model"),
+        Some("ordinary-agent"),
+        Some(None),
+    )
+    .await
+    .unwrap();
+
+    let loaded = base.load_session_without_updates(&info).await.unwrap();
+    assert_eq!(loaded.summary.current_model_id.0.as_ref(), "ordinary-model");
+    assert_eq!(loaded.summary.agent_name.as_deref(), Some("ordinary-agent"));
+    assert!(
+        !base.model_switch_journal_file(&info).exists(),
+        "ordinary model mutation must recover and clear the pending intent first"
+    );
+}
 fn create_test_info() -> Info {
     Info {
         id: acp::SessionId::new("test-session-123"),
