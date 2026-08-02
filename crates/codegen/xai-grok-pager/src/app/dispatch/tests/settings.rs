@@ -1447,6 +1447,64 @@ fn set_default_model_confirmed_hard_blocks_unready() {
         Some(reason),
     );
 }
+
+#[test]
+fn concurrent_default_model_switch_from_another_session_is_serialized() {
+    use super::super::settings::setters::set_default_model_confirmed;
+
+    let mut app = test_app_with_agent();
+    let first_id = AgentId(0);
+    let model_a = acp::ModelId::new("model-a");
+    let model_b = acp::ModelId::new("model-b");
+    let model_c = acp::ModelId::new("model-c");
+    for model_id in [&model_a, &model_b, &model_c] {
+        let info = acp::ModelInfo::new(model_id.clone(), model_id.0.to_string());
+        app.models.available.insert(model_id.clone(), info.clone());
+        app.agents[&first_id]
+            .session
+            .models
+            .available
+            .insert(model_id.clone(), info);
+    }
+    app.models.set_current(model_a.clone(), None);
+    app.agents[&first_id]
+        .session
+        .models
+        .set_current(model_a.clone(), None);
+
+    let first_effects = set_default_model_confirmed(&mut app, model_b.clone());
+    assert!(first_effects.iter().any(
+        |effect| matches!(effect, Effect::SwitchModel { model_id, .. } if model_id == &model_b)
+    ));
+    assert_eq!(app.models.current.as_ref(), Some(&model_b));
+
+    dispatch(Action::NewSession, &mut app);
+    let ActiveView::Agent(second_id) = app.active_view else {
+        panic!("new session must become active");
+    };
+    assert_ne!(second_id, first_id);
+    {
+        let second = app.agents.get_mut(&second_id).unwrap();
+        second.session.session_id = Some("second-session".into());
+        for model_id in [&model_a, &model_b, &model_c] {
+            second.session.models.available.insert(
+                model_id.clone(),
+                acp::ModelInfo::new(model_id.clone(), model_id.0.to_string()),
+            );
+        }
+        second.session.models.set_current(model_a, None);
+    }
+
+    let blocked_effects = set_default_model_confirmed(&mut app, model_c);
+    assert!(blocked_effects.is_empty());
+    assert_eq!(app.models.current.as_ref(), Some(&model_b));
+    assert!(
+        app.agents[&second_id]
+            .session
+            .model_switch_rollback
+            .is_none()
+    );
+}
 /// Re-dispatching the same model
 /// id is idempotent — no PersistSetting, no SwitchModel, no
 /// reasoning_effort reset.

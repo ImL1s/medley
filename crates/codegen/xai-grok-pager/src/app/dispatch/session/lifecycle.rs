@@ -50,14 +50,17 @@ pub(crate) fn begin_model_switch_request(
     let request_id = NEXT_MODEL_SWITCH_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     session.model_switch_pending = true;
     session.model_switch_request_id = Some(request_id);
-    session
+    let rollback = session
         .model_switch_rollback
         .get_or_insert_with(|| ModelSwitchRollback {
+            request_id: Some(request_id),
+            app_models_optimistic: false,
             session_model_id: session.models.current.clone(),
             session_reasoning_effort: session.models.reasoning_effort,
             app_model_id: app_models.current.clone(),
             app_reasoning_effort: app_models.reasoning_effort,
         });
+    rollback.request_id.get_or_insert(request_id);
     Some(request_id)
 }
 /// Resolve the stashed `-m` switch and/or `cli_effort_token` against the session
@@ -1191,21 +1194,28 @@ pub(in crate::app::dispatch) fn handle_session_created(
             )));
         }
         agent.bind_session_id(session_id);
-        // The replacement is now a real session. From here onward its queue
-        // belongs to it; a later close must not restore already-adopted work to
-        // the incompatible source session.
-        agent.session.model_switch_queue_handoff_from = None;
         agent.scheduler_background_loops = scheduler_background_loops;
         if let Some(m) = new_models {
             app.models = Some(m).into();
             agent.session.models = app.models.clone();
         }
+        let handoff_requires_deferred_switch =
+            agent.session.model_switch_queue_handoff_from.is_some()
+                && agent.session.deferred_model_switch.is_some();
         let deferred = apply_deferred_model_switch(agent, app.cli_effort_token.as_deref());
         let deferred_mode = agent.deferred_session_mode.take();
         let cwd = agent.session.cwd.clone();
         let deferred_request_id = deferred
             .as_ref()
             .and_then(|_| begin_model_switch_request(&mut agent.session, &app.models));
+        // A handoff without a deferred effort switch is fully adopted by the
+        // newly-created target session. Otherwise retain the source marker
+        // until the target switch commits, so a failed preflight or session
+        // close can still restore the queue instead of draining it under an
+        // unverified model configuration.
+        if !handoff_requires_deferred_switch {
+            agent.session.model_switch_queue_handoff_from = None;
+        }
         let mut drain = if app.reconnect_pending {
             QueueDrain {
                 effects: vec![],
@@ -1556,6 +1566,7 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
         let rollback = agent.session.model_switch_rollback.take();
         let mut effects = match result {
             Ok(()) => {
+                agent.session.model_switch_queue_handoff_from = None;
                 agent.session.user_model_preference = Some(model_id.clone());
                 let display_name = agent
                     .session

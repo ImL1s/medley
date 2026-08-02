@@ -1499,7 +1499,7 @@ fn incompatible_model_switch_hands_queue_to_replacement_until_target_switch_succ
         app.agents[&replacement_id]
             .session
             .model_switch_queue_handoff_from,
-        None
+        Some(source_id)
     );
 
     let switched_effects = dispatch(
@@ -1527,6 +1527,111 @@ fn incompatible_model_switch_hands_queue_to_replacement_until_target_switch_succ
             || (remaining.len() == 1 && remaining.front().unwrap().text == "second"),
         "combining is configurable, but FIFO ownership must be preserved: {remaining:?}"
     );
+    assert_eq!(
+        app.agents[&replacement_id]
+            .session
+            .model_switch_queue_handoff_from,
+        None
+    );
+}
+
+#[test]
+fn handed_queue_stays_gated_when_deferred_target_fails_hydrate_preflight() {
+    use xai_grok_shell::sampling::types::ReasoningEffort;
+
+    for target_state in ["missing", "unready"] {
+        let mut app = test_app_with_agent();
+        let source_id = AgentId(0);
+        let model_id = acp::ModelId::new("cursor-model");
+        insert_ready_model(&mut app, source_id, &model_id);
+        app.models.available.insert(
+            model_id.clone(),
+            acp::ModelInfo::new(model_id.clone(), model_id.0.to_string()),
+        );
+        {
+            let source = app.agents.get_mut(&source_id).unwrap();
+            source.session.model_switch_pending = true;
+            source.session.model_switch_request_id = Some(0);
+            source.session.enqueue_prompt("must stay gated".into());
+        }
+        let error = xai_grok_shell::agent::config::ModelSwitchIncompatibleAgentError {
+            code: "MODEL_SWITCH_INCOMPATIBLE_AGENT".into(),
+            active_agent_type: "grok-build".into(),
+            required_agent_type: "cursor".into(),
+            model_id: model_id.0.to_string(),
+            suggestion: "start_new_session".into(),
+        };
+        dispatch(
+            Action::TaskComplete(TaskResult::SwitchModelComplete {
+                agent_id: source_id,
+                model_id: model_id.clone(),
+                effort: Some(ReasoningEffort::High),
+                request_id: 0,
+                result: Err(SwitchModelError::IncompatibleAgent {
+                    error,
+                    prev_model_id: None,
+                }),
+                prev_model_id: None,
+            }),
+            &mut app,
+        );
+        dispatch(
+            Action::AgentTypeMismatchAnswered {
+                start_new: true,
+                model_id: model_id.clone(),
+                effort: Some(ReasoningEffort::High),
+            },
+            &mut app,
+        );
+        let ActiveView::Agent(replacement_id) = app.active_view else {
+            panic!("replacement must become active");
+        };
+        let replacement_models = &mut app.agents[&replacement_id].session.models.available;
+        if target_state == "missing" {
+            replacement_models.shift_remove(&model_id);
+        } else {
+            let mut meta = serde_json::Map::new();
+            meta.insert("ready".into(), serde_json::json!(false));
+            meta.insert(
+                "readinessReason".into(),
+                serde_json::json!("target harness unavailable"),
+            );
+            replacement_models.insert(
+                model_id.clone(),
+                acp::ModelInfo::new(model_id.clone(), model_id.0.to_string()).meta(Some(meta)),
+            );
+        }
+
+        let created_effects = dispatch(
+            Action::TaskComplete(TaskResult::SessionCreated {
+                agent_id: replacement_id,
+                session_id: format!("replacement-{target_state}").into(),
+                models: None,
+                scheduler_background_loops: None,
+            }),
+            &mut app,
+        );
+
+        assert!(
+            !created_effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::SwitchModel { .. })),
+            "{target_state} target must fail before ACP switch: {created_effects:?}"
+        );
+        assert!(
+            !created_effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::SendPrompt { .. })),
+            "{target_state} target must not drain the handed queue: {created_effects:?}"
+        );
+        let replacement = &app.agents[&replacement_id].session;
+        assert_eq!(replacement.queue_len(), 1, "{target_state}");
+        assert_eq!(
+            replacement.model_switch_queue_handoff_from,
+            Some(source_id),
+            "{target_state} preflight failure must preserve recovery ownership"
+        );
+    }
 }
 
 #[test]

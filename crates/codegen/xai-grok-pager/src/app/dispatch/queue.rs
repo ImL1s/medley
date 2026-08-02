@@ -222,6 +222,13 @@ pub(super) fn maybe_drain_queue(agent: &mut AgentView) -> QueueDrain {
         log_blocked("model_switch_pending", sid);
         return QueueDrain::blocked();
     }
+    // A queue handed to a replacement session remains provisional until the
+    // replacement's required deferred model switch commits. Keeping this as a
+    // separate gate also covers preflight failures where no ACP request starts.
+    if agent.session.model_switch_queue_handoff_from.is_some() {
+        log_blocked("model_switch_queue_handoff", sid);
+        return QueueDrain::blocked();
+    }
     if agent.session.loading_replay {
         log_blocked("loading_replay", sid);
         return QueueDrain::blocked();

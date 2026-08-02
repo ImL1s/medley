@@ -2815,6 +2815,8 @@ pub(crate) mod test_fixtures {
             agent.session.model_switch_pending = true;
             agent.session.model_switch_request_id = Some(7);
             agent.session.model_switch_rollback = Some(ModelSwitchRollback {
+                request_id: Some(7),
+                app_models_optimistic: true,
                 session_model_id: Some(original.clone()),
                 session_reasoning_effort: Some(ReasoningEffort::High),
                 app_model_id: Some(original.clone()),
