@@ -72,16 +72,32 @@ jobs:
             tag="$REF_NAME"
             publish=true
           else
-            tag="${INPUT_TAG:-v0.0.0-dryrun}"
+            tag="${INPUT_TAG:-v0.0.0+providers.0}"
             publish=false
           fi
 
+          # FORK.md pins releases to v{upstream}+providers.N. A bare upstream
+          # tag like v1.2.3 would produce archives and an embedded version
+          # indistinguishable from an official build, which is the confusion
+          # this fork's release identity exists to prevent.
+          scheme_error() {
+            echo "::error::release tags must follow the fork scheme in FORK.md — v<upstream>+providers.<N>, for example v1.2.3+providers.1 (got '${tag}'). A bare upstream tag would produce artifacts indistinguishable from an official release."
+            exit 1
+          }
+
           case "$tag" in
+            v?*+providers.*) ;;
+            *) scheme_error ;;
+          esac
+
+          upstream="${tag%%+providers.*}"
+          counter="${tag##*+providers.}"
+          case "$upstream" in
             v?*) ;;
-            *)
-              echo "::error::release tags must look like 'v<version>' (got '${tag}')"
-              exit 1
-              ;;
+            *) scheme_error ;;
+          esac
+          case "$counter" in
+            '' | *[!0-9]*) scheme_error ;;
           esac
 
           version="${tag#v}"
