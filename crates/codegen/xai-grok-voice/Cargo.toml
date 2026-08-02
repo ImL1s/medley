@@ -18,6 +18,9 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "macros", "rt", "rt-multi-thread"] }
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 toml = { workspace = true }
+# Shared state-dir resolution, so `voice-probe` reads the same config.toml the
+# pager writes.
+xai-grok-config = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }
