@@ -245,6 +245,11 @@ impl WebSearchClient {
                     attempt.stop()
                 }
             }));
+        } else {
+            // Static keys get no redirect at all: a bearer attached at build
+            // time must never follow a redirect to an origin that was never
+            // classified, matching the sampler-wide no-redirect policy.
+            http_builder = http_builder.redirect(reqwest::redirect::Policy::none());
         }
         let http = xai_grok_extra_ca::with_extra_root_certificates(http_builder)
             .build()
@@ -1726,6 +1731,47 @@ mod tests {
                 .count(),
             0,
             "provider-scoped credentials must not follow redirects outside the fixed path"
+        );
+    }
+
+    /// A static (build-time) key has no dynamic provider, so the builder's
+    /// dynamic-credential redirect policy never installs. The fallback must
+    /// be Policy::none(): a 307 is surfaced, never followed with the bearer.
+    #[tokio::test]
+    async fn static_key_search_does_not_follow_redirect() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/responses"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(307).insert_header("Location", "/elsewhere"),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/elsewhere"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let config = WebSearchConfig::Enabled {
+            api_key: "static-key".to_string(),
+            base_url: server.uri(),
+            model: "test-model".to_string(),
+            extra_headers: IndexMap::new(),
+            alpha_test_key: None,
+            api_key_provider: None,
+        };
+        let client = WebSearchClient::new(&config, None).expect("client should build");
+        let error = client.search("test query", None).await.unwrap_err();
+        assert!(error.to_string().contains("HTTP 307"));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/elsewhere")
+                .count(),
+            0,
+            "static-key clients must not follow redirects"
         );
     }
 
