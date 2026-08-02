@@ -497,19 +497,14 @@ impl SessionActor {
     /// Re-register MCP tools onto a freshly-built `ToolBridge` after a
     /// zero-turn harness rebuild.
     ///
-    /// Snapshots the live MCP `Client` connections from `mcp_state` and
-    /// (eventually) re-walks each client's `list_tools` to mirror its
-    /// tool registrations onto the new bridge. Best-effort: per-server
-    /// failures are logged but do not abort the rebuild.
-    ///
-    /// Re-register MCP tools from existing clients onto the rebuilt bridge.
-    ///
-    /// Iterates over all connected MCP clients, calls `list_tools` on each
-    /// to obtain tool registrations, and registers them on the new bridge.
-    /// Errors on individual servers are logged but don't abort the process.
-    /// After re-registration, refreshes the tool metadata snapshot so
-    /// `search_tool` returns accurate results.
-    pub(super) async fn re_register_mcp_tools_on_rebuilt_bridge(&self) {
+    /// Stage every live MCP registration on a freshly-built bridge before it
+    /// becomes session-visible. Unlike startup's best-effort reconciliation,
+    /// a model-switch rebuild is transactional: one missing server/tool aborts
+    /// the switch while the old bridge remains active.
+    pub(super) async fn stage_mcp_tools_on_bridge(
+        &self,
+        bridge: &std::sync::Arc<xai_grok_tools::bridge::ToolBridge>,
+    ) -> Result<(), acp::Error> {
         // Snapshot server names + client Arcs to avoid holding the lock
         // across async list_tools calls.
         let clients: Vec<(
@@ -523,8 +518,7 @@ impl SessionActor {
         };
 
         if clients.is_empty() {
-            self.refresh_mcp_snapshot_and_schedule_reminder().await;
-            return;
+            return Ok(());
         }
 
         tracing::info!(
@@ -534,36 +528,44 @@ impl SessionActor {
         );
 
         let mcp_state_arc = std::sync::Arc::clone(&self.mcp_state);
-        let mut all_ui_tools: std::collections::HashMap<
-            String,
-            Vec<crate::extensions::mcp::McpToolEntry>,
-        > = std::collections::HashMap::new();
-
         for (server_name, client) in &clients {
-            let registrations = match client
+            let registrations = client
                 .get_tool_registrations(std::sync::Arc::clone(&mcp_state_arc))
                 .await
-            {
-                Ok(regs) => regs,
-                Err(e) => {
-                    tracing::warn!(
-                        session_id = %self.session_info.id.0,
-                        server = %server_name,
-                        error = %e,
-                        "re_register_mcp_tools_on_rebuilt_bridge: failed to list tools, skipping server"
-                    );
-                    continue;
-                }
-            };
+                .map_err(|e| {
+                    acp::Error::internal_error().data(format!(
+                        "rebuild_agent: failed to list MCP tools for server={server_name}: {e}"
+                    ))
+                })?;
 
             let tool_count = registrations.len();
-            let mut mcp_state = self.mcp_state.lock().await;
-
             for reg in registrations {
-                self.register_mcp_tool(server_name, reg, &mut mcp_state, &mut all_ui_tools)
-                    .await;
+                let unqualified = reg
+                    .name
+                    .strip_prefix(&format!(
+                        "{}{}",
+                        server_name,
+                        crate::session::mcp_servers::MCP_TOOL_NAME_DELIMITER
+                    ))
+                    .unwrap_or(&reg.name)
+                    .to_owned();
+                let disabled = self
+                    .mcp_state
+                    .lock()
+                    .await
+                    .is_tool_disabled(server_name, &unqualified);
+                if reg.model_visible && !disabled {
+                    let qualified_name = reg.name.clone();
+                    bridge
+                        .register_mcp_tools(reg.name, reg.tool, Some(reg.input_schema))
+                        .await
+                        .map_err(|e| {
+                            acp::Error::internal_error().data(format!(
+                                "rebuild_agent: failed to register MCP tool={qualified_name} server={server_name}: {e}"
+                            ))
+                        })?;
+                }
             }
-            drop(mcp_state);
 
             tracing::info!(
                 session_id = %self.session_info.id.0,
@@ -572,10 +574,6 @@ impl SessionActor {
                 "re_register_mcp_tools_on_rebuilt_bridge: re-registered tools"
             );
         }
-
-        // Refresh the snapshot so search_tool returns accurate results
-        // against the newly-registered tools.
-        self.refresh_mcp_snapshot_and_schedule_reminder().await;
-        self.emit_mcp_tools_changed_notifications(all_ui_tools);
+        Ok(())
     }
 }

@@ -971,12 +971,22 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                 agent.session.deferred_model_switch = Some((model_id, effort));
                 return vec![];
             };
-            agent.session.model_switch_pending = true;
+            let request_id = super::session::lifecycle::begin_model_switch_request(
+                &mut app.model_switch_transaction,
+                id,
+                &mut agent.session,
+                &app.models,
+            );
+            let Some(request_id) = request_id else {
+                app.show_toast("Wait for the current model switch to finish");
+                return vec![];
+            };
             vec![Effect::SwitchModel {
                 agent_id: id,
                 session_id,
                 model_id,
                 effort,
+                request_id,
                 prev_model_id: None,
             }]
         }
@@ -1303,10 +1313,11 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             vec![]
         }
         Action::AgentTypeMismatchAnswered {
+            source_id,
             start_new,
             model_id,
             effort,
-        } => dispatch_agent_type_mismatch_answered(app, start_new, model_id, effort),
+        } => dispatch_agent_type_mismatch_answered(app, source_id, start_new, model_id, effort),
         Action::AuthClassSwitchAnswered {
             proceed,
             model_id,

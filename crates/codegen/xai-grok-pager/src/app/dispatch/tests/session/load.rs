@@ -95,6 +95,46 @@ fn session_loaded_with_restore_shows_summary_in_scrollback() {
         "SessionLoaded must store restore_degree on the session"
     );
 }
+
+#[test]
+fn restored_session_applies_deferred_switch_before_draining_prompt_queue() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let model_id = acp::ModelId::new("deferred-model");
+    insert_ready_model(&mut app, id, &model_id);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.session_id = None;
+        agent.session.deferred_model_switch = Some((model_id.clone(), None));
+        agent.session.enqueue_prompt("queued after restore".into());
+    }
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SessionLoaded {
+            agent_id: id,
+            session_id: acp::SessionId::new("restored-session"),
+            models: None,
+            code_restored: false,
+            restore_summary: None,
+            restore_degree: None,
+            running_prompt_id: None,
+            scheduler_background_loops: None,
+        }),
+        &mut app,
+    );
+
+    assert!(
+        matches!(effects.first(), Some(Effect::SwitchModel { model_id: id, .. }) if id == &model_id)
+    );
+    assert!(
+        effects
+            .iter()
+            .all(|effect| !matches!(effect, Effect::SendPrompt { .. })),
+        "queued prompt must remain gated until SwitchModelComplete: {effects:?}",
+    );
+    assert!(app.agents[&id].session.model_switch_pending);
+    assert_eq!(app.agents[&id].session.queue_len(), 1);
+}
 /// Title hydration for an auto-generated title keeps today's behavior:
 /// only `generated_session_title` is set, never `display_name` (no
 /// border title).

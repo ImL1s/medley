@@ -434,7 +434,12 @@ impl AgentView {
         if let Some(rid) = self.pending_recap_entry.take() {
             self.scrollback.remove_entry(rid);
         }
+        if let Some(rollback) = self.session.model_switch_rollback.take() {
+            self.session.models.current = rollback.session_model_id;
+            self.session.models.reasoning_effort = rollback.session_reasoning_effort;
+        }
         self.session.model_switch_pending = false;
+        self.session.model_switch_request_id = None;
         self.pending_adoption_updates.clear();
         let fresh = self.scrollback.fresh_continuation();
         self.session_reload = Some(SessionReload {

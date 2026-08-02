@@ -1990,6 +1990,55 @@ fn resolve_model_override_to_config_no_resolver_for_byok_model() {
     assert!(config.bearer_resolver.is_none());
     assert_eq!(config.api_key.as_deref(), Some("sk-byok"));
 }
+
+#[test]
+fn explicit_subagent_model_rejects_unavailable_custom_harness() {
+    let active = xai_grok_agent::AgentDefinition::grok_build_plan();
+    assert_eq!(
+        validate_subagent_model_harness(&active, "missing-custom-harness", None),
+        Err(SubagentModelHarnessError::Unavailable),
+    );
+}
+
+#[test]
+fn explicit_subagent_model_rejects_incompatible_resolved_harness() {
+    let active = xai_grok_agent::AgentDefinition::grok_build_plan();
+    let required = xai_grok_agent::AgentDefinition::codex();
+    assert_eq!(
+        validate_subagent_model_harness(&active, "codex", Some(&required)),
+        Err(SubagentModelHarnessError::Incompatible),
+    );
+}
+
+#[test]
+fn explicit_subagent_model_resolves_and_rejects_same_named_external_harness() {
+    let mut active = xai_grok_agent::AgentDefinition::default_grok_build();
+    active.plugin_name = Some("plugin-one".to_owned());
+    active.source_path = Some(std::path::PathBuf::from(
+        "/plugins/plugin-one/agents/grok-build.md",
+    ));
+    active.prompt_body = Some("Plugin-owned grok-build prompt".to_owned());
+    let cwd = tempfile::tempdir().unwrap();
+    assert_eq!(
+        resolve_and_validate_subagent_model_harness(&active, "grok-build", cwd.path(), None),
+        Err(SubagentModelHarnessError::Incompatible),
+    );
+}
+
+#[test]
+fn explicit_subagent_model_accepts_exact_or_stock_compatible_harness() {
+    let active = xai_grok_agent::AgentDefinition::codex();
+    assert_eq!(
+        validate_subagent_model_harness(&active, "codex", None),
+        Ok(()),
+    );
+    let stock = xai_grok_agent::AgentDefinition::grok_build_plan();
+    let required_stock = xai_grok_agent::AgentDefinition::default_grok_build();
+    assert_eq!(
+        validate_subagent_model_harness(&stock, "grok-build", Some(&required_stock)),
+        Ok(()),
+    );
+}
 #[tokio::test]
 async fn read_parent_sampling_config_resolves_backend_search_from_catalog() {
     let mut entry = test_model_entry("grok-4.5");

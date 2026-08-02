@@ -1065,21 +1065,150 @@ pub(crate) fn agent_name_after_model_switch(
 }
 /// Harness compatibility for zero-turn / mid-turn model switching.
 ///
-/// Two stock (non-strict) agents are interchangeable — they share the
-/// default wire format and toolset, so switching e.g. `grok-build` →
-/// `grok-build-plan` doesn't require rebuilding the harness and would
-/// destroy a client-supplied `_meta.agentProfile` if it did.
-///
-/// Strict harnesses (`codex`, …) are only compatible with
-/// themselves. Strict↔stock transitions are never compatible.
-pub(crate) fn harnesses_are_compatible(active: &str, required: &str) -> bool {
-    use xai_grok_agent::config::is_strict_harness_agent_type;
-    match (
-        is_strict_harness_agent_type(active),
-        is_strict_harness_agent_type(required),
+/// Exact built-in identities are always compatible. Differing definitions are
+/// only interchangeable when both are structurally stock built-ins. Plugin and
+/// file-backed definitions additionally require the same owning namespace and
+/// source path, because their Markdown prompt body is not part of structural
+/// strict-harness classification. A missing required definition is deliberately
+/// incompatible: unknown/custom names must never inherit the active harness.
+pub(crate) fn harnesses_are_compatible(
+    active: &xai_grok_agent::AgentDefinition,
+    required_agent_type: &str,
+    required: Option<&xai_grok_agent::AgentDefinition>,
+) -> bool {
+    let Some(required) = required else {
+        return active.name == required_agent_type
+            && active.plugin_name.is_none()
+            && active.source_path.is_none()
+            && active.prompt_body.is_none();
+    };
+
+    // Plugin and file-backed definitions carry prompt identity outside the
+    // structural strict-harness fields. Bare and qualified plugin lookups are
+    // compatible when they resolve to the same owning plugin/file, but two
+    // plugins (or two custom prompt files) with the same agent name are not.
+    let has_external_identity = active.plugin_name.is_some()
+        || required.plugin_name.is_some()
+        || active.source_path.is_some()
+        || required.source_path.is_some()
+        || active.prompt_body.is_some()
+        || required.prompt_body.is_some();
+    if has_external_identity || active.is_strict_harness() || required.is_strict_harness() {
+        return definitions_have_same_runtime_contract(active, required);
+    }
+
+    if active.name == required.name {
+        return true;
+    }
+
+    !active.is_strict_harness() && !required.is_strict_harness()
+}
+
+/// Select the first ready model whose required harness can reuse the active
+/// session definition. Candidate order is preserved so catalog priority stays
+/// authoritative while incompatible strict harnesses are skipped.
+pub(crate) fn first_ready_compatible_model<I, ResolveModel, ResolveDefinition>(
+    candidates: I,
+    active_definition: &xai_grok_agent::AgentDefinition,
+    mut resolve_model: ResolveModel,
+    mut resolve_definition: ResolveDefinition,
+) -> Option<acp::ModelId>
+where
+    I: IntoIterator<Item = acp::ModelId>,
+    ResolveModel: FnMut(&acp::ModelId) -> Option<ModelEntry>,
+    ResolveDefinition: FnMut(&str) -> Option<xai_grok_agent::AgentDefinition>,
+{
+    candidates.into_iter().find(|model_id| {
+        let Some(model) = resolve_model(model_id) else {
+            return false;
+        };
+        if !crate::agent::config::model_readiness(&model).0 {
+            return false;
+        }
+        let required_agent_type = model.info().agent_type.as_str();
+        let required_definition = resolve_definition(required_agent_type);
+        harnesses_are_compatible(
+            active_definition,
+            required_agent_type,
+            required_definition.as_ref(),
+        )
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ColdSpawnModelSelection {
+    pub(crate) model_id: acp::ModelId,
+    pub(crate) unavailable_model: Option<acp::ModelId>,
+}
+
+impl ColdSpawnModelSelection {
+    fn replace_unavailable_latch(
+        &self,
+        registry: &SessionRegistry,
+        session_id: &acp::SessionId,
     ) {
-        (false, false) => true,
-        (true, true) => active == required,
+        registry.take_unavailable_model(session_id);
+        if let Some(model_id) = self.unavailable_model.as_ref() {
+            registry.set_unavailable_model(session_id, model_id.clone());
+        }
+    }
+}
+
+pub(crate) fn cold_spawn_fallback_selection(
+    persisted_model: &acp::ModelId,
+    catalog_fallback: Option<acp::ModelId>,
+    current_only_fallback: Option<acp::ModelId>,
+) -> ColdSpawnModelSelection {
+    if let Some(model_id) = catalog_fallback {
+        return ColdSpawnModelSelection {
+            model_id,
+            unavailable_model: None,
+        };
+    }
+    ColdSpawnModelSelection {
+        model_id: current_only_fallback.unwrap_or_else(|| persisted_model.clone()),
+        unavailable_model: Some(persisted_model.clone()),
+    }
+}
+
+/// Apply the main session's authoritative CLI clamps to a freshly discovered
+/// model-required definition.
+///
+/// The active agent was built after these overrides were applied. Model-switch
+/// compatibility and a possible zero-turn rebuild must therefore use the same
+/// effective definition: comparing against, or rebuilding from, the raw
+/// discovered definition would either report a false mismatch or drop the
+/// operator's tool and permission restrictions.
+pub(crate) fn apply_session_cli_clamps(
+    definition: Option<xai_grok_agent::AgentDefinition>,
+    overrides: &crate::agent::config::CliAgentOverrides,
+) -> Option<xai_grok_agent::AgentDefinition> {
+    definition.map(|mut definition| {
+        overrides.apply_to_definition(&mut definition);
+        definition
+    })
+}
+
+fn definitions_have_same_runtime_contract(
+    active: &xai_grok_agent::AgentDefinition,
+    required: &xai_grok_agent::AgentDefinition,
+) -> bool {
+    if active.plugin_name != required.plugin_name
+        || active.source_path != required.source_path
+        || active.prompt_body != required.prompt_body
+        || active.system_prompt != required.system_prompt
+        || active.allowed_subagent_types != required.allowed_subagent_types
+        || active.session_tools_allowlist != required.session_tools_allowlist
+        || active.session_tools_denylist != required.session_tools_denylist
+        || active.scope != required.scope
+    {
+        return false;
+    }
+    match (
+        serde_json::to_value(active),
+        serde_json::to_value(required),
+    ) {
+        (Ok(active), Ok(required)) => active == required,
         _ => false,
     }
 }

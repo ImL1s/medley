@@ -957,6 +957,7 @@ fn switch_model_dispatch_produces_effect_and_sets_pending() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
     let model_id = acp::ModelId::new(std::sync::Arc::from("grok-4.5"));
+    insert_ready_model(&mut app, id, &model_id);
     assert!(!app.agents[&id].session.model_switch_pending);
     let effects = dispatch(
         Action::SwitchModel {
@@ -1201,6 +1202,7 @@ fn switch_model_allowed_when_agent_chat_kind() {
     let id = AgentId(0);
     app.agents.get_mut(&id).unwrap().chat_kind = true;
     let model_id = acp::ModelId::new(std::sync::Arc::from("auto"));
+    insert_ready_model(&mut app, id, &model_id);
     let effects = dispatch(
         Action::SwitchModel {
             model_id: model_id.clone(),
@@ -1218,6 +1220,7 @@ fn switch_model_allowed_when_app_chat_mode() {
     let id = AgentId(0);
     app.chat_mode = true;
     let model_id = acp::ModelId::new(std::sync::Arc::from("auto"));
+    insert_ready_model(&mut app, id, &model_id);
     let effects = dispatch(
         Action::SwitchModel {
             model_id: model_id.clone(),
@@ -1237,6 +1240,7 @@ fn agent_type_mismatch_cancel_is_noop() {
     let agent_count_before = app.agents.len();
     let effects = dispatch(
         Action::AgentTypeMismatchAnswered {
+            source_id: id,
             start_new: false,
             model_id,
             effort: None,
@@ -1255,6 +1259,7 @@ fn agent_type_mismatch_with_effort_stashes_deferred_switch() {
     let effort = Some(ReasoningEffort::High);
     let effects = dispatch(
         Action::AgentTypeMismatchAnswered {
+            source_id: AgentId(0),
             start_new: true,
             model_id: model_id.clone(),
             effort,
@@ -1704,6 +1709,8 @@ fn deferred_switch_overwritten_by_second_switch() {
     let id = AgentId(0);
     let model_a = acp::ModelId::new(std::sync::Arc::from("model-a"));
     let model_b = acp::ModelId::new(std::sync::Arc::from("model-b"));
+    insert_ready_model(&mut app, id, &model_a);
+    insert_ready_model(&mut app, id, &model_b);
     app.agents.get_mut(&id).unwrap().session.session_id = None;
     dispatch(
         Action::SwitchModel {

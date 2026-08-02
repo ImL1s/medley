@@ -2978,9 +2978,10 @@ impl MvpAgent {
     ///
     /// Returns an RAII guard; while it is alive,
     /// [`Self::wait_for_in_flight_session_load`] blocks racing session-scoped
-    /// requests for the same session. Dropping the guard (every exit path of
-    /// `load_session`, success or error) removes the marker and wakes all
-    /// waiters via watch-channel closure.
+    /// requests for the same session, including the interval after its handle
+    /// is registered but before persisted state restoration finishes. Dropping
+    /// the guard (every exit path of `load_session`, success or error) removes
+    /// the marker and wakes all waiters via watch-channel closure.
     pub(super) fn begin_session_load(
         &self,
         session_id: &acp::SessionId,
@@ -3010,22 +3011,33 @@ impl MvpAgent {
         &self,
         session_id: &acp::SessionId,
     ) -> Option<crate::session::SessionHandle> {
-        let existing = self.sessions.borrow().get(session_id).cloned();
-        if existing.is_some() {
-            return existing;
-        }
         self.wait_for_in_flight_session_load(session_id).await;
         self.sessions.borrow().get(session_id).cloned()
+    }
+    /// Resolve the registered handle from inside the active `session/load`.
+    ///
+    /// Unlike [`Self::session_handle_waiting_for_load`], this deliberately does
+    /// not wait for the marker owned by its caller. Requiring that marker to be
+    /// present keeps the bypass exclusive to the production restore path.
+    pub(crate) fn session_handle_during_load(
+        &self,
+        session_id: &acp::SessionId,
+    ) -> Option<crate::session::SessionHandle> {
+        self.loading_sessions
+            .borrow()
+            .contains_key(session_id)
+            .then(|| self.sessions.borrow().get(session_id).cloned())
+            .flatten()
     }
     /// If a `session/load` for `session_id` is in flight, wait (bounded) for
     /// it to finish. Returns immediately when no load is in flight.
     ///
     /// This closes the load-vs-request race after a leader restart: clients
     /// replay `session/load` on reconnect, and a `session/prompt` arriving
-    /// right behind it must wait for the session to land in `self.sessions`
-    /// instead of failing with "unknown session id". The wait wakes when the
-    /// load's [`SessionLoadGuard`] drops (success or failure) and re-checks;
-    /// a failed load still surfaces the original error to the caller.
+    /// right behind it must wait until registration *and restoration* finish.
+    /// The wait wakes when the load's [`SessionLoadGuard`] drops (success or
+    /// failure) and re-checks; a failed load still surfaces the original error
+    /// to the caller.
     pub(crate) async fn wait_for_in_flight_session_load(
         &self,
         session_id: &acp::SessionId,
@@ -3035,9 +3047,6 @@ impl MvpAgent {
         );
         let deadline = tokio::time::Instant::now() + LOAD_WAIT_TIMEOUT;
         loop {
-            if self.sessions.borrow().contains_key(session_id) {
-                return;
-            }
             let rx = self.loading_sessions.borrow().get(session_id).cloned();
             let Some(mut rx) = rx else { return };
             let now = tokio::time::Instant::now();
@@ -3993,8 +4002,9 @@ impl MvpAgent {
     /// 6. Built-in default agent.
     ///
     /// `GROK_AGENT` and an explicit `[agent] name` bypass step 1.
-    /// Strict-harness classification is structural — see
-    /// [`xai_grok_agent::config::is_strict_harness_agent_type`].
+    /// A model-selected definition wins when its runtime identity is exact:
+    /// either its wire harness is structurally strict, or it is backed by a
+    /// plugin/custom definition whose source and prompt must be preserved.
     ///
     /// Harness inheritance for a profile that pins its own model is applied by
     /// the caller via [`inherited_harness_template`], not here.
@@ -4005,16 +4015,45 @@ impl MvpAgent {
         acp_agent_profile: Option<xai_grok_agent::AgentDefinition>,
         model_agent_type: Option<&str>,
     ) -> xai_grok_agent::AgentDefinition {
+        Self::resolve_agent_definition_with_plugins(
+            cwd,
+            agent_profile_path,
+            agent_config,
+            acp_agent_profile,
+            model_agent_type,
+            None,
+        )
+    }
+
+    pub(crate) fn resolve_agent_definition_with_plugins(
+        cwd: &std::path::Path,
+        agent_profile_path: Option<&std::path::Path>,
+        agent_config: &config::AgentSelectionConfig,
+        acp_agent_profile: Option<xai_grok_agent::AgentDefinition>,
+        model_agent_type: Option<&str>,
+        plugins: Option<&xai_grok_agent::plugins::PluginRegistry>,
+    ) -> xai_grok_agent::AgentDefinition {
         use xai_grok_agent::AgentDefinition;
         let grok_agent_env_set = std::env::var("GROK_AGENT")
             .ok()
             .is_some_and(|s| !s.trim().is_empty());
         let config_agent_explicitly_set = agent_config.name.is_some();
-        let model_requires_strict_harness = model_agent_type
-            .is_some_and(xai_grok_agent::config::is_strict_harness_agent_type);
+        // Resolve the concrete definition before classifying it. Name-only
+        // classification deliberately treats unknown names as non-strict, but
+        // plugin/project/user definitions still have an exact runtime identity
+        // even when their wire template and toolset are structurally stock.
+        let model_agent_definition = model_agent_type.and_then(|required| {
+            xai_grok_agent::discovery::by_name_in_cwd_with_plugins(required, cwd, plugins)
+        });
+        let model_requires_exact_harness = model_agent_definition.as_ref().is_some_and(|def| {
+            def.is_strict_harness()
+                || def.plugin_name.is_some()
+                || def.source_path.is_some()
+                || def.prompt_body.is_some()
+        });
         if !grok_agent_env_set && !config_agent_explicitly_set
-            && model_requires_strict_harness && let Some(required) = model_agent_type
-            && let Some(def) = xai_grok_agent::discovery::by_name_in_cwd(required, cwd)
+            && model_requires_exact_harness
+            && let Some(def) = model_agent_definition.clone()
         {
             tracing::info!(
                 agent_name = %def.name,
@@ -4072,7 +4111,9 @@ impl MvpAgent {
                 agent_name = %name,
                 "Resolving agent definition from config.toml [agent] name"
             );
-            if let Some(def) = xai_grok_agent::discovery::by_name_in_cwd(name, cwd) {
+            if let Some(def) = xai_grok_agent::discovery::by_name_in_cwd_with_plugins(
+                name, cwd, plugins,
+            ) {
                 return def;
             }
             tracing::warn!(
@@ -4100,22 +4141,22 @@ impl MvpAgent {
                     }
                 }
             }
-            Some(name) => {
-                xai_grok_agent::discovery::by_name_in_cwd(name, cwd)
-                    .unwrap_or_else(AgentDefinition::grok_build_plan)
-            }
+            Some(name) => xai_grok_agent::discovery::by_name_in_cwd_with_plugins(
+                name, cwd, plugins,
+            )
+            .unwrap_or_else(AgentDefinition::grok_build_plan),
             None => AgentDefinition::grok_build_plan(),
         };
         if !grok_agent_env_set && !config_agent_explicitly_set
-            && model_requires_strict_harness && let Some(required) = model_agent_type
-            && resolved.name != required
+            && model_requires_exact_harness && let Some(required) = model_agent_type
+            && !harnesses_are_compatible(&resolved, required, model_agent_definition.as_ref())
         {
             tracing::info!(
                 resolved_agent = %resolved.name,
                 model_agent_type = %required,
                 "resolve_agent_definition: model requires different agent, re-resolving"
             );
-            if let Some(def) = xai_grok_agent::discovery::by_name_in_cwd(required, cwd) {
+            if let Some(def) = model_agent_definition {
                 return def;
             }
             tracing::warn!(
@@ -4480,14 +4521,16 @@ impl MvpAgent {
         let session_default_agent_profile = acp_agent_profile
             .as_ref()
             .map(|d| d.name.clone());
+        let plugin_registry = self.plugin_registry_handle.snapshot();
         let mut agent_definition = {
             let cfg = self.cfg.borrow();
-            Self::resolve_agent_definition(
+            Self::resolve_agent_definition_with_plugins(
                 cwd.as_path(),
                 cfg.agent_profile_path.as_deref(),
                 &cfg.agent,
                 acp_agent_profile,
                 model_agent_type,
+                plugin_registry.as_deref(),
             )
         };
         {

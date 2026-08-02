@@ -416,6 +416,9 @@ fn build_fork_placeholder(
             available_commands_generation: 1,
             available_tools: None,
             model_switch_pending: false,
+            model_switch_request_id: None,
+            model_switch_rollback: None,
+            model_switch_queue_handoff_from: None,
             user_model_preference: None,
             deferred_model_switch: app.deferred_model_switch_from_cli(),
             bg_tasks: std::collections::BTreeMap::new(),
@@ -522,8 +525,7 @@ pub(in crate::app::dispatch) fn handle_worktree_forked(
         &session_id_str,
         &app.cwd,
     ) {
-        refuse_chat_mode_build_agent(app, agent_id);
-        return vec![];
+        return refuse_chat_mode_build_agent(app, agent_id);
     }
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         supersede_open_reload_window(agent, agent_id, "WorktreeForked");
@@ -582,8 +584,7 @@ pub(in crate::app::dispatch) fn handle_fork_session_ready(
         &session_id_str,
         &app.cwd,
     ) {
-        refuse_chat_mode_build_agent(app, agent_id);
-        return vec![];
+        return refuse_chat_mode_build_agent(app, agent_id);
     }
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         supersede_open_reload_window(agent, agent_id, "ForkSessionReady");

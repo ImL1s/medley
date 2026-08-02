@@ -901,6 +901,110 @@ fn resolve_agent_definition_acp_profile_wins_for_explicit_grok_build_family() {
         unsafe { std::env::set_var("GROK_AGENT", v) }
     }
 }
+/// A model-declared Markdown definition carries an exact prompt/source
+/// identity even when it otherwise uses the stock wire template and toolset.
+#[test]
+#[serial_test::serial]
+fn resolve_agent_definition_model_selects_nonstrict_custom_prompt() {
+    let prev = std::env::var("GROK_AGENT").ok();
+    unsafe {
+        std::env::remove_var("GROK_AGENT");
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let agents_dir = tmp.path().join(".grok").join("agents");
+    std::fs::create_dir_all(&agents_dir).unwrap();
+    std::fs::write(
+        agents_dir.join("issue-nine-reviewer.md"),
+        "---\nname: issue-nine-reviewer\ndescription: exact custom prompt\n---\nReview issue nine.\n",
+    )
+    .unwrap();
+
+    let acp_profile = xai_grok_agent::AgentDefinition::from_json(&serde_json::json!({
+        "name": "client-profile",
+        "description": "must not replace the model-declared custom harness",
+    }))
+    .unwrap();
+    let def = MvpAgent::resolve_agent_definition(
+        tmp.path(),
+        None,
+        &config::AgentSelectionConfig::default(),
+        Some(acp_profile),
+        Some("issue-nine-reviewer"),
+    );
+
+    assert_eq!(def.name, "issue-nine-reviewer");
+    assert_eq!(def.prompt_body.as_deref(), Some("Review issue nine."));
+    assert!(def.source_path.is_some());
+    assert!(!def.is_strict_harness());
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_AGENT", v) },
+        None => unsafe { std::env::remove_var("GROK_AGENT") },
+    }
+}
+/// Both qualified and unambiguous bare plugin names must resolve to the same
+/// exact non-strict plugin definition rather than the ambient default/profile.
+#[test]
+#[serial_test::serial]
+fn resolve_agent_definition_model_selects_nonstrict_plugin_bare_and_qualified() {
+    let prev = std::env::var("GROK_AGENT").ok();
+    unsafe {
+        std::env::remove_var("GROK_AGENT");
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let plugin_root = tmp.path().join("plugin-one");
+    let agents_dir = plugin_root.join("agents");
+    std::fs::create_dir_all(&agents_dir).unwrap();
+    std::fs::write(plugin_root.join("plugin.json"), r#"{"name":"plugin-one"}"#).unwrap();
+    std::fs::write(
+        agents_dir.join("issue-nine-plugin-reviewer.md"),
+        "---\nname: issue-nine-plugin-reviewer\ndescription: plugin prompt\n---\nReview from plugin one.\n",
+    )
+    .unwrap();
+    let discovery = xai_grok_agent::plugins::discovery::DiscoveryConfig {
+        cli_plugin_dirs: vec![plugin_root],
+        ..Default::default()
+    };
+    let discovered = xai_grok_agent::plugins::discover_plugins(
+        Some(tmp.path()),
+        &discovery,
+        &xai_grok_agent::plugins::TrustStore::load_from(tmp.path().join("trust")),
+        true,
+    );
+    let registry = xai_grok_agent::plugins::PluginRegistry::from_discovered(
+        discovered,
+        &[],
+        &["plugin-one".to_owned()],
+    );
+    let acp_profile = xai_grok_agent::AgentDefinition::from_json(&serde_json::json!({
+        "name": "client-profile",
+        "description": "must not replace the model-declared plugin harness",
+    }))
+    .unwrap();
+
+    for required in [
+        "issue-nine-plugin-reviewer",
+        "plugin-one:issue-nine-plugin-reviewer",
+    ] {
+        let def = MvpAgent::resolve_agent_definition_with_plugins(
+            tmp.path(),
+            None,
+            &config::AgentSelectionConfig::default(),
+            Some(acp_profile.clone()),
+            Some(required),
+            Some(&registry),
+        );
+        assert_eq!(def.name, "issue-nine-plugin-reviewer");
+        assert_eq!(def.plugin_name.as_deref(), Some("plugin-one"));
+        assert_eq!(def.prompt_body.as_deref(), Some("Review from plugin one."));
+        assert!(def.source_path.is_some());
+        assert!(!def.is_strict_harness());
+        assert!(harnesses_are_compatible(&def, required, Some(&def)));
+    }
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_AGENT", v) },
+        None => unsafe { std::env::remove_var("GROK_AGENT") },
+    }
+}
 /// A non-strict (stock / vision-capable) model leaves the template alone, so
 /// such models keep native image input.
 #[test]
@@ -1101,22 +1205,315 @@ fn enqueue_replace_system_prompt_override_noop_when_absent_or_empty() {
 /// custom prompt body is preserved.
 #[test]
 fn harnesses_are_compatible_for_stock_family_pairs() {
-    assert!(harnesses_are_compatible("grok-build", "grok-build-plan"));
-    assert!(harnesses_are_compatible("grok-build-plan", "grok-build"));
-    assert!(harnesses_are_compatible("grok-build", "grok-build"));
+    let stock = |name: &str| {
+        let mut definition = xai_grok_agent::AgentDefinition::default_grok_build();
+        definition.name = name.to_owned();
+        definition
+    };
+    let grok_build = stock("grok-build");
+    let grok_build_plan = stock("grok-build-plan");
+    let grok_build_concise = stock("grok-build-concise");
+    let remote_sidebar = stock("remote-sidebar");
     assert!(harnesses_are_compatible(
-        "grok-build-concise",
-        "grok-build-plan"
+        &grok_build,
+        "grok-build-plan",
+        Some(&grok_build_plan),
     ));
     assert!(harnesses_are_compatible(
-        "remote-sidebar",
-        "grok-build-plan"
+        &grok_build_plan,
+        "grok-build",
+        Some(&grok_build),
+    ));
+    assert!(harnesses_are_compatible(&grok_build, "grok-build", None));
+    assert!(harnesses_are_compatible(
+        &grok_build_concise,
+        "grok-build-plan",
+        Some(&grok_build_plan),
+    ));
+    assert!(harnesses_are_compatible(
+        &remote_sidebar,
+        "grok-build-plan",
+        Some(&grok_build_plan),
     ));
 }
 #[test]
 fn harnesses_are_compatible_rejects_strict_mismatches() {
-    assert!(harnesses_are_compatible("codex", "codex"));
-    assert!(!harnesses_are_compatible("grok-build-plan", "codex"));
+    let codex = xai_grok_agent::AgentDefinition::codex();
+    let stock = xai_grok_agent::AgentDefinition::grok_build_plan();
+    assert!(harnesses_are_compatible(&codex, "codex", None));
+    assert!(!harnesses_are_compatible(
+        &stock,
+        "codex",
+        Some(&codex),
+    ));
+    assert!(!harnesses_are_compatible(
+        &stock,
+        "missing-custom-harness",
+        None,
+    ));
+}
+
+fn ready_fallback_entry(model_id: &str, agent_type: &str) -> ModelEntry {
+    let mut entry = ModelEntry::fallback(model_id, &config::EndpointsConfig::default());
+    entry.info.agent_type = agent_type.to_owned();
+    entry
+}
+
+#[test]
+fn ready_compatible_fallback_skips_incompatible_candidate_in_catalog_order() {
+    let active = xai_grok_agent::AgentDefinition::codex();
+    let candidates = [
+        acp::ModelId::new("first-ready-incompatible"),
+        acp::ModelId::new("second-ready-compatible"),
+    ];
+
+    let selected = first_ready_compatible_model(
+        candidates.clone(),
+        &active,
+        |id| match id.0.as_ref() {
+            "first-ready-incompatible" => Some(ready_fallback_entry(id.0.as_ref(), "cursor")),
+            "second-ready-compatible" => Some(ready_fallback_entry(id.0.as_ref(), "codex")),
+            _ => None,
+        },
+        |agent_type| {
+            xai_grok_agent::discovery::by_name_in_cwd(agent_type, std::path::Path::new("."))
+        },
+    );
+
+    assert_eq!(selected, Some(candidates[1].clone()));
+}
+
+#[test]
+fn ready_compatible_fallback_returns_none_without_compatible_candidate() {
+    let active = xai_grok_agent::AgentDefinition::codex();
+    let candidates = [
+        acp::ModelId::new("ready-cursor"),
+        acp::ModelId::new("ready-grok-build"),
+    ];
+
+    let selected = first_ready_compatible_model(
+        candidates,
+        &active,
+        |id| match id.0.as_ref() {
+            "ready-cursor" => Some(ready_fallback_entry(id.0.as_ref(), "cursor")),
+            "ready-grok-build" => Some(ready_fallback_entry(id.0.as_ref(), "grok-build")),
+            _ => None,
+        },
+        |agent_type| {
+            xai_grok_agent::discovery::by_name_in_cwd(agent_type, std::path::Path::new("."))
+        },
+    );
+
+    assert_eq!(selected, None);
+}
+
+#[test]
+fn cold_spawn_unresolved_model_uses_catalog_compatible_fallback_without_latch() {
+    let persisted = acp::ModelId::new("persisted-unresolved");
+    let compatible = acp::ModelId::new("second-ready-compatible");
+
+    let selection =
+        cold_spawn_fallback_selection(&persisted, Some(compatible.clone()), None);
+
+    assert_eq!(selection.model_id, compatible);
+    assert_eq!(selection.unavailable_model, None);
+}
+
+#[test]
+fn cold_spawn_restore_preserves_unavailable_latch_without_compatible_fallback() {
+    let persisted = acp::ModelId::new("persisted-unavailable");
+
+    let selection = cold_spawn_fallback_selection(&persisted, None, None);
+
+    assert_eq!(selection.model_id, persisted.clone());
+    assert_eq!(selection.unavailable_model, Some(persisted));
+}
+
+#[test]
+fn cold_spawn_current_only_fallback_keeps_persisted_model_latched() {
+    let persisted = acp::ModelId::new("persisted-unready");
+    let current = acp::ModelId::new("current-compatible-but-not-selectable");
+
+    let selection =
+        cold_spawn_fallback_selection(&persisted, None, Some(current.clone()));
+
+    assert_eq!(selection.model_id, current);
+    assert_eq!(selection.unavailable_model, Some(persisted));
+}
+
+#[test]
+fn cold_spawn_usable_fallback_clears_stale_unavailable_latch() {
+    let registry = SessionRegistry::default();
+    let session_id = acp::SessionId::new("cold-spawn-stale-latch");
+    let persisted = acp::ModelId::new("persisted-unavailable");
+    registry.set_unavailable_model(&session_id, persisted.clone());
+
+    let selection = cold_spawn_fallback_selection(
+        &persisted,
+        Some(acp::ModelId::new("ready-compatible")),
+        None,
+    );
+    selection.replace_unavailable_latch(&registry, &session_id);
+
+    assert_eq!(registry.unavailable_model(&session_id), None);
+}
+
+#[test]
+fn harnesses_are_compatible_matches_bare_and_qualified_plugin_identity() {
+    let source = std::path::PathBuf::from("/plugins/one/agents/reviewer.md");
+    let mut active = xai_grok_agent::AgentDefinition::default_grok_build();
+    active.name = "reviewer".to_owned();
+    active.plugin_name = Some("plugin-one".to_owned());
+    active.source_path = Some(source.clone());
+    active.prompt_body = Some("Review from plugin one".to_owned());
+    let required = active.clone();
+
+    assert!(harnesses_are_compatible(
+        &active,
+        "plugin-one:reviewer",
+        Some(&required),
+    ));
+    assert!(harnesses_are_compatible(
+        &active,
+        "reviewer",
+        Some(&required),
+    ));
+}
+#[test]
+fn harnesses_are_compatible_rejects_different_plugin_and_custom_prompt_sources() {
+    let plugin = |owner: &str| {
+        let mut definition = xai_grok_agent::AgentDefinition::default_grok_build();
+        definition.name = "reviewer".to_owned();
+        definition.plugin_name = Some(owner.to_owned());
+        definition.source_path = Some(std::path::PathBuf::from(format!(
+            "/plugins/{owner}/agents/reviewer.md"
+        )));
+        definition.prompt_body = Some(format!("Review from {owner}"));
+        definition
+    };
+    let plugin_one = plugin("plugin-one");
+    let plugin_two = plugin("plugin-two");
+    assert!(!harnesses_are_compatible(
+        &plugin_one,
+        "plugin-two:reviewer",
+        Some(&plugin_two),
+    ));
+
+    let custom = |path: &str, body: &str| {
+        let mut definition = xai_grok_agent::AgentDefinition::default_grok_build();
+        definition.name = "reviewer".to_owned();
+        definition.source_path = Some(std::path::PathBuf::from(path));
+        definition.prompt_body = Some(body.to_owned());
+        definition
+    };
+    let project = custom("/repo/.grok/agents/reviewer.md", "Project review prompt");
+    let user = custom("/home/.grok/agents/reviewer.md", "User review prompt");
+    assert!(!harnesses_are_compatible(
+        &project,
+        "reviewer",
+        Some(&user),
+    ));
+
+    let mut inline = xai_grok_agent::AgentDefinition::default_grok_build();
+    inline.name = "grok-build".to_owned();
+    inline.prompt_body = Some("Client-provided prompt".to_owned());
+    assert!(harnesses_are_compatible(
+        &inline,
+        "grok-build",
+        Some(&inline),
+    ));
+    let built_in = xai_grok_agent::AgentDefinition::default_grok_build();
+    assert!(!harnesses_are_compatible(
+        &inline,
+        "grok-build",
+        Some(&built_in),
+    ));
+}
+
+#[test]
+fn harnesses_are_compatible_rejects_changed_external_runtime_contract() {
+    let mut active = xai_grok_agent::AgentDefinition::default_grok_build();
+    active.name = "reviewer".to_owned();
+    active.plugin_name = Some("plugin-one".to_owned());
+    active.source_path = Some(std::path::PathBuf::from(
+        "/plugins/plugin-one/agents/reviewer.md",
+    ));
+    active.prompt_body = Some("Review from plugin one".to_owned());
+
+    let mut required = active.clone();
+    required.permission_mode = xai_grok_agent::config::PermissionMode::BypassPermissions;
+
+    assert!(!harnesses_are_compatible(
+        &active,
+        "plugin-one:reviewer",
+        Some(&required),
+    ));
+}
+
+#[test]
+fn model_switch_cli_clamps_do_not_false_mismatch_external_harness() {
+    let mut raw = xai_grok_agent::AgentDefinition::default_grok_build();
+    raw.name = "reviewer".to_owned();
+    raw.plugin_name = Some("plugin-one".to_owned());
+    raw.source_path = Some(std::path::PathBuf::from(
+        "/plugins/plugin-one/agents/reviewer.md",
+    ));
+    raw.prompt_body = Some("Review from plugin one".to_owned());
+
+    let overrides = crate::agent::config::CliAgentOverrides {
+        tools: Some(vec!["Read".to_owned(), "Grep".to_owned()]),
+        disallowed_tools: Some(vec!["Bash".to_owned()]),
+        permission_mode: Some(xai_grok_agent::config::PermissionMode::DontAsk),
+        ..Default::default()
+    };
+    let mut active = raw.clone();
+    overrides.apply_to_definition(&mut active);
+    let required = apply_session_cli_clamps(Some(raw), &overrides).unwrap();
+
+    assert!(harnesses_are_compatible(
+        &active,
+        "plugin-one:reviewer",
+        Some(&required),
+    ));
+}
+
+#[test]
+fn model_switch_rebuilt_definition_retains_session_cli_clamps() {
+    let mut raw = xai_grok_agent::AgentDefinition::codex();
+    raw.tools = vec!["HarnessOwnedTool".to_owned()];
+    raw.disallowed_tools = vec!["HarnessOwnedDeny".to_owned()];
+    raw.permission_mode = xai_grok_agent::config::PermissionMode::Default;
+    let overrides = crate::agent::config::CliAgentOverrides {
+        tools: Some(vec!["Read".to_owned()]),
+        disallowed_tools: Some(vec!["Bash".to_owned(), "Write".to_owned()]),
+        permission_mode: Some(xai_grok_agent::config::PermissionMode::Plan),
+        ..Default::default()
+    };
+
+    let rebuilt = apply_session_cli_clamps(Some(raw), &overrides).unwrap();
+
+    assert_eq!(rebuilt.tools, vec!["Read"]);
+    assert_eq!(rebuilt.disallowed_tools, vec!["Bash", "Write"]);
+    assert_eq!(
+        rebuilt.permission_mode,
+        xai_grok_agent::config::PermissionMode::Plan
+    );
+    assert_eq!(rebuilt.name, "codex", "harness identity must be preserved");
+}
+
+#[test]
+fn harnesses_are_compatible_rejects_changed_strict_system_prompt() {
+    let active = xai_grok_agent::AgentDefinition::codex();
+    let mut required = active.clone();
+    required.system_prompt = xai_grok_agent::prompt::context::TemplateOverride::Custom(
+        "Different strict system prompt".to_owned(),
+    );
+
+    assert!(!harnesses_are_compatible(
+        &active,
+        "codex",
+        Some(&required),
+    ));
 }
 #[test]
 fn explicit_agent_type_wins_over_session_default() {
@@ -2032,6 +2429,251 @@ fn build_minimal_agent_for_tests() -> MvpAgent {
     let cfg = AgentConfig::default();
     MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config")
 }
+
+fn build_agent_with_model_for_tests(
+    model_id: &str,
+    agent_type: &str,
+) -> MvpAgent {
+    use crate::agent::config::{Config as AgentConfig, ConfigModelOverride};
+    use crate::auth::{AuthManager, GrokComConfig};
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let auth_manager =
+        std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let gateway = GatewaySender::new(tx);
+    let mut cfg = AgentConfig::default();
+    cfg.models.default = Some(model_id.to_owned());
+    cfg.config_models.insert(
+        model_id.to_owned(),
+        ConfigModelOverride {
+            model: Some(model_id.to_owned()),
+            base_url: Some("http://localhost".to_owned()),
+            auth_scheme: Some(xai_grok_sampler::AuthScheme::None),
+            agent_type: Some(agent_type.to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config");
+    agent
+        .models_manager
+        .set_current_model_id(acp::ModelId::new(model_id));
+    agent
+}
+
+#[test]
+fn acp_model_switch_validation_and_apply_handoff_emit_one_failure_event() {
+    run_local_for_bridge_test(|| async {
+        for rejection in ["unknown", "disallowed", "unready", "unknown-session"] {
+            let model_id = format!("validation-{rejection}-model");
+            let session_id = acp::SessionId::new(format!("validation-{rejection}-session"));
+            let agent = build_agent_with_model_for_tests(&model_id, "grok-build");
+            let requested_model = if rejection == "unknown" {
+                acp::ModelId::new(format!("{model_id}-missing"))
+            } else if matches!(rejection, "disallowed" | "unready") {
+                let mut entry = agent
+                    .models_manager
+                    .models()
+                    .shift_remove(&model_id)
+                    .expect("test model");
+                if rejection == "disallowed" {
+                    entry.info.user_selectable = false;
+                } else {
+                    entry
+                        .config_validation_errors
+                        .push("injected readiness failure".to_owned());
+                }
+                agent
+                    .models_manager
+                    .insert_test_entry(model_id.clone(), entry);
+                acp::ModelId::new(model_id.clone())
+            } else {
+                acp::ModelId::new(model_id.clone())
+            };
+
+            let error = <MvpAgent as acp::Agent>::set_session_model(
+                &agent,
+                acp::SetSessionModelRequest::new(session_id.clone(), requested_model.clone()),
+            )
+            .await
+            .expect_err("public ACP validation must reject the request");
+            assert_eq!(error.code, acp::ErrorCode::InvalidParams.into(), "{rejection}");
+
+            let events = crate::agent::handlers::model_switch::take_captured_failure_telemetry(
+                session_id.0.as_ref(),
+            );
+            assert_eq!(events.len(), 1, "{rejection}: {events:?}");
+            let event = &events[0];
+            assert_eq!(event["session_id"], session_id.0.as_ref(), "{rejection}");
+            assert_eq!(event["new_model_id"], requested_model.0.as_ref(), "{rejection}");
+            assert_eq!(event["success"], false, "{rejection}");
+            assert_eq!(
+                event["error_code"],
+                crate::agent::config::MODEL_SWITCH_VALIDATION_FAILED,
+                "{rejection}"
+            );
+            assert!(event.get("required_agent_type").is_none(), "{rejection}");
+            assert!(event.get("current_agent_type").is_none(), "{rejection}");
+        }
+    });
+}
+
+#[test]
+fn zero_turn_model_switch_fails_closed_when_required_harness_is_unresolved() {
+    run_local_for_bridge_test(|| async {
+        let model_id = "unresolved-harness-model";
+        let agent = build_agent_with_model_for_tests(model_id, "missing-custom-harness");
+        let sid = acp::SessionId::new("zero-turn-unresolved-harness");
+        let mut handle = make_test_handle("previous-model", false, None);
+        handle.info.id = sid.clone();
+        handle.agent_name = "grok-build".to_owned();
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        handle.cmd_tx = cmd_tx;
+        agent.sessions.borrow_mut().insert(sid.clone(), handle);
+
+        tokio::task::spawn_local(async move {
+            while let Some(command) = cmd_rx.recv().await {
+                match command {
+                    TestSessionCommand::GetActiveAgent { responds_to } => {
+                        let _ = responds_to.send(Some("grok-build".to_owned()));
+                    }
+                    TestSessionCommand::ApplyModelSwitch {
+                        prepared,
+                        responds_to,
+                    } => {
+                        assert!(
+                            prepared.required_definition.is_none(),
+                            "the missing required harness must stay unresolved"
+                        );
+                        let _ = responds_to.send(Err(
+                            crate::agent::config::ModelSwitchHarnessError {
+                                code: crate::agent::config::MODEL_SWITCH_REBUILD_FAILED.to_owned(),
+                                active_agent_type: "grok-build".to_owned(),
+                                required_agent_type: "missing-custom-harness".to_owned(),
+                                model_id: prepared.catalog_model_id.0.to_string(),
+                                reason: "agent_definition_unresolved".to_owned(),
+                            }
+                            .into_acp_error(),
+                        ));
+                    }
+                    _ => panic!("unexpected model-switch command"),
+                }
+            }
+        });
+
+        let err = crate::agent::handlers::model_switch::apply(
+            &agent,
+            acp::SetSessionModelRequest::new(sid.clone(), acp::ModelId::new(model_id)),
+        )
+        .await
+        .expect_err("an unresolved required harness must fail the whole switch");
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(|code| code.as_str()),
+            Some(crate::agent::config::MODEL_SWITCH_REBUILD_FAILED),
+        );
+        let handle = agent.sessions.borrow();
+        let handle = handle.get(&sid).expect("session remains registered");
+        assert_eq!(handle.model_id.0.as_ref(), "previous-model");
+        assert_eq!(handle.agent_name, "grok-build");
+    });
+}
+
+#[test]
+fn new_session_explicit_model_fails_before_spawn_when_harness_is_unresolved() {
+    run_local_for_bridge_test(|| async {
+        let model_id = "unresolved-default-harness-model";
+        let agent = build_agent_with_model_for_tests(model_id, "missing-custom-harness");
+        agent
+            .auth_manager
+            .hot_swap(crate::auth::GrokAuth::test_default());
+        agent.set_auth_method(acp::AuthMethodId::new(
+            crate::agent::auth_method::XAI_API_KEY_METHOD_ID,
+        ));
+        let init = acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_capabilities(
+            acp::ClientCapabilities::new()
+                .fs(acp::FileSystemCapabilities::new())
+                .terminal(false),
+        );
+        agent
+            .initialize_request
+            .set(init)
+            .expect("test initialize request should be set once");
+        let cwd = tempfile::tempdir().expect("temporary session cwd");
+
+        let err = <MvpAgent as acp::Agent>::new_session(
+            &agent,
+            acp::NewSessionRequest::new(cwd.path().to_path_buf()).meta(
+                serde_json::json!({ "modelId": model_id })
+                    .as_object()
+                    .cloned(),
+            ),
+        )
+        .await
+        .expect_err("an unresolved explicit-model harness must fail before spawn");
+        let payload = crate::agent::config::ModelSwitchHarnessError::from_acp_error(&err)
+            .unwrap_or_else(|| panic!("expected structured harness error, got {err:?}"));
+        assert_eq!(payload.model_id, model_id);
+        assert_eq!(payload.required_agent_type, "missing-custom-harness");
+        assert_eq!(payload.reason, "agent_definition_unresolved");
+        assert!(
+            agent.sessions.borrow().is_empty(),
+            "failed harness preflight must not register a session"
+        );
+    });
+}
+
+#[test]
+fn new_session_unknown_model_fallback_still_preflights_default_harness() {
+    run_local_for_bridge_test(|| async {
+        let default_model_id = "unresolved-fallback-harness-model";
+        let agent = build_agent_with_model_for_tests(
+            default_model_id,
+            "missing-default-custom-harness",
+        );
+        agent
+            .auth_manager
+            .hot_swap(crate::auth::GrokAuth::test_default());
+        agent.set_auth_method(acp::AuthMethodId::new(
+            crate::agent::auth_method::XAI_API_KEY_METHOD_ID,
+        ));
+        let init = acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_capabilities(
+            acp::ClientCapabilities::new()
+                .fs(acp::FileSystemCapabilities::new())
+                .terminal(false),
+        );
+        agent
+            .initialize_request
+            .set(init)
+            .expect("test initialize request should be set once");
+        let cwd = tempfile::tempdir().expect("temporary session cwd");
+
+        let err = <MvpAgent as acp::Agent>::new_session(
+            &agent,
+            acp::NewSessionRequest::new(cwd.path().to_path_buf()).meta(
+                serde_json::json!({ "modelId": "unknown-explicit-model" })
+                    .as_object()
+                    .cloned(),
+            ),
+        )
+        .await
+        .expect_err("fallback default harness must be checked before spawn");
+        let payload = crate::agent::config::ModelSwitchHarnessError::from_acp_error(&err)
+            .unwrap_or_else(|| panic!("expected structured harness error, got {err:?}"));
+        assert_eq!(payload.model_id, default_model_id);
+        assert_eq!(
+            payload.required_agent_type,
+            "missing-default-custom-harness"
+        );
+        assert_eq!(payload.reason, "agent_definition_unresolved");
+        assert!(
+            agent.sessions.borrow().is_empty(),
+            "failed fallback harness preflight must not register a session"
+        );
+    });
+}
 fn session_usage_request(session_id: &str) -> acp::ExtRequest {
     acp::ExtRequest::new(
         "x.ai/session/usage",
@@ -2204,6 +2846,147 @@ async fn wait_for_in_flight_load_blocks_until_load_completes() {
         })
         .await;
 }
+
+/// Registration happens before `session/load` finishes restoring its persisted
+/// model. A racing request must therefore remain behind the load marker even
+/// after the handle becomes visible, or it can observe the older model and run
+/// before the restore's fallback wins.
+#[tokio::test]
+async fn registered_session_stays_gated_until_restored_model_is_final() {
+    use std::task::Poll;
+
+    let agent = build_minimal_agent_for_tests();
+    let sid = acp::SessionId::new("sess-registered-while-loading");
+    let persisted = acp::ModelId::new("persisted-model");
+    let fallback = acp::ModelId::new("ready-fallback");
+    let guard = agent.begin_session_load(&sid);
+    let mut handle = make_test_handle(persisted.0.as_ref(), false, None);
+    handle.info.id = sid.clone();
+    agent.sessions.borrow_mut().insert(sid.clone(), handle);
+
+    let mut racing_request = Box::pin(agent.session_handle_waiting_for_load(&sid));
+    assert!(
+        matches!(futures::poll!(racing_request.as_mut()), Poll::Pending),
+        "a registered handle must remain gated until persisted restoration completes"
+    );
+
+    agent
+        .sessions
+        .borrow_mut()
+        .get_mut(&sid)
+        .expect("registered session")
+        .model_id = fallback.clone();
+    drop(guard);
+
+    let observed = racing_request.await.expect("restored session handle");
+    assert_eq!(
+        observed.model_id, fallback,
+        "the racing request must observe the restored fallback, never the persisted model"
+    );
+    assert_eq!(
+        agent.sessions.borrow()[&sid].model_id, observed.model_id,
+        "the registered handle and racing request must agree on the final model ordering"
+    );
+}
+
+/// The production `session/load` restore entry point must bypass only its own
+/// load marker. A real registered session is restored while an ordinary model
+/// switch remains gated; after the guard drops, that later request commits last.
+#[test]
+fn load_restore_apply_bypasses_own_marker_and_preserves_request_order() {
+    use std::task::Poll;
+
+    let local = tokio::task::LocalSet::new();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime")
+        .block_on(local.run_until(async {
+            let restored_model = "restored-model";
+            let later_model = "later-model";
+            let agent = std::rc::Rc::new(build_agent_with_model_for_tests(
+                restored_model,
+                "grok-build",
+            ));
+            let mut later_entry = agent
+                .models_manager
+                .models()
+                .get(restored_model)
+                .expect("restored model entry")
+                .clone();
+            later_entry.info.model = later_model.to_owned();
+            agent
+                .models_manager
+                .insert_test_entry(later_model, later_entry);
+
+            let sid = acp::SessionId::new("sess-load-restore-order");
+            let guard = agent.begin_session_load(&sid);
+            let mut handle = make_test_handle("persisted-model", false, None);
+            handle.info.id = sid.clone();
+            let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+            handle.cmd_tx = cmd_tx;
+            agent.sessions.borrow_mut().insert(sid.clone(), handle);
+
+            tokio::task::spawn_local(async move {
+                while let Some(command) = cmd_rx.recv().await {
+                    match command {
+                        TestSessionCommand::GetActiveAgent { responds_to } => {
+                            let _ = responds_to.send(Some("grok-build".to_owned()));
+                        }
+                        TestSessionCommand::ApplyModelSwitch {
+                            prepared,
+                            responds_to,
+                        } => {
+                            let model_id = prepared.catalog_model_id;
+                            let _ = responds_to.send(Ok(crate::session::AppliedModelSwitch {
+                                previous_model_id: acp::ModelId::new("previous-model"),
+                                catalog_model_id: model_id,
+                                did_rebuild: false,
+                                active_agent_type: Some("grok-build".to_owned()),
+                            }));
+                        }
+                        _ => panic!("unexpected command during model restore"),
+                    }
+                }
+            });
+
+            let mut later_request = Box::pin(crate::agent::handlers::model_switch::apply(
+                &agent,
+                acp::SetSessionModelRequest::new(sid.clone(), acp::ModelId::new(later_model)),
+            ));
+            assert!(
+                matches!(futures::poll!(later_request.as_mut()), Poll::Pending),
+                "an external switch must remain gated while session/load owns the marker"
+            );
+
+            acp_agent::restore_registered_session_model(
+                &agent,
+                acp::SetSessionModelRequest::new(sid.clone(), acp::ModelId::new(restored_model)),
+            )
+            .await
+            .expect("session/load restore must not wait on its own marker");
+            assert_eq!(
+                agent.sessions.borrow()[&sid].model_id.0.as_ref(),
+                restored_model,
+                "the load restore must commit before the load marker is released"
+            );
+            assert!(
+                matches!(futures::poll!(later_request.as_mut()), Poll::Pending),
+                "the external request must still be gated until load completion"
+            );
+
+            drop(guard);
+            later_request
+                .await
+                .expect("the gated external switch must run after load completion");
+            assert_eq!(
+                agent.sessions.borrow()[&sid].model_id.0.as_ref(),
+                later_model,
+                "the later external request must be the final committed model"
+            );
+        }));
+}
+
 /// A failed load (guard dropped WITHOUT registering the session) also
 /// wakes waiters — they re-check, find nothing, and the caller surfaces
 /// the regular "unknown session id" error rather than hanging.
