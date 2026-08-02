@@ -155,11 +155,13 @@ pub(crate) fn stream_responses_tracked<'a>(
         let mut message_chunk_count: u64 = 0;
         let mut first_token_emitted = false;
         let mut reasoning_acc = String::new();
-        // Full items from `ResponseOutputItemDone`, replayed into the final
-        // response when the terminal event carries an empty `output` (the
-        // ChatGPT Codex backend never populates it; items arrive only via
-        // the incremental events).
-        let mut done_output_items: Vec<rs::OutputItem> = Vec::new();
+        // Full items from `ResponseOutputItemDone`, keyed by `output_index`
+        // so replay preserves the server's emission order even when done
+        // events arrive out of order. Replayed into the final response when
+        // the terminal event carries an empty `output` (the ChatGPT Codex
+        // backend never populates it; items arrive only via the incremental
+        // events).
+        let mut done_output_items: BTreeMap<u32, rs::OutputItem> = BTreeMap::new();
         let mut last_content_chunk_at = Instant::now();
 
         // Maps Responses API `output_index` to our tool-only `tool_index`.
@@ -448,7 +450,7 @@ pub(crate) fn stream_responses_tracked<'a>(
                         }
                         _ => {}
                     }
-                    done_output_items.push(done_event.item);
+                    done_output_items.insert(done_event.output_index, done_event.item);
                 }
 
                 // CustomToolCallInputDelta is x_search in-progress streaming.
@@ -511,8 +513,15 @@ pub(crate) fn stream_responses_tracked<'a>(
         // response isn't misclassified as empty (which would trigger a
         // retry storm: re-streamed text and duplicated output). Platform
         // deployments populate `output`, so this path stays inert there.
-        if response.output.is_empty() && !done_output_items.is_empty() {
-            response.output = done_output_items;
+        // Only a `completed` terminal payload is trusted for backfill: a
+        // truncated (`incomplete`) response must keep its empty output so
+        // downstream truncation handling sees StopReason::Length instead of
+        // ToolCalls derived from partially streamed items.
+        if matches!(response.status, Status::Completed)
+            && response.output.is_empty()
+            && !done_output_items.is_empty()
+        {
+            response.output = done_output_items.into_values().collect();
         }
 
         // Billing fields (`prompt_tokens`, `completion_tokens`,
@@ -755,6 +764,26 @@ mod tests {
         }
     }
 
+    /// A full message item as it rides `response.output_item.done`.
+    fn message_item_done(output_index: u32, text: &str) -> rs::ResponseStreamEvent {
+        rs::ResponseStreamEvent::ResponseOutputItemDone(rs_types::ResponseOutputItemDoneEvent {
+            sequence_number: 1,
+            output_index,
+            item: rs_types::OutputItem::Message(rs_types::OutputMessage {
+                content: vec![rs_types::OutputMessageContent::OutputText(
+                    rs_types::OutputTextContent {
+                        text: text.to_string(),
+                        annotations: vec![],
+                        logprobs: None,
+                    },
+                )],
+                id: format!("msg_{output_index}"),
+                role: rs_types::AssistantRole::Assistant,
+                status: rs_types::OutputStatus::Completed,
+            }),
+        })
+    }
+
     /// The ChatGPT Codex backend terminates with `response.completed` whose
     /// `output` is an empty array — the full message rides
     /// `ResponseOutputItemDone`. The collected items must be replayed into
@@ -762,27 +791,9 @@ mod tests {
     /// (which would retry and re-stream the same text).
     #[tokio::test]
     async fn codex_empty_terminal_output_backfills_from_item_done() {
-        let done = rs::ResponseStreamEvent::ResponseOutputItemDone(
-            rs_types::ResponseOutputItemDoneEvent {
-                sequence_number: 1,
-                output_index: 0,
-                item: rs_types::OutputItem::Message(rs_types::OutputMessage {
-                    content: vec![rs_types::OutputMessageContent::OutputText(
-                        rs_types::OutputTextContent {
-                            text: "OAUTH_E2E_OK".to_string(),
-                            annotations: vec![],
-                            logprobs: None,
-                        },
-                    )],
-                    id: "msg_1".to_string(),
-                    role: rs_types::AssistantRole::Assistant,
-                    status: rs_types::OutputStatus::Completed,
-                }),
-            },
-        );
         let raw = stream::iter(vec![
             Ok(text_delta_event("OAUTH_E2E_OK")),
-            Ok(done),
+            Ok(message_item_done(0, "OAUTH_E2E_OK")),
             // Codex shape: the terminal response carries no output items.
             Ok(completed_event()),
         ])
@@ -813,6 +824,88 @@ mod tests {
                     })
                     .expect("assistant item with text");
                 assert_eq!(&*text, "OAUTH_E2E_OK");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// A truncated (`incomplete`) terminal payload must NOT be backfilled:
+    /// a partially streamed function call would otherwise flip the stop
+    /// reason from Length to ToolCalls and bypass truncation rejection,
+    /// dispatching a tool call with incomplete arguments.
+    #[tokio::test]
+    async fn incomplete_terminal_output_is_not_backfilled() {
+        let fc_done = rs::ResponseStreamEvent::ResponseOutputItemDone(
+            rs_types::ResponseOutputItemDoneEvent {
+                sequence_number: 1,
+                output_index: 0,
+                item: rs_types::OutputItem::FunctionCall(rs_types::FunctionToolCall {
+                    arguments: "{\"path\": \"/tmp/tru".to_string(),
+                    call_id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    id: None,
+                    status: Some(rs_types::OutputStatus::Incomplete),
+                }),
+            },
+        );
+        let raw = stream::iter(vec![
+            Ok(function_call_added_event(0, "call_1", "read_file")),
+            Ok(fc_done),
+            Ok(incomplete_event()),
+        ])
+        .boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(
+                    response.stop_reason,
+                    Some(StopReason::Length),
+                    "truncated response must keep Length, not ToolCalls from a partial call"
+                );
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// Done events can complete out of order; the backfilled output must be
+    /// ordered by `output_index` to honor the converter's ordered-replay
+    /// contract, not by arrival order.
+    #[tokio::test]
+    async fn backfill_orders_items_by_output_index() {
+        let raw = stream::iter(vec![
+            Ok(message_item_done(1, "second")),
+            Ok(message_item_done(0, "first")),
+            Ok(completed_event()),
+        ])
+        .boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                let text = response
+                    .items
+                    .iter()
+                    .find_map(|i| match i {
+                        ConversationItem::Assistant(a) => Some(a.content.clone()),
+                        _ => None,
+                    })
+                    .expect("assistant item with text");
+                assert_eq!(&*text, "first\nsecond");
             }
             other => panic!("expected Completed, got {other:?}"),
         }
