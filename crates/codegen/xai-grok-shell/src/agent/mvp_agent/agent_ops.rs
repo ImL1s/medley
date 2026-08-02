@@ -3014,6 +3014,21 @@ impl MvpAgent {
         self.wait_for_in_flight_session_load(session_id).await;
         self.sessions.borrow().get(session_id).cloned()
     }
+    /// Resolve the registered handle from inside the active `session/load`.
+    ///
+    /// Unlike [`Self::session_handle_waiting_for_load`], this deliberately does
+    /// not wait for the marker owned by its caller. Requiring that marker to be
+    /// present keeps the bypass exclusive to the production restore path.
+    pub(crate) fn session_handle_during_load(
+        &self,
+        session_id: &acp::SessionId,
+    ) -> Option<crate::session::SessionHandle> {
+        self.loading_sessions
+            .borrow()
+            .contains_key(session_id)
+            .then(|| self.sessions.borrow().get(session_id).cloned())
+            .flatten()
+    }
     /// If a `session/load` for `session_id` is in flight, wait (bounded) for
     /// it to finish. Returns immediately when no load is in flight.
     ///

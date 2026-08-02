@@ -2888,49 +2888,102 @@ async fn registered_session_stays_gated_until_restored_model_is_final() {
     );
 }
 
-/// A racing model switch must not hold the per-session dispatch lock while it
-/// waits for `session/load`. The load path applies its restored model before its
-/// RAII load guard drops, so taking the lock first creates a lock-order cycle.
-#[tokio::test]
-async fn model_switch_waits_for_load_before_taking_dispatch_lock() {
+/// The production `session/load` restore entry point must bypass only its own
+/// load marker. A real registered session is restored while an ordinary model
+/// switch remains gated; after the guard drops, that later request commits last.
+#[test]
+fn load_restore_apply_bypasses_own_marker_and_preserves_request_order() {
+    use std::task::Poll;
+
     let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let agent = std::rc::Rc::new(build_minimal_agent_for_tests());
-            let sid = acp::SessionId::new("sess-loading-model-switch");
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime")
+        .block_on(local.run_until(async {
+            let restored_model = "restored-model";
+            let later_model = "later-model";
+            let agent = std::rc::Rc::new(build_agent_with_model_for_tests(
+                restored_model,
+                "grok-build",
+            ));
+            let mut later_entry = agent
+                .models_manager
+                .models()
+                .get(restored_model)
+                .expect("restored model entry")
+                .clone();
+            later_entry.info.model = later_model.to_owned();
+            agent
+                .models_manager
+                .insert_test_entry(later_model, later_entry);
+
+            let sid = acp::SessionId::new("sess-load-restore-order");
             let guard = agent.begin_session_load(&sid);
-            let waiter_agent = agent.clone();
-            let waiter_sid = sid.clone();
-            let waiter = tokio::task::spawn_local(async move {
-                crate::agent::handlers::model_switch::apply(
-                    &waiter_agent,
-                    acp::SetSessionModelRequest::new(
-                        waiter_sid,
-                        acp::ModelId::new("test-model"),
-                    ),
-                )
-                .await
+            let mut handle = make_test_handle("persisted-model", false, None);
+            handle.info.id = sid.clone();
+            let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+            handle.cmd_tx = cmd_tx;
+            agent.sessions.borrow_mut().insert(sid.clone(), handle);
+
+            tokio::task::spawn_local(async move {
+                while let Some(command) = cmd_rx.recv().await {
+                    match command {
+                        TestSessionCommand::GetActiveAgent { responds_to } => {
+                            let _ = responds_to.send(Some("grok-build".to_owned()));
+                        }
+                        TestSessionCommand::ApplyModelSwitch {
+                            prepared,
+                            responds_to,
+                        } => {
+                            let model_id = prepared.catalog_model_id;
+                            let _ = responds_to.send(Ok(crate::session::AppliedModelSwitch {
+                                previous_model_id: acp::ModelId::new("previous-model"),
+                                catalog_model_id: model_id,
+                                did_rebuild: false,
+                                active_agent_type: Some("grok-build".to_owned()),
+                            }));
+                        }
+                        _ => panic!("unexpected command during model restore"),
+                    }
+                }
             });
 
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let mut later_request = Box::pin(crate::agent::handlers::model_switch::apply(
+                &agent,
+                acp::SetSessionModelRequest::new(sid.clone(), acp::ModelId::new(later_model)),
+            ));
             assert!(
-                !waiter.is_finished(),
-                "the racing switch must be waiting for the in-flight load"
+                matches!(futures::poll!(later_request.as_mut()), Poll::Pending),
+                "an external switch must remain gated while session/load owns the marker"
             );
-            let dispatch_lock = agent.dispatch_lock(&sid);
-            let dispatch_guard = tokio::time::timeout(
-                std::time::Duration::from_millis(200),
-                dispatch_lock.lock(),
+
+            acp_agent::restore_registered_session_model(
+                &agent,
+                acp::SetSessionModelRequest::new(sid.clone(), acp::ModelId::new(restored_model)),
             )
             .await
-            .expect("session/load must be able to take the dispatch lock");
-            drop(dispatch_guard);
+            .expect("session/load restore must not wait on its own marker");
+            assert_eq!(
+                agent.sessions.borrow()[&sid].model_id.0.as_ref(),
+                restored_model,
+                "the load restore must commit before the load marker is released"
+            );
+            assert!(
+                matches!(futures::poll!(later_request.as_mut()), Poll::Pending),
+                "the external request must still be gated until load completion"
+            );
 
-            waiter.abort();
             drop(guard);
-            let _ = waiter.await;
-        })
-        .await;
+            later_request
+                .await
+                .expect("the gated external switch must run after load completion");
+            assert_eq!(
+                agent.sessions.borrow()[&sid].model_id.0.as_ref(),
+                later_model,
+                "the later external request must be the final committed model"
+            );
+        }));
 }
 
 /// A failed load (guard dropped WITHOUT registering the session) also

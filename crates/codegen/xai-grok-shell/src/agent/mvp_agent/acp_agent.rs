@@ -3,6 +3,17 @@
 //! [`acp::Agent`] trait implementation for [`MvpAgent`].
 //! Co-located child of `mvp_agent` (`use super::*`).
 use super::*;
+
+/// The single model-restore edge used by `session/load` after registration and
+/// before its load guard is released. Keeping this wrapper in the load module
+/// prevents restore callers from accidentally taking the external wait path.
+pub(super) async fn restore_registered_session_model(
+    agent: &MvpAgent,
+    request: acp::SetSessionModelRequest,
+) -> Result<acp::SetSessionModelResponse, acp::Error> {
+    crate::agent::handlers::model_switch::apply_during_session_load(agent, request).await
+}
+
 /// Which `x_search` sub-tools enforce the date cutoff, sent in `initialize`. `x_user_search` and
 /// `x_thread_fetch` are `false`: they don't honor it yet.
 #[derive(serde::Serialize)]
@@ -2506,12 +2517,12 @@ impl acp::Agent for MvpAgent {
                     );
                     map
                 });
-            let apply_result = crate::agent::handlers::model_switch::apply(
-                    self,
-                    acp::SetSessionModelRequest::new(session_id.to_owned(), model_id.clone())
-                        .meta(restore_meta),
-                )
-                .await;
+            let apply_result = restore_registered_session_model(
+                self,
+                acp::SetSessionModelRequest::new(session_id.to_owned(), model_id.clone())
+                    .meta(restore_meta),
+            )
+            .await;
             if let Err(e) = apply_result {
                 tracing::warn!(
                     session_id = %session_id.0,
