@@ -375,6 +375,19 @@ Aliases: `/tour`, `/onboarding`
 
 Open the Claude import modal to bring over `~/.claude` settings: permissions, environment variables, MCP servers, hooks, and paths.
 
+### `/init [focus]`
+
+Analyze the repository and write its [AGENTS.md](12-project-rules.md) — the project rules every later session starts with. Grok reads the README, the build manifests, the CI workflow, and enough of the source tree to describe the project, then writes the file at the repo root and reports what went into it.
+
+```
+/init
+/init focus on the integration test setup
+```
+
+If an instruction file already exists (`AGENTS.md`, `AGENT.md`, `CLAUDE.md`, or `.claude/CLAUDE.md`), Grok reads it first and improves it in place rather than regenerating it. Rules other tools left behind — `.grok/rules/`, `.claude/rules/`, `.cursor/rules/`, `.github/copilot-instructions.md` — get folded in. The optional argument is extra direction, not a filter.
+
+Run it once per repository. Re-run it after a restructure, and review the result like any other patch: nothing about it is authoritative until you have read it.
+
 ---
 
 ## Agents and Personas

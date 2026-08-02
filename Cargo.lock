@@ -13640,6 +13640,7 @@ dependencies = [
  "xai-grok-telemetry",
  "xai-grok-test-support",
  "xai-grok-tools",
+ "xai-grok-tools-api",
  "xai-grok-update",
  "xai-grok-version",
  "xai-grok-voice",
