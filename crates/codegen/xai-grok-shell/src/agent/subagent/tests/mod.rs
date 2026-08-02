@@ -2167,6 +2167,7 @@ fn test_sampling_config(model_slug: &str) -> xai_grok_sampling_types::SamplingCo
         max_completion_tokens: None,
         temperature: None,
         top_p: None,
+        endpoint_trust: None,
         api_backend: Default::default(),
         extra_headers: Default::default(),
         query_params: Default::default(),

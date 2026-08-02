@@ -1,0 +1,81 @@
+{
+  "updatedAt": "2026-08-02T13:40:17.750Z",
+  "missions": [
+    {
+      "id": "session:6d71f77b-1aa9-431d-a1f4-ec922e67119f:none",
+      "source": "session",
+      "name": "none",
+      "objective": "Session mission",
+      "createdAt": "2026-08-02T08:15:10.164Z",
+      "updatedAt": "2026-08-02T13:40:17.750Z",
+      "status": "running",
+      "workerCount": 3,
+      "taskCounts": {
+        "total": 3,
+        "pending": 0,
+        "blocked": 0,
+        "inProgress": 1,
+        "completed": 2,
+        "failed": 0
+      },
+      "agents": [
+        {
+          "name": "rebrand-docs:arebran",
+          "role": "rebrand-docs",
+          "ownership": "arebrand-docs-562bf58095959618",
+          "status": "done",
+          "currentStep": null,
+          "latestUpdate": "completed",
+          "completedSummary": null,
+          "updatedAt": "2026-08-02T13:40:17.447Z"
+        },
+        {
+          "name": "tui-gap-audit:atui-ga",
+          "role": "tui-gap-audit",
+          "ownership": "atui-gap-audit-ca121edb324f5cfe",
+          "status": "done",
+          "currentStep": null,
+          "latestUpdate": "completed",
+          "completedSummary": null,
+          "updatedAt": "2026-08-02T10:10:50.062Z"
+        },
+        {
+          "name": "state-dir-isolation:astate-",
+          "role": "state-dir-isolation",
+          "ownership": "astate-dir-isolation-a32b88c5bb2ec31c",
+          "status": "running",
+          "currentStep": null,
+          "latestUpdate": null,
+          "completedSummary": null,
+          "updatedAt": "2026-08-02T13:40:17.750Z"
+        }
+      ],
+      "timeline": [
+        {
+          "id": "session-stop:a4ce535e64bfe8a8b:2026-08-02T10:43:47.551Z",
+          "at": "2026-08-02T10:43:47.551Z",
+          "kind": "completion",
+          "agent": "rebrand-docs:arebran",
+          "detail": "completed",
+          "sourceKey": "session-stop:a4ce535e64bfe8a8b"
+        },
+        {
+          "id": "session-stop:astate-dir-isolation-a32b88c5bb2ec31c:2026-08-02T13:40:17.447Z",
+          "at": "2026-08-02T13:40:17.447Z",
+          "kind": "completion",
+          "agent": "rebrand-docs:arebran",
+          "detail": "completed",
+          "sourceKey": "session-stop:astate-dir-isolation-a32b88c5bb2ec31c"
+        },
+        {
+          "id": "session-start:astate-dir-isolation-a32b88c5bb2ec31c:2026-08-02T13:40:17.750Z",
+          "at": "2026-08-02T13:40:17.750Z",
+          "kind": "update",
+          "agent": "state-dir-isolation:astate-",
+          "detail": "started state-dir-isolation:astate-",
+          "sourceKey": "session-start:astate-dir-isolation-a32b88c5bb2ec31c"
+        }
+      ]
+    }
+  ]
+}

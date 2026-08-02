@@ -47,6 +47,10 @@ pub enum AuthScheme {
 /// `SamplerConfig` is handed to the actor. Auth is selected separately
 /// via `auth_scheme`, while `api_backend` controls only the request/response
 /// protocol shape.
+// The trust classification lives in `xai-grok-sampling-types` so chat-state
+// configs can carry it from config resolution into request construction.
+pub use xai_grok_sampling_types::EndpointTrustClass;
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SamplerConfig {
     pub api_key: Option<String>,
@@ -58,6 +62,12 @@ pub struct SamplerConfig {
     pub api_backend: ApiBackend,
     #[serde(default)]
     pub auth_scheme: AuthScheme,
+    /// Explicit endpoint trust override. `None` (default) derives the class
+    /// at client construction: xAI-operated hosts (including the
+    /// cli-chat-proxy) with real auth are `FirstPartyXai`, loopback hosts are
+    /// `Local`, and everything else is `External`.
+    #[serde(default)]
+    pub endpoint_trust: Option<EndpointTrustClass>,
     /// Extra request headers applied verbatim. The sampler never inspects
     /// the URL to derive headers; callers (the session) inject proxy auth
     /// and other access headers here before constructing the config.
@@ -140,6 +150,7 @@ impl std::fmt::Debug for SamplerConfig {
             .field("base_url_configured", &!self.base_url.is_empty())
             .field("model", &self.model)
             .field("auth_scheme", &self.auth_scheme)
+            .field("endpoint_trust", &self.endpoint_trust)
             .field("extra_header_count", &self.extra_headers.len())
             .field("query_param_count", &self.query_params.len())
             .field("env_http_header_count", &self.env_http_headers.len())
@@ -184,6 +195,7 @@ impl Default for SamplerConfig {
             top_p: None,
             api_backend: ApiBackend::default(),
             auth_scheme: AuthScheme::default(),
+            endpoint_trust: None,
             extra_headers: IndexMap::new(),
             query_params: IndexMap::new(),
             env_http_headers: IndexMap::new(),

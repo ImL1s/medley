@@ -5707,6 +5707,7 @@ pub fn sampling_config_for_model(
         max_completion_tokens,
         temperature,
         top_p,
+        endpoint_trust: None,
         api_backend,
         auth_scheme: credentials.auth_scheme,
         extra_headers,
