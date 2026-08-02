@@ -1,6 +1,10 @@
-# ImL1s fork of xai-org/grok-build
+# Medley — ImL1s fork of xai-org/grok-build
 
-This repository is **[ImL1s/grok-build](https://github.com/ImL1s/grok-build)**, a friendly fork of **[xai-org/grok-build](https://github.com/xai-org/grok-build)** with a long-lived multi-provider / local LLM product line.
+This repository is **[ImL1s/grok-build](https://github.com/ImL1s/grok-build)**, published as **Medley**: a community fork of **[xai-org/grok-build](https://github.com/xai-org/grok-build)** with a long-lived multi-provider / local LLM product line. It is not affiliated with or endorsed by xAI — see [`NOTICE.md`](NOTICE.md) for the trademark and non-affiliation statement.
+
+This file doubles as the Apache-2.0 §4(b) statement of modification: the "What's different from upstream" table below is the record of changes made to the upstream work.
+
+The `medley` command alias, the `~/.medley/` state directory, and the `MEDLEY_*` environment prefix arrive with the packaging change in [#49](https://github.com/ImL1s/grok-build/issues/49). Until then the binary is invoked as `grok` and state lives in `~/.grok/`, shared with any official Grok Build install on the same machine.
 
 Remotes:
 

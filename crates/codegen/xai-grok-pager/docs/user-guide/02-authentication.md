@@ -2,6 +2,15 @@
 
 Grok supports several authentication methods, including interactive browser login, enterprise single sign-on (SSO), and headless CI/CD runners.
 
+> **Fork note (Medley).** The [OpenAI Codex](#openai-codex-chatgpt-oauth) provider
+> below exists only in [Medley](https://github.com/ImL1s/grok-build), a community
+> fork that is not affiliated with or endorsed by xAI; it is compatibility with a
+> pinned public Codex contract, not an OpenAI endorsement. Every other flow on this
+> page is upstream behaviour. Medley shares `~/.grok/` with an official Grok Build
+> install today, so alternating between the two can corrupt stored credentials —
+> the separate `~/.medley/` state directory is tracked in
+> [#49](https://github.com/ImL1s/grok-build/issues/49).
+
 ---
 
 ## Browser Login (Default)

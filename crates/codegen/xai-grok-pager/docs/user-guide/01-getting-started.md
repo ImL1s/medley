@@ -8,6 +8,16 @@ You can use it interactively as a full-screen TUI, run it headlessly for scripti
 
 ## Installation
 
+> **Fork note (Medley).** This section installs **xAI's official Grok Build**, not
+> [Medley](https://github.com/ImL1s/grok-build), the community fork you are
+> reading these docs from. `x.ai/cli/install.sh`, `install.ps1`, and `grok update`
+> all fetch the official build; running them over a Medley install replaces it and
+> drops the fork's multi-provider features. Build Medley from source instead (see
+> the fork's README), and set `auto_update = false` under `[cli]` in
+> `~/.grok/config.toml`. Fork installer docs are tracked in
+> [#28](https://github.com/ImL1s/grok-build/issues/28), fork release artifacts in
+> [#29](https://github.com/ImL1s/grok-build/issues/29).
+
 Install the latest stable release (macOS, Linux, or Windows via Git Bash):
 
 ```bash
