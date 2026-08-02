@@ -3193,6 +3193,7 @@ mod tests {
                 "x-grok-client-version",
                 "x-compactions-remaining",
                 "x-compaction-at",
+                "x-authenticateresponse",
                 "x-xai-token-auth",
             ] {
                 headers.insert(
@@ -3215,7 +3216,7 @@ mod tests {
         config
     }
 
-    const INTERNAL_METADATA: [&str; 10] = [
+    const INTERNAL_METADATA: [&str; 11] = [
         "traceparent",
         "tracestate",
         "baggage",
@@ -3224,6 +3225,7 @@ mod tests {
         "x-grok-client-version",
         "x-compactions-remaining",
         "x-compaction-at",
+        "x-authenticateresponse",
         "x-xai-token-auth",
         "x-grok-user-id",
     ];
