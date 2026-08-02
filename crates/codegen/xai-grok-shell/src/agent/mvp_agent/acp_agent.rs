@@ -414,12 +414,11 @@ impl acp::Agent for MvpAgent {
             .get(self.models_manager.current_model_id().0.as_ref())
             .map(|e| e.info.auth_scheme == xai_grok_sampler::AuthScheme::None)
             .unwrap_or(false);
-        // Catalog-wide, unlike the selected-model check above: the credential
-        // exists for the whole session, and a Codex-only user reaches their
-        // model with `/model` once the session is up.
-        let has_openai_codex_credential = self.models_manager.models().values().any(|e| {
-            e.is_openai_codex_profile() && crate::agent::config::model_readiness(e).0
-        });
+        // Catalog-wide, unlike the selected-model check above: a Codex-only
+        // user reaches their model with `/model` once the session is up. It
+        // must therefore be a model `/model` can actually offer, not merely
+        // one that exists in the catalog.
+        let has_openai_codex_credential = self.models_manager.has_selectable_openai_codex_model();
         let built = auth_method::build_auth_methods(auth_method::AuthMethodsBuildInputs {
             has_external_api_key,
             has_cached_token,

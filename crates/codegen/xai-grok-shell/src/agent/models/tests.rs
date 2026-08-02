@@ -2057,3 +2057,73 @@ async fn identity_switch_clears_user_pick_latch() {
         "a new identity's first catalog must reselect the default after clear()",
     );
 }
+
+/// A Codex entry the picker cannot offer must not suppress the xAI login
+/// screen: `allowed_models` / `hidden_models` filter the catalog by clearing
+/// `user_selectable` / setting `hidden`, and a session started on that basis
+/// would strand the user on a default xAI model with no credential.
+#[test]
+fn filtered_out_codex_model_does_not_count_as_selectable() {
+    let tmp = tempfile::tempdir().expect("temp home");
+    let auth_home = tmp.path();
+    let auth = crate::auth::GrokAuth {
+        key: "live-codex-token".to_owned(),
+        auth_mode: crate::auth::AuthMode::OpenAiCodex,
+        refresh_token: Some("refresh".to_owned()),
+        expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        oidc_issuer: Some(crate::auth::openai_codex::ISSUER.to_owned()),
+        oidc_client_id: Some(crate::auth::openai_codex::CLIENT_ID.to_owned()),
+        account_id: Some("account".to_owned()),
+        ..crate::auth::GrokAuth::default()
+    };
+    std::fs::write(
+        auth_home.join("auth.json"),
+        serde_json::to_vec(&std::collections::HashMap::from([(
+            crate::auth::openai_codex::AUTH_SCOPE.to_owned(),
+            auth,
+        )]))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let toml_cfg: toml::Value = toml::from_str("").unwrap();
+    let cfg = config::Config::new_from_toml_cfg(&toml_cfg).expect("config should parse");
+    let mut catalog = config::resolve_model_list(&cfg, None);
+    let preset_key = crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID;
+    let preset = catalog.get_mut(preset_key).expect("preset in catalog");
+    preset.auth_provider = Some(crate::auth::AuthProviderRef::openai_codex(
+        crate::auth::openai_codex::manager(auth_home),
+    ));
+
+    let manager_with = |models: IndexMap<String, ModelEntry>| {
+        let xai_home = tmp.path().join("xai");
+        ModelsManagerBuilder::new(
+            None,
+            models,
+            acp::ModelId::new("default"),
+            Arc::new(AuthManager::new(&xai_home, GrokComConfig::default())),
+            config::Config::default(),
+        )
+        .cache(test_cache_manager(tmp.path()))
+        .build()
+    };
+
+    assert!(
+        manager_with(catalog.clone()).has_selectable_openai_codex_model(),
+        "a ready, unfiltered preset must count — otherwise this test is vacuous"
+    );
+
+    let mut filtered = catalog.clone();
+    filtered.get_mut(preset_key).unwrap().info.user_selectable = false;
+    assert!(
+        !manager_with(filtered).has_selectable_openai_codex_model(),
+        "an allowed_models-filtered Codex model must not suppress the login screen"
+    );
+
+    let mut hidden = catalog;
+    hidden.get_mut(preset_key).unwrap().info.hidden = true;
+    assert!(
+        !manager_with(hidden).has_selectable_openai_codex_model(),
+        "a hidden_models-hidden Codex model must not suppress the login screen"
+    );
+}
