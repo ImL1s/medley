@@ -137,13 +137,94 @@ resolve_version() {
   printf '%s\n' "${resolve_tag#v}"
 }
 
+# Collapse '.' and '..' textually. Only ever called on a path whose existing
+# prefix has already been resolved with `pwd -P`, so no component being
+# collapsed here can be a symlink and the result is the true physical path.
+normalize_path() {
+  printf '%s\n' "$1" | awk -F/ '
+    {
+      depth = 0
+      for (i = 1; i <= NF; i++) {
+        if ($i == "" || $i == ".") continue
+        if ($i == "..") { if (depth > 0) depth--; continue }
+        stack[++depth] = $i
+      }
+      out = ""
+      for (i = 1; i <= depth; i++) out = out "/" stack[i]
+      print (out == "" ? "/" : out)
+    }'
+}
+
+# Physical path of something that may not exist yet. Walks up to the nearest
+# existing ancestor, resolves *that* through `pwd -P` (which follows symlinks),
+# then re-attaches the remainder and collapses any '..' left in it.
+#
+# `realpath` would be simpler but is neither POSIX nor present on every macOS.
+canonicalize() {
+  canon_path="$1"
+  case "$canon_path" in
+  /*) ;;
+  *) canon_path="$(pwd -P)/${canon_path}" ;;
+  esac
+
+  canon_rest=''
+  canon_head="$canon_path"
+  while [ ! -d "$canon_head" ]; do
+    canon_leaf="$(basename "$canon_head")"
+    canon_head="$(dirname "$canon_head")"
+    if [ -n "$canon_rest" ]; then
+      canon_rest="${canon_leaf}/${canon_rest}"
+    else
+      canon_rest="$canon_leaf"
+    fi
+    [ "$canon_head" != '/' ] || break
+  done
+
+  canon_head="$(cd "$canon_head" 2>/dev/null && pwd -P)" ||
+    die "could not resolve ${1}"
+
+  if [ -n "$canon_rest" ]; then
+    normalize_path "${canon_head%/}/${canon_rest}"
+  else
+    normalize_path "$canon_head"
+  fi
+}
+
+# `version` and `target` are interpolated into install paths, archive names and
+# release URLs. Anything but a plain path component could climb out of the
+# install root or point the download somewhere else entirely.
+assert_path_component() {
+  case "$2" in
+  '' | . | ..)
+    die "${1} must not be empty, '.', or '..' (got '${2}')"
+    ;;
+  */* | *\\*)
+    die "${1} must be a single path component (got '${2}')"
+    ;;
+  -*)
+    die "${1} must not start with '-' (got '${2}')"
+    ;;
+  *[!A-Za-z0-9._+-]*)
+    die "${1} may only contain letters, digits, '.', '_', '+' and '-' (got '${2}')"
+    ;;
+  esac
+}
+
 # Installing into ~/.grok would put fork state where the official CLI reads it,
-# which is the exact corruption this fork exists to avoid.
+# which is the exact corruption this fork exists to avoid. Comparing the paths
+# as written is not enough: '$HOME/.medley/../.grok', or a MEDLEY_HOME symlink
+# pointing inside ~/.grok, both read as outside it. Resolve first, compare
+# after, and keep the resolved paths so the rest of the script writes exactly
+# what was checked.
 assert_outside_grok_home() {
+  guard_grok="$(canonicalize "$GROK_HOME")"
+  MEDLEY_HOME="$(canonicalize "$MEDLEY_HOME")"
+  INSTALL_DIR="$(canonicalize "$INSTALL_DIR")"
+
   for guard_path in "$MEDLEY_HOME" "$INSTALL_DIR"; do
     case "$guard_path" in
-    "$GROK_HOME" | "$GROK_HOME"/*)
-      die "refusing to install into ${guard_path}: ~/.grok belongs to the official Grok Build and medley must not share it."
+    "$guard_grok" | "$guard_grok"/*)
+      die "refusing to install into ${guard_path}: that resolves inside ${guard_grok}, which belongs to the official Grok Build and medley must not share it."
       ;;
     esac
   done
@@ -173,6 +254,21 @@ print_path_guidance() {
   esac
 }
 
+# Undo a partial install. `previous` is only non-empty between moving the old
+# version aside and finishing activation, so an interruption inside that window
+# puts the working version back.
+cleanup() {
+  [ -z "$tmp" ] || rm -rf "$tmp"
+  [ -z "$staging" ] || rm -rf "$staging"
+  [ -z "$link_tmp" ] || rm -f "$link_tmp"
+  if [ -n "$previous" ] && [ -d "$previous" ]; then
+    rm -rf "$version_dir"
+    mv "$previous" "$version_dir"
+    warn "install did not finish; restored the previous version at ${version_dir}"
+  fi
+  :
+}
+
 main() {
   select_downloader
   assert_outside_grok_home
@@ -182,8 +278,11 @@ main() {
   else
     target="$(detect_target)"
   fi
+  assert_path_component 'target' "$target"
 
   version="$(resolve_version)"
+  assert_path_component 'version' "$version"
+
   tag="v${version}"
   stage="${DIST_NAME}-${version}-${target}"
   archive="${stage}.tar.gz"
@@ -191,7 +290,8 @@ main() {
   base_url="https://github.com/${REPO}/releases/download/$(url_escape "$tag")"
   archive_url="${base_url}/$(url_escape "$archive")"
   checksums_url="${base_url}/$(url_escape "$checksums")"
-  version_dir="${MEDLEY_HOME}/versions/${version}"
+  versions_root="${MEDLEY_HOME}/versions"
+  version_dir="${versions_root}/${version}"
 
   say "medley ${version} (${target})"
   say "  archive:     ${archive_url}"
@@ -207,8 +307,13 @@ main() {
 
   report_coexistence
 
+  # Initialised before the trap so cleanup can never touch an unset variable.
+  tmp=''
+  staging=''
+  previous=''
+  link_tmp=''
+  trap cleanup EXIT INT TERM
   tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT INT TERM
 
   say ''
   say "Downloading ${archive}..."
@@ -233,21 +338,41 @@ main() {
   [ -f "${tmp}/${stage}/${DIST_NAME}" ] ||
     die "${archive} does not contain a ${DIST_NAME} binary."
 
-  mkdir -p "${MEDLEY_HOME}/versions"
-  rm -rf "$version_dir"
-  mv "${tmp}/${stage}" "$version_dir"
-  chmod +x "${version_dir}/${DIST_NAME}"
+  # Stage inside the versions directory, so that activating is a rename on one
+  # filesystem rather than a copy that can be interrupted halfway.
+  mkdir -p "$versions_root"
+  staging="${versions_root}/.staging-$$"
+  rm -rf "$staging"
+  mv "${tmp}/${stage}" "$staging"
+  chmod +x "${staging}/${DIST_NAME}"
 
-  # `ln -n` is not POSIX, so replace the old link rather than relying on it.
-  mkdir -p "$INSTALL_DIR"
-  rm -f "${INSTALL_DIR}/${DIST_NAME}"
-  ln -s "${version_dir}/${DIST_NAME}" "${INSTALL_DIR}/${DIST_NAME}"
+  # Prove the new binary runs before it replaces one that already does.
+  smoke="$("${staging}/${DIST_NAME}" --version 2>/dev/null)" ||
+    die "the downloaded ${DIST_NAME} could not run on this machine, so your existing installation was left untouched. On macOS this is usually Gatekeeper quarantine."
 
-  say "Installed ${DIST_NAME} to ${INSTALL_DIR}/${DIST_NAME}"
-
-  if ! "${INSTALL_DIR}/${DIST_NAME}" --version; then
-    warn "${DIST_NAME} was installed but did not run. On macOS, try: xattr -d com.apple.quarantine ${version_dir}/${DIST_NAME}"
+  # Activate. Both steps are renames, so an interruption leaves either the old
+  # version or the new one — never a half-written tree or a dangling symlink.
+  if [ -d "$version_dir" ]; then
+    previous="${versions_root}/.previous-$$"
+    rm -rf "$previous"
+    mv "$version_dir" "$previous"
   fi
+  mv "$staging" "$version_dir"
+  staging=''
+
+  mkdir -p "$INSTALL_DIR"
+  link_tmp="${INSTALL_DIR}/.${DIST_NAME}.new-$$"
+  rm -f "$link_tmp"
+  ln -s "${version_dir}/${DIST_NAME}" "$link_tmp"
+  mv -f "$link_tmp" "${INSTALL_DIR}/${DIST_NAME}"
+  link_tmp=''
+
+  if [ -n "$previous" ]; then
+    rm -rf "$previous"
+    previous=''
+  fi
+
+  say "Installed ${DIST_NAME} ${smoke} to ${INSTALL_DIR}/${DIST_NAME}"
 
   print_path_guidance
   say ''
