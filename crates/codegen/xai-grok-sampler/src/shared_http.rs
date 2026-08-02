@@ -16,8 +16,6 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-static SHARED_H2: OnceLock<reqwest::Client> = OnceLock::new();
-static SHARED_HTTP1: OnceLock<reqwest::Client> = OnceLock::new();
 static SHARED_NO_REDIRECT_H2: OnceLock<reqwest::Client> = OnceLock::new();
 static SHARED_NO_REDIRECT_HTTP1: OnceLock<reqwest::Client> = OnceLock::new();
 
@@ -58,17 +56,6 @@ fn shared(
     Ok(cell.get_or_init(|| built).clone())
 }
 
-/// Shared HTTP/2 sampling client (connection pooling + h2 keepalive).
-pub(crate) fn client() -> Result<reqwest::Client, reqwest::Error> {
-    shared(&SHARED_H2, build_http_client, sharing_disabled())
-}
-
-/// Shared HTTP/1.1 fallback client. Pool-less by construction, so sharing it
-/// is behaviorally identical to building a fresh one.
-pub(crate) fn client_http1() -> Result<reqwest::Client, reqwest::Error> {
-    shared(&SHARED_HTTP1, build_http_client_http1, sharing_disabled())
-}
-
 /// Sampling client for authenticated transports that must not follow redirects.
 pub(crate) fn client_no_redirect(force_http1: bool) -> Result<reqwest::Client, reqwest::Error> {
     if force_http1 {
@@ -84,36 +71,6 @@ pub(crate) fn client_no_redirect(force_http1: bool) -> Result<reqwest::Client, r
             sharing_disabled(),
         )
     }
-}
-
-/// Build a `reqwest::Client` for sampling with HTTP/2 + connection pooling.
-/// Env knobs are read once, when the shared client is first built.
-fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
-    let pool_max_idle: usize = std::env::var("GROK_POOL_MAX_IDLE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(2);
-    let pool_idle_timeout_secs: u64 = std::env::var("GROK_POOL_IDLE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(90);
-    let connect_timeout_secs: u64 = std::env::var("GROK_CONNECT_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(10);
-
-    xai_grok_extra_ca::with_extra_root_certificates(
-        reqwest::Client::builder()
-            .pool_max_idle_per_host(pool_max_idle)
-            .pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs))
-            .connect_timeout(Duration::from_secs(connect_timeout_secs))
-            .tcp_nodelay(true)
-            // HTTP/2 keep-alive: ping every 15s, timeout after 5s.
-            .http2_keep_alive_interval(Duration::from_secs(15))
-            .http2_keep_alive_timeout(Duration::from_secs(5))
-            .http2_keep_alive_while_idle(true),
-    )
-    .build()
 }
 
 fn build_http_client_no_redirect() -> Result<reqwest::Client, reqwest::Error> {
@@ -140,25 +97,6 @@ fn build_http_client_no_redirect() -> Result<reqwest::Client, reqwest::Error> {
             .http2_keep_alive_timeout(Duration::from_secs(5))
             .http2_keep_alive_while_idle(true)
             .redirect(reqwest::redirect::Policy::none()),
-    )
-    .build()
-}
-
-/// Build a `reqwest::Client` constrained to HTTP/1.1 with pooling disabled.
-/// Used as a fallback after HTTP/2 transport failures.
-fn build_http_client_http1() -> Result<reqwest::Client, reqwest::Error> {
-    let connect_timeout_secs: u64 = std::env::var("GROK_CONNECT_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(10);
-
-    xai_grok_extra_ca::with_extra_root_certificates(
-        reqwest::Client::builder()
-            .pool_max_idle_per_host(0)
-            .pool_idle_timeout(Duration::from_secs(0))
-            .connect_timeout(Duration::from_secs(connect_timeout_secs))
-            .tcp_nodelay(true)
-            .http1_only(),
     )
     .build()
 }

@@ -29,7 +29,7 @@ use xai_grok_sampling_types::{
     is_check_event, messages, rs,
 };
 
-use crate::config::{AuthScheme, OriginClientInfo, SamplerConfig};
+use crate::config::{AuthScheme, EndpointTrustClass, OriginClientInfo, SamplerConfig};
 use xai_grok_auth::{CredentialComparison, SentCredentialRelation};
 
 /// Credential bytes from the final outbound header map. This value stays
@@ -56,6 +56,102 @@ fn should_send_xai_identity_headers(auth_scheme: AuthScheme, base_url: &str) -> 
 fn strip_xai_identity_headers(headers: &mut HeaderMap) {
     headers.remove(HeaderName::from_static("x-grok-deployment-id"));
     headers.remove(HeaderName::from_static("x-grok-user-id"));
+}
+
+/// Resolve the endpoint trust class: explicit config wins, then xAI-operated
+/// hosts (including the cli-chat-proxy) with real auth, then loopback, then
+/// external. Decided once at client construction and enforced at every
+/// request boundary.
+fn resolve_endpoint_trust(config: &SamplerConfig) -> EndpointTrustClass {
+    if let Some(explicit) = config.endpoint_trust {
+        return explicit;
+    }
+    // The production cli-chat-proxy is first-party even though it lives on
+    // loopback — matched exactly, never by host class.
+    if crate::util::is_prod_cli_chat_proxy_url(&config.base_url) {
+        return EndpointTrustClass::FirstPartyXai;
+    }
+    // Any other loopback endpoint is Local regardless of auth scheme: an
+    // authenticated Ollama/LM Studio server must not be classified
+    // first-party just because `is_xai_api_url` accepts loopback mocks.
+    if is_loopback_url(&config.base_url) {
+        return EndpointTrustClass::Local;
+    }
+    if should_send_xai_identity_headers(config.auth_scheme, &config.base_url) {
+        return EndpointTrustClass::FirstPartyXai;
+    }
+    EndpointTrustClass::External
+}
+
+fn is_loopback_url(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|u| match u.host_str() {
+        Some("localhost") => true,
+        // `host_str` wraps IPv6 literals in brackets; strip them for parsing.
+        Some(host) => host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback()),
+        None => false,
+    })
+}
+
+/// First-party metadata namespaces that must never reach a non-xAI endpoint,
+/// regardless of how they were injected (defaults, extra_headers, env
+/// headers, or a per-request header injector).
+fn is_internal_metadata_header(name: &HeaderName) -> bool {
+    let name = name.as_str();
+    name.starts_with("x-grok-")
+        || name.starts_with("x-xai-")
+        || name == "x-compactions-remaining"
+        || name == "x-compaction-at"
+        || name == "x-authenticateresponse"
+        || name == "traceparent"
+        || name == "tracestate"
+        || name == "baggage"
+}
+
+/// Replace a stable first-party session identifier in `prompt_cache_key`
+/// with an irreversible digest: non-xAI endpoints keep a stable
+/// cache-affinity key without learning the raw session ID.
+fn anonymize_prompt_cache_key(body: &mut serde_json::Value) {
+    if let Some(key) = body
+        .get("prompt_cache_key")
+        .and_then(serde_json::Value::as_str)
+        .filter(|key| !key.is_empty())
+    {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(key.as_bytes());
+        body["prompt_cache_key"] = serde_json::Value::String(format!("{digest:x}"));
+    }
+}
+
+/// Allowlist boundary for `External` / `Local` endpoints: keep protocol
+/// headers, the selected credential, the User-Agent, and explicitly
+/// configured provider headers; drop everything else. Internal metadata
+/// namespaces are denied even when explicitly configured, so a shell-side
+/// injection into `extra_headers` cannot re-open the boundary.
+fn enforce_external_metadata_boundary(headers: &mut HeaderMap, explicit: &[HeaderName]) {
+    let retained: Vec<(HeaderName, HeaderValue)> = headers
+        .iter()
+        .filter(|(name, _)| {
+            if is_internal_metadata_header(name) {
+                return false;
+            }
+            **name == CONTENT_TYPE
+                || **name == ACCEPT
+                || **name == USER_AGENT
+                || **name == AUTHORIZATION
+                || name.as_str() == "x-api-key"
+                || **name == CHATGPT_ACCOUNT_ID
+                || explicit.contains(name)
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    headers.clear();
+    for (name, value) in retained {
+        headers.append(name, value);
+    }
 }
 
 fn normalize_codex_base_url(base_url: &str) -> Result<String> {
@@ -135,6 +231,13 @@ impl GrokRequestHeaders<'_> {
         builder: reqwest::RequestBuilder,
         include_identity: bool,
     ) -> reqwest::RequestBuilder {
+        // `include_identity` is the endpoint-trust gate: non-first-party
+        // endpoints receive no request-correlation metadata at all. These
+        // headers ride the builder (after `post()`), so this early return is
+        // the enforcement point — the post-injector boundary cannot see them.
+        if !include_identity {
+            return builder;
+        }
         let mut b = builder
             .header("x-grok-conv-id", self.conv_id)
             .header("x-grok-req-id", self.req_id)
@@ -464,6 +567,9 @@ pub struct SamplingClient {
     header_injector: Option<crate::config::SharedHeaderInjector>,
     /// Endpoint URL builder, resolved once from `base_url` + `query_params`.
     endpoint: EndpointTemplate,
+    /// Header names the caller explicitly configured (extra_headers +
+    /// env_http_headers), retained across the external metadata boundary.
+    explicit_header_names: Vec<HeaderName>,
 }
 
 impl std::fmt::Debug for SamplingClient {
@@ -488,6 +594,7 @@ struct ClientDefaults {
     top_p: Option<f32>,
     api_backend: ApiBackend,
     auth_scheme: AuthScheme,
+    endpoint_trust: EndpointTrustClass,
     stream_tool_calls: bool,
     doom_loop_recovery: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
 }
@@ -665,6 +772,8 @@ impl SamplingClient {
     /// pre-computes the default request headers. This does not perform
     /// any network I/O.
     pub fn new(config: SamplerConfig) -> Result<Self> {
+        let endpoint_trust = resolve_endpoint_trust(&config);
+        let is_first_party = matches!(endpoint_trust, EndpointTrustClass::FirstPartyXai);
         let is_codex = matches!(config.api_backend, ApiBackend::CodexResponses);
         if is_codex && !config.query_params.is_empty() {
             return Err(SamplingError::InvalidConfiguration(
@@ -708,12 +817,19 @@ impl SamplingClient {
         // Apply all extra headers verbatim. This is the single
         // injection point for proxy-auth headers and any other URL- or
         // environment-specific headers the session decides to set.
+        let mut explicit_header_names: Vec<HeaderName> = Vec::new();
         for (key, value) in &config.extra_headers {
             let header_name = HeaderName::try_from(key.as_str())
                 .map_err(|_| SamplingError::InvalidConfiguration("Invalid extra header name"))?;
             let header_value = HeaderValue::from_str(value)
                 .map_err(|_| SamplingError::InvalidConfiguration("Invalid extra header value"))?;
+            explicit_header_names.push(header_name.clone());
             headers.insert(header_name, header_value);
+        }
+        for key in config.env_http_headers.keys() {
+            if let Ok(header_name) = HeaderName::try_from(key.as_str()) {
+                explicit_header_names.push(header_name);
+            }
         }
 
         // Resolve here, not into `extra_headers`, so an env-sourced secret stays
@@ -740,7 +856,7 @@ impl SamplingClient {
             );
         }
 
-        if should_send_xai_identity_headers(config.auth_scheme, &base_url) {
+        if is_first_party {
             if let Some(deployment_id) = config.deployment_id.as_ref()
                 && let Ok(header_value) = HeaderValue::from_str(deployment_id)
             {
@@ -759,7 +875,7 @@ impl SamplingClient {
             strip_xai_identity_headers(&mut headers);
         }
 
-        {
+        if is_first_party {
             let client_id = config
                 .client_identifier
                 .clone()
@@ -772,29 +888,35 @@ impl SamplingClient {
             }
         }
 
-        // Always set User-Agent: per-session origin if available, else fallback.
+        // Always set User-Agent: per-session origin for first-party endpoints;
+        // a minimal, non-identifying product string (no version, platform, or
+        // frontend origin) for external and local providers.
         {
-            let ua_string = match config.origin_client.as_ref() {
-                Some(origin) => user_agent_string_for(origin),
-                None => user_agent_string_for(&OriginClientInfo {
-                    product: AGENT_PRODUCT.to_string(),
-                    version: Some(agent_version()),
-                }),
+            let ua_string = if is_first_party {
+                match config.origin_client.as_ref() {
+                    Some(origin) => user_agent_string_for(origin),
+                    None => user_agent_string_for(&OriginClientInfo {
+                        product: AGENT_PRODUCT.to_string(),
+                        version: Some(agent_version()),
+                    }),
+                }
+            } else {
+                AGENT_PRODUCT.to_string()
             };
             if let Ok(v) = HeaderValue::from_str(&ua_string) {
                 headers.insert(USER_AGENT, v);
             }
         }
 
-        let http = if is_codex {
-            crate::shared_http::client_no_redirect(config.force_http1)
-                .map_err(SamplingError::from)?
-        } else if config.force_http1 {
+        // No sampling transport has a legitimate cross-origin redirect;
+        // following one would forward already-attached credentials and
+        // first-party metadata to an origin that was never classified.
+        // The no-redirect builders keep the same pooling and keepalive.
+        if config.force_http1 && !is_codex {
             tracing::info!("Using HTTP/1.1 for sampling client (force_http1=true)");
-            crate::shared_http::client_http1().map_err(SamplingError::from)?
-        } else {
-            crate::shared_http::client().map_err(SamplingError::from)?
-        };
+        }
+        let http = crate::shared_http::client_no_redirect(config.force_http1)
+            .map_err(SamplingError::from)?;
 
         tracing::info!(
             target: crate::sampling_log::TARGET,
@@ -819,6 +941,7 @@ impl SamplingClient {
             top_p: config.top_p,
             api_backend: config.api_backend,
             auth_scheme: config.auth_scheme,
+            endpoint_trust,
             stream_tool_calls: config.stream_tool_calls,
             doom_loop_recovery: config.doom_loop_recovery,
         };
@@ -834,6 +957,7 @@ impl SamplingClient {
             bearer_resolver: config.bearer_resolver,
             header_injector: config.header_injector,
             endpoint,
+            explicit_header_names,
         })
     }
 
@@ -842,10 +966,14 @@ impl SamplingClient {
         self.defaults.api_backend.clone()
     }
 
-    /// Whether xAI account identity headers (`x-grok-user-id`, `x-grok-deployment-id`)
-    /// should ride on outbound requests for this client.
+    /// Whether this client targets a first-party xAI endpoint and may send
+    /// internal request metadata (`x-grok-*`, client identifier, trace
+    /// context). External and local providers receive none of it.
     fn sends_xai_identity_headers(&self) -> bool {
-        should_send_xai_identity_headers(self.defaults.auth_scheme, &self.base_url)
+        matches!(
+            self.defaults.endpoint_trust,
+            EndpointTrustClass::FirstPartyXai
+        )
     }
 
     fn is_codex(&self) -> bool {
@@ -898,7 +1026,10 @@ impl SamplingClient {
             headers.remove(HeaderName::from_static("x-api-key"));
         }
         if !self.sends_xai_identity_headers() {
-            strip_xai_identity_headers(&mut headers);
+            // Allowlist boundary for non-xAI endpoints, applied after every
+            // injector so neither the trace injector nor extra headers can
+            // re-add first-party metadata.
+            enforce_external_metadata_boundary(&mut headers, &self.explicit_header_names);
         }
         if self.is_codex() {
             retain_codex_headers(
@@ -1391,6 +1522,9 @@ impl SamplingClient {
         if self.is_codex() {
             xai_grok_sampling_types::patch_codex_instructions(&mut request_body);
         }
+        if !self.sends_xai_identity_headers() {
+            anonymize_prompt_cache_key(&mut request_body);
+        }
         // async-openai's ReasoningTextContent struct omits the `type`
         // discriminator that the Responses API requires on input. Patch
         // it in post-serialize. This is the last surviving piece of the
@@ -1517,6 +1651,9 @@ impl SamplingClient {
         if self.is_codex() {
             xai_grok_sampling_types::patch_codex_instructions(&mut request_body);
         }
+        if !self.sends_xai_identity_headers() {
+            anonymize_prompt_cache_key(&mut request_body);
+        }
         // Inject xAI-specific fields only for the generic Responses transport.
         if !self.is_codex() && self.defaults.stream_tool_calls {
             request_body["stream_tool_calls"] = serde_json::json!(true);
@@ -1533,7 +1670,10 @@ impl SamplingClient {
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
         // Fresh per attempt so signals never leak across retries; `None`
         // (check disabled) sends no header and does no peek work per event.
-        let doom_loop = (!self.is_codex())
+        // First-party only: the doom-loop check is an xAI server feature and
+        // its opt-in header is internal metadata (rides the builder after
+        // `post()`, so it must be gated here, not at the boundary).
+        let doom_loop = (!self.is_codex() && self.sends_xai_identity_headers())
             .then_some(self.defaults.doom_loop_recovery)
             .flatten()
             .map(crate::doom_loop::DoomLoopSignalCollector::new);
@@ -2273,6 +2413,7 @@ mod tests {
             temperature: None,
             top_p: None,
             api_backend: ApiBackend::ChatCompletions,
+            endpoint_trust: None,
             auth_scheme: AuthScheme::Bearer,
             extra_headers: IndexMap::new(),
             query_params: IndexMap::new(),
@@ -3024,14 +3165,271 @@ mod tests {
         }
 
         let mut config = minimal_config();
+        // First-party endpoint: trace context is kept. (External endpoints
+        // strip it at the metadata boundary — covered separately below.)
+        config.base_url = "https://api.x.ai/v1".to_string();
         config.header_injector = Some(std::sync::Arc::new(TestInjector));
         let client = SamplingClient::new(config).expect("build");
-        let (builder, _final_credential) = client.post("http://localhost/test");
+        let (builder, _final_credential) = client.post("https://api.x.ai/v1/test");
         let req = builder.build().expect("build request");
         assert!(
             req.headers().contains_key("traceparent"),
-            "HeaderInjector should inject traceparent into post() requests"
+            "HeaderInjector should inject traceparent into first-party post() requests"
         );
+    }
+
+    /// Hostile injector for boundary tests: tries to smuggle every class of
+    /// first-party metadata onto an outbound request.
+    #[derive(Debug)]
+    struct MetadataSmuggler;
+    impl crate::config::HeaderInjector for MetadataSmuggler {
+        fn inject(&self, headers: &mut HeaderMap) {
+            for name in [
+                "traceparent",
+                "tracestate",
+                "baggage",
+                "x-grok-conv-id",
+                "x-grok-client-identifier",
+                "x-grok-client-version",
+                "x-compactions-remaining",
+                "x-compaction-at",
+                "x-authenticateresponse",
+                "x-xai-token-auth",
+            ] {
+                headers.insert(
+                    HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    HeaderValue::from_static("must-not-leak"),
+                );
+            }
+        }
+    }
+
+    fn boundary_config(base_url: &str) -> SamplerConfig {
+        let mut config = minimal_config();
+        config.base_url = base_url.to_string();
+        config.client_identifier = Some("secret-frontend".to_string());
+        config.client_version = Some("9.9.9".to_string());
+        config.header_injector = Some(std::sync::Arc::new(MetadataSmuggler));
+        config
+            .extra_headers
+            .insert("x-provider-key".to_string(), "configured".to_string());
+        config
+    }
+
+    const INTERNAL_METADATA: [&str; 11] = [
+        "traceparent",
+        "tracestate",
+        "baggage",
+        "x-grok-conv-id",
+        "x-grok-client-identifier",
+        "x-grok-client-version",
+        "x-compactions-remaining",
+        "x-compaction-at",
+        "x-authenticateresponse",
+        "x-xai-token-auth",
+        "x-grok-user-id",
+    ];
+
+    #[test]
+    fn external_endpoint_strips_all_first_party_metadata() {
+        let client =
+            SamplingClient::new(boundary_config("https://api.openai.com/v1")).expect("build");
+        let req = client
+            .post("https://api.openai.com/v1/chat/completions")
+            .0
+            .build()
+            .expect("build request");
+        for name in INTERNAL_METADATA {
+            assert!(
+                req.headers().get(name).is_none(),
+                "external endpoint must not receive {name}"
+            );
+        }
+        assert_eq!(req.headers()[AUTHORIZATION], "Bearer test-key");
+        assert_eq!(
+            req.headers()[HeaderName::from_static("x-provider-key")],
+            "configured",
+            "explicitly configured provider headers must survive the boundary"
+        );
+        assert_eq!(
+            req.headers()[USER_AGENT],
+            AGENT_PRODUCT,
+            "external User-Agent must be the minimal product string"
+        );
+    }
+
+    #[test]
+    fn local_endpoint_strips_all_first_party_metadata() {
+        let mut config = boundary_config("http://127.0.0.1:11434/v1");
+        config.auth_scheme = AuthScheme::None;
+        config.api_key = None;
+        let client = SamplingClient::new(config).expect("build");
+        let req = client
+            .post("http://127.0.0.1:11434/v1/chat/completions")
+            .0
+            .build()
+            .expect("build request");
+        for name in INTERNAL_METADATA {
+            assert!(
+                req.headers().get(name).is_none(),
+                "local endpoint must not receive {name}"
+            );
+        }
+        assert!(req.headers().get(AUTHORIZATION).is_none());
+    }
+
+    /// An authenticated loopback server (Ollama/LM Studio with a key) is
+    /// Local, not first-party: `is_xai_api_url` accepts loopback for mock
+    /// convenience, but trust derivation must not inherit that.
+    #[test]
+    fn authenticated_loopback_is_local_not_first_party() {
+        let mut config = boundary_config("http://127.0.0.1:11434/v1");
+        config.auth_scheme = AuthScheme::Bearer;
+        config.api_key = Some("local-server-key".to_string());
+        let client = SamplingClient::new(config).expect("build");
+        assert!(!client.sends_xai_identity_headers());
+        let req = client
+            .post("http://127.0.0.1:11434/v1/chat/completions")
+            .0
+            .build()
+            .expect("build request");
+        for name in INTERNAL_METADATA {
+            assert!(
+                req.headers().get(name).is_none(),
+                "authenticated loopback must not receive {name}"
+            );
+        }
+        assert_eq!(req.headers()[AUTHORIZATION], "Bearer local-server-key");
+    }
+
+    #[test]
+    fn prompt_cache_key_anonymized_irreversibly_and_stably() {
+        let mut body = serde_json::json!({"prompt_cache_key": "0199-session-uuid"});
+        anonymize_prompt_cache_key(&mut body);
+        let first = body["prompt_cache_key"].as_str().unwrap().to_owned();
+        assert_ne!(first, "0199-session-uuid");
+        assert!(!first.contains("0199"), "digest must not embed the raw id");
+        assert_eq!(first.len(), 64, "sha-256 hex digest");
+
+        let mut again = serde_json::json!({"prompt_cache_key": "0199-session-uuid"});
+        anonymize_prompt_cache_key(&mut again);
+        assert_eq!(
+            again["prompt_cache_key"].as_str().unwrap(),
+            first,
+            "same session must keep a stable cache key"
+        );
+
+        let mut empty = serde_json::json!({"prompt_cache_key": ""});
+        anonymize_prompt_cache_key(&mut empty);
+        assert_eq!(empty["prompt_cache_key"].as_str().unwrap(), "");
+        let mut absent = serde_json::json!({"model": "m"});
+        anonymize_prompt_cache_key(&mut absent);
+        assert!(absent.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn xai_endpoint_keeps_first_party_metadata() {
+        let client = SamplingClient::new(boundary_config("https://api.x.ai/v1")).expect("build");
+        let req = client
+            .post("https://api.x.ai/v1/chat/completions")
+            .0
+            .build()
+            .expect("build request");
+        assert_eq!(req.headers()["traceparent"], "must-not-leak");
+        // Values may be overwritten by the (trusted, first-party) injector —
+        // what matters is that first-party metadata is present at all.
+        assert!(
+            req.headers()
+                .contains_key(HeaderName::from_static("x-grok-client-identifier"))
+        );
+        assert!(
+            req.headers()
+                .contains_key(HeaderName::from_static("x-grok-client-version"))
+        );
+    }
+
+    #[test]
+    fn internal_namespace_denied_even_when_explicitly_configured() {
+        let mut config = boundary_config("https://api.openai.com/v1");
+        // The shell folds per-turn compaction metadata into extra_headers;
+        // explicit configuration must not reopen the boundary for internal
+        // namespaces.
+        config
+            .extra_headers
+            .insert("x-compactions-remaining".to_string(), "3".to_string());
+        config
+            .extra_headers
+            .insert("x-grok-session-id".to_string(), "sess-1".to_string());
+        let client = SamplingClient::new(config).expect("build");
+        let req = client
+            .post("https://api.openai.com/v1/chat/completions")
+            .0
+            .build()
+            .expect("build request");
+        assert!(
+            req.headers().get("x-compactions-remaining").is_none(),
+            "internal namespace must be denied even when explicitly configured"
+        );
+        assert!(req.headers().get("x-grok-session-id").is_none());
+        assert_eq!(
+            req.headers()[HeaderName::from_static("x-provider-key")],
+            "configured"
+        );
+    }
+
+    #[test]
+    fn explicit_endpoint_trust_override_wins_over_derivation() {
+        let mut config = boundary_config("https://internal-relay.example");
+        config.endpoint_trust = Some(crate::config::EndpointTrustClass::FirstPartyXai);
+        let client = SamplingClient::new(config).expect("build");
+        let req = client
+            .post("https://internal-relay.example/chat/completions")
+            .0
+            .build()
+            .expect("build request");
+        assert_eq!(
+            req.headers()["traceparent"],
+            "must-not-leak",
+            "an explicit FirstPartyXai override must keep first-party metadata"
+        );
+    }
+
+    #[test]
+    fn grok_request_headers_skip_non_first_party() {
+        let client =
+            SamplingClient::new(boundary_config("https://api.openai.com/v1")).expect("build");
+        let headers = GrokRequestHeaders {
+            conv_id: "conv",
+            req_id: "req",
+            model_id: "model",
+            session_id: "sess",
+            turn_idx: Some("0"),
+            agent_id: "agent",
+            deployment_id: Some("deploy"),
+            user_id: Some("user"),
+        };
+        let req = headers
+            .apply(
+                client.post("https://api.openai.com/v1/chat/completions").0,
+                client.sends_xai_identity_headers(),
+            )
+            .build()
+            .expect("build request");
+        for name in [
+            "x-grok-conv-id",
+            "x-grok-req-id",
+            "x-grok-model-override",
+            "x-grok-session-id",
+            "x-grok-agent-id",
+            "x-grok-turn-idx",
+            "x-grok-deployment-id",
+            "x-grok-user-id",
+        ] {
+            assert!(
+                req.headers().get(name).is_none(),
+                "builder-level metadata {name} must be gated off for external endpoints"
+            );
+        }
     }
 
     #[derive(Debug)]

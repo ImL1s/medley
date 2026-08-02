@@ -655,6 +655,10 @@ async fn recap_request_rides_parent_prompt_cache() {
             let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
             cfg.base_url = server.url();
             cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+            // The loopback mock stands in for a first-party xAI endpoint; the
+            // metadata boundary would otherwise classify it Local and strip
+            // the x-grok-* correlation headers these tests assert on.
+            cfg.endpoint_trust = Some(xai_grok_sampling_types::EndpointTrustClass::FirstPartyXai);
             actor.chat_state_handle.update_sampling_config(cfg);
 
             actor.chat_state_handle.replace_conversation(vec![
@@ -741,6 +745,10 @@ async fn recap_request_sends_hosted_tools_under_backend_search() {
             let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
             cfg.base_url = server.url();
             cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+            // The loopback mock stands in for a first-party xAI endpoint; the
+            // metadata boundary would otherwise classify it Local and strip
+            // the x-grok-* correlation headers these tests assert on.
+            cfg.endpoint_trust = Some(xai_grok_sampling_types::EndpointTrustClass::FirstPartyXai);
             actor.chat_state_handle.update_sampling_config(cfg);
 
             actor.chat_state_handle.replace_conversation(vec![
@@ -832,6 +840,10 @@ async fn recap_hosted_tools_reflect_the_active_per_turn_override() {
             let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
             cfg.base_url = server.url();
             cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+            // The loopback mock stands in for a first-party xAI endpoint; the
+            // metadata boundary would otherwise classify it Local and strip
+            // the x-grok-* correlation headers these tests assert on.
+            cfg.endpoint_trust = Some(xai_grok_sampling_types::EndpointTrustClass::FirstPartyXai);
             actor.chat_state_handle.update_sampling_config(cfg);
 
             actor.chat_state_handle.replace_conversation(vec![
