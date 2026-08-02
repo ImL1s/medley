@@ -66,11 +66,19 @@ fn resolve_endpoint_trust(config: &SamplerConfig) -> EndpointTrustClass {
     if let Some(explicit) = config.endpoint_trust {
         return explicit;
     }
-    if should_send_xai_identity_headers(config.auth_scheme, &config.base_url) {
+    // The production cli-chat-proxy is first-party even though it lives on
+    // loopback — matched exactly, never by host class.
+    if crate::util::is_prod_cli_chat_proxy_url(&config.base_url) {
         return EndpointTrustClass::FirstPartyXai;
     }
+    // Any other loopback endpoint is Local regardless of auth scheme: an
+    // authenticated Ollama/LM Studio server must not be classified
+    // first-party just because `is_xai_api_url` accepts loopback mocks.
     if is_loopback_url(&config.base_url) {
         return EndpointTrustClass::Local;
+    }
+    if should_send_xai_identity_headers(config.auth_scheme, &config.base_url) {
+        return EndpointTrustClass::FirstPartyXai;
     }
     EndpointTrustClass::External
 }
@@ -97,9 +105,25 @@ fn is_internal_metadata_header(name: &HeaderName) -> bool {
         || name.starts_with("x-xai-")
         || name == "x-compactions-remaining"
         || name == "x-compaction-at"
+        || name == "x-authenticateresponse"
         || name == "traceparent"
         || name == "tracestate"
         || name == "baggage"
+}
+
+/// Replace a stable first-party session identifier in `prompt_cache_key`
+/// with an irreversible digest: non-xAI endpoints keep a stable
+/// cache-affinity key without learning the raw session ID.
+fn anonymize_prompt_cache_key(body: &mut serde_json::Value) {
+    if let Some(key) = body
+        .get("prompt_cache_key")
+        .and_then(serde_json::Value::as_str)
+        .filter(|key| !key.is_empty())
+    {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(key.as_bytes());
+        body["prompt_cache_key"] = serde_json::Value::String(format!("{digest:x}"));
+    }
 }
 
 /// Allowlist boundary for `External` / `Local` endpoints: keep protocol
@@ -884,15 +908,15 @@ impl SamplingClient {
             }
         }
 
-        let http = if is_codex {
-            crate::shared_http::client_no_redirect(config.force_http1)
-                .map_err(SamplingError::from)?
-        } else if config.force_http1 {
+        // No sampling transport has a legitimate cross-origin redirect;
+        // following one would forward already-attached credentials and
+        // first-party metadata to an origin that was never classified.
+        // The no-redirect builders keep the same pooling and keepalive.
+        if config.force_http1 && !is_codex {
             tracing::info!("Using HTTP/1.1 for sampling client (force_http1=true)");
-            crate::shared_http::client_http1().map_err(SamplingError::from)?
-        } else {
-            crate::shared_http::client().map_err(SamplingError::from)?
-        };
+        }
+        let http = crate::shared_http::client_no_redirect(config.force_http1)
+            .map_err(SamplingError::from)?;
 
         tracing::info!(
             target: crate::sampling_log::TARGET,
@@ -1498,6 +1522,9 @@ impl SamplingClient {
         if self.is_codex() {
             xai_grok_sampling_types::patch_codex_instructions(&mut request_body);
         }
+        if !self.sends_xai_identity_headers() {
+            anonymize_prompt_cache_key(&mut request_body);
+        }
         // async-openai's ReasoningTextContent struct omits the `type`
         // discriminator that the Responses API requires on input. Patch
         // it in post-serialize. This is the last surviving piece of the
@@ -1623,6 +1650,9 @@ impl SamplingClient {
         })?;
         if self.is_codex() {
             xai_grok_sampling_types::patch_codex_instructions(&mut request_body);
+        }
+        if !self.sends_xai_identity_headers() {
+            anonymize_prompt_cache_key(&mut request_body);
         }
         // Inject xAI-specific fields only for the generic Responses transport.
         if !self.is_codex() && self.defaults.stream_tool_calls {
@@ -3244,6 +3274,55 @@ mod tests {
             );
         }
         assert!(req.headers().get(AUTHORIZATION).is_none());
+    }
+
+    /// An authenticated loopback server (Ollama/LM Studio with a key) is
+    /// Local, not first-party: `is_xai_api_url` accepts loopback for mock
+    /// convenience, but trust derivation must not inherit that.
+    #[test]
+    fn authenticated_loopback_is_local_not_first_party() {
+        let mut config = boundary_config("http://127.0.0.1:11434/v1");
+        config.auth_scheme = AuthScheme::Bearer;
+        config.api_key = Some("local-server-key".to_string());
+        let client = SamplingClient::new(config).expect("build");
+        assert!(!client.sends_xai_identity_headers());
+        let req = client
+            .post("http://127.0.0.1:11434/v1/chat/completions")
+            .0
+            .build()
+            .expect("build request");
+        for name in INTERNAL_METADATA {
+            assert!(
+                req.headers().get(name).is_none(),
+                "authenticated loopback must not receive {name}"
+            );
+        }
+        assert_eq!(req.headers()[AUTHORIZATION], "Bearer local-server-key");
+    }
+
+    #[test]
+    fn prompt_cache_key_anonymized_irreversibly_and_stably() {
+        let mut body = serde_json::json!({"prompt_cache_key": "0199-session-uuid"});
+        anonymize_prompt_cache_key(&mut body);
+        let first = body["prompt_cache_key"].as_str().unwrap().to_owned();
+        assert_ne!(first, "0199-session-uuid");
+        assert!(!first.contains("0199"), "digest must not embed the raw id");
+        assert_eq!(first.len(), 64, "sha-256 hex digest");
+
+        let mut again = serde_json::json!({"prompt_cache_key": "0199-session-uuid"});
+        anonymize_prompt_cache_key(&mut again);
+        assert_eq!(
+            again["prompt_cache_key"].as_str().unwrap(),
+            first,
+            "same session must keep a stable cache key"
+        );
+
+        let mut empty = serde_json::json!({"prompt_cache_key": ""});
+        anonymize_prompt_cache_key(&mut empty);
+        assert_eq!(empty["prompt_cache_key"].as_str().unwrap(), "");
+        let mut absent = serde_json::json!({"model": "m"});
+        anonymize_prompt_cache_key(&mut absent);
+        assert!(absent.get("prompt_cache_key").is_none());
     }
 
     #[test]

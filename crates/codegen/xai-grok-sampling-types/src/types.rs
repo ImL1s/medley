@@ -1047,9 +1047,7 @@ impl ApiBackend {
 /// selected provider credential, a minimal User-Agent, and explicitly
 /// configured provider headers — internal metadata must never create
 /// cross-provider correlation.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EndpointTrustClass {
     /// An xAI-operated endpoint authenticated with first-party credentials.

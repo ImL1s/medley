@@ -793,7 +793,10 @@ async fn read_parent_sampling_config(
                 max_completion_tokens: cfg.max_completion_tokens,
                 temperature: cfg.temperature,
                 top_p: cfg.top_p,
-                endpoint_trust: None,
+                // Inherit the parent's trust classification: an explicit
+                // External must not silently become derivable-first-party
+                // (and vice versa) across the subagent boundary.
+                endpoint_trust: cfg.endpoint_trust,
                 api_backend: cfg.api_backend,
                 auth_scheme,
                 extra_headers,

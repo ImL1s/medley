@@ -20,6 +20,14 @@ fn matches_trusted_base_url(candidate: &str, trusted_base: &str) -> bool {
         && path_matches
 }
 
+/// True ONLY for the production cli-chat-proxy base URL — exact
+/// scheme/host/port/path match, no loopback fallback. Endpoint-trust
+/// derivation uses this so an arbitrary authenticated local server is
+/// never classified first-party just for being on loopback.
+pub(crate) fn is_prod_cli_chat_proxy_url(url: &str) -> bool {
+    matches_trusted_base_url(url, xai_grok_env::PROD_CLI_CHAT_PROXY_BASE_URL)
+}
+
 /// True for cli-chat-proxy URLs and loopback (local mock servers).
 fn is_cli_chat_proxy_url(url: &str) -> bool {
     if matches_trusted_base_url(url, xai_grok_env::PROD_CLI_CHAT_PROXY_BASE_URL) {
