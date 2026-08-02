@@ -155,39 +155,62 @@ normalize_path() {
     }'
 }
 
-# Physical path of something that may not exist yet. Walks up to the nearest
-# existing ancestor, resolves *that* through `pwd -P` (which follows symlinks),
-# then re-attaches the remainder and collapses any '..' left in it.
-#
-# `realpath` would be simpler but is neither POSIX nor present on every macOS.
-canonicalize() {
-  canon_path="$1"
-  case "$canon_path" in
-  /*) ;;
-  *) canon_path="$(pwd -P)/${canon_path}" ;;
-  esac
-
-  canon_rest=''
-  canon_head="$canon_path"
-  while [ ! -d "$canon_head" ]; do
-    canon_leaf="$(basename "$canon_head")"
-    canon_head="$(dirname "$canon_head")"
-    if [ -n "$canon_rest" ]; then
-      canon_rest="${canon_leaf}/${canon_rest}"
+# One resolution pass: walk up to the nearest existing ancestor, resolve *that*
+# through `pwd -P` (which follows symlinks), re-attach the remainder, and
+# collapse any '.' or '..' left in it.
+canonicalize_once() {
+  once_rest=''
+  once_head="$1"
+  while [ ! -d "$once_head" ]; do
+    once_leaf="$(basename "$once_head")"
+    once_head="$(dirname "$once_head")"
+    if [ -n "$once_rest" ]; then
+      once_rest="${once_leaf}/${once_rest}"
     else
-      canon_rest="$canon_leaf"
+      once_rest="$once_leaf"
     fi
-    [ "$canon_head" != '/' ] || break
+    [ "$once_head" != '/' ] || break
   done
 
-  canon_head="$(cd "$canon_head" 2>/dev/null && pwd -P)" ||
+  once_head="$(cd "$once_head" 2>/dev/null && pwd -P)" ||
     die "could not resolve ${1}"
 
-  if [ -n "$canon_rest" ]; then
-    normalize_path "${canon_head%/}/${canon_rest}"
+  if [ -n "$once_rest" ]; then
+    normalize_path "${once_head%/}/${once_rest}"
   else
-    normalize_path "$canon_head"
+    normalize_path "$once_head"
   fi
+}
+
+# Physical path of something that may not exist yet.
+#
+# `realpath` would be simpler but is neither POSIX nor present on every macOS.
+#
+# One pass is not enough. Collapsing '..' can expose a symlink the '..' was
+# hiding: 'outer/missing/../grok-link/sub' collapses to 'outer/grok-link/sub'
+# with grok-link still unresolved, which is exactly how a path can end up
+# inside ~/.grok while looking like it is not. Repeat until the answer stops
+# changing — the fixed point is reached once no unresolved symlink remains in
+# the existing prefix.
+canonicalize() {
+  canon_result="$1"
+  case "$canon_result" in
+  /*) ;;
+  *) canon_result="$(pwd -P)/${canon_result}" ;;
+  esac
+
+  canon_round=0
+  while [ "$canon_round" -lt 40 ]; do
+    canon_previous="$canon_result"
+    canon_result="$(canonicalize_once "$canon_result")"
+    if [ "$canon_result" = "$canon_previous" ]; then
+      printf '%s\n' "$canon_result"
+      return 0
+    fi
+    canon_round=$((canon_round + 1))
+  done
+
+  die "could not resolve ${1}: too many levels of symbolic links."
 }
 
 # `version` and `target` are interpolated into install paths, archive names and
@@ -257,6 +280,9 @@ print_path_guidance() {
 # Undo a partial install. `previous` is only non-empty between moving the old
 # version aside and finishing activation, so an interruption inside that window
 # puts the working version back.
+#
+# Safe to run twice: a signal runs it, and the EXIT trap may run it again as
+# the shell dies. Every step is already conditional on the state it undoes.
 cleanup() {
   [ -z "$tmp" ] || rm -rf "$tmp"
   [ -z "$staging" ] || rm -rf "$staging"
@@ -267,6 +293,18 @@ cleanup() {
     warn "install did not finish; restored the previous version at ${version_dir}"
   fi
   :
+}
+
+# Clean up, then die from the signal rather than returning.
+#
+# `trap cleanup INT` alone would run cleanup and let the shell carry straight
+# on: an interrupted install would roll back, resume, and still exit 0 claiming
+# success. Clearing the trap and re-signalling ourselves gives the caller the
+# conventional 128+N status and a genuine signal death.
+on_signal() {
+  cleanup
+  trap - "$1"
+  kill -s "$1" "$$"
 }
 
 main() {
@@ -312,7 +350,10 @@ main() {
   staging=''
   previous=''
   link_tmp=''
-  trap cleanup EXIT INT TERM
+  trap cleanup EXIT
+  trap 'on_signal INT' INT
+  trap 'on_signal TERM' TERM
+  trap 'on_signal HUP' HUP
   tmp="$(mktemp -d)"
 
   say ''
