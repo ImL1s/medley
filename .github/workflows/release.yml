@@ -24,7 +24,7 @@ on:
           Version tag to package for a dry run. Nothing is published: the
           archives and checksums are attached to the workflow run instead.
         required: false
-        default: v0.0.0-dryrun
+        default: v0.0.0+providers.0
 
 permissions:
   contents: read

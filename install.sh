@@ -251,6 +251,16 @@ assert_outside_grok_home() {
       ;;
     esac
   done
+
+  # The launcher in INSTALL_DIR execs the payload under versions/. If
+  # INSTALL_DIR resolved inside versions/ the launcher would overwrite the
+  # binary it points at and exec itself forever.
+  guard_versions="${MEDLEY_HOME}/versions"
+  case "$INSTALL_DIR" in
+  "$guard_versions" | "$guard_versions"/*)
+    die "refusing to install the launcher into ${INSTALL_DIR}: that is inside ${guard_versions}, where the versioned payloads live. Choose an install dir outside versions/."
+    ;;
+  esac
 }
 
 report_coexistence() {
