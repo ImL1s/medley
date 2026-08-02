@@ -11,6 +11,41 @@ const OPENAI_FEDRAMP: HeaderName = HeaderName::from_static("x-openai-fedramp");
 const ORIGINATOR: HeaderName = HeaderName::from_static("originator");
 const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 
+/// Session-wide auth belongs only to xAI-operated endpoints. A custom model's
+/// static key is scoped to its configured endpoint and must never be replaced
+/// with the current xAI session bearer merely because the caller supplied a
+/// default provider.
+fn accepts_xai_session_provider(base_url: &str) -> bool {
+    let Ok(candidate) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    if candidate.scheme() != "https"
+        || candidate.port_or_known_default() != Some(443)
+        || !candidate.username().is_empty()
+        || candidate.password().is_some()
+    {
+        return false;
+    }
+
+    let host = candidate.host_str().unwrap_or_default();
+    if host == "x.ai" || host.ends_with(".x.ai") {
+        return true;
+    }
+
+    let Ok(proxy) = reqwest::Url::parse(xai_grok_env::PROD_CLI_CHAT_PROXY_BASE_URL) else {
+        return false;
+    };
+    let trusted_path = proxy.path();
+    let candidate_path = candidate.path();
+    candidate.scheme() == proxy.scheme()
+        && candidate.host_str() == proxy.host_str()
+        && candidate.port_or_known_default() == proxy.port_or_known_default()
+        && (candidate_path == trusted_path
+            || candidate_path
+                .strip_prefix(trusted_path)
+                .is_some_and(|suffix| suffix.starts_with('/')))
+}
+
 fn strip_codex_routing_headers(headers: &mut HeaderMap) {
     headers.remove(CHATGPT_ACCOUNT_ID);
     headers.remove(OPENAI_FEDRAMP);
@@ -196,11 +231,18 @@ impl WebSearchClient {
                     "Failed to build HTTP client.".to_string(),
                 )
             })?;
+        let request_api_key_provider = api_key_provider.clone().or_else(|| {
+            if accepts_xai_session_provider(&base_url) {
+                default_api_key_provider
+            } else {
+                None
+            }
+        });
         Ok(Self {
             http,
             base_url,
             model: model.clone(),
-            api_key_provider: api_key_provider.clone().or(default_api_key_provider),
+            api_key_provider: request_api_key_provider,
             provider_scoped,
             transport_profile,
             attribution_callback: None,
@@ -1280,21 +1322,23 @@ mod tests {
             .expect("search must succeed with static key fallback");
         assert_eq!(content, "search result");
     }
-    /// When the provider returns a fresh key, it overrides the static one.
+    /// A session-wide provider belongs to xAI's first-party transport and must
+    /// never replace a model-scoped static key on an external endpoint.
     #[tokio::test]
-    async fn provider_key_overrides_static_key() {
+    async fn external_endpoint_uses_static_key_not_session_default_provider() {
         use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        struct FreshProvider;
+        struct FreshProvider(std::sync::Arc<std::sync::atomic::AtomicUsize>);
         impl crate::types::ApiKeyProvider for FreshProvider {
             fn current_api_key(&self) -> Option<String> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Some("fresh-key-from-provider".to_string())
             }
         }
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/responses"))
-            .and(header("Authorization", "Bearer fresh-key-from-provider"))
+            .and(header("Authorization", "Bearer model-static-key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "resp_test",
                 "object": "response",
@@ -1316,8 +1360,41 @@ mod tests {
             .mount(&server)
             .await;
         let config = WebSearchConfig::Enabled {
-            api_key: "stale-static-key".to_string(),
+            api_key: "model-static-key".to_string(),
             base_url: server.uri(),
+            model: "test-model".to_string(),
+            extra_headers: IndexMap::new(),
+            alpha_test_key: None,
+            api_key_provider: None,
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider: SharedApiKeyProvider =
+            std::sync::Arc::new(FreshProvider(std::sync::Arc::clone(&calls)));
+        let client = WebSearchClient::new(&config, Some(provider)).expect("client should build");
+        let (content, _citations) = client
+            .search("test query", None)
+            .await
+            .expect("search must use the credential scoped to the external model");
+        assert_eq!(content, "fresh result");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an external model must not even resolve the session-wide xAI credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_party_xai_endpoint_uses_session_default_provider() {
+        struct FreshProvider;
+        impl crate::types::ApiKeyProvider for FreshProvider {
+            fn current_api_key(&self) -> Option<String> {
+                Some("fresh-xai-session-key".to_string())
+            }
+        }
+
+        let config = WebSearchConfig::Enabled {
+            api_key: "stale-static-key".to_string(),
+            base_url: "https://api.x.ai/v1".to_string(),
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
             alpha_test_key: None,
@@ -1325,11 +1402,38 @@ mod tests {
         };
         let provider: SharedApiKeyProvider = std::sync::Arc::new(FreshProvider);
         let client = WebSearchClient::new(&config, Some(provider)).expect("client should build");
-        let (content, _citations) = client
-            .search("test query", None)
+        let request = client
+            .build_authenticated_request(
+                "https://api.x.ai/v1/responses",
+                &serde_json::json!({"model": "test-model"}),
+            )
             .await
-            .expect("search must succeed with provider key");
-        assert_eq!(content, "fresh result");
+            .expect("first-party request should build");
+        assert_eq!(
+            request.headers().get(AUTHORIZATION).unwrap(),
+            "Bearer fresh-xai-session-key"
+        );
+    }
+
+    #[test]
+    fn session_default_provider_allowlist_rejects_lookalikes_and_cleartext() {
+        for allowed in [
+            "https://api.x.ai/v1",
+            xai_grok_env::PROD_CLI_CHAT_PROXY_BASE_URL,
+        ] {
+            assert!(accepts_xai_session_provider(allowed), "rejected {allowed}");
+        }
+        for denied in [
+            "http://api.x.ai/v1",
+            "https://api.x.ai:8443/v1",
+            "https://user@api.x.ai/v1",
+            "https://api.x.ai.evil.example/v1",
+            "https://cli-chat-proxy.grok.com.evil.example/v1",
+            "https://cli-chat-proxy.grok.com/not-v1",
+            "http://127.0.0.1:8080/v1",
+        ] {
+            assert!(!accepts_xai_session_provider(denied), "accepted {denied}");
+        }
     }
 
     /// A model-scoped provider must win over the session-wide default. Codex
@@ -1613,9 +1717,9 @@ mod tests {
             model: "test-model".into(),
             extra_headers: IndexMap::new(),
             alpha_test_key: None,
-            api_key_provider: None,
+            api_key_provider: Some(provider),
         };
-        let client = WebSearchClient::new(&config, Some(provider))
+        let client = WebSearchClient::new(&config, None)
             .unwrap()
             .with_attribution_callback(Some(callback.clone()));
 
