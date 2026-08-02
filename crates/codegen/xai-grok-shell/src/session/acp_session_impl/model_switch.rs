@@ -22,6 +22,13 @@ struct InstalledHarnessRebuild {
     system_prompt: String,
 }
 
+#[derive(Clone, Copy)]
+enum ModelSwitchFailurePhase {
+    Validation,
+    Rebuild,
+    Commit,
+}
+
 async fn restore_chat_before_workspace_bind<E>(
     chat_state_handle: &xai_chat_state::ChatStateHandle,
     snapshot: xai_chat_state::ChatStateSnapshot,
@@ -61,10 +68,11 @@ impl SessionActor {
             acp::ModelId::new(value)
         };
         if self.state.lock().await.running_task.is_some() {
-            return Err(model_switch_harness_error(
+            return Err(model_switch_error(
                 &catalog_model_id,
                 &active_agent_type,
                 &required_agent_type,
+                ModelSwitchFailurePhase::Validation,
                 "turn_in_flight",
             ));
         }
@@ -83,28 +91,31 @@ impl SessionActor {
             .gateway_enabled
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            return Err(model_switch_harness_error(
+            return Err(model_switch_error(
                 &catalog_model_id,
                 &active_agent_type,
                 &required_agent_type,
+                ModelSwitchFailurePhase::Validation,
                 "gateway_closed",
             ));
         }
 
         let prepared_rebuild = if mismatch {
             let definition = required_definition.ok_or_else(|| {
-                model_switch_harness_error(
+                model_switch_error(
                     &catalog_model_id,
                     &active_agent_type,
                     &required_agent_type,
+                    ModelSwitchFailurePhase::Rebuild,
                     "agent_definition_unresolved",
                 )
             })?;
             if !definition_matches_required_identity(&definition, &required_agent_type) {
-                return Err(model_switch_harness_error(
+                return Err(model_switch_error(
                     &catalog_model_id,
                     &active_agent_type,
                     &required_agent_type,
+                    ModelSwitchFailurePhase::Rebuild,
                     "agent_definition_mismatch",
                 ));
             }
@@ -113,10 +124,11 @@ impl SessionActor {
                 .snapshot()
                 .await
                 .ok_or_else(|| {
-                    model_switch_harness_error(
+                    model_switch_error(
                         &catalog_model_id,
                         &active_agent_type,
                         &required_agent_type,
+                        ModelSwitchFailurePhase::Validation,
                         "turn_count_unavailable",
                     )
                 })?
@@ -135,10 +147,11 @@ impl SessionActor {
                 self.prepare_harness_rebuild(definition)
                     .await
                     .map_err(|_| {
-                        model_switch_harness_error(
+                        model_switch_error(
                             &catalog_model_id,
                             &active_agent_type,
                             &required_agent_type,
+                            ModelSwitchFailurePhase::Rebuild,
                             "agent_build_failed",
                         )
                     })?,
@@ -151,10 +164,11 @@ impl SessionActor {
         // be resumed once cancelled. Reject instead of destroying compaction
         // state on a switch that may still fail later.
         if self.compaction.prefire.is_in_flight() {
-            return Err(model_switch_harness_error(
+            return Err(model_switch_error(
                 &catalog_model_id,
                 &active_agent_type,
                 &required_agent_type,
+                ModelSwitchFailurePhase::Validation,
                 "compaction_prefire_in_flight",
             ));
         }
@@ -169,10 +183,11 @@ impl SessionActor {
 
         let rollback = ModelSwitchRollbackState {
             chat: self.chat_state_handle.snapshot().await.ok_or_else(|| {
-                model_switch_harness_error(
+                model_switch_error(
                     &catalog_model_id,
                     &active_agent_type,
                     &required_agent_type,
+                    ModelSwitchFailurePhase::Validation,
                     "chat_state_unavailable",
                 )
             })?,
@@ -183,10 +198,11 @@ impl SessionActor {
                 self.install_harness_rebuild(prepared_rebuild, &required_agent_type)
                     .await
                     .map_err(|_| {
-                        model_switch_harness_error(
+                        model_switch_error(
                             &catalog_model_id,
                             &active_agent_type,
                             &required_agent_type,
+                            ModelSwitchFailurePhase::Rebuild,
                             "agent_build_failed",
                         )
                     })?,
@@ -230,10 +246,11 @@ impl SessionActor {
                     )
                     .await
                     {
-                        return Err(model_switch_harness_error(
+                        return Err(model_switch_error(
                             &catalog_model_id,
                             &previous_active_agent_type,
                             &required_agent_type,
+                            ModelSwitchFailurePhase::Commit,
                             reason,
                         ));
                     }
@@ -299,11 +316,17 @@ impl SessionActor {
             .lock()
             .clone()
             .unwrap_or_else(|| self.agent.borrow().definition().name.clone());
+        let unavailable_phase = if rollback.is_some() {
+            ModelSwitchFailurePhase::Commit
+        } else {
+            ModelSwitchFailurePhase::Validation
+        };
         let current_chat = self.chat_state_handle.snapshot().await.ok_or_else(|| {
-            model_switch_harness_error(
+            model_switch_error(
                 &catalog_model_id,
                 &active_agent_type,
                 required_agent_type,
+                unavailable_phase,
                 "chat_state_unavailable",
             )
         })?;
@@ -387,10 +410,11 @@ impl SessionActor {
         self.chat_state_handle
             .restore_snapshot(committed_chat.clone());
         if self.chat_state_handle.snapshot().await.is_none() {
-            return Err(model_switch_harness_error(
+            return Err(model_switch_error(
                 &catalog_model_id,
                 &active_agent_type,
                 required_agent_type,
+                ModelSwitchFailurePhase::Commit,
                 "chat_state_commit_unavailable",
             ));
         }
@@ -495,10 +519,11 @@ impl SessionActor {
     ) -> Result<acp::ModelId, acp::Error> {
         self.chat_state_handle.restore_snapshot(rollback.chat);
         let _ = self.chat_state_handle.snapshot().await;
-        Err(model_switch_harness_error(
+        Err(model_switch_error(
             &catalog_model_id,
             active_agent_type,
             required_agent_type,
+            ModelSwitchFailurePhase::Commit,
             failure_reason,
         ))
     }
@@ -758,20 +783,37 @@ impl SessionActor {
     }
 }
 
-fn model_switch_harness_error(
+fn model_switch_error(
     model_id: &acp::ModelId,
     active_agent_type: &str,
     required_agent_type: &str,
+    phase: ModelSwitchFailurePhase,
     reason: &str,
 ) -> acp::Error {
-    config::ModelSwitchHarnessError {
-        code: config::MODEL_SWITCH_REBUILD_FAILED.to_owned(),
-        active_agent_type: active_agent_type.to_owned(),
-        required_agent_type: required_agent_type.to_owned(),
-        model_id: model_id.0.to_string(),
-        reason: reason.to_owned(),
+    let harness_error = |code: &str| {
+        config::ModelSwitchHarnessError {
+            code: code.to_owned(),
+            active_agent_type: active_agent_type.to_owned(),
+            required_agent_type: required_agent_type.to_owned(),
+            model_id: model_id.0.to_string(),
+            reason: reason.to_owned(),
+        }
+        .into_acp_error()
+    };
+    match phase {
+        ModelSwitchFailurePhase::Validation => {
+            harness_error(config::MODEL_SWITCH_VALIDATION_FAILED)
+        }
+        ModelSwitchFailurePhase::Rebuild => harness_error(config::MODEL_SWITCH_REBUILD_FAILED),
+        ModelSwitchFailurePhase::Commit => config::ModelSwitchCommitError {
+            code: config::MODEL_SWITCH_COMMIT_FAILED.to_owned(),
+            active_agent_type: active_agent_type.to_owned(),
+            required_agent_type: required_agent_type.to_owned(),
+            model_id: model_id.0.to_string(),
+            reason: reason.to_owned(),
+        }
+        .into_acp_error(),
     }
-    .into_acp_error()
 }
 
 /// Discovery preserves a plugin agent's bare frontmatter `name` while the
@@ -847,6 +889,18 @@ mod model_switch_transaction_tests {
         let value = actor.catalog_model_id.take();
         actor.catalog_model_id.set(value.clone());
         value
+    }
+
+    fn assert_model_switch_phase(error: &acp::Error, code: &'static str, reason: &str) {
+        assert_eq!(config::model_switch_error_code(error), Some(code));
+        assert_eq!(
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("reason"))
+                .and_then(serde_json::Value::as_str),
+            Some(reason)
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -932,6 +986,11 @@ mod model_switch_transaction_tests {
                     .expect_err("unresolved required harness must fail closed");
                 let payload = config::ModelSwitchHarnessError::from_acp_error(&err)
                     .expect("structured harness error");
+                assert_model_switch_phase(
+                    &err,
+                    config::MODEL_SWITCH_REBUILD_FAILED,
+                    "agent_definition_unresolved",
+                );
                 assert_eq!(payload.model_id, "target-model");
                 assert_eq!(payload.active_agent_type, "grok-build");
                 assert_eq!(payload.required_agent_type, "missing-custom-harness");
@@ -1017,9 +1076,12 @@ mod model_switch_transaction_tests {
                     ))
                     .await
                     .expect_err("closed gateway must reject a required rebuild");
-                let payload = config::ModelSwitchHarnessError::from_acp_error(&err)
-                    .expect("structured harness error");
-                assert_eq!(payload.reason, "gateway_closed");
+                assert_model_switch_phase(
+                    &err,
+                    config::MODEL_SWITCH_VALIDATION_FAILED,
+                    "gateway_closed",
+                );
+                assert!(config::ModelSwitchHarnessError::from_acp_error(&err).is_none());
                 assert_eq!(catalog_model_id(&actor), "test");
                 assert_eq!(actor.active_agent_type.lock().as_deref(), Some("codex"));
                 assert_eq!(actor.compaction.threshold_percent.get(), 85);
@@ -1052,9 +1114,11 @@ mod model_switch_transaction_tests {
                     .handle_apply_model_switch(prepared_switch("grok-build", None))
                     .await
                     .expect_err("closed gateway must reject even a same-harness switch");
-                let payload = config::ModelSwitchHarnessError::from_acp_error(&err)
-                    .expect("structured harness error");
-                assert_eq!(payload.reason, "gateway_closed");
+                assert_model_switch_phase(
+                    &err,
+                    config::MODEL_SWITCH_VALIDATION_FAILED,
+                    "gateway_closed",
+                );
                 assert_eq!(catalog_model_id(&actor), "test");
                 assert_eq!(
                     actor.active_agent_type.lock().as_deref(),
@@ -1096,9 +1160,11 @@ mod model_switch_transaction_tests {
                     .handle_apply_model_switch(prepared_switch("grok-build", None))
                     .await
                     .expect_err("a live turn must keep its model snapshot stable");
-                let payload = config::ModelSwitchHarnessError::from_acp_error(&err)
-                    .expect("structured switch error");
-                assert_eq!(payload.reason, "turn_in_flight");
+                assert_model_switch_phase(
+                    &err,
+                    config::MODEL_SWITCH_VALIDATION_FAILED,
+                    "turn_in_flight",
+                );
                 assert_eq!(catalog_model_id(&actor), "test");
                 assert_eq!(
                     actor
@@ -1240,10 +1306,15 @@ mod model_switch_transaction_tests {
                     .handle_apply_model_switch(prepared_switch("grok-build", None))
                     .await
                     .expect_err("a closed real persistence channel must fail closed");
-                let payload = config::ModelSwitchHarnessError::from_acp_error(&error)
-                    .expect("structured model switch error");
-
+                assert_model_switch_phase(
+                    &error,
+                    config::MODEL_SWITCH_COMMIT_FAILED,
+                    "persistence_channel_closed",
+                );
+                let payload = config::ModelSwitchCommitError::from_acp_error(&error)
+                    .expect("structured commit error");
                 assert_eq!(payload.reason, "persistence_channel_closed");
+                assert!(config::ModelSwitchHarnessError::from_acp_error(&error).is_none());
                 assert_eq!(catalog_model_id(&actor), "test");
                 assert_eq!(
                     actor
@@ -1278,9 +1349,11 @@ mod model_switch_transaction_tests {
                     ))
                     .await
                     .expect_err("an in-flight prefire cannot be atomically replaced");
-                let payload = config::ModelSwitchHarnessError::from_acp_error(&error)
-                    .expect("structured model switch error");
-                assert_eq!(payload.reason, "compaction_prefire_in_flight");
+                assert_model_switch_phase(
+                    &error,
+                    config::MODEL_SWITCH_VALIDATION_FAILED,
+                    "compaction_prefire_in_flight",
+                );
                 assert_eq!(catalog_model_id(&actor), "test");
                 assert_eq!(actor.active_agent_type.lock().as_deref(), Some("codex"));
                 assert!(actor.compaction.prefire.is_in_flight());
@@ -1354,9 +1427,15 @@ mod model_switch_transaction_tests {
                     ))
                     .await
                     .expect_err("persistence failure must fail the switch");
-                let payload = config::ModelSwitchHarnessError::from_acp_error(&error)
-                    .expect("structured model switch error");
+                assert_model_switch_phase(
+                    &error,
+                    config::MODEL_SWITCH_COMMIT_FAILED,
+                    "persistence_write_failed",
+                );
+                let payload = config::ModelSwitchCommitError::from_acp_error(&error)
+                    .expect("structured commit error");
                 assert_eq!(payload.reason, "persistence_write_failed");
+                assert!(config::ModelSwitchHarnessError::from_acp_error(&error).is_none());
                 assert_eq!(catalog_model_id(&actor), "test");
                 assert_eq!(actor.agent.borrow().definition().name, previous_agent);
                 assert_eq!(actor.active_agent_type.lock().as_deref(), Some("codex"));

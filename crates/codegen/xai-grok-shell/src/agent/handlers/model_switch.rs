@@ -41,12 +41,14 @@ impl FailureTelemetry {
         self.armed = false;
     }
 
-    fn mark_rebuild_phase(&mut self) {
-        self.error_code = config::MODEL_SWITCH_REBUILD_FAILED;
+    fn mark_actor_error(&mut self, error: &acp::Error) {
+        if let Some(code) = config::model_switch_error_code(error) {
+            self.error_code = code;
+        }
     }
 
-    fn mark_incompatible(&mut self) {
-        self.error_code = config::MODEL_SWITCH_INCOMPATIBLE_AGENT;
+    fn mark_commit_phase(&mut self) {
+        self.error_code = config::MODEL_SWITCH_COMMIT_FAILED;
     }
 }
 
@@ -238,9 +240,6 @@ pub(crate) async fn apply(
         )
     };
     let (tx, rx) = oneshot::channel();
-    // Validation and preparation are complete. Failures from this point are
-    // actor/rebuild failures unless the actor returns the typed mismatch gate.
-    failure_telemetry.mark_rebuild_phase();
     handle
         .cmd_tx
         .send(SessionCommand::ApplyModelSwitch {
@@ -258,12 +257,15 @@ pub(crate) async fn apply(
     let receipt = match rx.await {
         Ok(Ok(receipt)) => receipt,
         Ok(Err(err)) => {
-            if config::ModelSwitchIncompatibleAgentError::from_acp_error(&err).is_some() {
-                failure_telemetry.mark_incompatible();
-            }
+            failure_telemetry.mark_actor_error(&err);
             return Err(err);
         }
         Err(_) => {
+            // The actor accepted the prepared command but dropped its receipt.
+            // Its durable commit status is therefore unknown; classify this
+            // conservatively as commit-phase rather than claiming validation or
+            // harness rebuild failed.
+            failure_telemetry.mark_commit_phase();
             return Err(acp::Error::internal_error().data("model_switch: session actor closed"));
         }
     };
@@ -344,19 +346,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn failure_telemetry_tracks_validation_rebuild_and_mismatch_phases() {
+    fn failure_telemetry_uses_structured_actor_phase_without_guessing() {
         let session_id = acp::SessionId::new("session");
         let model_id = acp::ModelId::new("target-model");
         let mut telemetry = FailureTelemetry::new(&session_id, &model_id);
 
         assert_eq!(telemetry.error_code, config::MODEL_SWITCH_VALIDATION_FAILED);
-        telemetry.mark_rebuild_phase();
-        assert_eq!(telemetry.error_code, config::MODEL_SWITCH_REBUILD_FAILED);
-        telemetry.mark_incompatible();
+        telemetry.mark_actor_error(&acp::Error::internal_error().data("actor error"));
         assert_eq!(
             telemetry.error_code,
-            config::MODEL_SWITCH_INCOMPATIBLE_AGENT
+            config::MODEL_SWITCH_VALIDATION_FAILED,
+            "unknown structured errors must not be guessed as rebuild failures"
         );
+        for code in [
+            config::MODEL_SWITCH_INCOMPATIBLE_AGENT,
+            config::MODEL_SWITCH_REBUILD_FAILED,
+            config::MODEL_SWITCH_COMMIT_FAILED,
+        ] {
+            telemetry.mark_actor_error(
+                &acp::Error::invalid_params().data(serde_json::json!({ "code": code })),
+            );
+            assert_eq!(telemetry.error_code, code);
+        }
+        telemetry.mark_commit_phase();
+        assert_eq!(telemetry.error_code, config::MODEL_SWITCH_COMMIT_FAILED);
 
         telemetry.disarm();
     }
