@@ -54,7 +54,9 @@ pub fn has_xai_api_key_env() -> bool {
 ///
 /// Probes `std::env` at call time and consults each `ModelEntry` for a
 /// resolvable api_key/env_key -- both inputs can change between calls, so the
-/// result is not cached.
+/// result is not cached. Entries on the reserved OpenAI Codex profile are
+/// skipped: their bearer comes from that provider's own OAuth login, so the
+/// built-in preset is not evidence of an xAI or BYOK key.
 ///
 /// `disable_api_key_auth` (`[grok_com_config] disable_api_key_auth` /
 /// `GROK_DISABLE_API_KEY_AUTH`) is the admin kill switch: when true the
@@ -67,7 +69,10 @@ where
     if disable_api_key_auth {
         return false;
     }
-    has_xai_api_key_env() || models.into_iter().any(ModelEntry::has_own_credentials)
+    has_xai_api_key_env()
+        || models
+            .into_iter()
+            .any(|m| m.has_own_credentials() && !m.is_openai_codex_profile())
 }
 
 /// Inputs to [`build_auth_methods`].
@@ -102,6 +107,12 @@ pub struct AuthMethodsBuildInputs<'a> {
     /// and selects it as the default. Catalog presence of other no-auth
     /// models alone must not set this — only the selected model matters.
     pub selected_model_is_no_auth: bool,
+    /// True when a live OpenAI Codex credential exists. It is not an xAI
+    /// credential, so it never advertises `xai.api_key` — but a user who has
+    /// only run `grok login --provider openai-codex` does have a way to
+    /// sample, and must not be sent to the xAI login screen. Only consulted
+    /// when no xAI credential is present at all; see [`build_unpinned`].
+    pub has_openai_codex_credential: bool,
 }
 
 /// Output of [`build_auth_methods`].
@@ -127,8 +138,12 @@ pub struct BuiltAuthMethods {
 /// screen. Unit tests lock this. When `selected_model_is_no_auth` is true,
 /// `local.none` is first instead (and is the default).
 ///
+/// `local.none` also goes first when a Codex credential is the only credential
+/// present (`has_openai_codex_credential` with neither xAI credential): the
+/// user can sample, so the interactive xAI login screen would be a dead end.
+///
 /// Unpinned ordering (when each method is enabled):
-/// 1. `local.none`      (if `selected_model_is_no_auth`)
+/// 1. `local.none`      (if `selected_model_is_no_auth` or Codex-only)
 /// 2. `xai.api_key`     (if `has_external_api_key`)
 /// 3. `cached_token`    (if `has_cached_token`)
 /// 4. exactly one of:
@@ -136,7 +151,7 @@ pub struct BuiltAuthMethods {
 ///    - `grok.com`      (otherwise)
 ///
 /// Unpinned `default_auth_method_id`:
-/// - `local.none`   if `selected_model_is_no_auth`
+/// - `local.none`   if `selected_model_is_no_auth` or Codex-only
 /// - `cached_token` else if `has_cached_token`
 /// - `xai.api_key`  else if `has_external_api_key`
 /// - `None`         otherwise
@@ -156,6 +171,7 @@ pub fn build_auth_methods(inputs: AuthMethodsBuildInputs<'_>) -> BuiltAuthMethod
         has_auth_provider_command,
         preferred_method,
         selected_model_is_no_auth,
+        has_openai_codex_credential,
     } = inputs;
 
     match preferred_method {
@@ -175,6 +191,7 @@ pub fn build_auth_methods(inputs: AuthMethodsBuildInputs<'_>) -> BuiltAuthMethod
             login_label,
             has_auth_provider_command,
             selected_model_is_no_auth,
+            has_openai_codex_credential,
         ),
     }
 }
@@ -234,14 +251,23 @@ fn build_unpinned(
     login_label: Option<&str>,
     has_auth_provider_command: bool,
     selected_model_is_no_auth: bool,
+    has_openai_codex_credential: bool,
 ) -> BuiltAuthMethods {
     let mut methods: Vec<acp::AuthMethod> = Vec::new();
     let mut default_auth_method_id: Option<acp::AuthMethodId> = None;
 
+    // A Codex credential with no xAI credential behind it: the user can sample
+    // (their Codex models are ready) but has nothing to authenticate to xAI
+    // with, so the interactive xAI login screen is a dead end. Gated on having
+    // neither xAI credential so every existing path stays byte-identical.
+    let codex_is_the_only_credential =
+        has_openai_codex_credential && !has_cached_token && !has_external_api_key;
+    let skip_interactive_login = selected_model_is_no_auth || codex_is_the_only_credential;
+
     // Selected no-auth model: advertise local.none first and default to it so
     // the pager skips interactive login. Catalog-only no-auth entries must
     // not set selected_model_is_no_auth (caller responsibility).
-    if selected_model_is_no_auth {
+    if skip_interactive_login {
         methods.push(local_none_auth_method());
         default_auth_method_id = Some(acp::AuthMethodId::new(LOCAL_NONE_METHOD_ID));
     }
@@ -258,7 +284,7 @@ fn build_unpinned(
         // cached_token wins over xai.api_key for default_auth_method_id so
         // is_session_based_auth() returns true and OIDC refresh stays alive.
         // It does NOT override local.none — keyless local models stay default.
-        if !selected_model_is_no_auth {
+        if !skip_interactive_login {
             let overrode_api_key = default_auth_method_id.is_some();
             default_auth_method_id = Some(acp::AuthMethodId::new(CACHED_TOKEN_AUTH_METHOD_ID));
             if overrode_api_key {
@@ -620,6 +646,7 @@ mod tests {
             has_auth_provider_command: false,
             preferred_method: None,
             selected_model_is_no_auth: false,
+            has_openai_codex_credential: false,
         }
     }
 
@@ -889,6 +916,95 @@ mod tests {
         }
     }
 
+    /// The built-in Codex preset ships with every install and satisfies
+    /// `has_own_credentials()` (its traffic must not carry an xAI session
+    /// token), but its bearer comes from `grok login --provider openai-codex`.
+    /// Counting it as an external key would advertise `xai.api_key` first for
+    /// every user and skip the login screen with no key anywhere.
+    #[test]
+    #[serial]
+    fn builtin_openai_codex_preset_does_not_advertise_xai_api_key() {
+        let _global = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        let _legacy = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+        let cfg = Config::new_from_toml_cfg(&toml::Value::Table(toml::map::Map::new()))
+            .expect("an empty config should parse");
+        let models = resolve_model_list(&cfg, None);
+        assert!(
+            models.values().any(ModelEntry::is_openai_codex_profile),
+            "this test is vacuous unless the Codex preset is in the catalog"
+        );
+
+        assert!(!should_advertise_xai_api_key(false, models.values()));
+        let built = build_auth_methods(AuthMethodsBuildInputs {
+            has_external_api_key: false,
+            has_cached_token: false,
+            ..default_inputs()
+        });
+        assert_ne!(
+            first_kind(&built.methods),
+            Some(AuthMethodKind::XaiApiKey),
+            "the Codex preset alone must not skip the login screen",
+        );
+    }
+
+    /// A user who has run only `grok login --provider openai-codex` has no xAI
+    /// credential, so `xai.api_key` must stay unadvertised — but they can
+    /// sample, and the interactive xAI login screen is a dead end for them.
+    /// `local.none` goes first so the pager starts the session instead.
+    #[test]
+    fn codex_only_credential_skips_the_interactive_xai_login() {
+        let built = build_auth_methods(AuthMethodsBuildInputs {
+            has_openai_codex_credential: true,
+            ..default_inputs()
+        });
+        assert_eq!(first_kind(&built.methods), Some(AuthMethodKind::LocalNone));
+        assert!(
+            !AuthMethodKind::from_id(built.methods[0].id()).needs_interactive_login(),
+            "a Codex-only user must not be sent to the xAI login screen"
+        );
+        assert!(
+            !built
+                .methods
+                .iter()
+                .any(|m| AuthMethodKind::from_id(m.id()) == AuthMethodKind::XaiApiKey),
+            "a Codex credential is not an xAI API key"
+        );
+    }
+
+    /// The Codex credential only breaks the login-screen tie when nothing else
+    /// authenticates. With an xAI session present, ordering and the default
+    /// method must be exactly what they were before Codex entered the picture.
+    #[test]
+    fn codex_credential_alongside_an_xai_session_changes_nothing() {
+        let with_codex = build_auth_methods(AuthMethodsBuildInputs {
+            has_cached_token: true,
+            has_openai_codex_credential: true,
+            ..default_inputs()
+        });
+        let without_codex = build_auth_methods(AuthMethodsBuildInputs {
+            has_cached_token: true,
+            ..default_inputs()
+        });
+        let ids = |b: &BuiltAuthMethods| {
+            b.methods
+                .iter()
+                .map(|m| m.id().0.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&with_codex), ids(&without_codex));
+        assert_eq!(
+            with_codex.default_auth_method_id.map(|id| id.0.to_string()),
+            without_codex
+                .default_auth_method_id
+                .map(|id| id.0.to_string()),
+        );
+        assert_eq!(
+            first_kind(&with_codex.methods),
+            Some(AuthMethodKind::CachedToken)
+        );
+    }
+
     /// `XAI_API_KEY` alone (no per-model creds) also triggers
     /// advertising `xai.api_key` as the first method. Historical "external
     /// key" path; covered here so the predicate keeps treating env-var-only
@@ -1117,6 +1233,7 @@ mod tests {
             has_auth_provider_command: false,
             preferred_method: None,
             selected_model_is_no_auth: true,
+            has_openai_codex_credential: false,
         };
         let built = build_auth_methods(inputs);
         assert_eq!(

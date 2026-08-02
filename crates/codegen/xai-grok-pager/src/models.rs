@@ -14,6 +14,9 @@ pub async fn list_available_models(agent_config: &AgentConfig) -> Result<()> {
         AuthStatus::ModelCredentials(model) => {
             println!("Model '{model}' is using its own API key.");
         }
+        AuthStatus::OpenAiCodex => {
+            println!("You are signed in to OpenAI Codex (no xAI credential).");
+        }
         AuthStatus::DeploymentKey => println!("You are authenticated via deployment key."),
         AuthStatus::NotAuthenticated => println!("You are not authenticated."),
     }
@@ -31,10 +34,14 @@ pub async fn list_available_models(agent_config: &AgentConfig) -> Result<()> {
     println!();
     println!("Available models:");
     for m in state.available_models {
-        if m.model_id == state.current_model_id {
-            println!("  * {} (default)", m.model_id.0);
+        let (marker, default) = if m.model_id == state.current_model_id {
+            ("*", " (default)")
         } else {
-            println!("  - {}", m.model_id.0);
+            ("-", "")
+        };
+        match crate::slash::commands::model::unready_reason_from_model_meta(m.meta.as_ref()) {
+            Some(reason) => println!("  {marker} {}{default} — unready: {reason}", m.model_id.0),
+            None => println!("  {marker} {}{default}", m.model_id.0),
         }
     }
 

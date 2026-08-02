@@ -4,7 +4,7 @@ use agent_client_protocol as acp;
 use anyhow::Result;
 use xai_acp_lib::{AcpAgentTx, acp_send};
 
-use crate::agent::config::Config as AgentConfig;
+use crate::agent::config::{Config as AgentConfig, model_readiness};
 
 /// Status for the `grok models` banner (display order ≠ sampling priority; see [`AuthStatus::resolve`]).
 #[derive(Debug, PartialEq, Eq)]
@@ -14,12 +14,17 @@ pub enum AuthStatus {
     LoggedIn(String),
     /// Catalog key of the first model with own `api_key`/`env_key`.
     ModelCredentials(String),
+    /// A live provider-scoped OpenAI Codex credential, reported only once
+    /// every xAI-side credential above has been ruled out — which is what
+    /// makes its "no xAI credential" wording true. Without it the banner would
+    /// read "not authenticated" directly above the ready Codex rows.
+    OpenAiCodex,
     DeploymentKey,
     NotAuthenticated,
 }
 
 impl AuthStatus {
-    /// Banner status: env key → session → BYOK → deployment → none.
+    /// Banner status: env key → session → BYOK → deployment → Codex → none.
     ///
     /// Differs from sampling (`resolve_credentials`: BYOK → session → env) so a
     /// logged-in user sees the login host. BYOK uses
@@ -41,14 +46,21 @@ impl AuthStatus {
         if crate::agent::auth_method::should_advertise_xai_api_key(
             agent_config.grok_com_config.api_key_auth_disabled(),
             models.values(),
-        ) && let Some(name) = models
-            .iter()
-            .find_map(|(name, entry)| entry.has_own_credentials().then(|| name.clone()))
-        {
+        ) && let Some(name) = models.iter().find_map(|(name, entry)| {
+            (entry.has_own_credentials() && !entry.is_openai_codex_profile()).then(|| name.clone())
+        }) {
             return Self::ModelCredentials(name);
         }
         if agent_config.endpoints.deployment_key.is_some() {
             return Self::DeploymentKey;
+        }
+        // Last before "nothing": every xAI-side credential above outranks it,
+        // so reaching here is what makes the "no xAI credential" wording true.
+        if models
+            .values()
+            .any(|entry| entry.is_openai_codex_profile() && model_readiness(entry).0)
+        {
+            return Self::OpenAiCodex;
         }
         Self::NotAuthenticated
     }
@@ -212,6 +224,30 @@ mod tests {
                 AuthStatus::ModelCredentials(dm.to_owned())
             );
         }
+    }
+
+    /// Without a Codex credential the preset is unready, so the banner must
+    /// still read "not authenticated" — the Codex status is not merely
+    /// "a Codex entry exists in the catalog".
+    #[test]
+    #[serial]
+    fn resolve_not_authenticated_when_the_codex_preset_is_unready() {
+        let (_dir, _g) = isolate_auth_sources();
+        assert_eq!(
+            AuthStatus::resolve(&config_from_toml("")),
+            AuthStatus::NotAuthenticated
+        );
+    }
+
+    /// A deployment key is an xAI-side credential, so it outranks the
+    /// Codex-only status — whose message asserts there is no xAI credential.
+    #[test]
+    #[serial]
+    fn resolve_prefers_deployment_key_over_codex_only_status() {
+        let (_dir, _g) = isolate_auth_sources();
+        let mut cfg = config_from_toml("");
+        cfg.endpoints.deployment_key = Some("deploy-key".into());
+        assert_eq!(AuthStatus::resolve(&cfg), AuthStatus::DeploymentKey);
     }
 
     #[test]

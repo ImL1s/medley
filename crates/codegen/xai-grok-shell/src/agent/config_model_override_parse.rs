@@ -38,6 +38,9 @@ pub enum ConfigWarningKind {
     /// Entry failed to parse even after skipping invalid fields; the model
     /// keeps an empty override.
     UnparseableEntry,
+    /// Section is spelled correctly and would be valid, but the config tier it
+    /// was written in never loads it, so the entry is inert where it sits.
+    WrongConfigTier,
 }
 
 /// What a [`ConfigWarning`] is about. Serialize-only: `grok inspect --json`

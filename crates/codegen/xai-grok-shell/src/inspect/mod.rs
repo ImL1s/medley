@@ -386,10 +386,21 @@ async fn build_report(cwd: &Path) -> InspectReport {
     let configs = list_config_sources(cwd);
     let tool_capabilities =
         crate::config::tool_capabilities::load_trusted_tool_capabilities(cwd, project_trusted);
-    let config_warnings = parsed_config
+    let mut config_warnings = parsed_config
         .as_ref()
         .map(|c| c.config_warnings.clone())
         .unwrap_or_default();
+    // Project `[model.*]` never reaches `Config`, so it produces no parse
+    // warning of its own; report it here rather than leave it silently inert.
+    for (path, declared) in crate::config::inert_project_model_sections(cwd) {
+        config_warnings.push(
+            crate::agent::config_model_override_parse::ConfigWarning::config_key(
+                declared.join(", "),
+                crate::agent::config_model_override_parse::ConfigWarningKind::WrongConfigTier,
+                crate::config::inert_project_model_sections_message(&path, &declared),
+            ),
+        );
+    }
     let mcp_config_problems = crate::util::config::load_mcp_server_problems_with_project(cwd);
 
     InspectReport {

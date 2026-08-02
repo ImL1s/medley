@@ -2208,9 +2208,10 @@ impl Config {
     pub fn new_from_toml_cfg(raw_config: &toml::Value) -> Result<Self, String> {
         let raw_config = &Self::expand_auth_alias(raw_config);
         let super::config_model_override_parse::ParsedModelOverrides {
-            models: config_models,
+            models: mut config_models,
             warnings: config_warnings,
         } = super::config_model_override_parse::parse_model_overrides(raw_config);
+        super::model_providers::merge_openai_codex_presets(&mut config_models);
         let (mut auth_providers, auth_provider_warnings) = parse_auth_providers(raw_config);
         let (model_providers, mut model_provider_warnings) = parse_model_providers(raw_config);
         for (id, provider) in &model_providers {
@@ -4851,6 +4852,17 @@ impl ModelEntry {
     /// changes. Never executes a provider command.
     pub fn has_own_credentials(&self) -> bool {
         self.own_credential().is_some() || self.auth_provider.is_some()
+    }
+    /// `true` when this entry is routed through the reserved OpenAI Codex
+    /// profile, whose bearer comes from that provider's own OAuth login.
+    ///
+    /// Such an entry satisfies [`Self::has_own_credentials`] (its traffic must
+    /// never carry an xAI session token), but it is not evidence that the user
+    /// holds an xAI API key or any BYOK key. Aggregate "does this install have
+    /// an external key" predicates therefore skip it — otherwise the built-in
+    /// Codex preset alone would advertise API-key auth to every user.
+    pub fn is_openai_codex_profile(&self) -> bool {
+        self.info.api_backend == ApiBackend::CodexResponses
     }
 }
 impl std::ops::Deref for ModelEntry {

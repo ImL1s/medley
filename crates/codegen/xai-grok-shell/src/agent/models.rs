@@ -413,6 +413,24 @@ impl ModelsManager {
             .is_some_and(|a| a.is_session_auth())
     }
 
+    /// Whether a Codex-backed model is actually reachable: holding a live
+    /// provider credential *and* surviving the same `user_selectable` /
+    /// `visible_for_auth` filters the picker applies.
+    ///
+    /// Suppressing the interactive xAI login keys on this, so a Codex entry
+    /// that `allowed_models` or `hidden_models` filters out must not count —
+    /// otherwise the login screen is skipped for a model `/model` cannot
+    /// reach, stranding the session on a default xAI model with no credential.
+    pub(crate) fn has_selectable_openai_codex_model(&self) -> bool {
+        let is_session_auth = self.is_session_auth();
+        self.models().values().any(|entry| {
+            entry.is_openai_codex_profile()
+                && entry.info.user_selectable
+                && entry.info.visible_for_auth(is_session_auth)
+                && config::model_readiness(entry).0
+        })
+    }
+
     /// ACP-visible (non-hidden) projection of the catalog.
     pub fn available(&self) -> IndexMap<acp::ModelId, acp::ModelInfo> {
         let snapshot = {
