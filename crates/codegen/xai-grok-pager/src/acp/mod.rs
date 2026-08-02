@@ -968,6 +968,7 @@ mod tests {
             has_auth_provider_command: false,
             preferred_method: None,
             selected_model_is_no_auth: false,
+            has_openai_codex_credential: false,
         });
 
         let (needs, label, method_id, mode) = startup_auth_metadata(&built.methods);

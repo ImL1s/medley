@@ -91,8 +91,28 @@ pub(crate) fn merge_openai_codex_presets(
         if user_entry.declares_own_routing() {
             continue;
         }
-        user_entry.model_provider = preset.model_provider;
-        user_entry.model.get_or_insert(preset.model.unwrap_or(key));
+        // Overlay the user's fields on the whole preset, not just its routing:
+        // `context_window = 400000` alone must not also blank the shipped
+        // display name and description out of the picker.
+        let ConfigModelOverride {
+            model,
+            model_provider,
+            name,
+            description,
+            context_window,
+            ..
+        } = preset;
+        user_entry.model_provider = model_provider;
+        user_entry.model.get_or_insert(model.unwrap_or(key));
+        if let Some(name) = name {
+            user_entry.name.get_or_insert(name);
+        }
+        if let Some(description) = description {
+            user_entry.description.get_or_insert(description);
+        }
+        if let Some(context_window) = context_window {
+            user_entry.context_window.get_or_insert(context_window);
+        }
     }
 }
 
@@ -1482,6 +1502,45 @@ mod tests {
             resolve_credentials(model, Some("xai-session-token")).api_key,
             None,
             "the xAI session token must never authenticate a Codex-keyed model"
+        );
+    }
+
+    /// Drift guard: every field the preset ships must survive a metadata-only
+    /// override. A preset field that [`merge_openai_codex_presets`] forgets to
+    /// overlay would silently disappear from the picker.
+    #[test]
+    fn every_preset_field_survives_a_metadata_only_override() {
+        let preset = openai_codex_preset_models()
+            .shift_remove(OPENAI_CODEX_PRESET_MODEL_ID)
+            .expect("the preset should be keyed by its model id");
+        let preset_value = toml::Value::try_from(&preset).expect("preset serializes");
+        let preset_table = preset_value.as_table().expect("preset is a table");
+
+        // Sets one field the preset does not, and declares no routing.
+        let mut models = IndexMap::from([(
+            OPENAI_CODEX_PRESET_MODEL_ID.to_owned(),
+            ConfigModelOverride {
+                top_p: Some(0.5),
+                ..ConfigModelOverride::default()
+            },
+        )]);
+        merge_openai_codex_presets(&mut models);
+        let merged_value = toml::Value::try_from(&models[OPENAI_CODEX_PRESET_MODEL_ID])
+            .expect("merged serializes");
+        let merged_table = merged_value.as_table().expect("merged is a table");
+
+        for (field, value) in preset_table {
+            assert_eq!(
+                merged_table.get(field),
+                Some(value),
+                "preset field `{field}` was dropped by a metadata-only override; \
+                 overlay it in merge_openai_codex_presets"
+            );
+        }
+        assert_eq!(
+            merged_table.get("top_p").and_then(toml::Value::as_float),
+            Some(0.5),
+            "the user's own field must survive the overlay"
         );
     }
 

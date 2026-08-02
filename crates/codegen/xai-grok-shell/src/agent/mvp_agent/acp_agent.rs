@@ -414,6 +414,12 @@ impl acp::Agent for MvpAgent {
             .get(self.models_manager.current_model_id().0.as_ref())
             .map(|e| e.info.auth_scheme == xai_grok_sampler::AuthScheme::None)
             .unwrap_or(false);
+        // Catalog-wide, unlike the selected-model check above: the credential
+        // exists for the whole session, and a Codex-only user reaches their
+        // model with `/model` once the session is up.
+        let has_openai_codex_credential = self.models_manager.models().values().any(|e| {
+            e.is_openai_codex_profile() && crate::agent::config::model_readiness(e).0
+        });
         let built = auth_method::build_auth_methods(auth_method::AuthMethodsBuildInputs {
             has_external_api_key,
             has_cached_token,
@@ -423,6 +429,7 @@ impl acp::Agent for MvpAgent {
             has_auth_provider_command: has_auth_provider,
             preferred_method,
             selected_model_is_no_auth,
+            has_openai_codex_credential,
         });
         let auth_methods = built.methods;
         xai_grok_telemetry::unified_log::info(
@@ -437,6 +444,7 @@ impl acp::Agent for MvpAgent {
                 "has_cached_token": has_cached_token,
                 "has_enterprise_oidc": has_enterprise_oidc,
                 "selected_model_is_no_auth": selected_model_is_no_auth,
+                "has_openai_codex_credential": has_openai_codex_credential,
                 "init_has_current": init_has_current,
                 "init_is_expired": init_is_expired,
                 "auth_mode": self.auth_manager.current().map(|a| format!("{:?}", a.auth_mode)),

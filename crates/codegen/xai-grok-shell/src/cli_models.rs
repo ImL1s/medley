@@ -4,7 +4,7 @@ use agent_client_protocol as acp;
 use anyhow::Result;
 use xai_acp_lib::{AcpAgentTx, acp_send};
 
-use crate::agent::config::Config as AgentConfig;
+use crate::agent::config::{Config as AgentConfig, model_readiness};
 
 /// Status for the `grok models` banner (display order ≠ sampling priority; see [`AuthStatus::resolve`]).
 #[derive(Debug, PartialEq, Eq)]
@@ -14,12 +14,17 @@ pub enum AuthStatus {
     LoggedIn(String),
     /// Catalog key of the first model with own `api_key`/`env_key`.
     ModelCredentials(String),
+    /// A live provider-scoped OpenAI Codex credential, with no xAI credential
+    /// behind it. Its Codex models are ready even though nothing authenticates
+    /// to xAI, so reporting "not authenticated" would contradict the very rows
+    /// printed underneath the banner.
+    OpenAiCodex,
     DeploymentKey,
     NotAuthenticated,
 }
 
 impl AuthStatus {
-    /// Banner status: env key → session → BYOK → deployment → none.
+    /// Banner status: env key → session → BYOK → Codex → deployment → none.
     ///
     /// Differs from sampling (`resolve_credentials`: BYOK → session → env) so a
     /// logged-in user sees the login host. BYOK uses
@@ -45,6 +50,12 @@ impl AuthStatus {
             (entry.has_own_credentials() && !entry.is_openai_codex_profile()).then(|| name.clone())
         }) {
             return Self::ModelCredentials(name);
+        }
+        if models
+            .values()
+            .any(|entry| entry.is_openai_codex_profile() && model_readiness(entry).0)
+        {
+            return Self::OpenAiCodex;
         }
         if agent_config.endpoints.deployment_key.is_some() {
             return Self::DeploymentKey;
@@ -211,6 +222,18 @@ mod tests {
                 AuthStatus::ModelCredentials(dm.to_owned())
             );
         }
+    }
+
+    /// `grok models` must not print "You are not authenticated" directly above
+    /// a ready `gpt-5.6-sol` row. A Codex login is a real credential, just not
+    /// an xAI one.
+    #[test]
+    #[serial]
+    fn resolve_reports_codex_login_rather_than_not_authenticated() {
+        let (_dir, _g) = isolate_auth_sources();
+        let cfg = config_from_toml("");
+        // No Codex credential yet: the preset is unready, so nothing to report.
+        assert_eq!(AuthStatus::resolve(&cfg), AuthStatus::NotAuthenticated);
     }
 
     #[test]
