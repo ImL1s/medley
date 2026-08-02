@@ -832,13 +832,15 @@ async fn logout_with_revoke_endpoint(
     timeout: StdDuration,
     revoke_endpoint: &str,
 ) -> Result<(), CodexOAuthError> {
-    if let Some(auth) = manager.current_or_expired()
-        && let Err(error) = revoke_at(revoke_endpoint, &auth, timeout.min(REVOKE_TIMEOUT)).await
-    {
-        tracing::warn!(error = %error, "Codex OAuth remote revocation failed; continuing local logout");
-    }
     manager
-        .clear_durable(timeout)
+        .clear_durable_with_current_scope(timeout, |auth| async move {
+            if let Some(auth) = auth
+                && let Err(error) =
+                    revoke_at(revoke_endpoint, &auth, timeout.min(REVOKE_TIMEOUT)).await
+            {
+                tracing::warn!(error = %error, "Codex OAuth remote revocation failed; continuing local logout");
+            }
+        })
         .await
         .map_err(|error| match error.kind() {
             std::io::ErrorKind::WouldBlock => CodexOAuthError::StoreBusy,
@@ -1188,13 +1190,21 @@ mod tests {
     #[tokio::test]
     async fn logout_does_not_clear_memory_or_report_success_while_store_is_locked() {
         let dir = tempfile::tempdir().unwrap();
+        let revoke_calls = Arc::new(AtomicUsize::new(0));
+        let captured_calls = Arc::clone(&revoke_calls);
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
         let addr = listener.local_addr().unwrap();
         let router = Router::new().route(
             "/revoke",
-            axum::routing::post(|| async { StatusCode::NO_CONTENT }),
+            axum::routing::post(move || {
+                let captured_calls = Arc::clone(&captured_calls);
+                async move {
+                    captured_calls.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::NO_CONTENT
+                }
+            }),
         );
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let revoke_endpoint = format!("http://{addr}/revoke");
@@ -1219,6 +1229,11 @@ mod tests {
                 .await,
             Err(CodexOAuthError::StoreBusy)
         ));
+        assert_eq!(
+            revoke_calls.load(Ordering::SeqCst),
+            0,
+            "logout must not revoke a cached credential before acquiring the durable-store lock"
+        );
         assert!(status(&manager).signed_in, "memory must remain coherent");
         assert!(
             status(&AuthManager::new_openai_codex(dir.path())).signed_in,
@@ -1231,6 +1246,138 @@ mod tests {
             .unwrap();
         assert!(!status(&manager).signed_in);
         assert!(!status(&AuthManager::new_openai_codex(dir.path())).signed_in);
+        assert_eq!(revoke_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn logout_revokes_disk_current_generation_while_holding_store_lock() {
+        use axum::extract::Json;
+        use tokio::sync::{Barrier, Mutex, Notify};
+
+        let dir = tempfile::tempdir().unwrap();
+        let xai = GrokAuth {
+            key: "xai-secret".into(),
+            auth_mode: AuthMode::Oidc,
+            ..GrokAuth::default()
+        };
+        super::super::storage::write_auth_json(
+            &dir.path().join("auth.json"),
+            &std::collections::BTreeMap::from([("xai::scope".to_owned(), xai)]),
+        )
+        .unwrap();
+
+        let logout_manager = manager(dir.path());
+        logout_manager
+            .save_without_enrichment(previous_codex_auth())
+            .await
+            .unwrap();
+        let rotating_manager = manager(dir.path());
+
+        let rotation_barrier = Arc::new(Barrier::new(2));
+        let rotating_task = {
+            let rotating_manager = Arc::clone(&rotating_manager);
+            let rotation_barrier = Arc::clone(&rotation_barrier);
+            tokio::spawn(async move {
+                rotation_barrier.wait().await;
+                let rotation_lock = rotating_manager
+                    .try_lock_auth_file_async(StdDuration::from_secs(1))
+                    .await
+                    .expect("rotating manager must acquire the shared auth-file lock");
+                let mut rotated = previous_codex_auth();
+                rotated.key = "rotated-access".into();
+                rotated.refresh_token = Some("rotated-refresh".into());
+                rotated.account_id = Some("rotated-account".into());
+                rotating_manager
+                    .save_without_enrichment(rotated)
+                    .await
+                    .unwrap();
+                drop(rotation_lock);
+            })
+        };
+        rotation_barrier.wait().await;
+        tokio::time::timeout(StdDuration::from_secs(5), rotating_task)
+            .await
+            .expect("credential rotation must not deadlock")
+            .unwrap();
+        assert_eq!(
+            logout_manager
+                .current_or_expired()
+                .unwrap()
+                .refresh_token
+                .as_deref(),
+            Some("old-refresh"),
+            "logout manager must retain the deliberately stale cached generation"
+        );
+
+        let captured_bodies = Arc::new(Mutex::new(Vec::new()));
+        let revoke_started = Arc::new(Notify::new());
+        let release_revoke = Arc::new(Notify::new());
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = Router::new().route(
+            "/revoke",
+            axum::routing::post({
+                let captured_bodies = Arc::clone(&captured_bodies);
+                let revoke_started = Arc::clone(&revoke_started);
+                let release_revoke = Arc::clone(&release_revoke);
+                move |Json(body): Json<serde_json::Value>| {
+                    let captured_bodies = Arc::clone(&captured_bodies);
+                    let revoke_started = Arc::clone(&revoke_started);
+                    let release_revoke = Arc::clone(&release_revoke);
+                    async move {
+                        captured_bodies.lock().await.push(body);
+                        revoke_started.notify_one();
+                        release_revoke.notified().await;
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let revoke_endpoint = format!("http://{addr}/revoke");
+        let logout_task = {
+            let logout_manager = Arc::clone(&logout_manager);
+            tokio::spawn(async move {
+                logout_with_revoke_endpoint(
+                    &logout_manager,
+                    StdDuration::from_secs(1),
+                    &revoke_endpoint,
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(StdDuration::from_secs(5), revoke_started.notified())
+            .await
+            .expect("logout must reach remote revocation without deadlocking");
+
+        let bodies = captured_bodies.lock().await;
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(
+            bodies[0]["token"], "rotated-refresh",
+            "logout must revoke the generation reread from disk under lock"
+        );
+        drop(bodies);
+        assert!(
+            rotating_manager
+                .try_lock_auth_file_async(StdDuration::from_millis(20))
+                .await
+                .is_none(),
+            "the auth-file lock must remain held while remote revocation is in flight"
+        );
+
+        release_revoke.notify_one();
+        tokio::time::timeout(StdDuration::from_secs(5), logout_task)
+            .await
+            .expect("logout must finish after revocation is released")
+            .unwrap()
+            .unwrap();
+        assert!(!status(&logout_manager).signed_in);
+        let store = super::super::storage::read_auth_json(&dir.path().join("auth.json")).unwrap();
+        assert!(!store.contains_key(AUTH_SCOPE));
+        assert_eq!(store.get("xai::scope").unwrap().key, "xai-secret");
     }
 
     #[tokio::test]

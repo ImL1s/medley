@@ -4,6 +4,7 @@
 
 use chrono::{Duration, Utc};
 use parking_lot::RwLock;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -17,7 +18,7 @@ pub(super) mod lock;
 #[path = "manager/sleep_gate.rs"]
 mod sleep_gate;
 
-use lock::try_lock_auth_file_async;
+use lock::{try_lock_auth_file_async, try_lock_auth_file_async_with_heartbeat};
 use sleep_gate::{InFlightGuard, SleepGate};
 
 use crate::util::dual_clock::DualClock;
@@ -541,7 +542,28 @@ impl AuthManager {
     /// auth-file lock. Unlike [`Self::clear`], this never reports success or
     /// clears memory while the on-disk credential may still be present.
     pub(crate) async fn clear_durable(&self, timeout: StdDuration) -> std::io::Result<()> {
-        let Some(lock) = self.try_lock_auth_file_async(timeout).await else {
+        self.clear_durable_with_current_scope(timeout, |_| async {})
+            .await
+    }
+
+    /// Durably remove the current scope as one auth-file transaction.
+    ///
+    /// The callback receives the current durable scoped credential, not a
+    /// potentially stale in-memory snapshot. The auth-file lock remains held
+    /// (with a heartbeat) across the callback so a sibling process cannot
+    /// rotate the credential between remote revocation and durable removal.
+    /// Memory is cleared only after the lock is revalidated and disk removal
+    /// succeeds.
+    pub(crate) async fn clear_durable_with_current_scope<F, Fut>(
+        &self,
+        timeout: StdDuration,
+        before_remove: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(Option<GrokAuth>) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let Some(lock) = try_lock_auth_file_async_with_heartbeat(&self.path, timeout).await else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "auth credential store is busy",
@@ -551,6 +573,20 @@ impl AuthManager {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "auth credential store lock is no longer live",
+            ));
+        }
+
+        let current_auth = match self.read_auth_store() {
+            Ok(store) => self.lookup_scoped_auth(&store),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        before_remove(current_auth).await;
+
+        if !lock.still_live(&self.path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "auth credential store lock was lost during durable removal",
             ));
         }
 
@@ -623,7 +659,15 @@ impl AuthManager {
     /// already-logged-out success, while unreadable data and write failures
     /// are surfaced so memory cannot diverge from durable state.
     fn write_scope_removal_durable(&self, scope: &str) -> std::io::Result<ScopeRemoval> {
-        let mut auth_store = read_auth_json_or_empty(&self.path)?;
+        let mut auth_store = if self.xai_session {
+            read_auth_json_or_empty(&self.path)?
+        } else {
+            match read_auth_json_owner_only(&self.path) {
+                Ok(store) => store,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => AuthStore::new(),
+                Err(error) => return Err(error),
+            }
+        };
         auth_store.remove(scope);
         if auth_store.is_empty() {
             match std::fs::remove_file(&self.path) {
@@ -633,7 +677,11 @@ impl AuthManager {
             }
             Ok(ScopeRemoval::FileDeleted)
         } else {
-            write_auth_json(&self.path, &auth_store)?;
+            if self.xai_session {
+                write_auth_json(&self.path, &auth_store)?;
+            } else {
+                write_auth_json_strict(&self.path, &auth_store)?;
+            }
             Ok(ScopeRemoval::EntryRemoved)
         }
     }

@@ -45,10 +45,10 @@ const _: () = assert!(
     LOCK_HEARTBEAT_INTERVAL.as_secs() < STALE_LOCK_TIMEOUT_SECS,
     "a heartbeating holder must never age past the stale threshold"
 );
-// Refresh-sized callers must keep both a meaningful Phase-2 wait after the
-// Phase-3 confirmation reservation ([`phase2_budget`]) and the heartbeat
-// (the `timeout >= REFRESH_LOCK_TIMEOUT` gate in
-// [`try_lock_auth_file_async_with`]).
+// Refresh-sized callers must keep a meaningful Phase-2 wait after the Phase-3
+// confirmation reservation ([`phase2_budget`]). They also receive a heartbeat
+// through the default timeout-based policy; network-spanning callers with a
+// shorter acquisition budget opt in explicitly.
 const _: () = assert!(
     super::REFRESH_LOCK_TIMEOUT.as_millis() >= 2 * STUCK_LIVE_CONFIRM_DELAY.as_millis(),
     "the refresh lock budget must comfortably exceed the confirmation delay"
@@ -566,13 +566,28 @@ fn locked(file: File, with_heartbeat: bool) -> AuthFileLock {
 ///
 /// `timeout` is the total budget: Phase 2's wait is shortened by
 /// [`phase2_budget`] so the function returns within ~`timeout`, never
-/// `timeout + STUCK_LIVE_CONFIRM_DELAY`. The guard carries the holder
-/// heartbeat only for refresh-sized budgets (see [`locked`]).
+/// `timeout + STUCK_LIVE_CONFIRM_DELAY`. By default, the guard carries the
+/// holder heartbeat only for refresh-sized budgets; network-spanning callers
+/// with a shorter wait budget use [`try_lock_auth_file_async_with_heartbeat`].
 pub(crate) async fn try_lock_auth_file_async(
     auth_json_path: &Path,
     timeout: StdDuration,
 ) -> Option<AuthFileLock> {
     try_lock_auth_file_async_with(auth_json_path, timeout, STUCK_LIVE_CONFIRM_DELAY).await
+}
+
+/// Acquire the auth-file lock with the caller's normal wait budget while
+/// keeping the holder heartbeat alive for a network-spanning transaction.
+///
+/// Acquisition timeout and hold duration are deliberately independent: a
+/// provider logout should not wait refresh-sized time to acquire the lock, but
+/// once acquired it must remain visibly live while awaiting remote revocation.
+pub(crate) async fn try_lock_auth_file_async_with_heartbeat(
+    auth_json_path: &Path,
+    timeout: StdDuration,
+) -> Option<AuthFileLock> {
+    try_lock_auth_file_async_with_options(auth_json_path, timeout, STUCK_LIVE_CONFIRM_DELAY, true)
+        .await
 }
 
 /// Phase-2 (blocking-wait) budget: the total `timeout` minus a reservation
@@ -596,10 +611,20 @@ async fn try_lock_auth_file_async_with(
     timeout: StdDuration,
     confirm_delay: StdDuration,
 ) -> Option<AuthFileLock> {
-    let lock_path = auth_json_path.with_file_name("auth.json.lock");
     // Heartbeat only for holds that may span an IdP exchange; see
     // [`locked`] for why short advisory holds skip it.
     let with_heartbeat = timeout >= super::REFRESH_LOCK_TIMEOUT;
+    try_lock_auth_file_async_with_options(auth_json_path, timeout, confirm_delay, with_heartbeat)
+        .await
+}
+
+async fn try_lock_auth_file_async_with_options(
+    auth_json_path: &Path,
+    timeout: StdDuration,
+    confirm_delay: StdDuration,
+    with_heartbeat: bool,
+) -> Option<AuthFileLock> {
+    let lock_path = auth_json_path.with_file_name("auth.json.lock");
 
     unified_log::debug(
         &format!(
@@ -1106,9 +1131,9 @@ mod tests {
         assert_eq!(phase2_budget(confirm, confirm), StdDuration::ZERO);
     }
 
-    /// Heartbeat attaches only to refresh-sized holds (the ones that span
-    /// an IdP exchange); short advisory holds must not spawn a thread per
-    /// acquisition.
+    /// The default policy attaches a heartbeat only to refresh-sized holds;
+    /// network-spanning transactions may opt in without inflating their
+    /// acquisition timeout, while short advisory holds stay heartbeat-free.
     #[tokio::test]
     async fn heartbeat_attached_only_for_refresh_sized_budgets() {
         let dir = TempDir::new().unwrap();
@@ -1122,6 +1147,16 @@ mod tests {
             "an AUTH_LOCK_TIMEOUT-sized hold must not carry a heartbeat"
         );
         drop(short);
+
+        let network =
+            try_lock_auth_file_async_with_heartbeat(&path, crate::auth::manager::AUTH_LOCK_TIMEOUT)
+                .await
+                .expect("uncontended acquire");
+        assert!(
+            network._heartbeat.is_some(),
+            "a network-spanning hold must carry a heartbeat without changing its wait budget"
+        );
+        drop(network);
 
         let refresh = try_lock_auth_file_async(&path, crate::auth::manager::REFRESH_LOCK_TIMEOUT)
             .await
