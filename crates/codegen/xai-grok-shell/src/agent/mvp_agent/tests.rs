@@ -2846,6 +2846,48 @@ async fn wait_for_in_flight_load_blocks_until_load_completes() {
         .await;
 }
 
+/// Registration happens before `session/load` finishes restoring its persisted
+/// model. A racing request must therefore remain behind the load marker even
+/// after the handle becomes visible, or it can observe the older model and run
+/// before the restore's fallback wins.
+#[tokio::test]
+async fn registered_session_stays_gated_until_restored_model_is_final() {
+    use std::task::Poll;
+
+    let agent = build_minimal_agent_for_tests();
+    let sid = acp::SessionId::new("sess-registered-while-loading");
+    let persisted = acp::ModelId::new("persisted-model");
+    let fallback = acp::ModelId::new("ready-fallback");
+    let guard = agent.begin_session_load(&sid);
+    let mut handle = make_test_handle(persisted.0.as_ref(), false, None);
+    handle.info.id = sid.clone();
+    agent.sessions.borrow_mut().insert(sid.clone(), handle);
+
+    let mut racing_request = Box::pin(agent.session_handle_waiting_for_load(&sid));
+    assert!(
+        matches!(futures::poll!(racing_request.as_mut()), Poll::Pending),
+        "a registered handle must remain gated until persisted restoration completes"
+    );
+
+    agent
+        .sessions
+        .borrow_mut()
+        .get_mut(&sid)
+        .expect("registered session")
+        .model_id = fallback.clone();
+    drop(guard);
+
+    let observed = racing_request.await.expect("restored session handle");
+    assert_eq!(
+        observed.model_id, fallback,
+        "the racing request must observe the restored fallback, never the persisted model"
+    );
+    assert_eq!(
+        agent.sessions.borrow()[&sid].model_id, observed.model_id,
+        "the registered handle and racing request must agree on the final model ordering"
+    );
+}
+
 /// A racing model switch must not hold the per-session dispatch lock while it
 /// waits for `session/load`. The load path applies its restored model before its
 /// RAII load guard drops, so taking the lock first creates a lock-order cycle.

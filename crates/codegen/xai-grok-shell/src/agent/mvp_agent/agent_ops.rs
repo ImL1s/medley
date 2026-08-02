@@ -2978,9 +2978,10 @@ impl MvpAgent {
     ///
     /// Returns an RAII guard; while it is alive,
     /// [`Self::wait_for_in_flight_session_load`] blocks racing session-scoped
-    /// requests for the same session. Dropping the guard (every exit path of
-    /// `load_session`, success or error) removes the marker and wakes all
-    /// waiters via watch-channel closure.
+    /// requests for the same session, including the interval after its handle
+    /// is registered but before persisted state restoration finishes. Dropping
+    /// the guard (every exit path of `load_session`, success or error) removes
+    /// the marker and wakes all waiters via watch-channel closure.
     pub(super) fn begin_session_load(
         &self,
         session_id: &acp::SessionId,
@@ -3010,10 +3011,6 @@ impl MvpAgent {
         &self,
         session_id: &acp::SessionId,
     ) -> Option<crate::session::SessionHandle> {
-        let existing = self.sessions.borrow().get(session_id).cloned();
-        if existing.is_some() {
-            return existing;
-        }
         self.wait_for_in_flight_session_load(session_id).await;
         self.sessions.borrow().get(session_id).cloned()
     }
@@ -3022,10 +3019,10 @@ impl MvpAgent {
     ///
     /// This closes the load-vs-request race after a leader restart: clients
     /// replay `session/load` on reconnect, and a `session/prompt` arriving
-    /// right behind it must wait for the session to land in `self.sessions`
-    /// instead of failing with "unknown session id". The wait wakes when the
-    /// load's [`SessionLoadGuard`] drops (success or failure) and re-checks;
-    /// a failed load still surfaces the original error to the caller.
+    /// right behind it must wait until registration *and restoration* finish.
+    /// The wait wakes when the load's [`SessionLoadGuard`] drops (success or
+    /// failure) and re-checks; a failed load still surfaces the original error
+    /// to the caller.
     pub(crate) async fn wait_for_in_flight_session_load(
         &self,
         session_id: &acp::SessionId,
@@ -3035,9 +3032,6 @@ impl MvpAgent {
         );
         let deadline = tokio::time::Instant::now() + LOAD_WAIT_TIMEOUT;
         loop {
-            if self.sessions.borrow().contains_key(session_id) {
-                return;
-            }
             let rx = self.loading_sessions.borrow().get(session_id).cloned();
             let Some(mut rx) = rx else { return };
             let now = tokio::time::Instant::now();
