@@ -259,6 +259,7 @@ pub(super) fn build_grok_auth(
         oidc_client_id: Some(client_id.to_owned()),
         id_token: None,
         account_id: None,
+        chatgpt_account_is_fedramp: false,
     }
 }
 #[derive(Debug, Clone, Deserialize)]

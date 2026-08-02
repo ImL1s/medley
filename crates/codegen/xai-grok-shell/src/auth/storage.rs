@@ -84,6 +84,82 @@ pub fn read_auth_json(auth_file: &Path) -> std::io::Result<AuthStore> {
     Ok(map)
 }
 
+/// Read `auth.json` only after its permissions are proven owner-only.
+///
+/// Provider credentials use this stricter policy because a failed repair of a
+/// world-readable credential store must make the credential unavailable. The
+/// legacy xAI reader remains best-effort for backwards compatibility.
+pub(crate) fn read_auth_json_owner_only(auth_file: &Path) -> std::io::Result<AuthStore> {
+    ensure_auth_json_owner_only(auth_file)?;
+
+    let mut file = File::open(auth_file)?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        return Ok(AuthStore::new());
+    }
+
+    serde_json::from_str(trimmed)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+/// Path-scoped, test-only fault for deterministic strict-permission failures.
+/// The production repair still delegates to the cross-platform secure-file
+/// implementation.
+#[cfg(test)]
+pub(super) static PERMISSION_REPAIR_FAULT_PATHS: std::sync::Mutex<Vec<PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn ensure_auth_json_owner_only(auth_file: &Path) -> std::io::Result<()> {
+    #[cfg(all(test, unix))]
+    let injected_repair_failure = {
+        use std::os::unix::fs::PermissionsExt;
+        PERMISSION_REPAIR_FAULT_PATHS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .any(|path| path == auth_file)
+            && std::fs::metadata(auth_file)
+                .map(|metadata| metadata.permissions().mode() & 0o777 != 0o600)
+                .unwrap_or(false)
+    };
+    #[cfg(all(test, not(unix)))]
+    let injected_repair_failure = PERMISSION_REPAIR_FAULT_PATHS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .any(|path| path == auth_file);
+    #[cfg(test)]
+    if injected_repair_failure {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected owner-only permission repair failure",
+        ));
+    }
+
+    crate::util::secure_file::ensure_owner_only_permissions(auth_file)
+}
+
+/// Strict provider counterpart to
+/// [`read_auth_json_or_empty_recovering_corrupt`]. Permission repair failures
+/// are never converted into an empty store, so a login/rotation cannot read or
+/// overwrite sibling scopes from an unsafe credential file.
+pub(crate) fn read_auth_json_owner_only_or_empty_recovering_corrupt(
+    auth_file: &Path,
+) -> std::io::Result<AuthStore> {
+    match read_auth_json_owner_only(auth_file) {
+        Ok(map) => Ok(map),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(AuthStore::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            let _ = backup_corrupt_auth_file(auth_file);
+            Ok(AuthStore::new())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Read auth.json, returning an empty map if the file does not exist.
 ///
 /// Non-empty corrupt JSON, permission errors, etc. are returned as errors
