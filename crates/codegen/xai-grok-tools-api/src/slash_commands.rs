@@ -1,6 +1,6 @@
-//! Canonical slash-command wording (`/loop`, `/imagine`, `/imagine-video`, `/goal`),
-//! shared by every front-end (Grok Build shell/pager and other hosts) so
-//! expansions cannot drift.
+//! Canonical slash-command wording (`/loop`, `/imagine`, `/imagine-video`,
+//! `/goal`, `/init`), shared by every front-end (Grok Build shell/pager and
+//! other hosts) so expansions cannot drift.
 
 /// Canonical tool name advertised by the scheduler create tool. Gating code
 /// (shell `CommandAvailability`, pager `required_tools`, host command lists)
@@ -219,6 +219,92 @@ pub fn goal_instruction(objective: &str) -> String {
     )
 }
 
+/// Advertised name of the /init command.
+pub const INIT_COMMAND_NAME: &str = "init";
+
+/// Build the model instruction that `/init` expands into.
+///
+/// `/init` writes no file itself: it hands the model an assignment and lets the
+/// normal toolset do the reading and writing, so the analysis is as good as the
+/// session's tools rather than as good as a hard-coded Rust scanner.
+///
+/// The "already exists" branch is delegated to the model on purpose. A host-side
+/// `AGENTS.md.exists()` check would miss every other name the loader accepts
+/// (`AGENT.md`, `CLAUDE.md`, `.claude/CLAUDE.md`) and every copy above the
+/// working directory, and it would be checking a different directory than the
+/// one the model ends up working in.
+///
+/// `args` is optional extra direction from the user ("focus on the test setup");
+/// empty args produce no trailing section.
+pub fn init_agents_md_instruction(args: &str) -> String {
+    let extra = args.trim();
+    let extra_section = if extra.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n## Also from the user\n{extra}")
+    };
+    format!(
+        "# /init -- write this repository's AGENTS.md\n\n\
+         Produce the AGENTS.md that every future session in this repository starts with.\n\
+         It is loaded automatically from the git root down to the working directory and\n\
+         prepended to every conversation, so its length is a permanent cost: make it earn it.\n\n\
+         ## 1. Find what already exists -- never overwrite blindly\n\
+         Search every directory from the git root down to the working directory, not just the\n\
+         two ends: the loader reads all of them, so a file in an intermediate package directory\n\
+         is already in play. In each, the names it accepts are AGENTS.md, AGENT.md, Agents.md,\n\
+         CLAUDE.md, Claude.md, CLAUDE.local.md, .claude/CLAUDE.md, and .claude/CLAUDE.local.md.\n\
+         Also look for rules other tools left behind: .grok/rules/, .claude/rules/,\n\
+         .cursor/rules/, .github/copilot-instructions.md, CONTRIBUTING.md.\n\n\
+         If any of those instruction files exists, READ IT FIRST and treat it as the source of\n\
+         truth. Improve the one whose directory already covers the scope you are documenting --\n\
+         do not add a competing AGENTS.md beside a file that is already loaded. Correct what is\n\
+         wrong, add what is missing, delete what the code no longer does. Do not regenerate it\n\
+         from scratch, and do not drop a rule you cannot show is obsolete -- someone put it\n\
+         there for a reason you may not have hit yet.\n\n\
+         If none exists, create AGENTS.md at the repository root. Fold anything useful from the\n\
+         other tools' rule files into it rather than leaving it stranded. Shared rules belong in\n\
+         AGENTS.md, not CLAUDE.local.md -- that one is a personal, usually untracked override.\n\n\
+         ## 2. Investigate before you write\n\
+         Every line you write must come from a file you actually read, not from how projects\n\
+         like this usually work. At minimum read the README and CONTRIBUTING, the build and\n\
+         package manifests, the CI workflow (usually the most reliable source for the real\n\
+         build/test/lint commands), the linter and formatter configs, and enough of the source\n\
+         tree to describe the architecture honestly. Prefer confirming a command exists over\n\
+         asserting it does.\n\n\
+         ## 3. What the file must cover\n\
+         In this order, skipping any heading that genuinely does not apply:\n\n\
+         - Overview -- one or two sentences: what this project is and what it produces.\n\
+         - Commands -- the exact build, test, lint, format, and run invocations,\n  \
+           copy-pasteable. Include how to run a SINGLE test or one package's tests; that is\n  \
+           usually the most valuable line in the file. Note any environment variable, toolchain\n  \
+           version manager, or setup step that is easy to miss and expensive to get wrong.\n\
+         - Architecture -- the things that take an hour to work out from the source: what the\n  \
+           top-level modules/crates/packages own, where the entry points are, how a request or\n  \
+           build flows through them, and which directories are generated or vendored and must\n  \
+           never be hand-edited.\n\
+         - Conventions -- this project's own style where it departs from the language default:\n  \
+           naming, error handling, logging, test layout, import ordering. Only what a reviewer\n  \
+           would actually reject a patch over.\n\
+         - Gotchas -- the rules that cause real breakage: pre-commit hooks, generated files,\n  \
+           migration ordering, platform-specific steps, tests that need a flag or a long\n  \
+           timeout. State the commit-message or PR convention if the repo has one.\n\n\
+         ## 4. Keep it earned\n\
+         - Aim for roughly 30-60 lines. Density beats coverage.\n\
+         - Write instructions, not description: \"run `<test command> <one test>`\", not \"this\n  \
+           project has tests\".\n\
+         - Cut anything an agent finds faster by looking: file listings, dependency dumps,\n  \
+           paraphrases of the README.\n\
+         - Cut transient state: open bugs, in-flight work, TODOs. It goes stale silently.\n\
+         - Do not invent a convention the code does not follow. An unverified rule is worse\n  \
+           than a missing one.\n\
+         - In a monorepo keep the root file general and put package-specific rules in that\n  \
+           package's own AGENTS.md -- deeper files are loaded too and win on conflict.\n\n\
+         ## 5. Finish\n\
+         Write the file, then report its path and a short summary of what went in it. If you\n\
+         improved an existing file, say exactly what you changed and why.{extra_section}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,5 +391,88 @@ mod tests {
     fn usage_message_has_no_default_claim() {
         assert!(loop_usage_message().contains("Usage: /loop"));
         assert!(!loop_usage_message().contains("10m"));
+    }
+
+    #[test]
+    fn init_instruction_carries_contract_tokens() {
+        let text = init_agents_md_instruction("");
+        // Assert against a wrap-insensitive form: the prompt is hard-wrapped for
+        // readability, so a phrase that survives an edit can still straddle a
+        // newline. Line structure is covered by `init_instruction_indents_wrapped_bullets`.
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let has = |phrase: &str| flat.contains(phrase);
+
+        // The deliverable and where it goes.
+        assert!(has("AGENTS.md"));
+        assert!(has("repository root"));
+
+        // Every name `CompatConfig::agent_filenames` accepts must be searched,
+        // or the "already exists" branch silently misses repos using another
+        // one and /init writes a competing file next to a live instruction file.
+        for name in [
+            "AGENTS.md",
+            "AGENT.md",
+            "Agents.md",
+            "CLAUDE.md",
+            "Claude.md",
+            "CLAUDE.local.md",
+            ".claude/CLAUDE.md",
+            ".claude/CLAUDE.local.md",
+        ] {
+            assert!(has(name), "missing existing-file name {name}");
+        }
+
+        // The loader walks the whole git-root -> cwd chain, so an /init run from
+        // a nested package must not search only the two ends and then write a
+        // competing root file.
+        assert!(has(
+            "every directory from the git root down to the working directory"
+        ));
+        assert!(has("not just the two ends"));
+        assert!(has("do not add a competing AGENTS.md"));
+
+        // The non-destructive contract for an existing file.
+        assert!(has("never overwrite blindly"));
+        assert!(has("READ IT FIRST"));
+        assert!(has("Do not regenerate it from scratch"));
+
+        // The sections that make the file worth its permanent context cost.
+        assert!(has("SINGLE test"));
+        assert!(has("generated or vendored"));
+
+        // Expansions ride as user messages and must not claim reminder authority.
+        assert!(!has("system-reminder"));
+    }
+
+    /// Rust's `\`-continuation eats the leading whitespace of the next source
+    /// line, so a wrapped bullet silently loses its markdown indent. Structural
+    /// guard: inside a bullet, a continuation line must be indented.
+    #[test]
+    fn init_instruction_indents_wrapped_bullets() {
+        let text = init_agents_md_instruction("");
+        let mut in_bullet = false;
+        for line in text.lines() {
+            if line.starts_with("- ") {
+                in_bullet = true;
+            } else if line.is_empty() || line.starts_with('#') {
+                in_bullet = false;
+            } else if in_bullet {
+                assert!(
+                    line.starts_with("  "),
+                    "unindented bullet continuation: {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn init_instruction_appends_user_direction_only_when_present() {
+        let bare = init_agents_md_instruction("");
+        assert!(!bare.contains("Also from the user"));
+        assert_eq!(bare, init_agents_md_instruction("   "));
+
+        let focused = init_agents_md_instruction("focus on the test setup");
+        assert!(focused.contains("## Also from the user\nfocus on the test setup"));
+        assert!(focused.starts_with(&bare));
     }
 }

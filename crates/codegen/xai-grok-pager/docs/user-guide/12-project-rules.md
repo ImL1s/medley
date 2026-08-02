@@ -10,6 +10,10 @@ Project rules are Markdown files that Grok reads and adds to its context. Grok f
 
 This is the primary mechanism for teaching Grok about your project's conventions, so you need not restate them each session.
 
+### Starting One
+
+Run [`/init`](04-slash-commands.md#init-focus) in a repository that has no rules yet. Grok analyzes the project and writes an AGENTS.md covering the build and test commands, the architecture, and the conventions it found. In a repository that already has one, `/init` reads the existing file and improves it in place instead of replacing it. Either way the result is a draft to review, not a finished file — you own what it says.
+
 ---
 
 ## Supported File Names

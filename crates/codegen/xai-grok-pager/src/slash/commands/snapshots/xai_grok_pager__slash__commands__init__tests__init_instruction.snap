@@ -1,0 +1,71 @@
+---
+source: crates/codegen/xai-grok-pager/src/slash/commands/init.rs
+expression: "init_agents_md_instruction(\"\")"
+---
+# /init -- write this repository's AGENTS.md
+
+Produce the AGENTS.md that every future session in this repository starts with.
+It is loaded automatically from the git root down to the working directory and
+prepended to every conversation, so its length is a permanent cost: make it earn it.
+
+## 1. Find what already exists -- never overwrite blindly
+Search every directory from the git root down to the working directory, not just the
+two ends: the loader reads all of them, so a file in an intermediate package directory
+is already in play. In each, the names it accepts are AGENTS.md, AGENT.md, Agents.md,
+CLAUDE.md, Claude.md, CLAUDE.local.md, .claude/CLAUDE.md, and .claude/CLAUDE.local.md.
+Also look for rules other tools left behind: .grok/rules/, .claude/rules/,
+.cursor/rules/, .github/copilot-instructions.md, CONTRIBUTING.md.
+
+If any of those instruction files exists, READ IT FIRST and treat it as the source of
+truth. Improve the one whose directory already covers the scope you are documenting --
+do not add a competing AGENTS.md beside a file that is already loaded. Correct what is
+wrong, add what is missing, delete what the code no longer does. Do not regenerate it
+from scratch, and do not drop a rule you cannot show is obsolete -- someone put it
+there for a reason you may not have hit yet.
+
+If none exists, create AGENTS.md at the repository root. Fold anything useful from the
+other tools' rule files into it rather than leaving it stranded. Shared rules belong in
+AGENTS.md, not CLAUDE.local.md -- that one is a personal, usually untracked override.
+
+## 2. Investigate before you write
+Every line you write must come from a file you actually read, not from how projects
+like this usually work. At minimum read the README and CONTRIBUTING, the build and
+package manifests, the CI workflow (usually the most reliable source for the real
+build/test/lint commands), the linter and formatter configs, and enough of the source
+tree to describe the architecture honestly. Prefer confirming a command exists over
+asserting it does.
+
+## 3. What the file must cover
+In this order, skipping any heading that genuinely does not apply:
+
+- Overview -- one or two sentences: what this project is and what it produces.
+- Commands -- the exact build, test, lint, format, and run invocations,
+  copy-pasteable. Include how to run a SINGLE test or one package's tests; that is
+  usually the most valuable line in the file. Note any environment variable, toolchain
+  version manager, or setup step that is easy to miss and expensive to get wrong.
+- Architecture -- the things that take an hour to work out from the source: what the
+  top-level modules/crates/packages own, where the entry points are, how a request or
+  build flows through them, and which directories are generated or vendored and must
+  never be hand-edited.
+- Conventions -- this project's own style where it departs from the language default:
+  naming, error handling, logging, test layout, import ordering. Only what a reviewer
+  would actually reject a patch over.
+- Gotchas -- the rules that cause real breakage: pre-commit hooks, generated files,
+  migration ordering, platform-specific steps, tests that need a flag or a long
+  timeout. State the commit-message or PR convention if the repo has one.
+
+## 4. Keep it earned
+- Aim for roughly 30-60 lines. Density beats coverage.
+- Write instructions, not description: "run `<test command> <one test>`", not "this
+  project has tests".
+- Cut anything an agent finds faster by looking: file listings, dependency dumps,
+  paraphrases of the README.
+- Cut transient state: open bugs, in-flight work, TODOs. It goes stale silently.
+- Do not invent a convention the code does not follow. An unverified rule is worse
+  than a missing one.
+- In a monorepo keep the root file general and put package-specific rules in that
+  package's own AGENTS.md -- deeper files are loaded too and win on conflict.
+
+## 5. Finish
+Write the file, then report its path and a short summary of what went in it. If you
+improved an existing file, say exactly what you changed and why.

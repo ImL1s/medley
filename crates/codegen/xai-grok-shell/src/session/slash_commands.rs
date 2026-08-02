@@ -476,6 +476,7 @@ impl<'a> EffectiveCommandCatalog<'a> {
             "imagine",
             "imagine-video",
             "import-claude",
+            "init",
             "jump",
             "login",
             "logout",
