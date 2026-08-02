@@ -116,20 +116,10 @@
       "synthetic": true,
       "telemetry_status": "unmatched_stop",
       "telemetry_note": "SubagentStop arrived without a matching SubagentStart; native Agent/Task start telemetry was not observed."
-    },
-    {
-      "agent_id": "astate-dir-isolation-a32b88c5bb2ec31c",
-      "agent_type": "state-dir-isolation",
-      "started_at": "2026-08-02T13:40:17.750Z",
-      "parent_mode": "none",
-      "status": "running",
-      "synthetic": true,
-      "telemetry_status": "unmatched_stop",
-      "telemetry_note": "SubagentStop arrived without a matching SubagentStart; native Agent/Task start telemetry was not observed."
     }
   ],
-  "total_spawned": 4,
-  "total_completed": 14,
+  "total_spawned": 3,
+  "total_completed": 13,
   "total_failed": 0,
-  "last_updated": "2026-08-02T13:40:17.854Z"
+  "last_updated": "2026-08-02T10:43:47.655Z"
 }

@@ -2,17 +2,17 @@
   "version": 1,
   "entries": {
     "79a93d4a2f8f50b95f852280616242fee1855dc99a3c75211917f55e72e95fae": {
-      "last_emitted_at_ms": 1785677894074,
+      "last_emitted_at_ms": 1785668413438,
       "message": "Use parallel execution for independent tasks. Use run_in_background for long operations (npm install, builds, tests)."
     },
-    "466399dafa2d20f60587180bad0a07358eb7f2bce724df0ff682f038ad33f5ad": {
-      "last_emitted_at_ms": 1785677844694,
-      "message": "Read multiple files in parallel when possible for faster analysis."
-    },
     "445ed27a3872b681d98190bae61ccb84954e1bc4e140df5370be958dee776b3a": {
-      "last_emitted_at_ms": 1785677798451,
+      "last_emitted_at_ms": 1785666568612,
       "message": "Verify changes work after editing. Test functionality before marking complete."
+    },
+    "3aa89e3c93238ba17ead639ac59a9b9f5a045037ea4f37d3c2c158037dbe2429": {
+      "last_emitted_at_ms": 1785665091988,
+      "message": "Spawning agent: general-purpose (opus) | Task: Audit TUI feature gaps"
     }
   },
-  "updated_at": "2026-08-02T13:38:14.074Z"
+  "updated_at": "2026-08-02T11:00:13.438Z"
 }
