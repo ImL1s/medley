@@ -3,3 +3,6 @@
 .DS_Store
 __pycache__/
 *.py[cod]
+
+# OMC operational state — never commit
+.omc/
