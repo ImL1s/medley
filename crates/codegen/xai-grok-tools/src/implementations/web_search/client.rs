@@ -2,7 +2,88 @@ use super::types::WebSearchConfig;
 use crate::attribution::{SharedAttributionCallback, ToolConsumer};
 use crate::types::{ApiCredential, ApiTransportProfile, SharedApiKeyProvider};
 use async_openai::types::responses as rs;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{
+    AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT,
+};
+
+const CHATGPT_ACCOUNT_ID: HeaderName = HeaderName::from_static("chatgpt-account-id");
+const OPENAI_FEDRAMP: HeaderName = HeaderName::from_static("x-openai-fedramp");
+const ORIGINATOR: HeaderName = HeaderName::from_static("originator");
+const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+
+fn strip_codex_routing_headers(headers: &mut HeaderMap) {
+    headers.remove(CHATGPT_ACCOUNT_ID);
+    headers.remove(OPENAI_FEDRAMP);
+    headers.remove(ORIGINATOR);
+}
+
+fn grok_build_user_agent() -> Result<HeaderValue, &'static str> {
+    HeaderValue::from_str(&format!("xai-grok-build/{}", xai_grok_version::VERSION))
+        .map_err(|_| "Grok Build version produced an invalid user agent.")
+}
+
+fn normalize_codex_base_url(base_url: &str) -> Result<String, &'static str> {
+    let url = reqwest::Url::parse(base_url)
+        .map_err(|_| "OpenAI Codex traffic must use https://chatgpt.com/backend-api/codex.")?;
+    let is_production = url.scheme() == "https"
+        && url.host_str() == Some("chatgpt.com")
+        && url.port().is_none()
+        && url.path().trim_end_matches('/') == "/backend-api/codex"
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+        // Keep the production destination byte-for-byte canonical (apart from
+        // an optional trailing slash). This also rejects an explicit default
+        // port such as `:443`, which `Url` otherwise normalizes away.
+        && base_url.trim_end_matches('/') == CODEX_BASE_URL;
+    if is_production {
+        return Ok(CODEX_BASE_URL.to_string());
+    }
+
+    // Tests may point Codex transport at an in-process mock server. This seam
+    // is absent from production builds and does not relax the production
+    // destination allowlist.
+    #[cfg(test)]
+    {
+        let is_loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"))
+            && matches!(url.scheme(), "http" | "https")
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && url.username().is_empty()
+            && url.password().is_none();
+        if is_loopback {
+            return Ok(base_url.trim_end_matches('/').to_string());
+        }
+    }
+
+    Err("OpenAI Codex traffic must use https://chatgpt.com/backend-api/codex.")
+}
+
+fn retain_codex_headers(
+    headers: &mut HeaderMap,
+    authorization: HeaderValue,
+    account_id: Option<&str>,
+    chatgpt_account_is_fedramp: bool,
+) -> Result<(), &'static str> {
+    let content_type = headers.get(CONTENT_TYPE).cloned();
+    headers.clear();
+    if let Some(value) = content_type {
+        headers.insert(CONTENT_TYPE, value);
+    }
+    headers.insert(USER_AGENT, grok_build_user_agent()?);
+    headers.insert(AUTHORIZATION, authorization);
+    if let Some(account_id) = account_id {
+        let value = HeaderValue::from_str(account_id)
+            .map_err(|_| "Provider returned an invalid account identifier.")?;
+        headers.insert(CHATGPT_ACCOUNT_ID, value);
+    }
+    if chatgpt_account_is_fedramp {
+        headers.insert(OPENAI_FEDRAMP, HeaderValue::from_static("true"));
+    }
+    headers.insert(ORIGINATOR, HeaderValue::from_static("grok_build"));
+    Ok(())
+}
 /// A minimal, purpose-built HTTP client for calling the Responses API
 /// with web search capability.
 #[derive(Clone)]
@@ -72,6 +153,34 @@ impl WebSearchClient {
             .as_ref()
             .map(|provider| provider.transport_profile())
             .unwrap_or_default();
+        let base_url = if transport_profile == ApiTransportProfile::CodexResponses {
+            normalize_codex_base_url(base_url).map_err(|message| {
+                xai_tool_runtime::ToolError::execution(
+                    xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+                    message.to_string(),
+                )
+            })?
+        } else {
+            base_url.clone()
+        };
+        if transport_profile == ApiTransportProfile::CodexResponses {
+            let content_type = headers.get(CONTENT_TYPE).cloned();
+            headers.clear();
+            if let Some(value) = content_type {
+                headers.insert(CONTENT_TYPE, value);
+            }
+            headers.insert(
+                USER_AGENT,
+                grok_build_user_agent().map_err(|message| {
+                    xai_tool_runtime::ToolError::execution(
+                        xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+                        message.to_string(),
+                    )
+                })?,
+            );
+        } else {
+            strip_codex_routing_headers(&mut headers);
+        }
         let mut http_builder = reqwest::Client::builder().default_headers(headers);
         if provider_scoped {
             // A provider-scoped credential is valid only for the configured
@@ -89,7 +198,7 @@ impl WebSearchClient {
             })?;
         Ok(Self {
             http,
-            base_url: base_url.clone(),
+            base_url,
             model: model.clone(),
             api_key_provider: api_key_provider.clone().or(default_api_key_provider),
             provider_scoped,
@@ -183,6 +292,15 @@ impl WebSearchClient {
         url: &str,
         body: &T,
     ) -> Result<reqwest::Request, xai_tool_runtime::ToolError> {
+        if self.transport_profile == ApiTransportProfile::CodexResponses
+            && url != format!("{}/responses", self.base_url)
+        {
+            return Err(xai_tool_runtime::ToolError::execution(
+                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+                "OpenAI Codex requests must use the configured canonical Responses endpoint."
+                    .to_string(),
+            ));
+        }
         let live_credential = self.current_credential().await;
         if self.provider_scoped && live_credential.is_none() {
             return Err(xai_tool_runtime::ToolError::unauthorized(
@@ -205,19 +323,25 @@ impl WebSearchClient {
                         )
                     },
                 )?;
-            request.headers_mut().insert(AUTHORIZATION, authorization);
-            let account_header = HeaderName::from_static("chatgpt-account-id");
-            if let Some(account_id) = credential.account_id {
-                let account_id = HeaderValue::from_str(&account_id).map_err(|_| {
+            if self.transport_profile == ApiTransportProfile::CodexResponses {
+                retain_codex_headers(
+                    request.headers_mut(),
+                    authorization,
+                    credential.account_id.as_deref(),
+                    credential.chatgpt_account_is_fedramp,
+                )
+                .map_err(|message| {
                     xai_tool_runtime::ToolError::execution(
                         xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                        "Provider returned an invalid account identifier.".to_string(),
+                        message.to_string(),
                     )
                 })?;
-                request.headers_mut().insert(account_header, account_id);
             } else {
-                request.headers_mut().remove(account_header);
+                request.headers_mut().insert(AUTHORIZATION, authorization);
+                strip_codex_routing_headers(request.headers_mut());
             }
+        } else {
+            strip_codex_routing_headers(request.headers_mut());
         }
         Ok(request)
     }
@@ -410,6 +534,27 @@ fn extract_citation_pairs(response: &rs::Response) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_web_search_omits_fedramp_for_untrusted_snapshot() {
+        let mut headers = HeaderMap::from_iter([
+            (CONTENT_TYPE, HeaderValue::from_static("application/json")),
+            (OPENAI_FEDRAMP, HeaderValue::from_static("true")),
+        ]);
+        retain_codex_headers(
+            &mut headers,
+            HeaderValue::from_static("Bearer trusted"),
+            Some("workspace-123"),
+            false,
+        )
+        .unwrap();
+        assert!(headers.get(OPENAI_FEDRAMP).is_none());
+        assert_eq!(headers[ORIGINATOR], "grok_build");
+        assert_eq!(
+            headers[USER_AGENT],
+            format!("xai-grok-build/{}", xai_grok_version::VERSION)
+        );
+    }
     use indexmap::IndexMap;
     /// Helper to create a Response from JSON for testing.
     fn response_from_json(json: serde_json::Value) -> rs::Response {
@@ -716,8 +861,84 @@ mod tests {
             Box::pin(std::future::ready(Some(ApiCredential {
                 access_token: "codex-key".to_string(),
                 account_id: Some("codex-account".to_string()),
+                chatgpt_account_is_fedramp: true,
             })))
         }
+    }
+
+    fn codex_config(base_url: &str) -> WebSearchConfig {
+        WebSearchConfig::Enabled {
+            api_key: "stale-codex-key".to_string(),
+            base_url: base_url.to_string(),
+            model: "test-model".to_string(),
+            extra_headers: IndexMap::new(),
+            alpha_test_key: None,
+            api_key_provider: Some(std::sync::Arc::new(ScopedProvider)),
+        }
+    }
+
+    #[test]
+    fn codex_web_search_rejects_noncanonical_production_destinations() {
+        let secret = "must-not-appear-0123456789";
+        for base_url in [
+            "http://chatgpt.com/backend-api/codex",
+            "https://evil.example/backend-api/codex",
+            "https://chatgpt.com/backend-api",
+            "https://chatgpt.com/backend-api/codex/extra",
+            "https://chatgpt.com:444/backend-api/codex",
+            "https://chatgpt.com:443/backend-api/codex",
+            "https://user@chatgpt.com/backend-api/codex",
+            "https://chatgpt.com/backend-api/codex?target=evil",
+            "https://chatgpt.com/backend-api/codex#evil",
+            "https://evil.example/backend-api/codex?token=must-not-appear-0123456789",
+        ] {
+            let error = match WebSearchClient::new(&codex_config(base_url), None) {
+                Ok(_) => panic!("noncanonical Codex destination was accepted: {base_url}"),
+                Err(error) => error,
+            };
+            let message = error.to_string();
+            assert!(
+                message.contains(CODEX_BASE_URL),
+                "unexpected safe error for {base_url}: {message}"
+            );
+            assert!(
+                !message.contains(secret),
+                "credential-bearing destination leaked into error: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_web_search_uses_canonical_responses_endpoint_before_auth() {
+        let client = WebSearchClient::new(
+            &codex_config("https://chatgpt.com/backend-api/codex/"),
+            None,
+        )
+        .expect("canonical Codex destination should build");
+        assert_eq!(client.base_url, CODEX_BASE_URL);
+
+        let endpoint = format!("{}/responses", client.base_url);
+        let request = client
+            .build_authenticated_request(&endpoint, &serde_json::json!({}))
+            .await
+            .expect("canonical Codex request should build");
+        assert_eq!(
+            request.url().as_str(),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(request.headers()[AUTHORIZATION], "Bearer codex-key");
+        assert_eq!(request.headers()[CHATGPT_ACCOUNT_ID], "codex-account");
+        assert_eq!(request.headers()[OPENAI_FEDRAMP], "true");
+
+        let secret = "must-not-appear-0123456789";
+        let error = client
+            .build_authenticated_request(
+                &format!("https://evil.example/responses?token={secret}"),
+                &serde_json::json!({}),
+            )
+            .await
+            .expect_err("noncanonical request URL must fail before auth attachment");
+        assert!(!error.to_string().contains(secret));
     }
 
     #[derive(Default)]
@@ -731,11 +952,13 @@ mod tests {
                 ApiCredential {
                     access_token: "fresh-codex-key".to_string(),
                     account_id: Some("fresh-codex-account".to_string()),
+                    chatgpt_account_is_fedramp: true,
                 }
             } else {
                 ApiCredential {
                     access_token: "rejected-codex-key".to_string(),
                     account_id: Some("rejected-codex-account".to_string()),
+                    chatgpt_account_is_fedramp: true,
                 }
             }
         }
@@ -983,7 +1206,14 @@ mod tests {
             api_key: "generic-key".to_string(),
             base_url: server.uri(),
             model: "generic-model".to_string(),
-            extra_headers: IndexMap::new(),
+            extra_headers: IndexMap::from([
+                (
+                    "chatgpt-account-id".to_string(),
+                    "must-not-leak".to_string(),
+                ),
+                ("x-openai-fedramp".to_string(), "true".to_string()),
+                ("originator".to_string(), "codex_cli_rs".to_string()),
+            ]),
             alpha_test_key: None,
             api_key_provider: Some(std::sync::Arc::new(GenericScopedProvider)),
         };
@@ -995,6 +1225,12 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(body.get("temperature"), Some(&serde_json::json!(0.1)));
         assert_eq!(body.get("top_p"), Some(&serde_json::json!(0.95)));
+        for name in ["chatgpt-account-id", "x-openai-fedramp", "originator"] {
+            assert!(
+                requests[0].headers.get(name).is_none(),
+                "Codex-only routing header leaked to generic Responses: {name}"
+            );
+        }
     }
     /// When the dynamic provider returns `None`, the static `api_key`
     /// from config must still be sent as the Authorization header.
@@ -1117,6 +1353,10 @@ mod tests {
                 Some("stale-codex-key".to_string())
             }
 
+            fn transport_profile(&self) -> ApiTransportProfile {
+                ApiTransportProfile::CodexResponses
+            }
+
             fn current_api_key_async(
                 &self,
             ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + '_>>
@@ -1132,6 +1372,7 @@ mod tests {
                 Box::pin(std::future::ready(Some(ApiCredential {
                     access_token: "refreshed-codex-key".to_string(),
                     account_id: Some("refreshed-codex-account".to_string()),
+                    chatgpt_account_is_fedramp: true,
                 })))
             }
         }
@@ -1141,6 +1382,12 @@ mod tests {
             .and(path("/responses"))
             .and(header("Authorization", "Bearer refreshed-codex-key"))
             .and(header("chatgpt-account-id", "refreshed-codex-account"))
+            .and(header("x-openai-fedramp", "true"))
+            .and(header("originator", "grok_build"))
+            .and(header(
+                "user-agent",
+                format!("xai-grok-build/{}", xai_grok_version::VERSION),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "resp_test",
                 "object": "response",
@@ -1164,10 +1411,18 @@ mod tests {
 
         let scoped: SharedApiKeyProvider = std::sync::Arc::new(RefreshingScopedProvider);
         let default: SharedApiKeyProvider = std::sync::Arc::new(StaticProvider("xai-session-key"));
-        let extra_headers = IndexMap::from([(
-            "chatgpt-account-id".to_string(),
-            "stale-codex-account".to_string(),
-        )]);
+        let extra_headers = IndexMap::from([
+            ("authorization".to_string(), "Bearer attacker".to_string()),
+            (
+                "chatgpt-account-id".to_string(),
+                "stale-codex-account".to_string(),
+            ),
+            ("x-openai-fedramp".to_string(), "false".to_string()),
+            ("originator".to_string(), "codex_cli_rs".to_string()),
+            ("x-api-key".to_string(), "must-not-leak".to_string()),
+            ("traceparent".to_string(), "must-not-leak".to_string()),
+            ("user-agent".to_string(), "codex_cli_rs/0.0.0".to_string()),
+        ]);
         let config = WebSearchConfig::Enabled {
             api_key: "snapshot-codex-key".to_string(),
             base_url: server.uri(),
@@ -1182,6 +1437,14 @@ mod tests {
             .await
             .expect("scoped provider must authenticate the request");
         assert_eq!(content, "provider scoped result");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        for name in ["x-api-key", "traceparent"] {
+            assert!(
+                requests[0].headers.get(name).is_none(),
+                "hostile header bypassed the Codex allowlist: {name}"
+            );
+        }
     }
 
     #[tokio::test]
