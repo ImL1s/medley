@@ -62,7 +62,22 @@ impl StateDirSource {
 
     /// True when the directory came from an environment override.
     pub fn from_env(self) -> bool {
-        matches!(self, Self::StateHomeEnv | Self::LegacyStateHomeEnv)
+        self.env_var().is_some()
+    }
+
+    /// The environment variable this directory came from, or `None` when it is
+    /// home-anchored.
+    ///
+    /// Display helpers label paths from this rather than from whether a
+    /// variable is *set*: an exported-but-empty `MEDLEY_HOME` is ignored by
+    /// resolution, and labelling paths `$MEDLEY_HOME/...` would point the user
+    /// at an empty location.
+    pub fn env_var(self) -> Option<&'static str> {
+        match self {
+            Self::StateHomeEnv => Some(STATE_HOME_ENV),
+            Self::LegacyStateHomeEnv => Some(LEGACY_STATE_HOME_ENV),
+            _ => None,
+        }
     }
 }
 
@@ -216,12 +231,23 @@ pub fn keep_legacy(legacy: &Path) -> std::io::Result<()> {
     )
 }
 
+/// Staging directory the copy builds in before it is renamed into place. Owned
+/// entirely by [`migrate_copy`], which clears any leftover before starting.
+const STAGING_DIR_NAME: &str = ".medley.incomplete";
+
 /// Recursively copy `legacy` into `target`, preserving permissions.
 ///
 /// File modes carry over (`auth.json` stays owner-only), symlinks are recreated
 /// rather than followed, and non-regular entries are skipped. `target` must not
 /// already exist — a migration never merges into a directory that may hold
 /// state from a different install.
+///
+/// The copy is built in a sibling staging directory and renamed into place, so
+/// `~/.medley` only ever appears complete. A half-copied one would be worse
+/// than no copy at all: the next startup would see it exist, resolve to it
+/// ahead of `~/.grok`, never offer the migration again, and silently run on
+/// truncated state. The rename makes that true even if the process is killed
+/// mid-copy, which removing the target on the error path alone cannot.
 pub fn migrate_copy(legacy: &Path, target: &Path) -> std::io::Result<MigrationStats> {
     if target.exists() {
         return Err(std::io::Error::new(
@@ -235,14 +261,33 @@ pub fn migrate_copy(legacy: &Path, target: &Path) -> std::io::Result<MigrationSt
             "refusing to copy a directory into itself",
         ));
     }
+    let parent = target.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} has no parent directory", target.display()),
+        )
+    })?;
+    let staging = parent.join(STAGING_DIR_NAME);
+    // A previous attempt that was killed mid-copy leaves this behind; it is
+    // never read by resolution, so clearing it here keeps retries self-healing.
+    let _ = std::fs::remove_dir_all(&staging);
+
     let mut stats = MigrationStats::default();
-    copy_dir(legacy, target, &mut stats)?;
-    Ok(stats)
+    let result = copy_dir(legacy, &staging, &mut stats).and_then(|()| {
+        // Same directory as the staging dir, so this is an atomic rename.
+        std::fs::rename(&staging, target)
+    });
+    match result {
+        Ok(()) => Ok(stats),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            Err(e)
+        }
+    }
 }
 
 fn copy_dir(from: &Path, to: &Path, stats: &mut MigrationStats) -> std::io::Result<()> {
     std::fs::create_dir_all(to)?;
-    copy_permissions(from, to)?;
     stats.dirs += 1;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
@@ -269,7 +314,10 @@ fn copy_dir(from: &Path, to: &Path, stats: &mut MigrationStats) -> std::io::Resu
             stats.skipped += 1;
         }
     }
-    Ok(())
+    // Last, not first: a source directory with a restrictive mode (say 0o500)
+    // would otherwise block writing its own children, and would also defeat the
+    // cleanup that removes a partial target.
+    copy_permissions(from, to)
 }
 
 fn copy_permissions(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -326,6 +374,26 @@ mod tests {
         let resolved = resolve_in(home.path(), None, Some(os("/legacy/state")));
         assert_eq!(resolved.path, PathBuf::from("/legacy/state"));
         assert_eq!(resolved.source, StateDirSource::LegacyStateHomeEnv);
+    }
+
+    #[test]
+    fn env_var_names_the_override_that_actually_won() {
+        let home = TempDir::new().unwrap();
+        assert_eq!(
+            resolve_in(home.path(), Some(os("/a")), Some(os("/b")))
+                .source
+                .env_var(),
+            Some(STATE_HOME_ENV)
+        );
+        // An exported-but-empty MEDLEY_HOME must not claim the label: the
+        // resolver ignored it and GROK_HOME is what points at the real dir.
+        assert_eq!(
+            resolve_in(home.path(), Some(os("  ")), Some(os("/b")))
+                .source
+                .env_var(),
+            Some(LEGACY_STATE_HOME_ENV)
+        );
+        assert_eq!(resolve_in(home.path(), None, None).source.env_var(), None);
     }
 
     #[test]
@@ -480,6 +548,93 @@ mod tests {
         let target = home.path().join(STATE_DIR_NAME);
         migrate_copy(&legacy, &target).unwrap();
         assert!(!target.join(KEEP_LEGACY_MARKER).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_copies_a_directory_whose_mode_forbids_writing() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = TempDir::new().unwrap();
+        let legacy = home.path().join(LEGACY_STATE_DIR_NAME);
+        let readonly = legacy.join("signed_policy");
+        std::fs::create_dir_all(&readonly).unwrap();
+        std::fs::write(readonly.join("policy.json"), b"{}").unwrap();
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let target = home.path().join(STATE_DIR_NAME);
+        let stats = migrate_copy(&legacy, &target).expect("a read-only source dir must still copy");
+        assert_eq!(stats.files, 1);
+        assert!(target.join("signed_policy").join("policy.json").exists());
+        let mode = std::fs::metadata(target.join("signed_policy"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o500, "the source mode must carry over");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_copy_leaves_no_partial_target() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = TempDir::new().unwrap();
+        let legacy = home.path().join(LEGACY_STATE_DIR_NAME);
+        let unreadable = legacy.join("locked");
+        std::fs::create_dir_all(&unreadable).unwrap();
+        std::fs::write(legacy.join("config.toml"), b"x = 1").unwrap();
+        std::fs::write(unreadable.join("inner.txt"), b"data").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // root ignores the mode bits, which would make this assert nothing.
+        let blocked = std::fs::read_dir(&unreadable).is_err();
+
+        let target = home.path().join(STATE_DIR_NAME);
+        let result = migrate_copy(&legacy, &target);
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        if !blocked {
+            return;
+        }
+        assert!(result.is_err(), "an unreadable subtree must fail the copy");
+        assert!(
+            !target.exists(),
+            "a half-copied state dir would be resolved as complete on the next start"
+        );
+        assert!(
+            !home.path().join(STAGING_DIR_NAME).exists(),
+            "the staging dir must not be left behind"
+        );
+        assert_eq!(
+            resolve_in(home.path(), None, None).source,
+            StateDirSource::LegacyMigrationPending,
+            "the migration must still be offerable after a failed attempt"
+        );
+    }
+
+    #[test]
+    fn a_leftover_staging_dir_does_not_block_a_retry() {
+        let home = TempDir::new().unwrap();
+        let legacy = home.path().join(LEGACY_STATE_DIR_NAME);
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("config.toml"), b"x = 1").unwrap();
+        // What a copy killed mid-flight leaves behind.
+        let stale = home.path().join(STAGING_DIR_NAME);
+        std::fs::create_dir_all(stale.join("sessions")).unwrap();
+        std::fs::write(stale.join("truncated.json"), b"partial").unwrap();
+
+        // A stale staging dir is not a state dir, so it must not affect
+        // resolution either.
+        assert_eq!(
+            resolve_in(home.path(), None, None).source,
+            StateDirSource::LegacyMigrationPending
+        );
+
+        let target = home.path().join(STATE_DIR_NAME);
+        migrate_copy(&legacy, &target).expect("retry succeeds over the leftover");
+        assert!(target.join("config.toml").exists());
+        assert!(
+            !target.join("truncated.json").exists(),
+            "the retry must not inherit the abandoned attempt's contents"
+        );
+        assert!(!stale.exists(), "the staging dir is consumed by the rename");
     }
 
     #[test]

@@ -2066,10 +2066,7 @@ fn apply_state_dir_migration(migration: &xai_grok_config::state_dir::Migration) 
         Ok(stats) => stats,
         Err(e) => {
             eprintln!("Couldn't copy to {target}: {e}");
-            eprintln!(
-                "Continuing with {} for now.",
-                migration.legacy.display().to_string()
-            );
+            eprintln!("Continuing with {} for now.", migration.legacy.display());
             eprintln!();
             return;
         }

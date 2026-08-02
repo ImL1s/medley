@@ -30,11 +30,15 @@ fn display_grok_home_prefix_for(home: &Path) -> String {
             None => "~".to_string(),
         };
     }
-    let env = if std::env::var_os(xai_grok_config::state_dir::STATE_HOME_ENV).is_some() {
-        xai_grok_config::state_dir::STATE_HOME_ENV
-    } else {
-        xai_grok_config::state_dir::LEGACY_STATE_HOME_ENV
-    };
+    // Named from the source that actually won, not from which variable is set:
+    // an exported-but-empty `MEDLEY_HOME` is ignored by resolution, so labelling
+    // paths `$MEDLEY_HOME/...` would send the user to an empty location. When
+    // `home` is an explicit path rather than the resolved one, no override is in
+    // play and the compatibility variable is the right thing to name.
+    let env = xai_grok_config::state_dir::resolve()
+        .source
+        .env_var()
+        .unwrap_or(xai_grok_config::state_dir::LEGACY_STATE_HOME_ENV);
     format!("${env}")
 }
 
@@ -438,11 +442,10 @@ mod tests {
     /// The label of whichever env override is live, matching
     /// `display_grok_home_prefix_for`'s non-default branch.
     fn expected_env_label() -> String {
-        let env = if std::env::var_os(xai_grok_config::state_dir::STATE_HOME_ENV).is_some() {
-            xai_grok_config::state_dir::STATE_HOME_ENV
-        } else {
-            xai_grok_config::state_dir::LEGACY_STATE_HOME_ENV
-        };
+        let env = xai_grok_config::state_dir::resolve()
+            .source
+            .env_var()
+            .unwrap_or(xai_grok_config::state_dir::LEGACY_STATE_HOME_ENV);
         format!("${env}")
     }
 
