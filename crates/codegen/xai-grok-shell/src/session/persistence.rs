@@ -305,6 +305,13 @@ pub enum PersistenceMsg {
     },
     /// Replace the entire chat history (used for compaction)
     ReplaceChatHistory(Vec<ConversationItem>),
+    /// Replace the entire chat history and acknowledge the actual storage
+    /// result. Atomic model switching uses this form so the rewritten system
+    /// prompt is durable before the model selection is committed.
+    ReplaceChatHistoryAndAck {
+        messages: Vec<ConversationItem>,
+        respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
+    },
     CurrentModel {
         model_id: acp::ModelId,
         /// The active agent definition name (e.g. `"grok-build"`).
@@ -312,6 +319,15 @@ pub enum PersistenceMsg {
         /// on the mutable model catalog.
         agent_name: Option<String>,
         reasoning_effort: Option<Option<ReasoningEffort>>,
+    },
+    /// Persist the current model/harness selection and acknowledge the actual
+    /// storage result. Model switching uses this commit-aware form so an I/O
+    /// failure cannot be reported as a successful in-memory switch.
+    CurrentModelAndAck {
+        model_id: acp::ModelId,
+        agent_name: Option<String>,
+        reasoning_effort: Option<Option<ReasoningEffort>>,
+        respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
     },
     PlanState(TodoState),
     /// Plan mode lifecycle state to persist
@@ -1962,6 +1978,16 @@ impl SessionPersistence {
                         tracing::warn!(?e, "failed to replace chat history");
                     }
                 }
+                PersistenceMsg::ReplaceChatHistoryAndAck {
+                    messages,
+                    respond_to,
+                } => {
+                    let result = self
+                        .storage
+                        .replace_chat_history(&self.info, &messages)
+                        .await;
+                    let _ = respond_to.send(result);
+                }
                 PersistenceMsg::CurrentModel {
                     model_id,
                     agent_name,
@@ -1982,6 +2008,28 @@ impl SessionPersistence {
                     if let Some(sync) = &self.remote_sync {
                         sync.set_model_id(model_id.0.to_string());
                     }
+                }
+                PersistenceMsg::CurrentModelAndAck {
+                    model_id,
+                    agent_name,
+                    reasoning_effort,
+                    respond_to,
+                } => {
+                    let result = self
+                        .storage
+                        .update_current_model_and_agent(
+                            &self.info,
+                            &model_id,
+                            agent_name.as_deref(),
+                            reasoning_effort,
+                        )
+                        .await;
+                    if result.is_ok()
+                        && let Some(sync) = &self.remote_sync
+                    {
+                        sync.set_model_id(model_id.0.to_string());
+                    }
+                    let _ = respond_to.send(result);
                 }
                 PersistenceMsg::PlanState(state) => {
                     if let Err(e) = self.storage.write_plan_state(&self.info, &state).await {

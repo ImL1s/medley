@@ -5,7 +5,7 @@ use super::modal::remove_agent_and_cleanup;
 use crate::acp::model_state::{EffortTokenError, ModelState};
 use crate::acp::tracker::AcpUpdateTracker;
 use crate::app::actions::{Action, Effect, SwitchModelError};
-use crate::app::agent::{AgentCommand, AgentId, AgentSession, AgentState};
+use crate::app::agent::{AgentCommand, AgentId, AgentSession, AgentState, ModelSwitchRollback};
 use crate::app::agent_view::{ActivePane, AgentView, McpInitProgress};
 use crate::app::app_view::{ActiveView, AppView, TrustState};
 use crate::app::dispatch::ctx::{
@@ -22,6 +22,7 @@ use crate::scrollback::block::RenderBlock;
 use crate::scrollback::blocks::SessionEvent;
 use crate::scrollback::state::ScrollbackState;
 use agent_client_protocol as acp;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use xai_grok_shell::sampling::types::ReasoningEffort;
 /// A deferred model switch to apply once the session exists, plus any effort
@@ -32,6 +33,32 @@ use xai_grok_shell::sampling::types::ReasoningEffort;
 pub(crate) struct DeferredSwitchOutcome {
     pub switch: Option<(acp::ModelId, Option<ReasoningEffort>)>,
     pub effort_error: Option<EffortTokenError>,
+}
+
+static NEXT_MODEL_SWITCH_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Open the pager-side transaction for one model switch. Only one request may
+/// be in flight per session; callers must leave the UI untouched when this
+/// returns `None`.
+pub(crate) fn begin_model_switch_request(
+    session: &mut AgentSession,
+    app_models: &ModelState,
+) -> Option<u64> {
+    if session.model_switch_pending {
+        return None;
+    }
+    let request_id = NEXT_MODEL_SWITCH_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    session.model_switch_pending = true;
+    session.model_switch_request_id = Some(request_id);
+    session
+        .model_switch_rollback
+        .get_or_insert_with(|| ModelSwitchRollback {
+            session_model_id: session.models.current.clone(),
+            session_reasoning_effort: session.models.reasoning_effort,
+            app_model_id: app_models.current.clone(),
+            app_reasoning_effort: app_models.reasoning_effort,
+        });
+    Some(request_id)
 }
 /// Resolve the stashed `-m` switch and/or `cli_effort_token` against the session
 /// catalog via [`ModelState::resolve_effort_for_model`] (same gate-first policy
@@ -94,7 +121,11 @@ pub(crate) fn apply_deferred_model_switch(
 ) -> Option<(acp::ModelId, Option<ReasoningEffort>)> {
     let stashed = agent.session.deferred_model_switch.take();
     let outcome = take_deferred_model_switch(stashed, &agent.session.models, cli_effort_token);
-    apply_deferred_switch_outcome(agent, outcome)
+    let applied = apply_deferred_switch_outcome(agent, outcome);
+    if applied.is_none() {
+        agent.session.model_switch_rollback = None;
+    }
+    applied
 }
 /// Surface effort-token errors and return the model/effort switch (if any).
 pub(crate) fn apply_deferred_switch_outcome(
@@ -443,6 +474,9 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
             available_commands_generation: 1,
             available_tools: None,
             model_switch_pending: false,
+            model_switch_request_id: None,
+            model_switch_rollback: None,
+            model_switch_queue_handoff_from: None,
             user_model_preference: None,
             deferred_model_switch: app.deferred_model_switch_from_cli(),
             bg_tasks: std::collections::BTreeMap::new(),
@@ -933,6 +967,9 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
             available_commands_generation: 1,
             available_tools: None,
             model_switch_pending: false,
+            model_switch_request_id: None,
+            model_switch_rollback: None,
+            model_switch_queue_handoff_from: None,
             user_model_preference: None,
             deferred_model_switch: app.deferred_model_switch_from_cli(),
             bg_tasks: std::collections::BTreeMap::new(),
@@ -1154,6 +1191,10 @@ pub(in crate::app::dispatch) fn handle_session_created(
             )));
         }
         agent.bind_session_id(session_id);
+        // The replacement is now a real session. From here onward its queue
+        // belongs to it; a later close must not restore already-adopted work to
+        // the incompatible source session.
+        agent.session.model_switch_queue_handoff_from = None;
         agent.scheduler_background_loops = scheduler_background_loops;
         if let Some(m) = new_models {
             app.models = Some(m).into();
@@ -1162,9 +1203,9 @@ pub(in crate::app::dispatch) fn handle_session_created(
         let deferred = apply_deferred_model_switch(agent, app.cli_effort_token.as_deref());
         let deferred_mode = agent.deferred_session_mode.take();
         let cwd = agent.session.cwd.clone();
-        if deferred.is_some() {
-            agent.session.model_switch_pending = true;
-        }
+        let deferred_request_id = deferred
+            .as_ref()
+            .and_then(|_| begin_model_switch_request(&mut agent.session, &app.models));
         let mut drain = if app.reconnect_pending {
             QueueDrain {
                 effects: vec![],
@@ -1202,12 +1243,15 @@ pub(in crate::app::dispatch) fn handle_session_created(
             agent_id,
             silent: true,
         });
-        if let Some((model_id, effort)) = deferred {
+        if let Some((model_id, effort)) = deferred
+            && let Some(request_id) = deferred_request_id
+        {
             effects.push(Effect::SwitchModel {
                 agent_id,
                 session_id: session_id_clone.clone(),
                 model_id,
                 effort,
+                request_id,
                 prev_model_id: None,
             });
         }
@@ -1265,9 +1309,9 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
         let deferred = apply_deferred_model_switch(agent, app.cli_effort_token.as_deref());
         let deferred_mode = agent.deferred_session_mode.take();
         let cwd = agent.session.cwd.clone();
-        if deferred.is_some() {
-            agent.session.model_switch_pending = true;
-        }
+        let deferred_request_id = deferred
+            .as_ref()
+            .and_then(|_| begin_model_switch_request(&mut agent.session, &app.models));
         let mut drain = if app.reconnect_pending {
             QueueDrain {
                 effects: vec![],
@@ -1305,12 +1349,15 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
             agent_id,
             silent: true,
         });
-        if let Some((model_id, effort)) = deferred {
+        if let Some((model_id, effort)) = deferred
+            && let Some(request_id) = deferred_request_id
+        {
             effects.push(Effect::SwitchModel {
                 agent_id,
                 session_id: session_id_clone.clone(),
                 model_id,
                 effort,
+                request_id,
                 prev_model_id: None,
             });
         }
@@ -1455,16 +1502,58 @@ pub(in crate::app::dispatch) fn handle_worktree_session_failed(
     }
     vec![]
 }
+fn restore_model_switch_mirrors(
+    agent: &mut AgentView,
+    app_models: &mut ModelState,
+    rollback: Option<&ModelSwitchRollback>,
+    fallback_model_id: Option<&acp::ModelId>,
+) {
+    if let Some(rollback) = rollback {
+        agent.session.models.current = rollback.session_model_id.clone();
+        agent.session.models.reasoning_effort = rollback.session_reasoning_effort;
+        app_models.current = rollback.app_model_id.clone();
+        app_models.reasoning_effort = rollback.app_reasoning_effort;
+        return;
+    }
+    if let Some(previous) = fallback_model_id {
+        agent.session.models.set_current(previous.clone(), None);
+        if app_models.available.contains_key(previous) {
+            app_models.set_current(previous.clone(), None);
+        }
+    }
+}
+
 pub(in crate::app::dispatch) fn handle_switch_model_complete(
     app: &mut AppView,
     agent_id: AgentId,
     model_id: acp::ModelId,
     effort: Option<ReasoningEffort>,
+    request_id: u64,
     result: Result<(), SwitchModelError>,
     prev_model_id: Option<acp::ModelId>,
 ) -> Vec<Effect> {
     if let Some(agent) = app.agents.get_mut(&agent_id) {
+        if !agent.session.model_switch_pending {
+            tracing::debug!(
+                agent = ?agent_id,
+                request_id,
+                "ignoring model-switch completion after its transaction closed"
+            );
+            return vec![];
+        }
+        if agent.session.model_switch_request_id != Some(request_id) {
+            tracing::debug!(
+                agent = ?agent_id,
+                request_id,
+                expected = ?agent.session.model_switch_request_id,
+                "ignoring stale model-switch completion"
+            );
+            return vec![];
+        }
+
         agent.session.model_switch_pending = false;
+        agent.session.model_switch_request_id = None;
+        let rollback = agent.session.model_switch_rollback.take();
         let mut effects = match result {
             Ok(()) => {
                 agent.session.user_model_preference = Some(model_id.clone());
@@ -1486,12 +1575,29 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                         )
                     })
                     .unwrap_or_default();
-                let prev_model = agent.session.models.current.clone();
-                let prev_effort = agent.session.models.reasoning_effort;
+                let live_prev_model = agent.session.models.current.clone();
+                let live_prev_effort = agent.session.models.reasoning_effort;
                 agent.session.models.set_current(model_id.clone(), effort);
+                if app.models.available.contains_key(&model_id) {
+                    app.models.set_current(model_id.clone(), effort);
+                }
                 let resolved_effort = agent.session.models.reasoning_effort;
-                let unchanged =
-                    prev_model.as_ref() == Some(&model_id) && prev_effort == resolved_effort;
+                // A default-model selection updates both pager mirrors before the ACP
+                // request starts. Prefer its receipt/snapshot over that optimistic
+                // live value when deciding whether to persist and notify.
+                let model_changed = prev_model_id.as_ref().map_or_else(
+                    || {
+                        rollback.as_ref().map_or_else(
+                            || live_prev_model.as_ref() != Some(&model_id),
+                            |snapshot| snapshot.session_model_id.as_ref() != Some(&model_id),
+                        )
+                    },
+                    |previous| previous != &model_id,
+                );
+                let previous_effort = rollback.as_ref().map_or(live_prev_effort, |snapshot| {
+                    snapshot.session_reasoning_effort
+                });
+                let unchanged = !model_changed && previous_effort == resolved_effort;
                 if !unchanged {
                     let msg = if let Some(eff) = resolved_effort {
                         format!("Switched to {display_name} ({eff} effort)")
@@ -1521,13 +1627,12 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                 prev_model_id: error_prev,
                 ..
             }) => {
-                let rollback = error_prev.as_ref().or(prev_model_id.as_ref()).cloned();
-                if let Some(ref prev) = rollback {
-                    agent.session.models.set_current(prev.clone(), None);
-                    if app.models.available.contains_key(prev) {
-                        app.models.set_current(prev.clone(), None);
-                    }
-                }
+                let fallback = error_prev.as_ref().or(prev_model_id.as_ref());
+                restore_model_switch_mirrors(agent, &mut app.models, rollback.as_ref(), fallback);
+                // The decision modal is still part of this transaction. Keep
+                // the queue gated until the user either declines (drain here)
+                // or accepts (handoff to the replacement placeholder).
+                agent.session.model_switch_pending = true;
                 agent.active_modal = None;
                 let display_name = agent.session.models.display_name_for(&model_id);
                 return open_agent_type_mismatch_question(app, model_id, effort, &display_name);
@@ -1536,21 +1641,22 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                 error,
                 prev_model_id: error_prev,
             }) => {
-                let rollback = error_prev.as_ref().or(prev_model_id.as_ref()).cloned();
+                let fallback = error_prev.as_ref().or(prev_model_id.as_ref());
                 let message = format!(
                     "Couldn't switch to model '{}': required harness '{}' is unavailable ({}).",
                     error.model_id, error.required_agent_type, error.reason,
                 );
                 agent.scrollback.push_block(RenderBlock::system(message));
-                if let Some(ref prev) = rollback {
-                    agent.session.models.set_current(prev.clone(), None);
-                    if app.models.available.contains_key(prev) {
-                        app.models.set_current(prev.clone(), None);
-                    }
-                }
+                restore_model_switch_mirrors(agent, &mut app.models, rollback.as_ref(), fallback);
                 vec![]
             }
             Err(SwitchModelError::Other(msg)) => {
+                restore_model_switch_mirrors(
+                    agent,
+                    &mut app.models,
+                    rollback.as_ref(),
+                    prev_model_id.as_ref(),
+                );
                 agent
                     .scrollback
                     .push_block(RenderBlock::system(format!("Couldn't switch model: {msg}")));
@@ -1571,11 +1677,23 @@ pub(in crate::app::dispatch) fn dispatch_agent_type_mismatch_answered(
     model_id: acp::ModelId,
     effort: Option<ReasoningEffort>,
 ) -> Vec<Effect> {
+    let ActiveView::Agent(source_id) = app.active_view else {
+        return vec![];
+    };
+    let Some(source) = app.agents.get_mut(&source_id) else {
+        return vec![];
+    };
+    source.session.model_switch_pending = false;
+    source.session.model_switch_request_id = None;
+
     if start_new {
-        let effects = dispatch_new_session_inner(app, Some(model_id.clone()));
-        if let ActiveView::Agent(new_aid) = app.active_view
-            && let Some(agent) = app.agents.get_mut(&new_aid)
-        {
+        let handed_off = std::mem::take(&mut source.session.pending_prompts);
+        let (new_aid, effects) = dispatch_new_session_inner_with_id(app, Some(model_id.clone()));
+        if let Some(agent) = app.agents.get_mut(&new_aid) {
+            if !handed_off.is_empty() {
+                agent.session.replace_pending_prompts(handed_off);
+                agent.session.model_switch_queue_handoff_from = Some(source_id);
+            }
             agent.session.models.set_current(model_id.clone(), effort);
             if effort.is_some() {
                 agent.session.deferred_model_switch = Some((model_id, effort));
@@ -1583,7 +1701,13 @@ pub(in crate::app::dispatch) fn dispatch_agent_type_mismatch_answered(
         }
         effects
     } else {
-        vec![]
+        let agent = app
+            .agents
+            .get_mut(&source_id)
+            .expect("source agent checked above");
+        let drain = maybe_drain_queue(agent);
+        note_peek_page_flip(app, source_id, drain.page_flip_entry);
+        drain.effects
     }
 }
 
@@ -1619,12 +1743,16 @@ pub(in crate::app::dispatch) fn dispatch_auth_class_switch_answered(
         agent.session.deferred_model_switch = Some((model_id, effort));
         return vec![];
     };
-    agent.session.model_switch_pending = true;
+    let Some(request_id) = begin_model_switch_request(&mut agent.session, &app.models) else {
+        app.show_toast("Wait for the current model switch to finish");
+        return vec![];
+    };
     vec![Effect::SwitchModel {
         agent_id: id,
         session_id,
         model_id,
         effort,
+        request_id,
         prev_model_id: None,
     }]
 }

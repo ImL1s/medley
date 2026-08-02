@@ -1065,22 +1065,67 @@ pub(crate) fn agent_name_after_model_switch(
 }
 /// Harness compatibility for zero-turn / mid-turn model switching.
 ///
-/// Exact identities are always compatible. Differing definitions are only
-/// interchangeable when both are structurally stock. A missing required
-/// definition is deliberately incompatible: unknown/custom names must never
-/// inherit the active harness merely because the name-based strict predicate
-/// cannot classify them.
+/// Exact built-in identities are always compatible. Differing definitions are
+/// only interchangeable when both are structurally stock built-ins. Plugin and
+/// file-backed definitions additionally require the same owning namespace and
+/// source path, because their Markdown prompt body is not part of structural
+/// strict-harness classification. A missing required definition is deliberately
+/// incompatible: unknown/custom names must never inherit the active harness.
 pub(crate) fn harnesses_are_compatible(
     active: &xai_grok_agent::AgentDefinition,
     required_agent_type: &str,
     required: Option<&xai_grok_agent::AgentDefinition>,
 ) -> bool {
-    if active.name == required_agent_type {
+    let Some(required) = required else {
+        return active.name == required_agent_type
+            && active.plugin_name.is_none()
+            && active.source_path.is_none()
+            && active.prompt_body.is_none();
+    };
+
+    // Plugin and file-backed definitions carry prompt identity outside the
+    // structural strict-harness fields. Bare and qualified plugin lookups are
+    // compatible when they resolve to the same owning plugin/file, but two
+    // plugins (or two custom prompt files) with the same agent name are not.
+    let has_external_identity = active.plugin_name.is_some()
+        || required.plugin_name.is_some()
+        || active.source_path.is_some()
+        || required.source_path.is_some()
+        || active.prompt_body.is_some()
+        || required.prompt_body.is_some();
+    if has_external_identity || active.is_strict_harness() || required.is_strict_harness() {
+        return definitions_have_same_runtime_contract(active, required);
+    }
+
+    if active.name == required.name {
         return true;
     }
-    required.is_some_and(|required| {
-        !active.is_strict_harness() && !required.is_strict_harness()
-    })
+
+    !active.is_strict_harness() && !required.is_strict_harness()
+}
+
+fn definitions_have_same_runtime_contract(
+    active: &xai_grok_agent::AgentDefinition,
+    required: &xai_grok_agent::AgentDefinition,
+) -> bool {
+    if active.plugin_name != required.plugin_name
+        || active.source_path != required.source_path
+        || active.prompt_body != required.prompt_body
+        || active.system_prompt != required.system_prompt
+        || active.allowed_subagent_types != required.allowed_subagent_types
+        || active.session_tools_allowlist != required.session_tools_allowlist
+        || active.session_tools_denylist != required.session_tools_denylist
+        || active.scope != required.scope
+    {
+        return false;
+    }
+    match (
+        serde_json::to_value(active),
+        serde_json::to_value(required),
+    ) {
+        (Ok(active), Ok(required)) => active == required,
+        _ => false,
+    }
 }
 /// Read a string field from `session_meta` first, falling back to
 /// `init_meta`. The session path bypasses the `initialize_request`

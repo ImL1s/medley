@@ -10,7 +10,16 @@ use crate::app::dispatch::task_result::unregister_session_effect;
 /// Remove an agent and clean up all references to it:
 /// `forked_from` pointers on surviving agents.
 pub(in crate::app::dispatch) fn remove_agent_and_cleanup(app: &mut AppView, agent_id: AgentId) {
-    let removed = app.agents.shift_remove(&agent_id);
+    let mut removed = app.agents.shift_remove(&agent_id);
+    if let Some(removed) = removed.as_mut()
+        && let Some(source_id) = removed.session.model_switch_queue_handoff_from.take()
+        && let Some(source) = app.agents.get_mut(&source_id)
+    {
+        let handed_off = std::mem::take(&mut removed.session.pending_prompts);
+        source.session.prepend_pending_prompts(handed_off);
+        source.session.model_switch_pending = false;
+        source.session.model_switch_request_id = None;
+    }
     for agent in app.agents.values_mut() {
         if agent.session.forked_from == Some(agent_id) {
             agent.session.forked_from = None;

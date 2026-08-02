@@ -701,6 +701,17 @@ pub struct AgentSession {
     /// `SwitchModelComplete`, or by `begin_session_reload` when a reconnect
     /// drops the in-flight RPC — else a lost completion jams the queue forever.
     pub model_switch_pending: bool,
+    /// Correlates the one in-flight switch with its async completion. A stale
+    /// completion must not commit or roll back a newer request.
+    pub model_switch_request_id: Option<u64>,
+    /// Exact pager mirrors captured before the in-flight switch. Every failure
+    /// class restores this snapshot; success discards it.
+    pub model_switch_rollback: Option<ModelSwitchRollback>,
+    /// Source session for prompts temporarily moved into a replacement-session
+    /// placeholder after an incompatible model/harness switch. Cleared once
+    /// session creation succeeds; if the placeholder is removed first, its
+    /// queue is restored to this source instead of being lost.
+    pub model_switch_queue_handoff_from: Option<AgentId>,
     /// Model the user chose this session via `/model` / the model picker, or
     /// the last successfully applied live remote `ModelChanged` (leader-mode
     /// fan-out). Survives reconnect (`begin_session_reload` does **not** clear
@@ -742,6 +753,14 @@ pub struct AgentSession {
     /// the `/dashboard` discoverability tip. `false` for sessions created
     /// by `/resume`, welcome-screen picker, `/fork`, or worktree flows.
     pub created_via_new: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelSwitchRollback {
+    pub session_model_id: Option<acp::ModelId>,
+    pub session_reasoning_effort: Option<ReasoningEffort>,
+    pub app_model_id: Option<acp::ModelId>,
+    pub app_reasoning_effort: Option<ReasoningEffort>,
 }
 /// Captured state for a prompt that has been sent but not yet acknowledged
 /// by any server activity. See `AgentSession::in_flight_prompt`.
@@ -1047,6 +1066,21 @@ impl AgentSession {
     pub fn queue_len(&self) -> usize {
         self.pending_prompts.len()
     }
+    /// Replace the queue with entries adopted from another session and assign
+    /// fresh, contiguous IDs in their preserved display/send order.
+    pub(crate) fn replace_pending_prompts(&mut self, mut prompts: VecDeque<QueuedPrompt>) {
+        for (index, prompt) in prompts.iter_mut().enumerate() {
+            prompt.id = index as u64;
+        }
+        self.next_queue_id = prompts.len() as u64;
+        self.pending_prompts = prompts;
+    }
+    /// Restore handed-off entries ahead of prompts queued on this session
+    /// after the handoff. Both groups retain their internal order.
+    pub(crate) fn prepend_pending_prompts(&mut self, mut prompts: VecDeque<QueuedPrompt>) {
+        prompts.append(&mut self.pending_prompts);
+        self.replace_pending_prompts(prompts);
+    }
     /// Find the 0-based positional index of a prompt by its stable ID.
     pub fn queue_position(&self, id: u64) -> Option<usize> {
         self.pending_prompts.iter().position(|p| p.id == id)
@@ -1099,6 +1133,9 @@ mod tests {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            model_switch_request_id: None,
+            model_switch_rollback: None,
+            model_switch_queue_handoff_from: None,
             user_model_preference: None,
             deferred_model_switch: None,
             bg_tasks: BTreeMap::new(),

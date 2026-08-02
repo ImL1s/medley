@@ -939,6 +939,7 @@ fn deferred_model_switch_applied_on_session_created() {
     let id = AgentId(0);
     let model_id = acp::ModelId::new(std::sync::Arc::from("grok-4.5"));
     let session_id: acp::SessionId = "new-session".into();
+    insert_ready_model(&mut app, id, &model_id);
     app.agents.get_mut(&id).unwrap().session.session_id = None;
     app.agents
         .get_mut(&id)
@@ -965,6 +966,144 @@ fn deferred_model_switch_applied_on_session_created() {
             .. } if *a_id == id && *s_id == session_id && *m_id == model_id
     )));
 }
+
+#[test]
+fn rapid_no_session_model_choices_coalesce_and_keep_original_rollback() {
+    use super::super::super::settings::setters::set_default_model_confirmed;
+
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let model_a = acp::ModelId::new("model-a");
+    let model_b = acp::ModelId::new("model-b");
+    let model_c = acp::ModelId::new("model-c");
+    let infos = [&model_a, &model_b, &model_c]
+        .into_iter()
+        .map(|model| acp::ModelInfo::new(model.clone(), model.0.to_string()))
+        .collect::<Vec<_>>();
+    for info in &infos {
+        app.models
+            .available
+            .insert(info.model_id.clone(), info.clone());
+        app.agents[&id]
+            .session
+            .models
+            .available
+            .insert(info.model_id.clone(), info.clone());
+    }
+    app.models.set_current(model_a.clone(), None);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.models.set_current(model_a.clone(), None);
+        agent.session.session_id = None;
+    }
+
+    assert!(set_default_model_confirmed(&mut app, model_b).is_empty());
+    assert!(set_default_model_confirmed(&mut app, model_c.clone()).is_empty());
+    let rollback = app.agents[&id]
+        .session
+        .model_switch_rollback
+        .as_ref()
+        .expect("first selection captures rollback");
+    assert_eq!(rollback.session_model_id.as_ref(), Some(&model_a));
+    assert_eq!(rollback.app_model_id.as_ref(), Some(&model_a));
+    assert_eq!(
+        app.agents[&id].session.deferred_model_switch,
+        Some((model_c.clone(), None)),
+    );
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SessionCreated {
+            agent_id: id,
+            session_id: acp::SessionId::new("new-session"),
+            models: Some(acp::SessionModelState::new(model_a.clone(), infos)),
+            scheduler_background_loops: None,
+        }),
+        &mut app,
+    );
+    let request_id = switch_model_request_id(&effects);
+    assert_eq!(app.models.current.as_ref(), Some(&model_a));
+    assert_eq!(
+        app.agents[&id].session.models.current.as_ref(),
+        Some(&model_a)
+    );
+
+    dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id: id,
+            model_id: model_c.clone(),
+            effort: None,
+            request_id,
+            result: Ok(()),
+            prev_model_id: None,
+        }),
+        &mut app,
+    );
+    assert_eq!(app.models.current.as_ref(), Some(&model_c));
+    assert_eq!(
+        app.agents[&id].session.models.current.as_ref(),
+        Some(&model_c)
+    );
+}
+
+#[test]
+fn rapid_no_session_model_choice_failure_restores_original_model() {
+    use super::super::super::settings::setters::set_default_model_confirmed;
+
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let model_a = acp::ModelId::new("failure-a");
+    let model_b = acp::ModelId::new("failure-b");
+    let model_c = acp::ModelId::new("failure-c");
+    let infos = [&model_a, &model_b, &model_c]
+        .into_iter()
+        .map(|model| acp::ModelInfo::new(model.clone(), model.0.to_string()))
+        .collect::<Vec<_>>();
+    for info in &infos {
+        app.models
+            .available
+            .insert(info.model_id.clone(), info.clone());
+        app.agents[&id]
+            .session
+            .models
+            .available
+            .insert(info.model_id.clone(), info.clone());
+    }
+    app.models.set_current(model_a.clone(), None);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.models.set_current(model_a.clone(), None);
+        agent.session.session_id = None;
+    }
+    set_default_model_confirmed(&mut app, model_b);
+    set_default_model_confirmed(&mut app, model_c.clone());
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SessionCreated {
+            agent_id: id,
+            session_id: acp::SessionId::new("failed-session"),
+            models: Some(acp::SessionModelState::new(model_a.clone(), infos)),
+            scheduler_background_loops: None,
+        }),
+        &mut app,
+    );
+    let request_id = switch_model_request_id(&effects);
+    dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id: id,
+            model_id: model_c,
+            effort: None,
+            request_id,
+            result: Err(SwitchModelError::Other("rejected".into())),
+            prev_model_id: None,
+        }),
+        &mut app,
+    );
+    assert_eq!(app.models.current.as_ref(), Some(&model_a));
+    assert_eq!(
+        app.agents[&id].session.models.current.as_ref(),
+        Some(&model_a)
+    );
+}
 #[test]
 fn deferred_model_switch_applied_on_worktree_session_created() {
     let mut app = test_app_git();
@@ -978,6 +1117,7 @@ fn deferred_model_switch_applied_on_worktree_session_created() {
         &mut app,
     );
     let id = AgentId(0);
+    insert_ready_model(&mut app, id, &model_id);
     app.agents
         .get_mut(&id)
         .unwrap()

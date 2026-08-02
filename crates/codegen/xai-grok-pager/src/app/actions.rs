@@ -1600,10 +1600,13 @@ pub enum Effect {
         session_id: acp::SessionId,
         model_id: acp::ModelId,
         effort: Option<ReasoningEffort>,
+        /// Correlates this RPC with the pager's active switch transaction.
+        request_id: u64,
         /// The model that was active before the optimistic UI update
         /// in `set_default_model`. `None` for `Action::SwitchModel`
         /// (no optimistic update). Threaded through to
-        /// `SwitchModelComplete` so `IncompatibleAgent` can roll back.
+        /// `SwitchModelComplete` as a compatibility fallback; the pager's
+        /// transaction snapshot handles exact rollback for every error class.
         prev_model_id: Option<acp::ModelId>,
     },
     /// Fetch changelog from CDN (both markdown + structured JSON).
@@ -2436,9 +2439,12 @@ pub enum TaskResult {
         agent_id: AgentId,
         model_id: acp::ModelId,
         effort: Option<ReasoningEffort>,
+        /// Forwarded from `Effect::SwitchModel.request_id` so stale async
+        /// completions cannot mutate a newer selection.
+        request_id: u64,
         result: Result<(), SwitchModelError>,
-        /// Forwarded from `Effect::SwitchModel.prev_model_id` for
-        /// rollback on `IncompatibleAgent`.
+        /// Forwarded from `Effect::SwitchModel.prev_model_id` as a fallback
+        /// when applying completions created by older/test-only call paths.
         prev_model_id: Option<acp::ModelId>,
     },
     /// Changelog fetched from CDN (both formats).

@@ -1691,6 +1691,7 @@ pub(crate) fn execute(
             session_id,
             model_id,
             effort,
+            request_id,
             prev_model_id,
         } => {
             let tx = acp_tx.clone();
@@ -1740,6 +1741,7 @@ pub(crate) fn execute(
                         agent_id,
                         model_id,
                         effort,
+                        request_id,
                         result,
                         prev_model_id,
                     }

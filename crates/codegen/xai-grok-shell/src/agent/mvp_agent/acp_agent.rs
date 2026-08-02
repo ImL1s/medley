@@ -1130,6 +1130,7 @@ impl acp::Agent for MvpAgent {
         let mut session_sampling_override: Option<SamplingConfig> = None;
         let mut disallowed_custom: Option<String> = None;
         let mut unreadiness_custom: Option<(String, String)> = None;
+        let fallback_model_id = self.models_manager.current_model_id();
         let session_initial_model = chat_initial_model(is_chat_kind, custom_model_id);
         let build_custom_model_id = if is_chat_kind { None } else { custom_model_id };
         let campaign_nudge = if is_chat_kind {
@@ -1191,24 +1192,21 @@ impl acp::Agent for MvpAgent {
                 Err(_) => {
                     tracing::warn!(
                         requested_model = custom_model,
-                        fallback_model = %self.models_manager.current_model_id().0,
+                        fallback_model = %fallback_model_id.0,
                         "Requested model not found, falling back to current default model"
                     );
                     None
                 }
             });
-        if model_agent_type.is_none() && custom_model_id.is_none()
-            && let Ok(default_model) = self
-                .resolve_model_id(&self.models_manager.current_model_id())
+        if model_agent_type.is_none()
+            && !is_chat_kind
+            && let Ok(default_model) = self.resolve_model_id(&fallback_model_id)
         {
+            // Unknown, disallowed, and unready explicit models all fall back
+            // to this exact captured default model below. Carry its harness
+            // identity through the same pre-spawn prerequisite check instead
+            // of silently spawning the fallback with an unrelated profile.
             model_agent_type = Some(default_model.info().agent_type.clone());
-        } else if model_agent_type.is_none() && custom_model_id.is_some() {
-            tracing::debug!(
-                custom_model = ?custom_model_id,
-                current_model_id = %self.models_manager.current_model_id().0,
-                "Skipping current_model_id agent_type fallback: custom model was requested, \
-                 avoiding cross-client agent_type contamination in leader mode"
-            );
         }
         // A model-declared harness is a prerequisite, not a best-effort hint.
         // Resolve it only after both explicit and default-model paths have
@@ -1226,15 +1224,12 @@ impl acp::Agent for MvpAgent {
                     plugin_registry.as_deref(),
                 )
             };
-            let required_definition = (selected_agent.name != required_agent_type)
-                .then(|| {
-                    xai_grok_agent::discovery::by_name_in_cwd_with_plugins(
+            let required_definition =
+                xai_grok_agent::discovery::by_name_in_cwd_with_plugins(
                     required_agent_type,
                     cwd.as_path(),
                     plugin_registry.as_deref(),
-                )
-                })
-                .flatten();
+                );
             if !harnesses_are_compatible(
                 &selected_agent,
                 required_agent_type,
@@ -1242,7 +1237,7 @@ impl acp::Agent for MvpAgent {
             ) {
                 let requested_model = resolved_custom_model
                     .map(str::to_owned)
-                    .unwrap_or_else(|| self.models_manager.current_model_id().0.to_string());
+                    .unwrap_or_else(|| fallback_model_id.0.to_string());
                 return Err(crate::agent::config::ModelSwitchHarnessError {
                     code: crate::agent::config::MODEL_SWITCH_REBUILD_FAILED.to_owned(),
                     active_agent_type: selected_agent.name,
@@ -1262,7 +1257,7 @@ impl acp::Agent for MvpAgent {
             .unwrap_or_else(|| {
                 self
                     .resolve_sampling_config_for_model(
-                        &self.models_manager.current_model_id(),
+                        &fallback_model_id,
                         origin_client.clone(),
                     )
             });
@@ -1293,7 +1288,7 @@ impl acp::Agent for MvpAgent {
             None => {
                 resolved_custom_model
                     .map(acp::ModelId::new)
-                    .unwrap_or_else(|| self.models_manager.current_model_id())
+                    .unwrap_or_else(|| fallback_model_id.clone())
             }
         };
         let session_model_id = model_id.clone();
@@ -2036,6 +2031,69 @@ impl acp::Agent for MvpAgent {
                     );
                     latch_persisted_unready = true;
                 }
+            }
+
+            // The fallback selection above is not authorization to use a
+            // mismatched harness. Validate the exact definition before
+            // transferring persistence into an actor or registering session
+            // state. Preserve the existing unavailable-model latch when the
+            // catalog is absent or no ready fallback exists: prompts remain
+            // blocked until the later restore path can validate a ready model.
+            let plugin_registry = self.plugin_registry_handle.snapshot();
+            let active_definition = {
+                let cfg = self.cfg.borrow();
+                Self::resolve_agent_definition_with_plugins(
+                    cwd.as_path(),
+                    cfg.agent_profile_path.as_deref(),
+                    &cfg.agent,
+                    None,
+                    persisted_agent_name.as_deref(),
+                    plugin_registry.as_deref(),
+                )
+            };
+            let required_agent_type = match self.resolve_model_id(&spawn_model_id) {
+                Ok(spawn_model) => {
+                    let (ready, reason) = crate::agent::config::model_readiness(&spawn_model);
+                    if !ready && !latch_persisted_unready {
+                        return Err(acp::Error::invalid_params().data(reason.unwrap_or_else(|| {
+                            format!("load_session model '{}' is not ready", spawn_model_id.0)
+                        })));
+                    }
+                    spawn_model.info().agent_type.clone()
+                }
+                Err(_) if latch_persisted_unready => persisted_agent_name
+                    .clone()
+                    .unwrap_or_else(|| active_definition.name.clone()),
+                Err(_) => {
+                    return Err(acp::Error::invalid_params().data(format!(
+                        "load_session model '{}' is not present in the catalog",
+                        spawn_model_id.0
+                    )));
+                }
+            };
+            let required_definition =
+                xai_grok_agent::discovery::by_name_in_cwd_with_plugins(
+                    &required_agent_type,
+                    cwd.as_path(),
+                    plugin_registry.as_deref(),
+                );
+            if !harnesses_are_compatible(
+                &active_definition,
+                &required_agent_type,
+                required_definition.as_ref(),
+            ) {
+                return Err(crate::agent::config::ModelSwitchHarnessError {
+                    code: crate::agent::config::MODEL_SWITCH_REBUILD_FAILED.to_owned(),
+                    active_agent_type: active_definition.name,
+                    required_agent_type,
+                    model_id: spawn_model_id.0.to_string(),
+                    reason: if required_definition.is_some() {
+                        "incompatible_agent".to_owned()
+                    } else {
+                        "agent_definition_unresolved".to_owned()
+                    },
+                }
+                .into_acp_error());
             }
             self.spawn_and_register_session(
                     init,

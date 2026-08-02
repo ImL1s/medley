@@ -3993,8 +3993,9 @@ impl MvpAgent {
     /// 6. Built-in default agent.
     ///
     /// `GROK_AGENT` and an explicit `[agent] name` bypass step 1.
-    /// Strict-harness classification is structural — see
-    /// [`xai_grok_agent::config::is_strict_harness_agent_type`].
+    /// A model-selected definition wins when its runtime identity is exact:
+    /// either its wire harness is structurally strict, or it is backed by a
+    /// plugin/custom definition whose source and prompt must be preserved.
     ///
     /// Harness inheritance for a profile that pins its own model is applied by
     /// the caller via [`inherited_harness_template`], not here.
@@ -4030,16 +4031,19 @@ impl MvpAgent {
         let config_agent_explicitly_set = agent_config.name.is_some();
         // Resolve the concrete definition before classifying it. Name-only
         // classification deliberately treats unknown names as non-strict, but
-        // a project/user custom harness may still carry a bespoke prompt,
-        // wire template, or curated toolset.
+        // plugin/project/user definitions still have an exact runtime identity
+        // even when their wire template and toolset are structurally stock.
         let model_agent_definition = model_agent_type.and_then(|required| {
             xai_grok_agent::discovery::by_name_in_cwd_with_plugins(required, cwd, plugins)
         });
-        let model_requires_strict_harness = model_agent_definition
-            .as_ref()
-            .is_some_and(xai_grok_agent::AgentDefinition::is_strict_harness);
+        let model_requires_exact_harness = model_agent_definition.as_ref().is_some_and(|def| {
+            def.is_strict_harness()
+                || def.plugin_name.is_some()
+                || def.source_path.is_some()
+                || def.prompt_body.is_some()
+        });
         if !grok_agent_env_set && !config_agent_explicitly_set
-            && model_requires_strict_harness
+            && model_requires_exact_harness
             && let Some(def) = model_agent_definition.clone()
         {
             tracing::info!(
@@ -4135,8 +4139,8 @@ impl MvpAgent {
             None => AgentDefinition::grok_build_plan(),
         };
         if !grok_agent_env_set && !config_agent_explicitly_set
-            && model_requires_strict_harness && let Some(required) = model_agent_type
-            && resolved.name != required
+            && model_requires_exact_harness && let Some(required) = model_agent_type
+            && !harnesses_are_compatible(&resolved, required, model_agent_definition.as_ref())
         {
             tracing::info!(
                 resolved_agent = %resolved.name,

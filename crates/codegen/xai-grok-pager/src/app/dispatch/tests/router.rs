@@ -1707,6 +1707,8 @@ fn deferred_switch_overwritten_by_second_switch() {
     let id = AgentId(0);
     let model_a = acp::ModelId::new(std::sync::Arc::from("model-a"));
     let model_b = acp::ModelId::new(std::sync::Arc::from("model-b"));
+    insert_ready_model(&mut app, id, &model_a);
+    insert_ready_model(&mut app, id, &model_b);
     app.agents.get_mut(&id).unwrap().session.session_id = None;
     dispatch(
         Action::SwitchModel {

@@ -900,6 +900,110 @@ fn resolve_agent_definition_acp_profile_wins_for_explicit_grok_build_family() {
         unsafe { std::env::set_var("GROK_AGENT", v) }
     }
 }
+/// A model-declared Markdown definition carries an exact prompt/source
+/// identity even when it otherwise uses the stock wire template and toolset.
+#[test]
+#[serial_test::serial]
+fn resolve_agent_definition_model_selects_nonstrict_custom_prompt() {
+    let prev = std::env::var("GROK_AGENT").ok();
+    unsafe {
+        std::env::remove_var("GROK_AGENT");
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let agents_dir = tmp.path().join(".grok").join("agents");
+    std::fs::create_dir_all(&agents_dir).unwrap();
+    std::fs::write(
+        agents_dir.join("issue-nine-reviewer.md"),
+        "---\nname: issue-nine-reviewer\ndescription: exact custom prompt\n---\nReview issue nine.\n",
+    )
+    .unwrap();
+
+    let acp_profile = xai_grok_agent::AgentDefinition::from_json(&serde_json::json!({
+        "name": "client-profile",
+        "description": "must not replace the model-declared custom harness",
+    }))
+    .unwrap();
+    let def = MvpAgent::resolve_agent_definition(
+        tmp.path(),
+        None,
+        &config::AgentSelectionConfig::default(),
+        Some(acp_profile),
+        Some("issue-nine-reviewer"),
+    );
+
+    assert_eq!(def.name, "issue-nine-reviewer");
+    assert_eq!(def.prompt_body.as_deref(), Some("Review issue nine."));
+    assert!(def.source_path.is_some());
+    assert!(!def.is_strict_harness());
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_AGENT", v) },
+        None => unsafe { std::env::remove_var("GROK_AGENT") },
+    }
+}
+/// Both qualified and unambiguous bare plugin names must resolve to the same
+/// exact non-strict plugin definition rather than the ambient default/profile.
+#[test]
+#[serial_test::serial]
+fn resolve_agent_definition_model_selects_nonstrict_plugin_bare_and_qualified() {
+    let prev = std::env::var("GROK_AGENT").ok();
+    unsafe {
+        std::env::remove_var("GROK_AGENT");
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let plugin_root = tmp.path().join("plugin-one");
+    let agents_dir = plugin_root.join("agents");
+    std::fs::create_dir_all(&agents_dir).unwrap();
+    std::fs::write(plugin_root.join("plugin.json"), r#"{"name":"plugin-one"}"#).unwrap();
+    std::fs::write(
+        agents_dir.join("issue-nine-plugin-reviewer.md"),
+        "---\nname: issue-nine-plugin-reviewer\ndescription: plugin prompt\n---\nReview from plugin one.\n",
+    )
+    .unwrap();
+    let discovery = xai_grok_agent::plugins::discovery::DiscoveryConfig {
+        cli_plugin_dirs: vec![plugin_root],
+        ..Default::default()
+    };
+    let discovered = xai_grok_agent::plugins::discover_plugins(
+        Some(tmp.path()),
+        &discovery,
+        &xai_grok_agent::plugins::TrustStore::load_from(tmp.path().join("trust")),
+        true,
+    );
+    let registry = xai_grok_agent::plugins::PluginRegistry::from_discovered(
+        discovered,
+        &[],
+        &["plugin-one".to_owned()],
+    );
+    let acp_profile = xai_grok_agent::AgentDefinition::from_json(&serde_json::json!({
+        "name": "client-profile",
+        "description": "must not replace the model-declared plugin harness",
+    }))
+    .unwrap();
+
+    for required in [
+        "issue-nine-plugin-reviewer",
+        "plugin-one:issue-nine-plugin-reviewer",
+    ] {
+        let def = MvpAgent::resolve_agent_definition_with_plugins(
+            tmp.path(),
+            None,
+            &config::AgentSelectionConfig::default(),
+            Some(acp_profile.clone()),
+            Some(required),
+            Some(&registry),
+        );
+        assert_eq!(def.name, "issue-nine-plugin-reviewer");
+        assert_eq!(def.plugin_name.as_deref(), Some("plugin-one"));
+        assert_eq!(def.prompt_body.as_deref(), Some("Review from plugin one."));
+        assert!(def.source_path.is_some());
+        assert!(!def.is_strict_harness());
+        assert!(harnesses_are_compatible(&def, required, Some(&def)));
+    }
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_AGENT", v) },
+        None => unsafe { std::env::remove_var("GROK_AGENT") },
+    }
+}
 /// A non-strict (stock / vision-capable) model leaves the template alone, so
 /// such models keep native image input.
 #[test]
@@ -1145,6 +1249,112 @@ fn harnesses_are_compatible_rejects_strict_mismatches() {
         &stock,
         "missing-custom-harness",
         None,
+    ));
+}
+#[test]
+fn harnesses_are_compatible_matches_bare_and_qualified_plugin_identity() {
+    let source = std::path::PathBuf::from("/plugins/one/agents/reviewer.md");
+    let mut active = xai_grok_agent::AgentDefinition::default_grok_build();
+    active.name = "reviewer".to_owned();
+    active.plugin_name = Some("plugin-one".to_owned());
+    active.source_path = Some(source.clone());
+    active.prompt_body = Some("Review from plugin one".to_owned());
+    let required = active.clone();
+
+    assert!(harnesses_are_compatible(
+        &active,
+        "plugin-one:reviewer",
+        Some(&required),
+    ));
+    assert!(harnesses_are_compatible(
+        &active,
+        "reviewer",
+        Some(&required),
+    ));
+}
+#[test]
+fn harnesses_are_compatible_rejects_different_plugin_and_custom_prompt_sources() {
+    let plugin = |owner: &str| {
+        let mut definition = xai_grok_agent::AgentDefinition::default_grok_build();
+        definition.name = "reviewer".to_owned();
+        definition.plugin_name = Some(owner.to_owned());
+        definition.source_path = Some(std::path::PathBuf::from(format!(
+            "/plugins/{owner}/agents/reviewer.md"
+        )));
+        definition.prompt_body = Some(format!("Review from {owner}"));
+        definition
+    };
+    let plugin_one = plugin("plugin-one");
+    let plugin_two = plugin("plugin-two");
+    assert!(!harnesses_are_compatible(
+        &plugin_one,
+        "plugin-two:reviewer",
+        Some(&plugin_two),
+    ));
+
+    let custom = |path: &str, body: &str| {
+        let mut definition = xai_grok_agent::AgentDefinition::default_grok_build();
+        definition.name = "reviewer".to_owned();
+        definition.source_path = Some(std::path::PathBuf::from(path));
+        definition.prompt_body = Some(body.to_owned());
+        definition
+    };
+    let project = custom("/repo/.grok/agents/reviewer.md", "Project review prompt");
+    let user = custom("/home/.grok/agents/reviewer.md", "User review prompt");
+    assert!(!harnesses_are_compatible(
+        &project,
+        "reviewer",
+        Some(&user),
+    ));
+
+    let mut inline = xai_grok_agent::AgentDefinition::default_grok_build();
+    inline.name = "grok-build".to_owned();
+    inline.prompt_body = Some("Client-provided prompt".to_owned());
+    assert!(harnesses_are_compatible(
+        &inline,
+        "grok-build",
+        Some(&inline),
+    ));
+    let built_in = xai_grok_agent::AgentDefinition::default_grok_build();
+    assert!(!harnesses_are_compatible(
+        &inline,
+        "grok-build",
+        Some(&built_in),
+    ));
+}
+
+#[test]
+fn harnesses_are_compatible_rejects_changed_external_runtime_contract() {
+    let mut active = xai_grok_agent::AgentDefinition::default_grok_build();
+    active.name = "reviewer".to_owned();
+    active.plugin_name = Some("plugin-one".to_owned());
+    active.source_path = Some(std::path::PathBuf::from(
+        "/plugins/plugin-one/agents/reviewer.md",
+    ));
+    active.prompt_body = Some("Review from plugin one".to_owned());
+
+    let mut required = active.clone();
+    required.permission_mode = xai_grok_agent::config::PermissionMode::BypassPermissions;
+
+    assert!(!harnesses_are_compatible(
+        &active,
+        "plugin-one:reviewer",
+        Some(&required),
+    ));
+}
+
+#[test]
+fn harnesses_are_compatible_rejects_changed_strict_system_prompt() {
+    let active = xai_grok_agent::AgentDefinition::codex();
+    let mut required = active.clone();
+    required.system_prompt = xai_grok_agent::prompt::context::TemplateOverride::Custom(
+        "Different strict system prompt".to_owned(),
+    );
+
+    assert!(!harnesses_are_compatible(
+        &active,
+        "codex",
+        Some(&required),
     ));
 }
 #[test]
@@ -2086,7 +2296,11 @@ fn build_agent_with_model_for_tests(
             ..Default::default()
         },
     );
-    MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config")
+    let agent = MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config");
+    agent
+        .models_manager
+        .set_current_model_id(acp::ModelId::new(model_id));
+    agent
 }
 
 #[test]
@@ -2192,6 +2406,56 @@ fn new_session_explicit_model_fails_before_spawn_when_harness_is_unresolved() {
         assert!(
             agent.sessions.borrow().is_empty(),
             "failed harness preflight must not register a session"
+        );
+    });
+}
+
+#[test]
+fn new_session_unknown_model_fallback_still_preflights_default_harness() {
+    run_local_for_bridge_test(|| async {
+        let default_model_id = "unresolved-fallback-harness-model";
+        let agent = build_agent_with_model_for_tests(
+            default_model_id,
+            "missing-default-custom-harness",
+        );
+        agent
+            .auth_manager
+            .hot_swap(crate::auth::GrokAuth::test_default());
+        agent.set_auth_method(acp::AuthMethodId::new(
+            crate::agent::auth_method::XAI_API_KEY_METHOD_ID,
+        ));
+        let init = acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_capabilities(
+            acp::ClientCapabilities::new()
+                .fs(acp::FileSystemCapabilities::new())
+                .terminal(false),
+        );
+        agent
+            .initialize_request
+            .set(init)
+            .expect("test initialize request should be set once");
+        let cwd = tempfile::tempdir().expect("temporary session cwd");
+
+        let err = <MvpAgent as acp::Agent>::new_session(
+            &agent,
+            acp::NewSessionRequest::new(cwd.path().to_path_buf()).meta(
+                serde_json::json!({ "modelId": "unknown-explicit-model" })
+                    .as_object()
+                    .cloned(),
+            ),
+        )
+        .await
+        .expect_err("fallback default harness must be checked before spawn");
+        let payload = crate::agent::config::ModelSwitchHarnessError::from_acp_error(&err)
+            .unwrap_or_else(|| panic!("expected structured harness error, got {err:?}"));
+        assert_eq!(payload.model_id, default_model_id);
+        assert_eq!(
+            payload.required_agent_type,
+            "missing-default-custom-harness"
+        );
+        assert_eq!(payload.reason, "agent_definition_unresolved");
+        assert!(
+            agent.sessions.borrow().is_empty(),
+            "failed fallback harness preflight must not register a session"
         );
     });
 }

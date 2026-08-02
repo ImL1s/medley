@@ -12,6 +12,51 @@ use crate::session::SessionCommand;
 use agent_client_protocol::{self as acp};
 use tokio::sync::oneshot;
 use xai_grok_sampling_types::parse_reasoning_effort_meta;
+
+struct FailureTelemetry {
+    armed: bool,
+    session_id: String,
+    previous_model_id: String,
+    new_model_id: String,
+    error_code: &'static str,
+    required_agent_type: Option<String>,
+    current_agent_type: Option<String>,
+}
+
+impl FailureTelemetry {
+    fn new(session_id: &acp::SessionId, model_id: &acp::ModelId) -> Self {
+        Self {
+            armed: true,
+            session_id: session_id.0.to_string(),
+            previous_model_id: String::new(),
+            new_model_id: model_id.0.to_string(),
+            error_code: config::MODEL_SWITCH_REBUILD_FAILED,
+            required_agent_type: None,
+            current_agent_type: None,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for FailureTelemetry {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::ModelSwitched {
+            session_id: self.session_id.clone(),
+            previous_model_id: self.previous_model_id.clone(),
+            new_model_id: self.new_model_id.clone(),
+            success: false,
+            error_code: Some(self.error_code.to_owned()),
+            required_agent_type: self.required_agent_type.clone(),
+            current_agent_type: self.current_agent_type.clone(),
+        });
+    }
+}
 /// Apply a model switch to a session.
 ///
 /// Always fail-closed on `model_readiness`. The ACP `allowed_models` gate still
@@ -28,6 +73,9 @@ pub(crate) async fn apply(
         model_id,
         ..
     } = args;
+    // Armed until the complete actor receipt and outer mirrors have committed.
+    // Every early return therefore emits exactly one sanitized failure event.
+    let mut failure_telemetry = FailureTelemetry::new(&session_id, &model_id);
     // Serialize the complete prepare/actor-commit/outer-handle sequence with
     // prompt intake and other model switches. Without this guard two actor
     // receipts can be observed out of order and regress the outer handle.
@@ -57,6 +105,8 @@ pub(crate) async fn apply(
     let required_agent_type =
         resolve_required_agent_type(Some(model.info().agent_type.as_str()), session_default);
     let previous_model_id = handle.model_id.0.clone();
+    failure_telemetry.previous_model_id = previous_model_id.to_string();
+    failure_telemetry.required_agent_type = Some(required_agent_type.clone());
     let (agent_tx, agent_rx) = oneshot::channel();
     handle
         .cmd_tx
@@ -70,18 +120,18 @@ pub(crate) async fn apply(
     let observed_active_agent_type = active_agent_type
         .clone()
         .unwrap_or_else(|| handle.agent_name.clone());
+    failure_telemetry.current_agent_type = Some(observed_active_agent_type.clone());
     // Resolve every differing target before compatibility classification.
     // In particular, an unknown custom name is not evidence of a stock
     // harness; it is an unavailable prerequisite and must fail closed.
-    let required_definition = (observed_active_agent_type != required_agent_type)
-        .then(|| {
-            xai_grok_agent::discovery::by_name_in_cwd_with_plugins(
-                &required_agent_type,
-                handle.tool_context.cwd.as_path(),
-                agent.plugin_registry_handle.snapshot().as_deref(),
-            )
-        })
-        .flatten();
+    // Always resolve the required definition. Equal canonical names are not
+    // sufficient for plugin/file-backed harnesses because their prompt/source
+    // identity can differ while the display name remains unchanged.
+    let required_definition = xai_grok_agent::discovery::by_name_in_cwd_with_plugins(
+        &required_agent_type,
+        handle.tool_context.cwd.as_path(),
+        agent.plugin_registry_handle.snapshot().as_deref(),
+    );
     let observed_definition = xai_grok_agent::discovery::by_name_in_cwd_with_plugins(
         &observed_active_agent_type,
         handle.tool_context.cwd.as_path(),
@@ -157,21 +207,9 @@ pub(crate) async fn apply(
     let receipt = match rx.await {
         Ok(Ok(receipt)) => receipt,
         Ok(Err(err)) => {
-            let error_code =
-                if config::ModelSwitchIncompatibleAgentError::from_acp_error(&err).is_some() {
-                    config::MODEL_SWITCH_INCOMPATIBLE_AGENT
-                } else {
-                    config::MODEL_SWITCH_REBUILD_FAILED
-                };
-            xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::ModelSwitched {
-                session_id: session_id.0.to_string(),
-                previous_model_id: previous_model_id.to_string(),
-                new_model_id: model_id.0.to_string(),
-                success: false,
-                error_code: Some(error_code.to_owned()),
-                required_agent_type: Some(required_agent_type.clone()),
-                current_agent_type: Some(observed_active_agent_type.clone()),
-            });
+            if config::ModelSwitchIncompatibleAgentError::from_acp_error(&err).is_some() {
+                failure_telemetry.error_code = config::MODEL_SWITCH_INCOMPATIBLE_AGENT;
+            }
             return Err(err);
         }
         Err(_) => {
@@ -214,6 +252,7 @@ pub(crate) async fn apply(
             .set_current_reasoning_effort(applied_effort);
     }
     agent.sync_process_static_api_key(Some(model_id.0.as_ref()));
+    failure_telemetry.disarm();
     Ok(acp::SetSessionModelResponse::new().meta(
         serde_json::json!({
             "model": updated_model,

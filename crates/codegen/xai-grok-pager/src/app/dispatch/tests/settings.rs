@@ -297,38 +297,44 @@ fn model_switch_pending_resets_correctly_across_success_and_failure() {
     let id = AgentId(0);
     let model_a = acp::ModelId::new(std::sync::Arc::from("model-a"));
     let model_b = acp::ModelId::new(std::sync::Arc::from("model-b"));
-    dispatch(
+    insert_ready_model(&mut app, id, &model_a);
+    insert_ready_model(&mut app, id, &model_b);
+    let first_effects = dispatch(
         Action::SwitchModel {
             model_id: model_a.clone(),
             effort: None,
         },
         &mut app,
     );
+    let first_request_id = switch_model_request_id(&first_effects);
     assert!(app.agents[&id].session.model_switch_pending);
     dispatch(
         Action::TaskComplete(TaskResult::SwitchModelComplete {
             agent_id: id,
             model_id: model_a,
             effort: None,
+            request_id: first_request_id,
             result: Ok(()),
             prev_model_id: None,
         }),
         &mut app,
     );
     assert!(!app.agents[&id].session.model_switch_pending);
-    dispatch(
+    let second_effects = dispatch(
         Action::SwitchModel {
             model_id: model_b.clone(),
             effort: None,
         },
         &mut app,
     );
+    let second_request_id = switch_model_request_id(&second_effects);
     assert!(app.agents[&id].session.model_switch_pending);
     dispatch(
         Action::TaskComplete(TaskResult::SwitchModelComplete {
             agent_id: id,
             model_id: model_b,
             effort: None,
+            request_id: second_request_id,
             result: Err(SwitchModelError::Other("network error".into())),
             prev_model_id: None,
         }),
@@ -1889,6 +1895,9 @@ fn set_simple_mode_propagates_to_every_agent() {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            model_switch_request_id: None,
+            model_switch_rollback: None,
+            model_switch_queue_handoff_from: None,
             user_model_preference: None,
             deferred_model_switch: None,
             bg_tasks: std::collections::BTreeMap::new(),

@@ -971,12 +971,20 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                 agent.session.deferred_model_switch = Some((model_id, effort));
                 return vec![];
             };
-            agent.session.model_switch_pending = true;
+            let request_id = super::session::lifecycle::begin_model_switch_request(
+                &mut agent.session,
+                &app.models,
+            );
+            let Some(request_id) = request_id else {
+                app.show_toast("Wait for the current model switch to finish");
+                return vec![];
+            };
             vec![Effect::SwitchModel {
                 agent_id: id,
                 session_id,
                 model_id,
                 effort,
+                request_id,
                 prev_model_id: None,
             }]
         }
