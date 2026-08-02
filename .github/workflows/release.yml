@@ -1,0 +1,577 @@
+name: Release
+
+# Tagged releases for the "medley" distribution of this fork (issue #29).
+#
+# Releases are cut from `providers`; `main` is a pristine upstream mirror and
+# never carries fork tags (see FORK.md).
+#
+# The published command is `medley`. The cargo bin target stays
+# `xai-grok-pager` — renaming it would churn every upstream sync (issue #49
+# non-goal), so the rename happens here, at the packaging layer, and again in
+# `install.sh` when the symlink is created.
+#
+# Every third-party action is pinned to a full commit SHA (issue #30); the
+# version tag in the trailing comment is documentation only.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Version tag to package for a dry run. Nothing is published: the
+          archives and checksums are attached to the workflow run instead.
+        required: false
+        default: v0.0.0+providers.0
+
+permissions:
+  contents: read
+
+concurrency:
+  # A half-uploaded release is worse than a queued one, so never cancel.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  # `[profile.release] incremental = true` is a local-dev convenience in
+  # Cargo.toml. Incremental artifacts are not reproducible, so releases opt out.
+  CARGO_INCREMENTAL: "0"
+  # What cargo builds, versus what users end up running.
+  CARGO_PACKAGE: xai-grok-pager-bin
+  CARGO_BIN: xai-grok-pager
+  DIST_NAME: medley
+  # Matches the version `bin/protoc` pins for local development, so release
+  # builds and developer builds run the same code generator.
+  PROTOC_VERSION: "29.3"
+
+jobs:
+  meta:
+    name: Resolve release identity
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.identity.outputs.tag }}
+      version: ${{ steps.identity.outputs.version }}
+      publish: ${{ steps.identity.outputs.publish }}
+    steps:
+      - name: Derive tag, version, and publish mode
+        id: identity
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "push" ]; then
+            tag="$REF_NAME"
+            publish=true
+          else
+            tag="${INPUT_TAG:-v0.0.0+providers.0}"
+            publish=false
+          fi
+
+          # FORK.md pins releases to v{upstream}+providers.N. A bare upstream
+          # tag like v1.2.3 would produce archives and an embedded version
+          # indistinguishable from an official build, which is the confusion
+          # this fork's release identity exists to prevent.
+          scheme_error() {
+            echo "::error::release tags must follow the fork scheme in FORK.md — v<upstream>+providers.<N>, for example v1.2.3+providers.1 (got '${tag}'). A bare upstream tag would produce artifacts indistinguishable from an official release."
+            exit 1
+          }
+
+          case "$tag" in
+            v?*+providers.*) ;;
+            *) scheme_error ;;
+          esac
+
+          upstream="${tag%%+providers.*}"
+          counter="${tag##*+providers.}"
+          case "$upstream" in
+            v?*) ;;
+            *) scheme_error ;;
+          esac
+          case "$counter" in
+            '' | *[!0-9]*) scheme_error ;;
+          esac
+
+          version="${tag#v}"
+          {
+            echo "tag=${tag}"
+            echo "version=${version}"
+            echo "publish=${publish}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Release identity"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Tag | \`${tag}\` |"
+            echo "| Version | \`${version}\` |"
+            echo "| Commit | \`${GITHUB_SHA}\` |"
+            echo "| Publishes a release | \`${publish}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  gate:
+    name: Pre-release gate
+    needs: meta
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read # read the CI verdict for the release commit
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Committed lockfile resolves without changes
+        # Releases build with --locked; catch a stale Cargo.lock in seconds
+        # rather than after a 40-minute matrix build.
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: CI must be green for the release commit
+        # The full suite already ran when this commit landed on `providers`;
+        # re-running it would add ~30 minutes to every release. Reuse that
+        # verdict, but only a *completed, successful* run of this repository's
+        # own ci.yml, triggered by a push of `providers`, at exactly this SHA.
+        #
+        # Every other case fails the release: no run at all, a run still in
+        # progress, a pull_request run (which tests the merge commit, not this
+        # one), or some other workflow that merely calls itself "CI". Matching
+        # on `.path` rather than `.name` is what makes the last one impossible.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          successful="$(gh api \
+            "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${COMMIT}&event=push&branch=providers&per_page=100" \
+            --jq '[.workflow_runs[]
+                   | select(.head_sha == env.COMMIT
+                            and .event == "push"
+                            and .head_branch == "providers"
+                            and .path == ".github/workflows/ci.yml"
+                            and .status == "completed"
+                            and .conclusion == "success")]
+                  | length')"
+
+          if [ "${successful:-0}" -lt 1 ]; then
+            echo "::error::No completed, successful run of .github/workflows/ci.yml exists for ${COMMIT} (push to providers). Release artifacts are only built from commits CI has already passed — land the commit on providers, let CI finish green, then tag it."
+            exit 1
+          fi
+          echo "Found ${successful} successful CI run(s) for ${COMMIT}."
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [meta, gate]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # One native runner per target: nothing is cross-compiled, so every
+          # artifact is executed on the architecture it ships to before it is
+          # packaged. protoc is pinned per platform by SHA-256 (the three Linux
+          # and macOS-arm64 digests are the ones already committed in
+          # `bin/protoc`; the macOS-x86_64 digest is the same upstream release).
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            protoc_asset: osx-aarch_64
+            protoc_sha256: 2b8a3403cd097f95f3ba656e14b76c732b6b26d7f183330b11e36ef2bc028765
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            protoc_asset: osx-x86_64
+            protoc_sha256: 9a788036d8f9854f7b03c305df4777cf0e54e5b081e25bf15252da87e0e90875
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            protoc_asset: linux-x86_64
+            protoc_sha256: 3e866620c5be27664f3d2fa2d656b5f3e09b5152b42f1bedbf427b333e90021a
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            protoc_asset: linux-aarch_64
+            protoc_sha256: 6427349140e01f06e049e707a58709a4f221ae73ab9a0425bc4a00c8d0e1ab32
+    steps:
+      - name: Check out the release commit
+        # Pinned to the resolved commit, never a moving branch: artifacts must
+        # come from the tagged tree even if `providers` advances mid-release.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Runner architecture matches the target triple
+        # Runner images get retired and relabelled. If a label ever resolves to
+        # a different architecture, fail here rather than shipping an archive
+        # whose name lies about what is inside it.
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          host="$(rustc -vV | awk '/^host: /{print $2}')"
+          if [ "$host" != "$TARGET" ]; then
+            echo "::error::runner '${RUNNER_NAME}' has host triple '${host}' but this job packages '${TARGET}'"
+            exit 1
+          fi
+          echo "Host triple: ${host}"
+
+      - name: Install pinned protoc
+        env:
+          ASSET: ${{ matrix.protoc_asset }}
+          EXPECTED_SHA256: ${{ matrix.protoc_sha256 }}
+        run: |
+          set -euo pipefail
+          zip="protoc-${PROTOC_VERSION}-${ASSET}.zip"
+          url="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/${zip}"
+          workdir="${RUNNER_TEMP}/protoc"
+          mkdir -p "$workdir"
+
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "${workdir}/${zip}" "$url"
+
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            actual="$(sha256sum "${workdir}/${zip}" | cut -d' ' -f1)"
+          else
+            actual="$(shasum -a 256 "${workdir}/${zip}" | cut -d' ' -f1)"
+          fi
+          if [ "$actual" != "$EXPECTED_SHA256" ]; then
+            echo "::error::${zip} has SHA-256 ${actual}, expected ${EXPECTED_SHA256}"
+            exit 1
+          fi
+
+          unzip -q -o "${workdir}/${zip}" -d "$workdir"
+          chmod +x "${workdir}/bin/protoc"
+          echo "PROTOC=${workdir}/bin/protoc" >> "$GITHUB_ENV"
+          "${workdir}/bin/protoc" --version
+
+      - name: Use a portable baseline for aarch64 Linux
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        # `.cargo/config.toml` builds this target with `-C target-cpu=neoverse-v2`,
+        # which suits a known fleet but emits instructions that fault on older
+        # arm64 CPUs (Graviton2 and Ampere Altra are Neoverse N1). An archive
+        # published under the bare `aarch64-unknown-linux-gnu` triple has to run
+        # across that whole triple, so distribution builds drop the microarch pin.
+        #
+        # This has to be RUSTFLAGS rather than CARGO_TARGET_<TRIPLE>_RUSTFLAGS:
+        # cargo treats the latter as one more config source and *joins* it with
+        # `target.<triple>.rustflags`, so the microarch pin survives. RUSTFLAGS
+        # sits above config in cargo's mutually-exclusive precedence list and
+        # replaces it outright — which is also why force-unwind-tables
+        # (backtraces) has to be restated here. The next step proves it worked.
+        run: |
+          set -euo pipefail
+          echo 'RUSTFLAGS=-C force-unwind-tables=yes' >> "$GITHUB_ENV"
+
+      - name: Verify the effective rustc flags
+        # Compiling one cheap leaf crate with -v shows the exact rustc command
+        # cargo will use for the real build. Asserting on it means a change to
+        # .cargo/config.toml, or to how cargo resolves flag precedence, fails
+        # the release instead of silently shipping a binary pinned to a
+        # microarchitecture most of the triple does not have.
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/rustflags-probe.log"
+          CARGO_TARGET_DIR="${RUNNER_TEMP}/rustflags-probe" \
+            cargo build --release --locked -p xai-grok-version -v > "$log" 2>&1
+
+          if ! grep -q 'Running.*rustc' "$log"; then
+            echo "::error::the probe compiled nothing, so the assertions below would be vacuous"
+            exit 1
+          fi
+          if grep -q 'target-cpu=neoverse-v2' "$log"; then
+            echo "::error::rustc still receives -C target-cpu=neoverse-v2 for ${TARGET}; the published binary would fault on Neoverse N1 hardware"
+            exit 1
+          fi
+          if ! grep -q 'force-unwind-tables=yes' "$log"; then
+            echo "::error::force-unwind-tables=yes was lost for ${TARGET}; release backtraces would be degraded"
+            exit 1
+          fi
+          echo "Effective flags verified for ${TARGET}: no microarch pin, unwind tables intact."
+
+      - name: Build the release binary
+        env:
+          # Consumed by crates/codegen/xai-grok-pager/build.rs, which bakes
+          # "<version> (<short sha>)" into `medley --version`.
+          GROK_VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --package "$CARGO_PACKAGE" --bin "$CARGO_BIN"
+
+      - name: Package the archive
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          stage="${DIST_NAME}-${VERSION}-${TARGET}"
+          archive="${stage}.tar.gz"
+          dist="${GITHUB_WORKSPACE}/dist"
+          mkdir -p "${dist}/${stage}"
+
+          cp "target/release/${CARGO_BIN}" "${dist}/${stage}/${DIST_NAME}"
+          chmod 755 "${dist}/${stage}/${DIST_NAME}"
+          cp LICENSE "${dist}/${stage}/LICENSE"
+
+          # NOTICE.md carries the "community fork, not affiliated with or
+          # endorsed by xAI" statement and arrives with the outward-identity
+          # work (#53). Warn rather than fail so release order is not coupled
+          # to docs merge order.
+          if [ -f NOTICE.md ]; then
+            cp NOTICE.md "${dist}/${stage}/NOTICE.md"
+          else
+            echo "::warning::NOTICE.md is absent from this commit; ${archive} ships without the fork attribution notice"
+          fi
+
+          # Prove the binary runs on this architecture and reports the tag.
+          version_output="$("${dist}/${stage}/${DIST_NAME}" --version)"
+          echo "medley --version: ${version_output}"
+          case "$version_output" in
+            *"$VERSION"*) ;;
+            *)
+              echo "::error::binary reports '${version_output}', which does not contain the release version '${VERSION}'"
+              exit 1
+              ;;
+          esac
+
+          # Normalise mtimes, ownership, and entry order so the archive depends
+          # on its contents rather than on when the runner happened to build it.
+          epoch="$(git log -1 --pretty=%ct)"
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            stamp="$(date -u -d "@${epoch}" +%Y%m%d%H%M.%S)"
+          else
+            stamp="$(date -u -r "${epoch}" +%Y%m%d%H%M.%S)"
+          fi
+          find "${dist}/${stage}" -exec touch -t "$stamp" {} +
+
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            tar --sort=name --format=ustar --owner=0 --group=0 --numeric-owner \
+              -cf - -C "$dist" "$stage" | gzip -9 -n > "${dist}/${archive}"
+          else
+            # bsdtar has no --sort, so feed it an explicitly sorted file list.
+            entries="${RUNNER_TEMP}/entries.txt"
+            ( cd "$dist" && find "$stage" \( -type f -o -type l \) | LC_ALL=C sort > "$entries" )
+            tar --uid 0 --gid 0 --uname '' --gname '' --format ustar \
+              -cf - -C "$dist" -T "$entries" | gzip -9 -n > "${dist}/${archive}"
+          fi
+
+          rm -rf "${dist:?}/${stage}"
+
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            digest="$(sha256sum "${dist}/${archive}" | cut -d' ' -f1)"
+          else
+            digest="$(shasum -a 256 "${dist}/${archive}" | cut -d' ' -f1)"
+          fi
+          printf '%s  %s\n' "$digest" "$archive" > "${dist}/${archive}.sha256"
+          cat "${dist}/${archive}.sha256"
+
+      - name: Unpack and run what users will download
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          stage="${DIST_NAME}-${VERSION}-${TARGET}"
+          verify="${RUNNER_TEMP}/verify"
+          mkdir -p "$verify"
+          tar -xzf "${GITHUB_WORKSPACE}/dist/${stage}.tar.gz" -C "$verify"
+          test -f "${verify}/${stage}/LICENSE"
+          # Catches a lost executable bit, which tar preserves but a rebuilt
+          # packaging step could easily drop.
+          "${verify}/${stage}/${DIST_NAME}" --version
+
+      - name: Upload the archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: medley-archive-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  checksums:
+    name: Aggregate checksums
+    needs: [meta, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Download every target archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: medley-archive-*
+          merge-multiple: true
+          path: dist
+
+      - name: Build and verify the checksums file
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist
+
+          checksums="${DIST_NAME}-${VERSION}-checksums.txt"
+          # Each hash was computed on the runner that produced the archive, so
+          # concatenating those files keeps the per-target digests authoritative
+          # and re-verifies them here against the transferred bytes.
+          cat ./*.tar.gz.sha256 | LC_ALL=C sort -k2 > "$checksums"
+          rm -f ./*.tar.gz.sha256
+          sha256sum --check --strict "$checksums"
+
+          found="$(find . -name '*.tar.gz' | wc -l | tr -d ' ')"
+          if [ "$found" != "4" ]; then
+            echo "::error::expected 4 archives, found ${found}"
+            exit 1
+          fi
+
+          {
+            echo "### Artifacts"
+            echo
+            echo '```'
+            cat "$checksums"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the release bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: medley-release-bundle
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish draft release
+    needs: [meta, checksums]
+    if: needs.meta.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # create the release and upload assets
+      id-token: write # OIDC identity for provenance
+      attestations: write # record the provenance attestation
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download the release bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: medley-release-bundle
+          path: dist
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: dist/*.tar.gz
+
+      - name: Compose release notes
+        env:
+          TAG: ${{ needs.meta.outputs.tag }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          upstream="unknown"
+          if [ -f SOURCE_REV ]; then
+            upstream="$(tr -d '[:space:]' < SOURCE_REV)"
+          fi
+
+          {
+            echo "## medley ${TAG}"
+            echo
+            echo "Community distribution of a fork of [grok-build](https://github.com/xai-org/grok-build)."
+            echo "Not affiliated with, sponsored by, or endorsed by xAI."
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Fork release | \`${TAG}\` |"
+            echo "| Fork commit | \`${GITHUB_SHA}\` |"
+            echo "| Upstream base | \`${upstream}\` |"
+            echo "| Channel | \`providers\` |"
+            echo
+            echo "### Changes"
+            echo
+            echo "_Draft: summarise the fork changes in this release before publishing._"
+            echo
+            echo "### Install"
+            echo
+            echo '```sh'
+            echo "curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${TAG}/install.sh | sh"
+            echo '```'
+            echo
+            echo "\`medley\` installs to \`~/.medley/bin\` and keeps its state in \`~/.medley\`."
+            echo "An existing official \`grok\` installation is left untouched."
+            echo
+            echo "### Verify"
+            echo
+            echo '```sh'
+            echo "shasum -a 256 -c ${DIST_NAME}-${VERSION}-checksums.txt"
+            echo "gh attestation verify medley-${VERSION}-<target>.tar.gz --repo ${GITHUB_REPOSITORY}"
+            echo '```'
+          } > "${RUNNER_TEMP}/notes.md"
+
+          cat "${RUNNER_TEMP}/notes.md"
+
+      - name: Create or update the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if existing="$(gh release view "$TAG" --repo "$REPO" --json isDraft,body 2>/dev/null)"; then
+            # Re-running the job should refresh a draft it created moments ago,
+            # but must never rewrite artifacts users may already have
+            # downloaded and checksummed. Two conditions have to hold.
+            if [ "$(printf '%s' "$existing" | jq -r '.isDraft')" != "true" ]; then
+              echo "::error::Release ${TAG} is already published. Refusing to overwrite the assets of a published release — a checksum or attestation someone has already verified would silently stop matching. Delete the release manually if it really must be rebuilt."
+              exit 1
+            fi
+            # The generated notes always carry the fork commit, so this catches
+            # a stale draft left behind by a run against a different commit.
+            case "$(printf '%s' "$existing" | jq -r '.body')" in
+              *"$GITHUB_SHA"*) ;;
+              *)
+                echo "::error::Draft ${TAG} was built from a different commit than ${GITHUB_SHA}. Refusing to mix artifacts from two commits in one release; delete the stale draft and re-run."
+                exit 1
+                ;;
+            esac
+
+            echo "Refreshing the unpublished draft for ${TAG} at the same commit."
+            gh release upload "$TAG" dist/* --repo "$REPO" --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --repo "$REPO" \
+              --draft \
+              --verify-tag \
+              --title "medley ${TAG}" \
+              --notes-file "${RUNNER_TEMP}/notes.md"
+          fi
+
+          url="$(gh release view "$TAG" --repo "$REPO" --json url --jq .url)"
+          {
+            echo "### Draft release"
+            echo
+            echo "${url}"
+            echo
+            echo "Review the notes and publish manually — the release is created as a draft on purpose."
+          } >> "$GITHUB_STEP_SUMMARY"
