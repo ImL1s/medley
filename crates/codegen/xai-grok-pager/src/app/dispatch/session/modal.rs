@@ -14,6 +14,7 @@ pub(in crate::app::dispatch) fn remove_agent_and_cleanup(
     app: &mut AppView,
     agent_id: AgentId,
 ) -> Vec<Effect> {
+    super::lifecycle::abort_model_switch_transaction(app, agent_id);
     let mut removed = app.agents.shift_remove(&agent_id);
     let mut drain = None;
     if let Some(removed) = removed.as_mut()

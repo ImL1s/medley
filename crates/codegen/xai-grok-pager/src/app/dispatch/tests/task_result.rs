@@ -1834,7 +1834,7 @@ fn handed_queue_stays_gated_when_deferred_target_switch_fails() {
 }
 
 #[test]
-fn handed_queue_stays_gated_when_deferred_target_fails_hydrate_preflight() {
+fn failed_deferred_target_preflight_aborts_transaction_and_restores_source_queue() {
     use xai_grok_shell::sampling::types::ReasoningEffort;
 
     for target_state in ["missing", "unready"] {
@@ -1917,18 +1917,18 @@ fn handed_queue_stays_gated_when_deferred_target_fails_hydrate_preflight() {
                 .any(|effect| matches!(effect, Effect::SwitchModel { .. })),
             "{target_state} target must fail before ACP switch: {created_effects:?}"
         );
-        assert!(
-            !created_effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::SendPrompt { .. })),
-            "{target_state} target must not drain the handed queue: {created_effects:?}"
-        );
+        assert!(app.model_switch_transaction.is_none(), "{target_state}");
         let replacement = &app.agents[&replacement_id].session;
-        assert_eq!(replacement.queue_len(), 1, "{target_state}");
+        assert_eq!(replacement.queue_len(), 0, "{target_state}");
         assert_eq!(
-            replacement.model_switch_queue_handoff_from,
-            Some(source_id),
-            "{target_state} preflight failure must preserve recovery ownership"
+            replacement.model_switch_queue_handoff_from, None,
+            "{target_state} preflight failure must release recovery ownership"
+        );
+        assert!(
+            created_effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::SendPrompt { agent_id, .. } if *agent_id == source_id)),
+            "{target_state} must restore and drain the source queue: {created_effects:?}"
         );
     }
 }
@@ -2304,7 +2304,7 @@ fn replacement_session_persists_confirmed_default_after_creation() {
                 error,
                 prev_model_id: Some(previous.clone()),
             }),
-            prev_model_id: Some(previous),
+            prev_model_id: Some(previous.clone()),
         }),
         &mut app,
     );
@@ -2355,6 +2355,20 @@ fn replacement_session_persists_confirmed_default_after_creation() {
             .user_model_preference
             .as_ref(),
         Some(&target)
+    );
+    assert!(app.model_switch_transaction.is_none());
+    let follow_on = dispatch(
+        Action::SwitchModel {
+            model_id: previous,
+            effort: None,
+        },
+        &mut app,
+    );
+    assert!(
+        follow_on
+            .iter()
+            .any(|effect| matches!(effect, Effect::SwitchModel { .. })),
+        "replacement adoption must release global model-switch admission"
     );
 }
 
@@ -2515,13 +2529,11 @@ fn session_only_switch_failure_preserves_another_sessions_committed_default() {
     );
     let first_request_id = switch_model_request_id(&first_effects);
     assert!(
-        !app.agents[&first_id]
-            .session
-            .model_switch_rollback
+        !app.model_switch_transaction
             .as_ref()
             .unwrap()
             .app_models_optimistic,
-        "an ordinary session switch must not own the app-wide model mirror"
+        "an ordinary session switch must not optimistically own the app mirror"
     );
 
     let (second_id, _) =
@@ -2529,6 +2541,24 @@ fn session_only_switch_failure_preserves_another_sessions_committed_default() {
             &mut app, None,
         );
     app.agents.get_mut(&second_id).unwrap().session.session_id = Some("session-b".into());
+    let blocked = dispatch(Action::SetDefaultModel(global_new.clone()), &mut app);
+    assert!(
+        !blocked
+            .iter()
+            .any(|effect| matches!(effect, Effect::SwitchModel { .. }))
+    );
+    assert!(
+        app.model_switch_transaction
+            .as_ref()
+            .is_some_and(|transaction| {
+                transaction.owner_agent_id == first_id
+                    && transaction.request_id == Some(first_request_id)
+            })
+    );
+    dispatch_sessions_confirm_close(&mut app, first_id);
+    assert!(!app.agents.contains_key(&first_id));
+    assert!(app.model_switch_transaction.is_none());
+
     let second_effects = dispatch(Action::SetDefaultModel(global_new.clone()), &mut app);
     let second_request_id = switch_model_request_id(&second_effects);
     dispatch(
@@ -2544,7 +2574,7 @@ fn session_only_switch_failure_preserves_another_sessions_committed_default() {
     );
     assert_eq!(app.models.current, Some(global_new.clone()));
 
-    dispatch(
+    let late_effects = dispatch(
         Action::TaskComplete(TaskResult::SwitchModelComplete {
             agent_id: first_id,
             model_id: session_target,
@@ -2556,16 +2586,120 @@ fn session_only_switch_failure_preserves_another_sessions_committed_default() {
         &mut app,
     );
 
-    assert_eq!(
-        app.agents[&first_id].session.models.current,
-        Some(session_original)
-    );
+    assert!(late_effects.is_empty());
     assert_eq!(
         app.models.current,
         Some(global_new),
         "a session-only rollback must not overwrite another session's committed default"
     );
-    assert!(!app.agents[&first_id].session.model_switch_pending);
+}
+
+#[test]
+fn older_session_switch_success_cannot_overwrite_newer_committed_default() {
+    let mut app = test_app_with_agent();
+    let first_id = AgentId(0);
+    let session_original = acp::ModelId::new("session-original");
+    let session_target = acp::ModelId::new("session-target");
+    let global_original = acp::ModelId::new("global-original");
+    let global_new = acp::ModelId::new("global-new");
+
+    for (model_id, name) in [
+        (session_original.clone(), "Session Original"),
+        (session_target.clone(), "Session Target"),
+        (global_original.clone(), "Global Original"),
+        (global_new.clone(), "Global New"),
+    ] {
+        let info = acp::ModelInfo::new(model_id.clone(), name);
+        app.agents[&first_id]
+            .session
+            .models
+            .available
+            .insert(model_id.clone(), info.clone());
+        app.models.available.insert(model_id, info);
+    }
+    app.agents
+        .get_mut(&first_id)
+        .unwrap()
+        .session
+        .models
+        .set_current(session_original.clone(), None);
+    app.models.set_current(global_original.clone(), None);
+
+    let first_effects = dispatch(
+        Action::SwitchModel {
+            model_id: session_target.clone(),
+            effort: None,
+        },
+        &mut app,
+    );
+    let first_request_id = switch_model_request_id(&first_effects);
+
+    let (second_id, _) =
+        crate::app::dispatch::session::lifecycle::dispatch_new_session_inner_with_id(
+            &mut app, None,
+        );
+    app.agents.get_mut(&second_id).unwrap().session.session_id = Some("session-b".into());
+    let blocked = dispatch(Action::SetDefaultModel(global_new.clone()), &mut app);
+    assert!(
+        !blocked
+            .iter()
+            .any(|effect| matches!(effect, Effect::SwitchModel { .. }))
+    );
+    assert!(
+        app.model_switch_transaction
+            .as_ref()
+            .is_some_and(|transaction| {
+                transaction.owner_agent_id == first_id
+                    && transaction.request_id == Some(first_request_id)
+            })
+    );
+    dispatch_sessions_confirm_close(&mut app, first_id);
+    assert!(!app.agents.contains_key(&first_id));
+    assert!(app.model_switch_transaction.is_none());
+
+    let second_effects = dispatch(Action::SetDefaultModel(global_new.clone()), &mut app);
+    let second_request_id = switch_model_request_id(&second_effects);
+    let second_completion = dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id: second_id,
+            model_id: global_new.clone(),
+            effort: None,
+            request_id: second_request_id,
+            result: Ok(()),
+            prev_model_id: Some(global_original),
+        }),
+        &mut app,
+    );
+    assert!(matches!(
+        second_completion.as_slice(),
+        [Effect::PersistPreferredModel { model_id, .. }] if model_id == &global_new
+    ));
+    assert_eq!(app.models.current.as_ref(), Some(&global_new));
+
+    let first_completion = dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id: first_id,
+            model_id: session_target.clone(),
+            effort: None,
+            request_id: first_request_id,
+            result: Ok(()),
+            prev_model_id: None,
+        }),
+        &mut app,
+    );
+
+    assert!(first_completion.is_empty());
+    assert_eq!(
+        app.models.current.as_ref(),
+        Some(&global_new),
+        "the older completion must not overwrite the newer global default"
+    );
+    assert!(
+        !first_completion
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistPreferredModel { .. })),
+        "the older completion must not persist a stale global preference"
+    );
 }
 
 #[test]

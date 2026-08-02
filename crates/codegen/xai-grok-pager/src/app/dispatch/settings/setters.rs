@@ -1631,20 +1631,6 @@ pub(in crate::app::dispatch) fn set_default_model_inner(
 /// target model's auth class differs from the current one; otherwise starts
 /// the switch. Persistence and the success toast wait for the ACP receipt.
 /// Idempotent: same model already active → no-op.
-fn other_global_model_switch_pending(
-    app: &AppView,
-    active_agent_id: crate::app::agent::AgentId,
-) -> bool {
-    app.agents.iter().any(|(id, agent)| {
-        *id != active_agent_id
-            && agent
-                .session
-                .model_switch_rollback
-                .as_ref()
-                .is_some_and(|rollback| rollback.app_models_optimistic)
-    })
-}
-
 pub(in crate::app::dispatch) fn set_default_model(
     app: &mut AppView,
     new_id: acp::ModelId,
@@ -1715,7 +1701,13 @@ pub(in crate::app::dispatch) fn set_default_model(
     // The default model is app-global. Allow repeated choices on the same
     // pre-session placeholder to coalesce, but do not let another session
     // overwrite the sole durable rollback baseline while it is unresolved.
-    if other_global_model_switch_pending(app, aid) {
+    if app
+        .model_switch_transaction
+        .as_ref()
+        .is_some_and(|transaction| {
+            transaction.owner_agent_id != aid || transaction.request_id.is_some()
+        })
+    {
         app.show_toast("Wait for the current default-model switch to finish");
         return vec![];
     }
@@ -1781,7 +1773,13 @@ pub(in crate::app::dispatch) fn set_default_model_confirmed(
 
     // Re-check after an auth-class confirmation: another session may have
     // opened a global transaction while the question modal was visible.
-    if other_global_model_switch_pending(app, aid) {
+    if app
+        .model_switch_transaction
+        .as_ref()
+        .is_some_and(|transaction| {
+            transaction.owner_agent_id != aid || transaction.request_id.is_some()
+        })
+    {
         app.show_toast("Wait for the current default-model switch to finish");
         return vec![];
     }
@@ -1791,6 +1789,8 @@ pub(in crate::app::dispatch) fn set_default_model_confirmed(
             return vec![];
         };
         let request_id = crate::app::dispatch::session::lifecycle::begin_model_switch_request(
+            &mut app.model_switch_transaction,
+            aid,
             &mut agent.session,
             &app.models,
         );
@@ -1798,29 +1798,12 @@ pub(in crate::app::dispatch) fn set_default_model_confirmed(
             app.show_toast("Wait for the current model switch to finish");
             return vec![];
         };
-        if let Some(rollback) = agent.session.model_switch_rollback.as_mut() {
-            rollback.app_models_optimistic = true;
-        }
+        crate::app::dispatch::session::lifecycle::mark_model_switch_app_optimistic(app, aid);
         Some(request_id)
     } else {
-        let session_model_id = app
-            .agents
-            .get(&aid)
-            .and_then(|agent| agent.session.models.current.clone());
-        let session_reasoning_effort = app
-            .agents
-            .get(&aid)
-            .and_then(|agent| agent.session.models.reasoning_effort);
-        let rollback = crate::app::agent::ModelSwitchRollback {
-            request_id: None,
-            app_models_optimistic: true,
-            session_model_id,
-            session_reasoning_effort,
-            app_model_id: app.models.current.clone(),
-            app_reasoning_effort: app.models.reasoning_effort,
-        };
-        if let Some(agent) = app.agents.get_mut(&aid) {
-            agent.session.model_switch_rollback.get_or_insert(rollback);
+        if !crate::app::dispatch::session::lifecycle::begin_deferred_model_switch(app, aid, true) {
+            app.show_toast("Wait for the current model switch to finish");
+            return vec![];
         }
         None
     };

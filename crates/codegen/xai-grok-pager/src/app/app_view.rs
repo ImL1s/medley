@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use xai_acp_lib::AcpAgentTx;
+use xai_grok_shell::sampling::types::ReasoningEffort;
 /// State for the "New Worktree" popup dialog on the welcome screen.
 #[derive(Debug, Default)]
 pub struct NewWorktreeDialogState {
@@ -258,6 +259,21 @@ pub enum TickDemand {
     Slow,
     /// Real animation is on screen: tick at the configured animation fps.
     Fast,
+}
+
+/// App-owned admission and rollback state for the sole model switch that may
+/// be unresolved at a time. Keeping this above the agent map makes removal of
+/// the owning session an explicit abort instead of silently dropping rollback
+/// state with the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelSwitchTransaction {
+    pub owner_agent_id: AgentId,
+    /// `None` while a pre-session switch is deferred or an incompatible-agent
+    /// decision is being handed to a replacement session.
+    pub request_id: Option<u64>,
+    pub app_models_optimistic: bool,
+    pub app_model_id: Option<acp::ModelId>,
+    pub app_reasoning_effort: Option<ReasoningEffort>,
 }
 /// Tick cadence for [`TickDemand::Slow`] (~12fps). Matches the welcome logo's
 /// `SHIMMER_FPS` so slow ticks sample every shimmer frame, and bounds the
@@ -599,6 +615,9 @@ pub struct AppView {
     pub next_agent_id: usize,
     /// Available/selected models (shared across agents).
     pub models: ModelState,
+    /// The one app-wide model-switch transaction, shared by ordinary and
+    /// default-model switches.
+    pub(crate) model_switch_transaction: Option<ModelSwitchTransaction>,
     /// Keybinding definitions.
     pub registry: ActionRegistry,
     /// Settings registry — canonical metadata for user-tunable preferences.
@@ -1403,6 +1422,7 @@ impl AppView {
             agents: IndexMap::new(),
             next_agent_id: 0,
             models,
+            model_switch_transaction: None,
             registry: ActionRegistry::defaults(),
             settings_registry: Arc::new(crate::settings::SettingsRegistry::defaults()),
             current_ui: xai_grok_shell::agent::config::UiConfig::default(),
@@ -5911,6 +5931,7 @@ pub(crate) mod tests {
             agents: indexmap::IndexMap::new(),
             next_agent_id: 0,
             models: ModelState::default(),
+            model_switch_transaction: None,
             registry: ActionRegistry::defaults(),
             settings_registry: std::sync::Arc::new(crate::settings::SettingsRegistry::defaults()),
             current_ui: xai_grok_shell::agent::config::UiConfig::default(),

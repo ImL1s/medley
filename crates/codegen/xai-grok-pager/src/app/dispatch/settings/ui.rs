@@ -1079,6 +1079,8 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
                             && let Some(agent) = app.agents.get_mut(&aid)
                         {
                             crate::app::dispatch::session::lifecycle::begin_model_switch_request(
+                                &mut app.model_switch_transaction,
+                                aid,
                                 &mut agent.session,
                                 &app.models,
                             )

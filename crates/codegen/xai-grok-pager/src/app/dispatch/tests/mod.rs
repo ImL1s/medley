@@ -92,6 +92,7 @@ fn test_app() -> AppView {
         agents: IndexMap::new(),
         next_agent_id: 0,
         models: ModelState::default(),
+        model_switch_transaction: None,
         registry: crate::actions::ActionRegistry::defaults(),
         settings_registry: std::sync::Arc::new(crate::settings::SettingsRegistry::defaults()),
         current_ui: xai_grok_shell::agent::config::UiConfig::default(),

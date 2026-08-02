@@ -972,6 +972,8 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                 return vec![];
             };
             let request_id = super::session::lifecycle::begin_model_switch_request(
+                &mut app.model_switch_transaction,
+                id,
                 &mut agent.session,
                 &app.models,
             );

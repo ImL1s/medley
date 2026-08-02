@@ -1131,6 +1131,8 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
         }
         let deferred_request_id = deferred.as_ref().and_then(|_| {
             crate::app::dispatch::session::lifecycle::begin_model_switch_request(
+                &mut app.model_switch_transaction,
+                agent_id,
                 &mut agent.session,
                 &app.models,
             )

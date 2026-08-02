@@ -1006,7 +1006,12 @@ fn rapid_no_session_model_choices_coalesce_and_keep_original_rollback() {
         .as_ref()
         .expect("first selection captures rollback");
     assert_eq!(rollback.session_model_id.as_ref(), Some(&model_a));
-    assert_eq!(rollback.app_model_id.as_ref(), Some(&model_a));
+    assert_eq!(
+        app.model_switch_transaction
+            .as_ref()
+            .and_then(|transaction| transaction.app_model_id.as_ref()),
+        Some(&model_a)
+    );
     assert_eq!(
         app.agents[&id].session.deferred_model_switch,
         Some((model_c.clone(), None)),

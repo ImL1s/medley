@@ -7,7 +7,7 @@ use crate::acp::tracker::AcpUpdateTracker;
 use crate::app::actions::{Action, Effect, SwitchModelError};
 use crate::app::agent::{AgentCommand, AgentId, AgentSession, AgentState, ModelSwitchRollback};
 use crate::app::agent_view::{ActivePane, AgentView, McpInitProgress};
-use crate::app::app_view::{ActiveView, AppView, TrustState};
+use crate::app::app_view::{ActiveView, AppView, ModelSwitchTransaction, TrustState};
 use crate::app::dispatch::ctx::{
     SwitchCause, get_active_agent, reseed_tip_for_new_session, show_welcome, switch_to_agent,
 };
@@ -37,15 +37,29 @@ pub(crate) struct DeferredSwitchOutcome {
 
 static NEXT_MODEL_SWITCH_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Open the pager-side transaction for one model switch. Only one request may
-/// be in flight per session; callers must leave the UI untouched when this
-/// returns `None`.
+/// Open the pager-side transaction for one model switch. Ordinary and
+/// default-model switches share one app-global admission slot.
 pub(crate) fn begin_model_switch_request(
+    transaction: &mut Option<ModelSwitchTransaction>,
+    agent_id: AgentId,
     session: &mut AgentSession,
     app_models: &ModelState,
 ) -> Option<u64> {
     if session.model_switch_pending {
         return None;
+    }
+    match transaction.as_ref() {
+        Some(active) if active.owner_agent_id == agent_id && active.request_id.is_none() => {}
+        Some(_) => return None,
+        None => {
+            *transaction = Some(ModelSwitchTransaction {
+                owner_agent_id: agent_id,
+                request_id: None,
+                app_models_optimistic: false,
+                app_model_id: app_models.current.clone(),
+                app_reasoning_effort: app_models.reasoning_effort,
+            });
+        }
     }
     let request_id = NEXT_MODEL_SWITCH_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     session.model_switch_pending = true;
@@ -54,14 +68,80 @@ pub(crate) fn begin_model_switch_request(
         .model_switch_rollback
         .get_or_insert_with(|| ModelSwitchRollback {
             request_id: Some(request_id),
-            app_models_optimistic: false,
             session_model_id: session.models.current.clone(),
             session_reasoning_effort: session.models.reasoning_effort,
-            app_model_id: app_models.current.clone(),
-            app_reasoning_effort: app_models.reasoning_effort,
         });
     rollback.request_id.get_or_insert(request_id);
+    transaction
+        .as_mut()
+        .expect("transaction opened above")
+        .request_id = Some(request_id);
     Some(request_id)
+}
+
+/// Reserve the global slot before an ACP session id exists.
+pub(crate) fn begin_deferred_model_switch(
+    app: &mut AppView,
+    agent_id: AgentId,
+    app_models_optimistic: bool,
+) -> bool {
+    if let Some(transaction) = app.model_switch_transaction.as_ref() {
+        return transaction.owner_agent_id == agent_id && transaction.request_id.is_none();
+    }
+    let Some(agent) = app.agents.get_mut(&agent_id) else {
+        return false;
+    };
+    agent
+        .session
+        .model_switch_rollback
+        .get_or_insert_with(|| ModelSwitchRollback {
+            request_id: None,
+            session_model_id: agent.session.models.current.clone(),
+            session_reasoning_effort: agent.session.models.reasoning_effort,
+        });
+    app.model_switch_transaction = Some(ModelSwitchTransaction {
+        owner_agent_id: agent_id,
+        request_id: None,
+        app_models_optimistic,
+        app_model_id: app.models.current.clone(),
+        app_reasoning_effort: app.models.reasoning_effort,
+    });
+    true
+}
+
+pub(crate) fn mark_model_switch_app_optimistic(app: &mut AppView, agent_id: AgentId) {
+    if let Some(transaction) = app.model_switch_transaction.as_mut()
+        && transaction.owner_agent_id == agent_id
+    {
+        transaction.app_models_optimistic = true;
+    }
+}
+
+pub(crate) fn abort_model_switch_transaction(app: &mut AppView, agent_id: AgentId) {
+    let Some(transaction) = app
+        .model_switch_transaction
+        .take_if(|transaction| transaction.owner_agent_id == agent_id)
+    else {
+        return;
+    };
+    if transaction.app_models_optimistic {
+        app.models.current = transaction.app_model_id;
+        app.models.reasoning_effort = transaction.app_reasoning_effort;
+    }
+    if let Some(agent) = app.agents.get_mut(&agent_id) {
+        agent.session.model_switch_pending = false;
+        agent.session.model_switch_request_id = None;
+        agent.session.model_switch_rollback = None;
+    }
+}
+
+fn handoff_model_switch_transaction(app: &mut AppView, from: AgentId, to: AgentId) {
+    if let Some(transaction) = app.model_switch_transaction.as_mut()
+        && transaction.owner_agent_id == from
+    {
+        transaction.owner_agent_id = to;
+        transaction.request_id = None;
+    }
 }
 /// Resolve the stashed `-m` switch and/or `cli_effort_token` against the session
 /// catalog via [`ModelState::resolve_effort_for_model`] (same gate-first policy
@@ -1228,11 +1308,12 @@ pub(in crate::app::dispatch) fn handle_session_created(
             && !agent.chat_kind
             && !agent.app_chat_mode
             && agent.session.deferred_model_switch.is_none()
-            && agent
-                .session
-                .model_switch_rollback
+            && app
+                .model_switch_transaction
                 .as_ref()
-                .is_some_and(|rollback| rollback.app_models_optimistic))
+                .is_some_and(|transaction| {
+                    transaction.owner_agent_id == agent_id && transaction.app_models_optimistic
+                }))
         .then(|| {
             agent
                 .session
@@ -1245,15 +1326,39 @@ pub(in crate::app::dispatch) fn handle_session_created(
         let deferred = apply_deferred_model_switch(agent, app.cli_effort_token.as_deref());
         let deferred_mode = agent.deferred_session_mode.take();
         let cwd = agent.session.cwd.clone();
-        let deferred_request_id = deferred
-            .as_ref()
-            .and_then(|_| begin_model_switch_request(&mut agent.session, &app.models));
+        let deferred_request_id = deferred.as_ref().and_then(|_| {
+            begin_model_switch_request(
+                &mut app.model_switch_transaction,
+                agent_id,
+                &mut agent.session,
+                &app.models,
+            )
+        });
+        let failed_handoff = (handoff_requires_deferred_switch && deferred_request_id.is_none())
+            .then(|| {
+                let source_id = agent
+                    .session
+                    .model_switch_queue_handoff_from
+                    .take()
+                    .expect("handoff gate checked above");
+                let prompts = std::mem::take(&mut agent.session.pending_prompts);
+                agent.session.model_switch_pending = false;
+                agent.session.model_switch_request_id = None;
+                agent.session.model_switch_rollback = None;
+                if let Some(transaction) = app.model_switch_transaction.take()
+                    && transaction.app_models_optimistic
+                {
+                    app.models.current = transaction.app_model_id;
+                    app.models.reasoning_effort = transaction.app_reasoning_effort;
+                }
+                (source_id, prompts)
+            });
         // A handoff without a deferred effort switch is fully adopted by the
         // newly-created target session. Otherwise retain the source marker
         // until the target switch commits, so a failed preflight or session
         // close can still restore the queue instead of draining it under an
         // unverified model configuration.
-        if !handoff_requires_deferred_switch {
+        if !handoff_requires_deferred_switch || failed_handoff.is_some() {
             agent.session.model_switch_queue_handoff_from = None;
         }
         let mut drain = if app.reconnect_pending {
@@ -1269,6 +1374,13 @@ pub(in crate::app::dispatch) fn handle_session_created(
             agent.session.user_model_preference = Some(model_id.clone());
             if app.models.available.contains_key(&model_id) {
                 app.models.set_current(model_id.clone(), reasoning_effort);
+            }
+            if app
+                .model_switch_transaction
+                .as_ref()
+                .is_some_and(|transaction| transaction.owner_agent_id == agent_id)
+            {
+                app.model_switch_transaction = None;
             }
             effects.push(Effect::PersistPreferredModel {
                 model_id,
@@ -1336,6 +1448,16 @@ pub(in crate::app::dispatch) fn handle_session_created(
         });
         notify_session_ready(&app.notification_service, agent);
         note_peek_page_flip(app, agent_id, drain.page_flip_entry);
+        if let Some((source_id, prompts)) = failed_handoff
+            && let Some(source) = app.agents.get_mut(&source_id)
+        {
+            source.session.prepend_pending_prompts(prompts);
+            source.session.model_switch_pending = false;
+            source.session.model_switch_request_id = None;
+            let source_drain = maybe_drain_queue(source);
+            effects.extend(source_drain.effects);
+            note_peek_page_flip(app, source_id, source_drain.page_flip_entry);
+        }
         return effects;
     }
     vec![]
@@ -1369,9 +1491,14 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
         let deferred = apply_deferred_model_switch(agent, app.cli_effort_token.as_deref());
         let deferred_mode = agent.deferred_session_mode.take();
         let cwd = agent.session.cwd.clone();
-        let deferred_request_id = deferred
-            .as_ref()
-            .and_then(|_| begin_model_switch_request(&mut agent.session, &app.models));
+        let deferred_request_id = deferred.as_ref().and_then(|_| {
+            begin_model_switch_request(
+                &mut app.model_switch_transaction,
+                agent_id,
+                &mut agent.session,
+                &app.models,
+            )
+        });
         let mut drain = if app.reconnect_pending {
             QueueDrain {
                 effects: vec![],
@@ -1568,22 +1695,18 @@ fn restore_model_switch_mirrors(
     agent: &mut AgentView,
     app_models: &mut ModelState,
     rollback: Option<&ModelSwitchRollback>,
+    transaction: &ModelSwitchTransaction,
     fallback_model_id: Option<&acp::ModelId>,
 ) {
     if let Some(rollback) = rollback {
         agent.session.models.current = rollback.session_model_id.clone();
         agent.session.models.reasoning_effort = rollback.session_reasoning_effort;
-        if rollback.app_models_optimistic {
-            app_models.current = rollback.app_model_id.clone();
-            app_models.reasoning_effort = rollback.app_reasoning_effort;
-        }
-        return;
-    }
-    if let Some(previous) = fallback_model_id {
+    } else if let Some(previous) = fallback_model_id {
         agent.session.models.set_current(previous.clone(), None);
-        if app_models.available.contains_key(previous) {
-            app_models.set_current(previous.clone(), None);
-        }
+    }
+    if transaction.app_models_optimistic {
+        app_models.current = transaction.app_model_id.clone();
+        app_models.reasoning_effort = transaction.app_reasoning_effort;
     }
 }
 
@@ -1596,6 +1719,21 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
     result: Result<(), SwitchModelError>,
     prev_model_id: Option<acp::ModelId>,
 ) -> Vec<Effect> {
+    let Some(transaction) = app
+        .model_switch_transaction
+        .as_ref()
+        .filter(|transaction| {
+            transaction.owner_agent_id == agent_id && transaction.request_id == Some(request_id)
+        })
+        .cloned()
+    else {
+        tracing::debug!(
+            agent = ?agent_id,
+            request_id,
+            "ignoring completion outside the active app model-switch transaction"
+        );
+        return vec![];
+    };
     let app_chat_mode = app.chat_mode;
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         let persist_preferred_model = !app_chat_mode && !agent.chat_kind && !agent.app_chat_mode;
@@ -1695,12 +1833,21 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                 ..
             }) => {
                 let fallback = error_prev.as_ref().or(prev_model_id.as_ref());
-                restore_model_switch_mirrors(agent, &mut app.models, rollback.as_ref(), fallback);
+                restore_model_switch_mirrors(
+                    agent,
+                    &mut app.models,
+                    rollback.as_ref(),
+                    &transaction,
+                    fallback,
+                );
                 // The decision modal is still part of this transaction. Keep
                 // the queue gated until the user either declines (drain here)
                 // or accepts (handoff to the replacement placeholder).
                 agent.session.model_switch_pending = true;
                 agent.session.model_switch_rollback = rollback.clone();
+                if let Some(active) = app.model_switch_transaction.as_mut() {
+                    active.request_id = None;
+                }
                 agent.active_modal = None;
                 let display_name = agent.session.models.display_name_for(&model_id);
                 return open_agent_type_mismatch_question(
@@ -1721,7 +1868,13 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                     error.model_id, error.required_agent_type, error.reason,
                 );
                 agent.scrollback.push_block(RenderBlock::system(message));
-                restore_model_switch_mirrors(agent, &mut app.models, rollback.as_ref(), fallback);
+                restore_model_switch_mirrors(
+                    agent,
+                    &mut app.models,
+                    rollback.as_ref(),
+                    &transaction,
+                    fallback,
+                );
                 vec![]
             }
             Err(SwitchModelError::Other(msg)) => {
@@ -1729,6 +1882,7 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                     agent,
                     &mut app.models,
                     rollback.as_ref(),
+                    &transaction,
                     prev_model_id.as_ref(),
                 );
                 agent
@@ -1737,6 +1891,7 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                 vec![]
             }
         };
+        app.model_switch_transaction = None;
         let drain = maybe_drain_queue(agent);
         effects.extend(drain.effects);
         note_peek_page_flip(app, agent_id, drain.page_flip_entry);
@@ -1762,6 +1917,7 @@ pub(in crate::app::dispatch) fn dispatch_agent_type_mismatch_answered(
     if start_new {
         let handed_off = std::mem::take(&mut source.session.pending_prompts);
         let (new_aid, effects) = dispatch_new_session_inner_with_id(app, Some(model_id.clone()));
+        handoff_model_switch_transaction(app, source_id, new_aid);
         if let Some(agent) = app.agents.get_mut(&new_aid) {
             agent.session.model_switch_rollback = carried_rollback.map(|mut rollback| {
                 rollback.request_id = None;
@@ -1778,6 +1934,7 @@ pub(in crate::app::dispatch) fn dispatch_agent_type_mismatch_answered(
         }
         effects
     } else {
+        abort_model_switch_transaction(app, source_id);
         let agent = app
             .agents
             .get_mut(&source_id)
@@ -1820,7 +1977,12 @@ pub(in crate::app::dispatch) fn dispatch_auth_class_switch_answered(
         agent.session.deferred_model_switch = Some((model_id, effort));
         return vec![];
     };
-    let Some(request_id) = begin_model_switch_request(&mut agent.session, &app.models) else {
+    let Some(request_id) = begin_model_switch_request(
+        &mut app.model_switch_transaction,
+        id,
+        &mut agent.session,
+        &app.models,
+    ) else {
         app.show_toast("Wait for the current model switch to finish");
         return vec![];
     };

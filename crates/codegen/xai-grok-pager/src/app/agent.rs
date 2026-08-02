@@ -760,14 +760,8 @@ pub struct ModelSwitchRollback {
     /// Request that owns this rollback once the ACP switch has started.
     /// `None` while a pre-session default switch is only deferred.
     pub request_id: Option<u64>,
-    /// Whether this transaction optimistically changed the app-wide model
-    /// mirror. Session-only switches must not restore that global mirror on
-    /// reconnect.
-    pub app_models_optimistic: bool,
     pub session_model_id: Option<acp::ModelId>,
     pub session_reasoning_effort: Option<ReasoningEffort>,
-    pub app_model_id: Option<acp::ModelId>,
-    pub app_reasoning_effort: Option<ReasoningEffort>,
 }
 /// Captured state for a prompt that has been sent but not yet acknowledged
 /// by any server activity. See `AgentSession::in_flight_prompt`.
