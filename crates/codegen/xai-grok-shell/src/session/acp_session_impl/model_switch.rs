@@ -53,6 +53,7 @@ impl SessionActor {
                 max_completion_tokens: sampling_config.max_completion_tokens,
                 temperature: sampling_config.temperature,
                 top_p: sampling_config.top_p,
+                endpoint_trust: sampling_config.endpoint_trust,
                 api_backend: sampling_config.api_backend.clone(),
                 extra_headers: sampling_config.extra_headers.clone(),
                 query_params: sampling_config.query_params.clone(),

@@ -793,6 +793,7 @@ async fn read_parent_sampling_config(
                 max_completion_tokens: cfg.max_completion_tokens,
                 temperature: cfg.temperature,
                 top_p: cfg.top_p,
+                endpoint_trust: None,
                 api_backend: cfg.api_backend,
                 auth_scheme,
                 extra_headers,

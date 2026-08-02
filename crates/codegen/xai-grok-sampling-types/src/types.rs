@@ -1038,6 +1038,31 @@ impl ApiBackend {
     }
 }
 
+/// Trust classification of the resolved inference endpoint, decided at
+/// config resolution time and enforced at request construction.
+///
+/// `FirstPartyXai` endpoints receive full first-party request metadata
+/// (`x-grok-*` correlation headers, client identifier, trace context).
+/// `External` and `Local` endpoints receive only protocol headers, the
+/// selected provider credential, a minimal User-Agent, and explicitly
+/// configured provider headers — internal metadata must never create
+/// cross-provider correlation.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointTrustClass {
+    /// An xAI-operated endpoint authenticated with first-party credentials.
+    FirstPartyXai,
+    /// A third-party remote endpoint (OpenAI/Anthropic-compatible or custom).
+    /// The fail-closed default: an unclassified endpoint gets no first-party
+    /// metadata.
+    #[default]
+    External,
+    /// A loopback endpoint (local model runtimes).
+    Local,
+}
+
 /// Sampling client configuration (API key excluded — that stays in the client).
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct SamplingConfig {
@@ -1068,6 +1093,11 @@ pub struct SamplingConfig {
     /// API request body so the upstream emits per-chunk argument deltas.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_tool_calls: Option<bool>,
+    /// Explicit endpoint trust override carried from config resolution into
+    /// request construction. `None` lets the sampling client derive the class
+    /// from `base_url` and auth scheme.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_trust: Option<EndpointTrustClass>,
 }
 
 impl std::fmt::Debug for SamplingConfig {
@@ -1085,6 +1115,7 @@ impl std::fmt::Debug for SamplingConfig {
             .field("context_window", &self.context_window)
             .field("reasoning_effort", &self.reasoning_effort)
             .field("stream_tool_calls", &self.stream_tool_calls)
+            .field("endpoint_trust", &self.endpoint_trust)
             .finish()
     }
 }
