@@ -212,8 +212,8 @@ impl SessionActor {
                     {
                         return Err(model_switch_harness_error(
                             &catalog_model_id,
-                            &required_agent_type,
                             &previous_active_agent_type,
+                            &required_agent_type,
                             "workspace_rollback_failed",
                         ));
                     }
@@ -222,8 +222,8 @@ impl SessionActor {
                     if self.chat_state_handle.snapshot().await.is_none() {
                         return Err(model_switch_harness_error(
                             &catalog_model_id,
-                            &required_agent_type,
                             &previous_active_agent_type,
+                            &required_agent_type,
                             "chat_state_rollback_failed",
                         ));
                     }

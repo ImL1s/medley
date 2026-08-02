@@ -30,7 +30,7 @@ impl FailureTelemetry {
             session_id: session_id.0.to_string(),
             previous_model_id: String::new(),
             new_model_id: model_id.0.to_string(),
-            error_code: config::MODEL_SWITCH_REBUILD_FAILED,
+            error_code: config::MODEL_SWITCH_VALIDATION_FAILED,
             required_agent_type: None,
             current_agent_type: None,
         }
@@ -38,6 +38,14 @@ impl FailureTelemetry {
 
     fn disarm(&mut self) {
         self.armed = false;
+    }
+
+    fn mark_rebuild_phase(&mut self) {
+        self.error_code = config::MODEL_SWITCH_REBUILD_FAILED;
+    }
+
+    fn mark_incompatible(&mut self) {
+        self.error_code = config::MODEL_SWITCH_INCOMPATIBLE_AGENT;
     }
 }
 
@@ -190,6 +198,9 @@ pub(crate) async fn apply(
         )
     };
     let (tx, rx) = oneshot::channel();
+    // Validation and preparation are complete. Failures from this point are
+    // actor/rebuild failures unless the actor returns the typed mismatch gate.
+    failure_telemetry.mark_rebuild_phase();
     handle
         .cmd_tx
         .send(SessionCommand::ApplyModelSwitch {
@@ -208,7 +219,7 @@ pub(crate) async fn apply(
         Ok(Ok(receipt)) => receipt,
         Ok(Err(err)) => {
             if config::ModelSwitchIncompatibleAgentError::from_acp_error(&err).is_some() {
-                failure_telemetry.error_code = config::MODEL_SWITCH_INCOMPATIBLE_AGENT;
+                failure_telemetry.mark_incompatible();
             }
             return Err(err);
         }
@@ -285,5 +296,28 @@ fn broadcast_model_changed(
                 "x.ai/session_notification",
                 params.into(),
             ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failure_telemetry_tracks_validation_rebuild_and_mismatch_phases() {
+        let session_id = acp::SessionId::new("session");
+        let model_id = acp::ModelId::new("target-model");
+        let mut telemetry = FailureTelemetry::new(&session_id, &model_id);
+
+        assert_eq!(telemetry.error_code, config::MODEL_SWITCH_VALIDATION_FAILED);
+        telemetry.mark_rebuild_phase();
+        assert_eq!(telemetry.error_code, config::MODEL_SWITCH_REBUILD_FAILED);
+        telemetry.mark_incompatible();
+        assert_eq!(
+            telemetry.error_code,
+            config::MODEL_SWITCH_INCOMPATIBLE_AGENT
+        );
+
+        telemetry.disarm();
     }
 }

@@ -1046,13 +1046,16 @@ impl AgentView {
     /// view opened, so typed "additional context" doesn't leak into the
     /// main prompt. Also clears any stashed (tab-hidden) question view.
     fn dismiss_question_view(&mut self) -> InputOutcome {
-        let is_doctor_fix = self.question_view.as_ref().is_some_and(|qv| {
+        let requires_explicit_decline = self.question_view.as_ref().is_some_and(|qv| {
             matches!(
                 qv.local_kind,
-                Some(crate::views::question_view::LocalQuestionKind::DoctorFix { .. })
+                Some(
+                    crate::views::question_view::LocalQuestionKind::DoctorFix { .. }
+                        | crate::views::question_view::LocalQuestionKind::AgentTypeMismatch { .. }
+                )
             )
         });
-        if is_doctor_fix {
+        if requires_explicit_decline {
             return self.submit_question_answers(true);
         }
         if let Some(qv) = self.question_view.take() {

@@ -1404,6 +1404,72 @@ fn incompatible_model_switch_holds_queue_until_declined() {
 }
 
 #[test]
+fn incompatible_model_switch_cancel_keys_decline_and_release_queue() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    for key in [
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT),
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+    ] {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        let model_id = acp::ModelId::new("cursor-model");
+        {
+            let agent = app.agents.get_mut(&id).unwrap();
+            agent.session.model_switch_pending = true;
+            agent.session.model_switch_request_id = Some(0);
+            agent.session.enqueue_prompt("queued prompt".into());
+        }
+        let error = xai_grok_shell::agent::config::ModelSwitchIncompatibleAgentError {
+            code: "MODEL_SWITCH_INCOMPATIBLE_AGENT".into(),
+            active_agent_type: "grok-build".into(),
+            required_agent_type: "cursor".into(),
+            model_id: model_id.0.to_string(),
+            suggestion: "start_new_session".into(),
+        };
+        dispatch(
+            Action::TaskComplete(TaskResult::SwitchModelComplete {
+                agent_id: id,
+                model_id: model_id.clone(),
+                effort: None,
+                request_id: 0,
+                result: Err(SwitchModelError::IncompatibleAgent {
+                    error,
+                    prev_model_id: None,
+                }),
+                prev_model_id: None,
+            }),
+            &mut app,
+        );
+
+        let outcome = app
+            .agents
+            .get_mut(&id)
+            .unwrap()
+            .handle_question_key_for_test(&key);
+        let crate::app::app_view::InputOutcome::Action(action) = outcome else {
+            panic!("cancel key {key:?} must decline the mismatch: {outcome:?}");
+        };
+        assert!(matches!(
+            action,
+            Action::AgentTypeMismatchAnswered {
+                start_new: false,
+                ..
+            }
+        ));
+
+        let effects = dispatch(action, &mut app);
+        assert!(effects.iter().any(
+            |effect| matches!(effect, Effect::SendPrompt { text, .. } if text == "queued prompt")
+        ));
+        assert_eq!(app.agents[&id].session.queue_len(), 0);
+        assert!(!app.agents[&id].session.model_switch_pending);
+        assert!(app.agents[&id].question_view.is_none());
+    }
+}
+
+#[test]
 fn incompatible_model_switch_hands_queue_to_replacement_until_target_switch_succeeds() {
     use xai_grok_shell::sampling::types::ReasoningEffort;
 
@@ -2010,6 +2076,103 @@ fn generic_switch_failure_restores_exact_model_mirrors_and_effort() {
     assert_eq!(app.models.current, Some(prev_model));
     assert_eq!(app.models.reasoning_effort, Some(ReasoningEffort::Low));
     assert!(!app.agents[&id].session.model_switch_pending);
+}
+
+#[test]
+fn session_only_switch_failure_preserves_another_sessions_committed_default() {
+    let mut app = test_app_with_agent();
+    let first_id = AgentId(0);
+    let session_original = acp::ModelId::new("session-original");
+    let session_target = acp::ModelId::new("session-target");
+    let global_original = acp::ModelId::new("global-original");
+    let global_new = acp::ModelId::new("global-new");
+
+    for (model_id, name) in [
+        (session_original.clone(), "Session Original"),
+        (session_target.clone(), "Session Target"),
+    ] {
+        app.agents[&first_id]
+            .session
+            .models
+            .available
+            .insert(model_id.clone(), acp::ModelInfo::new(model_id, name));
+    }
+    app.agents
+        .get_mut(&first_id)
+        .unwrap()
+        .session
+        .models
+        .set_current(session_original.clone(), None);
+    for (model_id, name) in [
+        (global_original.clone(), "Global Original"),
+        (global_new.clone(), "Global New"),
+    ] {
+        app.models
+            .available
+            .insert(model_id.clone(), acp::ModelInfo::new(model_id, name));
+    }
+    app.models.set_current(global_original.clone(), None);
+
+    let first_effects = dispatch(
+        Action::SwitchModel {
+            model_id: session_target.clone(),
+            effort: None,
+        },
+        &mut app,
+    );
+    let first_request_id = switch_model_request_id(&first_effects);
+    assert!(
+        !app.agents[&first_id]
+            .session
+            .model_switch_rollback
+            .as_ref()
+            .unwrap()
+            .app_models_optimistic,
+        "an ordinary session switch must not own the app-wide model mirror"
+    );
+
+    let (second_id, _) =
+        crate::app::dispatch::session::lifecycle::dispatch_new_session_inner_with_id(
+            &mut app, None,
+        );
+    app.agents.get_mut(&second_id).unwrap().session.session_id = Some("session-b".into());
+    let second_effects = dispatch(Action::SetDefaultModel(global_new.clone()), &mut app);
+    let second_request_id = switch_model_request_id(&second_effects);
+    dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id: second_id,
+            model_id: global_new.clone(),
+            effort: None,
+            request_id: second_request_id,
+            result: Ok(()),
+            prev_model_id: Some(global_original),
+        }),
+        &mut app,
+    );
+    assert_eq!(app.models.current, Some(global_new.clone()));
+
+    dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id: first_id,
+            model_id: session_target,
+            effort: None,
+            request_id: first_request_id,
+            result: Err(SwitchModelError::Other("session switch failed".into())),
+            prev_model_id: None,
+        }),
+        &mut app,
+    );
+
+    assert_eq!(
+        app.agents[&first_id].session.models.current,
+        Some(session_original)
+    );
+    assert_eq!(
+        app.models.current,
+        Some(global_new),
+        "a session-only rollback must not overwrite another session's committed default"
+    );
+    assert!(!app.agents[&first_id].session.model_switch_pending);
 }
 
 #[test]

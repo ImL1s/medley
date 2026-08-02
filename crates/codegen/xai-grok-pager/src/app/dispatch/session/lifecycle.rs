@@ -1521,8 +1521,10 @@ fn restore_model_switch_mirrors(
     if let Some(rollback) = rollback {
         agent.session.models.current = rollback.session_model_id.clone();
         agent.session.models.reasoning_effort = rollback.session_reasoning_effort;
-        app_models.current = rollback.app_model_id.clone();
-        app_models.reasoning_effort = rollback.app_reasoning_effort;
+        if rollback.app_models_optimistic {
+            app_models.current = rollback.app_model_id.clone();
+            app_models.reasoning_effort = rollback.app_reasoning_effort;
+        }
         return;
     }
     if let Some(previous) = fallback_model_id {

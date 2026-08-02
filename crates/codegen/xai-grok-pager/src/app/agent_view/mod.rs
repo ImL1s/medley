@@ -1673,7 +1673,16 @@ fn translate_local_submit(
         );
     }
     if skipped {
-        return InputOutcome::Changed;
+        return match kind {
+            LocalQuestionKind::AgentTypeMismatch { model_id, effort } => {
+                InputOutcome::Action(Action::AgentTypeMismatchAnswered {
+                    start_new: false,
+                    model_id,
+                    effort,
+                })
+            }
+            _ => InputOutcome::Changed,
+        };
     }
     let Some(QuestionSelection::Single(Some(idx))) = qv.selections.first() else {
         return InputOutcome::Changed;

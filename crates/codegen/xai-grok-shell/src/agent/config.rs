@@ -6160,6 +6160,9 @@ pub fn to_acp_model_info(
 }
 /// Error code for model switch rejection due to agent type mismatch.
 pub const MODEL_SWITCH_INCOMPATIBLE_AGENT: &str = "MODEL_SWITCH_INCOMPATIBLE_AGENT";
+/// Error code for failures before a prepared model switch reaches the session
+/// actor (for example an unknown session, unknown model, or readiness gate).
+pub const MODEL_SWITCH_VALIDATION_FAILED: &str = "MODEL_SWITCH_VALIDATION_FAILED";
 /// Error code for model switch failure during the zero-turn full harness
 /// rebuild path. Emitted when `RebuildAgentForDefinition` fails (definition
 /// could not be resolved at handler time, `AgentBuilder::build()` errored,
