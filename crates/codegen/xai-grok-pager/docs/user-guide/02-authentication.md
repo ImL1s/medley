@@ -81,6 +81,14 @@ Codex-backed models appear ready only when this scoped credential is usable or
 refreshable. Account entitlements, workspace policy, rate limits, and model
 availability are still enforced by OpenAI.
 
+Grok ships one built-in Codex model, `gpt-5.6-sol`, so no config editing is
+needed to use this provider. Before you log in it is listed as unready with
+the reason `sign in with grok login --provider openai-codex`; after a
+successful login it becomes selectable in `grok models` and the `/model`
+picker. To change its metadata or add other Codex models, declare them in the
+**global** `~/.grok/config.toml` — see
+[Custom Models](11-custom-models.md#openai-codex-chatgpt-subscription).
+
 ---
 
 ## API Key

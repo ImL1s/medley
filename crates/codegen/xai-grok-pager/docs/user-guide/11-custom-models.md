@@ -75,7 +75,13 @@ To send provider-specific non-secret headers -- for example, Anthropic's `anthro
 
 ## Configuring Custom Models
 
-Add custom model endpoints in `~/.grok/config.toml` under `[model.<name>]` sections:
+Add custom model endpoints in `~/.grok/config.toml` under `[model.<name>]` sections.
+
+Model entries load from that **global** file only. A `[model.*]` or
+`[model_providers.*]` block in a project-local `.grok/config.toml` has no
+effect — the project tier contributes MCP servers, plugins, and permissions
+only. Grok warns at session start and lists the file under Config Warnings in
+`grok inspect` when it finds one.
 
 ```toml
 [model.my-model]
@@ -258,19 +264,27 @@ env_key = "OPENAI_API_KEY"
 
 ### OpenAI Codex (ChatGPT subscription)
 
-Sign in to the dedicated provider, then point a model declaration at the
-reserved built-in profile:
+Grok ships a built-in Codex model, so signing in is the only required step:
 
 ```bash
 grok login --provider openai-codex
 ```
 
+The preset is `gpt-5.6-sol`. It is present in `grok models` and the `/model`
+picker from a fresh install, listed as unready with the reason `sign in with
+grok login --provider openai-codex` until the credential above exists, and
+selectable once it does. Nothing has to be written to `config.toml` for it.
+
+To change the preset's metadata, declare the same catalog key in the global
+config — a matching `[model."gpt-5.6-sol"]` replaces the preset rather than
+adding a second entry. Use the same shape to add other Codex models:
+
 ```toml
-[model.my-codex-model]
-model = "<supported-codex-model-id>"
+[model."gpt-5.6-sol"]
+model = "gpt-5.6-sol"
 model_provider = "openai-codex"
 name = "OpenAI Codex"
-context_window = 200000 # example only; use metadata accurate for the model
+context_window = 200000 # the preset's value; raise it if your account allows more
 ```
 
 The `openai-codex` provider fixes the transport to

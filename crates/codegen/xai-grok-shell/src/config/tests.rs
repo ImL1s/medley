@@ -3713,3 +3713,49 @@ fn from_remote_gated_requires_xai_auth_for_writeback() {
         StorageMode::Local
     );
 }
+/// Project `.grok/config.toml` contributes MCP servers, plugins, and
+/// permissions only. `[model.*]` / `[model_providers.*]` written there load
+/// nowhere, so they must be reported rather than silently dropped.
+#[test]
+fn project_local_model_sections_are_reported_as_inert() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("repo");
+    std::fs::create_dir_all(project.join(".grok")).unwrap();
+    let config_path = project.join(".grok").join("config.toml");
+    std::fs::write(
+        &config_path,
+        "[mcp_servers.demo]\ncommand = \"true\"\n\n\
+         [model.\"gpt-5.6-sol\"]\nmodel = \"gpt-5.6-sol\"\nmodel_provider = \"openai-codex\"\n\n\
+         [model_providers.gateway]\nbase_url = \"https://gateway.example/v1\"\n",
+    )
+    .unwrap();
+
+    let findings = inert_project_model_sections(&project);
+    assert_eq!(findings.len(), 1, "one offending project config: {findings:?}");
+    assert_eq!(findings[0].0, config_path);
+    assert_eq!(findings[0].1, vec!["model", "model_providers"]);
+
+    let message = inert_project_model_sections_message(&findings[0].0, &findings[0].1);
+    assert!(message.contains("[model.*]"), "{message}");
+    assert!(message.contains("[model_providers.*]"), "{message}");
+    assert!(message.contains(&config_path.display().to_string()), "{message}");
+    assert!(
+        message.contains("Move these entries to"),
+        "the warning must point at the global config: {message}"
+    );
+}
+/// A project config that stays within the sections the project tier loads
+/// must not warn — otherwise every repo with an `.grok/config.toml` is noisy.
+#[test]
+fn project_config_without_model_sections_is_quiet() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("repo");
+    std::fs::create_dir_all(project.join(".grok")).unwrap();
+    std::fs::write(
+        project.join(".grok").join("config.toml"),
+        "[mcp_servers.demo]\ncommand = \"true\"\n\n[permission]\nrules = []\n",
+    )
+    .unwrap();
+
+    assert!(inert_project_model_sections(&project).is_empty());
+}

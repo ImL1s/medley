@@ -41,10 +41,9 @@ impl AuthStatus {
         if crate::agent::auth_method::should_advertise_xai_api_key(
             agent_config.grok_com_config.api_key_auth_disabled(),
             models.values(),
-        ) && let Some(name) = models
-            .iter()
-            .find_map(|(name, entry)| entry.has_own_credentials().then(|| name.clone()))
-        {
+        ) && let Some(name) = models.iter().find_map(|(name, entry)| {
+            (entry.has_own_credentials() && !entry.is_openai_codex_profile()).then(|| name.clone())
+        }) {
             return Self::ModelCredentials(name);
         }
         if agent_config.endpoints.deployment_key.is_some() {

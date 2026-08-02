@@ -54,7 +54,9 @@ pub fn has_xai_api_key_env() -> bool {
 ///
 /// Probes `std::env` at call time and consults each `ModelEntry` for a
 /// resolvable api_key/env_key -- both inputs can change between calls, so the
-/// result is not cached.
+/// result is not cached. Entries on the reserved OpenAI Codex profile are
+/// skipped: their bearer comes from that provider's own OAuth login, so the
+/// built-in preset is not evidence of an xAI or BYOK key.
 ///
 /// `disable_api_key_auth` (`[grok_com_config] disable_api_key_auth` /
 /// `GROK_DISABLE_API_KEY_AUTH`) is the admin kill switch: when true the
@@ -67,7 +69,10 @@ where
     if disable_api_key_auth {
         return false;
     }
-    has_xai_api_key_env() || models.into_iter().any(ModelEntry::has_own_credentials)
+    has_xai_api_key_env()
+        || models
+            .into_iter()
+            .any(|m| m.has_own_credentials() && !m.is_openai_codex_profile())
 }
 
 /// Inputs to [`build_auth_methods`].
@@ -887,6 +892,38 @@ mod tests {
                  uses to decide whether to show the login screen",
             );
         }
+    }
+
+    /// The built-in Codex preset ships with every install and satisfies
+    /// `has_own_credentials()` (its traffic must not carry an xAI session
+    /// token), but its bearer comes from `grok login --provider openai-codex`.
+    /// Counting it as an external key would advertise `xai.api_key` first for
+    /// every user and skip the login screen with no key anywhere.
+    #[test]
+    #[serial]
+    fn builtin_openai_codex_preset_does_not_advertise_xai_api_key() {
+        let _global = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        let _legacy = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+        let cfg = Config::new_from_toml_cfg(&toml::Value::Table(toml::map::Map::new()))
+            .expect("an empty config should parse");
+        let models = resolve_model_list(&cfg, None);
+        assert!(
+            models.values().any(ModelEntry::is_openai_codex_profile),
+            "this test is vacuous unless the Codex preset is in the catalog"
+        );
+
+        assert!(!should_advertise_xai_api_key(false, models.values()));
+        let built = build_auth_methods(AuthMethodsBuildInputs {
+            has_external_api_key: false,
+            has_cached_token: false,
+            ..default_inputs()
+        });
+        assert_ne!(
+            first_kind(&built.methods),
+            Some(AuthMethodKind::XaiApiKey),
+            "the Codex preset alone must not skip the login screen",
+        );
     }
 
     /// `XAI_API_KEY` alone (no per-model creds) also triggers

@@ -7,12 +7,49 @@ use crate::sampling::ApiBackend;
 /// Reserved first-party provider profile for ChatGPT Codex OAuth traffic.
 pub const OPENAI_CODEX_PROVIDER_ID: &str = "openai-codex";
 
+/// Catalog key and routing slug of the built-in Codex preset. The two are the
+/// same string so a user's `[model."gpt-5.6-sol"]` in the global config
+/// replaces the preset in place instead of adding a second entry.
+pub const OPENAI_CODEX_PRESET_MODEL_ID: &str = "gpt-5.6-sol";
+
+/// Conservative context window for the preset. Codex-side metadata is not
+/// discoverable from the CLI, and under-reporting only makes auto-compact fire
+/// earlier, so this matches the value the custom-models guide has always used
+/// in its Codex example.
+const OPENAI_CODEX_PRESET_CONTEXT_WINDOW: u64 = 200_000;
+
 fn openai_codex_provider() -> ModelProviderConfig {
     ModelProviderConfig {
         base_url: Some(crate::auth::openai_codex::CODEX_API_BASE_URL.to_owned()),
         api_backend: Some(ApiBackend::CodexResponses),
         ..ModelProviderConfig::default()
     }
+}
+
+/// Built-in `[model.*]` entries bound to the reserved `openai-codex` provider.
+///
+/// Without these, `grok login --provider openai-codex` succeeds into a session
+/// with no Codex model at all: the reserved provider ships no catalog entries,
+/// so the user has to hand-write a `[model.<id>]` block in the *global*
+/// `$GROK_HOME/config.toml` before anything is selectable.
+///
+/// Seeded by [`super::config::Config::new_from_toml_cfg`] only for keys the
+/// user has not defined, so a hand-written entry still wins. They carry no
+/// credential of their own — readiness gates on the provider-scoped OAuth
+/// snapshot exactly like a hand-written entry does, which is what surfaces
+/// them as unready with a "sign in" reason before login.
+pub(crate) fn openai_codex_preset_models() -> IndexMap<String, ConfigModelOverride> {
+    IndexMap::from([(
+        OPENAI_CODEX_PRESET_MODEL_ID.to_owned(),
+        ConfigModelOverride {
+            model: Some(OPENAI_CODEX_PRESET_MODEL_ID.to_owned()),
+            model_provider: Some(OPENAI_CODEX_PROVIDER_ID.to_owned()),
+            name: Some("GPT-5.6 Sol (Codex)".to_owned()),
+            description: Some("OpenAI Codex via a ChatGPT subscription".to_owned()),
+            context_window: Some(OPENAI_CODEX_PRESET_CONTEXT_WINDOW),
+            ..ConfigModelOverride::default()
+        },
+    )])
 }
 
 #[derive(Clone, Default, serde::Deserialize)]
@@ -1216,6 +1253,148 @@ mod tests {
             None,
             "even a live native Codex token is detached from a custom-origin entry"
         );
+    }
+
+    /// Auth home holding the credential a successful `grok login --provider
+    /// openai-codex` writes.
+    fn live_codex_auth_home() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().expect("temporary auth home");
+        let auth = crate::auth::GrokAuth {
+            key: "live-access-token".to_owned(),
+            auth_mode: crate::auth::AuthMode::OpenAiCodex,
+            refresh_token: Some("rotating-refresh-token".to_owned()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            oidc_issuer: Some(crate::auth::openai_codex::ISSUER.to_owned()),
+            oidc_client_id: Some(crate::auth::openai_codex::CLIENT_ID.to_owned()),
+            account_id: Some("account-id".to_owned()),
+            ..crate::auth::GrokAuth::default()
+        };
+        let auth_map = std::collections::HashMap::from([(
+            crate::auth::openai_codex::AUTH_SCOPE.to_owned(),
+            auth,
+        )]);
+        std::fs::write(
+            temp.path().join("auth.json"),
+            serde_json::to_vec(&auth_map).unwrap(),
+        )
+        .unwrap();
+        temp
+    }
+
+    /// The preset's readiness must be decided by the credential in `auth_home`,
+    /// not by whatever `$GROK_HOME` the test runner happens to have.
+    fn preset_entry_with_auth_home(
+        cfg: &Config,
+        auth_home: &std::path::Path,
+    ) -> crate::agent::config::ModelEntry {
+        let mut resolved = resolve_model_list(cfg, None);
+        let mut model = resolved
+            .shift_remove(OPENAI_CODEX_PRESET_MODEL_ID)
+            .expect("built-in Codex preset should resolve");
+        model.auth_provider = Some(crate::auth::AuthProviderRef::openai_codex(
+            crate::auth::openai_codex::manager(auth_home),
+        ));
+        model
+    }
+
+    #[test]
+    fn builtin_openai_codex_preset_exists_without_user_config() {
+        let cfg = Config::new_from_toml_cfg(&toml::Value::Table(toml::map::Map::new()))
+            .expect("an empty config should parse");
+        let preset = cfg
+            .config_models
+            .get(OPENAI_CODEX_PRESET_MODEL_ID)
+            .expect("the Codex preset must ship without any user config");
+        assert_eq!(preset.model.as_deref(), Some(OPENAI_CODEX_PRESET_MODEL_ID));
+        assert_eq!(
+            preset.model_provider.as_deref(),
+            Some(OPENAI_CODEX_PROVIDER_ID)
+        );
+        assert!(
+            preset.api_key.is_none() && preset.env_key.is_none() && preset.base_url.is_none(),
+            "the preset must carry no credential or origin of its own"
+        );
+
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved
+            .get(OPENAI_CODEX_PRESET_MODEL_ID)
+            .expect("the preset must resolve into the catalog");
+        assert_eq!(
+            model.info.base_url,
+            crate::auth::openai_codex::CODEX_API_BASE_URL
+        );
+        assert_eq!(model.info.api_backend, ApiBackend::CodexResponses);
+        assert_eq!(
+            model
+                .auth_provider
+                .as_ref()
+                .map(|provider| provider.name.as_str()),
+            Some(OPENAI_CODEX_PROVIDER_ID)
+        );
+        assert!(
+            model.is_openai_codex_profile(),
+            "the preset must be excluded from the xAI/BYOK key predicates"
+        );
+    }
+
+    #[test]
+    fn builtin_openai_codex_preset_is_unready_before_login() {
+        let cfg = Config::new_from_toml_cfg(&toml::Value::Table(toml::map::Map::new()))
+            .expect("an empty config should parse");
+        let temp = tempfile::tempdir().expect("temporary auth home");
+        let model = preset_entry_with_auth_home(&cfg, temp.path());
+
+        let (ready, reason) = crate::agent::config::model_readiness(&model);
+        assert!(!ready, "the preset must not be selectable before login");
+        let reason = reason.expect("an unready preset must say why");
+        assert!(
+            reason.contains("grok login --provider openai-codex"),
+            "the reason must name the login command, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn builtin_openai_codex_preset_is_selectable_after_login() {
+        let cfg = Config::new_from_toml_cfg(&toml::Value::Table(toml::map::Map::new()))
+            .expect("an empty config should parse");
+        let temp = live_codex_auth_home();
+        let model = preset_entry_with_auth_home(&cfg, temp.path());
+
+        assert_eq!(crate::agent::config::model_readiness(&model), (true, None));
+        assert_eq!(
+            resolve_credentials(&model, Some("xai-session-token"))
+                .api_key
+                .as_deref(),
+            Some("live-access-token"),
+            "the preset must sample with the Codex bearer, never the xAI session token"
+        );
+    }
+
+    #[test]
+    fn user_global_config_overrides_the_builtin_openai_codex_preset() {
+        let toml_cfg: toml::Value = toml::from_str(&format!(
+            r#"
+            [model."{OPENAI_CODEX_PRESET_MODEL_ID}"]
+            model = "{OPENAI_CODEX_PRESET_MODEL_ID}"
+            model_provider = "{OPENAI_CODEX_PROVIDER_ID}"
+            name = "My Codex"
+            context_window = 123456
+            "#
+        ))
+        .unwrap();
+
+        let cfg = Config::new_from_toml_cfg(&toml_cfg).expect("config should parse");
+        assert_eq!(
+            cfg.config_models.len(),
+            1,
+            "the preset must merge into the user's entry, not sit alongside it"
+        );
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved
+            .get(OPENAI_CODEX_PRESET_MODEL_ID)
+            .expect("the user's entry keeps the preset key");
+        assert_eq!(model.info.name.as_deref(), Some("My Codex"));
+        assert_eq!(model.info.context_window.get(), 123_456);
     }
 
     #[test]

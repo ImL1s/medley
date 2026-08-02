@@ -1484,6 +1484,82 @@ pub fn load_project_config(cwd: &std::path::Path) -> std::io::Result<toml::Value
     load_config_file(&cwd.join(".grok").join("config.toml"))
 }
 pub use xai_grok_workspace::project_config::find_project_configs;
+/// Config sections a project `.grok/config.toml` never contributes. The
+/// project tier is consulted for MCP servers, plugins, and permissions only,
+/// so model entries written there are inert. Project-scoped model support is
+/// tracked separately; until it lands, the only fix is moving them to the
+/// global config, which is what [`warn_inert_project_model_sections`] says.
+pub const PROJECT_INERT_MODEL_SECTIONS: [&str; 2] = ["model", "model_providers"];
+/// One entry per project `.grok/config.toml` at or above `cwd` that declares a
+/// section from [`PROJECT_INERT_MODEL_SECTIONS`], naming the sections it
+/// declares. Empty when every project config stays within the sections the
+/// project tier actually loads.
+pub fn inert_project_model_sections(
+    cwd: &std::path::Path,
+) -> Vec<(std::path::PathBuf, Vec<&'static str>)> {
+    find_project_configs(cwd)
+        .into_iter()
+        .filter_map(|path| {
+            let root = load_config_file(&path).ok()?;
+            let declared: Vec<&'static str> = PROJECT_INERT_MODEL_SECTIONS
+                .into_iter()
+                .filter(|section| root.get(section).is_some())
+                .collect();
+            (!declared.is_empty()).then_some((path, declared))
+        })
+        .collect()
+}
+/// Human-readable warning for one [`inert_project_model_sections`] finding.
+pub fn inert_project_model_sections_message(
+    path: &std::path::Path,
+    declared: &[&'static str],
+) -> String {
+    let sections = declared
+        .iter()
+        .map(|section| format!("[{section}.*]"))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    let global = user_grok_home()
+        .map(|home| home.join("config.toml").display().to_string())
+        .unwrap_or_else(|| "$GROK_HOME/config.toml".to_owned());
+    format!(
+        "{sections} in {} is ignored: a project config contributes MCP servers, \
+         plugins, and permissions only. Move these entries to {global} for them to load.",
+        path.display()
+    )
+}
+/// Logs [`inert_project_model_sections`] once per distinct finding, so a
+/// persistently misplaced `[model.*]` warns once per process rather than once
+/// per config reload. Returns the findings so callers can surface them too.
+pub fn warn_inert_project_model_sections(
+    cwd: &std::path::Path,
+) -> Vec<(std::path::PathBuf, Vec<&'static str>)> {
+    use std::hash::{Hash as _, Hasher as _};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let findings = inert_project_model_sections(cwd);
+    static LAST_LOGGED: AtomicU64 = AtomicU64::new(0);
+    // 0 means "nothing found"; real hashes are clamped to nonzero.
+    let hash = if findings.is_empty() {
+        0
+    } else {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        findings.hash(&mut hasher);
+        hasher.finish().max(1)
+    };
+    if LAST_LOGGED.swap(hash, Ordering::Relaxed) == hash {
+        return findings;
+    }
+    for (path, declared) in &findings {
+        tracing::warn!(
+            config = %path.display(),
+            sections = ?declared,
+            "{}",
+            inert_project_model_sections_message(path, declared)
+        );
+    }
+    findings
+}
 /// Resolve the effective `[plugins]` config for a working directory the same
 /// way a session does at reload time: global/user config
 /// ([`load_effective_config`]) plus every ancestor project `.grok/config.toml`

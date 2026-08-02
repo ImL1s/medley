@@ -169,6 +169,23 @@ pub(crate) fn model_not_ready_reason(models: &ModelState, id: &acp::ModelId) -> 
     })
 }
 
+/// Why a model can't be selected, from ACP model meta. `None` when it is
+/// ready. Unlike [`model_not_ready_reason`] this needs no catalog lookup, so
+/// listing commands can annotate rows straight from `ModelInfo._meta`.
+pub(crate) fn unready_reason_from_model_meta(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<String> {
+    let readiness = parse_model_readiness(meta);
+    if readiness.ready {
+        return None;
+    }
+    Some(if readiness.readiness_reason.is_empty() {
+        "not ready".to_owned()
+    } else {
+        readiness.readiness_reason
+    })
+}
+
 /// Auth class string from ACP model meta (`none` | `env` | `session`).
 pub(crate) fn auth_class_from_model_meta(
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
