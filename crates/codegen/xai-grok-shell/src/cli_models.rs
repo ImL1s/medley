@@ -14,17 +14,17 @@ pub enum AuthStatus {
     LoggedIn(String),
     /// Catalog key of the first model with own `api_key`/`env_key`.
     ModelCredentials(String),
-    /// A live provider-scoped OpenAI Codex credential, with no xAI credential
-    /// behind it. Its Codex models are ready even though nothing authenticates
-    /// to xAI, so reporting "not authenticated" would contradict the very rows
-    /// printed underneath the banner.
+    /// A live provider-scoped OpenAI Codex credential, reported only once
+    /// every xAI-side credential above has been ruled out — which is what
+    /// makes its "no xAI credential" wording true. Without it the banner would
+    /// read "not authenticated" directly above the ready Codex rows.
     OpenAiCodex,
     DeploymentKey,
     NotAuthenticated,
 }
 
 impl AuthStatus {
-    /// Banner status: env key → session → BYOK → Codex → deployment → none.
+    /// Banner status: env key → session → BYOK → deployment → Codex → none.
     ///
     /// Differs from sampling (`resolve_credentials`: BYOK → session → env) so a
     /// logged-in user sees the login host. BYOK uses
@@ -51,14 +51,16 @@ impl AuthStatus {
         }) {
             return Self::ModelCredentials(name);
         }
+        if agent_config.endpoints.deployment_key.is_some() {
+            return Self::DeploymentKey;
+        }
+        // Last before "nothing": every xAI-side credential above outranks it,
+        // so reaching here is what makes the "no xAI credential" wording true.
         if models
             .values()
             .any(|entry| entry.is_openai_codex_profile() && model_readiness(entry).0)
         {
             return Self::OpenAiCodex;
-        }
-        if agent_config.endpoints.deployment_key.is_some() {
-            return Self::DeploymentKey;
         }
         Self::NotAuthenticated
     }
@@ -224,16 +226,28 @@ mod tests {
         }
     }
 
-    /// `grok models` must not print "You are not authenticated" directly above
-    /// a ready `gpt-5.6-sol` row. A Codex login is a real credential, just not
-    /// an xAI one.
+    /// Without a Codex credential the preset is unready, so the banner must
+    /// still read "not authenticated" — the Codex status is not merely
+    /// "a Codex entry exists in the catalog".
     #[test]
     #[serial]
-    fn resolve_reports_codex_login_rather_than_not_authenticated() {
+    fn resolve_not_authenticated_when_the_codex_preset_is_unready() {
         let (_dir, _g) = isolate_auth_sources();
-        let cfg = config_from_toml("");
-        // No Codex credential yet: the preset is unready, so nothing to report.
-        assert_eq!(AuthStatus::resolve(&cfg), AuthStatus::NotAuthenticated);
+        assert_eq!(
+            AuthStatus::resolve(&config_from_toml("")),
+            AuthStatus::NotAuthenticated
+        );
+    }
+
+    /// A deployment key is an xAI-side credential, so it outranks the
+    /// Codex-only status — whose message asserts there is no xAI credential.
+    #[test]
+    #[serial]
+    fn resolve_prefers_deployment_key_over_codex_only_status() {
+        let (_dir, _g) = isolate_auth_sources();
+        let mut cfg = config_from_toml("");
+        cfg.endpoints.deployment_key = Some("deploy-key".into());
+        assert_eq!(AuthStatus::resolve(&cfg), AuthStatus::DeploymentKey);
     }
 
     #[test]
