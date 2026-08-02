@@ -1721,6 +1721,119 @@ fn incompatible_model_switch_hands_queue_to_replacement_until_target_switch_succ
 }
 
 #[test]
+fn handed_queue_stays_gated_when_deferred_target_switch_fails() {
+    use xai_grok_shell::sampling::types::ReasoningEffort;
+
+    for failure_kind in ["harness_unavailable", "other"] {
+        let mut app = test_app_with_agent();
+        let source_id = AgentId(0);
+        let model_id = acp::ModelId::new("cursor-model");
+        insert_ready_model(&mut app, source_id, &model_id);
+        app.models.available.insert(
+            model_id.clone(),
+            acp::ModelInfo::new(model_id.clone(), model_id.0.to_string()),
+        );
+        {
+            let source = app.agents.get_mut(&source_id).unwrap();
+            source.session.model_switch_pending = true;
+            source.session.model_switch_request_id = Some(0);
+            source.session.enqueue_prompt("must stay gated".into());
+        }
+        let incompatible = xai_grok_shell::agent::config::ModelSwitchIncompatibleAgentError {
+            code: "MODEL_SWITCH_INCOMPATIBLE_AGENT".into(),
+            active_agent_type: "grok-build".into(),
+            required_agent_type: "cursor".into(),
+            model_id: model_id.0.to_string(),
+            suggestion: "start_new_session".into(),
+        };
+        dispatch(
+            Action::TaskComplete(TaskResult::SwitchModelComplete {
+                agent_id: source_id,
+                model_id: model_id.clone(),
+                effort: Some(ReasoningEffort::High),
+                request_id: 0,
+                result: Err(SwitchModelError::IncompatibleAgent {
+                    error: incompatible,
+                    prev_model_id: None,
+                }),
+                prev_model_id: None,
+            }),
+            &mut app,
+        );
+        dispatch(
+            Action::AgentTypeMismatchAnswered {
+                source_id,
+                start_new: true,
+                model_id: model_id.clone(),
+                effort: Some(ReasoningEffort::High),
+            },
+            &mut app,
+        );
+        let ActiveView::Agent(replacement_id) = app.active_view else {
+            panic!("replacement must become active");
+        };
+        let created = dispatch(
+            Action::TaskComplete(TaskResult::SessionCreated {
+                agent_id: replacement_id,
+                session_id: format!("replacement-{failure_kind}").into(),
+                models: None,
+                scheduler_background_loops: None,
+            }),
+            &mut app,
+        );
+        let request_id = switch_model_request_id(&created);
+        let result = match failure_kind {
+            "harness_unavailable" => {
+                let error = xai_grok_shell::agent::config::ModelSwitchHarnessError {
+                    code: xai_grok_shell::agent::config::MODEL_SWITCH_REBUILD_FAILED.to_string(),
+                    active_agent_type: "grok-build".into(),
+                    required_agent_type: "cursor".into(),
+                    model_id: model_id.0.to_string(),
+                    reason: "agent_definition_unavailable".into(),
+                };
+                Err(SwitchModelError::HarnessUnavailable {
+                    error,
+                    prev_model_id: None,
+                })
+            }
+            "other" => Err(SwitchModelError::Other("transport closed".into())),
+            _ => unreachable!(),
+        };
+
+        let failed = dispatch(
+            Action::TaskComplete(TaskResult::SwitchModelComplete {
+                agent_id: replacement_id,
+                model_id: model_id.clone(),
+                effort: Some(ReasoningEffort::High),
+                request_id,
+                result,
+                prev_model_id: None,
+            }),
+            &mut app,
+        );
+
+        assert!(
+            !failed
+                .iter()
+                .any(|effect| matches!(effect, Effect::SendPrompt { .. })),
+            "{failure_kind} must not drain the handed queue: {failed:?}"
+        );
+        let replacement = &app.agents[&replacement_id].session;
+        assert_eq!(replacement.queue_len(), 1, "{failure_kind}");
+        assert_eq!(
+            replacement.model_switch_queue_handoff_from,
+            Some(source_id),
+            "{failure_kind} must preserve recovery ownership"
+        );
+        assert!(
+            !replacement.model_switch_pending,
+            "the failed ACP transaction must close without releasing the handoff gate"
+        );
+        assert_eq!(app.agents[&source_id].session.queue_len(), 0);
+    }
+}
+
+#[test]
 fn handed_queue_stays_gated_when_deferred_target_fails_hydrate_preflight() {
     use xai_grok_shell::sampling::types::ReasoningEffort;
 
