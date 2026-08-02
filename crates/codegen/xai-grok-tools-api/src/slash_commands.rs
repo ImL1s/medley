@@ -249,16 +249,21 @@ pub fn init_agents_md_instruction(args: &str) -> String {
          It is loaded automatically from the git root down to the working directory and\n\
          prepended to every conversation, so its length is a permanent cost: make it earn it.\n\n\
          ## 1. Find what already exists -- never overwrite blindly\n\
-         Check the repository root and the working directory for an instruction file the\n\
-         loader already reads: AGENTS.md, AGENT.md, CLAUDE.md, or .claude/CLAUDE.md. Also\n\
-         look for rules other tools left behind: .grok/rules/, .claude/rules/, .cursor/rules/,\n\
-         .github/copilot-instructions.md, CONTRIBUTING.md.\n\n\
-         If one of those instruction files exists, READ IT FIRST and treat it as the source of\n\
-         truth. Improve it in place: correct what is wrong, add what is missing, delete what\n\
-         the code no longer does. Do not regenerate it from scratch, and do not drop a rule you\n\
-         cannot show is obsolete -- someone put it there for a reason you may not have hit yet.\n\
-         If no instruction file exists, create AGENTS.md at the repository root. Fold anything\n\
-         useful from the other tools' rule files into it rather than leaving it stranded.\n\n\
+         Search every directory from the git root down to the working directory, not just the\n\
+         two ends: the loader reads all of them, so a file in an intermediate package directory\n\
+         is already in play. In each, the names it accepts are AGENTS.md, AGENT.md, Agents.md,\n\
+         CLAUDE.md, Claude.md, CLAUDE.local.md, .claude/CLAUDE.md, and .claude/CLAUDE.local.md.\n\
+         Also look for rules other tools left behind: .grok/rules/, .claude/rules/,\n\
+         .cursor/rules/, .github/copilot-instructions.md, CONTRIBUTING.md.\n\n\
+         If any of those instruction files exists, READ IT FIRST and treat it as the source of\n\
+         truth. Improve the one whose directory already covers the scope you are documenting --\n\
+         do not add a competing AGENTS.md beside a file that is already loaded. Correct what is\n\
+         wrong, add what is missing, delete what the code no longer does. Do not regenerate it\n\
+         from scratch, and do not drop a rule you cannot show is obsolete -- someone put it\n\
+         there for a reason you may not have hit yet.\n\n\
+         If none exists, create AGENTS.md at the repository root. Fold anything useful from the\n\
+         other tools' rule files into it rather than leaving it stranded. Shared rules belong in\n\
+         AGENTS.md, not CLAUDE.local.md -- that one is a personal, usually untracked override.\n\n\
          ## 2. Investigate before you write\n\
          Every line you write must come from a file you actually read, not from how projects\n\
          like this usually work. At minimum read the README and CONTRIBUTING, the build and\n\
@@ -391,28 +396,52 @@ mod tests {
     #[test]
     fn init_instruction_carries_contract_tokens() {
         let text = init_agents_md_instruction("");
+        // Assert against a wrap-insensitive form: the prompt is hard-wrapped for
+        // readability, so a phrase that survives an edit can still straddle a
+        // newline. Line structure is covered by `init_instruction_indents_wrapped_bullets`.
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let has = |phrase: &str| flat.contains(phrase);
 
         // The deliverable and where it goes.
-        assert!(text.contains("AGENTS.md"));
-        assert!(text.contains("repository root"));
+        assert!(has("AGENTS.md"));
+        assert!(has("repository root"));
 
-        // Every name the loader accepts must be searched, or the "already
-        // exists" branch silently misses repos that use a different one.
-        for name in ["AGENTS.md", "AGENT.md", "CLAUDE.md", ".claude/CLAUDE.md"] {
-            assert!(text.contains(name), "missing existing-file name {name}");
+        // Every name `CompatConfig::agent_filenames` accepts must be searched,
+        // or the "already exists" branch silently misses repos using another
+        // one and /init writes a competing file next to a live instruction file.
+        for name in [
+            "AGENTS.md",
+            "AGENT.md",
+            "Agents.md",
+            "CLAUDE.md",
+            "Claude.md",
+            "CLAUDE.local.md",
+            ".claude/CLAUDE.md",
+            ".claude/CLAUDE.local.md",
+        ] {
+            assert!(has(name), "missing existing-file name {name}");
         }
 
+        // The loader walks the whole git-root -> cwd chain, so an /init run from
+        // a nested package must not search only the two ends and then write a
+        // competing root file.
+        assert!(has(
+            "every directory from the git root down to the working directory"
+        ));
+        assert!(has("not just the two ends"));
+        assert!(has("do not add a competing AGENTS.md"));
+
         // The non-destructive contract for an existing file.
-        assert!(text.contains("never overwrite blindly"));
-        assert!(text.contains("READ IT FIRST"));
-        assert!(text.contains("Do not regenerate it from scratch"));
+        assert!(has("never overwrite blindly"));
+        assert!(has("READ IT FIRST"));
+        assert!(has("Do not regenerate it from scratch"));
 
         // The sections that make the file worth its permanent context cost.
-        assert!(text.contains("SINGLE test"));
-        assert!(text.contains("generated or vendored"));
+        assert!(has("SINGLE test"));
+        assert!(has("generated or vendored"));
 
         // Expansions ride as user messages and must not claim reminder authority.
-        assert!(!text.contains("system-reminder"));
+        assert!(!has("system-reminder"));
     }
 
     /// Rust's `\`-continuation eats the leading whitespace of the next source

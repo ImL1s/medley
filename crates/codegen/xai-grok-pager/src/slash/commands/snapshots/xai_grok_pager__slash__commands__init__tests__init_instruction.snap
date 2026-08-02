@@ -9,17 +9,23 @@ It is loaded automatically from the git root down to the working directory and
 prepended to every conversation, so its length is a permanent cost: make it earn it.
 
 ## 1. Find what already exists -- never overwrite blindly
-Check the repository root and the working directory for an instruction file the
-loader already reads: AGENTS.md, AGENT.md, CLAUDE.md, or .claude/CLAUDE.md. Also
-look for rules other tools left behind: .grok/rules/, .claude/rules/, .cursor/rules/,
-.github/copilot-instructions.md, CONTRIBUTING.md.
+Search every directory from the git root down to the working directory, not just the
+two ends: the loader reads all of them, so a file in an intermediate package directory
+is already in play. In each, the names it accepts are AGENTS.md, AGENT.md, Agents.md,
+CLAUDE.md, Claude.md, CLAUDE.local.md, .claude/CLAUDE.md, and .claude/CLAUDE.local.md.
+Also look for rules other tools left behind: .grok/rules/, .claude/rules/,
+.cursor/rules/, .github/copilot-instructions.md, CONTRIBUTING.md.
 
-If one of those instruction files exists, READ IT FIRST and treat it as the source of
-truth. Improve it in place: correct what is wrong, add what is missing, delete what
-the code no longer does. Do not regenerate it from scratch, and do not drop a rule you
-cannot show is obsolete -- someone put it there for a reason you may not have hit yet.
-If no instruction file exists, create AGENTS.md at the repository root. Fold anything
-useful from the other tools' rule files into it rather than leaving it stranded.
+If any of those instruction files exists, READ IT FIRST and treat it as the source of
+truth. Improve the one whose directory already covers the scope you are documenting --
+do not add a competing AGENTS.md beside a file that is already loaded. Correct what is
+wrong, add what is missing, delete what the code no longer does. Do not regenerate it
+from scratch, and do not drop a rule you cannot show is obsolete -- someone put it
+there for a reason you may not have hit yet.
+
+If none exists, create AGENTS.md at the repository root. Fold anything useful from the
+other tools' rule files into it rather than leaving it stranded. Shared rules belong in
+AGENTS.md, not CLAUDE.local.md -- that one is a personal, usually untracked override.
 
 ## 2. Investigate before you write
 Every line you write must come from a file you actually read, not from how projects

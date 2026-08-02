@@ -28,8 +28,15 @@ impl SlashCommand for InitCommand {
         "Analyze this repo and write its AGENTS.md"
     }
 
-    /// Session-scoped: the expansion is an agent turn, so it needs a
-    /// conversation to land in.
+    /// Session-scoped so the dashboard's session-less dispatch input refuses
+    /// `/init` with a toast. Without the flag it would reach
+    /// `dispatch_dashboard_dispatch`, which spawns an agent whose first prompt
+    /// is the raw typed text — the literal `/init`, never expanded, since the
+    /// shell has no resolver for it.
+    ///
+    /// The welcome screen is unaffected: its prompt fires `Action::NewSession`
+    /// on the first typed character, so a `/init` submitted there already has a
+    /// session to land in.
     fn session_scoped(&self) -> bool {
         true
     }
@@ -119,7 +126,11 @@ mod tests {
         assert_eq!(cmd.usage(), "/init [focus]");
         assert!(cmd.takes_args(), "/init accepts an optional focus");
         assert!(!cmd.args_required(), "bare /init must execute");
-        assert!(cmd.session_scoped(), "the expansion needs a conversation");
+        assert!(
+            cmd.session_scoped(),
+            "must stay session-scoped: the dashboard would otherwise spawn an \
+             agent whose first prompt is the unexpanded /init"
+        );
         assert!(cmd.aliases().is_empty());
     }
 

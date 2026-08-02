@@ -384,7 +384,7 @@ Analyze the repository and write its [AGENTS.md](12-project-rules.md) — the pr
 /init focus on the integration test setup
 ```
 
-If an instruction file already exists (`AGENTS.md`, `AGENT.md`, `CLAUDE.md`, or `.claude/CLAUDE.md`), Grok reads it first and improves it in place rather than regenerating it. Rules other tools left behind — `.grok/rules/`, `.claude/rules/`, `.cursor/rules/`, `.github/copilot-instructions.md` — get folded in. The optional argument is extra direction, not a filter.
+Grok first searches every directory from the git root down to your working directory — the same chain the loader reads — for any of the [supported file names](12-project-rules.md#supported-file-names). If it finds one, it reads it and improves it in place rather than regenerating it, and won't drop an AGENTS.md next to a file that is already loaded. Rules other tools left behind — `.grok/rules/`, `.claude/rules/`, `.cursor/rules/`, `.github/copilot-instructions.md` — get folded in. The optional argument is extra direction, not a filter.
 
 Run it once per repository. Re-run it after a restructure, and review the result like any other patch: nothing about it is authoritative until you have read it.
 
