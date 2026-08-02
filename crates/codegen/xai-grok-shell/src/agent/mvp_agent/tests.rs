@@ -1251,6 +1251,112 @@ fn harnesses_are_compatible_rejects_strict_mismatches() {
         None,
     ));
 }
+
+fn ready_fallback_entry(model_id: &str, agent_type: &str) -> ModelEntry {
+    let mut entry = ModelEntry::fallback(model_id, &config::EndpointsConfig::default());
+    entry.info.agent_type = agent_type.to_owned();
+    entry
+}
+
+#[test]
+fn ready_compatible_fallback_skips_incompatible_candidate_in_catalog_order() {
+    let active = xai_grok_agent::AgentDefinition::codex();
+    let candidates = [
+        acp::ModelId::new("first-ready-incompatible"),
+        acp::ModelId::new("second-ready-compatible"),
+    ];
+
+    let selected = first_ready_compatible_model(
+        candidates.clone(),
+        &active,
+        |id| match id.0.as_ref() {
+            "first-ready-incompatible" => Some(ready_fallback_entry(id.0.as_ref(), "cursor")),
+            "second-ready-compatible" => Some(ready_fallback_entry(id.0.as_ref(), "codex")),
+            _ => None,
+        },
+        |agent_type| {
+            xai_grok_agent::discovery::by_name_in_cwd(agent_type, std::path::Path::new("."))
+        },
+    );
+
+    assert_eq!(selected, Some(candidates[1].clone()));
+}
+
+#[test]
+fn ready_compatible_fallback_returns_none_without_compatible_candidate() {
+    let active = xai_grok_agent::AgentDefinition::codex();
+    let candidates = [
+        acp::ModelId::new("ready-cursor"),
+        acp::ModelId::new("ready-grok-build"),
+    ];
+
+    let selected = first_ready_compatible_model(
+        candidates,
+        &active,
+        |id| match id.0.as_ref() {
+            "ready-cursor" => Some(ready_fallback_entry(id.0.as_ref(), "cursor")),
+            "ready-grok-build" => Some(ready_fallback_entry(id.0.as_ref(), "grok-build")),
+            _ => None,
+        },
+        |agent_type| {
+            xai_grok_agent::discovery::by_name_in_cwd(agent_type, std::path::Path::new("."))
+        },
+    );
+
+    assert_eq!(selected, None);
+}
+
+#[test]
+fn cold_spawn_unresolved_model_uses_catalog_compatible_fallback_without_latch() {
+    let persisted = acp::ModelId::new("persisted-unresolved");
+    let compatible = acp::ModelId::new("second-ready-compatible");
+
+    let selection =
+        cold_spawn_fallback_selection(&persisted, Some(compatible.clone()), None);
+
+    assert_eq!(selection.model_id, compatible);
+    assert_eq!(selection.unavailable_model, None);
+}
+
+#[test]
+fn cold_spawn_restore_preserves_unavailable_latch_without_compatible_fallback() {
+    let persisted = acp::ModelId::new("persisted-unavailable");
+
+    let selection = cold_spawn_fallback_selection(&persisted, None, None);
+
+    assert_eq!(selection.model_id, persisted.clone());
+    assert_eq!(selection.unavailable_model, Some(persisted));
+}
+
+#[test]
+fn cold_spawn_current_only_fallback_keeps_persisted_model_latched() {
+    let persisted = acp::ModelId::new("persisted-unready");
+    let current = acp::ModelId::new("current-compatible-but-not-selectable");
+
+    let selection =
+        cold_spawn_fallback_selection(&persisted, None, Some(current.clone()));
+
+    assert_eq!(selection.model_id, current);
+    assert_eq!(selection.unavailable_model, Some(persisted));
+}
+
+#[test]
+fn cold_spawn_usable_fallback_clears_stale_unavailable_latch() {
+    let registry = SessionRegistry::default();
+    let session_id = acp::SessionId::new("cold-spawn-stale-latch");
+    let persisted = acp::ModelId::new("persisted-unavailable");
+    registry.set_unavailable_model(&session_id, persisted.clone());
+
+    let selection = cold_spawn_fallback_selection(
+        &persisted,
+        Some(acp::ModelId::new("ready-compatible")),
+        None,
+    );
+    selection.replace_unavailable_latch(&registry, &session_id);
+
+    assert_eq!(registry.unavailable_model(&session_id), None);
+}
+
 #[test]
 fn harnesses_are_compatible_matches_bare_and_qualified_plugin_identity() {
     let source = std::path::PathBuf::from("/plugins/one/agents/reviewer.md");

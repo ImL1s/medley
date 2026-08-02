@@ -1639,6 +1639,7 @@ impl acp::Agent for MvpAgent {
             );
         });
         let session_exists = self.sessions.borrow().contains_key(&session_id);
+        let mut cold_spawn_selection = None;
         if session_exists {
             tracing::info!(
                 session_id = %session_id.0,
@@ -1959,86 +1960,6 @@ impl acp::Agent for MvpAgent {
             // Fail-closed before spawn: never build the actor on an unready
             // persisted model (would attach ambient Bearer via sampling_config).
             let available = self.models_manager.available();
-            let mut spawn_model_id = summary.current_model_id.clone();
-            let mut latch_persisted_unready = false;
-            match self.resolve_model_id(&spawn_model_id) {
-                Ok(entry) if crate::agent::config::model_readiness(&entry).0 => {}
-                Ok(entry) => {
-                    let reason = crate::agent::config::model_readiness(&entry)
-                        .1
-                        .unwrap_or_else(|| "model is not ready".to_owned());
-                    if let Some(fallback) = available.keys().find(|id| {
-                        self.resolve_model_id(id)
-                            .ok()
-                            .is_some_and(|m| crate::agent::config::model_readiness(&m).0)
-                    }).cloned() {
-                        tracing::warn!(
-                            session_id = %session_id.0,
-                            previous = %spawn_model_id.0,
-                            new = %fallback.0,
-                            %reason,
-                            "load_session: persisted model not ready before spawn; using ready fallback"
-                        );
-                        spawn_model_id = fallback;
-                    } else if let Ok(current) = self
-                        .resolve_model_id(&self.models_manager.current_model_id())
-                        && crate::agent::config::model_readiness(&current).0
-                    {
-                        tracing::warn!(
-                            session_id = %session_id.0,
-                            previous = %spawn_model_id.0,
-                            new = %self.models_manager.current_model_id().0,
-                            %reason,
-                            "load_session: persisted model not ready; spawning on current ready default and latching"
-                        );
-                        latch_persisted_unready = true;
-                        spawn_model_id = self.models_manager.current_model_id();
-                    } else {
-                        tracing::warn!(
-                            session_id = %session_id.0,
-                            previous = %spawn_model_id.0,
-                            %reason,
-                            "load_session: persisted model not ready and no ready fallback; latching prompts"
-                        );
-                        latch_persisted_unready = true;
-                    }
-                }
-                Err(_) if !available.is_empty() => {
-                    if let Some(fallback) = available.keys().find(|id| {
-                        self.resolve_model_id(id)
-                            .ok()
-                            .is_some_and(|m| crate::agent::config::model_readiness(&m).0)
-                    }).cloned() {
-                        tracing::warn!(
-                            session_id = %session_id.0,
-                            previous = %spawn_model_id.0,
-                            new = %fallback.0,
-                            "load_session: persisted model unresolved; spawning on ready fallback"
-                        );
-                        latch_persisted_unready = true;
-                        spawn_model_id = fallback;
-                    } else {
-                        latch_persisted_unready = true;
-                    }
-                }
-                Err(_) => {
-                    // Catalog empty / still loading: latch so prompts cannot run
-                    // on an unverified persisted model with ambient credentials.
-                    tracing::warn!(
-                        session_id = %session_id.0,
-                        persisted = %spawn_model_id.0,
-                        "load_session: catalog empty at spawn; latching until a ready model is confirmed"
-                    );
-                    latch_persisted_unready = true;
-                }
-            }
-
-            // The fallback selection above is not authorization to use a
-            // mismatched harness. Validate the exact definition before
-            // transferring persistence into an actor or registering session
-            // state. Preserve the existing unavailable-model latch when the
-            // catalog is absent or no ready fallback exists: prompts remain
-            // blocked until the later restore path can validate a ready model.
             let plugin_registry = self.plugin_registry_handle.snapshot();
             let active_definition = {
                 let cfg = self.cfg.borrow();
@@ -2051,6 +1972,111 @@ impl acp::Agent for MvpAgent {
                     plugin_registry.as_deref(),
                 )
             };
+            let mut ready_compatible_fallback = |candidates: Vec<acp::ModelId>| {
+                first_ready_compatible_model(
+                    candidates,
+                    &active_definition,
+                    |id| self.resolve_model_id(id).ok(),
+                    |agent_type| {
+                        xai_grok_agent::discovery::by_name_in_cwd_with_plugins(
+                            agent_type,
+                            cwd.as_path(),
+                            plugin_registry.as_deref(),
+                        )
+                    },
+                )
+            };
+            let spawn_selection = match self.resolve_model_id(&summary.current_model_id) {
+                Ok(entry) if crate::agent::config::model_readiness(&entry).0 => {
+                    ColdSpawnModelSelection {
+                        model_id: summary.current_model_id.clone(),
+                        unavailable_model: None,
+                    }
+                }
+                Ok(entry) => {
+                    let reason = crate::agent::config::model_readiness(&entry)
+                        .1
+                        .unwrap_or_else(|| "model is not ready".to_owned());
+                    if let Some(fallback) =
+                        ready_compatible_fallback(available.keys().cloned().collect())
+                    {
+                        tracing::warn!(
+                            session_id = %session_id.0,
+                            previous = %summary.current_model_id.0,
+                            new = %fallback.0,
+                            %reason,
+                            "load_session: persisted model not ready before spawn; using ready fallback"
+                        );
+                        cold_spawn_fallback_selection(
+                            &summary.current_model_id,
+                            Some(fallback),
+                            None,
+                        )
+                    } else if let Some(current) = ready_compatible_fallback(vec![
+                        self.models_manager.current_model_id(),
+                    ])
+                    {
+                        tracing::warn!(
+                            session_id = %session_id.0,
+                            previous = %summary.current_model_id.0,
+                            new = %current.0,
+                            %reason,
+                            "load_session: persisted model not ready; spawning on current ready default and latching"
+                        );
+                        cold_spawn_fallback_selection(
+                            &summary.current_model_id,
+                            None,
+                            Some(current),
+                        )
+                    } else {
+                        tracing::warn!(
+                            session_id = %session_id.0,
+                            previous = %summary.current_model_id.0,
+                            %reason,
+                            "load_session: persisted model not ready and no ready fallback; latching prompts"
+                        );
+                        cold_spawn_fallback_selection(&summary.current_model_id, None, None)
+                    }
+                }
+                Err(_) if !available.is_empty() => {
+                    if let Some(fallback) =
+                        ready_compatible_fallback(available.keys().cloned().collect())
+                    {
+                        tracing::warn!(
+                            session_id = %session_id.0,
+                            previous = %summary.current_model_id.0,
+                            new = %fallback.0,
+                            "load_session: persisted model unresolved; spawning on ready fallback"
+                        );
+                        cold_spawn_fallback_selection(
+                            &summary.current_model_id,
+                            Some(fallback),
+                            None,
+                        )
+                    } else {
+                        cold_spawn_fallback_selection(&summary.current_model_id, None, None)
+                    }
+                }
+                Err(_) => {
+                    // Catalog empty / still loading: latch so prompts cannot run
+                    // on an unverified persisted model with ambient credentials.
+                    tracing::warn!(
+                        session_id = %session_id.0,
+                        persisted = %summary.current_model_id.0,
+                        "load_session: catalog empty at spawn; latching until a ready model is confirmed"
+                    );
+                    cold_spawn_fallback_selection(&summary.current_model_id, None, None)
+                }
+            };
+            let spawn_model_id = spawn_selection.model_id.clone();
+            let latch_persisted_unready = spawn_selection.unavailable_model.is_some();
+
+            // The fallback selection above is not authorization to use a
+            // mismatched harness. Validate the exact definition before
+            // transferring persistence into an actor or registering session
+            // state. Preserve the existing unavailable-model latch when the
+            // catalog is absent or no ready fallback exists: prompts remain
+            // blocked until the later restore path can validate a ready model.
             let required_agent_type = match self.resolve_model_id(&spawn_model_id) {
                 Ok(spawn_model) => {
                     let (ready, reason) = crate::agent::config::model_readiness(&spawn_model);
@@ -2095,6 +2121,7 @@ impl acp::Agent for MvpAgent {
                 }
                 .into_acp_error());
             }
+            cold_spawn_selection = Some(spawn_selection);
             self.spawn_and_register_session(
                     init,
                     SessionSpawnOptions {
@@ -2244,7 +2271,9 @@ impl acp::Agent for MvpAgent {
         let persisted_model = summary.current_model_id.clone();
         let models = self.models_manager.models();
         let available = self.models_manager.available();
-        self.session_registry.take_unavailable_model(&session_id);
+        if cold_spawn_selection.is_none() {
+            self.session_registry.take_unavailable_model(&session_id);
+        }
         let resolved_catalog_key = resolve_catalog_key(&models, &persisted_model);
         tracing::debug!(
             session_id = %session_id.0,
@@ -2266,7 +2295,35 @@ impl acp::Agent for MvpAgent {
             &available,
             &persisted_model,
         );
-        let model_id = if let Some(catalog_key) = selectable_catalog_key {
+        let model_id = if let Some(preflight) = cold_spawn_selection.as_ref() {
+            preflight.replace_unavailable_latch(&self.session_registry, &session_id);
+            if preflight.unavailable_model.is_some() {
+                let reason = format!(
+                    "Model \"{}\" is unavailable. Please start a new session or switch models.",
+                    persisted_model.0,
+                );
+                self.send_model_auto_switched(
+                    &session_id,
+                    &persisted_model,
+                    &acp::ModelId::new(String::new()),
+                    &reason,
+                )
+                .await;
+            } else if preflight.model_id != persisted_model {
+                let reason = format!(
+                    "Model \"{}\" could not be restored. Switched to \"{}\".",
+                    persisted_model.0, preflight.model_id.0,
+                );
+                self.send_model_auto_switched(
+                    &session_id,
+                    &persisted_model,
+                    &preflight.model_id,
+                    &reason,
+                )
+                .await;
+            }
+            preflight.model_id.clone()
+        } else if let Some(catalog_key) = selectable_catalog_key {
             if catalog_key != persisted_model {
                 tracing::info!(
                     session_id = %session_id.0,
@@ -2365,6 +2422,7 @@ impl acp::Agent for MvpAgent {
         // Fail-closed: never apply an unready catalog entry (invalid auth_scheme,
         // missing BYOK key, etc.) — that would attach ambient Bearer to the session.
         let model_id = match self.resolve_model_id(&model_id) {
+            Ok(_) if cold_spawn_selection.is_some() => model_id,
             Ok(entry) => {
                 let (ready, reason) = crate::agent::config::model_readiness(&entry);
                 if ready {

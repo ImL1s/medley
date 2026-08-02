@@ -1104,6 +1104,73 @@ pub(crate) fn harnesses_are_compatible(
     !active.is_strict_harness() && !required.is_strict_harness()
 }
 
+/// Select the first ready model whose required harness can reuse the active
+/// session definition. Candidate order is preserved so catalog priority stays
+/// authoritative while incompatible strict harnesses are skipped.
+pub(crate) fn first_ready_compatible_model<I, ResolveModel, ResolveDefinition>(
+    candidates: I,
+    active_definition: &xai_grok_agent::AgentDefinition,
+    mut resolve_model: ResolveModel,
+    mut resolve_definition: ResolveDefinition,
+) -> Option<acp::ModelId>
+where
+    I: IntoIterator<Item = acp::ModelId>,
+    ResolveModel: FnMut(&acp::ModelId) -> Option<ModelEntry>,
+    ResolveDefinition: FnMut(&str) -> Option<xai_grok_agent::AgentDefinition>,
+{
+    candidates.into_iter().find(|model_id| {
+        let Some(model) = resolve_model(model_id) else {
+            return false;
+        };
+        if !crate::agent::config::model_readiness(&model).0 {
+            return false;
+        }
+        let required_agent_type = model.info().agent_type.as_str();
+        let required_definition = resolve_definition(required_agent_type);
+        harnesses_are_compatible(
+            active_definition,
+            required_agent_type,
+            required_definition.as_ref(),
+        )
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ColdSpawnModelSelection {
+    pub(crate) model_id: acp::ModelId,
+    pub(crate) unavailable_model: Option<acp::ModelId>,
+}
+
+impl ColdSpawnModelSelection {
+    fn replace_unavailable_latch(
+        &self,
+        registry: &SessionRegistry,
+        session_id: &acp::SessionId,
+    ) {
+        registry.take_unavailable_model(session_id);
+        if let Some(model_id) = self.unavailable_model.as_ref() {
+            registry.set_unavailable_model(session_id, model_id.clone());
+        }
+    }
+}
+
+pub(crate) fn cold_spawn_fallback_selection(
+    persisted_model: &acp::ModelId,
+    catalog_fallback: Option<acp::ModelId>,
+    current_only_fallback: Option<acp::ModelId>,
+) -> ColdSpawnModelSelection {
+    if let Some(model_id) = catalog_fallback {
+        return ColdSpawnModelSelection {
+            model_id,
+            unavailable_model: None,
+        };
+    }
+    ColdSpawnModelSelection {
+        model_id: current_only_fallback.unwrap_or_else(|| persisted_model.clone()),
+        unavailable_model: Some(persisted_model.clone()),
+    }
+}
+
 /// Apply the main session's authoritative CLI clamps to a freshly discovered
 /// model-required definition.
 ///
