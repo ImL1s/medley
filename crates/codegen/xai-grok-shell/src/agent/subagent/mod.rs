@@ -681,6 +681,39 @@ async fn resolve_effective_model_config(
     }
     resolve_subagent_sampling_config(subagent_type, definition_model, ctx).await
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubagentModelHarnessError {
+    Unavailable,
+    Incompatible,
+}
+
+fn validate_subagent_model_harness(
+    active: &xai_grok_agent::AgentDefinition,
+    required_agent_type: &str,
+    required: Option<&xai_grok_agent::AgentDefinition>,
+) -> Result<(), SubagentModelHarnessError> {
+    if active.name != required_agent_type && required.is_none() {
+        return Err(SubagentModelHarnessError::Unavailable);
+    }
+    crate::agent::mvp_agent::harnesses_are_compatible(active, required_agent_type, required)
+        .then_some(())
+        .ok_or(SubagentModelHarnessError::Incompatible)
+}
+
+fn resolve_and_validate_subagent_model_harness(
+    active: &xai_grok_agent::AgentDefinition,
+    required_agent_type: &str,
+    cwd: &Path,
+    plugin_registry: Option<&xai_grok_agent::plugins::PluginRegistry>,
+) -> Result<(), SubagentModelHarnessError> {
+    let required = xai_grok_agent::discovery::by_name_in_cwd_with_plugins(
+        required_agent_type,
+        cwd,
+        plugin_registry,
+    );
+    validate_subagent_model_harness(active, required_agent_type, required.as_ref())
+}
 /// Emit a unified log entry recording which model and credentials a subagent
 /// resolved to, and how they compare to the parent's.
 fn log_subagent_model_resolution(
@@ -1524,10 +1557,9 @@ fn agent_owned_mcp_server_admission_error(
 fn agent_owned_mcp_servers_allowed(is_plugin_agent: bool) -> bool {
     !is_plugin_agent
 }
-/// Resolve a subagent type name to its `AgentDefinition`, with the parent
-/// session's CLI tool/permission overrides already applied (so the spawn path
-/// can never obtain a definition that skips them).
-fn resolve_agent_definition(
+/// Resolve a subagent type name to its source `AgentDefinition`, before the
+/// parent session's CLI tool/permission clamps are applied.
+fn resolve_agent_definition_without_session_cli_overrides(
     subagent_type: &str,
     ctx: &SubagentSpawnContext,
 ) -> Option<xai_grok_agent::config::AgentDefinition> {
@@ -1543,10 +1575,15 @@ fn resolve_agent_definition(
         toggles: &ctx.subagent_toggle,
         allowed_types: ctx.allowed_subagent_types.as_deref(),
     };
-    let mut def = xai_grok_subagent_resolution::discover_agent_definition(
-        subagent_type,
-        &resolution_context,
-    )?;
+    xai_grok_subagent_resolution::discover_agent_definition(subagent_type, &resolution_context)
+}
+/// Resolve a subagent type name to its effective `AgentDefinition`, with the
+/// parent session's CLI tool/permission clamps applied.
+fn resolve_agent_definition(
+    subagent_type: &str,
+    ctx: &SubagentSpawnContext,
+) -> Option<xai_grok_agent::config::AgentDefinition> {
+    let mut def = resolve_agent_definition_without_session_cli_overrides(subagent_type, ctx)?;
     ctx.apply_session_cli_overrides(&mut def);
     Some(def)
 }

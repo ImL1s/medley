@@ -26,6 +26,15 @@ pub enum SwitchModelError {
         /// declines to start a new session.
         prev_model_id: Option<acp::ModelId>,
     },
+    /// The target model names a harness that the shell could not resolve or
+    /// prepare. Starting a new session cannot fix this, so the pager must
+    /// fail closed without offering the incompatible-agent remediation.
+    HarnessUnavailable {
+        error: xai_grok_shell::agent::config::ModelSwitchHarnessError,
+        /// The model that was active before a default-model selection
+        /// optimistically updated the pager mirrors.
+        prev_model_id: Option<acp::ModelId>,
+    },
     /// Any other failure (network, auth, server error, etc.).
     Other(String),
 }
@@ -774,6 +783,8 @@ pub enum Action {
     /// the shell rejects a model switch because the target model requires
     /// a different agent harness.
     AgentTypeMismatchAnswered {
+        /// Session that owns the gated model-switch transaction.
+        source_id: AgentId,
         /// `true` = start a new session with the target model.
         /// `false` = cancel, return to current session.
         start_new: bool,
@@ -1591,10 +1602,13 @@ pub enum Effect {
         session_id: acp::SessionId,
         model_id: acp::ModelId,
         effort: Option<ReasoningEffort>,
+        /// Correlates this RPC with the pager's active switch transaction.
+        request_id: u64,
         /// The model that was active before the optimistic UI update
         /// in `set_default_model`. `None` for `Action::SwitchModel`
         /// (no optimistic update). Threaded through to
-        /// `SwitchModelComplete` so `IncompatibleAgent` can roll back.
+        /// `SwitchModelComplete` as a compatibility fallback; the pager's
+        /// transaction snapshot handles exact rollback for every error class.
         prev_model_id: Option<acp::ModelId>,
     },
     /// Fetch changelog from CDN (both markdown + structured JSON).
@@ -2427,9 +2441,12 @@ pub enum TaskResult {
         agent_id: AgentId,
         model_id: acp::ModelId,
         effort: Option<ReasoningEffort>,
+        /// Forwarded from `Effect::SwitchModel.request_id` so stale async
+        /// completions cannot mutate a newer selection.
+        request_id: u64,
         result: Result<(), SwitchModelError>,
-        /// Forwarded from `Effect::SwitchModel.prev_model_id` for
-        /// rollback on `IncompatibleAgent`.
+        /// Forwarded from `Effect::SwitchModel.prev_model_id` as a fallback
+        /// when applying completions created by older/test-only call paths.
         prev_model_id: Option<acp::ModelId>,
     },
     /// Changelog fetched from CDN (both formats).

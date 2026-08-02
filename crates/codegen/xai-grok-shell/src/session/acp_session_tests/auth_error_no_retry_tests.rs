@@ -142,6 +142,23 @@ async fn make_actor_with_method_and_credentials(
     (Arc::new(actor), persistence_rx)
 }
 
+fn spawn_model_persistence_ack(mut persistence_rx: mpsc::UnboundedReceiver<PersistenceMsg>) {
+    tokio::task::spawn_local(async move {
+        while let Some(message) = persistence_rx.recv().await {
+            match message {
+                PersistenceMsg::ModelSwitchAndAck { respond_to, .. } => {
+                    let _ = respond_to.send(Ok(()));
+                }
+                PersistenceMsg::CurrentModelAndAck { respond_to, .. }
+                | PersistenceMsg::ReplaceChatHistoryAndAck { respond_to, .. } => {
+                    let _ = respond_to.send(Ok(()));
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
 /// Pin the fixture's synthetic model as a ready first-party bearer model.
 /// `create_test_actor` intentionally uses a localhost endpoint and an
 /// uncatalogued model, so production resolution otherwise classifies it as
@@ -1430,13 +1447,14 @@ async fn set_session_model_preserves_catalog_key_for_none_alias_with_shared_wire
     local
         .run_until(async {
             let (_dir, am) = auth_manager_with_valid_token("session-token");
-            let (actor, _rx) = make_actor_with_method_and_credentials(
+            let (actor, persistence_rx) = make_actor_with_method_and_credentials(
                 Some(am),
                 "cached_token",
                 xai_chat_state::AuthType::SessionToken,
                 "stale-session-jwt".to_string(),
             )
             .await;
+            spawn_model_persistence_ack(persistence_rx);
 
             let shared_slug = "shared-routing-slug";
             let catalog_key = "none-alias";
@@ -1492,6 +1510,7 @@ async fn set_session_model_preserves_catalog_key_for_none_alias_with_shared_wire
                     false,
                     true,
                     85,
+                    "grok-build",
                 )
                 .await
                 .expect("model switch");
@@ -1527,13 +1546,14 @@ async fn handle_set_session_model_clears_credentials_for_none() {
     local
         .run_until(async {
             let (_dir, am) = auth_manager_with_valid_token("session-token");
-            let (actor, _rx) = make_actor_with_method_and_credentials(
+            let (actor, persistence_rx) = make_actor_with_method_and_credentials(
                 Some(am),
                 "cached_token",
                 xai_chat_state::AuthType::SessionToken,
                 "stale-session-jwt".to_string(),
             )
             .await;
+            spawn_model_persistence_ack(persistence_rx);
 
             let model = actor
                 .chat_state_handle
@@ -1583,6 +1603,7 @@ async fn handle_set_session_model_clears_credentials_for_none() {
                     false,
                     true,
                     85,
+                    "grok-build",
                 )
                 .await;
 
@@ -1612,13 +1633,14 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (actor, _rx) = make_actor_with_method_and_credentials(
+            let (actor, persistence_rx) = make_actor_with_method_and_credentials(
                 None,
                 "cached_token",
                 xai_chat_state::AuthType::SessionToken,
                 "k".to_string(),
             )
             .await;
+            spawn_model_persistence_ack(persistence_rx);
 
             let model = actor
                 .chat_state_handle
@@ -1681,6 +1703,7 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                     false,
                     true,
                     85,
+                    "grok-build",
                 )
                 .await;
 
@@ -1731,9 +1754,10 @@ async fn switch_to_first_party_model_drops_minted_provider_token() {
             let token = provider.ensure_fresh_token(None).await.rotated().unwrap();
             assert_eq!(token, "tok-1");
 
-            let (actor, _rx) =
+            let (actor, persistence_rx) =
                 make_actor_with_auth_and_credentials(None, xai_chat_state::AuthType::ApiKey, token)
                     .await;
+            spawn_model_persistence_ack(persistence_rx);
             seed_provider_memo(&actor, provider).await;
 
             let model = actor
@@ -1784,6 +1808,7 @@ async fn switch_to_first_party_model_drops_minted_provider_token() {
                     false,
                     true,
                     85,
+                    "grok-build",
                 )
                 .await;
 

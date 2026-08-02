@@ -1673,7 +1673,19 @@ fn translate_local_submit(
         );
     }
     if skipped {
-        return InputOutcome::Changed;
+        return match kind {
+            LocalQuestionKind::AgentTypeMismatch {
+                source_id,
+                model_id,
+                effort,
+            } => InputOutcome::Action(Action::AgentTypeMismatchAnswered {
+                source_id,
+                start_new: false,
+                model_id,
+                effort,
+            }),
+            _ => InputOutcome::Changed,
+        };
     }
     let Some(QuestionSelection::Single(Some(idx))) = qv.selections.first() else {
         return InputOutcome::Changed;
@@ -1731,9 +1743,14 @@ fn translate_local_submit(
             );
             InputOutcome::Action(Action::OpenUrl(url.to_string()))
         }
-        LocalQuestionKind::AgentTypeMismatch { model_id, effort } => {
+        LocalQuestionKind::AgentTypeMismatch {
+            source_id,
+            model_id,
+            effort,
+        } => {
             let start_new = *idx == 0;
             InputOutcome::Action(Action::AgentTypeMismatchAnswered {
+                source_id,
                 start_new,
                 model_id: model_id.clone(),
                 effort,
@@ -2540,6 +2557,9 @@ pub(crate) mod test_fixtures {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            model_switch_request_id: None,
+            model_switch_rollback: None,
+            model_switch_queue_handoff_from: None,
             user_model_preference: None,
             deferred_model_switch: None,
             bg_tasks: std::collections::BTreeMap::new(),
@@ -2603,6 +2623,9 @@ pub(crate) mod test_fixtures {
                 available_commands_generation: 0,
                 available_tools: None,
                 model_switch_pending: false,
+                model_switch_request_id: None,
+                model_switch_rollback: None,
+                model_switch_queue_handoff_from: None,
                 user_model_preference: None,
                 deferred_model_switch: None,
                 bg_tasks: std::collections::BTreeMap::new(),
@@ -2798,14 +2821,33 @@ pub(crate) mod test_fixtures {
     /// a window switch is live on the reconnected link.
     #[test]
     fn reconnect_reload_clears_stuck_model_switch_pending() {
+        use crate::app::agent::ModelSwitchRollback;
+        use xai_grok_shell::sampling::types::ReasoningEffort;
+
         for success in [false, true] {
             let mut agent = make_agent();
+            let original = acp::ModelId::new("original-model");
+            agent.session.models.current = Some(acp::ModelId::new("optimistic-model"));
+            agent.session.models.reasoning_effort = Some(ReasoningEffort::Xhigh);
             agent.session.model_switch_pending = true;
+            agent.session.model_switch_request_id = Some(7);
+            agent.session.model_switch_rollback = Some(ModelSwitchRollback {
+                request_id: Some(7),
+                session_model_id: Some(original.clone()),
+                session_reasoning_effort: Some(ReasoningEffort::High),
+            });
             agent.begin_session_reload(1);
             assert!(
                 !agent.session.model_switch_pending,
                 "reload start must release the hold for the lost pre-outage switch"
             );
+            assert_eq!(agent.session.model_switch_request_id, None);
+            assert_eq!(agent.session.models.current, Some(original));
+            assert_eq!(
+                agent.session.models.reasoning_effort,
+                Some(ReasoningEffort::High)
+            );
+            assert!(agent.session.model_switch_rollback.is_none());
             agent.session.model_switch_pending = true;
             assert!(agent.finish_session_reload(1, success));
             assert!(
@@ -3424,6 +3466,9 @@ pub(crate) fn test_agent_view(session_id: Option<&str>, cwd: std::path::PathBuf)
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            model_switch_request_id: None,
+            model_switch_rollback: None,
+            model_switch_queue_handoff_from: None,
             user_model_preference: None,
             deferred_model_switch: None,
             bg_tasks: std::collections::BTreeMap::new(),

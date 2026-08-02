@@ -1974,7 +1974,7 @@ async fn agent_rebuild_republishes_the_configured_cutoff() {
             let mut seeded = xai_grok_agent::AgentDefinition::default_grok_build();
             seeded.tool_overrides = Some(seed.clone());
             actor
-                .handle_rebuild_agent_for_definition(seeded)
+                .handle_rebuild_agent_for_definition(seeded, "grok-build")
                 .await
                 .expect("zero-turn rebuild should succeed");
             assert_eq!(
@@ -1990,6 +1990,7 @@ async fn agent_rebuild_republishes_the_configured_cutoff() {
             actor
                 .handle_rebuild_agent_for_definition(
                     xai_grok_agent::AgentDefinition::default_grok_build(),
+                    "grok-build",
                 )
                 .await
                 .expect("second rebuild should succeed");

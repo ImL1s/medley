@@ -1,0 +1,95 @@
+{
+  "updatedAt": "2026-08-02T10:43:47.551Z",
+  "missions": [
+    {
+      "id": "session:6d71f77b-1aa9-431d-a1f4-ec922e67119f:none",
+      "source": "session",
+      "name": "none",
+      "objective": "Session mission",
+      "createdAt": "2026-08-02T08:15:10.164Z",
+      "updatedAt": "2026-08-02T10:43:47.551Z",
+      "status": "done",
+      "workerCount": 2,
+      "taskCounts": {
+        "total": 2,
+        "pending": 0,
+        "blocked": 0,
+        "inProgress": 0,
+        "completed": 2,
+        "failed": 0
+      },
+      "agents": [
+        {
+          "name": "rebrand-docs:arebran",
+          "role": "rebrand-docs",
+          "ownership": "arebrand-docs-562bf58095959618",
+          "status": "done",
+          "currentStep": null,
+          "latestUpdate": "completed",
+          "completedSummary": null,
+          "updatedAt": "2026-08-02T10:43:47.551Z"
+        },
+        {
+          "name": "tui-gap-audit:atui-ga",
+          "role": "tui-gap-audit",
+          "ownership": "atui-gap-audit-ca121edb324f5cfe",
+          "status": "done",
+          "currentStep": null,
+          "latestUpdate": "completed",
+          "completedSummary": null,
+          "updatedAt": "2026-08-02T10:10:50.062Z"
+        }
+      ],
+      "timeline": [
+        {
+          "id": "session-start:atui-gap-audit-ca121edb324f5cfe:2026-08-02T10:04:52.074Z",
+          "at": "2026-08-02T10:04:52.074Z",
+          "kind": "update",
+          "agent": "tui-gap-audit:atui-ga",
+          "detail": "started tui-gap-audit:atui-ga",
+          "sourceKey": "session-start:atui-gap-audit-ca121edb324f5cfe"
+        },
+        {
+          "id": "session-stop:atui-gap-audit-ca121edb324f5cfe:2026-08-02T10:09:38.988Z",
+          "at": "2026-08-02T10:09:38.988Z",
+          "kind": "completion",
+          "agent": "tui-gap-audit:atui-ga",
+          "detail": "completed",
+          "sourceKey": "session-stop:atui-gap-audit-ca121edb324f5cfe"
+        },
+        {
+          "id": "session-start:atui-gap-audit-ca121edb324f5cfe:2026-08-02T10:09:54.758Z",
+          "at": "2026-08-02T10:09:54.758Z",
+          "kind": "update",
+          "agent": "tui-gap-audit:atui-ga",
+          "detail": "started tui-gap-audit:atui-ga",
+          "sourceKey": "session-start:atui-gap-audit-ca121edb324f5cfe"
+        },
+        {
+          "id": "session-stop:atui-gap-audit-ca121edb324f5cfe:2026-08-02T10:10:50.062Z",
+          "at": "2026-08-02T10:10:50.062Z",
+          "kind": "completion",
+          "agent": "tui-gap-audit:atui-ga",
+          "detail": "completed",
+          "sourceKey": "session-stop:atui-gap-audit-ca121edb324f5cfe"
+        },
+        {
+          "id": "session-stop:adb2a429a2dbd8e9e:2026-08-02T10:16:26.933Z",
+          "at": "2026-08-02T10:16:26.933Z",
+          "kind": "completion",
+          "agent": "rebrand-docs:arebran",
+          "detail": "completed",
+          "sourceKey": "session-stop:adb2a429a2dbd8e9e"
+        },
+        {
+          "id": "session-stop:a4ce535e64bfe8a8b:2026-08-02T10:43:47.551Z",
+          "at": "2026-08-02T10:43:47.551Z",
+          "kind": "completion",
+          "agent": "rebrand-docs:arebran",
+          "detail": "completed",
+          "sourceKey": "session-stop:a4ce535e64bfe8a8b"
+        }
+      ]
+    }
+  ]
+}

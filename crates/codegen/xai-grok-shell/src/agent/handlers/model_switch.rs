@@ -6,12 +6,95 @@
 //! unready model (e.g. invalid `auth_scheme` fail-open → ambient Bearer).
 use crate::agent::config;
 use crate::agent::mvp_agent::{
-    MvpAgent, agent_name_after_model_switch, harnesses_are_compatible, resolve_required_agent_type,
+    MvpAgent, agent_name_after_model_switch, apply_session_cli_clamps, harnesses_are_compatible,
+    resolve_required_agent_type,
 };
 use crate::session::SessionCommand;
 use agent_client_protocol::{self as acp};
 use tokio::sync::oneshot;
 use xai_grok_sampling_types::parse_reasoning_effort_meta;
+
+pub(crate) struct FailureTelemetry {
+    armed: bool,
+    session_id: String,
+    previous_model_id: String,
+    new_model_id: String,
+    error_code: &'static str,
+    required_agent_type: Option<String>,
+    current_agent_type: Option<String>,
+}
+
+impl FailureTelemetry {
+    pub(crate) fn new(session_id: &acp::SessionId, model_id: &acp::ModelId) -> Self {
+        Self {
+            armed: true,
+            session_id: session_id.0.to_string(),
+            previous_model_id: String::new(),
+            new_model_id: model_id.0.to_string(),
+            error_code: config::MODEL_SWITCH_VALIDATION_FAILED,
+            required_agent_type: None,
+            current_agent_type: None,
+        }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn mark_actor_error(&mut self, error: &acp::Error) {
+        if let Some(code) = config::model_switch_error_code(error) {
+            self.error_code = code;
+        }
+    }
+
+    fn mark_commit_phase(&mut self) {
+        self.error_code = config::MODEL_SWITCH_COMMIT_FAILED;
+    }
+}
+
+impl Drop for FailureTelemetry {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        emit_failure_telemetry(xai_grok_telemetry::events::ModelSwitched {
+            session_id: self.session_id.clone(),
+            previous_model_id: self.previous_model_id.clone(),
+            new_model_id: self.new_model_id.clone(),
+            success: false,
+            error_code: Some(self.error_code.to_owned()),
+            required_agent_type: self.required_agent_type.clone(),
+            current_agent_type: self.current_agent_type.clone(),
+        });
+    }
+}
+
+fn emit_failure_telemetry(event: xai_grok_telemetry::events::ModelSwitched) {
+    #[cfg(test)]
+    if let Ok(value) = serde_json::to_value(&event) {
+        CAPTURED_FAILURE_TELEMETRY.lock().unwrap().push(value);
+    }
+    xai_grok_telemetry::session_ctx::log_event(event);
+}
+
+#[cfg(test)]
+static CAPTURED_FAILURE_TELEMETRY: std::sync::LazyLock<std::sync::Mutex<Vec<serde_json::Value>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+#[cfg(test)]
+pub(crate) fn take_captured_failure_telemetry(session_id: &str) -> Vec<serde_json::Value> {
+    let mut captured = CAPTURED_FAILURE_TELEMETRY.lock().unwrap();
+    let mut matching = Vec::new();
+    captured.retain(|event| {
+        if event.get("session_id").and_then(serde_json::Value::as_str) == Some(session_id) {
+            matching.push(event.clone());
+            false
+        } else {
+            true
+        }
+    });
+    matching
+}
 /// Apply a model switch to a session.
 ///
 /// Always fail-closed on `model_readiness`. The ACP `allowed_models` gate still
@@ -20,12 +103,28 @@ pub(crate) async fn apply(
     agent: &MvpAgent,
     args: acp::SetSessionModelRequest,
 ) -> Result<acp::SetSessionModelResponse, acp::Error> {
+    apply_with_load_gate(agent, args, true).await
+}
+
+/// Apply the model restored by `session/load` while that load's guard is alive.
+///
+/// The load owns the marker that normally gates external session requests, so
+/// waiting for it here would wait on ourselves. The registered handle is still
+/// required, and the normal per-session dispatch lock continues to serialize
+/// the actor commit with every external request.
+pub(crate) async fn apply_during_session_load(
+    agent: &MvpAgent,
+    args: acp::SetSessionModelRequest,
+) -> Result<acp::SetSessionModelResponse, acp::Error> {
+    apply_with_load_gate(agent, args, false).await
+}
+
+async fn apply_with_load_gate(
+    agent: &MvpAgent,
+    args: acp::SetSessionModelRequest,
+    wait_for_session_load: bool,
+) -> Result<acp::SetSessionModelResponse, acp::Error> {
     tracing::info!("Received set session model request {args:?}");
-    xai_grok_telemetry::unified_log::info(
-        "model changed",
-        Some(args.session_id.0.as_ref()),
-        Some(serde_json::json!({"model": args.model_id.0.as_ref()})),
-    );
     tracing::debug!("session_session_model::mvp_agent: {:?}", &args);
     let effort_override = parse_reasoning_effort_meta(args.meta.as_ref());
     let acp::SetSessionModelRequest {
@@ -33,10 +132,24 @@ pub(crate) async fn apply(
         model_id,
         ..
     } = args;
-    let handle = agent
-        .session_handle_waiting_for_load(&session_id)
-        .await
-        .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))?;
+    // Armed until the complete actor receipt and outer mirrors have committed.
+    // Every early return therefore emits exactly one sanitized failure event.
+    let mut failure_telemetry = FailureTelemetry::new(&session_id, &model_id);
+    let handle = if wait_for_session_load {
+        agent.session_handle_waiting_for_load(&session_id).await
+    } else {
+        agent.session_handle_during_load(&session_id)
+    }
+    .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))?;
+    // Resolve an in-flight load before taking the per-session dispatch lock.
+    // `load_session` applies its restored model while its load guard is alive;
+    // holding this lock while waiting for that guard would deadlock the restore
+    // path until the bounded load wait expired.
+    //
+    // Once the session exists, serialize the complete prepare/actor-commit/
+    // outer-handle sequence with prompt intake and other model switches.
+    let dispatch_lock = agent.dispatch_lock(&session_id);
+    let _dispatch_guard = dispatch_lock.lock().await;
     let model = agent.resolve_model_id(&model_id)?;
     let (ready, reason) = config::model_readiness(&model);
     if !ready {
@@ -57,88 +170,65 @@ pub(crate) async fn apply(
     let required_agent_type =
         resolve_required_agent_type(Some(model.info().agent_type.as_str()), session_default);
     let previous_model_id = handle.model_id.0.clone();
-    let mut pending_rebuild_definition: Option<xai_grok_agent::AgentDefinition> = None;
-    {
-        let required = &required_agent_type;
-        let turn_count = handle
-            .signals_handle
-            .snapshot()
-            .await
-            .map(|s| s.turn_count)
-            .unwrap_or(0);
-        let (agent_tx, agent_rx) = oneshot::channel();
-        let _ = handle.cmd_tx.send(SessionCommand::GetActiveAgent {
+    failure_telemetry.previous_model_id = previous_model_id.to_string();
+    failure_telemetry.required_agent_type = Some(required_agent_type.clone());
+    let (agent_tx, agent_rx) = oneshot::channel();
+    handle
+        .cmd_tx
+        .send(SessionCommand::GetActiveAgent {
             responds_to: agent_tx,
-        });
-        let active_agent_type = agent_rx.await.ok().flatten();
-        let is_mismatch = active_agent_type
-            .as_ref()
-            .is_some_and(|active| !harnesses_are_compatible(active, required));
-        tracing::info!(
-            session_id = %session_id.0,
-            model_id = %model_id.0,
-            ?required_agent_type,
-            ?active_agent_type,
-            turn_count,
-            is_mismatch,
-            "set_session_model: agent type compatibility check"
-        );
-        if is_mismatch && turn_count > 0 {
-            tracing::warn!(
-                session_id = %session_id.0,
-                model_id = %model_id.0,
-                active_agent = ?active_agent_type,
-                required_agent = %required,
-                turn_count,
-                "set_session_model: agent type mismatch rejected"
-            );
-            xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::ModelSwitched {
-                session_id: session_id.0.to_string(),
-                previous_model_id: previous_model_id.to_string(),
-                new_model_id: model_id.0.to_string(),
-                success: false,
-                error_code: Some(config::MODEL_SWITCH_INCOMPATIBLE_AGENT.to_string()),
-                required_agent_type: Some(required.clone()),
-                current_agent_type: active_agent_type.clone(),
-            });
-            let err_payload = config::ModelSwitchIncompatibleAgentError {
-                code: config::MODEL_SWITCH_INCOMPATIBLE_AGENT.to_string(),
-                active_agent_type: active_agent_type.unwrap_or_else(|| "unknown".to_owned()),
-                required_agent_type: required.clone(),
-                model_id: model_id.0.to_string(),
-                suggestion: "start_new_session".to_string(),
-            };
-            return Err(err_payload.into_acp_error());
-        }
-        if is_mismatch && turn_count == 0 {
-            let cwd = handle.tool_context.cwd.as_path();
-            let resolved = xai_grok_agent::discovery::by_name_in_cwd_with_plugins(
-                required,
-                cwd,
-                agent.plugin_registry_handle.snapshot().as_deref(),
-            );
-            match resolved {
-                Some(def) => {
-                    tracing::info!(
-                        session_id = %session_id.0,
-                        model_id = %model_id.0,
-                        required_agent_type = %required,
-                        agent_def_name = %def.name,
-                        "set_session_model: zero-turn harness switch — queued agent rebuild"
-                    );
-                    pending_rebuild_definition = Some(def);
-                }
-                None => {
-                    tracing::warn!(
-                        session_id = %session_id.0,
-                        model_id = %model_id.0,
-                        required_agent_type = %required,
-                        "set_session_model: zero-turn harness switch — could not resolve agent definition; proceeding with stale harness"
-                    );
-                }
-            }
-        }
-    }
+        })
+        .map_err(|_| acp::Error::internal_error().data("model_switch: session actor closed"))?;
+    let active_agent_type = agent_rx
+        .await
+        .map_err(|_| acp::Error::internal_error().data("model_switch: session actor closed"))?;
+    let observed_active_agent_type = active_agent_type
+        .clone()
+        .unwrap_or_else(|| handle.agent_name.clone());
+    failure_telemetry.current_agent_type = Some(observed_active_agent_type.clone());
+    // Resolve every differing target before compatibility classification.
+    // In particular, an unknown custom name is not evidence of a stock
+    // harness; it is an unavailable prerequisite and must fail closed.
+    // Always resolve the required definition. Equal canonical names are not
+    // sufficient for plugin/file-backed harnesses because their prompt/source
+    // identity can differ while the display name remains unchanged.
+    let raw_required_definition = xai_grok_agent::discovery::by_name_in_cwd_with_plugins(
+        &required_agent_type,
+        handle.tool_context.cwd.as_path(),
+        agent.plugin_registry_handle.snapshot().as_deref(),
+    );
+    let observed_definition = xai_grok_agent::discovery::by_name_in_cwd_with_plugins(
+        &observed_active_agent_type,
+        handle.tool_context.cwd.as_path(),
+        agent.plugin_registry_handle.snapshot().as_deref(),
+    )
+    .unwrap_or_else(|| {
+        let mut definition = xai_grok_agent::AgentDefinition::default_grok_build();
+        definition.name.clone_from(&observed_active_agent_type);
+        definition
+    });
+    let is_mismatch = !harnesses_are_compatible(
+        &observed_definition,
+        &required_agent_type,
+        raw_required_definition.as_ref(),
+    );
+    tracing::info!(
+        session_id = %session_id.0,
+        model_id = %model_id.0,
+        ?required_agent_type,
+        active_agent_type = %observed_active_agent_type,
+        is_mismatch,
+        definition_resolved = raw_required_definition.is_some(),
+        "set_session_model: prepared actor-owned model switch"
+    );
+    // The active agent already carries the main session's authoritative CLI
+    // clamps. Apply the same clamps to the target before the actor compares or
+    // rebuilds it; otherwise --tools/--disallowed-tools/--permission-mode can
+    // cause a false mismatch and a zero-turn rebuild can silently drop them.
+    let required_definition = {
+        let cfg = agent.cfg.borrow();
+        apply_session_cli_clamps(raw_required_definition, &cfg.cli_agent_overrides)
+    };
     let mut model_sampling =
         agent.prepare_sampling_config_for_model(&model, handle.origin_client.clone());
     if let Some(eff) = effort_override {
@@ -162,56 +252,6 @@ pub(crate) async fn apply(
         }
     }
     let applied_effort = model_sampling.reasoning_effort;
-    let gate_closed = !handle
-        .gateway_enabled
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let apply_prompt_override = !gate_closed;
-    if gate_closed {
-        tracing::info!(
-            session_id = %session_id.0,
-            model_id = %model_id.0,
-            "set_session_model: gateway gate closed, prompt override suppressed"
-        );
-        pending_rebuild_definition = None;
-    }
-    let did_rebuild = if let Some(def) = pending_rebuild_definition {
-        let (rebuild_tx, rebuild_rx) = oneshot::channel();
-        let _ = handle
-            .cmd_tx
-            .send(SessionCommand::RebuildAgentForDefinition {
-                definition: def,
-                responds_to: rebuild_tx,
-            });
-        let rebuild_result = rebuild_rx
-            .await
-            .map_err(|_| acp::Error::internal_error().data("rebuild_agent: actor closed"))?;
-        match rebuild_result {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::error!(
-                    session_id = %session_id.0,
-                    model_id = %model_id.0,
-                    error = ?e,
-                    "set_session_model: zero-turn harness rebuild failed; aborting model switch"
-                );
-                xai_grok_telemetry::session_ctx::log_event(
-                    xai_grok_telemetry::events::ModelSwitched {
-                        session_id: session_id.0.to_string(),
-                        previous_model_id: previous_model_id.to_string(),
-                        new_model_id: model_id.0.to_string(),
-                        success: false,
-                        error_code: Some(config::MODEL_SWITCH_REBUILD_FAILED.to_string()),
-                        required_agent_type: Some(required_agent_type.clone()),
-                        current_agent_type: None,
-                    },
-                );
-                return Err(e);
-            }
-        }
-    } else {
-        false
-    };
-    let model_unchanged = previous_model_id == model_id.0;
     let new_threshold = {
         let cfg = agent.cfg.borrow();
         let models = agent.models_manager.models();
@@ -223,18 +263,38 @@ pub(crate) async fn apply(
         )
     };
     let (tx, rx) = oneshot::channel();
-    let _ = handle.cmd_tx.send(SessionCommand::SetSessionModel {
-        catalog_model_id: model_id.clone(),
-        sampling_config: model_sampling,
-        use_concise,
-        apply_prompt_override,
-        skip_prompt_rewrite: did_rebuild || model_unchanged,
-        auto_compact_threshold_percent: new_threshold,
-        responds_to: tx,
-    });
-    let updated_model = rx
-        .await
-        .map_err(|_| acp::Error::internal_error().data("failed to set session model"))?;
+    handle
+        .cmd_tx
+        .send(SessionCommand::ApplyModelSwitch {
+            prepared: Box::new(crate::session::PreparedModelSwitch {
+                catalog_model_id: model_id.clone(),
+                sampling_config: model_sampling,
+                use_concise,
+                auto_compact_threshold_percent: new_threshold,
+                required_agent_type: required_agent_type.clone(),
+                required_definition,
+            }),
+            responds_to: tx,
+        })
+        .map_err(|_| acp::Error::internal_error().data("model_switch: session actor closed"))?;
+    let receipt = match rx.await {
+        Ok(Ok(receipt)) => receipt,
+        Ok(Err(err)) => {
+            failure_telemetry.mark_actor_error(&err);
+            return Err(err);
+        }
+        Err(_) => {
+            // The actor accepted the prepared command but dropped its receipt.
+            // Its durable commit status is therefore unknown; classify this
+            // conservatively as commit-phase rather than claiming validation or
+            // harness rebuild failed.
+            failure_telemetry.mark_commit_phase();
+            return Err(acp::Error::internal_error().data("model_switch: session actor closed"));
+        }
+    };
+    let did_rebuild = receipt.did_rebuild;
+    let committed_previous_model_id = receipt.previous_model_id.0.to_string();
+    let updated_model = receipt.catalog_model_id;
     if let Some(handle) = agent.sessions.borrow_mut().get_mut(&session_id) {
         handle.model_id = model_id.clone();
         handle.reasoning_effort = applied_effort;
@@ -247,14 +307,19 @@ pub(crate) async fn apply(
         model_id.0.as_ref(),
         applied_effort.map(|eff| eff.to_string()),
     );
+    xai_grok_telemetry::unified_log::info(
+        "model changed",
+        Some(session_id.0.as_ref()),
+        Some(serde_json::json!({"model": model_id.0.as_ref()})),
+    );
     xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::ModelSwitched {
         session_id: session_id.0.to_string(),
-        previous_model_id: previous_model_id.to_string(),
+        previous_model_id: committed_previous_model_id,
         new_model_id: model_id.0.to_string(),
         success: true,
         error_code: None,
         required_agent_type: Some(required_agent_type.clone()),
-        current_agent_type: None,
+        current_agent_type: receipt.active_agent_type,
     });
     if agent.cfg.borrow().mode != config::AgentMode::Leader {
         agent.models_manager.set_current_model_id(model_id.clone());
@@ -263,6 +328,7 @@ pub(crate) async fn apply(
             .set_current_reasoning_effort(applied_effort);
     }
     agent.sync_process_static_api_key(Some(model_id.0.as_ref()));
+    failure_telemetry.disarm();
     Ok(acp::SetSessionModelResponse::new().meta(
         serde_json::json!({
             "model": updated_model,
@@ -295,5 +361,39 @@ fn broadcast_model_changed(
                 "x.ai/session_notification",
                 params.into(),
             ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failure_telemetry_uses_structured_actor_phase_without_guessing() {
+        let session_id = acp::SessionId::new("session");
+        let model_id = acp::ModelId::new("target-model");
+        let mut telemetry = FailureTelemetry::new(&session_id, &model_id);
+
+        assert_eq!(telemetry.error_code, config::MODEL_SWITCH_VALIDATION_FAILED);
+        telemetry.mark_actor_error(&acp::Error::internal_error().data("actor error"));
+        assert_eq!(
+            telemetry.error_code,
+            config::MODEL_SWITCH_VALIDATION_FAILED,
+            "unknown structured errors must not be guessed as rebuild failures"
+        );
+        for code in [
+            config::MODEL_SWITCH_INCOMPATIBLE_AGENT,
+            config::MODEL_SWITCH_REBUILD_FAILED,
+            config::MODEL_SWITCH_COMMIT_FAILED,
+        ] {
+            telemetry.mark_actor_error(
+                &acp::Error::invalid_params().data(serde_json::json!({ "code": code })),
+            );
+            assert_eq!(telemetry.error_code, code);
+        }
+        telemetry.mark_commit_phase();
+        assert_eq!(telemetry.error_code, config::MODEL_SWITCH_COMMIT_FAILED);
+
+        telemetry.disarm();
     }
 }

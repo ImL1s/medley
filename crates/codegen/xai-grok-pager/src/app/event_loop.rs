@@ -124,6 +124,15 @@ fn restore_dashboard_peek_before_reload(
     }
 }
 
+fn restore_model_switch_app_mirror_before_reload(app: &mut AppView) {
+    if let Some(transaction) = app.model_switch_transaction.take()
+        && transaction.app_models_optimistic
+    {
+        app.models.current = transaction.app_model_id;
+        app.models.reasoning_effort = transaction.app_reasoning_effort;
+    }
+}
+
 fn plan_reconnect_load(
     agent: &super::agent_view::AgentView,
     fallback_cwd: &std::path::Path,
@@ -2519,6 +2528,10 @@ pub(crate) async fn run(
                             ActiveView::Agent(id) => Some(id),
                             _ => None,
                         };
+                        // A reconnect drops every in-flight switch RPC. Restore
+                        // the app-scoped optimistic mirror before each agent's
+                        // reload consumes its corresponding session snapshot.
+                        restore_model_switch_app_mirror_before_reload(&mut app);
                         let mut agent_ids: Vec<super::agent::AgentId> =
                             app.agents.keys().copied().collect();
                         agent_ids.sort_by_key(|id| Some(*id) != active_agent_id);
@@ -3813,6 +3826,39 @@ fn process_effects(
 mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, KeyEventState};
+
+    #[test]
+    fn reconnect_restores_app_model_mirror_from_active_switch_rollback() {
+        use crate::app::agent::{AgentId, ModelSwitchRollback};
+        use crate::app::app_view::ModelSwitchTransaction;
+        use xai_grok_shell::sampling::types::ReasoningEffort;
+
+        let mut app = crate::app::app_view::tests::test_app_with_agent();
+        let id = AgentId(0);
+        let original = acp::ModelId::new("original-model");
+        let optimistic = acp::ModelId::new("optimistic-model");
+        app.models.current = Some(optimistic.clone());
+        app.models.reasoning_effort = Some(ReasoningEffort::Xhigh);
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.model_switch_pending = true;
+        agent.session.model_switch_rollback = Some(ModelSwitchRollback {
+            request_id: Some(7),
+            session_model_id: Some(original.clone()),
+            session_reasoning_effort: Some(ReasoningEffort::High),
+        });
+        app.model_switch_transaction = Some(ModelSwitchTransaction {
+            owner_agent_id: id,
+            request_id: Some(7),
+            app_models_optimistic: true,
+            app_model_id: Some(original.clone()),
+            app_reasoning_effort: Some(ReasoningEffort::Low),
+        });
+
+        restore_model_switch_app_mirror_before_reload(&mut app);
+
+        assert_eq!(app.models.current, Some(original));
+        assert_eq!(app.models.reasoning_effort, Some(ReasoningEffort::Low));
+    }
 
     #[cfg(feature = "local-workspace")]
     #[test]

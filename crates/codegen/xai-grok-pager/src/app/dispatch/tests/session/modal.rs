@@ -225,6 +225,127 @@ fn close_does_not_disturb_unrelated_forked_from_pointers() {
 }
 
 #[test]
+fn closing_default_switch_owner_restores_global_model_and_releases_transaction() {
+    use xai_grok_shell::sampling::types::ReasoningEffort;
+
+    let mut app = three_agent_app();
+    let owner = AgentId(0);
+    let survivor = AgentId(1);
+    let original = acp::ModelId::new("original-model");
+    let optimistic = acp::ModelId::new("optimistic-model");
+    let next = acp::ModelId::new("next-model");
+
+    for (model_id, name) in [
+        (original.clone(), "Original"),
+        (optimistic.clone(), "Optimistic"),
+        (next.clone(), "Next"),
+    ] {
+        let info = acp::ModelInfo::new(model_id.clone(), name);
+        app.models.available.insert(model_id.clone(), info.clone());
+        for agent_id in [owner, survivor] {
+            app.agents[&agent_id]
+                .session
+                .models
+                .available
+                .insert(model_id.clone(), info.clone());
+        }
+    }
+    app.models.current = Some(original.clone());
+    app.models.reasoning_effort = Some(ReasoningEffort::Low);
+    for agent_id in [owner, survivor] {
+        app.agents
+            .get_mut(&agent_id)
+            .unwrap()
+            .session
+            .models
+            .set_current(original.clone(), Some(ReasoningEffort::High));
+    }
+
+    let initial = dispatch(Action::SetDefaultModel(optimistic.clone()), &mut app);
+    let _request_id = switch_model_request_id(&initial);
+    assert_eq!(app.models.current.as_ref(), Some(&optimistic));
+
+    let close_effects = dispatch_sessions_confirm_close(&mut app, owner);
+
+    assert!(!app.agents.contains_key(&owner));
+    assert_eq!(app.active_view, ActiveView::Agent(survivor));
+    assert!(
+        !close_effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistPreferredModel { .. }))
+    );
+    assert_eq!(app.models.current.as_ref(), Some(&original));
+    assert_eq!(
+        app.models.reasoning_effort,
+        Some(ReasoningEffort::Low),
+        "closing the owner must restore the exact global snapshot"
+    );
+
+    let next_effects = dispatch(Action::SetDefaultModel(next), &mut app);
+    assert!(
+        next_effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::SwitchModel { .. })),
+        "closing the owner must release the app-wide transaction"
+    );
+    assert!(app.agents[&survivor].session.model_switch_pending);
+}
+
+#[test]
+fn late_success_after_default_switch_owner_close_cannot_mutate_or_persist() {
+    let mut app = three_agent_app();
+    let owner = AgentId(0);
+    let survivor = AgentId(1);
+    let original = acp::ModelId::new("original-model");
+    let target = acp::ModelId::new("target-model");
+
+    for (model_id, name) in [(original.clone(), "Original"), (target.clone(), "Target")] {
+        let info = acp::ModelInfo::new(model_id.clone(), name);
+        app.models.available.insert(model_id.clone(), info.clone());
+        for agent_id in [owner, survivor] {
+            app.agents[&agent_id]
+                .session
+                .models
+                .available
+                .insert(model_id.clone(), info.clone());
+        }
+    }
+    app.models.set_current(original.clone(), None);
+    for agent_id in [owner, survivor] {
+        app.agents
+            .get_mut(&agent_id)
+            .unwrap()
+            .session
+            .models
+            .set_current(original.clone(), None);
+    }
+
+    let initial = dispatch(Action::SetDefaultModel(target.clone()), &mut app);
+    let request_id = switch_model_request_id(&initial);
+    dispatch_sessions_confirm_close(&mut app, owner);
+    assert_eq!(app.models.current.as_ref(), Some(&original));
+
+    let late_effects = dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id: owner,
+            model_id: target,
+            effort: None,
+            request_id,
+            result: Ok(()),
+            prev_model_id: Some(original.clone()),
+        }),
+        &mut app,
+    );
+
+    assert!(late_effects.is_empty());
+    assert_eq!(app.models.current.as_ref(), Some(&original));
+    assert_eq!(
+        app.agents[&survivor].session.models.current.as_ref(),
+        Some(&original)
+    );
+}
+
+#[test]
 fn extensions_modal_in_non_project_dir_creates_session() {
     let mut app = project_picker_app();
     dispatch(Action::NewSession, &mut app);

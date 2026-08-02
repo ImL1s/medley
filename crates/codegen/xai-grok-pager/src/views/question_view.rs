@@ -124,6 +124,10 @@ pub enum LocalQuestionKind {
     /// type incompatibility. Carries the target model + effort so the
     /// answer handler can create a new session with it.
     AgentTypeMismatch {
+        /// Session whose switch transaction opened this modal. The active
+        /// view can change while the question is open, so the answer must not
+        /// infer ownership from UI focus.
+        source_id: crate::app::agent::AgentId,
         model_id: agent_client_protocol::ModelId,
         effort: Option<xai_grok_shell::sampling::types::ReasoningEffort>,
     },

@@ -1573,6 +1573,7 @@ pub(crate) async fn spawn_session_actor(
             gateway: gateway.clone(),
             gateway_enabled: gateway_enabled.clone(),
             persistence_tx: persistence.tx.clone(),
+            persistence_is_noop: persistence.is_noop(),
         },
         permissions,
         tool_context,

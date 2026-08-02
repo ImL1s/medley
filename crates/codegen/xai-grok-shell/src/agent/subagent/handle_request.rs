@@ -81,10 +81,17 @@ pub(crate) async fn run_shell_child(
             None,
         );
     }
-    let Some(mut definition) = resolve_agent_definition(&request.subagent_type, &ctx) else {
+    let Some(selected_harness_definition) =
+        resolve_agent_definition_without_session_cli_overrides(&request.subagent_type, &ctx)
+    else {
         let msg = format!("Unknown subagent type: {}", request.subagent_type);
         return child_run_output(failure_result(&request, &msg), completion_data, None);
     };
+    // Model compatibility compares the raw resolved harness identities. The
+    // session CLI clamp is enforced independently on the definition that
+    // actually runs and must not create a false harness mismatch.
+    let mut definition = selected_harness_definition.clone();
+    ctx.apply_session_cli_overrides(&mut definition);
     match gate_subagent_type(&request.subagent_type, &ctx) {
         SubagentValidateTypeOutcome::Disabled => {
             let msg = format!(
@@ -474,6 +481,76 @@ pub(crate) async fn run_shell_child(
                 "Cannot resume from subagent '{}': source model '{source_model}' \
                  is no longer available in the model catalogue.",
                 source.subagent_id,
+            );
+            return child_run_output(failure_result(&request, &msg), completion_data, None);
+        }
+    }
+    let requested_model_matches_effective = |requested: &str| {
+        crate::agent::config::find_model_by_id(&ctx.available_models, requested).is_some_and(
+            |entry| {
+                let resolved_id = if ctx.available_models.contains_key(requested) {
+                    requested
+                } else {
+                    entry.info().model.as_str()
+                };
+                effective_model_id.0.as_ref() == resolved_id
+            },
+        )
+    };
+    let explicit_model_selection = resume_source
+        .as_ref()
+        .and_then(|source| source.model_id.as_deref())
+        .is_some_and(&requested_model_matches_effective)
+        || (!request.fork_context
+            && effective_runtime
+                .model
+                .as_deref()
+                .is_some_and(&requested_model_matches_effective))
+        || ctx
+            .subagent_model_overrides
+            .get(&request.subagent_type)
+            .is_some_and(|model| requested_model_matches_effective(model))
+        || match &definition.model {
+            xai_grok_agent::config::ModelOverride::Override(model) => {
+                requested_model_matches_effective(model)
+            }
+            xai_grok_agent::config::ModelOverride::Inherit => false,
+        };
+    if explicit_model_selection {
+        let Some(effective_model_entry) = crate::agent::config::find_model_by_id(
+            &ctx.available_models,
+            effective_model_id.0.as_ref(),
+        ) else {
+            let msg = format!(
+                "Cannot spawn subagent '{}': resolved model '{}' is no longer in the model catalog.",
+                request.subagent_type, effective_model_id.0,
+            );
+            return child_run_output(failure_result(&request, &msg), completion_data, None);
+        };
+        let required_agent_type = effective_model_entry.info().agent_type.as_str();
+        if let Err(harness_error) = resolve_and_validate_subagent_model_harness(
+            &selected_harness_definition,
+            required_agent_type,
+            &ctx.parent_cwd,
+            ctx.plugin_registry.as_deref(),
+        ) {
+            let detail = match harness_error {
+                SubagentModelHarnessError::Unavailable => "is unavailable",
+                SubagentModelHarnessError::Incompatible => {
+                    "is incompatible with the selected subagent harness"
+                }
+            };
+            let msg = format!(
+                "Cannot spawn subagent '{}' with model '{}': required harness '{}' {}.",
+                request.subagent_type, effective_model_id.0, required_agent_type, detail,
+            );
+            tracing::warn!(
+                subagent_id = %request.id,
+                subagent_type = %request.subagent_type,
+                model_id = %effective_model_id.0,
+                required_agent_type,
+                active_agent_type = %selected_harness_definition.name,
+                "subagent model override rejected by harness preflight"
             );
             return child_run_output(failure_result(&request, &msg), completion_data, None);
         }

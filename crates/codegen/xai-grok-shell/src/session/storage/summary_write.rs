@@ -209,10 +209,31 @@ pub(crate) fn apply_patch_locked(
     result
 }
 
+/// Durable variant used by cross-file transactions. The summary lock remains
+/// held through the file and parent-directory barriers.
+pub(crate) fn apply_patch_locked_durable(
+    summary_path: &Path,
+    lock_path: &Path,
+    patch: &SummaryPatch,
+) -> io::Result<bool> {
+    let lock = open_lock_file(lock_path)?;
+    lock.lock_exclusive()?;
+    let result = read_modify_write_durable(summary_path, patch);
+    let _ = lock.unlock();
+    result
+}
+
 fn read_modify_write(summary_path: &Path, patch: &SummaryPatch) -> io::Result<bool> {
     let mut summary = read_summary(summary_path)?;
     let absent_title_applied = summary.apply_patch(patch, Utc::now());
     write_summary_atomic(summary_path, &summary)?;
+    Ok(absent_title_applied)
+}
+
+fn read_modify_write_durable(summary_path: &Path, patch: &SummaryPatch) -> io::Result<bool> {
+    let mut summary = read_summary(summary_path)?;
+    let absent_title_applied = summary.apply_patch(patch, Utc::now());
+    write_summary_atomic_durable(summary_path, &summary)?;
     Ok(absent_title_applied)
 }
 
@@ -241,6 +262,12 @@ fn write_summary_atomic(summary_path: &Path, summary: &Summary) -> io::Result<()
     let bytes = serde_json::to_vec_pretty(summary)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     crate::session::storage::write_bytes_atomic(summary_path, &bytes)
+}
+
+fn write_summary_atomic_durable(summary_path: &Path, summary: &Summary) -> io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(summary)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    crate::session::storage::write_bytes_atomic_durable(summary_path, &bytes)
 }
 
 #[cfg(test)]
