@@ -533,9 +533,18 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             agent_id,
             model_id,
             effort,
+            request_id,
             result,
             prev_model_id,
-        } => handle_switch_model_complete(app, agent_id, model_id, effort, result, prev_model_id),
+        } => handle_switch_model_complete(
+            app,
+            agent_id,
+            model_id,
+            effort,
+            request_id,
+            result,
+            prev_model_id,
+        ),
         TaskResult::BgTaskKilled {
             session_id,
             task_id,
@@ -947,10 +956,10 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                 .retain(|entry| entry.session_id != session_id);
             app.leader_roster
                 .retain(|entry| entry.session_id != session_id);
-            for id in to_remove {
-                remove_agent_and_cleanup(app, id);
-            }
             let mut effects = unregister_session_effect(Some(sid));
+            for id in to_remove {
+                effects.extend(remove_agent_and_cleanup(app, id));
+            }
             if after == AfterSessionDelete::Dashboard {
                 if let Some(d) = app.dashboard.as_mut() {
                     d.delete_confirm = None;

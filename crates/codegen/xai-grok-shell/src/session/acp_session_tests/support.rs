@@ -247,6 +247,7 @@ pub(crate) async fn create_test_actor_ex(
             gateway: GatewaySender::new(gateway_tx),
             gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             persistence_tx,
+            persistence_is_noop: false,
         },
         permissions: xai_grok_workspace::permission::PermissionHandle::allow_all(),
         tool_context,

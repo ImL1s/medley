@@ -73,6 +73,17 @@ use indexmap::IndexMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
+
+fn switch_model_request_id(effects: &[Effect]) -> u64 {
+    effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::SwitchModel { request_id, .. } => Some(*request_id),
+            _ => None,
+        })
+        .expect("expected a SwitchModel effect")
+}
+
 fn test_app() -> AppView {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     AppView {
@@ -81,6 +92,7 @@ fn test_app() -> AppView {
         agents: IndexMap::new(),
         next_agent_id: 0,
         models: ModelState::default(),
+        model_switch_transaction: None,
         registry: crate::actions::ActionRegistry::defaults(),
         settings_registry: std::sync::Arc::new(crate::settings::SettingsRegistry::defaults()),
         current_ui: xai_grok_shell::agent::config::UiConfig::default(),
@@ -329,6 +341,9 @@ fn make_test_agent_session(app: &AppView, id: AgentId, sid: &str) -> AgentSessio
         available_commands_generation: 0,
         available_tools: None,
         model_switch_pending: false,
+        model_switch_request_id: None,
+        model_switch_rollback: None,
+        model_switch_queue_handoff_from: None,
         user_model_preference: None,
         deferred_model_switch: app.deferred_model_switch_from_cli(),
         bg_tasks: std::collections::BTreeMap::new(),
@@ -350,6 +365,19 @@ pub(super) fn test_app_with_agent() -> AppView {
     app.next_agent_id = 1;
     switch_to_agent(&mut app, id, SwitchCause::New);
     app
+}
+
+fn insert_ready_model(app: &mut AppView, agent_id: AgentId, model_id: &acp::ModelId) {
+    app.agents
+        .get_mut(&agent_id)
+        .expect("test agent")
+        .session
+        .models
+        .available
+        .insert(
+            model_id.clone(),
+            acp::ModelInfo::new(model_id.clone(), model_id.0.to_string()),
+        );
 }
 /// Give a test agent a generated title so the dashboard renders it.
 ///
@@ -576,6 +604,9 @@ fn insert_placeholder_agent(app: &mut AppView, id: AgentId) {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            model_switch_request_id: None,
+            model_switch_rollback: None,
+            model_switch_queue_handoff_from: None,
             user_model_preference: None,
             deferred_model_switch: None,
             bg_tasks: std::collections::BTreeMap::new(),
@@ -721,6 +752,9 @@ fn two_agent_app_with_bg_task() -> AppView {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            model_switch_request_id: None,
+            model_switch_rollback: None,
+            model_switch_queue_handoff_from: None,
             user_model_preference: None,
             deferred_model_switch: None,
             bg_tasks: std::collections::BTreeMap::new(),

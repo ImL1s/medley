@@ -6160,11 +6160,104 @@ pub fn to_acp_model_info(
 }
 /// Error code for model switch rejection due to agent type mismatch.
 pub const MODEL_SWITCH_INCOMPATIBLE_AGENT: &str = "MODEL_SWITCH_INCOMPATIBLE_AGENT";
+/// Error code for failures before a prepared model switch reaches the session
+/// actor (for example an unknown session, unknown model, or readiness gate).
+pub const MODEL_SWITCH_VALIDATION_FAILED: &str = "MODEL_SWITCH_VALIDATION_FAILED";
 /// Error code for model switch failure during the zero-turn full harness
 /// rebuild path. Emitted when `RebuildAgentForDefinition` fails (definition
 /// could not be resolved at handler time, `AgentBuilder::build()` errored,
 /// or a turn started racing the rebuild).
 pub const MODEL_SWITCH_REBUILD_FAILED: &str = "MODEL_SWITCH_REBUILD_FAILED";
+/// Error code for failures after the target harness was prepared but the
+/// model switch could not be durably committed.
+pub const MODEL_SWITCH_COMMIT_FAILED: &str = "MODEL_SWITCH_COMMIT_FAILED";
+
+/// Return a recognized structured model-switch error code. Unknown payloads
+/// remain unclassified so callers never mislabel arbitrary actor failures as
+/// harness rebuild failures.
+pub fn model_switch_error_code(err: &acp::Error) -> Option<&'static str> {
+    match err.data.as_ref()?.get("code")?.as_str()? {
+        MODEL_SWITCH_VALIDATION_FAILED => Some(MODEL_SWITCH_VALIDATION_FAILED),
+        MODEL_SWITCH_INCOMPATIBLE_AGENT => Some(MODEL_SWITCH_INCOMPATIBLE_AGENT),
+        MODEL_SWITCH_REBUILD_FAILED => Some(MODEL_SWITCH_REBUILD_FAILED),
+        MODEL_SWITCH_COMMIT_FAILED => Some(MODEL_SWITCH_COMMIT_FAILED),
+        _ => None,
+    }
+}
+
+/// Structured error payload for validation and zero-turn rebuild failures. The
+/// payload deliberately identifies only the model, active harness, required
+/// harness, and a stable reason; builder internals and credentials stay in
+/// server-side logs. [`Self::from_acp_error`] remains rebuild-only because the
+/// pager uses it specifically to render the harness-unavailable flow.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSwitchHarnessError {
+    pub code: String,
+    pub active_agent_type: String,
+    pub required_agent_type: String,
+    pub model_id: String,
+    pub reason: String,
+}
+
+impl ModelSwitchHarnessError {
+    pub fn into_acp_error(self) -> acp::Error {
+        let message = if self.code == MODEL_SWITCH_VALIDATION_FAILED {
+            format!(
+                "Cannot switch to model '{}': the request or session prerequisites could not be validated.",
+                self.model_id,
+            )
+        } else {
+            format!(
+                "Cannot switch to model '{}': required harness '{}' could not replace active harness '{}'.",
+                self.model_id, self.required_agent_type, self.active_agent_type,
+            )
+        };
+        acp::Error::new(acp::ErrorCode::InvalidRequest.into(), message)
+            .data(serde_json::to_value(&self).ok())
+    }
+
+    pub fn from_acp_error(err: &acp::Error) -> Option<Self> {
+        let data = err.data.as_ref()?;
+        if data.get("code")?.as_str()? != MODEL_SWITCH_REBUILD_FAILED {
+            return None;
+        }
+        serde_json::from_value(data.clone()).ok()
+    }
+}
+
+/// Structured payload for a switch whose prepared actor state could not be
+/// durably committed. It intentionally mirrors the harness context carried by
+/// rebuild failures while using a distinct code and user-facing message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSwitchCommitError {
+    pub code: String,
+    pub active_agent_type: String,
+    pub required_agent_type: String,
+    pub model_id: String,
+    pub reason: String,
+}
+
+impl ModelSwitchCommitError {
+    pub fn into_acp_error(self) -> acp::Error {
+        let message = format!(
+            "Cannot switch to model '{}': the prepared session state could not be committed.",
+            self.model_id,
+        );
+        acp::Error::new(acp::ErrorCode::InvalidRequest.into(), message)
+            .data(serde_json::to_value(&self).ok())
+    }
+
+    pub fn from_acp_error(err: &acp::Error) -> Option<Self> {
+        let data = err.data.as_ref()?;
+        if data.get("code")?.as_str()? != MODEL_SWITCH_COMMIT_FAILED {
+            return None;
+        }
+        serde_json::from_value(data.clone()).ok()
+    }
+}
+
 /// Structured error payload for model switch rejection due to agent type
 /// incompatibility. Serialized into `acp::Error.data` by the shell and
 /// deserialized by the TUI for user-friendly error rendering.
@@ -6218,6 +6311,79 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use xai_grok_test_support::EnvGuard;
+
+    fn structured_model_switch_error(code: &str) -> acp::Error {
+        acp::Error::invalid_params().data(serde_json::json!({
+            "code": code,
+            "activeAgentType": "grok-build",
+            "requiredAgentType": "cursor",
+            "modelId": "target-model",
+            "reason": "persistence_write_failed",
+        }))
+    }
+
+    #[test]
+    fn model_switch_error_code_accepts_only_known_structured_codes() {
+        for code in [
+            MODEL_SWITCH_VALIDATION_FAILED,
+            MODEL_SWITCH_INCOMPATIBLE_AGENT,
+            MODEL_SWITCH_REBUILD_FAILED,
+            MODEL_SWITCH_COMMIT_FAILED,
+        ] {
+            assert_eq!(
+                model_switch_error_code(&structured_model_switch_error(code)),
+                Some(code)
+            );
+        }
+        assert_eq!(
+            model_switch_error_code(&structured_model_switch_error("MODEL_SWITCH_UNKNOWN")),
+            None
+        );
+        assert_eq!(model_switch_error_code(&acp::Error::invalid_params()), None);
+    }
+
+    #[test]
+    fn rebuild_and_commit_parsers_are_phase_strict() {
+        let validation = ModelSwitchHarnessError {
+            code: MODEL_SWITCH_VALIDATION_FAILED.to_owned(),
+            active_agent_type: "grok-build".to_owned(),
+            required_agent_type: "cursor".to_owned(),
+            model_id: "target-model".to_owned(),
+            reason: "gateway_closed".to_owned(),
+        }
+        .into_acp_error();
+        assert!(validation.message.contains("could not be validated"));
+        assert!(!validation.message.contains("required harness"));
+        assert!(ModelSwitchHarnessError::from_acp_error(&validation).is_none());
+        assert_eq!(
+            model_switch_error_code(&validation),
+            Some(MODEL_SWITCH_VALIDATION_FAILED)
+        );
+
+        let rebuild = structured_model_switch_error(MODEL_SWITCH_REBUILD_FAILED);
+        assert!(ModelSwitchHarnessError::from_acp_error(&rebuild).is_some());
+        assert!(ModelSwitchCommitError::from_acp_error(&rebuild).is_none());
+
+        let commit = structured_model_switch_error(MODEL_SWITCH_COMMIT_FAILED);
+        assert!(ModelSwitchCommitError::from_acp_error(&commit).is_some());
+        assert!(
+            ModelSwitchHarnessError::from_acp_error(&commit).is_none(),
+            "pager harness classification must remain rebuild-only"
+        );
+
+        let error = ModelSwitchCommitError {
+            code: MODEL_SWITCH_COMMIT_FAILED.to_owned(),
+            active_agent_type: "grok-build".to_owned(),
+            required_agent_type: "cursor".to_owned(),
+            model_id: "target-model".to_owned(),
+            reason: "persistence_write_failed".to_owned(),
+        }
+        .into_acp_error();
+        assert!(error.message.contains("could not be committed"));
+        let emitted =
+            ModelSwitchCommitError::from_acp_error(&error).expect("commit payload round-trips");
+        assert_eq!(emitted.code, MODEL_SWITCH_COMMIT_FAILED);
+    }
 
     struct RotatingCodexAuxRefresher {
         calls: Arc<AtomicUsize>,

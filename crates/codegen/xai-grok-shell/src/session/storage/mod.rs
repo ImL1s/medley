@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::extensions::notification::SessionNotification;
@@ -47,6 +47,107 @@ pub(crate) fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
             Err(e)
         }
     }
+}
+
+/// Crash-atomic replacement with stable-storage barriers for both file contents
+/// and the renamed directory entry.
+pub(crate) fn write_bytes_atomic_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = temp_sibling(path);
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        sync_file_durable(&file)?;
+        drop(file);
+        replace_file_atomic_durable(&tmp, path)?;
+        sync_parent_directory(path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomic_durable(tmp: &Path, path: &Path) -> io::Result<()> {
+    std::fs::rename(tmp, path)
+}
+
+#[cfg(windows)]
+const DURABLE_REPLACE_FLAGS: windows::Win32::Storage::FileSystem::MOVE_FILE_FLAGS =
+    windows::Win32::Storage::FileSystem::MOVE_FILE_FLAGS(1 | 8);
+
+#[cfg(windows)]
+fn windows_extended_path(path: &Path) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let absolute = std::path::absolute(path)?;
+    let mut wide = absolute.as_os_str().encode_wide().collect::<Vec<_>>();
+    if wide.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path contains NUL",
+        ));
+    }
+    const BACKSLASH: u16 = b'\\' as u16;
+    const QUESTION: u16 = b'?' as u16;
+    if wide.starts_with(&[BACKSLASH, BACKSLASH, QUESTION, BACKSLASH]) {
+        wide.push(0);
+        Ok(wide)
+    } else {
+        let unc = wide.starts_with(&[BACKSLASH, BACKSLASH]);
+        let mut extended = if unc { r"\\?\UNC\" } else { r"\\?\" }
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        if unc {
+            wide.drain(..2);
+        }
+        extended.extend(wide);
+        extended.push(0);
+        Ok(extended)
+    }
+}
+
+#[cfg(windows)]
+fn replace_file_atomic_durable(tmp: &Path, path: &Path) -> io::Result<()> {
+    use windows::Win32::Storage::FileSystem::MoveFileExW;
+    use windows::core::PCWSTR;
+
+    let from = windows_extended_path(tmp)?;
+    let to = windows_extended_path(path)?;
+    // Rust's Windows rename already replaces an existing file. Use MoveFileExW
+    // here specifically to add WRITE_THROUGH to the durable transaction path.
+    unsafe {
+        MoveFileExW(
+            PCWSTR(from.as_ptr()),
+            PCWSTR(to.as_ptr()),
+            DURABLE_REPLACE_FLAGS,
+        )
+    }
+    .map_err(io::Error::other)
+}
+
+#[cfg(unix)]
+pub(crate) fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(windows)]
+pub(crate) fn sync_parent_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn sync_parent_directory(_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "durable directory sync is unsupported on this platform",
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -966,6 +1067,26 @@ pub enum AppendUpdateError {
 }
 
 #[derive(Debug)]
+pub enum ModelSwitchCommitError {
+    NotCommitted(io::Error),
+    Committed(io::Error),
+}
+
+impl ModelSwitchCommitError {
+    pub fn is_committed(&self) -> bool {
+        matches!(self, Self::Committed(_))
+    }
+}
+
+impl std::fmt::Display for ModelSwitchCommitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotCommitted(error) | Self::Committed(error) => error.fmt(formatter),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum AppendCwdSwitchError {
     NotCommitted(io::Error),
     Committed {
@@ -1075,6 +1196,23 @@ pub trait StorageAdapter: Send + Sync {
         agent_name: Option<&str>,
         reasoning_effort: Option<Option<ReasoningEffort>>,
     ) -> io::Result<()>;
+
+    /// Atomically commit the chat/model generation used by a model switch.
+    /// Once durable intent is installed, errors are reported as `Committed`
+    /// and load must replay that intent before returning session data.
+    async fn commit_model_switch(
+        &self,
+        _info: &Info,
+        _messages: &[ConversationItem],
+        _model_id: &acp::ModelId,
+        _agent_name: Option<&str>,
+        _reasoning_effort: Option<ReasoningEffort>,
+    ) -> Result<(), ModelSwitchCommitError> {
+        Err(ModelSwitchCommitError::NotCommitted(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic model-switch persistence is unsupported",
+        )))
+    }
 
     /// Update the collection ID for telemetry tracing
     async fn update_collection_id(&self, info: &Info, collection_id: &str) -> io::Result<()>;
@@ -2389,6 +2527,29 @@ pub(crate) fn parse_prompt_extract_event(line: &str) -> PromptExtractEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn durable_windows_replace_requests_replacement_and_write_through() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+        use windows::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+
+        assert_eq!(
+            DURABLE_REPLACE_FLAGS.0,
+            MOVEFILE_REPLACE_EXISTING.0 | MOVEFILE_WRITE_THROUGH.0
+        );
+
+        let malformed =
+            OsString::from_wide(&[b'C' as u16, b':' as u16, b'\\' as u16, 0xD800, b'x' as u16]);
+        let extended = windows_extended_path(Path::new(&malformed)).unwrap();
+        assert!(
+            extended.contains(&0xD800),
+            "extended-path conversion must preserve unpaired UTF-16 surrogates"
+        );
+    }
 
     // ── helpers ──────────────────────────────────────────────────────────────
 

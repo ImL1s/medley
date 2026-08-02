@@ -199,6 +199,9 @@ fn dispatch_load_session_ungated(
             available_commands_generation: 1,
             available_tools: None,
             model_switch_pending: false,
+            model_switch_request_id: None,
+            model_switch_rollback: None,
+            model_switch_queue_handoff_from: None,
             user_model_preference: None,
             deferred_model_switch: app.deferred_model_switch_from_cli(),
             bg_tasks: std::collections::BTreeMap::new(),
@@ -967,6 +970,9 @@ pub(in crate::app::dispatch) fn dispatch_load_session_with_restore(
             available_commands_generation: 1,
             available_tools: None,
             model_switch_pending: false,
+            model_switch_request_id: None,
+            model_switch_rollback: None,
+            model_switch_queue_handoff_from: None,
             user_model_preference: None,
             deferred_model_switch: app.deferred_model_switch_from_cli(),
             bg_tasks: std::collections::BTreeMap::new(),
@@ -1123,6 +1129,26 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
         if let Some(directive) = agent.pending_first_prompt.take() {
             agent.session.enqueue_prompt_front(directive);
         }
+        let deferred_request_id = deferred.as_ref().and_then(|_| {
+            crate::app::dispatch::session::lifecycle::begin_model_switch_request(
+                &mut app.model_switch_transaction,
+                agent_id,
+                &mut agent.session,
+                &app.models,
+            )
+        });
+        if let Some((model_id, effort)) = deferred.as_ref()
+            && let Some(request_id) = deferred_request_id
+        {
+            effects.push(Effect::SwitchModel {
+                agent_id,
+                session_id: hydrate_sid.clone(),
+                model_id: model_id.clone(),
+                effort: *effort,
+                request_id,
+                prev_model_id: None,
+            });
+        }
         let drain = maybe_drain_queue(agent);
         let page_flip_entry = drain.page_flip_entry;
         effects.extend(drain.effects);
@@ -1152,16 +1178,6 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
             agent_id,
             silent: true,
         });
-        if let Some((model_id, effort)) = deferred {
-            agent.session.model_switch_pending = true;
-            effects.push(Effect::SwitchModel {
-                agent_id,
-                session_id: hydrate_sid.clone(),
-                model_id,
-                effort,
-                prev_model_id: None,
-            });
-        }
         if std::mem::take(&mut agent.pending_extensions_fetch)
             && let Some(modal) = agent.extensions_modal.as_mut()
         {
@@ -1307,8 +1323,7 @@ pub(in crate::app::dispatch) fn handle_session_restored(
         {
             app.welcome_history_load_as_build = false;
         }
-        refuse_chat_mode_build_agent(app, agent_id);
-        return vec![];
+        return refuse_chat_mode_build_agent(app, agent_id);
     }
     let sid = clear_stale_session_id(app, &local_session_id);
     let effective_chat_kind = effective_loaded_session_chat_kind(app, false);

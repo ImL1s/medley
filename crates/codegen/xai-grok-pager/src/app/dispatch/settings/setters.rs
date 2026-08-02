@@ -1627,16 +1627,10 @@ pub(in crate::app::dispatch) fn set_default_model_inner(
     true
 }
 
-/// Toast format for `default_model`. Mirrors `save_theme_toast` —
-/// renders the user-friendly model name (NOT the internal id) so the
-/// toast text matches what the user typed.
-fn save_default_model_toast(value: &str) -> String {
-    format!("\u{2713} Default model: {value}")
-}
-
 /// Outer dispatcher for `Action::SetDefaultModel`. Soft-confirms when the
-/// target model's auth class differs from the current one; otherwise
-/// switches, persists, and toasts. Idempotent: same model already active → no-op.
+/// target model's auth class differs from the current one; otherwise starts
+/// the switch. Persistence and the success toast wait for the ACP receipt.
+/// Idempotent: same model already active → no-op.
 pub(in crate::app::dispatch) fn set_default_model(
     app: &mut AppView,
     new_id: acp::ModelId,
@@ -1704,6 +1698,20 @@ pub(in crate::app::dispatch) fn set_default_model(
         return vec![];
     }
 
+    // The default model is app-global. Allow repeated choices on the same
+    // pre-session placeholder to coalesce, but do not let another session
+    // overwrite the sole durable rollback baseline while it is unresolved.
+    if app
+        .model_switch_transaction
+        .as_ref()
+        .is_some_and(|transaction| {
+            transaction.owner_agent_id != aid || transaction.request_id.is_some()
+        })
+    {
+        app.show_toast("Wait for the current default-model switch to finish");
+        return vec![];
+    }
+
     // Idempotent: same model already active → no-op.
     if prev_id.as_ref() == Some(&new_id) {
         return vec![];
@@ -1739,15 +1747,14 @@ pub(in crate::app::dispatch) fn set_default_model_confirmed(
         return vec![];
     };
 
-    let (prev_id, session_id, available_has_new, new_display) = {
+    let (prev_id, session_id, available_has_new) = {
         let Some(agent) = app.agents.get(&aid) else {
             return vec![];
         };
         let prev_id = agent.session.models.current.clone();
         let session_id = agent.session.session_id.clone();
         let available_has_new = agent.session.models.available.contains_key(&new_id);
-        let new_display = agent.session.models.display_name_for(&new_id);
-        (prev_id, session_id, available_has_new, new_display)
+        (prev_id, session_id, available_has_new)
     };
 
     if !available_has_new {
@@ -1764,54 +1771,62 @@ pub(in crate::app::dispatch) fn set_default_model_confirmed(
         return vec![];
     }
 
+    // Re-check after an auth-class confirmation: another session may have
+    // opened a global transaction while the question modal was visible.
+    if app
+        .model_switch_transaction
+        .as_ref()
+        .is_some_and(|transaction| {
+            transaction.owner_agent_id != aid || transaction.request_id.is_some()
+        })
+    {
+        app.show_toast("Wait for the current default-model switch to finish");
+        return vec![];
+    }
+
+    let request_id = if session_id.is_some() {
+        let Some(agent) = app.agents.get_mut(&aid) else {
+            return vec![];
+        };
+        let request_id = crate::app::dispatch::session::lifecycle::begin_model_switch_request(
+            &mut app.model_switch_transaction,
+            aid,
+            &mut agent.session,
+            &app.models,
+        );
+        let Some(request_id) = request_id else {
+            app.show_toast("Wait for the current model switch to finish");
+            return vec![];
+        };
+        crate::app::dispatch::session::lifecycle::mark_model_switch_app_optimistic(app, aid);
+        Some(request_id)
+    } else {
+        if !crate::app::dispatch::session::lifecycle::begin_deferred_model_switch(app, aid, true) {
+            app.show_toast("Wait for the current model switch to finish");
+            return vec![];
+        }
+        None
+    };
+
     let did_mutate = set_default_model_inner(app, &new_id);
     debug_assert!(did_mutate, "available_has_new gate guarantees mutation");
     refresh_open_settings_modals(app);
-    tracing::info!(
-        target: "settings",
-        key = "default_model",
-        new = ?new_display,
-        new_id = %new_id.0,
-        prev_id = ?prev_id.as_ref().map(|id| id.0.as_ref()),
-        "setting changed",
-    );
-    app.show_toast(&save_default_model_toast(&new_display));
 
-    // Persist the **model ID** (catalog key), not the display name.
-    // The shell's `resolve_default_model` matches by slug / map key,
-    // so persisting the human-readable name (e.g. "Grok Build")
-    // would silently fail to resolve on the next startup.
-    //
-    // Chat (`--chat` / GROK_CHAT_MODE) catalogs use opaque `/rest/modes`
-    // slugs that must not become the global Build `default_model`.
+    // Do not persist or show a success toast until the ACP switch commits.
+    // `handle_switch_model_complete` emits `PersistPreferredModel` after a
+    // successful response. This keeps disk state unchanged when the shell
+    // rejects an unavailable required harness.
     let mut effects: Vec<Effect> = Vec::new();
-    if !xai_grok_shell::agent::chat_modes::process_chat_mode_enabled() {
-        let new_id_str = new_id.0.to_string();
-        let prev_id_str = prev_id
-            .as_ref()
-            .map(|id| id.0.to_string())
-            .unwrap_or_default();
-        effects.push(Effect::PersistSetting {
-            key: "default_model",
-            value: crate::settings::SettingValue::String(new_id_str),
-            rollback_value: crate::settings::SettingValue::String(prev_id_str),
-        });
-    }
 
-    // Best-effort session-level switch. The `Effect::SwitchModel`
-    // pipeline handles its own deferred-switch semantics for the
-    // no-session-id-yet case (see line 583 of this file).
+    // Session-level switch. The `Effect::SwitchModel` pipeline handles its
+    // own deferred-switch semantics for the no-session-id-yet case.
     if let Some(sid) = session_id {
-        // We already hold a reference path to the agent above; re-borrow
-        // mutably here to flip `model_switch_pending`.
-        if let Some(agent) = app.agents.get_mut(&aid) {
-            agent.session.model_switch_pending = true;
-        }
         effects.push(Effect::SwitchModel {
             agent_id: aid,
             session_id: sid,
             model_id: new_id,
             effort: None,
+            request_id: request_id.expect("live session opened a model-switch transaction"),
             prev_model_id: prev_id.clone(),
         });
     } else if let Some(agent) = app.agents.get_mut(&aid) {
@@ -1895,9 +1910,8 @@ pub(super) fn set_fork_secondary_model_inner(app: &mut AppView, value: String) {
     app.current_ui.fork_secondary_model = value;
 }
 
-/// Toast format for `fork_secondary_model`. Mirrors
-/// `save_default_model_toast` — renders the user-friendly model
-/// name (NOT the internal id).
+/// Toast format for `fork_secondary_model`, using the user-friendly model
+/// name rather than the internal id.
 fn save_fork_secondary_model_toast(value: &str) -> String {
     format!("\u{2713} Fork secondary model: {value}")
 }

@@ -1074,22 +1074,42 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
                 };
                 match resolved {
                     Some(id) => {
-                        let _ = set_default_model_inner(app, &id);
-                        // Emit reverse SwitchModel so the ACP session
-                        // matches the rolled-back pager mirror.
-                        if let ActiveView::Agent(aid) = app.active_view
-                            && let Some(sid) = session_id
+                        let request_id = if let ActiveView::Agent(aid) = app.active_view
+                            && session_id.is_some()
+                            && let Some(agent) = app.agents.get_mut(&aid)
                         {
-                            if let Some(agent) = app.agents.get_mut(&aid) {
-                                agent.session.model_switch_pending = true;
+                            crate::app::dispatch::session::lifecycle::begin_model_switch_request(
+                                &mut app.model_switch_transaction,
+                                aid,
+                                &mut agent.session,
+                                &app.models,
+                            )
+                        } else {
+                            None
+                        };
+                        if session_id.is_some() && request_id.is_none() {
+                            tracing::warn!(
+                                target: "settings",
+                                key = "default_model",
+                                "rollback model switch already in flight; leaving mirrors unchanged",
+                            );
+                        } else {
+                            let _ = set_default_model_inner(app, &id);
+                            // Emit reverse SwitchModel so the ACP session
+                            // matches the rolled-back pager mirror.
+                            if let ActiveView::Agent(aid) = app.active_view
+                                && let Some(sid) = session_id
+                                && let Some(request_id) = request_id
+                            {
+                                companion_effects.push(Effect::SwitchModel {
+                                    agent_id: aid,
+                                    session_id: sid,
+                                    model_id: id,
+                                    effort: None,
+                                    request_id,
+                                    prev_model_id: None,
+                                });
                             }
-                            companion_effects.push(Effect::SwitchModel {
-                                agent_id: aid,
-                                session_id: sid,
-                                model_id: id,
-                                effort: None,
-                                prev_model_id: None,
-                            });
                         }
                     }
                     None => {

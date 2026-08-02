@@ -2325,6 +2325,7 @@ mod inline_auto_compact_flow_tests {
                 gateway: GatewaySender::new(gateway_tx),
                 gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 persistence_tx,
+                persistence_is_noop: false,
             },
             permissions: PermissionHandle::allow_all(),
             tool_context,

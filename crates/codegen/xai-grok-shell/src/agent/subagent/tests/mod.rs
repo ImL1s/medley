@@ -132,6 +132,45 @@ async fn subagent_inherits_session_cli_overrides() {
     assert_eq!(def.disallowed_tools, vec!["write"]);
     assert_eq!(def.permission_mode, PermissionMode::AcceptEdits);
 }
+/// Model-harness compatibility compares definitions before session CLI clamps.
+/// The selected definition that runs still receives the clamp independently.
+#[test]
+fn explicit_subagent_model_harness_validation_uses_pre_overlay_definition() {
+    let mut config = crate::agent::config::Config::default();
+    config.cli_agent_overrides = crate::agent::config::CliAgentOverrides {
+        tools: Some(vec!["read_file".into()]),
+        disallowed_tools: Some(vec!["web_search".into()]),
+        ..Default::default()
+    };
+    let mut ctx = ctx_with_toggle(std::collections::HashMap::new());
+    ctx.agent_config = Some(config);
+
+    let raw = resolve_agent_definition_without_session_cli_overrides("codex", &ctx)
+        .expect("strict harness resolves before session overlay");
+    let effective = resolve_agent_definition("codex", &ctx)
+        .expect("strict harness resolves with session overlay");
+    assert_eq!(raw.session_tools_allowlist, None);
+    assert_eq!(effective.session_tools_allowlist, Some(vec!["read_file".into()]));
+    assert_eq!(
+        resolve_and_validate_subagent_model_harness(
+            &raw,
+            "codex",
+            &ctx.parent_cwd,
+            ctx.plugin_registry.as_deref(),
+        ),
+        Ok(()),
+    );
+    assert_eq!(
+        resolve_and_validate_subagent_model_harness(
+            &effective,
+            "codex",
+            &ctx.parent_cwd,
+            ctx.plugin_registry.as_deref(),
+        ),
+        Err(SubagentModelHarnessError::Incompatible),
+        "test must fail if the caller compares the overlaid definition",
+    );
+}
 /// `permissionMode: bypassPermissions` is downgraded to `Default` under the
 /// pin and honored without it; other modes and plugin stripping unaffected.
 #[test]
