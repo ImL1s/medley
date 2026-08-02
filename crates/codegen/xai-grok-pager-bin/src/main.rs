@@ -1974,10 +1974,132 @@ fn main() {
     }
 }
 
+/// True when the invocation opens the interactive TUI rather than running a
+/// subcommand or a one-shot prompt.
+fn is_interactive_session(args: &PagerArgs) -> bool {
+    args.command.is_none()
+        && args.single.is_none()
+        && args.prompt_json.is_none()
+        && args.prompt_file.is_none()
+}
+
+/// Offer the one-time copy of a legacy `~/.grok` state directory into
+/// `~/.medley`.
+///
+/// This build writes provider-scoped credentials and config keys that an
+/// official Grok Build install does not understand, so the two must never share
+/// a directory. The copy leaves `~/.grok` untouched; once `~/.medley` exists it
+/// wins for good.
+///
+/// Only an interactive session with a terminal on both stdin and stderr
+/// prompts. Everything else keeps using `~/.grok` silently — `grok_home()` logs
+/// one line saying so.
+fn offer_state_dir_migration(is_interactive: bool) {
+    use xai_grok_config::state_dir;
+
+    let Some(migration) = state_dir::pending_migration() else {
+        return;
+    };
+    if !is_interactive || !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return;
+    }
+
+    let legacy = migration.legacy.display().to_string();
+    let target = migration.target.display().to_string();
+    eprintln!();
+    eprintln!("This build keeps its state in {target}, separate from Grok Build's {legacy}.");
+    eprintln!("Sharing one directory corrupts both, so pick where this build reads and writes:");
+    eprintln!();
+    eprintln!("  [1] Copy {legacy} to {target} and use {target} (nothing is deleted)");
+    eprintln!("  [2] Keep using {legacy} (won't ask again)");
+    eprintln!();
+
+    match read_state_dir_choice() {
+        Some(StateDirChoice::Copy) => apply_state_dir_migration(&migration),
+        Some(StateDirChoice::KeepLegacy) => {
+            if let Err(e) = state_dir::keep_legacy(&migration.legacy) {
+                eprintln!("warning: couldn't record the choice in {legacy}: {e}");
+                eprintln!("         you'll be asked again next time.");
+            } else {
+                eprintln!("Keeping {legacy}.");
+            }
+            eprintln!();
+        }
+        // No answer (EOF) is not a decision: keep the legacy directory for this
+        // run and ask again next time.
+        None => eprintln!(),
+    }
+}
+
+enum StateDirChoice {
+    Copy,
+    KeepLegacy,
+}
+
+/// Read the migration answer, re-prompting until it is one of the two options
+/// or stdin closes.
+fn read_state_dir_choice() -> Option<StateDirChoice> {
+    loop {
+        eprint!("Choice [1]: ");
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).ok()? == 0 {
+            eprintln!();
+            return None;
+        }
+        match line.trim() {
+            "" | "1" => return Some(StateDirChoice::Copy),
+            "2" => return Some(StateDirChoice::KeepLegacy),
+            other => eprintln!("'{other}' isn't 1 or 2."),
+        }
+    }
+}
+
+/// Run the copy and point this process at the new directory.
+///
+/// A failed copy is reported and leaves the legacy directory in use with no
+/// marker written, so the next run offers the migration again.
+fn apply_state_dir_migration(migration: &xai_grok_config::state_dir::Migration) {
+    let target = migration.target.display().to_string();
+    let stats = match xai_grok_config::state_dir::migrate_copy(&migration.legacy, &migration.target)
+    {
+        Ok(stats) => stats,
+        Err(e) => {
+            eprintln!("Couldn't copy to {target}: {e}");
+            eprintln!(
+                "Continuing with {} for now.",
+                migration.legacy.display().to_string()
+            );
+            eprintln!();
+            return;
+        }
+    };
+    eprintln!(
+        "Copied {} files and {} directories to {target}.",
+        stats.files, stats.dirs
+    );
+    if stats.skipped > 0 {
+        eprintln!(
+            "Skipped {} socket/pipe entries left by a running session.",
+            stats.skipped
+        );
+    }
+    if xai_grok_config::pin_grok_home(migration.target.clone()).is_err() {
+        // Something resolved the state directory before the prompt, so paths
+        // built from the old one are already in flight. Say so rather than
+        // pretending the new directory is live.
+        eprintln!("Restart to start using {target} — this session still uses the old directory.");
+    }
+    eprintln!();
+}
+
 fn run_after_cli_preflight(args: PagerArgs, prepared_serve: Option<PreparedServe>) {
     if dispatch_version_if_requested(&args) || dispatch_doctor_if_requested(&args) {
         return;
     }
+    // Before anything resolves the state directory, so the answer applies to
+    // the whole process rather than to a half-started session.
+    offer_state_dir_migration(is_interactive_session(&args));
     xai_grok_pager_minimal::install();
     #[cfg(all(feature = "jemalloc", unix))]
     xai_grok_pager::memory_release::install_release_hook(purge_jemalloc_retained_pages);
@@ -2115,10 +2237,7 @@ async fn async_main(args: PagerArgs, prepared_serve: Option<PreparedServe>) -> R
         args.cwd.as_deref(),
     );
     flag_dashboard_at_startup_if_requested(&mut args)?;
-    let is_interactive = args.command.is_none()
-        && args.single.is_none()
-        && args.prompt_json.is_none()
-        && args.prompt_file.is_none();
+    let is_interactive = is_interactive_session(&args);
     xai_grok_shell::http::set_client_name(if is_interactive {
         xai_grok_workspace::permission::ClientType::GrokPager
     } else {
@@ -2883,6 +3002,33 @@ mod tests {
             Some(Command::Version { json: false })
         ));
     }
+    #[test]
+    fn only_a_bare_invocation_is_an_interactive_session() {
+        let bare = PagerArgs::try_parse_from(["grok"]).unwrap();
+        assert!(is_interactive_session(&bare));
+
+        for headless in [
+            vec!["grok", "-p", "hello"],
+            vec!["grok", "--prompt-json", "[]"],
+            vec!["grok", "--prompt-file", "prompt.txt"],
+            vec!["grok", "version"],
+        ] {
+            let args = PagerArgs::try_parse_from(headless.clone()).unwrap();
+            assert!(
+                !is_interactive_session(&args),
+                "{headless:?} must not prompt for the state-dir migration"
+            );
+        }
+    }
+
+    #[test]
+    fn state_dir_migration_is_a_no_op_when_nothing_is_pending() {
+        // The prompt reads stdin, so the only safe assertion here is that a
+        // non-interactive call returns without touching it. Resolution and the
+        // copy itself are covered in `xai_grok_config::state_dir`.
+        offer_state_dir_migration(false);
+    }
+
     fn serve_args(bind: &str, secret: Option<&str>, allow_remote: bool) -> ServeArgs {
         ServeArgs {
             bind: bind.parse().unwrap(),

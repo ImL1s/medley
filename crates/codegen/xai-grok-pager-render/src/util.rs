@@ -11,20 +11,31 @@ pub fn pager_toml_path() -> PathBuf {
     grok_home().join("pager.toml")
 }
 
-/// User-facing label for the user grok directory (``~/.grok`` or ``$GROK_HOME``).
+/// User-facing label for the user state directory (``~/.medley``, ``~/.grok``
+/// while a legacy install is still live, or the override env var).
 ///
 /// Derived from resolved [`grok_home()`] vs `xai_grok_config::default_grok_home()`,
-/// not from whether `GROK_HOME` is set in the environment.
+/// not from whether an override is set in the environment.
 pub fn display_grok_home_prefix() -> String {
     display_grok_home_prefix_for(&grok_home())
 }
 
 fn display_grok_home_prefix_for(home: &Path) -> String {
-    if home == xai_grok_config::default_grok_home() {
-        "~/.grok".to_string()
-    } else {
-        "$GROK_HOME".to_string()
+    let default = xai_grok_config::default_grok_home();
+    if home == default {
+        // Name the directory that actually holds state — which of ~/.medley and
+        // ~/.grok that is depends on whether the migration has run.
+        return match default.file_name() {
+            Some(name) => format!("~/{}", name.to_string_lossy()),
+            None => "~".to_string(),
+        };
     }
+    let env = if std::env::var_os(xai_grok_config::state_dir::STATE_HOME_ENV).is_some() {
+        xai_grok_config::state_dir::STATE_HOME_ENV
+    } else {
+        xai_grok_config::state_dir::LEGACY_STATE_HOME_ENV
+    };
+    format!("${env}")
 }
 
 /// User-facing path under [`grok_home()`], e.g. ``~/.grok/config.toml``.
@@ -424,31 +435,54 @@ mod tests {
         assert_eq!(parse_schedule_interval_secs("every 5x"), None);
     }
 
+    /// The label of whichever env override is live, matching
+    /// `display_grok_home_prefix_for`'s non-default branch.
+    fn expected_env_label() -> String {
+        let env = if std::env::var_os(xai_grok_config::state_dir::STATE_HOME_ENV).is_some() {
+            xai_grok_config::state_dir::STATE_HOME_ENV
+        } else {
+            xai_grok_config::state_dir::LEGACY_STATE_HOME_ENV
+        };
+        format!("${env}")
+    }
+
     #[test]
     fn display_grok_home_prefix_default_install() {
-        if std::env::var("GROK_HOME").is_ok() {
+        if std::env::var_os(xai_grok_config::state_dir::STATE_HOME_ENV).is_some()
+            || std::env::var_os(xai_grok_config::state_dir::LEGACY_STATE_HOME_ENV).is_some()
+        {
             return;
         }
-        assert_eq!(display_grok_home_prefix(), "~/.grok");
+        // Names whichever directory currently holds state: ~/.medley normally,
+        // ~/.grok while a legacy install has not been migrated.
+        let default = xai_grok_config::default_grok_home();
+        let expected = format!("~/{}", default.file_name().unwrap().to_string_lossy());
+        assert_eq!(display_grok_home_prefix(), expected);
     }
 
     #[test]
     fn display_user_grok_path_joins_relative() {
         let path = display_user_grok_path("config.toml");
         assert!(path.ends_with("/config.toml") || path.ends_with("\\config.toml"));
-        assert!(path.contains(".grok") || path.contains("$GROK_HOME"));
+        assert!(
+            path.contains(xai_grok_config::state_dir::STATE_DIR_NAME)
+                || path.contains(xai_grok_config::state_dir::LEGACY_STATE_DIR_NAME)
+                || path.contains(&expected_env_label()),
+            "got {path}"
+        );
     }
 
     #[test]
     fn display_user_grok_path_for_custom_home_uses_override_label() {
         let custom = std::env::temp_dir().join("grok-home-display-regression");
+        let label = expected_env_label();
         assert_eq!(
             display_user_grok_path_for(&custom, "config.toml"),
-            "$GROK_HOME/config.toml"
+            format!("{label}/config.toml")
         );
         assert_eq!(
             display_user_grok_path_for(&custom, "sandbox.toml"),
-            "$GROK_HOME/sandbox.toml"
+            format!("{label}/sandbox.toml")
         );
     }
 

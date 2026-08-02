@@ -607,16 +607,7 @@ pub fn probe_advertised_tool_ids() -> Option<Vec<String>> {
 }
 #[cfg(feature = "local-workspace")]
 fn local_workspace_ack_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var("GROK_HOME")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            dirs::home_dir()
-                .or_else(|| std::env::var_os("HOME").map(Into::into))
-                .map(|h| h.join(".grok"))
-        })?;
-    Some(home.join("local_workspace_ack"))
+    Some(xai_grok_config::user_grok_home()?.join("local_workspace_ack"))
 }
 /// Conservative shape check for a chat-mode `--resume <id>` passthrough.
 ///

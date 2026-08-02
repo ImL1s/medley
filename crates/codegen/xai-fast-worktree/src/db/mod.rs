@@ -385,16 +385,16 @@ pub fn now_epoch_secs() -> i64 {
         .as_secs() as i64
 }
 
+/// The user state directory worktree checkouts and `worktrees.db` live under.
+///
+/// Routed through [`xai_grok_config::state_dir`] so worktree paths agree with
+/// trust, hooks and every other state path — including which of `~/.medley` and
+/// `~/.grok` is live. Resolved per call (not memoized) so a test or harness that
+/// re-points the environment is honored.
 pub fn resolve_grok_home() -> Result<PathBuf> {
-    if let Ok(v) = std::env::var("GROK_HOME") {
-        return Ok(PathBuf::from(v));
-    }
-    let home = PathBuf::from(std::env::var("HOME").context("neither $GROK_HOME nor $HOME is set")?);
-    // Canonicalize the home dir so worktree paths share the same physical .grok
-    // tree as trust/hooks even when it is symlinked. The dunce canonicalization
-    // must stay in sync with xai_grok_config::default_grok_home();
-    // home resolution deliberately differs ($HOME here vs std::env::home_dir()).
-    Ok(dunce::canonicalize(&home).unwrap_or(home).join(".grok"))
+    xai_grok_config::state_dir::resolve_user()
+        .map(|resolved| resolved.path)
+        .context("neither $MEDLEY_HOME/$GROK_HOME nor a home directory is set")
 }
 
 /// Serializes tests that mutate the process-global `GROK_HOME` env var so they

@@ -70,14 +70,16 @@ impl ChangelogManager {
     }
 
     /// Resolve cache paths from the live process environment (not the
-    /// `grok_home()` OnceLock). A seeded `$GROK_HOME` set on the pager
+    /// `grok_home()` OnceLock). A seeded state-dir override set on the pager
     /// process is always honoured even if some earlier init path cached a
     /// different home.
     fn from_env_home() -> Self {
-        let home = std::env::var_os("GROK_HOME")
-            .map(std::path::PathBuf::from)
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(crate::util::grok_home::grok_home);
+        let resolved = xai_grok_config::state_dir::resolve();
+        let home = if resolved.source.from_env() {
+            resolved.path
+        } else {
+            crate::util::grok_home::grok_home()
+        };
         Self {
             md_cache: home.join("CHANGELOG.md"),
             json_cache: home.join("CHANGELOG.json"),

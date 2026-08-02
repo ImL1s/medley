@@ -13190,6 +13190,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "xai-gix-status",
+ "xai-grok-config",
  "xai-sqlite-journal",
  "xai-test-utils",
  "xai-tty-utils",
@@ -14357,6 +14358,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "xai-grok-config",
  "xai-tty-utils",
 ]
 
