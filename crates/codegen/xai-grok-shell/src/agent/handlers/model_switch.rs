@@ -13,7 +13,7 @@ use agent_client_protocol::{self as acp};
 use tokio::sync::oneshot;
 use xai_grok_sampling_types::parse_reasoning_effort_meta;
 
-struct FailureTelemetry {
+pub(crate) struct FailureTelemetry {
     armed: bool,
     session_id: String,
     previous_model_id: String,
@@ -24,7 +24,7 @@ struct FailureTelemetry {
 }
 
 impl FailureTelemetry {
-    fn new(session_id: &acp::SessionId, model_id: &acp::ModelId) -> Self {
+    pub(crate) fn new(session_id: &acp::SessionId, model_id: &acp::ModelId) -> Self {
         Self {
             armed: true,
             session_id: session_id.0.to_string(),
@@ -36,7 +36,7 @@ impl FailureTelemetry {
         }
     }
 
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.armed = false;
     }
 
@@ -54,7 +54,7 @@ impl Drop for FailureTelemetry {
         if !self.armed {
             return;
         }
-        xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::ModelSwitched {
+        emit_failure_telemetry(xai_grok_telemetry::events::ModelSwitched {
             session_id: self.session_id.clone(),
             previous_model_id: self.previous_model_id.clone(),
             new_model_id: self.new_model_id.clone(),
@@ -64,6 +64,33 @@ impl Drop for FailureTelemetry {
             current_agent_type: self.current_agent_type.clone(),
         });
     }
+}
+
+fn emit_failure_telemetry(event: xai_grok_telemetry::events::ModelSwitched) {
+    #[cfg(test)]
+    if let Ok(value) = serde_json::to_value(&event) {
+        CAPTURED_FAILURE_TELEMETRY.lock().unwrap().push(value);
+    }
+    xai_grok_telemetry::session_ctx::log_event(event);
+}
+
+#[cfg(test)]
+static CAPTURED_FAILURE_TELEMETRY: std::sync::LazyLock<std::sync::Mutex<Vec<serde_json::Value>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+#[cfg(test)]
+pub(crate) fn take_captured_failure_telemetry(session_id: &str) -> Vec<serde_json::Value> {
+    let mut captured = CAPTURED_FAILURE_TELEMETRY.lock().unwrap();
+    let mut matching = Vec::new();
+    captured.retain(|event| {
+        if event.get("session_id").and_then(serde_json::Value::as_str) == Some(session_id) {
+            matching.push(event.clone());
+            false
+        } else {
+            true
+        }
+    });
+    matching
 }
 /// Apply a model switch to a session.
 ///

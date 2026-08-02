@@ -2304,6 +2304,63 @@ fn build_agent_with_model_for_tests(
 }
 
 #[test]
+fn acp_model_switch_validation_and_apply_handoff_emit_one_failure_event() {
+    run_local_for_bridge_test(|| async {
+        for rejection in ["unknown", "disallowed", "unready", "unknown-session"] {
+            let model_id = format!("validation-{rejection}-model");
+            let session_id = acp::SessionId::new(format!("validation-{rejection}-session"));
+            let agent = build_agent_with_model_for_tests(&model_id, "grok-build");
+            let requested_model = if rejection == "unknown" {
+                acp::ModelId::new(format!("{model_id}-missing"))
+            } else if matches!(rejection, "disallowed" | "unready") {
+                let mut entry = agent
+                    .models_manager
+                    .models()
+                    .shift_remove(&model_id)
+                    .expect("test model");
+                if rejection == "disallowed" {
+                    entry.info.user_selectable = false;
+                } else {
+                    entry
+                        .config_validation_errors
+                        .push("injected readiness failure".to_owned());
+                }
+                agent
+                    .models_manager
+                    .insert_test_entry(model_id.clone(), entry);
+                acp::ModelId::new(model_id.clone())
+            } else {
+                acp::ModelId::new(model_id.clone())
+            };
+
+            let error = <MvpAgent as acp::Agent>::set_session_model(
+                &agent,
+                acp::SetSessionModelRequest::new(session_id.clone(), requested_model.clone()),
+            )
+            .await
+            .expect_err("public ACP validation must reject the request");
+            assert_eq!(error.code, acp::ErrorCode::InvalidParams.into(), "{rejection}");
+
+            let events = crate::agent::handlers::model_switch::take_captured_failure_telemetry(
+                session_id.0.as_ref(),
+            );
+            assert_eq!(events.len(), 1, "{rejection}: {events:?}");
+            let event = &events[0];
+            assert_eq!(event["session_id"], session_id.0.as_ref(), "{rejection}");
+            assert_eq!(event["new_model_id"], requested_model.0.as_ref(), "{rejection}");
+            assert_eq!(event["success"], false, "{rejection}");
+            assert_eq!(
+                event["error_code"],
+                crate::agent::config::MODEL_SWITCH_VALIDATION_FAILED,
+                "{rejection}"
+            );
+            assert!(event.get("required_agent_type").is_none(), "{rejection}");
+            assert!(event.get("current_agent_type").is_none(), "{rejection}");
+        }
+    });
+}
+
+#[test]
 fn zero_turn_model_switch_fails_closed_when_required_harness_is_unresolved() {
     run_local_for_bridge_test(|| async {
         let model_id = "unresolved-harness-model";

@@ -3814,6 +3814,15 @@ impl acp::Agent for MvpAgent {
         &self,
         args: acp::SetSessionModelRequest,
     ) -> Result<acp::SetSessionModelResponse, acp::Error> {
+        // Own failure telemetry until the public ACP validation gates pass.
+        // `apply` creates the actor-phase guard after this handoff, so every
+        // rejection emits exactly once without misclassifying validation as a
+        // harness rebuild failure.
+        let mut validation_failure_telemetry =
+            crate::agent::handlers::model_switch::FailureTelemetry::new(
+                &args.session_id,
+                &args.model_id,
+            );
         let model = self.resolve_model_id(&args.model_id)?;
         if !model.info.user_selectable {
             return Err(
@@ -3827,6 +3836,7 @@ impl acp::Agent for MvpAgent {
                 reason.unwrap_or_else(|| "model is not ready".to_owned()),
             ));
         }
+        validation_failure_telemetry.disarm();
         let session_id = args.session_id.clone();
         let res = crate::agent::handlers::model_switch::apply(self, args).await;
         if res.is_ok()
