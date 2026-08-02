@@ -3725,6 +3725,7 @@ fn project_local_model_sections_are_reported_as_inert() {
     std::fs::write(
         &config_path,
         "[mcp_servers.demo]\ncommand = \"true\"\n\n\
+         [models]\ndefault = \"gpt-5.6-sol\"\n\n\
          [model.\"gpt-5.6-sol\"]\nmodel = \"gpt-5.6-sol\"\nmodel_provider = \"openai-codex\"\n\n\
          [model_providers.gateway]\nbase_url = \"https://gateway.example/v1\"\n",
     )
@@ -3733,11 +3734,15 @@ fn project_local_model_sections_are_reported_as_inert() {
     let findings = inert_project_model_sections(&project);
     assert_eq!(findings.len(), 1, "one offending project config: {findings:?}");
     assert_eq!(findings[0].0, config_path);
-    assert_eq!(findings[0].1, vec!["model", "model_providers"]);
+    assert_eq!(findings[0].1, vec!["model", "models", "model_providers"]);
 
     let message = inert_project_model_sections_message(&findings[0].0, &findings[0].1);
     assert!(message.contains("[model.*]"), "{message}");
     assert!(message.contains("[model_providers.*]"), "{message}");
+    assert!(
+        message.contains("[models]") && !message.contains("[models.*]"),
+        "the flat [models] table must not be written as a table of entries: {message}"
+    );
     assert!(message.contains(&config_path.display().to_string()), "{message}");
     assert!(
         message.contains("Move these entries to"),

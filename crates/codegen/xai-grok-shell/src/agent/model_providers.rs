@@ -33,12 +33,12 @@ fn openai_codex_provider() -> ModelProviderConfig {
 /// so the user has to hand-write a `[model.<id>]` block in the *global*
 /// `$GROK_HOME/config.toml` before anything is selectable.
 ///
-/// Seeded by [`super::config::Config::new_from_toml_cfg`] only for keys the
-/// user has not defined, so a hand-written entry still wins. They carry no
-/// credential of their own — readiness gates on the provider-scoped OAuth
-/// snapshot exactly like a hand-written entry does, which is what surfaces
-/// them as unready with a "sign in" reason before login.
-pub(crate) fn openai_codex_preset_models() -> IndexMap<String, ConfigModelOverride> {
+/// Folded into the user's `[model.*]` table by
+/// [`merge_openai_codex_presets`]. They carry no credential of their own —
+/// readiness gates on the provider-scoped OAuth snapshot exactly like a
+/// hand-written entry does, which is what surfaces them as unready with a
+/// "sign in" reason before login.
+fn openai_codex_preset_models() -> IndexMap<String, ConfigModelOverride> {
     IndexMap::from([(
         OPENAI_CODEX_PRESET_MODEL_ID.to_owned(),
         ConfigModelOverride {
@@ -50,6 +50,50 @@ pub(crate) fn openai_codex_preset_models() -> IndexMap<String, ConfigModelOverri
             ..ConfigModelOverride::default()
         },
     )])
+}
+
+impl ConfigModelOverride {
+    /// Whether this entry names where its traffic goes and what authenticates
+    /// it, rather than leaving both to a preset or provider.
+    fn declares_own_routing(&self) -> bool {
+        self.model_provider.is_some()
+            || self.base_url.is_some()
+            || self.api_base_url.is_some()
+            || self.api_key.is_some()
+            || self.env_key.is_some()
+            || self.auth_provider.is_some()
+    }
+}
+
+/// Fold the built-in Codex presets into the user's parsed `[model.*]` table.
+///
+/// A key the user never declared gets the preset outright.
+///
+/// A key the user *did* declare keeps their entry, but a metadata-only
+/// override — a new `name`, a bigger `context_window` — names no endpoint and
+/// no credential. Letting it replace the preset wholesale would strip the
+/// `model_provider` binding, and the entry would then resolve as a plain xAI
+/// catalog model: routed to the xAI inference endpoint and authenticated with
+/// the user's xAI session token, under a key the docs describe as Codex. So
+/// the preset's routing is backfilled underneath such an override.
+///
+/// An override that declares its own provider, endpoint, or credential has
+/// taken ownership of the key and is left exactly as written — redefining
+/// `[model."gpt-5.6-sol"]` as some other provider's model stays possible.
+pub(crate) fn merge_openai_codex_presets(
+    config_models: &mut IndexMap<String, ConfigModelOverride>,
+) {
+    for (key, preset) in openai_codex_preset_models() {
+        let Some(user_entry) = config_models.get_mut(&key) else {
+            config_models.insert(key, preset);
+            continue;
+        };
+        if user_entry.declares_own_routing() {
+            continue;
+        }
+        user_entry.model_provider = preset.model_provider;
+        user_entry.model.get_or_insert(preset.model.unwrap_or(key));
+    }
 }
 
 #[derive(Clone, Default, serde::Deserialize)]
@@ -1395,6 +1439,81 @@ mod tests {
             .expect("the user's entry keeps the preset key");
         assert_eq!(model.info.name.as_deref(), Some("My Codex"));
         assert_eq!(model.info.context_window.get(), 123_456);
+    }
+
+    /// The docs tell users to redeclare the preset key to retune its metadata.
+    /// Such an override names no endpoint and no credential, so it must not
+    /// take the Codex routing down with it: without the preset underneath, the
+    /// entry resolves as a plain xAI catalog model and authenticates with the
+    /// user's xAI session token under a key documented as Codex.
+    #[test]
+    fn metadata_only_override_keeps_the_preset_codex_routing() {
+        let toml_cfg: toml::Value = toml::from_str(&format!(
+            r#"
+            [model."{OPENAI_CODEX_PRESET_MODEL_ID}"]
+            name = "Codex"
+            context_window = 400000
+            "#
+        ))
+        .unwrap();
+
+        let cfg = Config::new_from_toml_cfg(&toml_cfg).expect("config should parse");
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved
+            .get(OPENAI_CODEX_PRESET_MODEL_ID)
+            .expect("the preset key should resolve");
+
+        assert_eq!(model.info.name.as_deref(), Some("Codex"));
+        assert_eq!(model.info.context_window.get(), 400_000);
+        assert_eq!(
+            model.info.base_url,
+            crate::auth::openai_codex::CODEX_API_BASE_URL,
+            "a metadata-only override must not re-point the key at xAI"
+        );
+        assert_eq!(model.info.api_backend, ApiBackend::CodexResponses);
+        assert_eq!(
+            model
+                .auth_provider
+                .as_ref()
+                .map(|provider| provider.name.as_str()),
+            Some(OPENAI_CODEX_PROVIDER_ID)
+        );
+        assert_eq!(
+            resolve_credentials(model, Some("xai-session-token")).api_key,
+            None,
+            "the xAI session token must never authenticate a Codex-keyed model"
+        );
+    }
+
+    /// The flip side: an override that names its own endpoint and credential
+    /// has taken the key over, so the preset must not clamp it back onto Codex
+    /// (which would silently strip that endpoint and key).
+    #[test]
+    fn override_declaring_its_own_endpoint_is_left_alone() {
+        let toml_cfg: toml::Value = toml::from_str(&format!(
+            r#"
+            [model."{OPENAI_CODEX_PRESET_MODEL_ID}"]
+            model = "gpt-5.6-sol"
+            base_url = "https://api.openai.com/v1"
+            env_key = "OPENAI_API_KEY"
+            context_window = 200000
+            "#
+        ))
+        .unwrap();
+
+        let cfg = Config::new_from_toml_cfg(&toml_cfg).expect("config should parse");
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved
+            .get(OPENAI_CODEX_PRESET_MODEL_ID)
+            .expect("the user's entry should resolve");
+
+        assert_eq!(model.info.base_url, "https://api.openai.com/v1");
+        assert_eq!(
+            model.env_key.as_ref().map(|keys| keys.names()),
+            Some(vec!["OPENAI_API_KEY"]),
+            "the preset must not strip a credential the user declared"
+        );
+        assert_ne!(model.info.api_backend, ApiBackend::CodexResponses);
     }
 
     #[test]

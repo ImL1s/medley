@@ -1489,7 +1489,13 @@ pub use xai_grok_workspace::project_config::find_project_configs;
 /// so model entries written there are inert. Project-scoped model support is
 /// tracked separately; until it lands, the only fix is moving them to the
 /// global config, which is what [`warn_inert_project_model_sections`] says.
-pub const PROJECT_INERT_MODEL_SECTIONS: [&str; 2] = ["model", "model_providers"];
+/// Each pair is the TOML key and how it is written in prose: `[models]` is a
+/// flat table, the other two are tables of entries.
+pub const PROJECT_INERT_MODEL_SECTIONS: [(&str, &str); 3] = [
+    ("model", "[model.*]"),
+    ("models", "[models]"),
+    ("model_providers", "[model_providers.*]"),
+];
 /// One entry per project `.grok/config.toml` at or above `cwd` that declares a
 /// section from [`PROJECT_INERT_MODEL_SECTIONS`], naming the sections it
 /// declares. Empty when every project config stays within the sections the
@@ -1503,7 +1509,8 @@ pub fn inert_project_model_sections(
             let root = load_config_file(&path).ok()?;
             let declared: Vec<&'static str> = PROJECT_INERT_MODEL_SECTIONS
                 .into_iter()
-                .filter(|section| root.get(section).is_some())
+                .filter(|(key, _)| root.get(key).is_some())
+                .map(|(key, _)| key)
                 .collect();
             (!declared.is_empty()).then_some((path, declared))
         })
@@ -1516,7 +1523,12 @@ pub fn inert_project_model_sections_message(
 ) -> String {
     let sections = declared
         .iter()
-        .map(|section| format!("[{section}.*]"))
+        .map(|declared_key| {
+            PROJECT_INERT_MODEL_SECTIONS
+                .into_iter()
+                .find_map(|(key, label)| (key == *declared_key).then_some(label))
+                .unwrap_or(declared_key)
+        })
         .collect::<Vec<_>>()
         .join(" and ");
     let global = user_grok_home()

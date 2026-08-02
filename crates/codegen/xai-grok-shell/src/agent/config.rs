@@ -2211,9 +2211,7 @@ impl Config {
             models: mut config_models,
             warnings: config_warnings,
         } = super::config_model_override_parse::parse_model_overrides(raw_config);
-        for (key, preset) in super::model_providers::openai_codex_preset_models() {
-            config_models.entry(key).or_insert(preset);
-        }
+        super::model_providers::merge_openai_codex_presets(&mut config_models);
         let (mut auth_providers, auth_provider_warnings) = parse_auth_providers(raw_config);
         let (model_providers, mut model_provider_warnings) = parse_model_providers(raw_config);
         for (id, provider) in &model_providers {

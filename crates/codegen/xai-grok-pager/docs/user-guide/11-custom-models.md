@@ -275,16 +275,30 @@ picker from a fresh install, listed as unready with the reason `sign in with
 grok login --provider openai-codex` until the credential above exists, and
 selectable once it does. Nothing has to be written to `config.toml` for it.
 
-To change the preset's metadata, declare the same catalog key in the global
-config — a matching `[model."gpt-5.6-sol"]` replaces the preset rather than
-adding a second entry. Use the same shape to add other Codex models:
+To retune the preset, declare the same catalog key in the global config — it
+edits the preset in place rather than adding a second entry:
 
 ```toml
 [model."gpt-5.6-sol"]
-model = "gpt-5.6-sol"
-model_provider = "openai-codex"
 name = "OpenAI Codex"
 context_window = 200000 # the preset's value; raise it if your account allows more
+```
+
+An override like that names no endpoint and no credential, so it keeps the
+preset's Codex routing. Declaring your own `base_url`, `env_key`, `api_key`,
+`api_base_url`, `auth_provider`, or `model_provider` instead takes the key over
+completely — useful if you want `gpt-5.6-sol` to mean your own OpenAI Platform
+model, but it is then no longer a Codex entry and the ChatGPT credential does
+not apply to it.
+
+To add a *different* Codex model, give it its own key and name the provider:
+
+```toml
+[model.my-other-codex-model]
+model = "<the wire id>"
+model_provider = "openai-codex"
+name = "OpenAI Codex"
+context_window = 200000 # example only; use metadata accurate for the model
 ```
 
 The `openai-codex` provider fixes the transport to
