@@ -6,9 +6,9 @@ const MODEL_SWITCH_LOCK_FILE: &str = "model_switch.intent.lock";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModelSwitchCommitStep {
-    IntentDurable,
-    ChatDurable,
-    SummaryDurable,
+    Intent,
+    Chat,
+    Summary,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -63,7 +63,7 @@ impl JsonlStorageAdapter {
                 ModelSwitchCommitError::NotCommitted(error)
             });
         }
-        if let Err(error) = self.probe_model_switch(ModelSwitchCommitStep::IntentDurable) {
+        if let Err(error) = self.probe_model_switch(ModelSwitchCommitStep::Intent) {
             let _ = lock.unlock();
             return Err(ModelSwitchCommitError::Committed(error));
         }
@@ -112,7 +112,7 @@ impl JsonlStorageAdapter {
             &session_dir.join(super::super::CHAT_HISTORY_FILE),
             &chat_bytes,
         )?;
-        self.probe_model_switch(ModelSwitchCommitStep::ChatDurable)?;
+        self.probe_model_switch(ModelSwitchCommitStep::Chat)?;
 
         let cwd_switch_bookkeeping_generation = intent
             .messages
@@ -137,7 +137,7 @@ impl JsonlStorageAdapter {
                 ..Default::default()
             },
         )?;
-        self.probe_model_switch(ModelSwitchCommitStep::SummaryDurable)?;
+        self.probe_model_switch(ModelSwitchCommitStep::Summary)?;
 
         let journal = session_dir.join(MODEL_SWITCH_JOURNAL_FILE);
         std::fs::remove_file(&journal)?;

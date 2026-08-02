@@ -22,7 +22,7 @@ async fn model_switch_recovers_new_generation_after_durable_intent_only() {
     let crashing = JsonlStorageAdapter::with_model_switch_probe(
         temp_dir.path().to_path_buf(),
         |step| {
-            if step == ModelSwitchCommitStep::IntentDurable {
+            if step == ModelSwitchCommitStep::Intent {
                 Err(std::io::Error::other("simulated process crash"))
             } else {
                 Ok(())
@@ -78,7 +78,7 @@ async fn model_switch_recovers_new_generation_after_chat_materialization() {
     let crashing = JsonlStorageAdapter::with_model_switch_probe(
         temp_dir.path().to_path_buf(),
         |step| {
-            if step == ModelSwitchCommitStep::ChatDurable {
+            if step == ModelSwitchCommitStep::Chat {
                 Err(std::io::Error::other("simulated process crash"))
             } else {
                 Ok(())
@@ -123,7 +123,7 @@ async fn model_switch_recovers_pending_intent_before_installing_next_intent() {
     let first = JsonlStorageAdapter::with_model_switch_probe(
         temp_dir.path().to_path_buf(),
         |step| {
-            if step == ModelSwitchCommitStep::IntentDurable {
+            if step == ModelSwitchCommitStep::Intent {
                 Err(std::io::Error::other("leave first intent pending"))
             } else {
                 Ok(())
@@ -148,7 +148,7 @@ async fn model_switch_recovers_pending_intent_before_installing_next_intent() {
     let second = JsonlStorageAdapter::with_model_switch_probe(
         temp_dir.path().to_path_buf(),
         move |step| {
-            if step == ModelSwitchCommitStep::IntentDurable {
+            if step == ModelSwitchCommitStep::Intent {
                 let chat = std::fs::read_to_string(&chat_file)?;
                 if !chat.contains("first-chat") {
                     return Err(std::io::Error::other(
