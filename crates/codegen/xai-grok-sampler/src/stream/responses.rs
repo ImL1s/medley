@@ -155,6 +155,11 @@ pub(crate) fn stream_responses_tracked<'a>(
         let mut message_chunk_count: u64 = 0;
         let mut first_token_emitted = false;
         let mut reasoning_acc = String::new();
+        // Full items from `ResponseOutputItemDone`, replayed into the final
+        // response when the terminal event carries an empty `output` (the
+        // ChatGPT Codex backend never populates it; items arrive only via
+        // the incremental events).
+        let mut done_output_items: Vec<rs::OutputItem> = Vec::new();
         let mut last_content_chunk_at = Instant::now();
 
         // Maps Responses API `output_index` to our tool-only `tool_index`.
@@ -443,6 +448,7 @@ pub(crate) fn stream_responses_tracked<'a>(
                         }
                         _ => {}
                     }
+                    done_output_items.push(done_event.item);
                 }
 
                 // CustomToolCallInputDelta is x_search in-progress streaming.
@@ -498,6 +504,16 @@ pub(crate) fn stream_responses_tracked<'a>(
                 return;
             }
         };
+
+        // The ChatGPT Codex backend terminates with `response.completed`
+        // whose `output` is an empty array — the real items arrived only
+        // through `ResponseOutputItemDone` above. Replay them so the
+        // response isn't misclassified as empty (which would trigger a
+        // retry storm: re-streamed text and duplicated output). Platform
+        // deployments populate `output`, so this path stays inert there.
+        if response.output.is_empty() && !done_output_items.is_empty() {
+            response.output = done_output_items;
+        }
 
         // Billing fields (`prompt_tokens`, `completion_tokens`,
         // `cached_prompt_tokens`, `reasoning_tokens`) are the cumulative
@@ -734,6 +750,69 @@ mod tests {
         match events.last().unwrap() {
             SamplingEvent::Completed { response, .. } => {
                 assert_eq!(response.stop_reason, Some(StopReason::Stop));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// The ChatGPT Codex backend terminates with `response.completed` whose
+    /// `output` is an empty array — the full message rides
+    /// `ResponseOutputItemDone`. The collected items must be replayed into
+    /// the final response so the attempt isn't misclassified as empty
+    /// (which would retry and re-stream the same text).
+    #[tokio::test]
+    async fn codex_empty_terminal_output_backfills_from_item_done() {
+        let done = rs::ResponseStreamEvent::ResponseOutputItemDone(
+            rs_types::ResponseOutputItemDoneEvent {
+                sequence_number: 1,
+                output_index: 0,
+                item: rs_types::OutputItem::Message(rs_types::OutputMessage {
+                    content: vec![rs_types::OutputMessageContent::OutputText(
+                        rs_types::OutputTextContent {
+                            text: "OAUTH_E2E_OK".to_string(),
+                            annotations: vec![],
+                            logprobs: None,
+                        },
+                    )],
+                    id: "msg_1".to_string(),
+                    role: rs_types::AssistantRole::Assistant,
+                    status: rs_types::OutputStatus::Completed,
+                }),
+            },
+        );
+        let raw = stream::iter(vec![
+            Ok(text_delta_event("OAUTH_E2E_OK")),
+            Ok(done),
+            // Codex shape: the terminal response carries no output items.
+            Ok(completed_event()),
+        ])
+        .boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(response.stop_reason, Some(StopReason::Stop));
+                assert_eq!(
+                    response.empty_reason(),
+                    None,
+                    "backfilled response must not classify as empty"
+                );
+                let text = response
+                    .items
+                    .iter()
+                    .find_map(|i| match i {
+                        ConversationItem::Assistant(a) => Some(a.content.clone()),
+                        _ => None,
+                    })
+                    .expect("assistant item with text");
+                assert_eq!(&*text, "OAUTH_E2E_OK");
             }
             other => panic!("expected Completed, got {other:?}"),
         }
