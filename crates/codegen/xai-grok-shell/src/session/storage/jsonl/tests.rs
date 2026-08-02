@@ -6,6 +6,177 @@ use crate::session::storage::{CopySessionOptions, SessionUpdate};
 use crate::tools::todo::TodoState;
 use agent_client_protocol as acp;
 use tempfile::TempDir;
+
+#[tokio::test]
+async fn model_switch_recovers_new_generation_after_durable_intent_only() {
+    let temp_dir = TempDir::new().unwrap();
+    let info = create_test_info();
+    let base = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    base.init_session(&info, acp::ModelId::new("old-model"))
+        .await
+        .unwrap();
+    base.replace_chat_history(&info, &[ConversationItem::user("old-chat")])
+        .await
+        .unwrap();
+
+    let crashing = JsonlStorageAdapter::with_model_switch_probe(
+        temp_dir.path().to_path_buf(),
+        |step| {
+            if step == ModelSwitchCommitStep::IntentDurable {
+                Err(std::io::Error::other("simulated process crash"))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    let error = crashing
+        .commit_model_switch(
+            &info,
+            &[ConversationItem::user("new-chat")],
+            &acp::ModelId::new("new-model"),
+            Some("new-agent"),
+            None,
+        )
+        .await
+        .expect_err("the crash seam must interrupt materialization");
+    assert!(error.is_committed(), "durable intent is the commit point");
+
+    let resumed = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let direct_chat = resumed
+        .load_chat_history_from_dir(&resumed.session_dir(&info))
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(direct_chat).unwrap(),
+        serde_json::to_value([ConversationItem::user("new-chat")]).unwrap(),
+        "direct chat loads must recover pending model-switch intent first"
+    );
+    let loaded = resumed.load_session(&info).await.unwrap();
+    assert_eq!(loaded.summary.current_model_id.0.as_ref(), "new-model");
+    assert_eq!(loaded.summary.agent_name.as_deref(), Some("new-agent"));
+    assert_eq!(
+        serde_json::to_value(loaded.chat_history).unwrap(),
+        serde_json::to_value([ConversationItem::user("new-chat")]).unwrap()
+    );
+    assert!(
+        !resumed.model_switch_journal_file(&info).exists(),
+        "successful recovery must durably clear the intent"
+    );
+}
+
+#[tokio::test]
+async fn model_switch_recovers_new_generation_after_chat_materialization() {
+    let temp_dir = TempDir::new().unwrap();
+    let info = create_test_info();
+    let base = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    base.init_session(&info, acp::ModelId::new("old-model"))
+        .await
+        .unwrap();
+    base.replace_chat_history(&info, &[ConversationItem::user("old-chat")])
+        .await
+        .unwrap();
+
+    let crashing = JsonlStorageAdapter::with_model_switch_probe(
+        temp_dir.path().to_path_buf(),
+        |step| {
+            if step == ModelSwitchCommitStep::ChatDurable {
+                Err(std::io::Error::other("simulated process crash"))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(
+        crashing
+            .commit_model_switch(
+                &info,
+                &[ConversationItem::user("new-chat")],
+                &acp::ModelId::new("new-model"),
+                Some("new-agent"),
+                None,
+            )
+            .await
+            .expect_err("the crash seam must interrupt summary materialization")
+            .is_committed()
+    );
+
+    let resumed = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let loaded = resumed.load_session_without_updates(&info).await.unwrap();
+    assert_eq!(loaded.summary.current_model_id.0.as_ref(), "new-model");
+    assert_eq!(
+        serde_json::to_value(loaded.chat_history).unwrap(),
+        serde_json::to_value([ConversationItem::user("new-chat")]).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn model_switch_recovers_pending_intent_before_installing_next_intent() {
+    let temp_dir = TempDir::new().unwrap();
+    let info = create_test_info();
+    let base = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    base.init_session(&info, acp::ModelId::new("old-model"))
+        .await
+        .unwrap();
+    base.replace_chat_history(&info, &[ConversationItem::user("old-chat")])
+        .await
+        .unwrap();
+
+    let first = JsonlStorageAdapter::with_model_switch_probe(
+        temp_dir.path().to_path_buf(),
+        |step| {
+            if step == ModelSwitchCommitStep::IntentDurable {
+                Err(std::io::Error::other("leave first intent pending"))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(
+        first
+            .commit_model_switch(
+                &info,
+                &[ConversationItem::user("first-chat")],
+                &acp::ModelId::new("first-model"),
+                None,
+                None,
+            )
+            .await
+            .expect_err("the first intent must remain pending")
+            .is_committed()
+    );
+
+    let chat_file = base.session_dir(&info).join(super::super::CHAT_HISTORY_FILE);
+    let second = JsonlStorageAdapter::with_model_switch_probe(
+        temp_dir.path().to_path_buf(),
+        move |step| {
+            if step == ModelSwitchCommitStep::IntentDurable {
+                let chat = std::fs::read_to_string(&chat_file)?;
+                if !chat.contains("first-chat") {
+                    return Err(std::io::Error::other(
+                        "pending first intent was not recovered before installing the second",
+                    ));
+                }
+            }
+            Ok(())
+        },
+    );
+    second
+        .commit_model_switch(
+            &info,
+            &[ConversationItem::user("second-chat")],
+            &acp::ModelId::new("second-model"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let loaded = base.load_session_without_updates(&info).await.unwrap();
+    assert_eq!(loaded.summary.current_model_id.0.as_ref(), "second-model");
+    assert_eq!(
+        serde_json::to_value(loaded.chat_history).unwrap(),
+        serde_json::to_value([ConversationItem::user("second-chat")]).unwrap()
+    );
+}
 fn create_test_info() -> Info {
     Info {
         id: acp::SessionId::new("test-session-123"),

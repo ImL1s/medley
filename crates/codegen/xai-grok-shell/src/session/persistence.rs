@@ -306,8 +306,8 @@ pub enum PersistenceMsg {
     /// Replace the entire chat history (used for compaction)
     ReplaceChatHistory(Vec<ConversationItem>),
     /// Replace the entire chat history and acknowledge the actual storage
-    /// result. Atomic model switching uses this form so the rewritten system
-    /// prompt is durable before the model selection is committed.
+    /// result. This is not a cross-file transaction; model switches use
+    /// `ModelSwitchAndAck` below.
     ReplaceChatHistoryAndAck {
         messages: Vec<ConversationItem>,
         respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
@@ -321,13 +321,23 @@ pub enum PersistenceMsg {
         reasoning_effort: Option<Option<ReasoningEffort>>,
     },
     /// Persist the current model/harness selection and acknowledge the actual
-    /// storage result. Model switching uses this commit-aware form so an I/O
-    /// failure cannot be reported as a successful in-memory switch.
+    /// storage result. This is not a cross-file transaction; model switches use
+    /// `ModelSwitchAndAck` below.
     CurrentModelAndAck {
         model_id: acp::ModelId,
         agent_name: Option<String>,
         reasoning_effort: Option<Option<ReasoningEffort>>,
         respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
+    },
+    /// Commit the chat/model generation as one crash-consistent operation.
+    ModelSwitchAndAck {
+        messages: Vec<ConversationItem>,
+        model_id: acp::ModelId,
+        agent_name: Option<String>,
+        reasoning_effort: Option<ReasoningEffort>,
+        respond_to: tokio::sync::oneshot::Sender<
+            Result<(), crate::session::storage::ModelSwitchCommitError>,
+        >,
     },
     PlanState(TodoState),
     /// Plan mode lifecycle state to persist
@@ -2025,6 +2035,30 @@ impl SessionPersistence {
                         )
                         .await;
                     if result.is_ok()
+                        && let Some(sync) = &self.remote_sync
+                    {
+                        sync.set_model_id(model_id.0.to_string());
+                    }
+                    let _ = respond_to.send(result);
+                }
+                PersistenceMsg::ModelSwitchAndAck {
+                    messages,
+                    model_id,
+                    agent_name,
+                    reasoning_effort,
+                    respond_to,
+                } => {
+                    let result = self
+                        .storage
+                        .commit_model_switch(
+                            &self.info,
+                            &messages,
+                            &model_id,
+                            agent_name.as_deref(),
+                            reasoning_effort,
+                        )
+                        .await;
+                    if (result.is_ok() || result.as_ref().is_err_and(|error| error.is_committed()))
                         && let Some(sync) = &self.remote_sync
                     {
                         sync.set_model_id(model_id.0.to_string());

@@ -14,6 +14,9 @@ use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use xai_chat_state::StrictAppendAck;
 use xai_grok_workspace::session::file_state::RewindPoint;
+mod model_switch;
+#[cfg(test)]
+use model_switch::ModelSwitchCommitStep;
 #[derive(Clone)]
 enum SessionDirMode {
     FromRoot(PathBuf),
@@ -30,9 +33,13 @@ pub struct JsonlStorageAdapter {
     dir_mode: SessionDirMode,
     #[cfg(test)]
     update_append_probe: Option<std::sync::Arc<AppendProbe>>,
+    #[cfg(test)]
+    model_switch_probe: Option<std::sync::Arc<ModelSwitchProbe>>,
 }
 #[cfg(test)]
 type AppendProbe = dyn Fn(AppendDurability) -> io::Result<()> + Send + Sync;
+#[cfg(test)]
+type ModelSwitchProbe = dyn Fn(ModelSwitchCommitStep) -> io::Result<()> + Send + Sync;
 impl Default for JsonlStorageAdapter {
     fn default() -> Self {
         Self::new()
@@ -44,6 +51,8 @@ impl JsonlStorageAdapter {
             dir_mode: SessionDirMode::FromRoot(crate::util::grok_home::grok_home()),
             #[cfg(test)]
             update_append_probe: None,
+            #[cfg(test)]
+            model_switch_probe: None,
         }
     }
     pub fn with_root(root_dir: PathBuf) -> Self {
@@ -51,6 +60,8 @@ impl JsonlStorageAdapter {
             dir_mode: SessionDirMode::FromRoot(root_dir),
             #[cfg(test)]
             update_append_probe: None,
+            #[cfg(test)]
+            model_switch_probe: None,
         }
     }
     /// Create an adapter that writes directly to `session_dir`, bypassing
@@ -63,6 +74,8 @@ impl JsonlStorageAdapter {
             dir_mode: SessionDirMode::Explicit(session_dir),
             #[cfg(test)]
             update_append_probe: None,
+            #[cfg(test)]
+            model_switch_probe: None,
         }
     }
     #[cfg(test)]
@@ -73,6 +86,18 @@ impl JsonlStorageAdapter {
         Self {
             dir_mode: SessionDirMode::Explicit(session_dir),
             update_append_probe: Some(std::sync::Arc::new(append_probe)),
+            model_switch_probe: None,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn with_model_switch_probe(
+        root_dir: PathBuf,
+        probe: impl Fn(ModelSwitchCommitStep) -> io::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            dir_mode: SessionDirMode::FromRoot(root_dir),
+            update_append_probe: None,
+            model_switch_probe: Some(std::sync::Arc::new(probe)),
         }
     }
     /// Load chat history from a specific directory.
@@ -81,6 +106,7 @@ impl JsonlStorageAdapter {
         &self,
         dir: &std::path::Path,
     ) -> std::io::Result<Vec<ConversationItem>> {
+        self.recover_model_switch_in_dir_sync(dir)?;
         let chat_file = dir.join(super::CHAT_HISTORY_FILE);
         self.read_chat_history_sync(chat_file, CHAT_FORMAT_VERSION)
     }
@@ -610,6 +636,7 @@ impl JsonlStorageAdapter {
         super::write_bytes_atomic(&summary_path, &bytes)
     }
     fn read_summary_sync(&self, info: &Info) -> io::Result<Summary> {
+        self.recover_model_switch_sync(info)?;
         let path = self.summary_file(info);
         let bytes = std::fs::read(&path)?;
         if bytes.is_empty() {
@@ -1393,9 +1420,7 @@ impl StorageAdapter for JsonlStorageAdapter {
         let summary_path = self.summary_file(info);
         if Path::new(&summary_path).exists() {
             tracing::info!("Loading existing session from JSONL");
-            let bytes = tokio::fs::read(&summary_path).await?;
-            serde_json::from_slice::<Summary>(&bytes)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            self.read_summary_sync(info)
         } else {
             tracing::info!("Creating new session in JSONL");
             let mut summary = Summary::new(info, model_id)?;
@@ -1488,6 +1513,31 @@ impl StorageAdapter for JsonlStorageAdapter {
             },
         )
         .await
+    }
+    async fn commit_model_switch(
+        &self,
+        info: &Info,
+        messages: &[ConversationItem],
+        model_id: &acp::ModelId,
+        agent_name: Option<&str>,
+        reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
+    ) -> Result<(), super::ModelSwitchCommitError> {
+        let adapter = self.clone();
+        let info = info.clone();
+        let messages = messages.to_vec();
+        let model_id = model_id.clone();
+        let agent_name = agent_name.map(str::to_owned);
+        tokio::task::spawn_blocking(move || {
+            adapter.commit_model_switch_sync(
+                &info,
+                &messages,
+                &model_id,
+                agent_name.as_deref(),
+                reasoning_effort,
+            )
+        })
+        .await
+        .map_err(|error| super::ModelSwitchCommitError::NotCommitted(io::Error::other(error)))?
     }
     async fn update_collection_id(&self, info: &Info, collection_id: &str) -> io::Result<()> {
         self.apply_summary_patch(

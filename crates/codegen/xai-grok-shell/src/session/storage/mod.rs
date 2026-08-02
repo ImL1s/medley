@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::extensions::notification::SessionNotification;
@@ -47,6 +47,48 @@ pub(crate) fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
             Err(e)
         }
     }
+}
+
+/// Crash-atomic replacement with stable-storage barriers for both file contents
+/// and the renamed directory entry.
+pub(crate) fn write_bytes_atomic_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = temp_sibling(path);
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        sync_file_durable(&file)?;
+        drop(file);
+        std::fs::rename(&tmp, path)?;
+        sync_parent_directory(path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+#[cfg(unix)]
+pub(crate) fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(windows)]
+pub(crate) fn sync_parent_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn sync_parent_directory(_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "durable directory sync is unsupported on this platform",
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -966,6 +1008,26 @@ pub enum AppendUpdateError {
 }
 
 #[derive(Debug)]
+pub enum ModelSwitchCommitError {
+    NotCommitted(io::Error),
+    Committed(io::Error),
+}
+
+impl ModelSwitchCommitError {
+    pub fn is_committed(&self) -> bool {
+        matches!(self, Self::Committed(_))
+    }
+}
+
+impl std::fmt::Display for ModelSwitchCommitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotCommitted(error) | Self::Committed(error) => error.fmt(formatter),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum AppendCwdSwitchError {
     NotCommitted(io::Error),
     Committed {
@@ -1075,6 +1137,23 @@ pub trait StorageAdapter: Send + Sync {
         agent_name: Option<&str>,
         reasoning_effort: Option<Option<ReasoningEffort>>,
     ) -> io::Result<()>;
+
+    /// Atomically commit the chat/model generation used by a model switch.
+    /// Once durable intent is installed, errors are reported as `Committed`
+    /// and load must replay that intent before returning session data.
+    async fn commit_model_switch(
+        &self,
+        _info: &Info,
+        _messages: &[ConversationItem],
+        _model_id: &acp::ModelId,
+        _agent_name: Option<&str>,
+        _reasoning_effort: Option<ReasoningEffort>,
+    ) -> Result<(), ModelSwitchCommitError> {
+        Err(ModelSwitchCommitError::NotCommitted(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic model-switch persistence is unsupported",
+        )))
+    }
 
     /// Update the collection ID for telemetry tracing
     async fn update_collection_id(&self, info: &Info, collection_id: &str) -> io::Result<()>;

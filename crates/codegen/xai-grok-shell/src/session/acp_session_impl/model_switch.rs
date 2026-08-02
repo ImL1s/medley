@@ -7,8 +7,6 @@ use xai_chat_state::conversation_util::replace_or_insert_system_head;
 
 #[derive(Clone)]
 struct ModelSwitchRollbackState {
-    catalog_model_id: acp::ModelId,
-    agent_type: String,
     chat: xai_chat_state::ChatStateSnapshot,
 }
 
@@ -22,6 +20,18 @@ struct InstalledHarnessRebuild {
     previous_agent: xai_grok_agent::Agent,
     prompt_context: xai_grok_agent::PromptContext,
     system_prompt: String,
+}
+
+async fn restore_chat_before_workspace_bind<E>(
+    chat_state_handle: &xai_chat_state::ChatStateHandle,
+    snapshot: xai_chat_state::ChatStateSnapshot,
+    bind_workspace: impl FnOnce() -> Result<(), E>,
+) -> Result<(), &'static str> {
+    chat_state_handle.restore_snapshot(snapshot);
+    if chat_state_handle.snapshot().await.is_none() {
+        return Err("chat_state_rollback_failed");
+    }
+    bind_workspace().map_err(|_| "workspace_rollback_failed")
 }
 
 impl SessionActor {
@@ -158,8 +168,6 @@ impl SessionActor {
         }
 
         let rollback = ModelSwitchRollbackState {
-            catalog_model_id: previous_model_id.clone(),
-            agent_type: active_agent_type.clone(),
             chat: self.chat_state_handle.snapshot().await.ok_or_else(|| {
                 model_switch_harness_error(
                     &catalog_model_id,
@@ -207,32 +215,26 @@ impl SessionActor {
                     *self.agent.borrow_mut() = rebuild.previous_agent;
                     *self.active_agent_type.lock() = Some(previous_active_agent_type.clone());
                     let old_toolset = self.agent.borrow().tool_bridge().toolset();
-                    if self
-                        .workspace_ops
-                        .bind_local_session(
-                            &self.session_id_string(),
-                            self.tool_context.cwd.as_path().to_path_buf(),
-                            self.tool_context.hunk_tracker_handle.clone(),
-                            old_toolset,
-                            None,
-                        )
-                        .is_err()
+                    if let Err(reason) = restore_chat_before_workspace_bind(
+                        &self.chat_state_handle,
+                        rollback.chat.clone(),
+                        || {
+                            self.workspace_ops.bind_local_session(
+                                &self.session_id_string(),
+                                self.tool_context.cwd.as_path().to_path_buf(),
+                                self.tool_context.hunk_tracker_handle.clone(),
+                                old_toolset,
+                                None,
+                            )
+                        },
+                    )
+                    .await
                     {
                         return Err(model_switch_harness_error(
                             &catalog_model_id,
                             &previous_active_agent_type,
                             &required_agent_type,
-                            "workspace_rollback_failed",
-                        ));
-                    }
-                    self.chat_state_handle
-                        .restore_snapshot(rollback.chat.clone());
-                    if self.chat_state_handle.snapshot().await.is_none() {
-                        return Err(model_switch_harness_error(
-                            &catalog_model_id,
-                            &previous_active_agent_type,
-                            &required_agent_type,
-                            "chat_state_rollback_failed",
+                            reason,
                         ));
                     }
                 }
@@ -305,14 +307,8 @@ impl SessionActor {
                 "chat_state_unavailable",
             )
         })?;
-        let rollback = rollback.unwrap_or_else(|| {
-            let value = self.catalog_model_id.take();
-            self.catalog_model_id.set(value.clone());
-            ModelSwitchRollbackState {
-                catalog_model_id: acp::ModelId::new(value),
-                agent_type: active_agent_type.clone(),
-                chat: current_chat.clone(),
-            }
+        let rollback = rollback.unwrap_or_else(|| ModelSwitchRollbackState {
+            chat: current_chat.clone(),
         });
         let new_context_window = self.compaction.context_window_override.unwrap_or_else(|| {
             std::num::NonZeroU64::new(sampling_config.context_window).unwrap_or_else(|| {
@@ -400,23 +396,8 @@ impl SessionActor {
         }
 
         if let Err(reason) = self
-            .persist_model_switch_conversation(committed_chat.conversation)
-            .await
-        {
-            return self
-                .rollback_model_switch_persistence(
-                    catalog_model_id,
-                    &active_agent_type,
-                    required_agent_type,
-                    rollback,
-                    false,
-                    reason,
-                )
-                .await;
-        }
-
-        if let Err(reason) = self
-            .persist_model_switch_selection(
+            .persist_model_switch_transaction(
+                committed_chat.conversation,
                 &catalog_model_id,
                 &active_agent_type,
                 sampling_config.reasoning_effort,
@@ -429,7 +410,6 @@ impl SessionActor {
                     &active_agent_type,
                     required_agent_type,
                     rollback,
-                    true,
                     reason,
                 )
                 .await;
@@ -470,30 +450,9 @@ impl SessionActor {
         Ok(catalog_model_id)
     }
 
-    async fn persist_model_switch_conversation(
+    async fn persist_model_switch_transaction(
         &self,
         conversation: Vec<ConversationItem>,
-    ) -> Result<(), &'static str> {
-        if self.notifications.persistence_is_noop {
-            return Ok(());
-        }
-        let (respond_to, acknowledgement) = tokio::sync::oneshot::channel();
-        self.notifications
-            .persistence_tx
-            .send(PersistenceMsg::ReplaceChatHistoryAndAck {
-                messages: conversation,
-                respond_to,
-            })
-            .map_err(|_| "chat_persistence_channel_closed")?;
-        match acknowledgement.await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => Err("chat_persistence_write_failed"),
-            Err(_) => Err("chat_persistence_ack_dropped"),
-        }
-    }
-
-    async fn persist_model_switch_selection(
-        &self,
         model_id: &acp::ModelId,
         agent_type: &str,
         reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
@@ -504,15 +463,23 @@ impl SessionActor {
         let (respond_to, acknowledgement) = tokio::sync::oneshot::channel();
         self.notifications
             .persistence_tx
-            .send(PersistenceMsg::CurrentModelAndAck {
+            .send(PersistenceMsg::ModelSwitchAndAck {
+                messages: conversation,
                 model_id: model_id.clone(),
                 agent_name: Some(agent_type.to_owned()),
-                reasoning_effort: Some(reasoning_effort),
+                reasoning_effort,
                 respond_to,
             })
             .map_err(|_| "persistence_channel_closed")?;
         match acknowledgement.await {
             Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) if error.is_committed() => {
+                tracing::warn!(
+                    ?error,
+                    "model-switch intent committed; recovery remains pending"
+                );
+                Ok(())
+            }
             Ok(Err(_)) => Err("persistence_write_failed"),
             Err(_) => Err("persistence_ack_dropped"),
         }
@@ -524,34 +491,15 @@ impl SessionActor {
         active_agent_type: &str,
         required_agent_type: &str,
         rollback: ModelSwitchRollbackState,
-        restore_model_selection: bool,
         failure_reason: &'static str,
     ) -> Result<acp::ModelId, acp::Error> {
-        let model_rollback = if restore_model_selection {
-            self.persist_model_switch_selection(
-                &rollback.catalog_model_id,
-                &rollback.agent_type,
-                rollback.chat.sampling_config.reasoning_effort,
-            )
-            .await
-        } else {
-            Ok(())
-        };
-        let chat_rollback = self
-            .persist_model_switch_conversation(rollback.chat.conversation.clone())
-            .await;
         self.chat_state_handle.restore_snapshot(rollback.chat);
         let _ = self.chat_state_handle.snapshot().await;
-        let reason = if model_rollback.is_ok() && chat_rollback.is_ok() {
-            failure_reason
-        } else {
-            "persistence_rollback_failed"
-        };
         Err(model_switch_harness_error(
             &catalog_model_id,
             active_agent_type,
             required_agent_type,
-            reason,
+            failure_reason,
         ))
     }
     /// Build and validate a replacement harness without mutating live session
@@ -901,6 +849,39 @@ mod model_switch_transaction_tests {
         value
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn workspace_bind_failure_still_restores_chat_snapshot_first() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (actor, _event_rx) =
+                    create_test_actor_ex(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                let old_chat = actor.chat_state_handle.snapshot().await.expect("snapshot");
+                let mut switched_chat = old_chat.clone();
+                switched_chat.sampling_config.model = "new-wire-model".to_owned();
+                actor.chat_state_handle.restore_snapshot(switched_chat);
+
+                let error = restore_chat_before_workspace_bind(
+                    &actor.chat_state_handle,
+                    old_chat.clone(),
+                    || Err::<(), ()>(()),
+                )
+                .await
+                .expect_err("injected workspace bind failure");
+
+                assert_eq!(error, "workspace_rollback_failed");
+                assert_eq!(
+                    serde_json::to_value(actor.chat_state_handle.snapshot().await.unwrap())
+                        .unwrap(),
+                    serde_json::to_value(old_chat).unwrap(),
+                    "bind failure must not return before the old chat generation is restored"
+                );
+            })
+            .await;
+    }
+
     fn prefire_cache(model_slug: &str) -> crate::session::compaction_config::AsyncCompactionCache {
         crate::session::compaction_config::AsyncCompactionCache {
             note1: "cached prefire summary".to_owned(),
@@ -1147,6 +1128,9 @@ mod model_switch_transaction_tests {
                 tokio::task::spawn_local(async move {
                     while let Some(message) = persistence_rx.recv().await {
                         match message {
+                            PersistenceMsg::ModelSwitchAndAck { respond_to, .. } => {
+                                let _ = respond_to.send(Ok(()));
+                            }
                             PersistenceMsg::CurrentModelAndAck { respond_to, .. }
                             | PersistenceMsg::ReplaceChatHistoryAndAck { respond_to, .. } => {
                                 let _ = respond_to.send(Ok(()));
@@ -1241,9 +1225,14 @@ mod model_switch_transaction_tests {
 
                 assert_eq!(
                     actor
-                        .persist_model_switch_conversation(previous_chat.conversation.clone())
+                        .persist_model_switch_transaction(
+                            previous_chat.conversation.clone(),
+                            &acp::ModelId::new("test"),
+                            "grok-build",
+                            previous_chat.sampling_config.reasoning_effort,
+                        )
                         .await,
-                    Err("chat_persistence_channel_closed"),
+                    Err("persistence_channel_closed"),
                     "a dropped real receiver must not be treated as explicit no-op persistence"
                 );
 
@@ -1254,7 +1243,7 @@ mod model_switch_transaction_tests {
                 let payload = config::ModelSwitchHarnessError::from_acp_error(&error)
                     .expect("structured model switch error");
 
-                assert_eq!(payload.reason, "persistence_rollback_failed");
+                assert_eq!(payload.reason, "persistence_channel_closed");
                 assert_eq!(catalog_model_id(&actor), "test");
                 assert_eq!(
                     actor
@@ -1313,35 +1302,26 @@ mod model_switch_transaction_tests {
             .run_until(async {
                 let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
                 let (persistence_tx, mut persistence_rx) = tokio::sync::mpsc::unbounded_channel();
-                let persisted_chats = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-                let persisted_models = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-                let receiver_chats = persisted_chats.clone();
-                let receiver_models = persisted_models.clone();
+                let persisted_generations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let receiver_generations = persisted_generations.clone();
                 tokio::task::spawn_local(async move {
                     while let Some(message) = persistence_rx.recv().await {
                         match message {
-                            PersistenceMsg::ReplaceChatHistoryAndAck {
+                            PersistenceMsg::ModelSwitchAndAck {
                                 messages,
-                                respond_to,
-                            } => {
-                                receiver_chats.lock().unwrap().push(messages);
-                                let _ = respond_to.send(Ok(()));
-                            }
-                            PersistenceMsg::CurrentModelAndAck {
                                 model_id,
                                 respond_to,
                                 ..
                             } => {
-                                let is_initial_commit = {
-                                    let mut models = receiver_models.lock().unwrap();
-                                    models.push(model_id.0.to_string());
-                                    models.len() == 1
-                                };
-                                let _ = if is_initial_commit {
-                                    respond_to.send(Err(std::io::Error::other("injected failure")))
-                                } else {
-                                    respond_to.send(Ok(()))
-                                };
+                                receiver_generations
+                                    .lock()
+                                    .unwrap()
+                                    .push((model_id.0.to_string(), messages));
+                                let _ = respond_to.send(Err(
+                                    crate::session::storage::ModelSwitchCommitError::NotCommitted(
+                                        std::io::Error::other("injected failure"),
+                                    ),
+                                ));
                             }
                             _ => {}
                         }
@@ -1412,17 +1392,17 @@ mod model_switch_transaction_tests {
                     restored.credentials.auth_type,
                     previous_chat.credentials.auth_type
                 );
+                let generations = persisted_generations.lock().unwrap();
                 assert_eq!(
-                    persisted_models.lock().unwrap().as_slice(),
-                    ["target-model", "test"],
-                    "a failed model write must be followed by a durable old-model rollback"
+                    generations.len(),
+                    1,
+                    "the switch must use one persistence request"
                 );
-                let histories = persisted_chats.lock().unwrap();
-                assert_eq!(histories.len(), 2);
-                assert_eq!(
-                    serde_json::to_value(histories.last().unwrap()).unwrap(),
+                assert_eq!(generations[0].0, "target-model");
+                assert_ne!(
+                    serde_json::to_value(&generations[0].1).unwrap(),
                     serde_json::to_value(&previous_chat.conversation).unwrap(),
-                    "the last durable chat write must restore the pre-switch harness prompt"
+                    "the single request carries the complete target chat generation"
                 );
             })
             .await;

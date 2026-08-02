@@ -146,6 +146,9 @@ fn spawn_model_persistence_ack(mut persistence_rx: mpsc::UnboundedReceiver<Persi
     tokio::task::spawn_local(async move {
         while let Some(message) = persistence_rx.recv().await {
             match message {
+                PersistenceMsg::ModelSwitchAndAck { respond_to, .. } => {
+                    let _ = respond_to.send(Ok(()));
+                }
                 PersistenceMsg::CurrentModelAndAck { respond_to, .. }
                 | PersistenceMsg::ReplaceChatHistoryAndAck { respond_to, .. } => {
                     let _ = respond_to.send(Ok(()));
