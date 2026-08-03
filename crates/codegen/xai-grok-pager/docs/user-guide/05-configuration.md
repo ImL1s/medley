@@ -25,6 +25,7 @@ Location: `~/.medley/config.toml`. If the file is missing, Grok uses its built-i
 ```toml
 [cli]
 auto_update = true                     # check for updates on launch
+                                       # (no effect on Medley builds — see "Updates and the release channel")
 
 [models]
 default = "grok-4.5"                   # model used for new sessions
@@ -515,17 +516,67 @@ otel_log_user_prompts = false                             # content gate (admins
 otel_log_tool_details = false                             # content gate (admins can pin via requirements)
 ```
 
+### Updates and the release channel
+
+**On a [Medley](https://github.com/ImL1s/grok-build) build, the CLI does not
+self-update.** The inherited updater resolves versions from xAI's release
+channel, so running it would replace Medley with an official Grok Build binary —
+losing multi-provider support and orphaning the `~/.medley` state directory. All
+of its entry points refuse instead:
+
+| You run | What happens |
+| --- | --- |
+| `medley update` | Prints why self-update is disabled and how to upgrade. Nothing is downloaded. |
+| `medley update --check` | Same explanation. It does not report upstream versions, because it would never install them. |
+| Launch-time auto-update | Does not run. `auto_update` under `[cli]` has no effect. |
+
+To upgrade, re-run the installer. It resolves the newest published release,
+verifies its SHA-256 against the release checksums, and swaps the version in
+place:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ImL1s/grok-build/providers/install.sh | sh
+```
+
+Set `MEDLEY_VERSION` to install a specific release. Releases and checksums:
+<https://github.com/ImL1s/grok-build/releases>.
+
+#### Build identity
+
+The refusal is driven by a marker baked in at build time, not by configuration,
+so it cannot be turned off from `config.toml` or the environment. Check which
+distribution a binary belongs to:
+
+```bash
+medley version --json     # {"currentVersion":"…","channel":"…","distChannel":"medley"}
+```
+
+- `"medley"` — built by this fork's release pipeline. Refuses to self-update and
+  points at the installer above.
+- `"unknown"` — no marker: a local `cargo build`, or a rebuild that did not set
+  `MEDLEY_CHANNEL`. Also refuses, because a binary that cannot prove which
+  distribution it belongs to cannot know whose releases are the right ones. Build
+  with `MEDLEY_CHANNEL=medley cargo build --release` to stamp one yourself.
+- anything else — an unrecognised marker, reported verbatim. Refuses. `medley` is
+  the only value the marker accepts; there is no value of `MEDLEY_CHANNEL` that
+  re-enables the inherited updater.
+
+An unstamped build — and only an unstamped build — honours
+`GROK_TEST_DIST_CHANNEL` to select an identity at run time. It exists so the
+inherited upstream update tests can still exercise the updater, and it is why a
+build you compiled yourself should be stamped if you distribute it. A stamped
+binary ignores the variable outright, so no published release can be talked into
+self-updating by its environment.
+
+This does not change anything for an official Grok Build install, which is built
+from upstream's sources and keeps upstream's updater.
+
 ### Version pinning
 
-> **Fork note (Medley).** The updater described here targets xAI's official
-> release channel. On a [Medley](https://github.com/ImL1s/grok-build) build,
-> letting it run replaces the fork with an official Grok Build binary and drops
-> its multi-provider features, and the version bounds below are compared against
-> upstream's version numbers. Set `auto_update = false` under `[cli]` and update
-> Medley by re-running the fork's
-> [`install.sh`](https://github.com/ImL1s/grok-build#installing) or rebuilding
-> from source. Fork release artifacts are tracked in
-> [#29](https://github.com/ImL1s/grok-build/issues/29).
+The bounds below are the upstream updater's, so on a Medley build the two
+updater-facing knobs (`minimum_version`, `maximum_version`) have nothing to act
+on. The hard bounds still gate startup, and are compared against the upstream
+version embedded in the fork's `v<upstream>+providers.<N>` tag.
 
 Control which versions the CLI may auto-update to and which versions may run. Set
 these in `[cli]`, or in a managed layer for fleet-wide policy. Each has an

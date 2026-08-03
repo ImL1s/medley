@@ -10,6 +10,7 @@ use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::io::AsyncWriteExt;
 
+use crate::dist_channel::{self, MEDLEY_INSTALL_COMMAND, MEDLEY_RELEASES_URL};
 use crate::version::{
     UpdateConfig, fetch_latest_version, get_installed_grok_version, get_latest_version,
     is_version_cache_fresh, try_fetch_stable_pointer, write_version_cache,
@@ -36,7 +37,26 @@ fn manual_install_cmd() -> &'static str {
 }
 
 /// Build a reinstall hint for a known installer type.
+///
+/// Upstream's installers are only the right answer for a build that ships
+/// through upstream's channel. Anything else — a medley build, or a build with
+/// no distribution identity — gets pointed at the medley installer, because
+/// telling a fork user to run `npm i -g @xai-official/grok` is the same
+/// silent-replacement failure this module exists to prevent.
 fn reinstall_hint(installer: &str) -> String {
+    reinstall_hint_for(installer, dist_channel::self_update_refusal().is_some())
+}
+
+/// Pure half of [`reinstall_hint`]. `self_update_disabled` is the distribution
+/// decision, passed in so both branches are testable without touching the
+/// process environment.
+fn reinstall_hint_for(installer: &str, self_update_disabled: bool) -> String {
+    if self_update_disabled {
+        return format!(
+            "Please reinstall via the medley installer:\n  {MEDLEY_INSTALL_COMMAND}\n\
+             Releases and checksums: {MEDLEY_RELEASES_URL}"
+        );
+    }
     match installer {
         "npm" => "Please reinstall via npm:\n  npm i -g @xai-official/grok".to_string(),
         "gh-release" => "Please reinstall via GitHub Releases:\n  gh release download --repo xai-org-shared/grok-build --pattern 'grok-*' --output grok && chmod +x grok".to_string(),
@@ -54,6 +74,11 @@ pub struct UpdateStatus {
     pub channel: String,
     pub auto_update: Option<bool>,
     pub error: Option<String>,
+    /// Why this build will not self-update, when it will not. Distinct from
+    /// `error`: nothing failed, the updater was never allowed to run. `None`
+    /// on a build that uses the inherited upstream channel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub self_update_disabled: Option<String>,
 }
 
 /// Format and print an [`UpdateStatus`] to stdout.
@@ -61,6 +86,12 @@ pub fn print_update_status(status: &UpdateStatus, json: bool) -> anyhow::Result<
     if json {
         let payload = serde_json::to_string(status)?;
         println!("{payload}");
+        return Ok(());
+    }
+
+    if let Some(reason) = status.self_update_disabled.as_deref() {
+        println!("Grok Build - v{}", status.current_version);
+        println!("{reason}");
         return Ok(());
     }
 
@@ -106,6 +137,22 @@ pub async fn check_update_status(update_config: &UpdateConfig) -> UpdateStatus {
     let auto_update = current_config.cli.auto_update;
     let channel = update_config.channel.clone();
 
+    // A build that will not self-update must not advertise upstream's releases
+    // either: reporting "a new version is available" for a version it would
+    // never install is how a user ends up running upstream's installer by hand.
+    if let Some(reason) = dist_channel::self_update_refusal() {
+        return UpdateStatus {
+            current_version,
+            latest_version: None,
+            update_available: false,
+            installer,
+            channel,
+            auto_update,
+            error: None,
+            self_update_disabled: Some(reason),
+        };
+    }
+
     let Some(ref inst) = installer else {
         return UpdateStatus {
             current_version,
@@ -115,6 +162,7 @@ pub async fn check_update_status(update_config: &UpdateConfig) -> UpdateStatus {
             channel,
             auto_update,
             error: None,
+            self_update_disabled: None,
         };
     };
 
@@ -156,6 +204,7 @@ pub async fn check_update_status(update_config: &UpdateConfig) -> UpdateStatus {
                     channel,
                     auto_update,
                     error,
+                    self_update_disabled: None,
                 }
             }
             // Policy skips (anti-downgrade) or can't satisfy the floor: no upgrade.
@@ -167,6 +216,7 @@ pub async fn check_update_status(update_config: &UpdateConfig) -> UpdateStatus {
                 channel,
                 auto_update,
                 error: None,
+                self_update_disabled: None,
             },
         },
         Err(err) => UpdateStatus {
@@ -177,6 +227,7 @@ pub async fn check_update_status(update_config: &UpdateConfig) -> UpdateStatus {
             channel,
             auto_update,
             error: Some(err.to_string()),
+            self_update_disabled: None,
         },
     }
 }
@@ -229,6 +280,10 @@ async fn fetch_update_plan(
 /// on the installer (via `installer_allows_downgrade`) so npm is never
 /// downgraded — the decision depends on the installer, never the caller.
 pub async fn auto_update_target(update_config: &UpdateConfig) -> Option<(&'static str, String)> {
+    if let Some(reason) = dist_channel::self_update_refusal() {
+        tracing::debug!("self-update disabled for this build: {reason}");
+        return None;
+    }
     let installer = get_installer().await?;
     let current = get_installed_grok_version();
     let policy = config::VersionPolicy::resolve();
@@ -281,6 +336,10 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
         installed: None,
         relaunch_needed: false,
     };
+    if let Some(reason) = dist_channel::self_update_refusal() {
+        tracing::debug!("self-update disabled for this build: {reason}");
+        return Ok(outcome);
+    }
     let Some(installer) = get_installer().await else {
         return Ok(outcome);
     };
@@ -454,6 +513,10 @@ impl BackgroundUpdateCheck {
 /// TUI, the leader's hourly checker) already put the target version on disk,
 /// no download is started — only the restart hint is surfaced.
 pub async fn check_update_background(update_config: &UpdateConfig) -> BackgroundUpdateCheck {
+    if let Some(reason) = dist_channel::self_update_refusal() {
+        tracing::debug!("self-update disabled for this build: {reason}");
+        return BackgroundUpdateCheck::none();
+    }
     let Some(installer) = get_installer().await else {
         return BackgroundUpdateCheck::none();
     };
@@ -541,6 +604,13 @@ pub async fn run_update_if_available(
     interactive: bool,
     update_config: &UpdateConfig,
 ) -> Result<bool> {
+    if let Some(reason) = dist_channel::self_update_refusal() {
+        // Silent on this path by design: it runs on every launch, and the
+        // explicit surfaces (`grok update`, `grok update --check`) are where
+        // the user gets the full explanation.
+        tracing::debug!("self-update disabled for this build: {reason}");
+        return Ok(false);
+    }
     let Some(inst) = get_installer().await else {
         // Skip update check if no known installer.
         return Ok(false);
@@ -669,6 +739,12 @@ pub async fn run_update_if_available(
 /// Dropping the handle does not kill the child (`kill_on_drop` is off), so
 /// callers that don't care can ignore it. `Blocking` mode returns `None`.
 async fn run_update_subcommand(run_mode: UpdateRunMode) -> Result<Option<tokio::process::Child>> {
+    // Choke point: spawning `grok update` is how every automatic path starts a
+    // download. The child would refuse anyway, so this only saves a process —
+    // but it keeps the guarantee local to the primitive that does the spawning.
+    if let Some(reason) = dist_channel::self_update_refusal() {
+        anyhow::bail!("{reason}");
+    }
     let exe = std::env::current_exe()?;
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("update");
@@ -765,6 +841,14 @@ pub async fn run_install_script(
     target: Option<&str>,
     update_config: &UpdateConfig,
 ) -> Result<()> {
+    // Refuses on its own authority rather than trusting that every caller
+    // remembered to ask. It is not the last line of defence — the public
+    // `install_internal_from_base*` and `install_npm_for_test` entry points
+    // skip this function entirely — so the irreversible leaves
+    // (`activate_verified_download`, `install_npm`) each carry the same check.
+    if let Some(reason) = dist_channel::self_update_refusal() {
+        anyhow::bail!("{reason}");
+    }
     let result = match installer {
         "npm" => install_npm(
             target,
@@ -1011,6 +1095,12 @@ async fn download_range(
 /// If the server provides a `Content-Length` header, a determinate bar is shown
 /// with bytes downloaded, total size, and ETA. Otherwise a spinner with a byte
 /// counter is used as a fallback.
+///
+/// Deliberately not gated by [`crate::dist_channel`]: this writes bytes to a
+/// path its caller chose and activates nothing, so on its own it cannot replace
+/// the installed CLI. The distribution check sits on
+/// [`activate_verified_download`], the step that repoints the managed
+/// entrypoint at a downloaded binary.
 #[doc(hidden)]
 pub async fn download_with_progress(url: &str, dest: &std::path::Path) -> Result<()> {
     // Try parallel byte-range first. Falls through to single-connection on any
@@ -1186,6 +1276,13 @@ pub async fn install_internal_from_bases(
     update_config: &UpdateConfig,
     bases: &[&str],
 ) -> Result<()> {
+    // Before the download, not after it. `download_verified_from_base` writes
+    // the artifact into ~/.grok/downloads and `smoke_test_binary` *executes* it
+    // to check it runs — so refusing later would still have fetched and run an
+    // upstream binary, and left it on disk.
+    if let Some(reason) = dist_channel::self_update_refusal() {
+        anyhow::bail!("{reason}");
+    }
     let mut last_err: Option<anyhow::Error> = None;
     for (i, base) in bases.iter().enumerate() {
         match download_verified_from_base(target, update_config, base).await {
@@ -1273,6 +1370,13 @@ async fn download_verified_from_base(
     update_config: &UpdateConfig,
     gcs_base_url: &str,
 ) -> Result<VerifiedDownload> {
+    // The real pre-download choke point: both public `install_internal_*`
+    // entry points funnel through here, and everything below fetches an
+    // artifact and then *runs* it (`smoke_test_binary`). A build that must not
+    // install must not get that far.
+    if let Some(reason) = dist_channel::self_update_refusal() {
+        anyhow::bail!("{reason}");
+    }
     let (os, arch) = detect_platform()?;
     let platform = format!("{}-{}", os, arch);
 
@@ -1323,6 +1427,14 @@ async fn download_verified_from_base(
 /// binary and finish bookkeeping. Nothing here depends on which base URL
 /// served the download, so callers must not retry another base on failure.
 async fn activate_verified_download(download: &VerifiedDownload) -> Result<()> {
+    // Point of no return: this repoints the managed entrypoint at a downloaded
+    // binary. Unreachable on a refusing build — `download_verified_from_base`
+    // already bailed — but kept so the guarantee does not depend on the two
+    // being wired together, and so a future caller that acquires a
+    // `VerifiedDownload` some other way still cannot activate it.
+    if let Some(reason) = dist_channel::self_update_refusal() {
+        anyhow::bail!("{reason}");
+    }
     let grok_home = grok_home();
     let download_dir = grok_home.join("downloads");
     let bin_dir = grok_home.join("bin");
@@ -2264,6 +2376,14 @@ pub fn install_npm_for_test(
 }
 
 fn install_npm(target: Option<&str>, channel: &str, npm_registry: Option<&str>) -> Result<()> {
+    // Irreversible leaf: everything below spawns `npm i -g @xai-official/grok`,
+    // which replaces the globally installed CLI. `install_npm_for_test` is a
+    // public door into this function, so it is gated here rather than only in
+    // `run_install_script`.
+    if let Some(reason) = dist_channel::self_update_refusal() {
+        anyhow::bail!("{reason}");
+    }
+
     // Warn on macOS about potential impact on other running processes.
     #[cfg(target_os = "macos")]
     warn_if_other_grok_processes_running();
@@ -2333,6 +2453,15 @@ fn install_npm(target: Option<&str>, channel: &str, npm_registry: Option<&str>) 
 }
 
 pub async fn apply_channel_switch(channel_switch: Option<&str>, update_config: &mut UpdateConfig) {
+    // The channel only selects between upstream's release pointers, which a
+    // build that refuses to self-update never reads. Persisting the switch
+    // would leave a setting that does nothing but claims otherwise — and
+    // `update --check --alpha` reaches this before the gated status call, so
+    // the check has to live here rather than at that one caller.
+    if let Some(reason) = dist_channel::self_update_refusal() {
+        tracing::debug!("self-update disabled for this build: {reason}");
+        return;
+    }
     if let Some(ch) = channel_switch
         && update_config.channel != ch
     {
@@ -2359,6 +2488,13 @@ pub async fn run_update(
     channel_switch: Option<&str>,
     update_config: &mut UpdateConfig,
 ) -> Result<Option<String>> {
+    // The user asked for this explicitly, so say why it is not happening —
+    // including for `--force` and `--version`, which are still requests to
+    // overwrite this binary from a channel that is not ours.
+    if let Some(reason) = dist_channel::self_update_refusal() {
+        eprintln!("{reason}");
+        return Ok(None);
+    }
     apply_channel_switch(channel_switch, update_config).await;
     let installer = match get_installer().await {
         Some(i) => i,
@@ -3556,9 +3692,14 @@ mod tests {
     // reinstall_hint
     // ──────────────────────────────────────────────────────────────────────
 
+    // The `false` argument is "this build uses the inherited upstream channel";
+    // these cases describe the upstream hints unchanged. See
+    // `reinstall_hint_is_installer_agnostic_when_self_update_is_disabled` for
+    // what a fork build gets instead.
+
     #[test]
     fn test_reinstall_hint_npm_mentions_npm_command() {
-        let hint = reinstall_hint("npm");
+        let hint = reinstall_hint_for("npm", false);
         assert!(hint.contains("npm i -g"), "should suggest npm i -g: {hint}");
         assert!(
             hint.contains("@xai-official/grok"),
@@ -3568,7 +3709,7 @@ mod tests {
 
     #[test]
     fn test_reinstall_hint_gh_release_mentions_gh_command() {
-        let hint = reinstall_hint("gh-release");
+        let hint = reinstall_hint_for("gh-release", false);
         assert!(
             hint.contains("gh release download"),
             "should suggest gh release download: {hint}"
@@ -3581,7 +3722,7 @@ mod tests {
 
     #[test]
     fn test_reinstall_hint_internal_mentions_platform_installer() {
-        let hint = reinstall_hint("internal");
+        let hint = reinstall_hint_for("internal", false);
         if cfg!(windows) {
             assert!(hint.contains("irm"), "should suggest irm install: {hint}");
             assert!(
@@ -3600,15 +3741,49 @@ mod tests {
     #[test]
     fn test_reinstall_hint_unknown_falls_back_to_internal() {
         // Unknown installer falls back to the same hint as "internal".
-        let unknown = reinstall_hint("homebrew");
-        let internal = reinstall_hint("internal");
+        let unknown = reinstall_hint_for("homebrew", false);
+        let internal = reinstall_hint_for("internal", false);
         assert_eq!(unknown, internal);
     }
 
     #[test]
     fn test_reinstall_hint_empty_falls_back_to_internal() {
-        let hint = reinstall_hint("");
-        assert_eq!(hint, reinstall_hint("internal"));
+        let hint = reinstall_hint_for("", false);
+        assert_eq!(hint, reinstall_hint_for("internal", false));
+    }
+
+    /// A build that refuses to self-update must not hand the user an upstream
+    /// install command as a workaround — whatever installer it was launched
+    /// with, the only correct recovery is the fork's own installer.
+    #[test]
+    fn reinstall_hint_is_installer_agnostic_when_self_update_is_disabled() {
+        let expected = reinstall_hint_for("internal", true);
+        for installer in ["npm", "gh-release", "internal", "homebrew", ""] {
+            let hint = reinstall_hint_for(installer, true);
+            assert_eq!(hint, expected, "installer {installer:?} changed the hint");
+            assert!(
+                hint.contains(MEDLEY_INSTALL_COMMAND),
+                "should point at the medley installer: {hint}"
+            );
+            for upstream in [
+                "@xai-official/grok",
+                "xai-org-shared/grok-build",
+                "x.ai/cli",
+            ] {
+                assert!(
+                    !hint.contains(upstream),
+                    "must not suggest {upstream}: {hint}"
+                );
+            }
+        }
+    }
+
+    /// The wrapper must read the real distribution decision, not a constant:
+    /// under `cargo test` this build is unstamped, so it is disabled.
+    #[test]
+    fn reinstall_hint_follows_the_distribution_decision() {
+        let disabled = dist_channel::self_update_refusal().is_some();
+        assert_eq!(reinstall_hint("npm"), reinstall_hint_for("npm", disabled));
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -3624,6 +3799,7 @@ mod tests {
             channel: "stable".to_string(),
             auto_update: Some(true),
             error: None,
+            self_update_disabled: None,
         }
     }
 
@@ -3669,6 +3845,7 @@ mod tests {
             channel: "stable".to_string(),
             auto_update: None,
             error: None,
+            self_update_disabled: None,
         };
         let v = serde_json::to_value(&s).unwrap();
         assert!(v["latestVersion"].is_null());
@@ -3688,9 +3865,44 @@ mod tests {
             channel: "stable".to_string(),
             auto_update: Some(true),
             error: Some("npm view failed: ENETUNREACH".to_string()),
+            self_update_disabled: None,
         };
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["error"], "npm view failed: ENETUNREACH");
+    }
+
+    /// `selfUpdateDisabled` is absent for a build that self-updates and present
+    /// (as one JSON string, newlines escaped) for one that refuses, so `--json`
+    /// consumers can tell "no update" from "never updates".
+    #[test]
+    fn test_update_status_self_update_disabled_serialization() {
+        let absent = serde_json::to_value(make_status()).unwrap();
+        assert!(
+            !absent
+                .as_object()
+                .unwrap()
+                .contains_key("selfUpdateDisabled"),
+            "must be omitted when the updater is allowed to run: {absent}"
+        );
+
+        let reason = crate::dist_channel::refusal_message(
+            &crate::dist_channel::RefusalReason::AmbiguousIdentity { stamp: None },
+        );
+        let s = UpdateStatus {
+            self_update_disabled: Some(reason.clone()),
+            update_available: false,
+            latest_version: None,
+            ..make_status()
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains('\n'), "must stay single line: {json}");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["selfUpdateDisabled"], reason);
+        assert_eq!(v["updateAvailable"], false);
+        assert!(
+            v["error"].is_null(),
+            "a refusal is not a failed check: {json}"
+        );
     }
 
     #[test]
@@ -3703,6 +3915,7 @@ mod tests {
             channel: "alpha".to_string(),
             auto_update: Some(true),
             error: None,
+            self_update_disabled: None,
         };
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["channel"], "alpha");
@@ -3752,6 +3965,7 @@ mod tests {
             channel: "stable".to_string(),
             auto_update: None,
             error: None,
+            self_update_disabled: None,
         };
         print_update_status(&s, false).unwrap();
     }
@@ -3766,6 +3980,7 @@ mod tests {
             channel: "stable".to_string(),
             auto_update: Some(true),
             error: Some("network down".to_string()),
+            self_update_disabled: None,
         };
         print_update_status(&s, false).unwrap();
     }
@@ -3780,8 +3995,23 @@ mod tests {
             channel: "stable".to_string(),
             auto_update: Some(true),
             error: None,
+            self_update_disabled: None,
         };
         print_update_status(&s, false).unwrap();
+    }
+
+    /// The refusal path prints the reason instead of an upstream comparison,
+    /// even when a stale `latest_version` is somehow present.
+    #[test]
+    fn test_print_update_status_human_returns_ok_when_self_update_disabled() {
+        let s = UpdateStatus {
+            self_update_disabled: Some(crate::dist_channel::refusal_message(
+                &crate::dist_channel::RefusalReason::ForkBuild,
+            )),
+            ..make_status()
+        };
+        print_update_status(&s, false).unwrap();
+        print_update_status(&s, true).unwrap();
     }
 
     // ──────────────────────────────────────────────────────────────────────

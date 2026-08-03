@@ -323,6 +323,12 @@ jobs:
           # Consumed by crates/codegen/xai-grok-pager/build.rs, which bakes
           # "<version> (<short sha>)" into `medley --version`.
           GROK_VERSION: ${{ needs.meta.outputs.version }}
+          # Consumed by crates/codegen/xai-grok-version/build.rs, which bakes
+          # the distribution identity in. Without it the binary cannot prove
+          # which release channel it belongs to and refuses to self-update
+          # (issue #71). It refuses either way — the marker is what turns a
+          # blank "unverified build" refusal into medley's upgrade instructions.
+          MEDLEY_CHANNEL: medley
         run: |
           set -euo pipefail
           cargo build --release --locked --package "$CARGO_PACKAGE" --bin "$CARGO_BIN"
@@ -399,6 +405,21 @@ jobs:
             *"$VERSION"*) ;;
             *)
               echo "::error::binary reports '${version_output}', which does not contain the release version '${VERSION}'"
+              exit 1
+              ;;
+          esac
+
+          # Prove the distribution marker survived the build. If MEDLEY_CHANNEL
+          # were dropped, the binary would still run and still refuse to
+          # self-update, but its refusal would read as an unidentified build
+          # instead of naming medley's installer — a silent downgrade in the
+          # only guidance a stuck user gets (issue #71).
+          dist_output="$("${dist}/${stage}/${DIST_NAME}" version --json)"
+          echo "medley version --json: ${dist_output}"
+          case "$dist_output" in
+            *'"distChannel":"medley"'*) ;;
+            *)
+              echo "::error::binary reports ${dist_output}, which is not stamped as the medley distribution; check that MEDLEY_CHANNEL reached the build step"
               exit 1
               ;;
           esac

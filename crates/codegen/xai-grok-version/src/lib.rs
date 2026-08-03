@@ -9,6 +9,27 @@ pub const VERSION: &str = match option_env!("GROK_VERSION") {
     None => env!("CARGO_PKG_VERSION"),
 };
 
+/// Build-time env var carrying the distribution channel marker.
+///
+/// Set by this fork's release workflow alongside `GROK_VERSION`. A build that
+/// does not set it produces a binary with no distribution identity.
+pub const DIST_CHANNEL_ENV: &str = "MEDLEY_CHANNEL";
+
+/// Env var a **dev build** may set to choose a distribution identity at run
+/// time. Deliberately ignored by any binary that carries [`DIST_CHANNEL_STAMP`],
+/// so a published build's identity cannot be overridden from the environment.
+pub const TEST_DIST_CHANNEL_ENV: &str = "GROK_TEST_DIST_CHANNEL";
+
+/// Distribution channel baked in at compile time from `MEDLEY_CHANNEL`.
+///
+/// `None` on any build that did not set it — a local `cargo build`, a
+/// third-party rebuild, or an upstream build that never had the variable. The
+/// updater treats `None` as an unproven identity and refuses to self-update
+/// (see `xai_grok_update::dist_channel`), because a binary that cannot say
+/// which distribution it belongs to also cannot say whose releases are the
+/// right ones to install.
+pub const DIST_CHANNEL_STAMP: Option<&str> = option_env!("MEDLEY_CHANNEL");
+
 /// [`TEST_VERSION_ENV`] override first, then [`VERSION`]. Trimmed so
 /// non-semver-aware callers can pass the result straight into parsing.
 pub fn installed() -> String {
