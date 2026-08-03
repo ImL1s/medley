@@ -51,6 +51,12 @@ pub fn test_home() -> &'static PathBuf {
         // these env vars. Tests using this helper must be `#[serial]`.
         unsafe {
             std::env::set_var("GROK_HOME", &path);
+            // The suites below exercise the inherited upstream updater, which
+            // a fork build refuses to run at all (see
+            // `xai_grok_update::dist_channel`). Test binaries are unstamped, so
+            // they may select the upstream identity; a stamped release binary
+            // ignores this variable entirely.
+            std::env::set_var("GROK_TEST_DIST_CHANNEL", "upstream");
             std::env::remove_var("GROK_TEST_VERSION");
             std::env::remove_var("NPM_TOKEN");
             std::env::remove_var("GROK_INSTALLER");

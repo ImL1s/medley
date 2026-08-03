@@ -2248,6 +2248,11 @@ async fn async_main(args: PagerArgs, prepared_serve: Option<PreparedServe>) -> R
                     let payload = serde_json::json!({
                         "currentVersion": env!("VERSION_WITH_COMMIT"),
                         "channel": xai_grok_update::channel_name().unwrap_or("unknown"),
+                        // Which distribution built this binary, baked in at
+                        // compile time. "unknown" means it carries no marker
+                        // and will refuse to self-update. Release packaging
+                        // asserts on this field.
+                        "distChannel": xai_grok_update::dist_channel::identity().name(),
                     });
                     println!("{}", serde_json::to_string(&payload)?);
                 } else {
