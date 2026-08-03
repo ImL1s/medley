@@ -1953,11 +1953,25 @@ fn invoked_as() -> String {
 fn invoked_name_from(argv0: Option<&std::ffi::OsStr>) -> String {
     argv0
         .map(std::path::Path::new)
-        .and_then(std::path::Path::file_stem)
-        .and_then(|stem| stem.to_str())
-        .filter(|stem| !stem.is_empty())
+        .and_then(std::path::Path::file_name)
+        .and_then(|name| name.to_str())
+        .map(strip_exe_suffix)
+        .filter(|name| !name.is_empty())
         .unwrap_or("grok")
         .to_string()
+}
+
+/// `.exe` is the only suffix on a program name that is an extension rather
+/// than part of the name. `Path::file_stem` does not know that: it strips
+/// everything after the last dot, turning `medley.preview` into `medley` and
+/// answering with a name the user never invoked.
+fn strip_exe_suffix(name: &str) -> &str {
+    match name.rfind('.') {
+        // `rfind` lands on a char boundary, so both slices are safe. Windows
+        // treats the suffix case-insensitively, so `MEDLEY.EXE` counts.
+        Some(idx) if name[idx..].eq_ignore_ascii_case(".exe") => &name[..idx],
+        _ => name,
+    }
 }
 
 fn version_text(channel_label: &str) -> String {
@@ -3071,8 +3085,23 @@ mod tests {
             ("/home/u/.medley/bin/medley", "medley"),
             ("medley", "medley"),
             ("./medley", "medley"),
-            // Whatever a user renames it to.
+            // Whatever a user renames it to — including a dotted name, which
+            // `Path::file_stem` would have truncated to `medley`.
             ("/usr/local/bin/my-custom-name", "my-custom-name"),
+            ("/usr/local/bin/medley.preview", "medley.preview"),
+            ("medley.0.2.117", "medley.0.2.117"),
+            // `.exe` is the one suffix that really is an extension, and
+            // Windows treats it case-insensitively. Written without a Windows
+            // path because `\` is an ordinary character to `Path` on unix, so
+            // a backslash path here would assert host-specific behaviour
+            // rather than the suffix rule.
+            ("medley.exe", "medley"),
+            ("/opt/medley/bin/medley.exe", "medley"),
+            ("medley.EXE", "medley"),
+            // Not an .exe despite ending in those letters.
+            ("medley.notexe", "medley.notexe"),
+            // Degenerate: stripping leaves nothing, so fall back.
+            (".exe", "grok"),
             // Degenerate argv[0]: fall back rather than fail.
             ("", "grok"),
             ("/", "grok"),
