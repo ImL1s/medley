@@ -122,19 +122,20 @@ resolve_version() {
     return
   fi
 
-  # A tag is read ONLY out of a transfer that completed with a 2xx: this keeps
-  # curl's --fail and Wget's default refusal, and the `|| resolve_body=''`
-  # discards whatever a failed transfer left behind. That ordering is the whole
-  # point. A tag scavenged from an error page, a truncated body, a retried
-  # request whose earlier attempt was concatenated ahead of the good one, or an
-  # intercepting proxy would name a real-but-wrong release — and its checksum
-  # would then verify perfectly, so nothing downstream would catch it.
-  # stderr is dropped because this failure is expected and diagnosed below: the
-  # downloader's own "returned error: 404" would otherwise land above a message
-  # explaining that there is simply nothing published yet, and read as a crash.
+  # The fetch is unchanged from what this script has always done, and the
+  # `|| resolve_body=''` discards whatever a failed transfer left behind rather
+  # than parsing it. Everything below the parse only ever produces a *message* —
+  # this function grew a better diagnosis, not a new way to choose a version.
+  #
+  # What this is NOT is a strict 2xx gate, and the comment must not pretend
+  # otherwise: `--fail` errors on HTTP 400 and above, so a final 3xx can still
+  # exit zero carrying a body, and a downloader's internal retry can leave an
+  # earlier attempt's bytes on stdout ahead of the good ones. Both predate this
+  # change; closing them needs the response written to a file with its status
+  # asserted explicitly, which is more than a better error message should
+  # smuggle in. Tracked separately.
   resolve_body="$(
-    fetch_to_stdout "https://api.github.com/repos/${REPO}/releases/latest" \
-      2>/dev/null
+    fetch_to_stdout "https://api.github.com/repos/${REPO}/releases/latest"
   )" || resolve_body=''
 
   if [ -n "$resolve_body" ]; then
@@ -150,20 +151,23 @@ resolve_version() {
     fi
   fi
 
-  # Resolution failed, and --fail collapsed every reason into one exit code.
-  # GitHub reports "no release published as latest" as a 404, which needs
-  # guidance nothing like an unreachable network's — reporting it as the latter
-  # is exactly what this printed against a repository whose only release was a
-  # prerelease. Asking whether the repository itself is readable is the one
-  # question that separates the cases on every downloader, and it runs only
-  # here, so a successful install still costs a single request.
+  # No tag. The downloader collapsed every reason into one exit code, and the
+  # old message picked the worst reading of it: GitHub answers 404 when a
+  # repository has no release published as latest, which this reported as an
+  # unreachable network. That is what it actually printed against this
+  # repository, whose only release was a prerelease.
   #
-  # Deliberately not parsed: the error body. Reading it would mean accepting
-  # bodies from failed transfers, which is the hazard above.
+  # One extra request separates the two readings better than guessing does.
+  # It runs only here, so a successful install still costs a single request,
+  # and it cannot influence which version is installed — a tag has already
+  # returned above, and both branches below end in `die`.
+  #
+  # Deliberately not parsed: the error body. Reading it would mean drawing
+  # conclusions from a transfer that failed.
   if fetch_to_stdout "https://api.github.com/repos/${REPO}" >/dev/null 2>&1; then
-    die "could not resolve the latest release of ${REPO}. The repository is readable, so most likely it has no release published as latest — drafts and prereleases are both excluded, so publish the draft release the release workflow created. Otherwise GitHub returned an error; retry, or set MEDLEY_VERSION to install a specific tag."
+    die "could not resolve the latest release of ${REPO}, though the repository responded. The likeliest cause is that nothing is published as latest yet — drafts and prereleases are both excluded, so publish the draft release the release workflow created. Otherwise GitHub returned something unusable; retry, or set MEDLEY_VERSION to install a specific tag."
   fi
-  die "could not read ${REPO} from GitHub: it is unreachable, rate-limiting this host, private, or does not exist. Retry later, check MEDLEY_REPO, or set MEDLEY_VERSION to install a specific tag."
+  die "could not read ${REPO} from GitHub. Common causes: no network or DNS, a proxy or TLS interception, GitHub rate-limiting this host, an outage, or a repository that is private or does not exist. The downloader's own error above says which. Retry later, check MEDLEY_REPO, or set MEDLEY_VERSION to install a specific tag."
 }
 
 # Collapse '.' and '..' textually. Only ever called on a path whose existing
