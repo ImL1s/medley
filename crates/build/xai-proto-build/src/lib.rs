@@ -110,10 +110,23 @@ impl XaiProtoBuilder {
         let includes = Vec::from_iter(includes);
 
         if let Some(protoc) = protoc {
-            println!(
-                "cargo:rerun-if-changed={}",
-                protoc.to_str().context("protoc path not UTF-8")?
-            );
+            // Only for a path that exists. Cargo resolves rerun-if-changed
+            // relative to the package root and treats a missing entry as
+            // permanently dirty — it says so outright: "Dirty <crate>: the
+            // file `protoc` is missing". Emitting an unresolvable path
+            // therefore does the opposite of what this line is for: instead of
+            // rebuilding when protoc changes, it rebuilds always, and takes
+            // every crate downstream of this build script with it.
+            //
+            // Dropping the line when the path does not resolve leaves Cargo on
+            // its default — rerun when any file in the package changes — which
+            // is conservative and stable, rather than never-stable.
+            if protoc.try_exists().unwrap_or(false) {
+                println!(
+                    "cargo:rerun-if-changed={}",
+                    protoc.to_str().context("protoc path not UTF-8")?
+                );
+            }
         }
 
         // Can only process one input file when using --dependency_out=FILE.
