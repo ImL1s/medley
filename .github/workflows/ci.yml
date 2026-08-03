@@ -35,6 +35,43 @@ jobs:
       - name: Enforce credential-safe observability
         run: python3 -B -m unittest tests.test_credential_observability_guard -v
 
+  installer:
+    name: Installer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The installer is the one thing here that runs on machines unlike this
+      # one, and until now nothing exercised it at all — every claim about it
+      # rested on one macOS laptop. See #79.
+      - name: Lint for POSIX sh
+        run: |
+          shellcheck -s sh install.sh
+          dash -n install.sh
+          dash -n tests/installer/run_cases.sh
+
+      - name: Behaviour, with curl
+        run: sh tests/installer/run_cases.sh
+
+      # `select_downloader` prefers curl whenever it is present, so on any
+      # normal machine the wget branch never runs. That is how it stayed
+      # unexercised. This run hides curl.
+      - name: Behaviour, with wget only
+        env:
+          EXCLUDE_DOWNLOADER: curl
+        run: sh tests/installer/run_cases.sh
+
+      # The fixture rewrites the GitHub hosts, so it cannot catch a mistake in
+      # the real URLs — percent-encoding of `+` in a tag, say. One live install
+      # covers exactly that, and nothing else does.
+      - name: Install the published release for real
+        run: |
+          set -eux
+          home="$(mktemp -d)"
+          HOME="$home" sh install.sh
+          HOME="$home" "$home/.medley/bin/medley" --version
+          test ! -e "$home/.grok"
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
