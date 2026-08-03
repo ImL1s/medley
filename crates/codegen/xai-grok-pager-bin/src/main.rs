@@ -1932,13 +1932,27 @@ fn install_heap_profile_hooks() {
 /// both — `medley` from a release, `grok` from an upstream-style install, and
 /// whatever a user renamed it to.
 ///
+/// Read from argv[0], NOT `current_exe()`. `current_exe()` resolves symlinks,
+/// and upstream's installer stores the binary as `grok-<platform>` with `grok`
+/// and `agent` symlinked at it — so resolving would answer
+/// `grok-linux-x86_64` to `grok --version`, and would leave `agent` unable to
+/// name itself at all. argv[0] is the entry point the user actually invoked,
+/// which is the question being asked.
+///
 /// Falls back to "grok" when argv[0] is missing, empty, or not valid UTF-8:
 /// that is what upstream installs it as, and a version string is not worth
 /// failing over.
 fn invoked_as() -> String {
-    std::env::current_exe()
-        .ok()
-        .as_deref()
+    invoked_name_from(std::env::args_os().next().as_deref())
+}
+
+/// Pure policy behind [`invoked_as`], split out because argv[0] is
+/// process-level state a test cannot set. Everything worth asserting — the
+/// symlink case, a bare name, an absolute path, and each degenerate input —
+/// lives here.
+fn invoked_name_from(argv0: Option<&std::ffi::OsStr>) -> String {
+    argv0
+        .map(std::path::Path::new)
         .and_then(std::path::Path::file_stem)
         .and_then(|stem| stem.to_str())
         .filter(|stem| !stem.is_empty())
@@ -3029,9 +3043,8 @@ mod tests {
             assert!(output.contains(env!("VERSION_WITH_COMMIT")));
         }
     }
-    /// argv[0] is attacker-adjacent input in the sense that it can be anything
-    /// at all, including absent. A version string must not be the thing that
-    /// makes the process fail.
+    /// argv[0] can be anything at all, including absent. A version string must
+    /// not be the thing that makes the process fail.
     #[test]
     fn invoked_name_is_non_empty_and_bare() {
         let name = invoked_as();
@@ -3040,6 +3053,43 @@ mod tests {
             !name.contains('/') && !name.contains('\\'),
             "expected a bare file stem, got {name:?}"
         );
+    }
+    /// The reason this reads argv[0] rather than `current_exe()`: upstream's
+    /// installer stores the binary as `grok-<platform>` and symlinks both
+    /// `grok` and `agent` at it. Resolving the executable would answer with
+    /// the *target's* name — `grok --version` reporting `grok-linux-x86_64`,
+    /// and `agent` unable to name itself at all. argv[0] is the entry point
+    /// the user invoked, which is the question `--version` is answering.
+    #[test]
+    fn invoked_name_comes_from_the_entry_point_not_the_target() {
+        use std::ffi::OsStr;
+        for (argv0, expected) in [
+            // The symlink case this exists for.
+            ("/home/u/.grok/bin/grok", "grok"),
+            ("/home/u/.grok/bin/agent", "agent"),
+            // The release archive's own name, and a plain invocation.
+            ("/home/u/.medley/bin/medley", "medley"),
+            ("medley", "medley"),
+            ("./medley", "medley"),
+            // Whatever a user renames it to.
+            ("/usr/local/bin/my-custom-name", "my-custom-name"),
+            // Degenerate argv[0]: fall back rather than fail.
+            ("", "grok"),
+            ("/", "grok"),
+            // Not "grok": `Path::file_stem` ignores a trailing separator, so
+            // this yields the last component. Asserted as-is rather than
+            // special-cased — argv[0] names an executable, never a directory,
+            // so the input cannot occur and code to reject it would defend
+            // against nothing while adding a branch to get wrong.
+            ("/usr/local/bin/", "bin"),
+        ] {
+            assert_eq!(
+                invoked_name_from(Some(OsStr::new(argv0))),
+                expected,
+                "argv0 {argv0:?}"
+            );
+        }
+        assert_eq!(invoked_name_from(None), "grok", "absent argv[0]");
     }
     #[test]
     fn version_flags_and_doctor_are_distinct_early_intents() {
