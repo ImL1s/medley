@@ -94,33 +94,6 @@ fetch_to_stdout() {
   fi
 }
 
-# `--content-on-error` arrived in Wget 1.16 (2014); older builds and BusyBox
-# abort with an unrecognised-option error instead. Passing it blindly would
-# turn every lookup on those systems into a failure — including the ones that
-# would have succeeded — so ask before using it.
-wget_keeps_error_body() {
-  wget --help 2>&1 | grep -q -- '--content-on-error'
-}
-
-# Same as `fetch_to_stdout`, except an HTTP error status may yield its response
-# body instead of a failure. Only `resolve_version` wants that: GitHub answers
-# 404 when a repository has no release published as latest, and the guidance
-# for an empty release channel is nothing like the guidance for an unreachable
-# GitHub. A body is best-effort — on a Wget that cannot keep one, an HTTP error
-# is indistinguishable here from a transport failure, so callers must resolve
-# that ambiguity themselves rather than reading anything into an empty body.
-fetch_body_allow_http_error() {
-  if [ "$DOWNLOADER" = curl ]; then
-    curl --silent --show-error --location --retry 3 "$1"
-  elif wget_keeps_error_body; then
-    # wget still exits non-zero on an error status even while writing the
-    # body, so callers must tolerate that exit and inspect the body.
-    wget --quiet --tries=3 --content-on-error --output-document=- "$1"
-  else
-    wget --quiet --tries=3 --output-document=- "$1"
-  fi
-}
-
 # Fork tags carry build metadata (v1.2.3+providers.4), and GitHub itself links
 # to those releases with the '+' percent-encoded. A bare '+' in a URL path is
 # not routed reliably, so encode it before fetching.
@@ -149,54 +122,48 @@ resolve_version() {
     return
   fi
 
-  # An HTTP error must not abort here. GitHub reports "no release published as
-  # latest" as a 404, and `--fail` collapsed that into the same failure as an
-  # unreachable network — which is exactly what this printed the first time it
-  # ran against a repository whose only release was a prerelease.
+  # A tag is read ONLY out of a transfer that completed with a 2xx: this keeps
+  # curl's --fail and Wget's default refusal, and the `|| resolve_body=''`
+  # discards whatever a failed transfer left behind. That ordering is the whole
+  # point. A tag scavenged from an error page, a truncated body, a retried
+  # request whose earlier attempt was concatenated ahead of the good one, or an
+  # intercepting proxy would name a real-but-wrong release — and its checksum
+  # would then verify perfectly, so nothing downstream would catch it.
+  # stderr is dropped because this failure is expected and diagnosed below: the
+  # downloader's own "returned error: 404" would otherwise land above a message
+  # explaining that there is simply nothing published yet, and read as a crash.
   resolve_body="$(
-    fetch_body_allow_http_error \
-      "https://api.github.com/repos/${REPO}/releases/latest" || :
-  )"
+    fetch_to_stdout "https://api.github.com/repos/${REPO}/releases/latest" \
+      2>/dev/null
+  )" || resolve_body=''
 
-  resolve_tag="$(
-    printf '%s\n' "$resolve_body" |
-      sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
-      head -n 1
-  )"
+  if [ -n "$resolve_body" ]; then
+    resolve_tag="$(
+      printf '%s\n' "$resolve_body" |
+        sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+        head -n 1
+    )"
 
-  if [ -n "$resolve_tag" ]; then
-    printf '%s\n' "${resolve_tag#v}"
-    return
+    if [ -n "$resolve_tag" ]; then
+      printf '%s\n' "${resolve_tag#v}"
+      return
+    fi
   fi
 
-  # Every GitHub API refusal arrives as {"message": ...}, and they are not
-  # interchangeable: an unauthenticated client that has exhausted the hourly
-  # rate limit gets 403 with a body, and reporting that as a missing repository
-  # sends someone to fix MEDLEY_REPO over a problem that clears by itself.
-  # Surface whatever GitHub said, except for the one message that is ambiguous.
-  resolve_message="$(
-    printf '%s\n' "$resolve_body" |
-      sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
-      head -n 1
-  )"
-
-  case "$resolve_message" in
-  '' | 'Not Found') ;;
-  *)
-    die "the GitHub release API rejected the request for ${REPO} (${resolve_message}). Set MEDLEY_VERSION to install a specific tag."
-    ;;
-  esac
-
-  # What is left is a 404, or no body at all — either because the transfer
-  # never happened or because this Wget discarded the error body. An empty
-  # body is deliberately NOT read as "network down": on a pre-1.16 Wget that
-  # is also what a perfectly ordinary 404 looks like. The repository endpoint
-  # is what actually separates the remaining cases, and it runs only here, so
-  # a successful install still costs a single request.
+  # Resolution failed, and --fail collapsed every reason into one exit code.
+  # GitHub reports "no release published as latest" as a 404, which needs
+  # guidance nothing like an unreachable network's — reporting it as the latter
+  # is exactly what this printed against a repository whose only release was a
+  # prerelease. Asking whether the repository itself is readable is the one
+  # question that separates the cases on every downloader, and it runs only
+  # here, so a successful install still costs a single request.
+  #
+  # Deliberately not parsed: the error body. Reading it would mean accepting
+  # bodies from failed transfers, which is the hazard above.
   if fetch_to_stdout "https://api.github.com/repos/${REPO}" >/dev/null 2>&1; then
-    die "${REPO} has no release published as latest. Drafts and prereleases are both excluded, so publish the draft release the release workflow created — or set MEDLEY_VERSION to install a specific tag."
+    die "could not resolve the latest release of ${REPO}. The repository is readable, so most likely it has no release published as latest — drafts and prereleases are both excluded, so publish the draft release the release workflow created. Otherwise GitHub returned an error; retry, or set MEDLEY_VERSION to install a specific tag."
   fi
-  die "cannot read the releases for ${REPO}: GitHub is unreachable, or the repository is private or does not exist. Check your network and MEDLEY_REPO."
+  die "could not read ${REPO} from GitHub: it is unreachable, rate-limiting this host, private, or does not exist. Retry later, check MEDLEY_REPO, or set MEDLEY_VERSION to install a specific tag."
 }
 
 # Collapse '.' and '..' textually. Only ever called on a path whose existing
