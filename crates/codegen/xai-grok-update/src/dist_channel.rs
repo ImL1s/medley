@@ -100,9 +100,29 @@ fn install_ref_for(identity: &DistIdentity, version: &str) -> String {
         // the tag is recoverable by putting it back. A raw.githubusercontent
         // path takes the `+` in `v1.2.3+providers.4` literally — verified
         // against GitHub, which serves both the bare and percent-encoded form.
-        DistIdentity::Medley => format!("v{version}"),
+        //
+        // Gated on the version actually looking like a release, because a
+        // stamp alone does not make one: the docs tell developers to build
+        // with `MEDLEY_CHANNEL=medley cargo build --release`, and such a build
+        // has no `GROK_VERSION`, so it falls back to the Cargo package version.
+        // Deriving a ref from that would name `v0.2.117` — a tag this
+        // repository never publishes, since the release scheme requires
+        // `+providers.<N>`. That 404s, or worse, resolves an unrelated tag
+        // inherited from upstream.
+        DistIdentity::Medley if is_fork_release_version(version) => format!("v{version}"),
         _ => MEDLEY_DEV_INSTALL_REF.to_string(),
     }
+}
+
+/// Whether a version came from a tag this repository publishes.
+///
+/// Mirrors the scheme the release workflow enforces: `<upstream>+providers.<N>`
+/// with a numeric, non-empty counter.
+fn is_fork_release_version(version: &str) -> bool {
+    let Some((upstream, counter)) = version.split_once("+providers.") else {
+        return false;
+    };
+    !upstream.is_empty() && !counter.is_empty() && counter.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Where medley's release artifacts and checksums are published.
@@ -516,6 +536,42 @@ mod tests {
             assert!(
                 !dev.contains("0.1.220-alpha.4"),
                 "{identity:?} must not fabricate a tag from a dev version: {dev}"
+            );
+        }
+    }
+
+    /// A stamp is not a release. The docs tell developers to build with
+    /// `MEDLEY_CHANNEL=medley cargo build --release`, and such a build has no
+    /// `GROK_VERSION` — so its version is the Cargo package version, and
+    /// deriving a ref from it would name a tag this repository never
+    /// publishes. That 404s, or resolves an unrelated tag inherited from
+    /// upstream, and it is baked into the binary either way.
+    #[test]
+    fn a_stamp_without_a_release_version_still_names_the_branch() {
+        for version in [
+            // What a local `MEDLEY_CHANNEL=medley` build actually reports.
+            "0.2.117",
+            "0.1.220-alpha.4",
+            // Shapes that resemble the scheme without matching it.
+            "0.2.117+providers",
+            "0.2.117+providers.",
+            "0.2.117+providers.x",
+            "0.2.117+providers.1a",
+            "+providers.1",
+        ] {
+            let cmd = install_command_for(&DistIdentity::Medley, version);
+            assert!(
+                cmd.contains("/providers/install.sh"),
+                "{version:?} is not a release version, so it must name the branch: {cmd}"
+            );
+        }
+
+        // And the real thing still pins.
+        for version in ["0.2.117+providers.1", "1.2.3+providers.42"] {
+            let cmd = install_command_for(&DistIdentity::Medley, version);
+            assert!(
+                cmd.contains(&format!("/v{version}/install.sh")),
+                "{version:?} follows the release scheme and must pin: {cmd}"
             );
         }
     }
