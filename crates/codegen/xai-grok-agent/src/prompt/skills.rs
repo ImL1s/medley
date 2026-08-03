@@ -85,10 +85,17 @@ pub async fn list_skills_with_plugins(
     let _skill_discovery_timer = crate::timing::timer("skill_discovery");
     let workspace_user_dir = crate::prompt::workspace_user::optional_workspace_user_dir();
 
+    // The ambient home is read here, at the top, and passed down explicitly
+    // from this point on. Anything below that reached for it directly could
+    // not be tested without the developer's own directory joining in (#94).
+    #[allow(deprecated)]
+    let home = std::env::home_dir();
+
     let mut skills = list_skills_with_options(
         working_directory,
         workspace_user_dir.as_deref(),
         &xai_grok_tools::util::grok_home::grok_home(),
+        home.as_deref(),
         compat,
     )
     .await;
@@ -143,6 +150,7 @@ pub fn collect_skill_config_dirs(
     cwd: Option<&Path>,
     workspace_user_dir: Option<&Path>,
     global_dir: &Path,
+    home: Option<&Path>,
     config_paths: &[String],
     compat: CompatConfig,
 ) -> Vec<PathBuf> {
@@ -203,8 +211,13 @@ pub fn collect_skill_config_dirs(
     // be overridden), so it's handled separately; `.agents` is always added,
     // while `.claude`/`.cursor` are gated by the skills compat cells.
     try_add(grok_home);
-    #[allow(deprecated)]
-    if let Some(home) = std::env::home_dir() {
+    // `home` arrives as an argument rather than from the environment. It used
+    // to be read here with `std::env::home_dir()`, which meant a caller could
+    // choose the state directory and *not* the vendor directories beside it —
+    // so a test handed a temp directory still scanned the developer's real
+    // `~/.claude`, and failed if they happened to have a skill of the same
+    // name. See #94.
+    if let Some(home) = home {
         try_add(home.join(".agents"));
         if compat.claude.skills {
             try_add(home.join(".claude"));
@@ -224,11 +237,15 @@ pub fn collect_skill_config_dirs(
 
 /// Determine the skill scope for a config directory based on its location
 /// relative to `cwd`, `git_root`, and the user's home directory.
-fn scope_for_config_dir(dir: &Path, cwd: Option<&Path>, git_root: Option<&Path>) -> SkillScope {
+fn scope_for_config_dir(
+    dir: &Path,
+    cwd: Option<&Path>,
+    git_root: Option<&Path>,
+    home: Option<&Path>,
+) -> SkillScope {
     // Home-level dirs (e.g. ~/.grok/, ~/.agents/, ~/.claude/) are User scope.
-    #[allow(deprecated)]
-    if let Some(home) = std::env::home_dir()
-        && dir.parent() == Some(home.as_path())
+    if let Some(home) = home
+        && dir.parent() == Some(home)
     {
         return SkillScope::User;
     }
@@ -280,6 +297,7 @@ async fn list_skills_with_options(
     working_directory: Option<&str>,
     workspace_user_dir: Option<&Path>,
     global_dir: &Path,
+    home: Option<&Path>,
     compat: CompatConfig,
 ) -> Vec<SkillInfo> {
     let cwd = working_directory.map(PathBuf::from);
@@ -290,14 +308,20 @@ async fn list_skills_with_options(
             .and_then(|repo| repo.workdir().map(|p| p.to_path_buf()))
     });
 
-    let config_dirs =
-        collect_skill_config_dirs(cwd.as_deref(), workspace_user_dir, global_dir, &[], compat);
+    let config_dirs = collect_skill_config_dirs(
+        cwd.as_deref(),
+        workspace_user_dir,
+        global_dir,
+        home,
+        &[],
+        compat,
+    );
 
     let mut skill_files: Vec<(PathBuf, SkillScope)> = Vec::new();
     let mut seen_canonical_paths = HashSet::new();
 
     for config_dir in &config_dirs {
-        let scope = scope_for_config_dir(config_dir, cwd.as_deref(), git_root.as_deref());
+        let scope = scope_for_config_dir(config_dir, cwd.as_deref(), git_root.as_deref(), home);
 
         // Skills before commands: skills win name collisions.
         collect_discovered_paths(
@@ -1352,6 +1376,7 @@ mod tests {
             Some(repo_root.to_str().unwrap()),
             Some(&user_dir),
             tmp.path(),
+            Some(tmp.path()),
             CompatConfig::default(),
         )
         .await;
@@ -1382,6 +1407,7 @@ mod tests {
             Some(user_dir.to_str().unwrap()),
             Some(&user_dir),
             tmp.path(),
+            Some(tmp.path()),
             CompatConfig::default(),
         )
         .await;
@@ -1410,6 +1436,7 @@ mod tests {
             Some(repo_root.to_str().unwrap()),
             None,
             tmp.path(),
+            Some(tmp.path()),
             CompatConfig::default(),
         )
         .await;
@@ -1438,6 +1465,7 @@ mod tests {
             Some(repo_root.to_str().unwrap()),
             Some(&user_dir),
             tmp.path(),
+            Some(tmp.path()),
             CompatConfig::default(),
         )
         .await;
@@ -2143,6 +2171,7 @@ mod tests {
             Some(repo_root.to_str().unwrap()),
             None,
             &home,
+            Some(&home),
             CompatConfig::default(),
         )
         .await;
@@ -2177,6 +2206,7 @@ mod tests {
             Some(repo_root.to_str().unwrap()),
             None,
             &home,
+            Some(&home),
             CompatConfig::default(),
         )
         .await;
@@ -2247,9 +2277,14 @@ mod tests {
         );
 
         let repo_str = repo_root.to_str().unwrap_or_default();
-        let skills =
-            list_skills_with_options(Some(repo_str), None, tmp.path(), CompatConfig::default())
-                .await;
+        let skills = list_skills_with_options(
+            Some(repo_str),
+            None,
+            tmp.path(),
+            Some(tmp.path()),
+            CompatConfig::default(),
+        )
+        .await;
         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
 
         assert!(
@@ -2324,9 +2359,14 @@ mod tests {
         .expect("write deploy.md command");
 
         let repo_str = repo_root.to_str().unwrap_or_default();
-        let raw =
-            list_skills_with_options(Some(repo_str), None, tmp.path(), CompatConfig::default())
-                .await;
+        let raw = list_skills_with_options(
+            Some(repo_str),
+            None,
+            tmp.path(),
+            Some(tmp.path()),
+            CompatConfig::default(),
+        )
+        .await;
 
         let deploy_entries: Vec<_> = raw.iter().filter(|s| s.name == "deploy").collect();
         assert_eq!(deploy_entries.len(), 2);
@@ -2448,6 +2488,7 @@ mod tests {
             Some(repo_root.to_str().unwrap()),
             None,
             &home,
+            Some(&home),
             CompatConfig::default(),
         )
         .await;
@@ -2465,6 +2506,53 @@ mod tests {
     // ── collect_skill_config_dirs vendor gating ────────────
 
     #[test]
+    /// The scan must look only where it is told. It used to take the state
+    /// directory as an argument and then read `std::env::home_dir()` for the
+    /// vendor directories beside it — so a caller could choose half the search
+    /// path. A test handed a temp directory still scanned the developer's real
+    /// `~/.claude` and failed on whatever they happened to have installed
+    /// there, which is how `skills_shadow_commands_with_same_name` came to be
+    /// red on every machine with a skill named `deploy` (#94).
+    #[test]
+    fn the_scan_looks_only_where_it_is_told() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture_home = tmp.path().join("home");
+        let cwd = tmp.path().join("work");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(fixture_home.join(".claude")).unwrap();
+        fs::create_dir_all(fixture_home.join(".agents")).unwrap();
+
+        let with_home = collect_skill_config_dirs(
+            Some(&cwd),
+            None,
+            &fixture_home.join(".medley"),
+            Some(&fixture_home),
+            &[],
+            CompatConfig::default(),
+        );
+        assert!(
+            with_home.contains(&fixture_home.join(".claude")),
+            "the home it was given was not searched: {with_home:?}"
+        );
+
+        // And with no home, nothing home-level is searched at all — including
+        // the real one, which is the property the tests depend on.
+        let without_home = collect_skill_config_dirs(
+            Some(&cwd),
+            None,
+            &fixture_home.join(".medley"),
+            None,
+            &[],
+            CompatConfig::default(),
+        );
+        assert!(
+            !without_home.iter().any(|d| d.ends_with(".claude")
+                || d.ends_with(".agents")
+                || d.ends_with(".cursor")),
+            "a vendor directory was searched with no home supplied: {without_home:?}"
+        );
+    }
+
     fn collect_skill_config_dirs_gates_vendor_dirs() {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
@@ -2476,15 +2564,22 @@ mod tests {
         let ends_with = |dirs: &[PathBuf], suffix: &str| dirs.iter().any(|d| d.ends_with(suffix));
 
         // All on → both vendor dirs present (byte-for-byte legacy behavior).
-        let all =
-            collect_skill_config_dirs(Some(cwd), None, tmp.path(), &[], CompatConfig::default());
+        let all = collect_skill_config_dirs(
+            Some(cwd),
+            None,
+            tmp.path(),
+            Some(tmp.path()),
+            &[],
+            CompatConfig::default(),
+        );
         assert!(ends_with(&all, ".claude"), "claude missing: {all:?}");
         assert!(ends_with(&all, ".cursor"), "cursor missing: {all:?}");
 
         // cursor.skills off → .cursor dropped, .claude kept.
         let mut compat = CompatConfig::default();
         compat.cursor.skills = false;
-        let dirs = collect_skill_config_dirs(Some(cwd), None, tmp.path(), &[], compat);
+        let dirs =
+            collect_skill_config_dirs(Some(cwd), None, tmp.path(), Some(tmp.path()), &[], compat);
         assert!(
             !ends_with(&dirs, ".cursor"),
             "cursor must be gated off: {dirs:?}"

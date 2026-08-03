@@ -696,10 +696,16 @@ impl SkillsFileWatcher {
         // per-session discovery gating happens downstream, so watching a
         // currently-disabled vendor dir is harmless (a change just re-runs the
         // gated discovery) and avoids ever missing a watch if a toggle flips.
+        // The vendor directories beside the user's home are now passed in
+        // rather than discovered inside the callee, so that a caller choosing
+        // a state directory chooses the whole set (#94).
+        #[allow(deprecated)]
+        let home = std::env::home_dir();
         let dirs_to_watch = xai_grok_agent::prompt::skills::collect_skill_config_dirs(
             cwd,
             monorepo_user_dir,
             &grok_home,
+            home.as_deref(),
             config_paths,
             xai_grok_tools::types::compat::CompatConfig::default(),
         );
