@@ -30,6 +30,35 @@ fn find_protoc_include_dir(protoc: Option<&Path>) -> Option<PathBuf> {
     }
 }
 
+/// The `cargo:rerun-if-changed` value for a located `protoc`, or `None` when
+/// there is nothing safe to emit.
+///
+/// A perfectly usable `protoc` can still yield nothing here, in two ways:
+///
+/// * **The path does not resolve from the package root.** Cargo resolves
+///   `rerun-if-changed` relative to the package root and calls a missing entry
+///   permanently dirty — it says so outright: "Dirty <crate>: the file
+///   `protoc` is missing". Emitting an unresolvable path does the opposite of
+///   what the directive is for: instead of rebuilding when protoc changes, it
+///   rebuilds always, and takes every crate downstream with it.
+/// * **The path is not UTF-8.** `rerun-if-changed` has no encoding for those
+///   bytes, but `Command` and `PATH` lookup take `OsStr`, so such a protoc
+///   runs fine. Failing the build over it would break a working configuration
+///   to protect a rebuild trigger.
+///
+/// Either way the protoc itself is still used — only this one line is dropped.
+/// The cost is that edits to the protoc binary no longer force a rebuild; the
+/// `.proto` dependency lines emitted alongside it keep the build script
+/// tracked regardless.
+///
+/// The encoding gate comes first so it is reachable without a filesystem that
+/// permits such a name — APFS and HFS+ reject non-UTF-8 filenames outright, so
+/// checking existence first would make that branch untestable on macOS.
+fn rerun_if_changed_for_protoc(protoc: &Path) -> Option<&str> {
+    let path = protoc.to_str()?;
+    protoc.try_exists().unwrap_or(false).then_some(path)
+}
+
 pub struct XaiProtoBuilder {
     builder: tonic_prost_build::Builder,
     file_descriptor_set_path: Option<PathBuf>,
@@ -109,24 +138,8 @@ impl XaiProtoBuilder {
     ) -> anyhow::Result<()> {
         let includes = Vec::from_iter(includes);
 
-        if let Some(protoc) = protoc {
-            // Only for a path that exists. Cargo resolves rerun-if-changed
-            // relative to the package root and treats a missing entry as
-            // permanently dirty — it says so outright: "Dirty <crate>: the
-            // file `protoc` is missing". Emitting an unresolvable path
-            // therefore does the opposite of what this line is for: instead of
-            // rebuilding when protoc changes, it rebuilds always, and takes
-            // every crate downstream of this build script with it.
-            //
-            // Dropping the line when the path does not resolve leaves Cargo on
-            // its default — rerun when any file in the package changes — which
-            // is conservative and stable, rather than never-stable.
-            if protoc.try_exists().unwrap_or(false) {
-                println!(
-                    "cargo:rerun-if-changed={}",
-                    protoc.to_str().context("protoc path not UTF-8")?
-                );
-            }
+        if let Some(path) = protoc.and_then(rerun_if_changed_for_protoc) {
+            println!("cargo:rerun-if-changed={path}");
         }
 
         // Can only process one input file when using --dependency_out=FILE.
@@ -303,5 +316,79 @@ pub fn configure() -> XaiProtoBuilder {
         pbjson_ignore_unknown_fields: false,
         pbjson_preserve_proto_field_names: false,
         file_descriptor_set_path: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir_named(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "xai-proto-build-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// The bug this guards: emitting a path Cargo cannot resolve makes the
+    /// build script permanently dirty, so every downstream crate recompiles on
+    /// every cargo invocation.
+    #[test]
+    fn an_unresolvable_protoc_emits_nothing() {
+        assert_eq!(
+            rerun_if_changed_for_protoc(Path::new("/nonexistent-aXbYcZ/protoc")),
+            None
+        );
+        assert_eq!(
+            rerun_if_changed_for_protoc(Path::new("protoc")),
+            None,
+            "the bare name resolves against the package root, where no such \
+             file exists"
+        );
+    }
+
+    #[test]
+    fn a_resolvable_protoc_is_emitted() {
+        let dir = temp_dir_named("emit");
+        let protoc = dir.join("protoc");
+        fs::write(&protoc, b"").expect("write protoc");
+
+        assert_eq!(
+            rerun_if_changed_for_protoc(&protoc),
+            Some(protoc.to_str().expect("temp path is UTF-8"))
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `PATH` entries are `OsStr`, so a `protoc` under a directory with
+    /// non-UTF-8 bytes runs perfectly well — `Command` never needs to decode
+    /// it. Only `cargo:rerun-if-changed` does, and treating that as fatal
+    /// would fail a build that had already located a working protoc, purely to
+    /// protect a rebuild trigger.
+    ///
+    /// No file is created: APFS and HFS+ refuse these names with `Illegal byte
+    /// sequence`, so a filesystem-backed version of this test could only ever
+    /// run on Linux. Because the encoding gate precedes the existence gate,
+    /// this reaches the branch under test on every platform.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_protoc_is_skipped_rather_than_failing_the_build() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        // 0xFF can never appear in UTF-8, but is a legal byte in a Linux
+        // filename.
+        let protoc = Path::new(OsStr::from_bytes(b"/usr/local/b\xffn/protoc"));
+
+        assert_eq!(
+            rerun_if_changed_for_protoc(protoc),
+            None,
+            "an undecodable path must be skipped, not raised — the previous \
+             code turned this into a build failure via `to_str()?`"
+        );
     }
 }
