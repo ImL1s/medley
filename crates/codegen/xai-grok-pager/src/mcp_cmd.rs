@@ -9,6 +9,19 @@ use xai_grok_shell::util::config::{McpServerConfig, McpServerTransportConfig};
 
 use crate::util::display_user_grok_path;
 
+/// `--scope`'s help, with the user config resolved.
+///
+/// `./.grok/config.toml` stays literal on purpose: that one is relative to the
+/// repository being worked in and does not move with `MEDLEY_HOME`. Rendering
+/// it through the state-directory helper would be wrong in the other
+/// direction.
+fn scope_help() -> String {
+    format!(
+        "Config to write to: user ({}) or project (`./.grok/config.toml`)",
+        display_user_grok_path("config.toml")
+    )
+}
+
 /// `grok mcp add --help`'s trailer, built at runtime.
 ///
 /// Only the user-scoped path is resolved. `./.grok/config.toml` stays literal
@@ -57,7 +70,7 @@ pub enum McpTransport {
 /// Which config file an MCP server definition is written to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum McpScope {
-    /// `~/.grok/config.toml`, available in all your projects
+    /// The user config, available in all your projects
     User,
     /// `./.grok/config.toml`, shared with everyone working in this directory
     Project,
@@ -132,8 +145,14 @@ pub struct AddArgs {
     #[arg(short = 't', long, value_enum)]
     transport: Option<McpTransport>,
 
-    /// Config to write to: user (~/.grok/config.toml) or project (./.grok/config.toml)
-    #[arg(short = 's', long, value_enum, default_value = "user")]
+    /// Config to write to: user or project (`./.grok/config.toml`)
+    #[arg(
+        long_help = scope_help(),
+        short = 's',
+        long,
+        value_enum,
+        default_value = "user"
+    )]
     scope: McpScope,
 
     /// Environment variable for the server process (repeatable)
