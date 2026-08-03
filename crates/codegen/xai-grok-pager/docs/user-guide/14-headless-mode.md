@@ -540,12 +540,13 @@ For agent servers and SDKs, see [Agent mode](15-agent-mode.md#automation-and-sdk
 
 Key environment variables that affect headless mode:
 
-| Variable                        | Description                                                   |
-| ------------------------------- | ------------------------------------------------------------- |
-| `XAI_API_KEY`        | API key for authentication (required when no browser login)   |
-| `GROK_HOME`                    | Override config directory (default: `~/.grok`)                |
-| `GROK_LOG_FILE`                | Path to a log file (used verbatim as the path; works in headless and TUI, honors `RUST_LOG`) |
-| `RUST_LOG`                     | Log level filter (e.g. `debug`). Headless logs to stderr.     |
+| Variable        | Description                                                                                  |
+| --------------- | -------------------------------------------------------------------------------------------- |
+| `XAI_API_KEY`   | API key for authentication (required when no browser login)                                  |
+| `MEDLEY_HOME`   | Override the state directory (default: `~/.medley`); checked first                           |
+| `GROK_HOME`     | Same, checked after `MEDLEY_HOME`; accepted for compatibility                                |
+| `GROK_LOG_FILE` | Path to a log file (used verbatim as the path; works in headless and TUI, honors `RUST_LOG`) |
+| `RUST_LOG`      | Log level filter (e.g. `debug`). Headless logs to stderr.                                    |
 
 For CI environments without browser access, set `XAI_API_KEY` with an API key from [console.x.ai](https://console.x.ai):
 
@@ -603,7 +604,7 @@ the scope small.
 
 ## File Locations
 
-Grok stores data in `~/.grok` (override with `GROK_HOME`; see [Environment Variables for Headless](#environment-variables-for-headless)):
+Grok stores data in `~/.medley` (override with `MEDLEY_HOME`, or `GROK_HOME` after it; see [Environment Variables for Headless](#environment-variables-for-headless) and [Configuration](05-configuration.md#file-locations) for the full resolution order). A headless run never prompts, so a host whose state still lives in `~/.grok` keeps using that directory and logs one line saying so:
 
 | Path                     | Contents                              |
 | ------------------------ | ------------------------------------- |
@@ -620,9 +621,9 @@ Grok stores data in `~/.grok` (override with `GROK_HOME`; see [Environment Varia
 | `trace-exports/`         | Session trace exports                 |
 | `worktrees/`             | Git worktree metadata                 |
 
-### Read-Only `~/.grok`
+### Read-Only `~/.medley`
 
-For containers or CI, mount `~/.grok` read-only:
+For containers or CI, mount `~/.medley` read-only:
 
 - Pre-populate `auth.json` or use `XAI_API_KEY`
 - Session persistence fails silently (ephemeral)
@@ -649,7 +650,10 @@ grok -p "..." --no-auto-update
 case) counts as not set. The agent SDKs
 inject `GROK_DISABLE_AUTOUPDATER=1` for the non-leader agents they spawn (a falsy value in
 the SDK's isolation env keeps updates on), and the stdio agent skips its background update
-unless it runs from the managed install (`$GROK_HOME/bin/grok`).
+unless it runs from the managed install, which is specifically `bin/grok` inside
+the state directory (`~/.medley/bin/grok` by default). The fork's installer writes
+`bin/medley`, not `bin/grok`, so an installed Medley never matches this check and
+always skips that background update — an inherited mismatch, not a setting.
 
 Update messages go to **stderr**. Stdout stays clean for `--output-format json`. See also [Environment Variables for Headless](#environment-variables-for-headless).
 

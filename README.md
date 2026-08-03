@@ -37,14 +37,23 @@ local models, each with its credentials kept in its own lane.
 > [`NOTICE.md`](NOTICE.md) for the full trademark and non-affiliation statement.
 
 > [!NOTE]
-> **The command is still `grok`.** Medley currently builds and runs as the
-> upstream binary name, so every command example in this repository — here and
-> throughout the user guide — reads `grok …`, and state still lives in
-> `~/.grok/`. The `medley` command alias, the `~/.medley/` state directory, and
-> the `MEDLEY_*` environment prefix arrive with the packaging change tracked in
-> [#49](https://github.com/ImL1s/grok-build/issues/49). Until then, read
-> [Coexistence](#coexistence-with-official-grok-build) before installing Medley
-> on a machine that already has official Grok Build.
+> **Three names for one binary.** The release archives and
+> [`install.sh`](install.sh) ship it as **`medley`**, installed under
+> `~/.medley/bin`. A **source build** produces the upstream cargo bin target
+> **`xai-grok-pager`** — crate and bin names deliberately do not change, see
+> [Repository layout](#repository-layout). Official **upstream** installs ship
+> that same target as **`grok`**. Command examples in this repository and throughout the user
+> guide are written as `grok …`; read them as "whatever you invoke your build
+> as".
+>
+> **State lives in `~/.medley`.** It resolves as `$MEDLEY_HOME` → `$GROK_HOME` →
+> `~/.medley` when it exists → `~/.grok` when it exists and `~/.medley` does not
+> → `~/.medley`, so a fresh install lands in `~/.medley` while an existing
+> `~/.grok` keeps working. `MEDLEY_HOME` is the only `MEDLEY_*` variable the
+> binary itself reads; every other application variable is still `GROK_*`. The
+> `MEDLEY_*` prefix otherwise belongs to the installer. See
+> [Coexistence](#coexistence-with-official-grok-build) for the migration and the
+> remaining sharp edges.
 
 This repository ([ImL1s/grok-build](https://github.com/ImL1s/grok-build)) tracks
 upstream on `main` (a pristine fast-forward mirror) and ships the fork's product
@@ -77,18 +86,35 @@ and [Authentication](crates/codegen/xai-grok-pager/docs/user-guide/02-authentica
 
 ## Coexistence with official Grok Build
 
-Until the packaging change lands, Medley and official Grok Build **share
-runtime identity**, and installing both on one machine is not yet safe:
+Medley now installs under its own command and keeps its state in its own
+directory, so the two builds no longer collide by default. What still needs care:
 
-- both provide a `grok` command, so `PATH` order silently decides which one runs;
-- both read and write `~/.grok/` — Medley writes provider-scoped credentials and
-  config fields (`model_provider`, `auth_scheme`) that upstream does not know,
-  and upstream schema changes can likewise confuse Medley. Alternating between
-  the two can corrupt that state in ways that look like random bugs;
-- both honour the same `GROK_*` environment variables.
-
-Distinct commands, a distinct state directory, and a one-time copy migration are
-tracked in [#49](https://github.com/ImL1s/grok-build/issues/49).
+- **Command.** The installer writes a `medley` command into `~/.medley/bin` and
+  never touches an existing `grok` binary — it warns when it finds one. A source
+  build has no installed name of its own; if you put `target/release/xai-grok-pager`
+  on your `PATH` as `grok`, `PATH` order silently decides which build runs.
+- **State.** Medley resolves its state directory as `$MEDLEY_HOME` →
+  `$GROK_HOME` → `~/.medley` when it exists → `~/.grok` when it exists and
+  `~/.medley` does not → `~/.medley`. The installed `medley` launcher pins the
+  directory to its install location before the binary starts, so an installed
+  Medley does not fall through to `~/.grok` — **unless you have exported
+  `MEDLEY_HOME` or `GROK_HOME` yourself**, which the launcher deliberately leaves
+  alone so your choice wins. A **source build** has no launcher, so on a machine
+  that already has `~/.grok` it does resolve to it until the migration below runs.
+- **Migration.** When Medley resolves to `~/.grok`, the first interactive run
+  offers a one-time **copy** into `~/.medley`; nothing is deleted and `~/.grok`
+  is left as it was. Decline, and Medley writes a `.medley-keep-legacy` marker
+  into `~/.grok` and stops asking — it then keeps sharing that directory with
+  official Grok Build, which can corrupt both: Medley writes provider-scoped
+  credentials and config fields (`model_provider`, `auth_scheme`) that upstream
+  does not know, and upstream schema changes can likewise confuse Medley.
+  Non-interactive runs never prompt; they keep using `~/.grok` and log one line
+  saying so.
+- **Environment.** Both builds still honour the same `GROK_*` variables,
+  including `GROK_HOME`. Exporting `GROK_HOME` globally therefore points both at
+  one directory again — set `MEDLEY_HOME` instead, which only Medley reads.
+  Renaming the application's own `GROK_*` variables is remaining scope on
+  [#49](https://github.com/ImL1s/grok-build/issues/49).
 
 > [!NOTE]
 > **Medley does not self-update.** The inherited updater points at upstream's
@@ -103,9 +129,40 @@ tracked in [#49](https://github.com/ImL1s/grok-build/issues/49).
 > [!CAUTION]
 > **The official installer does not install Medley.** `x.ai/cli/install.sh`,
 > `x.ai/cli/install.ps1`, and `grok update` all fetch xAI's official build. Use
-> them only if upstream Grok Build is what you want. Fork-specific installer
-> guidance is tracked in [#28](https://github.com/ImL1s/grok-build/issues/28);
-> until it lands, building from source is the supported path for Medley.
+> them only if upstream Grok Build is what you want.
+
+### From a release (macOS and Linux)
+
+[`install.sh`](install.sh) downloads the release archive for your platform,
+verifies its SHA-256 against the release checksums file, unpacks it under
+`~/.medley/versions/<version>/`, and writes a `medley` launcher into
+`~/.medley/bin` that supplies `~/.medley` as the state directory whenever you
+have not exported `MEDLEY_HOME` or `GROK_HOME` yourself:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ImL1s/grok-build/providers/install.sh | sh
+```
+
+| Variable | Effect |
+|----------|--------|
+| `MEDLEY_VERSION` | Version or tag to install (default: latest published release) |
+| `MEDLEY_INSTALL_DIR` | Where the `medley` launcher goes (default: `~/.medley/bin`) |
+| `MEDLEY_HOME` | Where unpacked versions and state live (default: `~/.medley`) |
+| `MEDLEY_TARGET` | Force a target triple instead of detecting one |
+| `MEDLEY_REPO` | Source repository (default: `ImL1s/grok-build`) |
+| `MEDLEY_DRYRUN` | Set to `1` to print the plan and skip the download, extraction, and install. The release version is still resolved first, so this queries the GitHub API unless `MEDLEY_VERSION` is also set |
+
+Releases are published for `aarch64`/`x86_64` macOS and Linux. The installer
+refuses to install into `~/.grok`, never touches an existing `grok` binary, and
+warns when it finds one. Windows is not covered — build from source there.
+
+> [!IMPORTANT]
+> The installer resolves the **latest published release**, and this repository
+> has not published one carrying artifacts yet: the release workflow deliberately
+> uploads to a **draft** that a maintainer publishes by hand. Until a release is
+> published the one-liner above fails at the download step, and building from
+> source is the working path. Tracked in
+> [#29](https://github.com/ImL1s/grok-build/issues/29).
 
 ### Building from source
 
@@ -140,9 +197,13 @@ Check out `providers` — `main` is the pristine upstream mirror and contains no
 of the fork's changes.
 
 The binary artifact is named `xai-grok-pager`; official upstream installs ship it
-as `grok`, and the fork's own `medley` alias arrives with the packaging change.
-On first launch it opens your browser to authenticate — see the
+as `grok`, and the release archives ship it as `medley`. A source build keeps the
+cargo name, so what you invoke it as is up to you. On first launch it opens your
+browser to authenticate — see the
 [authentication guide](crates/codegen/xai-grok-pager/docs/user-guide/02-authentication.md).
+If the machine already has a `~/.grok` directory, that first interactive launch
+also offers the one-time copy into `~/.medley` described under
+[Coexistence](#coexistence-with-official-grok-build).
 
 ## Documentation
 

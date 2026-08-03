@@ -55,7 +55,7 @@ Each row shows a short provider hint and a readiness badge (`ready`, `missing`, 
 
 ### Config Default
 
-Set a persistent default in `~/.grok/config.toml`:
+Set a persistent default in `~/.medley/config.toml`:
 
 ```toml
 [models]
@@ -84,7 +84,7 @@ To send provider-specific non-secret headers -- for example, Anthropic's `anthro
 
 ## Configuring Custom Models
 
-Add custom model endpoints in `~/.grok/config.toml` under `[model.<name>]` sections.
+Add custom model endpoints in `~/.medley/config.toml` under `[model.<name>]` sections.
 
 Model entries load from that **global** file only. A `[model.*]` or
 `[model_providers.*]` block in a project-local `.grok/config.toml` has no
@@ -321,7 +321,7 @@ terms govern use.
 The provider fixes the transport to
 `https://chatgpt.com/backend-api/codex/responses` and supplies the live bearer
 and trusted ChatGPT workspace-routing metadata from one provider-scoped
-credential snapshot. Grok Build sends its own truthful transport identity and
+credential snapshot. Medley sends its own truthful transport identity and
 does not impersonate the official Codex CLI. It rejects custom origins, query
 parameters, arbitrary routing headers, and attempts to override the reserved
 provider. Do not add `api_key`, `env_key`, `base_url`, `extra_headers`, or
