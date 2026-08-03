@@ -94,6 +94,21 @@ fetch_to_stdout() {
   fi
 }
 
+# Same as `fetch_to_stdout`, except an HTTP error status yields its response
+# body instead of a failure. Only `resolve_version` wants that: GitHub answers
+# 404 when a repository has no release published as latest, and the guidance
+# for an empty release channel is nothing like the guidance for an unreachable
+# GitHub. Callers separate the two by whether a body came back at all.
+fetch_body_allow_http_error() {
+  if [ "$DOWNLOADER" = curl ]; then
+    curl --silent --show-error --location --retry 3 "$1"
+  else
+    # --content-on-error keeps the error body; wget still exits non-zero on an
+    # error status, so callers must tolerate that exit and inspect the body.
+    wget --quiet --tries=3 --content-on-error --output-document=- "$1"
+  fi
+}
+
 # Fork tags carry build metadata (v1.2.3+providers.4), and GitHub itself links
 # to those releases with the '+' percent-encoded. A bare '+' in a URL path is
 # not routed reliably, so encode it before fetching.
@@ -122,7 +137,17 @@ resolve_version() {
     return
   fi
 
-  resolve_body="$(fetch_to_stdout "https://api.github.com/repos/${REPO}/releases/latest")" ||
+  # An HTTP error must not abort here. GitHub reports "no release published as
+  # latest" as a 404, and --fail would collapse that into the same failure as
+  # an unreachable network — which is what actually happened the first time
+  # this ran against a repository whose only release was a prerelease. A
+  # transport failure yields no body, which is what separates the two.
+  resolve_body="$(
+    fetch_body_allow_http_error \
+      "https://api.github.com/repos/${REPO}/releases/latest" || :
+  )"
+
+  [ -n "$resolve_body" ] ||
     die "could not reach the GitHub release API for ${REPO}. Set MEDLEY_VERSION to install a specific version."
 
   resolve_tag="$(
@@ -131,8 +156,16 @@ resolve_version() {
       head -n 1
   )"
 
-  [ -n "$resolve_tag" ] ||
-    die "${REPO} has no published release yet. Publish the draft release, or set MEDLEY_VERSION."
+  if [ -z "$resolve_tag" ]; then
+    # "no release published as latest" and "this repository does not exist"
+    # are both a 404 carrying the identical {"message":"Not Found"} body, so
+    # ask about the repository itself before blaming the release channel and
+    # telling someone with a typo in MEDLEY_REPO to go publish a draft.
+    if fetch_to_stdout "https://api.github.com/repos/${REPO}" >/dev/null 2>&1; then
+      die "${REPO} has no release published as latest. Drafts and prereleases are both excluded, so publish the draft release the release workflow created — or set MEDLEY_VERSION to install a specific tag."
+    fi
+    die "cannot read releases for ${REPO}: the repository is unreachable, private, or does not exist. Check MEDLEY_REPO."
+  fi
 
   printf '%s\n' "${resolve_tag#v}"
 }
