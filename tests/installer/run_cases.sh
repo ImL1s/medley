@@ -120,25 +120,36 @@ stop_server() {
   SERVER_PID=''
 }
 
-# A PATH holding exactly the tools install.sh needs, minus the downloader we
-# want to exclude.
+# A PATH mirroring the real one, minus the downloader we want to exclude.
 #
-# `select_downloader` prefers curl whenever it is present, so on a normal
-# machine the wget branch is unreachable — which is how it went unexercised
-# long enough to matter. Shadowing curl is not enough (`command -v` still finds
-# a non-executable stub), so the PATH is rebuilt from scratch instead.
+# `select_downloader` prefers curl whenever it is present, so on any machine
+# that has both, the wget branch never executes — which is how it stayed
+# unexercised long enough to matter. Shadowing curl is not enough: `command -v`
+# finds a non-executable stub perfectly well.
+#
+# Everything else is mirrored rather than enumerated. An allowlist looks
+# tidier and is wrong in a way that is hard to read: the first version of this
+# omitted `gzip`, and GNU `tar -xzf` shells out to it, so the failure surfaced
+# as "could not extract" — an installer bug that was not one.
 restricted_path() {
   exclude="$1"
   dir="${WORK}/bin-no-${exclude}"
   rm -rf "$dir"
   mkdir -p "$dir"
-  for tool in sh awk basename cat chmod cut dirname head mkdir mktemp mv \
-    openssl printf pwd rm sed sha256sum shasum tar uname curl wget python3 \
-    ln find grep sleep kill; do
-    [ "$tool" = "$exclude" ] && continue
-    resolved="$(command -v "$tool" 2>/dev/null)" || continue
-    ln -sf "$resolved" "${dir}/${tool}"
+  saved_ifs="$IFS"
+  IFS=:
+  for entry in $PATH; do
+    IFS="$saved_ifs"
+    [ -d "$entry" ] || { IFS=:; continue; }
+    for candidate in "$entry"/*; do
+      [ -x "$candidate" ] || continue
+      base="${candidate##*/}"
+      [ "$base" = "$exclude" ] && continue
+      [ -e "${dir}/${base}" ] || ln -s "$candidate" "${dir}/${base}" 2>/dev/null || true
+    done
+    IFS=:
   done
+  IFS="$saved_ifs"
   printf '%s\n' "$dir"
 }
 
@@ -247,6 +258,7 @@ run_case no-repo no-repo clean 1 'could not read'
 run_case redirect-body redirect-body clean 1 ''
 if grep -q '0\.0\.1' "${WORK}/out-redirect-body.txt"; then
   bad "redirect-body: the tag from a non-2xx response was used"
+  sed 's/^/       /' "${WORK}/out-redirect-body.txt" | head -8
 else
   ok "redirect-body: the tag from a non-2xx response was rejected"
 fi
