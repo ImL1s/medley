@@ -7,6 +7,55 @@ use rand::TryRngCore as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 /// Top-level commands for the pager binary.
+/// Help strings that name the state directory, for the places a `///` comment
+/// cannot reach.
+///
+/// A doc comment becomes clap's help text verbatim and cannot interpolate, so
+/// every path written in one is frozen at whatever it said when it was typed.
+/// These moved to attributes for the same reason the runtime messages did: the
+/// directory is `~/.medley` on a fresh install, an existing `~/.grok` on a
+/// migrated one, and anywhere at all under `MEDLEY_HOME`.
+fn setup_json_help() -> String {
+    format!(
+        "Print the fetched configuration as JSON instead of installing it; writes nothing to {}.",
+        crate::util::display_grok_home_prefix()
+    )
+}
+
+fn dashboard_help() -> String {
+    format!(
+        "Centralised, agent-native overview of every session (top-level and \
+         subagents). Disabled when `[dashboard].enabled = false` in {} or when \
+         the `GROK_AGENT_DASHBOARD=0` env var is set.",
+        crate::util::display_user_grok_path("config.toml")
+    )
+}
+
+fn leader_socket_help() -> String {
+    format!(
+        "Use a custom leader socket path instead of the default `{}`.",
+        crate::util::display_user_grok_path("leader.sock")
+    )
+}
+
+fn minimal_help() -> String {
+    format!(
+        "Experimental: scrollback-native rendering. Finalized blocks are printed \
+         into the terminal's native scrollback (use the terminal's own scroll / \
+         selection); a small pinned region holds the prompt + running turn. \
+         Session-scoped only — does not write config. To default plain `grok` to \
+         minimal, set `[ui] screen_mode = \"minimal\"` in {}.",
+        crate::util::display_user_grok_path("config.toml")
+    )
+}
+
+fn log_sampling_help() -> String {
+    format!(
+        "Write sampling events to {}.",
+        crate::util::display_user_grok_path("logs/sampling.jsonl")
+    )
+}
+
 /// `grok wrap --help`'s long form, built at runtime so the README pointer
 /// names the directory this install actually uses. As a literal it read
 /// `~/.grok/README.md`, which is neither where medley writes that file nor
@@ -96,8 +145,8 @@ pub enum Command {
     /// Fetch and install managed configuration
     Setup {
         /// Print the fetched configuration as JSON instead of installing it;
-        /// writes nothing to ~/.grok.
-        #[arg(long)]
+        /// writes nothing to the user state directory.
+        #[arg(long, long_help = setup_json_help())]
         json: bool,
     },
     /// Share a session and print the share URL
@@ -157,11 +206,7 @@ pub enum Command {
     #[command(hide = true)]
     Workspace(WorkspaceMgmtArgs),
     /// Open the Agent Dashboard view at startup.
-    ///
-    /// Centralised, agent-native overview of every session (top-level and
-    /// subagents). Disabled when `[dashboard].enabled = false` in
-    /// `~/.grok/config.toml` or when the `GROK_AGENT_DASHBOARD=0` env
-    /// var is set.
+    #[command(long_about = dashboard_help())]
     Dashboard,
 }
 
@@ -618,8 +663,10 @@ pub struct PagerArgs {
     /// Working directory.
     #[arg(long)]
     pub cwd: Option<PathBuf>,
-    /// Use a custom leader socket path instead of the default `~/.grok/leader.sock`.
+    /// Use a custom leader socket path instead of the default one under the
+    /// user state directory.
     #[arg(
+        long_help = leader_socket_help(),
         long = "leader-socket",
         value_name = "PATH",
         global = true,
@@ -934,8 +981,8 @@ pub struct PagerArgs {
     /// into the terminal's native scrollback (use the terminal's own scroll /
     /// selection); a small pinned region holds the prompt + running turn.
     /// Session-scoped only — does not write config. To default plain `grok` to
-    /// minimal, set `[ui] screen_mode = "minimal"` in ~/.grok/config.toml.
-    #[arg(long = "minimal")]
+    /// minimal, set `[ui] screen_mode = "minimal"` in the user config.
+    #[arg(long = "minimal", long_help = minimal_help())]
     pub minimal: bool,
     /// Open in the standard fullscreen TUI for this session, overriding a
     /// config `[ui] screen_mode = "minimal"` preference. Session-scoped only —
@@ -943,8 +990,13 @@ pub struct PagerArgs {
     /// policy (--no-alt-screen, [terminal] alt_screen, terminal auto-detection).
     #[arg(long = "fullscreen", conflicts_with = "minimal")]
     pub fullscreen: bool,
-    /// Write sampling events to ~/.grok/logs/sampling.jsonl.
-    #[arg(long = "log-sampling", env = "GROK_LOG_SAMPLING", hide = true)]
+    /// Write sampling events to the user state directory.
+    #[arg(
+        long_help = log_sampling_help(),
+        long = "log-sampling",
+        env = "GROK_LOG_SAMPLING",
+        hide = true
+    )]
     pub log_sampling: bool,
     /// Show the login screen even when credentials are already available.
     #[arg(long = "force-login", hide = true)]
@@ -1880,5 +1932,61 @@ mod tests {
             panic!("expected agent subcommand");
         };
         assert_eq!(agent.reasoning_effort.as_deref(), Some("max"));
+    }
+}
+
+#[cfg(test)]
+mod state_dir_help_tests {
+    /// A `///` comment on a clap field or variant *becomes the help text*, and
+    /// cannot interpolate — so a path written in one is frozen at whatever it
+    /// said when it was typed. That is how `~/.grok` survived the move to
+    /// `~/.medley` in seven places, telling users to look somewhere the
+    /// program does not write.
+    ///
+    /// Checked against the source rather than the rendered help, because
+    /// rendering resolves the *developer's* state directory: on a machine that
+    /// still has `~/.grok` and no `~/.medley`, correct output contains
+    /// `~/.grok` and the test would fail for being right.
+    ///
+    /// Doc comments on `fn` items are exempt: those are developer
+    /// documentation, and some of them name the old path precisely because
+    /// they are explaining this.
+    #[test]
+    fn no_clap_doc_comment_hardcodes_the_state_directory() {
+        for (file, src) in [
+            ("app/cli.rs", include_str!("cli.rs")),
+            ("mcp_cmd.rs", include_str!("../mcp_cmd.rs")),
+        ] {
+            let lines: Vec<&str> = src.lines().collect();
+            for (idx, line) in lines.iter().enumerate() {
+                let trimmed = line.trim_start();
+                if !trimmed.starts_with("///") || !trimmed.contains("~/.grok") {
+                    continue;
+                }
+                if documents_a_function(&lines, idx) {
+                    continue;
+                }
+                panic!(
+                    "{file}:{} is a clap doc comment naming ~/.grok, which becomes \
+                     help text verbatim. Move it to #[arg(long_help = ...)] or \
+                     #[command(long_about = ...)] and resolve the path with \
+                     crate::util::display_user_grok_path.\n  {}",
+                    idx + 1,
+                    trimmed
+                );
+            }
+        }
+    }
+
+    /// Whether the doc block containing `idx` is attached to a `fn`.
+    fn documents_a_function(lines: &[&str], idx: usize) -> bool {
+        for line in lines.iter().skip(idx + 1) {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("///") || trimmed.starts_with("#[") || trimmed.is_empty() {
+                continue;
+            }
+            return trimmed.starts_with("fn ") || trimmed.starts_with("pub fn ");
+        }
+        false
     }
 }
