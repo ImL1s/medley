@@ -151,14 +151,14 @@ fn discover_servers(cwd: &Path) -> (Vec<ConfigSourceStatus>, Vec<DiscoveredServe
     let user_config = grok_home.join("config.toml");
     if user_config.is_file() {
         sources.push(ConfigSourceStatus {
-            path: "~/.grok/config.toml".to_string(),
+            path: xai_grok_config::display_user_grok_path("config.toml"),
             status: ConfigSourceState::Found {
                 server_count: config_count,
             },
         });
     } else {
         sources.push(ConfigSourceStatus {
-            path: "~/.grok/config.toml".to_string(),
+            path: xai_grok_config::display_user_grok_path("config.toml"),
             status: ConfigSourceState::NotFound,
         });
     }

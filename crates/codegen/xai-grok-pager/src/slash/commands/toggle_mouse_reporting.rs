@@ -38,11 +38,11 @@ impl SlashCommand for ToggleMouseReportingCommand {
         if crate::app::mouse_reporting_toggle_enabled() {
             CommandResult::Action(Action::ToggleMouseCapture)
         } else {
-            CommandResult::Message(
+            CommandResult::Message(format!(
                 "Mouse reporting toggle is off. Set `[ui] mouse_reporting_toggle = true` \
-                 in ~/.grok/config.toml to enable it."
-                    .to_string(),
-            )
+                 in {} to enable it.",
+                crate::util::display_user_grok_path("config.toml")
+            ))
         }
     }
 }
