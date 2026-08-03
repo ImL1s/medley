@@ -1924,9 +1924,64 @@ fn install_heap_profile_hooks() {
         prof_available: jemalloc_prof_available,
     });
 }
+/// The name this process was invoked as, for `--version` to report itself by.
+///
+/// The release archives install the binary as `medley`, so a hardcoded "grok"
+/// answered the wrong name to the one question whose entire job is identity:
+/// `medley --version` replied `grok …`. Reading argv[0] answers correctly for
+/// both — `medley` from a release, `grok` from an upstream-style install, and
+/// whatever a user renamed it to.
+///
+/// Read from argv[0], NOT `current_exe()`. `current_exe()` resolves symlinks,
+/// and upstream's installer stores the binary as `grok-<platform>` with `grok`
+/// and `agent` symlinked at it — so resolving would answer
+/// `grok-linux-x86_64` to `grok --version`, and would leave `agent` unable to
+/// name itself at all. argv[0] is the entry point the user actually invoked,
+/// which is the question being asked.
+///
+/// Falls back to "grok" when argv[0] is missing, empty, or not valid UTF-8:
+/// that is what upstream installs it as, and a version string is not worth
+/// failing over.
+fn invoked_as() -> String {
+    invoked_name_from(std::env::args_os().next().as_deref())
+}
+
+/// Pure policy behind [`invoked_as`], split out because argv[0] is
+/// process-level state a test cannot set. Everything worth asserting — the
+/// symlink case, a bare name, an absolute path, and each degenerate input —
+/// lives here.
+fn invoked_name_from(argv0: Option<&std::ffi::OsStr>) -> String {
+    argv0
+        .map(std::path::Path::new)
+        .and_then(std::path::Path::file_name)
+        .and_then(|name| name.to_str())
+        .map(strip_exe_suffix)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("grok")
+        .to_string()
+}
+
+/// `.exe` is the only suffix on a program name that is an extension rather
+/// than part of the name. `Path::file_stem` does not know that: it strips
+/// everything after the last dot, turning `medley.preview` into `medley` and
+/// answering with a name the user never invoked.
+fn strip_exe_suffix(name: &str) -> &str {
+    match name.rfind('.') {
+        // `rfind` lands on a char boundary, so both slices are safe. Windows
+        // treats the suffix case-insensitively, so `MEDLEY.EXE` counts.
+        Some(idx) if name[idx..].eq_ignore_ascii_case(".exe") => &name[..idx],
+        _ => name,
+    }
+}
+
 fn version_text(channel_label: &str) -> String {
+    version_text_for(&invoked_as(), channel_label)
+}
+
+fn version_text_for(name: &str, channel_label: &str) -> String {
     format!(
-        "grok {}\n",
+        "{} {}\n",
+        name,
         xai_grok_version::display_version_with_commit(env!("VERSION_WITH_COMMIT"), channel_label,)
     )
 }
@@ -3016,10 +3071,91 @@ mod tests {
             let mut output = Vec::new();
             write_version(&mut output, label).unwrap();
             let output = String::from_utf8(output).unwrap();
-            assert!(output.starts_with("grok "));
+            // Not asserted against a literal name: under `cargo test` the
+            // running executable is the test harness, so the name this reports
+            // is the harness's. That it reports *the invoked name* is what
+            // `version_text_names_the_invoked_binary` covers.
             assert!(output.contains(env!("VERSION_WITH_COMMIT")));
             assert!(output.ends_with(expected_suffix), "{output:?}");
         }
+    }
+    /// The release archives install this binary as `medley`, so `--version`
+    /// has to answer with the name it was invoked as rather than a compiled-in
+    /// one — a `medley` that replies `grok` is wrong about the single thing
+    /// the command exists to report.
+    #[test]
+    fn version_text_names_the_invoked_binary() {
+        for name in ["medley", "grok", "renamed-by-a-user"] {
+            let output = version_text_for(name, "");
+            assert!(
+                output.starts_with(&format!("{name} ")),
+                "expected {output:?} to lead with {name:?}"
+            );
+            assert!(output.contains(env!("VERSION_WITH_COMMIT")));
+        }
+    }
+    /// argv[0] can be anything at all, including absent. A version string must
+    /// not be the thing that makes the process fail.
+    #[test]
+    fn invoked_name_is_non_empty_and_bare() {
+        let name = invoked_as();
+        assert!(!name.is_empty());
+        assert!(
+            !name.contains('/') && !name.contains('\\'),
+            "expected a bare file stem, got {name:?}"
+        );
+    }
+    /// The reason this reads argv[0] rather than `current_exe()`: upstream's
+    /// installer stores the binary as `grok-<platform>` and symlinks both
+    /// `grok` and `agent` at it. Resolving the executable would answer with
+    /// the *target's* name — `grok --version` reporting `grok-linux-x86_64`,
+    /// and `agent` unable to name itself at all. argv[0] is the entry point
+    /// the user invoked, which is the question `--version` is answering.
+    #[test]
+    fn invoked_name_comes_from_the_entry_point_not_the_target() {
+        use std::ffi::OsStr;
+        for (argv0, expected) in [
+            // The symlink case this exists for.
+            ("/home/u/.grok/bin/grok", "grok"),
+            ("/home/u/.grok/bin/agent", "agent"),
+            // The release archive's own name, and a plain invocation.
+            ("/home/u/.medley/bin/medley", "medley"),
+            ("medley", "medley"),
+            ("./medley", "medley"),
+            // Whatever a user renames it to — including a dotted name, which
+            // `Path::file_stem` would have truncated to `medley`.
+            ("/usr/local/bin/my-custom-name", "my-custom-name"),
+            ("/usr/local/bin/medley.preview", "medley.preview"),
+            ("medley.0.2.117", "medley.0.2.117"),
+            // `.exe` is the one suffix that really is an extension, and
+            // Windows treats it case-insensitively. Written without a Windows
+            // path because `\` is an ordinary character to `Path` on unix, so
+            // a backslash path here would assert host-specific behaviour
+            // rather than the suffix rule.
+            ("medley.exe", "medley"),
+            ("/opt/medley/bin/medley.exe", "medley"),
+            ("medley.EXE", "medley"),
+            // Not an .exe despite ending in those letters.
+            ("medley.notexe", "medley.notexe"),
+            // Degenerate: stripping leaves nothing, so fall back.
+            (".exe", "grok"),
+            // Degenerate argv[0]: fall back rather than fail.
+            ("", "grok"),
+            ("/", "grok"),
+            // Not "grok": `Path::file_stem` ignores a trailing separator, so
+            // this yields the last component. Asserted as-is rather than
+            // special-cased — argv[0] names an executable, never a directory,
+            // so the input cannot occur and code to reject it would defend
+            // against nothing while adding a branch to get wrong.
+            ("/usr/local/bin/", "bin"),
+        ] {
+            assert_eq!(
+                invoked_name_from(Some(OsStr::new(argv0))),
+                expected,
+                "argv0 {argv0:?}"
+            );
+        }
+        assert_eq!(invoked_name_from(None), "grok", "absent argv[0]");
     }
     #[test]
     fn version_flags_and_doctor_are_distinct_early_intents() {
