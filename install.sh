@@ -94,18 +94,30 @@ fetch_to_stdout() {
   fi
 }
 
-# Same as `fetch_to_stdout`, except an HTTP error status yields its response
+# `--content-on-error` arrived in Wget 1.16 (2014); older builds and BusyBox
+# abort with an unrecognised-option error instead. Passing it blindly would
+# turn every lookup on those systems into a failure — including the ones that
+# would have succeeded — so ask before using it.
+wget_keeps_error_body() {
+  wget --help 2>&1 | grep -q -- '--content-on-error'
+}
+
+# Same as `fetch_to_stdout`, except an HTTP error status may yield its response
 # body instead of a failure. Only `resolve_version` wants that: GitHub answers
 # 404 when a repository has no release published as latest, and the guidance
 # for an empty release channel is nothing like the guidance for an unreachable
-# GitHub. Callers separate the two by whether a body came back at all.
+# GitHub. A body is best-effort — on a Wget that cannot keep one, an HTTP error
+# is indistinguishable here from a transport failure, so callers must resolve
+# that ambiguity themselves rather than reading anything into an empty body.
 fetch_body_allow_http_error() {
   if [ "$DOWNLOADER" = curl ]; then
     curl --silent --show-error --location --retry 3 "$1"
-  else
-    # --content-on-error keeps the error body; wget still exits non-zero on an
-    # error status, so callers must tolerate that exit and inspect the body.
+  elif wget_keeps_error_body; then
+    # wget still exits non-zero on an error status even while writing the
+    # body, so callers must tolerate that exit and inspect the body.
     wget --quiet --tries=3 --content-on-error --output-document=- "$1"
+  else
+    wget --quiet --tries=3 --output-document=- "$1"
   fi
 }
 
@@ -138,17 +150,13 @@ resolve_version() {
   fi
 
   # An HTTP error must not abort here. GitHub reports "no release published as
-  # latest" as a 404, and --fail would collapse that into the same failure as
-  # an unreachable network — which is what actually happened the first time
-  # this ran against a repository whose only release was a prerelease. A
-  # transport failure yields no body, which is what separates the two.
+  # latest" as a 404, and `--fail` collapsed that into the same failure as an
+  # unreachable network — which is exactly what this printed the first time it
+  # ran against a repository whose only release was a prerelease.
   resolve_body="$(
     fetch_body_allow_http_error \
       "https://api.github.com/repos/${REPO}/releases/latest" || :
   )"
-
-  [ -n "$resolve_body" ] ||
-    die "could not reach the GitHub release API for ${REPO}. Set MEDLEY_VERSION to install a specific version."
 
   resolve_tag="$(
     printf '%s\n' "$resolve_body" |
@@ -156,33 +164,39 @@ resolve_version() {
       head -n 1
   )"
 
-  if [ -z "$resolve_tag" ]; then
-    # Every GitHub API refusal arrives as {"message": ...}, and they are not
-    # interchangeable. An unauthenticated client that has exhausted the hourly
-    # rate limit gets 403 with a body, which would otherwise fall through the
-    # 404 reasoning below and be reported as a missing repository.
-    resolve_message="$(
-      printf '%s\n' "$resolve_body" |
-        sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
-        head -n 1
-    )"
-
-    if [ "$resolve_message" != "Not Found" ]; then
-      die "the GitHub release API rejected the request for ${REPO}${resolve_message:+ (${resolve_message})}. Set MEDLEY_VERSION to install a specific tag."
-    fi
-
-    # 404 stays ambiguous: "no release published as latest" and "this
-    # repository does not exist" carry a byte-identical body. Only the
-    # repository endpoint separates them, so ask it before telling someone
-    # with a typo in MEDLEY_REPO to go publish a draft release. Error path
-    # only — the success path still costs a single request.
-    if fetch_to_stdout "https://api.github.com/repos/${REPO}" >/dev/null 2>&1; then
-      die "${REPO} has no release published as latest. Drafts and prereleases are both excluded, so publish the draft release the release workflow created — or set MEDLEY_VERSION to install a specific tag."
-    fi
-    die "cannot read releases for ${REPO}: the repository is unreachable, private, or does not exist. Check MEDLEY_REPO."
+  if [ -n "$resolve_tag" ]; then
+    printf '%s\n' "${resolve_tag#v}"
+    return
   fi
 
-  printf '%s\n' "${resolve_tag#v}"
+  # Every GitHub API refusal arrives as {"message": ...}, and they are not
+  # interchangeable: an unauthenticated client that has exhausted the hourly
+  # rate limit gets 403 with a body, and reporting that as a missing repository
+  # sends someone to fix MEDLEY_REPO over a problem that clears by itself.
+  # Surface whatever GitHub said, except for the one message that is ambiguous.
+  resolve_message="$(
+    printf '%s\n' "$resolve_body" |
+      sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+      head -n 1
+  )"
+
+  case "$resolve_message" in
+  '' | 'Not Found') ;;
+  *)
+    die "the GitHub release API rejected the request for ${REPO} (${resolve_message}). Set MEDLEY_VERSION to install a specific tag."
+    ;;
+  esac
+
+  # What is left is a 404, or no body at all — either because the transfer
+  # never happened or because this Wget discarded the error body. An empty
+  # body is deliberately NOT read as "network down": on a pre-1.16 Wget that
+  # is also what a perfectly ordinary 404 looks like. The repository endpoint
+  # is what actually separates the remaining cases, and it runs only here, so
+  # a successful install still costs a single request.
+  if fetch_to_stdout "https://api.github.com/repos/${REPO}" >/dev/null 2>&1; then
+    die "${REPO} has no release published as latest. Drafts and prereleases are both excluded, so publish the draft release the release workflow created — or set MEDLEY_VERSION to install a specific tag."
+  fi
+  die "cannot read the releases for ${REPO}: GitHub is unreachable, or the repository is private or does not exist. Check your network and MEDLEY_REPO."
 }
 
 # Collapse '.' and '..' textually. Only ever called on a path whose existing
