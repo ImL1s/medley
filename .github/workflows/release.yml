@@ -146,6 +146,20 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: CI must be green for the release commit
+        # Skipped for a dry run, and only for a dry run. The gate exists so
+        # published artifacts are only built from commits CI has passed; a
+        # dispatch publishes nothing, attaching its archives to the workflow
+        # run instead.
+        #
+        # Requiring it of a dispatch made the dry run useless for the thing it
+        # is most needed for. A workflow change lives on a branch, a branch
+        # cannot have a `push`-to-`providers` CI run for its own SHA, so
+        # dry-running a change to *this file* always died here — leaving
+        # "merge and find out" as the only way to test the release pipeline.
+        #
+        # The lockfile and formatting checks above still run, so a dispatch
+        # still catches the cheap failures.
+        if: needs.meta.outputs.publish == 'true'
         # The full suite already ran when this commit landed on `providers`;
         # re-running it would add ~30 minutes to every release. Reuse that
         # verdict, but only a *completed, successful* run of this repository's
