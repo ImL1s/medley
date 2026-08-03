@@ -21,8 +21,12 @@
 //! |--------------------------------|-------------------------|-------------|
 //! | `medley`                       | [`DistIdentity::Medley`]| refused     |
 //! | unset                          | [`DistIdentity::Unstamped`] | refused |
-//! | anything else, blank included  | [`DistIdentity::Unknown`]   | refused |
+//! | anything else — blank, or even `upstream` | [`DistIdentity::Unknown`] | refused |
 //! | *(unstamped + test override)*  | [`DistIdentity::Upstream`]  | allowed |
+//!
+//! [`DistIdentity::Upstream`] is reachable **only** from the test override on
+//! an unstamped build. No value of `MEDLEY_CHANNEL` produces it, so no build
+//! of this tree can be compiled back into upstream's updater.
 //!
 //! A medley build refuses rather than updating because this fork ships through
 //! `install.sh` (GitHub releases, SHA-256 verified, launcher + `versions/`
@@ -46,9 +50,11 @@ use xai_grok_version::{DIST_CHANNEL_ENV, DIST_CHANNEL_STAMP, TEST_DIST_CHANNEL_E
 /// Stamp this fork's release workflow bakes into published binaries.
 pub const MEDLEY_CHANNEL: &str = "medley";
 
-/// Identity that selects the inherited upstream update channel. The release
-/// workflow never emits it; only an unstamped dev build can select it, via
-/// [`TEST_DIST_CHANNEL_ENV`].
+/// Identity that selects the inherited upstream update channel.
+///
+/// Valid **only** as a [`TEST_DIST_CHANNEL_ENV`] value on an unstamped build.
+/// It is not a valid build stamp: `MEDLEY_CHANNEL=upstream` resolves to
+/// [`DistIdentity::Unknown`] and refuses, like any other unrecognised stamp.
 pub const UPSTREAM_CHANNEL: &str = "upstream";
 
 /// One-liner that installs or upgrades medley.
@@ -125,24 +131,24 @@ pub enum SelfUpdate {
 pub fn resolve_identity(stamp: Option<&str>, test_override: Option<&str>) -> DistIdentity {
     match stamp {
         Some(raw) => match non_empty(Some(raw)) {
-            Some(value) => classify(value),
-            // Stamped, but with nothing usable in it.
-            None => DistIdentity::Unknown(raw.to_string()),
+            // A build stamp can only ever declare *this* fork. `upstream` is
+            // deliberately not accepted here: a build asserting it is upstream
+            // proves nothing, and honouring it would turn a compile-time flag
+            // into a switch that re-enables the updater this module exists to
+            // disable. Anything that is not `medley`, blank included, is
+            // ambiguous.
+            Some(MEDLEY_CHANNEL) => DistIdentity::Medley,
+            _ => DistIdentity::Unknown(raw.to_string()),
         },
         // Genuinely unstamped builds only: a dev build running the inherited
         // update suites, or a developer reproducing a distribution's behaviour.
+        // This is the one path that can reach `Upstream`.
         None => match non_empty(test_override) {
-            Some(value) => classify(value),
+            Some(MEDLEY_CHANNEL) => DistIdentity::Medley,
+            Some(UPSTREAM_CHANNEL) => DistIdentity::Upstream,
+            Some(other) => DistIdentity::Unknown(other.to_string()),
             None => DistIdentity::Unstamped,
         },
-    }
-}
-
-fn classify(value: &str) -> DistIdentity {
-    match value {
-        MEDLEY_CHANNEL => DistIdentity::Medley,
-        UPSTREAM_CHANNEL => DistIdentity::Upstream,
-        other => DistIdentity::Unknown(other.to_string()),
     }
 }
 
@@ -279,6 +285,26 @@ mod tests {
                     stamp: Some("acme-grok".to_string()),
                 }),
             ),
+            // `upstream` is not a build stamp. Honouring it would make
+            // `MEDLEY_CHANNEL=upstream` a compile-time switch that turns the
+            // inherited updater back on, which is the whole thing this module
+            // prevents.
+            (
+                Some(UPSTREAM_CHANNEL),
+                None,
+                DistIdentity::Unknown("upstream".to_string()),
+                SelfUpdate::Refused(RefusalReason::AmbiguousIdentity {
+                    stamp: Some("upstream".to_string()),
+                }),
+            ),
+            (
+                Some(UPSTREAM_CHANNEL),
+                Some(UPSTREAM_CHANNEL),
+                DistIdentity::Unknown("upstream".to_string()),
+                SelfUpdate::Refused(RefusalReason::AmbiguousIdentity {
+                    stamp: Some("upstream".to_string()),
+                }),
+            ),
             // Surrounding whitespace does not create a new distribution.
             (
                 Some(" medley\n"),
@@ -341,7 +367,14 @@ mod tests {
         // Every stamp that is not literally absent must resist the override —
         // a malformed one most of all, since that is the case an attacker or a
         // broken pipeline can most easily produce.
-        for stamp in ["acme-grok", "", "   ", "MEDLEY", "medley\u{0}"] {
+        for stamp in [
+            "acme-grok",
+            "",
+            "   ",
+            "MEDLEY",
+            "medley\u{0}",
+            UPSTREAM_CHANNEL,
+        ] {
             let identity = resolve_identity(Some(stamp), Some(UPSTREAM_CHANNEL));
             assert_ne!(
                 identity,
@@ -353,6 +386,44 @@ mod tests {
                 "stamp {stamp:?} with an upstream override must still refuse"
             );
         }
+    }
+
+    /// `Upstream` — the only identity that permits self-update — must be
+    /// unreachable from a build stamp. If this ever fails, `MEDLEY_CHANNEL`
+    /// has become a way to compile the inherited updater back on.
+    #[test]
+    fn no_build_stamp_can_select_upstream() {
+        for stamp in [
+            UPSTREAM_CHANNEL,
+            "Upstream",
+            " upstream ",
+            "upstream-channel",
+            MEDLEY_CHANNEL,
+            "",
+        ] {
+            for override_value in [None, Some(UPSTREAM_CHANNEL), Some("")] {
+                let identity = resolve_identity(Some(stamp), override_value);
+                assert_ne!(
+                    identity,
+                    DistIdentity::Upstream,
+                    "stamp {stamp:?} with override {override_value:?} reached Upstream"
+                );
+                assert!(
+                    matches!(decide(&identity), SelfUpdate::Refused(_)),
+                    "stamp {stamp:?} with override {override_value:?} must refuse"
+                );
+            }
+        }
+
+        // The override on an unstamped build remains the single door to it.
+        assert_eq!(
+            resolve_identity(None, Some(UPSTREAM_CHANNEL)),
+            DistIdentity::Upstream
+        );
+        assert_eq!(
+            decide(&resolve_identity(None, Some(UPSTREAM_CHANNEL))),
+            SelfUpdate::Allowed
+        );
     }
 
     /// Channel names are matched exactly; casing is not a distribution.

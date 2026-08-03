@@ -557,6 +557,9 @@ medley version --json     # {"currentVersion":"…","channel":"…","distChannel
   `MEDLEY_CHANNEL`. Also refuses, because a binary that cannot prove which
   distribution it belongs to cannot know whose releases are the right ones. Build
   with `MEDLEY_CHANNEL=medley cargo build --release` to stamp one yourself.
+- anything else — an unrecognised marker, reported verbatim. Refuses. `medley` is
+  the only value the marker accepts; there is no value of `MEDLEY_CHANNEL` that
+  re-enables the inherited updater.
 
 An unstamped build — and only an unstamped build — honours
 `GROK_TEST_DIST_CHANNEL` to select an identity at run time. It exists so the
