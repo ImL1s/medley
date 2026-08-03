@@ -2505,7 +2505,6 @@ mod tests {
 
     // ── collect_skill_config_dirs vendor gating ────────────
 
-    #[test]
     /// The scan must look only where it is told. It used to take the state
     /// directory as an argument and then read `std::env::home_dir()` for the
     /// vendor directories beside it — so a caller could choose half the search
@@ -2553,6 +2552,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn collect_skill_config_dirs_gates_vendor_dirs() {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
