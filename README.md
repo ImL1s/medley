@@ -55,7 +55,7 @@ local models, each with its credentials kept in its own lane.
 > [Coexistence](#coexistence-with-official-grok-build) for the migration and the
 > remaining sharp edges.
 
-This repository ([ImL1s/grok-build](https://github.com/ImL1s/grok-build)) tracks
+This repository ([ImL1s/medley](https://github.com/ImL1s/medley)) tracks
 upstream on `main` (a pristine fast-forward mirror) and ships the fork's product
 line on `providers`, which is the default branch for users and releases. See
 [`FORK.md`](FORK.md) for the branch model, the upstream sync process, and the
@@ -114,7 +114,7 @@ directory, so the two builds no longer collide by default. What still needs care
   including `GROK_HOME`. Exporting `GROK_HOME` globally therefore points both at
   one directory again — set `MEDLEY_HOME` instead, which only Medley reads.
   Renaming the application's own `GROK_*` variables is remaining scope on
-  [#49](https://github.com/ImL1s/grok-build/issues/49).
+  [#49](https://github.com/ImL1s/medley/issues/49).
 
 > [!NOTE]
 > **Medley does not self-update.** The inherited updater points at upstream's
@@ -140,7 +140,7 @@ verifies its SHA-256 against the release checksums file, unpacks it under
 have not exported `MEDLEY_HOME` or `GROK_HOME` yourself:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ImL1s/grok-build/providers/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/ImL1s/medley/providers/install.sh | sh
 ```
 
 | Variable | Effect |
@@ -149,12 +149,21 @@ curl -fsSL https://raw.githubusercontent.com/ImL1s/grok-build/providers/install.
 | `MEDLEY_INSTALL_DIR` | Where the `medley` launcher goes (default: `~/.medley/bin`) |
 | `MEDLEY_HOME` | Where unpacked versions and state live (default: `~/.medley`) |
 | `MEDLEY_TARGET` | Force a target triple instead of detecting one |
-| `MEDLEY_REPO` | Source repository (default: `ImL1s/grok-build`) |
+| `MEDLEY_REPO` | Source repository (default: `ImL1s/medley`) |
 | `MEDLEY_DRYRUN` | Set to `1` to print the plan and skip the download, extraction, and install. The release version is still resolved first, so this queries the GitHub API unless `MEDLEY_VERSION` is also set |
 
 Releases are published for `aarch64`/`x86_64` macOS and Linux. The installer
 refuses to install into `~/.grok`, never touches an existing `grok` binary, and
 warns when it finds one. Windows is not covered — build from source there.
+
+The Linux archives are dynamically linked and need **glibc 2.35 or newer** —
+Ubuntu 22.04+, Debian 12+, Fedora 36+. Distributions on an older glibc need a
+build from source: RHEL 9, Rocky 9, Alma 9, and Amazon Linux 2023 are all on
+2.34, and Debian 11 and Ubuntu 20.04 on 2.31. The release job measures this
+floor out of each binary and fails rather than publishing an archive that would
+not start, so the number above is asserted, not aspirational. Lowering it —
+static musl builds, or building against an older glibc in a container — is
+tracked in [#82](https://github.com/ImL1s/medley/issues/82).
 
 > [!IMPORTANT]
 > The installer resolves the **latest published release**, and this repository
@@ -162,7 +171,7 @@ warns when it finds one. Windows is not covered — build from source there.
 > uploads to a **draft** that a maintainer publishes by hand. Until a release is
 > published the one-liner above fails at the download step, and building from
 > source is the working path. Tracked in
-> [#29](https://github.com/ImL1s/grok-build/issues/29).
+> [#29](https://github.com/ImL1s/medley/issues/29).
 
 ### Building from source
 
@@ -186,8 +195,8 @@ Requirements:
   and not currently tested from this tree.
 
 ```sh
-git clone -b providers https://github.com/ImL1s/grok-build.git
-cd grok-build
+git clone -b providers https://github.com/ImL1s/medley.git
+cd medley
 cargo run -p xai-grok-pager-bin              # build + launch the TUI
 cargo build -p xai-grok-pager-bin --release  # release binary: target/release/xai-grok-pager
 cargo check -p xai-grok-pager-bin            # fast validation
@@ -256,7 +265,7 @@ for the sync workflow, the auth/config watchlist, and the release tagging scheme
 ## Support and contributions
 
 Report Medley bugs and request features on the fork's tracker:
-<https://github.com/ImL1s/grok-build/issues>. Feature branches target
+<https://github.com/ImL1s/medley/issues>. Feature branches target
 `providers`, never `main`.
 
 > [!WARNING]
@@ -265,7 +274,7 @@ Report Medley bugs and request features on the fork's tracker:
 > project — including a HackerOne program that does not cover this fork. Do not
 > send Medley bugs or vulnerability reports there. The fork's own contribution
 > and security policy is tracked in
-> [#28](https://github.com/ImL1s/grok-build/issues/28).
+> [#28](https://github.com/ImL1s/medley/issues/28).
 
 ## License and notices
 

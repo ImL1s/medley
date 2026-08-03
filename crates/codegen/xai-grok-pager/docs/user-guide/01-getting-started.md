@@ -9,19 +9,19 @@ You can use it interactively as a full-screen TUI, run it headlessly for scripti
 ## Installation
 
 > **Fork note (Medley).** This section installs **xAI's official Grok Build**, not
-> [Medley](https://github.com/ImL1s/grok-build), the community fork you are
+> [Medley](https://github.com/ImL1s/medley), the community fork you are
 > reading these docs from. `x.ai/cli/install.sh`, `install.ps1`, and `grok update`
 > all fetch the official build; running them over a Medley install replaces it and
 > drops the fork's multi-provider features. Install Medley with the fork's own
-> [`install.sh`](https://github.com/ImL1s/grok-build#installing) — it ships the
+> [`install.sh`](https://github.com/ImL1s/medley#installing) — it ships the
 > binary as `medley` and keeps state in `~/.medley` — or build it from source.
 > Either way, set `auto_update = false` under `[cli]` in the `config.toml` of
 > whichever state directory your install resolved to (`~/.medley/config.toml` by
 > default — see [Configuration](05-configuration.md#file-locations)) so the
 > inherited updater cannot swap the fork out. Fork release artifacts are
-> tracked in [#29](https://github.com/ImL1s/grok-build/issues/29), and replacing
+> tracked in [#29](https://github.com/ImL1s/medley/issues/29), and replacing
 > the upstream installer text below in
-> [#28](https://github.com/ImL1s/grok-build/issues/28).
+> [#28](https://github.com/ImL1s/medley/issues/28).
 
 Install the latest stable release (macOS, Linux, or Windows via Git Bash):
 

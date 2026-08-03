@@ -5,7 +5,7 @@ Grok connects to custom model endpoints for alternative providers, self-hosted m
 > **Fork note (Medley).** Several capabilities on this page —
 > `auth_scheme = "none"` for keyless local servers, the fail-closed handling of an
 > invalid `auth_scheme`, and the `openai-codex` provider — ship in
-> [Medley](https://github.com/ImL1s/grok-build), a community fork that is not
+> [Medley](https://github.com/ImL1s/medley), a community fork that is not
 > affiliated with or endorsed by xAI. Provider and model names below are the
 > trademarks of their owners and appear only to identify the endpoints you can
 > point Medley at; connecting to any of them is governed by that provider's terms,

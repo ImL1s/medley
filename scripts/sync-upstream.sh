@@ -61,7 +61,7 @@ fi
 require_remote upstream
 require_remote origin
 require_remote_repo upstream "xai-org/grok-build"
-require_remote_repo origin "ImL1s/grok-build"
+require_remote_repo origin "ImL1s/medley"
 
 echo "==> Fetching upstream and origin"
 git fetch upstream

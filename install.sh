@@ -9,20 +9,20 @@
 # Build installation: it never reads or writes ~/.grok, and it never touches an
 # existing `grok` binary.
 #
-#   curl -fsSL https://raw.githubusercontent.com/ImL1s/grok-build/providers/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/ImL1s/medley/providers/install.sh | sh
 #
 # Environment:
 #   MEDLEY_VERSION      version or tag to install (default: latest release)
 #   MEDLEY_INSTALL_DIR  where the `medley` symlink goes (default: ~/.medley/bin)
 #   MEDLEY_HOME         where unpacked versions live (default: ~/.medley)
 #   MEDLEY_TARGET       force a target triple instead of detecting one
-#   MEDLEY_REPO         source repository (default: ImL1s/grok-build)
+#   MEDLEY_REPO         source repository (default: ImL1s/medley)
 #   MEDLEY_DRYRUN       set to 1 to print the plan without downloading anything
 
 set -eu
 
 DIST_NAME=medley
-REPO="${MEDLEY_REPO:-ImL1s/grok-build}"
+REPO="${MEDLEY_REPO:-ImL1s/medley}"
 MEDLEY_HOME="${MEDLEY_HOME:-${HOME}/.medley}"
 INSTALL_DIR="${MEDLEY_INSTALL_DIR:-${MEDLEY_HOME}/bin}"
 DRYRUN="${MEDLEY_DRYRUN:-0}"

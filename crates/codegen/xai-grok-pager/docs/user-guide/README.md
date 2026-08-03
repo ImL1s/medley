@@ -1,7 +1,7 @@
 # Medley User Guide
 
 Learn how to install, configure, and extend
-[Medley](https://github.com/ImL1s/grok-build), a community multi-provider fork of
+[Medley](https://github.com/ImL1s/medley), a community multi-provider fork of
 Grok Build, the terminal-based AI coding assistant from SpaceXAI.
 
 > **Fork note (Medley).** Medley is not affiliated with or endorsed by xAI. Most
@@ -9,10 +9,10 @@ Grok Build, the terminal-based AI coding assistant from SpaceXAI.
 > inherits unchanged; the **installation, update, and support** instructions in
 > them (`x.ai/cli/…`, `grok update`, xAI support channels) belong to the official
 > build and do not apply to Medley — install Medley from the fork's
-> [README](https://github.com/ImL1s/grok-build#installing) and report Medley bugs
-> on the [fork's tracker](https://github.com/ImL1s/grok-build/issues). Replacing
+> [README](https://github.com/ImL1s/medley#installing) and report Medley bugs
+> on the [fork's tracker](https://github.com/ImL1s/medley/issues). Replacing
 > the remaining upstream installer text on these pages is tracked in
-> [#28](https://github.com/ImL1s/grok-build/issues/28). Fork-specific behaviour is
+> [#28](https://github.com/ImL1s/medley/issues/28). Fork-specific behaviour is
 > called out in [Authentication](02-authentication.md) and
 > [Custom Models](11-custom-models.md).
 >
