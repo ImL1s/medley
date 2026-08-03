@@ -125,25 +125,12 @@ fetch_checked() {
         sed -n 's|^[[:space:]]*HTTP/[0-9.]*[[:space:]]\{1,\}\([0-9]\{3\}\).*|\1|p' |
         tail -n 1
     )"
-    # An unreadable status is not treated as failure here, and the asymmetry is
-    # deliberate rather than a shortcut.
-    #
-    # The two downloaders have different holes. curl's is the final 3xx that
-    # `--fail` lets through, which only an explicit status can catch — so for
-    # curl the status is required. Wget's is the retry that resumes with
-    # `Range:` and appends to the previous attempt, and writing to a file
-    # closes that whatever the status says, because a retry rewrites the file
-    # instead of extending a stream. Wget also exits non-zero on a 300 with no
-    # Location, so the 3xx case never reaches here in the first place.
-    #
-    # Requiring a parseable status from every wget in existence — GNU, BusyBox,
-    # whatever a minimal image ships — would trade a hole wget does not have
-    # for an install that fails outright on a downloader whose header format
-    # this script guessed wrong. The tag still has to look like a tag, and the
-    # body still comes from a file.
-    if [ -z "$fc_status" ]; then
-      return 0
-    fi
+    # An unreadable status is a failure, not a pass. This was briefly the
+    # other way round, because there was no wget on the machine this was
+    # written on and a wrong guess about its header format would have meant
+    # "cannot install at all" rather than "weaker check". `tests/installer`
+    # now runs every case a second time with curl removed from PATH, on Linux,
+    # in CI — so the guess is checked, and the concession it forced is gone.
   fi
 
   case "$fc_status" in
