@@ -2683,14 +2683,46 @@ fn build_update_config() -> UpdateConfig {
 /// Central gate for auto-update checks; add new suppression rules here,
 /// not at call sites.
 fn should_check_for_updates(no_auto_update_flag: bool) -> bool {
-    if cfg!(debug_assertions) {
+    update_checks_allowed(
+        cfg!(debug_assertions),
+        no_auto_update_flag,
+        xai_grok_update::self_update_refusal().is_some(),
+        std::env::var_os("GROK_DISABLE_AUTOUPDATER")
+            .is_some_and(|v| env_flag_enabled(&v.to_string_lossy())),
+    )
+}
+
+/// Pure policy behind [`should_check_for_updates`].
+///
+/// `is_debug_build` and `self_update_disabled` are parameters rather than
+/// reads because the combination that actually ships — a *release* build of a
+/// *stamped* binary — is the one `cfg!(debug_assertions)` hides from a test
+/// binary, which is always compiled with debug assertions on. Passing them in
+/// is what lets `release_build_without_a_fork_marker_never_checks_for_updates`
+/// assert on the shipped behaviour rather than the test build's.
+fn update_checks_allowed(
+    is_debug_build: bool,
+    no_auto_update_flag: bool,
+    self_update_disabled: bool,
+    disabled_by_env: bool,
+) -> bool {
+    // First, because it is the only rule here the user cannot turn off. A
+    // build that will refuse to install an update has nothing to gain by
+    // checking for one: the request would do nothing but tell upstream's
+    // endpoint that a medley install exists (issue #71). This is the gate that
+    // matters most — auto-update is ON by default in release builds, so
+    // without it a shipped binary would reach upstream's channel on startup
+    // without the user ever typing `grok update`.
+    if self_update_disabled {
+        return false;
+    }
+    if is_debug_build {
         return false;
     }
     if no_auto_update_flag {
         return false;
     }
-    !std::env::var_os("GROK_DISABLE_AUTOUPDATER")
-        .is_some_and(|v| env_flag_enabled(&v.to_string_lossy()))
+    !disabled_by_env
 }
 /// Gate for the stdio agent's background auto-update: only the direct stdio
 /// agent, from the managed install. Other modes update in `run_agent_command`.
@@ -3417,6 +3449,62 @@ mod tests {
         assert!(
             !stdio_auto_update_enabled(true, false, true, false),
             "pinned binary"
+        );
+    }
+
+    /// Issue #71's real blast radius. Auto-update is ON by default in release
+    /// builds — `cfg!(debug_assertions)` is false there — so every background
+    /// path (startup check, stdio agent, leader hourly checker, TUI background
+    /// download) would reach upstream's channel without the user typing
+    /// `grok update`. A build that cannot prove its distribution must not even
+    /// check.
+    ///
+    /// `is_debug_build = false` is what makes this a statement about the
+    /// shipped binary rather than about this test binary.
+    #[test]
+    fn release_build_without_a_fork_marker_never_checks_for_updates() {
+        // (debug, --no-auto-update, self-update disabled, GROK_DISABLE_AUTOUPDATER)
+        for no_auto_update in [false, true] {
+            for disabled_by_env in [false, true] {
+                assert!(
+                    !update_checks_allowed(false, no_auto_update, true, disabled_by_env),
+                    "release build with no usable distribution marker must not check \
+                     (no_auto_update={no_auto_update}, disabled_by_env={disabled_by_env})"
+                );
+            }
+        }
+
+        // The distribution rule is the one the user cannot switch off: with it
+        // clear, the pre-existing suppressions still behave as before.
+        assert!(
+            update_checks_allowed(false, false, false, false),
+            "a release build that may self-update still checks"
+        );
+        assert!(!update_checks_allowed(true, false, false, false), "debug");
+        assert!(
+            !update_checks_allowed(false, true, false, false),
+            "--no-auto-update"
+        );
+        assert!(
+            !update_checks_allowed(false, false, false, true),
+            "GROK_DISABLE_AUTOUPDATER"
+        );
+    }
+
+    /// The composed gate must actually consult the distribution decision, not
+    /// just have a testable pure function sitting next to it. Under `cargo
+    /// test` this build is unstamped, so the decision is "disabled" and the
+    /// gate is closed no matter what the caller passes.
+    #[test]
+    fn should_check_for_updates_consults_the_distribution_decision() {
+        let disabled = xai_grok_update::self_update_refusal().is_some();
+        assert!(
+            disabled,
+            "an unstamped test build must report self-update disabled"
+        );
+        assert!(
+            !should_check_for_updates(false),
+            "the central gate must be closed while self-update is disabled"
         );
     }
     use clap::Parser as _;

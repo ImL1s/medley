@@ -233,14 +233,28 @@ async fn ambiguous_identity_refuses_a_channel_switch() {
     let fixture = Fixture::new(None);
     let mut config = make_update_config("stable");
 
+    // Exactly what `run_update_command` does for `update --check --alpha`:
+    // switch the channel, then read status. The switch runs *first*, so a gate
+    // that lived only in `check_update_status` would leave `channel = "alpha"`
+    // persisted behind a command that then says self-update is disabled.
     apply_channel_switch(Some("alpha"), &mut config).await;
+    let status = check_update_status(&config).await;
 
     assert_eq!(config.channel, "stable", "channel must not be switched");
+    assert_eq!(
+        status.channel, "stable",
+        "the reported channel must match what was not persisted"
+    );
+    assert!(
+        status.self_update_disabled.is_some(),
+        "check mode must still report the refusal"
+    );
     assert!(
         !test_home().join("config.toml").exists(),
-        "a refused channel switch must not write config"
+        "a refused check-mode channel switch must not write config"
     );
-    fixture.assert_no_installer_ran("after a refused channel switch");
+    fixture.assert_no_installer_ran("after a refused check-mode channel switch");
+    fixture.assert_home_untouched("after a refused check-mode channel switch");
 }
 
 /// A refused `grok update --stable/--alpha` must not persist the switch: the
