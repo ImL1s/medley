@@ -1056,14 +1056,24 @@ fn shell_aliases_expand_to_exact_argv_and_bypass_is_explicit() {
     if let Some(bash) = find_on_path("bash") {
         let rc = temp.path().join("bashrc");
         std::fs::write(&rc, "alias ssh='grok wrap ssh'\n").unwrap();
+        // `shopt -s expand_aliases` rather than `-i`. Bash expands aliases in
+        // an interactive shell *or* when this is set, and `-i` also sources
+        // the developer's `~/.bashrc` — so this test used to fail on any
+        // machine whose startup files touched `ssh` or exited non-zero,
+        // reporting 255 with nothing captured. CI never saw it, having no
+        // startup files at all.
+        //
+        // The zsh branch below already runs isolated (`-df`); this only makes
+        // bash match it. The behaviour under test — an alias expanding to
+        // `grok wrap` — is unchanged, and still exercised.
         let command = format!(
-            "source '{}'; source '{}'; eval 'ssh -p 2222 host'",
+            "shopt -s expand_aliases; source '{}'; source '{}'; eval 'ssh -p 2222 host'",
             rc.display(),
             rc.display()
         );
         let mut shell = std::process::Command::new(bash);
         shell
-            .args(["-ic", &command])
+            .args(["-c", &command])
             .env(
                 "PATH",
                 format!(
