@@ -11,50 +11,10 @@ pub fn pager_toml_path() -> PathBuf {
     grok_home().join("pager.toml")
 }
 
-/// User-facing label for the user state directory (``~/.medley``, ``~/.grok``
-/// while a legacy install is still live, or the override env var).
-///
-/// Derived from resolved [`grok_home()`] vs `xai_grok_config::default_grok_home()`,
-/// not from whether an override is set in the environment.
-pub fn display_grok_home_prefix() -> String {
-    display_grok_home_prefix_for(&grok_home())
-}
-
-fn display_grok_home_prefix_for(home: &Path) -> String {
-    let default = xai_grok_config::default_grok_home();
-    if home == default {
-        // Name the directory that actually holds state — which of ~/.medley and
-        // ~/.grok that is depends on whether the migration has run.
-        return match default.file_name() {
-            Some(name) => format!("~/{}", name.to_string_lossy()),
-            None => "~".to_string(),
-        };
-    }
-    // Named from the source that actually won, not from which variable is set:
-    // an exported-but-empty `MEDLEY_HOME` is ignored by resolution, so labelling
-    // paths `$MEDLEY_HOME/...` would send the user to an empty location. When
-    // `home` is an explicit path rather than the resolved one, no override is in
-    // play and the compatibility variable is the right thing to name.
-    let env = xai_grok_config::state_dir::resolve()
-        .source
-        .env_var()
-        .unwrap_or(xai_grok_config::state_dir::LEGACY_STATE_HOME_ENV);
-    format!("${env}")
-}
-
-/// User-facing path under [`grok_home()`], e.g. ``~/.grok/config.toml``.
-pub fn display_user_grok_path(relative: impl AsRef<Path>) -> String {
-    display_user_grok_path_for(&grok_home(), relative)
-}
-
-fn display_user_grok_path_for(home: &Path, relative: impl AsRef<Path>) -> String {
-    let rel = relative.as_ref();
-    let prefix = display_grok_home_prefix_for(home);
-    if rel.as_os_str().is_empty() {
-        return prefix;
-    }
-    format!("{prefix}/{}", rel.display())
-}
+// Both live in `xai-grok-config`, beside the resolution they describe, so
+// that layers below the pager can render a state path too. Re-exported here
+// because this module is where the rest of the pager already reaches for them.
+pub use xai_grok_config::{display_grok_home_prefix, display_user_grok_path};
 
 /// Abbreviate an absolute path for display: prefer [`grok_home()`], then `$HOME`.
 pub fn abbreviate_path(path: &str) -> Cow<'_, str> {
@@ -439,55 +399,9 @@ mod tests {
         assert_eq!(parse_schedule_interval_secs("every 5x"), None);
     }
 
-    /// The label of whichever env override is live, matching
-    /// `display_grok_home_prefix_for`'s non-default branch.
-    fn expected_env_label() -> String {
-        let env = xai_grok_config::state_dir::resolve()
-            .source
-            .env_var()
-            .unwrap_or(xai_grok_config::state_dir::LEGACY_STATE_HOME_ENV);
-        format!("${env}")
-    }
-
-    #[test]
-    fn display_grok_home_prefix_default_install() {
-        if std::env::var_os(xai_grok_config::state_dir::STATE_HOME_ENV).is_some()
-            || std::env::var_os(xai_grok_config::state_dir::LEGACY_STATE_HOME_ENV).is_some()
-        {
-            return;
-        }
-        // Names whichever directory currently holds state: ~/.medley normally,
-        // ~/.grok while a legacy install has not been migrated.
-        let default = xai_grok_config::default_grok_home();
-        let expected = format!("~/{}", default.file_name().unwrap().to_string_lossy());
-        assert_eq!(display_grok_home_prefix(), expected);
-    }
-
-    #[test]
-    fn display_user_grok_path_joins_relative() {
-        let path = display_user_grok_path("config.toml");
-        assert!(path.ends_with("/config.toml") || path.ends_with("\\config.toml"));
-        assert!(
-            path.contains(xai_grok_config::state_dir::STATE_DIR_NAME)
-                || path.contains(xai_grok_config::state_dir::LEGACY_STATE_DIR_NAME)
-                || path.contains(&expected_env_label()),
-            "got {path}"
-        );
-    }
-
-    #[test]
-    fn display_user_grok_path_for_custom_home_uses_override_label() {
-        let custom = std::env::temp_dir().join("grok-home-display-regression");
-        let label = expected_env_label();
-        assert_eq!(
-            display_user_grok_path_for(&custom, "config.toml"),
-            format!("{label}/config.toml")
-        );
-        assert_eq!(
-            display_user_grok_path_for(&custom, "sandbox.toml"),
-            format!("{label}/sandbox.toml")
-        );
-    }
+    // The three tests that covered `display_grok_home_prefix` and
+    // `display_user_grok_path` moved to `xai-grok-config` with the functions
+    // themselves; testing a re-export here would only prove `pub use` works.
 
     #[test]
     fn abbreviate_path_uses_home_when_under_default_grok() {

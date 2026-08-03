@@ -7,6 +7,34 @@ use rand::TryRngCore as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 /// Top-level commands for the pager binary.
+/// `grok wrap --help`'s long form, built at runtime so the README pointer
+/// names the directory this install actually uses. As a literal it read
+/// `~/.grok/README.md`, which is neither where medley writes that file nor
+/// where a `MEDLEY_HOME` install keeps it — a "see this file" line pointing at
+/// a file that is not there.
+fn wrap_long_about() -> String {
+    format!(
+        "\
+Run any command inside a local PTY that forwards its clipboard to yours.
+
+Wraps an arbitrary command (for example `docker exec`, `kubectl exec`, or a
+remote shell) in a local pseudo-terminal, intercepts OSC 52 clipboard escape
+sequences from its output, and writes them to your local system clipboard. This
+makes copy work when the program runs somewhere that cannot reach your
+clipboard (containers, SSH) and your terminal does not handle OSC 52 itself
+(for example Apple Terminal). The wrapped command's terminal is also kept in
+sync with your window size.
+
+Examples:
+  grok wrap docker exec -it my-container bash
+  grok wrap kubectl exec -it my-pod -- bash
+
+See {readme} for more information.
+",
+        readme = crate::util::display_user_grok_path("README.md")
+    )
+}
+
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
     /// Run Grok without the interactive UI
@@ -77,23 +105,7 @@ pub enum Command {
     Share(crate::share_cmd::ShareArgs),
     /// Run any command with local clipboard support (OSC 52 → system clipboard).
     #[cfg_attr(not(any(unix, windows)), command(hide = true))]
-    #[command(long_about = "\
-Run any command inside a local PTY that forwards its clipboard to yours.
-
-Wraps an arbitrary command (for example `docker exec`, `kubectl exec`, or a
-remote shell) in a local pseudo-terminal, intercepts OSC 52 clipboard escape
-sequences from its output, and writes them to your local system clipboard. This
-makes copy work when the program runs somewhere that cannot reach your
-clipboard (containers, SSH) and your terminal does not handle OSC 52 itself
-(for example Apple Terminal). The wrapped command's terminal is also kept in
-sync with your window size.
-
-Examples:
-  grok wrap docker exec -it my-container bash
-  grok wrap kubectl exec -it my-pod -- bash
-
-See ~/.grok/README.md for more information.
-")]
+    #[command(long_about = wrap_long_about())]
     Wrap(WrapArgs),
     /// Export a session transcript as Markdown
     Export(crate::export_cmd::ExportArgs),

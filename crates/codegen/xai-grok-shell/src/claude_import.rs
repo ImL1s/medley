@@ -92,7 +92,10 @@ impl ImportPlan {
         let mut out = String::from("Found Claude settings to import:\n");
 
         if !self.global_items.is_empty() {
-            out.push_str("\nGlobal (~/.grok/config.toml):\n");
+            out.push_str(&format!(
+                "\nGlobal ({}):\n",
+                xai_grok_config::display_user_grok_path("config.toml")
+            ));
             out.push_str(&format_item_summary(&self.global_items));
         }
 

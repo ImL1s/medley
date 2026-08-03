@@ -57,8 +57,14 @@ pub enum ManagedConfigError {
         "The server's response could not be verified as authentic managed policy, so nothing was installed. Try again; if this persists, contact your administrator."
     )]
     SignatureRejected,
+    // Resolved at construction rather than written literally: the directory
+    // is `~/.medley` on a fresh install, an existing `~/.grok` on a migrated
+    // one, and anywhere at all under `MEDLEY_HOME`. Naming the wrong one in a
+    // "make sure this directory is writable" message sends the user to fix a
+    // directory that was never the problem.
     #[error(
-        "Can't save the configuration to ~/.grok. Make sure the directory exists and is writable.\n  ({0})"
+        "Can't save the configuration to {home}. Make sure the directory exists and is writable.\n  ({0})",
+        home = xai_grok_config::display_grok_home_prefix()
     )]
     DiskWrite(#[from] std::io::Error),
 }

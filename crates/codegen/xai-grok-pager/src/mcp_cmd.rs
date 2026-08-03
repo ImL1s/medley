@@ -9,7 +9,15 @@ use xai_grok_shell::util::config::{McpServerConfig, McpServerTransportConfig};
 
 use crate::util::display_user_grok_path;
 
-const ADD_AFTER_HELP: &str = "\
+/// `grok mcp add --help`'s trailer, built at runtime.
+///
+/// Only the user-scoped path is resolved. `./.grok/config.toml` stays literal
+/// on purpose: that one is relative to the repository being worked in and does
+/// not move with `MEDLEY_HOME`, so rendering it through the state-directory
+/// helper would be wrong in the opposite direction.
+fn add_after_help() -> String {
+    format!(
+        "\
 Examples:
   # Add a stdio server (everything after -- is the server command)
   grok mcp add xcode -- xcrun mcpbridge
@@ -23,8 +31,11 @@ Examples:
   # Add a remote server with an authentication header
   grok mcp add --transport http api https://mcp.example.com/mcp --header \"Authorization: Bearer YOUR_TOKEN\"
 
-  # Add to the project config (./.grok/config.toml) instead of ~/.grok/config.toml
-  grok mcp add --scope project github -- npx -y @modelcontextprotocol/server-github";
+  # Add to the project config (./.grok/config.toml) instead of {user_config}
+  grok mcp add --scope project github -- npx -y @modelcontextprotocol/server-github",
+        user_config = display_user_grok_path("config.toml")
+    )
+}
 
 #[derive(Debug, clap::Args, Clone)]
 pub struct McpArgs {
@@ -103,7 +114,7 @@ pub enum McpCommand {
 // Everything `mcp add` accepts, before validation; `resolve_add` turns it
 // into a transport config.
 #[derive(Debug, clap::Args, Clone)]
-#[command(after_help = ADD_AFTER_HELP)]
+#[command(after_help = add_after_help())]
 pub struct AddArgs {
     /// Server name
     name: String,
