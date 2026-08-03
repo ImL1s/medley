@@ -36,12 +36,21 @@ fn protoc_on_path() -> Option<PathBuf> {
 
 /// Pure half of [`protoc_on_path`]. Split out because `PATH` is process-global
 /// state: a test that set it would race every other test in the binary.
+///
+/// Candidates are accepted only if they actually **run**, not merely exist.
+/// The OS skips unusable entries during its own `PATH` lookup, so a directory
+/// or a non-executable file named `protoc` early on `PATH` is invisible to
+/// `check_protoc_good("protoc")` — but picking it here would hand that path to
+/// `protoc_executable` and fail the build with `PermissionDenied`, having
+/// resolved a `protoc` the caller had already proven works.
 fn protoc_in_dirs(dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
     dirs.into_iter()
         .map(|dir| dir.join("protoc"))
-        // `try_exists` rather than `exists`: a broken symlink is not something
-        // to hand Cargo as a fingerprint input.
-        .find(|candidate| candidate.try_exists().unwrap_or(false))
+        .find(|candidate| {
+            // `try_exists` first: cheap, and skips the subprocess for the
+            // majority of PATH entries that hold no protoc at all.
+            candidate.try_exists().unwrap_or(false) && check_protoc_good(candidate).is_ok()
+        })
 }
 
 /// Find `protoc` command.
@@ -139,16 +148,29 @@ mod tests {
     ///
     /// So what matters is not merely *finding* protoc — it is returning
     /// something Cargo can still find afterwards, from the package root.
-    #[test]
-    fn path_lookup_returns_a_resolvable_path_not_a_bare_name() {
+    /// A stub `protoc` that runs and exits zero, so `check_protoc_good`
+    /// accepts it. Returns the directory holding it.
+    #[cfg(unix)]
+    fn stub_protoc_dir(tag: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!(
-            "xai-proto-build-find-protoc-{}-{:?}",
+            "xai-proto-build-{tag}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let protoc = dir.join("protoc");
         std::fs::write(&protoc, b"#!/bin/sh\nexit 0\n").expect("write stub");
+        std::fs::set_permissions(&protoc, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod stub");
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_lookup_returns_a_resolvable_path_not_a_bare_name() {
+        let dir = stub_protoc_dir("resolvable");
+        let protoc = dir.join("protoc");
 
         let found = protoc_in_dirs([dir.clone()]).expect("stub is on the search path");
 
@@ -176,5 +198,50 @@ mod tests {
             protoc_in_dirs([PathBuf::from("/nonexistent-aXbYcZ/bin")]),
             None
         );
+    }
+
+    /// Existing is not the same as usable, and the difference is invisible to
+    /// the caller: the OS skips unusable entries during its own `PATH` lookup,
+    /// so `check_protoc_good("protoc")` succeeds on the *later* directory
+    /// while a naive scan would return the earlier one. Handing that back
+    /// fails the build with `PermissionDenied` after protoc had been proven to
+    /// work — a worse outcome than the bare-name bug this function replaced.
+    #[cfg(unix)]
+    #[test]
+    fn unrunnable_candidates_are_skipped_in_favour_of_a_working_one() {
+        let good = stub_protoc_dir("runnable");
+
+        // A non-executable file named protoc, earlier on the search path.
+        let shadow = std::env::temp_dir().join(format!(
+            "xai-proto-build-shadow-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&shadow).expect("temp dir");
+        std::fs::write(shadow.join("protoc"), b"not executable\n").expect("write shadow");
+
+        assert_eq!(
+            protoc_in_dirs([shadow.clone(), good.clone()]),
+            Some(good.join("protoc")),
+            "a protoc that cannot run must not shadow one that can"
+        );
+
+        // And a *directory* named protoc, which also exists but cannot run.
+        let dir_shadow = std::env::temp_dir().join(format!(
+            "xai-proto-build-dirshadow-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(dir_shadow.join("protoc")).expect("temp dir");
+
+        assert_eq!(
+            protoc_in_dirs([dir_shadow.clone(), good.clone()]),
+            Some(good.join("protoc")),
+            "a directory named protoc must not shadow a real one"
+        );
+
+        for d in [good, shadow, dir_shadow] {
+            std::fs::remove_dir_all(d).ok();
+        }
     }
 }
