@@ -25,8 +25,20 @@ fn main() {
             println!("cargo:rerun-if-changed={printable}");
         }
         if let Ok(rev) = std::fs::read_to_string(&path) {
-            let rev = rev.trim();
-            if !rev.is_empty() {
+            // Validated before it is printed, because Cargo parses build
+            // script output **one directive per line**. A `SOURCE_REV`
+            // containing a newline would emit whatever followed it as a
+            // second directive — confirmed against Cargo:
+            //
+            //   let rev = "abc123\ncargo:rustc-env=INJECTED=yes";
+            //   println!("cargo:rustc-env=MEDLEY_UPSTREAM_BASE={rev}");
+            //   -> MEDLEY_UPSTREAM_BASE = "abc123", INJECTED = "yes"
+            //
+            // `trim()` only strips the ends, so it does not prevent this. The
+            // file is checked in and reviewed, so this is not a live hole —
+            // but it is one bad sync away from being one, and a git object id
+            // has a shape worth insisting on regardless.
+            if let Some(rev) = valid_object_id(rev.trim()) {
                 println!("cargo:rustc-env=MEDLEY_UPSTREAM_BASE={rev}");
             }
         }
@@ -52,4 +64,14 @@ fn upstream_rev_path() -> Option<PathBuf> {
             return None;
         }
     }
+}
+
+/// A full git object id, or nothing.
+///
+/// Deliberately strict about length as well as alphabet: an abbreviated id is
+/// ambiguous, and anything that is neither is not a commit this build should
+/// be claiming as its base.
+fn valid_object_id(candidate: &str) -> Option<&str> {
+    let looks_right = candidate.len() == 40 && candidate.bytes().all(|b| b.is_ascii_hexdigit());
+    looks_right.then_some(candidate)
 }
