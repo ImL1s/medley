@@ -1924,9 +1924,36 @@ fn install_heap_profile_hooks() {
         prof_available: jemalloc_prof_available,
     });
 }
+/// The name this process was invoked as, for `--version` to report itself by.
+///
+/// The release archives install the binary as `medley`, so a hardcoded "grok"
+/// answered the wrong name to the one question whose entire job is identity:
+/// `medley --version` replied `grok …`. Reading argv[0] answers correctly for
+/// both — `medley` from a release, `grok` from an upstream-style install, and
+/// whatever a user renamed it to.
+///
+/// Falls back to "grok" when argv[0] is missing, empty, or not valid UTF-8:
+/// that is what upstream installs it as, and a version string is not worth
+/// failing over.
+fn invoked_as() -> String {
+    std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(std::path::Path::file_stem)
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("grok")
+        .to_string()
+}
+
 fn version_text(channel_label: &str) -> String {
+    version_text_for(&invoked_as(), channel_label)
+}
+
+fn version_text_for(name: &str, channel_label: &str) -> String {
     format!(
-        "grok {}\n",
+        "{} {}\n",
+        name,
         xai_grok_version::display_version_with_commit(env!("VERSION_WITH_COMMIT"), channel_label,)
     )
 }
@@ -2979,10 +3006,40 @@ mod tests {
             let mut output = Vec::new();
             write_version(&mut output, label).unwrap();
             let output = String::from_utf8(output).unwrap();
-            assert!(output.starts_with("grok "));
+            // Not asserted against a literal name: under `cargo test` the
+            // running executable is the test harness, so the name this reports
+            // is the harness's. That it reports *the invoked name* is what
+            // `version_text_names_the_invoked_binary` covers.
             assert!(output.contains(env!("VERSION_WITH_COMMIT")));
             assert!(output.ends_with(expected_suffix), "{output:?}");
         }
+    }
+    /// The release archives install this binary as `medley`, so `--version`
+    /// has to answer with the name it was invoked as rather than a compiled-in
+    /// one — a `medley` that replies `grok` is wrong about the single thing
+    /// the command exists to report.
+    #[test]
+    fn version_text_names_the_invoked_binary() {
+        for name in ["medley", "grok", "renamed-by-a-user"] {
+            let output = version_text_for(name, "");
+            assert!(
+                output.starts_with(&format!("{name} ")),
+                "expected {output:?} to lead with {name:?}"
+            );
+            assert!(output.contains(env!("VERSION_WITH_COMMIT")));
+        }
+    }
+    /// argv[0] is attacker-adjacent input in the sense that it can be anything
+    /// at all, including absent. A version string must not be the thing that
+    /// makes the process fail.
+    #[test]
+    fn invoked_name_is_non_empty_and_bare() {
+        let name = invoked_as();
+        assert!(!name.is_empty());
+        assert!(
+            !name.contains('/') && !name.contains('\\'),
+            "expected a bare file stem, got {name:?}"
+        );
     }
     #[test]
     fn version_flags_and_doctor_are_distinct_early_intents() {
