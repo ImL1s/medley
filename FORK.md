@@ -4,7 +4,7 @@ This repository is **[ImL1s/grok-build](https://github.com/ImL1s/grok-build)**, 
 
 This file doubles as the Apache-2.0 §4(b) statement of modification: the "What's different from upstream" table below is the record of changes made to the upstream work.
 
-The `medley` command alias, the `~/.medley/` state directory, and the `MEDLEY_*` environment prefix arrive with the packaging change in [#49](https://github.com/ImL1s/grok-build/issues/49). Until then the binary is invoked as `grok` and state lives in `~/.grok/`, shared with any official Grok Build install on the same machine.
+Release archives and [`install.sh`](install.sh) ship the binary as `medley` and install it under `~/.medley/bin`; a source build keeps the upstream cargo bin target name `xai-grok-pager`, which upstream installs ship as `grok`. State resolves in this order: `$MEDLEY_HOME`, `$GROK_HOME`, `~/.medley` when it exists, an existing `~/.grok` (which the first interactive run offers to copy across), then `~/.medley`. Renaming the application's own `GROK_*` environment variables is remaining scope on [#49](https://github.com/ImL1s/grok-build/issues/49).
 
 Remotes:
 
@@ -43,6 +43,8 @@ Relative to `xai-org/grok-build` `main`, this fork's `providers` branch adds:
 | ACP `local.none` | Advertised only when the **startup-selected** model is no-auth. |
 | Session safety | Catalog key vs wire slug kept separate; readiness gated in `model_switch::apply` (covers new/load/switch); unready defaults fall back to a bundled sentinel; turn-time `reconstruct_full_config` re-checks `ModelAuthFacts.ready` and strips ambient Bearer / identity for unready or `None` models. |
 | TUI readiness | `/model` and Ctrl+M show `ready` / `missing` / `none` badges; hard-block unready; soft-confirm auth-class changes. |
+| State directory | State resolves to `~/.medley` instead of upstream's `~/.grok`, honouring `MEDLEY_HOME` ahead of `GROK_HOME`. An existing `~/.grok` is still read, and an interactive run offers a one-time copy into `~/.medley`; declining writes a `.medley-keep-legacy` marker so the prompt does not repeat. |
+| Packaging | [`install.sh`](install.sh) and [`.github/workflows/release.yml`](.github/workflows/release.yml) publish the binary as `medley` with SHA-256 checksums and build provenance, installing a launcher that supplies the install location as the state directory unless the caller exported `MEDLEY_HOME` or `GROK_HOME`. Upstream's `x.ai/cli` installers are not used. |
 | Fork ops | [`FORK.md`](FORK.md), [`scripts/sync-upstream.sh`](scripts/sync-upstream.sh), and providers-only [CI](.github/workflows/ci.yml). |
 
 Provider setup examples (Anthropic, OpenAI, Ollama, …): [11-custom-models.md](crates/codegen/xai-grok-pager/docs/user-guide/11-custom-models.md).
@@ -122,7 +124,7 @@ Scope is the fork hot path (not full workspace):
 
 ## TUI and config
 
-- **Source of truth for providers:** `~/.grok/config.toml` — `[model.*]` entries (`auth_scheme`, `env_key`, `api_backend`, `base_url`, …) and optional `[models].default`.
+- **Source of truth for providers:** `config.toml` in the resolved state directory (`~/.medley/config.toml` by default — see the resolution order above) — `[model.*]` entries (`auth_scheme`, `env_key`, `api_backend`, `base_url`, …) and optional `[models].default`.
 - **Day-to-day switching:** TUI `/model` (or `/m`) and **Ctrl+M** (model picker from scrollback). The picker selects from the catalog; it does not replace editing `config.toml` for adding providers.
 
 Do not commit secrets, local agent scratch (`.omc/`), or scratch notes into this fork’s product branch.

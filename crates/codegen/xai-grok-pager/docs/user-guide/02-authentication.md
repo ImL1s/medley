@@ -6,10 +6,10 @@ Grok supports several authentication methods, including interactive browser logi
 > below exists only in [Medley](https://github.com/ImL1s/grok-build), a community
 > fork that is not affiliated with or endorsed by xAI; it is compatibility with a
 > pinned public Codex contract, not an OpenAI endorsement. Every other flow on this
-> page is upstream behaviour. Medley shares `~/.grok/` with an official Grok Build
-> install today, so alternating between the two can corrupt stored credentials —
-> the separate `~/.medley/` state directory is tracked in
-> [#49](https://github.com/ImL1s/grok-build/issues/49).
+> page is upstream behaviour. Medley stores credentials in its own state directory
+> (`~/.medley/auth.json` by default), so it no longer shares them with an official
+> Grok Build install. An install still carried over from `~/.grok` is the one
+> exception — see [Configuration](05-configuration.md#file-locations).
 
 ---
 
@@ -21,15 +21,15 @@ On first launch, Grok opens your browser to authenticate with grok.com:
 grok
 ```
 
-Grok stores credentials in `~/.grok/auth.json` and reuses them across sessions. Grok refreshes access tokens automatically in the background. When a token can't be refreshed, Grok prompts you to sign in again. Credentials without a server-provided expiry fall back to a 30-day lifetime.
+Grok stores credentials in `~/.medley/auth.json` and reuses them across sessions. Grok refreshes access tokens automatically in the background. When a token can't be refreshed, Grok prompts you to sign in again. Credentials without a server-provided expiry fall back to a 30-day lifetime.
 
 ### Credential storage
 
-Tokens in `~/.grok/auth.json` (and MCP OAuth tokens in `~/.grok/mcp_credentials.json`) are written with owner-only permissions (`0600` on Unix). Anyone with filesystem access to those paths can use the credentials, so:
+Tokens in `~/.medley/auth.json` (and MCP OAuth tokens in `~/.medley/mcp_credentials.json`) are written with owner-only permissions (`0600` on Unix). Anyone with filesystem access to those paths can use the credentials, so:
 
 - Prefer full-disk encryption (FileVault, BitLocker, LUKS, or equivalent).
 - Do not copy `auth.json` or `mcp_credentials.json` into shared directories, tickets, or chat.
-- On multi-user hosts, keep `$HOME` / `$GROK_HOME` private to your account.
+- On multi-user hosts, keep `$HOME` and the state directory private to your account.
 
 ### Re-authenticate
 
@@ -66,7 +66,7 @@ grok logout --provider openai-codex
 
 Login uses a Codex-compatible browser OAuth flow with PKCE. The consent page
 identifies the registered Codex public client; completing that consent does not
-make Grok Build an OpenAI product or imply OpenAI endorsement. Grok prints the
+make Medley an OpenAI product or imply OpenAI endorsement. Grok prints the
 authorization URL even when opening a browser fails. Over SSH, open
 both possible callback ports from the machine running the browser before
 starting Grok:
@@ -82,7 +82,7 @@ loopback listener on the SSH host. Copying the URL to an unrelated machine
 without this forwarding will time out.
 
 The credential is stored under its own `openai::codex` scope in
-`~/.grok/auth.json`. Access-token refresh and refresh-token rotation happen
+`~/.medley/auth.json`. Access-token refresh and refresh-token rotation happen
 before a Codex request, and a rejected request is refreshed/retried at most
 once. If the refreshed credential is rejected, run the login command again.
 Signing out first makes a short best-effort request to revoke the refresh token
@@ -102,7 +102,7 @@ needed to use this provider. Before you log in it is listed as unready with
 the reason `sign in with grok login --provider openai-codex`; after a
 successful login it becomes selectable in `grok models` and the `/model`
 picker. To change its metadata or add other Codex models, declare them in the
-**global** `~/.grok/config.toml` — see
+**global** `~/.medley/config.toml` — see
 [Custom Models](11-custom-models.md#openai-codex-chatgpt-subscription).
 
 ### Compatibility and live-proof boundary
@@ -138,7 +138,7 @@ export XAI_API_KEY="xai-..."
 grok
 ```
 
-Grok uses the API key as a fallback when no session token is active. If you have already signed in interactively, the stored session token takes precedence. To fall back to the API key, run `grok logout` or delete `~/.grok/auth.json`.
+Grok uses the API key as a fallback when no session token is active. If you have already signed in interactively, the stored session token takes precedence. To fall back to the API key, run `grok logout` or delete `~/.medley/auth.json`.
 
 ---
 
@@ -157,7 +157,7 @@ Authenticate developers through your own Identity Provider (IdP) -- such as Okta
 Via config file:
 
 ```toml
-# ~/.grok/config.toml
+# ~/.medley/config.toml
 [grok_com_config.oidc]
 issuer = "https://acme.okta.com"
 client_id = "0oa1b2c3d4e5f6g7h8i9"
@@ -178,7 +178,7 @@ export GROK_CLI_CHAT_PROXY_BASE_URL="https://grok-proxy.acme.com/v1"
 
 ### 3. Run `grok`
 
-The CLI discovers endpoints via `{issuer}/.well-known/openid-configuration`, opens the IdP login page, and stores tokens in `~/.grok/auth.json`. Tokens auto-refresh silently via the stored `refresh_token`.
+The CLI discovers endpoints via `{issuer}/.well-known/openid-configuration`, opens the IdP login page, and stores tokens in `~/.medley/auth.json`. Tokens auto-refresh silently via the stored `refresh_token`.
 
 ### Optional fields
 
@@ -250,7 +250,7 @@ JSON fields:
 Via config file:
 
 ```toml
-# ~/.grok/config.toml
+# ~/.medley/config.toml
 [auth]
 auth_provider_command = "/usr/local/bin/my-auth-provider"
 auth_provider_label = "Acme Corp"   # optional -- customizes the TUI login button
@@ -335,7 +335,7 @@ export GROK_AUTH_EARLY_INVALIDATION_SECS=0
 
 ## Hot Reload
 
-Grok picks up changes to `~/.grok/auth.json` automatically. If you update credentials externally (for example, with a script that writes new tokens), Grok uses the new credentials on the next API call without a restart.
+Grok picks up changes to `~/.medley/auth.json` automatically. If you update credentials externally (for example, with a script that writes new tokens), Grok uses the new credentials on the next API call without a restart.
 
 ---
 
@@ -344,7 +344,7 @@ Grok picks up changes to `~/.grok/auth.json` automatically. If you update creden
 Grok resolves credentials for each request in this order, highest to lowest:
 
 1. **Per-model `api_key` or `env_key`** -- set under `[model.<name>]` in `config.toml`. Wins whenever present.
-2. **Active session token** -- obtained through browser, OIDC/OAuth2, or external-provider login and stored in `~/.grok/auth.json`.
+2. **Active session token** -- obtained through browser, OIDC/OAuth2, or external-provider login and stored in `~/.medley/auth.json`.
 3. **`XAI_API_KEY`** -- fallback when no session token is active.
 
 When more than one login flow is configured, Grok populates the session token from the first available source, highest to lowest:

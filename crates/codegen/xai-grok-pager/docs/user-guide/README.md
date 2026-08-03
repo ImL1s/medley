@@ -1,15 +1,28 @@
-# Grok Build User Guide
+# Medley User Guide
 
-Learn how to install, configure, and extend Grok Build, the terminal-based AI coding assistant from SpaceXAI.
+Learn how to install, configure, and extend
+[Medley](https://github.com/ImL1s/grok-build), a community multi-provider fork of
+Grok Build, the terminal-based AI coding assistant from SpaceXAI.
 
-> **Fork note (Medley).** You are reading the user guide as it ships inside
-> [Medley](https://github.com/ImL1s/grok-build), a community fork that is not affiliated with
-> or endorsed by xAI. These pages are carried over from upstream and describe the
-> official build, so installation, update, and support instructions here do not
-> apply to Medley. Fork-specific behaviour is called out in
-> [Authentication](02-authentication.md) and [Custom Models](11-custom-models.md);
-> everything still runs as the `grok` command. Fork-specific installer docs are
-> tracked in [#28](https://github.com/ImL1s/grok-build/issues/28).
+> **Fork note (Medley).** Medley is not affiliated with or endorsed by xAI. Most
+> of these pages are carried over from upstream and describe behaviour Medley
+> inherits unchanged; the **installation, update, and support** instructions in
+> them (`x.ai/cli/…`, `grok update`, xAI support channels) belong to the official
+> build and do not apply to Medley — install Medley from the fork's
+> [README](https://github.com/ImL1s/grok-build#installing) and report Medley bugs
+> on the [fork's tracker](https://github.com/ImL1s/grok-build/issues). Replacing
+> the remaining upstream installer text on these pages is tracked in
+> [#28](https://github.com/ImL1s/grok-build/issues/28). Fork-specific behaviour is
+> called out in [Authentication](02-authentication.md) and
+> [Custom Models](11-custom-models.md).
+>
+> **Two reading conventions.** Command examples read `grok …`: the release
+> archives install the binary as `medley`, while a source build keeps upstream's
+> `xai-grok-pager` cargo name — read them as "whatever you invoke your build as".
+> Paths read `~/.medley`, the state directory Medley resolves by default; an
+> install still carried over from `~/.grok` keeps using that directory until the
+> one-time copy runs. See [Configuration](05-configuration.md#file-locations) for
+> the full resolution order.
 
 ---
 
@@ -29,7 +42,7 @@ Start here. These guides cover what you need on your first day.
 
 ## Tier 2: Core Feature Docs
 
-Customize and extend Grok Build.
+Customize and extend Medley.
 
 | # | Document | Description |
 |---|----------|-------------|
@@ -46,7 +59,7 @@ Customize and extend Grok Build.
 
 ## Tier 3: Advanced Usage Docs
 
-Automate, script, and integrate Grok Build with other systems.
+Automate, script, and integrate Medley with other systems.
 
 | # | Document | Description |
 |---|----------|-------------|
