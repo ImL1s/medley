@@ -506,8 +506,12 @@ jobs:
           # concatenating those files keeps the per-target digests authoritative
           # and re-verifies them here against the transferred bytes.
           cat ./*.tar.gz.sha256 | LC_ALL=C sort -k2 > "$checksums"
-          rm -f ./*.tar.gz.sha256
           sha256sum --check --strict "$checksums"
+          # The per-archive files are kept and published alongside the
+          # aggregate. Checking the aggregate requires all four archives
+          # present, so a user who downloaded only their own platform would see
+          # three "No such file" errors and a non-zero exit from a verification
+          # that actually succeeded for the file they have.
 
           found="$(find . -name '*.tar.gz' | wc -l | tr -d ' ')"
           if [ "$found" != "4" ]; then
@@ -604,10 +608,27 @@ jobs:
             echo
             echo "### Verify"
             echo
+            echo "Each archive ships its own \`.sha256\` next to it. Check that one —"
+            echo "the combined \`${DIST_NAME}-${VERSION}-checksums.txt\` lists all four"
+            echo "platforms, so checking it reports the three archives you did not"
+            echo "download as missing and exits non-zero."
+            echo
+            echo "On Linux:"
+            echo
             echo '```sh'
-            echo "sha256sum -c ${DIST_NAME}-${VERSION}-checksums.txt      # Linux"
-            echo "shasum -a 256 -c ${DIST_NAME}-${VERSION}-checksums.txt  # macOS"
-            echo "gh attestation verify medley-${VERSION}-<target>.tar.gz --repo ${GITHUB_REPOSITORY}"
+            echo "sha256sum -c ${DIST_NAME}-${VERSION}-<target>.tar.gz.sha256"
+            echo '```'
+            echo
+            echo "On macOS:"
+            echo
+            echo '```sh'
+            echo "shasum -a 256 -c ${DIST_NAME}-${VERSION}-<target>.tar.gz.sha256"
+            echo '```'
+            echo
+            echo "Provenance, either platform:"
+            echo
+            echo '```sh'
+            echo "gh attestation verify ${DIST_NAME}-${VERSION}-<target>.tar.gz --repo ${GITHUB_REPOSITORY}"
             echo '```'
           } > "${RUNNER_TEMP}/notes.md"
 

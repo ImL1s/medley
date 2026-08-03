@@ -57,9 +57,53 @@ pub const MEDLEY_CHANNEL: &str = "medley";
 /// [`DistIdentity::Unknown`] and refuses, like any other unrecognised stamp.
 pub const UPSTREAM_CHANNEL: &str = "upstream";
 
-/// One-liner that installs or upgrades medley.
-pub const MEDLEY_INSTALL_COMMAND: &str =
-    "curl -fsSL https://raw.githubusercontent.com/ImL1s/medley/providers/install.sh | sh";
+/// Repository the installer and releases live in.
+pub const MEDLEY_REPO_SLUG: &str = "ImL1s/medley";
+
+/// Git ref a **dev** build points at, having no tag of its own to name.
+pub const MEDLEY_DEV_INSTALL_REF: &str = "providers";
+
+/// One-liner that installs or upgrades medley, pinned to the ref this binary
+/// was built from.
+///
+/// A published build names its own tag. Pointing at the `providers` branch
+/// instead would mean a binary released today instructs its users to pipe
+/// whatever that branch contains *whenever they get round to upgrading* into
+/// `sh` — the instruction is compiled in and cannot be corrected afterwards,
+/// so it must not resolve to moving content. The tag is immutable and its
+/// installer still resolves the newest release, so pinning costs nothing.
+///
+/// Unstamped builds keep `providers`: they have no tag, and naming a branch is
+/// the honest answer rather than a guess.
+pub fn medley_install_command() -> String {
+    install_command_for(&identity(), xai_grok_version::VERSION)
+}
+
+/// Pure policy behind [`medley_install_command`].
+///
+/// Split out because both inputs are compile-time state: a test binary is
+/// always unstamped, so the published-build branch — the one that matters —
+/// would be unreachable from a test that called the wrapper.
+pub(crate) fn install_command_for(identity: &DistIdentity, version: &str) -> String {
+    format!(
+        "curl -fsSL https://raw.githubusercontent.com/{}/{}/install.sh | sh",
+        MEDLEY_REPO_SLUG,
+        install_ref_for(identity, version)
+    )
+}
+
+/// The ref to pin: this build's tag when it is a stamped medley release,
+/// otherwise the development branch.
+fn install_ref_for(identity: &DistIdentity, version: &str) -> String {
+    match identity {
+        // `GROK_VERSION` is set from the tag with its leading `v` stripped, so
+        // the tag is recoverable by putting it back. A raw.githubusercontent
+        // path takes the `+` in `v1.2.3+providers.4` literally — verified
+        // against GitHub, which serves both the bare and percent-encoded form.
+        DistIdentity::Medley => format!("v{version}"),
+        _ => MEDLEY_DEV_INSTALL_REF.to_string(),
+    }
+}
 
 /// Where medley's release artifacts and checksums are published.
 pub const MEDLEY_RELEASES_URL: &str = "https://github.com/ImL1s/medley/releases";
@@ -183,13 +227,14 @@ pub fn decide(identity: &DistIdentity) -> SelfUpdate {
 
 /// User-facing explanation of a refusal, ending with how to upgrade instead.
 pub fn refusal_message(reason: &RefusalReason) -> String {
+    let install_command = medley_install_command();
     match reason {
         RefusalReason::ForkBuild => format!(
             "medley does not self-update.\n\n\
              This is a medley build — a community fork of Grok Build. The bundled \
              updater installs official Grok Build releases, which would replace \
              medley with the upstream CLI and leave its state directory behind.\n\n\
-             To upgrade, re-run the medley installer:\n  {MEDLEY_INSTALL_COMMAND}\n\n\
+             To upgrade, re-run the medley installer:\n  {install_command}\n\n\
              Releases and checksums: {MEDLEY_RELEASES_URL}"
         ),
         RefusalReason::AmbiguousIdentity { stamp } => {
@@ -209,7 +254,7 @@ pub fn refusal_message(reason: &RefusalReason) -> String {
                  {detail}\n\n\
                  Refusing rather than risk replacing it with a binary from another \
                  distribution. To install a published medley build:\n  \
-                 {MEDLEY_INSTALL_COMMAND}\n\n\
+                 {install_command}\n\n\
                  Releases and checksums: {MEDLEY_RELEASES_URL}"
             )
         }
@@ -442,6 +487,40 @@ mod tests {
     /// Every refusal has to be actionable: name the installer, and never point
     /// a fork user at an upstream install command.
     #[test]
+    fn published_builds_pin_the_installer_to_their_own_tag() {
+        // The whole point: a published binary must not send its users to a
+        // moving branch. The instruction is compiled in and cannot be
+        // corrected after the tag, so whatever it names has to be immutable.
+        let published = install_command_for(&DistIdentity::Medley, "0.2.117+providers.1");
+        assert!(
+            published.contains("/v0.2.117+providers.1/install.sh"),
+            "a stamped build must pin its own tag: {published}"
+        );
+        assert!(
+            !published.contains("/providers/install.sh"),
+            "a stamped build must not point at the branch: {published}"
+        );
+
+        // Everything that cannot prove it is a published build has no tag to
+        // name, so the branch is the honest answer rather than a guess.
+        for identity in [
+            DistIdentity::Unstamped,
+            DistIdentity::Upstream,
+            DistIdentity::Unknown("acme-grok".to_string()),
+        ] {
+            let dev = install_command_for(&identity, "0.1.220-alpha.4");
+            assert!(
+                dev.contains("/providers/install.sh"),
+                "{identity:?} has no tag, so it must name the branch: {dev}"
+            );
+            assert!(
+                !dev.contains("0.1.220-alpha.4"),
+                "{identity:?} must not fabricate a tag from a dev version: {dev}"
+            );
+        }
+    }
+
+    #[test]
     fn refusal_messages_point_at_the_medley_installer() {
         let reasons = [
             RefusalReason::ForkBuild,
@@ -460,10 +539,23 @@ mod tests {
                 message.contains(MEDLEY_RELEASES_URL),
                 "refusal must link the fork's releases: {message}"
             );
+            // Asserted as a literal, not via the constants above: the message
+            // is *built* from those constants, so comparing against them
+            // proves only that the format string interpolated. Reverting both
+            // constants to the pre-rename slug would still pass that check,
+            // and these URLs are compiled into every published binary — an
+            // undetected revert ships permanently.
+            assert!(
+                message.contains("ImL1s/medley"),
+                "refusal must name the canonical repository: {message}"
+            );
             for upstream in [
                 "x.ai/cli",
                 "@xai-official/grok",
                 "xai-org-shared/grok-build",
+                // The pre-rename slug. Redirects keep it working, which is
+                // exactly why a regression here would go unnoticed.
+                "ImL1s/grok-build",
             ] {
                 assert!(
                     !message.contains(upstream),

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "repository": "ImL1s/grok-build",
+  "repository": "ImL1s/medley",
   "audit_date": "2026-07-31",
   "audited_branch": "providers",
   "audited_commit": "eafa57c43bfc1d0d8516ffceee5371c45759eb8f",

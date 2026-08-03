@@ -10,7 +10,7 @@ use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::io::AsyncWriteExt;
 
-use crate::dist_channel::{self, MEDLEY_INSTALL_COMMAND, MEDLEY_RELEASES_URL};
+use crate::dist_channel::{self, MEDLEY_RELEASES_URL};
 use crate::version::{
     UpdateConfig, fetch_latest_version, get_installed_grok_version, get_latest_version,
     is_version_cache_fresh, try_fetch_stable_pointer, write_version_cache,
@@ -52,8 +52,9 @@ fn reinstall_hint(installer: &str) -> String {
 /// process environment.
 fn reinstall_hint_for(installer: &str, self_update_disabled: bool) -> String {
     if self_update_disabled {
+        let install_command = dist_channel::medley_install_command();
         return format!(
-            "Please reinstall via the medley installer:\n  {MEDLEY_INSTALL_COMMAND}\n\
+            "Please reinstall via the medley installer:\n  {install_command}\n\
              Releases and checksums: {MEDLEY_RELEASES_URL}"
         );
     }
@@ -3762,7 +3763,7 @@ mod tests {
             let hint = reinstall_hint_for(installer, true);
             assert_eq!(hint, expected, "installer {installer:?} changed the hint");
             assert!(
-                hint.contains(MEDLEY_INSTALL_COMMAND),
+                hint.contains(&dist_channel::medley_install_command()),
                 "should point at the medley installer: {hint}"
             );
             for upstream in [

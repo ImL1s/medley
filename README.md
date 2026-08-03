@@ -196,7 +196,7 @@ Requirements:
 
 ```sh
 git clone -b providers https://github.com/ImL1s/medley.git
-cd grok-build
+cd medley
 cargo run -p xai-grok-pager-bin              # build + launch the TUI
 cargo build -p xai-grok-pager-bin --release  # release binary: target/release/xai-grok-pager
 cargo check -p xai-grok-pager-bin            # fast validation
