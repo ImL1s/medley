@@ -518,7 +518,7 @@ otel_log_tool_details = false                             # content gate (admins
 
 ### Updates and the release channel
 
-**On a [Medley](https://github.com/ImL1s/grok-build) build, the CLI does not
+**On a [Medley](https://github.com/ImL1s/medley) build, the CLI does not
 self-update.** The inherited updater resolves versions from xAI's release
 channel, so running it would replace Medley with an official Grok Build binary —
 losing multi-provider support and orphaning the `~/.medley` state directory. All
@@ -535,11 +535,11 @@ verifies its SHA-256 against the release checksums, and swaps the version in
 place:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ImL1s/grok-build/providers/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/ImL1s/medley/providers/install.sh | sh
 ```
 
 Set `MEDLEY_VERSION` to install a specific release. Releases and checksums:
-<https://github.com/ImL1s/grok-build/releases>.
+<https://github.com/ImL1s/medley/releases>.
 
 #### Build identity
 

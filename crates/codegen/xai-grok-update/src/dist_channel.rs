@@ -43,7 +43,7 @@
 //! talked into self-updating by its environment. This is strictly narrower than
 //! the pre-existing `GROK_TEST_VERSION` override, which every build honours.
 //!
-//! [#71]: https://github.com/ImL1s/grok-build/issues/71
+//! [#71]: https://github.com/ImL1s/medley/issues/71
 
 use xai_grok_version::{DIST_CHANNEL_ENV, DIST_CHANNEL_STAMP, TEST_DIST_CHANNEL_ENV};
 
@@ -59,10 +59,10 @@ pub const UPSTREAM_CHANNEL: &str = "upstream";
 
 /// One-liner that installs or upgrades medley.
 pub const MEDLEY_INSTALL_COMMAND: &str =
-    "curl -fsSL https://raw.githubusercontent.com/ImL1s/grok-build/providers/install.sh | sh";
+    "curl -fsSL https://raw.githubusercontent.com/ImL1s/medley/providers/install.sh | sh";
 
 /// Where medley's release artifacts and checksums are published.
-pub const MEDLEY_RELEASES_URL: &str = "https://github.com/ImL1s/grok-build/releases";
+pub const MEDLEY_RELEASES_URL: &str = "https://github.com/ImL1s/medley/releases";
 
 /// Distribution a binary belongs to, as far as it can prove.
 #[derive(Debug, Clone, PartialEq, Eq)]

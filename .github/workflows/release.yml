@@ -605,7 +605,8 @@ jobs:
             echo "### Verify"
             echo
             echo '```sh'
-            echo "shasum -a 256 -c ${DIST_NAME}-${VERSION}-checksums.txt"
+            echo "sha256sum -c ${DIST_NAME}-${VERSION}-checksums.txt      # Linux"
+            echo "shasum -a 256 -c ${DIST_NAME}-${VERSION}-checksums.txt  # macOS"
             echo "gh attestation verify medley-${VERSION}-<target>.tar.gz --repo ${GITHUB_REPOSITORY}"
             echo '```'
           } > "${RUNNER_TEMP}/notes.md"

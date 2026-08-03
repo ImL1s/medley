@@ -10,7 +10,7 @@ This product includes software developed by xAI as part of Grok Build
 (<https://github.com/xai-org/grok-build>), licensed under the Apache License,
 Version 2.0.
 
-Medley is maintained at <https://github.com/ImL1s/grok-build>. Its changes
+Medley is maintained at <https://github.com/ImL1s/medley>. Its changes
 relative to upstream live on the `providers` branch and are summarised in
 [`FORK.md`](FORK.md), which serves as the Apache-2.0 §4(b) statement of
 modification. The [`SOURCE_REV`](SOURCE_REV) file records the upstream commit
@@ -44,7 +44,7 @@ Medley claims no rights in any third-party mark.
 The inherited [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`SECURITY.md`](SECURITY.md)
 files describe **upstream's** policies for the official project. They do not
 describe how this fork accepts reports. Use the fork's own issue tracker at
-<https://github.com/ImL1s/grok-build/issues>.
+<https://github.com/ImL1s/medley/issues>.
 
 ## Third-party service boundary (OpenAI Codex)
 
