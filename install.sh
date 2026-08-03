@@ -167,7 +167,11 @@ resolve_version() {
   if fetch_to_stdout "https://api.github.com/repos/${REPO}" >/dev/null 2>&1; then
     die "could not resolve the latest release of ${REPO}, though the repository responded. The likeliest cause is that nothing is published as latest yet — drafts and prereleases are both excluded, so publish the draft release the release workflow created. Otherwise GitHub returned something unusable; retry, or set MEDLEY_VERSION to install a specific tag."
   fi
-  die "could not read ${REPO} from GitHub. Common causes: no network or DNS, a proxy or TLS interception, GitHub rate-limiting this host, an outage, or a repository that is private or does not exist. The downloader's own error above says which. Retry later, check MEDLEY_REPO, or set MEDLEY_VERSION to install a specific tag."
+  # No pointer at "the error above": Wget is invoked with --quiet, so on a
+  # curl-less host there is nothing above to point at. Promising a diagnosis
+  # this script did not produce is the same overclaiming the messages were just
+  # corrected for.
+  die "could not read ${REPO} from GitHub. Common causes: no network or DNS, a proxy or TLS interception, GitHub rate-limiting this host, an outage, or a repository that is private or does not exist. Retry later, check MEDLEY_REPO, or set MEDLEY_VERSION to install a specific tag."
 }
 
 # Collapse '.' and '..' textually. Only ever called on a path whose existing
