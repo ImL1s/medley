@@ -23,11 +23,53 @@ fn find_protoc_include_dir(protoc: Option<&Path>) -> Option<PathBuf> {
     let grandparent = parent.parent()?; // .../
     let include_dir = grandparent.join("include");
 
-    if include_dir.is_dir() {
-        Some(include_dir)
-    } else {
-        None
-    }
+    // Everything downstream needs this decoded — the `-I` flag is built with
+    // `format!`, and protoc's dependency output is read back as UTF-8 — so an
+    // undecodable include directory fails the build rather than being used.
+    //
+    // Discovering it at all is new. This is reached from a `protoc` resolved
+    // off `PATH`, which used to be the bare name: `parent()` of that is `""`
+    // and `parent()` of `""` is `None`, so the walk stopped here and no
+    // include directory was ever derived. Resolving the real path is what
+    // exposed the sibling `include`, so declining an undecodable one restores
+    // exactly what those builds had before, rather than trading a slow build
+    // for a broken one. Handling such a path end to end is worth doing, but it
+    // is a different change than this one: tracked in #88.
+    //
+    // Ahead of `is_dir` only because it answers without a syscall; the two
+    // gates are independent and either order gives the same result.
+    include_dir.to_str()?;
+
+    include_dir.is_dir().then_some(include_dir)
+}
+
+/// The `cargo:rerun-if-changed` value for a located `protoc`, or `None` when
+/// there is nothing safe to emit.
+///
+/// A perfectly usable `protoc` can still yield nothing here, in two ways:
+///
+/// * **The path does not resolve from the package root.** Cargo resolves
+///   `rerun-if-changed` relative to the package root and calls a missing entry
+///   permanently dirty — it says so outright: "Dirty <crate>: the file
+///   `protoc` is missing". Emitting an unresolvable path does the opposite of
+///   what the directive is for: instead of rebuilding when protoc changes, it
+///   rebuilds always, and takes every crate downstream with it.
+/// * **The path is not UTF-8.** `rerun-if-changed` has no encoding for those
+///   bytes, but `Command` and `PATH` lookup take `OsStr`, so such a protoc
+///   runs fine. Failing the build over it would break a working configuration
+///   to protect a rebuild trigger.
+///
+/// Either way the protoc itself is still used — only this one line is dropped.
+/// The cost is that edits to the protoc binary no longer force a rebuild; the
+/// `.proto` dependency lines emitted alongside it keep the build script
+/// tracked regardless.
+///
+/// The encoding gate comes first so it is reachable without a filesystem that
+/// permits such a name — APFS and HFS+ reject non-UTF-8 filenames outright, so
+/// checking existence first would make that branch untestable on macOS.
+fn rerun_if_changed_for_protoc(protoc: &Path) -> Option<&str> {
+    let path = protoc.to_str()?;
+    protoc.try_exists().unwrap_or(false).then_some(path)
 }
 
 pub struct XaiProtoBuilder {
@@ -109,11 +151,8 @@ impl XaiProtoBuilder {
     ) -> anyhow::Result<()> {
         let includes = Vec::from_iter(includes);
 
-        if let Some(protoc) = protoc {
-            println!(
-                "cargo:rerun-if-changed={}",
-                protoc.to_str().context("protoc path not UTF-8")?
-            );
+        if let Some(path) = protoc.and_then(rerun_if_changed_for_protoc) {
+            println!("cargo:rerun-if-changed={path}");
         }
 
         // Can only process one input file when using --dependency_out=FILE.
@@ -290,5 +329,152 @@ pub fn configure() -> XaiProtoBuilder {
         pbjson_ignore_unknown_fields: false,
         pbjson_preserve_proto_field_names: false,
         file_descriptor_set_path: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir_named(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "xai-proto-build-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// The bug this guards: emitting a path Cargo cannot resolve makes the
+    /// build script permanently dirty, so every downstream crate recompiles on
+    /// every cargo invocation.
+    #[test]
+    fn an_unresolvable_protoc_emits_nothing() {
+        assert_eq!(
+            rerun_if_changed_for_protoc(Path::new("/nonexistent-aXbYcZ/protoc")),
+            None
+        );
+        assert_eq!(
+            rerun_if_changed_for_protoc(Path::new("protoc")),
+            None,
+            "the bare name resolves against the package root, where no such \
+             file exists"
+        );
+    }
+
+    #[test]
+    fn a_resolvable_protoc_is_emitted() {
+        let dir = temp_dir_named("emit");
+        let protoc = dir.join("protoc");
+        fs::write(&protoc, b"").expect("write protoc");
+
+        assert_eq!(
+            rerun_if_changed_for_protoc(&protoc),
+            Some(protoc.to_str().expect("temp path is UTF-8"))
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `PATH` entries are `OsStr`, so a `protoc` under a directory with
+    /// non-UTF-8 bytes runs perfectly well — `Command` never needs to decode
+    /// it. Only `cargo:rerun-if-changed` does, and treating that as fatal
+    /// would fail a build that had already located a working protoc, purely to
+    /// protect a rebuild trigger.
+    ///
+    /// No file is created: APFS and HFS+ refuse these names with `Illegal byte
+    /// sequence`, so a filesystem-backed version of this test could only ever
+    /// run on Linux. Because the encoding gate precedes the existence gate,
+    /// this reaches the branch under test on every platform.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_protoc_is_skipped_rather_than_failing_the_build() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        // 0xFF can never appear in UTF-8, but is a legal byte in a Linux
+        // filename.
+        let protoc = Path::new(OsStr::from_bytes(b"/usr/local/b\xffn/protoc"));
+
+        assert_eq!(
+            rerun_if_changed_for_protoc(protoc),
+            None,
+            "an undecodable path must be skipped, not raised — the previous \
+             code turned this into a build failure via `to_str()?`"
+        );
+    }
+
+    /// Why this function had no reachable non-UTF-8 case until recently: the
+    /// `PATH` branch used to return the bare name, and the walk to a sibling
+    /// `include` dies on it. Resolving the real path is what made the rest of
+    /// this behaviour reachable at all.
+    #[test]
+    fn a_bare_protoc_name_derives_no_include_dir() {
+        assert_eq!(find_protoc_include_dir(Some(Path::new("protoc"))), None);
+        assert_eq!(find_protoc_include_dir(None), None);
+    }
+
+    #[test]
+    fn a_sibling_include_dir_is_found() {
+        let root = temp_dir_named("layout");
+        fs::create_dir_all(root.join("bin")).expect("bin");
+        fs::create_dir_all(root.join("include")).expect("include");
+        let protoc = root.join("bin").join("protoc");
+        fs::write(&protoc, b"").expect("write protoc");
+
+        assert_eq!(
+            find_protoc_include_dir(Some(&protoc)),
+            Some(root.join("include"))
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A contract assertion, not a regression catch — and worth labelling as
+    /// such, because it looks like one. The path does not exist, so `is_dir`
+    /// rejects it whether or not the decode gate is there; removing the gate
+    /// leaves this test green. Proving the gate needs a directory that exists
+    /// *and* cannot be decoded, which is the Linux-only test below.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_include_dir_is_declined() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let protoc = Path::new(OsStr::from_bytes(b"/opt/we\xffird/bin/protoc"));
+
+        assert_eq!(find_protoc_include_dir(Some(protoc)), None);
+    }
+
+    /// The half that actually pins the decode gate, and it can only run where
+    /// the filesystem accepts the name: APFS and HFS+ reject non-UTF-8
+    /// filenames with `Illegal byte sequence`, so this is unconstructible on
+    /// macOS. Without the gate the directory exists, `is_dir` accepts it, and
+    /// the build fails later in `emit_rerun_if_changed` — for a protoc that
+    /// runs perfectly well and that, before #87, derived no include directory
+    /// at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_existing_non_utf8_include_dir_is_declined() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let parent = temp_dir_named("nonutf8-layout");
+        let root = parent.join(OsStr::from_bytes(b"we\xffird"));
+        fs::create_dir_all(root.join("bin")).expect("bin");
+        fs::create_dir_all(root.join("include")).expect("include");
+        let protoc = root.join("bin").join("protoc");
+        fs::write(&protoc, b"").expect("write protoc");
+
+        assert!(
+            root.join("include").is_dir(),
+            "the point of this test is an include directory that exists and \
+             cannot be decoded; without the first half `is_dir` would reject \
+             it and the decode gate would go unexercised"
+        );
+        assert_eq!(find_protoc_include_dir(Some(&protoc)), None);
+
+        fs::remove_dir_all(&parent).ok();
     }
 }
