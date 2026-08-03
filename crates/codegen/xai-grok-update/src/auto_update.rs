@@ -1276,6 +1276,13 @@ pub async fn install_internal_from_bases(
     update_config: &UpdateConfig,
     bases: &[&str],
 ) -> Result<()> {
+    // Before the download, not after it. `download_verified_from_base` writes
+    // the artifact into ~/.grok/downloads and `smoke_test_binary` *executes* it
+    // to check it runs — so refusing later would still have fetched and run an
+    // upstream binary, and left it on disk.
+    if let Some(reason) = dist_channel::self_update_refusal() {
+        anyhow::bail!("{reason}");
+    }
     let mut last_err: Option<anyhow::Error> = None;
     for (i, base) in bases.iter().enumerate() {
         match download_verified_from_base(target, update_config, base).await {
@@ -1363,6 +1370,13 @@ async fn download_verified_from_base(
     update_config: &UpdateConfig,
     gcs_base_url: &str,
 ) -> Result<VerifiedDownload> {
+    // The real pre-download choke point: both public `install_internal_*`
+    // entry points funnel through here, and everything below fetches an
+    // artifact and then *runs* it (`smoke_test_binary`). A build that must not
+    // install must not get that far.
+    if let Some(reason) = dist_channel::self_update_refusal() {
+        anyhow::bail!("{reason}");
+    }
     let (os, arch) = detect_platform()?;
     let platform = format!("{}-{}", os, arch);
 
@@ -1413,12 +1427,11 @@ async fn download_verified_from_base(
 /// binary and finish bookkeeping. Nothing here depends on which base URL
 /// served the download, so callers must not retry another base on failure.
 async fn activate_verified_download(download: &VerifiedDownload) -> Result<()> {
-    // Irreversible leaf. Downloading is recoverable — the bytes sit in a temp
-    // path nobody runs — but this function repoints the managed entrypoint at
-    // them. Both public install entry points (`install_internal_from_base` and
-    // `install_internal_from_bases`) reach here without passing through
-    // `run_install_script`, so the policy is enforced at the point of no
-    // return rather than at any one caller.
+    // Point of no return: this repoints the managed entrypoint at a downloaded
+    // binary. Unreachable on a refusing build — `download_verified_from_base`
+    // already bailed — but kept so the guarantee does not depend on the two
+    // being wired together, and so a future caller that acquires a
+    // `VerifiedDownload` some other way still cannot activate it.
     if let Some(reason) = dist_channel::self_update_refusal() {
         anyhow::bail!("{reason}");
     }

@@ -186,18 +186,21 @@ async fn ambiguous_identity_refuses_the_public_install_primitives() {
         "refusal must point at the installer: {err}"
     );
 
-    // The internal installer is allowed to fetch — the bytes land in a temp
-    // path nobody runs — but must refuse at activation, before the managed
-    // entrypoint is repointed at them.
+    // The internal installer must refuse *before* fetching. Downloading is not
+    // harmless here: the download phase writes the artifact into the state dir
+    // and then executes it to smoke-test that it runs. `expect(0)` fails the
+    // test on server drop if either endpoint is touched at all.
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/stable"))
         .respond_with(ResponseTemplate::new(200).set_body_string("9.9.9"))
+        .expect(0)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(path(format!("/grok-9.9.9-{}", common::host_platform())))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(common::small_good_artifact()))
+        .expect(0)
         .mount(&server)
         .await;
 
@@ -218,10 +221,7 @@ async fn ambiguous_identity_refuses_the_public_install_primitives() {
     );
 
     fixture.assert_no_installer_ran("after the public install primitives");
-    assert!(
-        !test_home().join("bin").exists(),
-        "no managed entrypoint may be created"
-    );
+    fixture.assert_home_untouched("after the public install primitives");
 }
 
 /// `update --check --alpha` reaches `apply_channel_switch` before the gated
