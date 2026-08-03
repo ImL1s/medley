@@ -90,13 +90,13 @@ runtime identity**, and installing both on one machine is not yet safe:
 Distinct commands, a distinct state directory, and a one-time copy migration are
 tracked in [#49](https://github.com/ImL1s/grok-build/issues/49).
 
-> [!WARNING]
-> The inherited auto-updater points at upstream's release channel
-> (`x.ai/cli/install.sh`). Letting it run on a Medley build will replace it with
-> an official Grok Build binary and silently drop the fork's features. Set
-> `auto_update = false` under `[cli]` in `~/.grok/config.toml` on a
-> source-built Medley install. Fork-published release artifacts are tracked in
-> [#29](https://github.com/ImL1s/grok-build/issues/29).
+> [!NOTE]
+> **Medley does not self-update.** The inherited updater points at upstream's
+> release channel, so running it would replace Medley with an official Grok
+> Build binary and silently drop the fork's features. Every one of its entry
+> points now refuses instead, and says so — no configuration required. To
+> upgrade, re-run [`install.sh`](install.sh). See
+> [Updates and the release channel](crates/codegen/xai-grok-pager/docs/user-guide/05-configuration.md#updates-and-the-release-channel).
 
 ## Installing
 

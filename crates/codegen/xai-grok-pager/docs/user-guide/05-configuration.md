@@ -558,6 +558,13 @@ medley version --json     # {"currentVersion":"…","channel":"…","distChannel
   distribution it belongs to cannot know whose releases are the right ones. Build
   with `MEDLEY_CHANNEL=medley cargo build --release` to stamp one yourself.
 
+An unstamped build — and only an unstamped build — honours
+`GROK_TEST_DIST_CHANNEL` to select an identity at run time. It exists so the
+inherited upstream update tests can still exercise the updater, and it is why a
+build you compiled yourself should be stamped if you distribute it. A stamped
+binary ignores the variable outright, so no published release can be talked into
+self-updating by its environment.
+
 This does not change anything for an official Grok Build install, which is built
 from upstream's sources and keeps upstream's updater.
 

@@ -21,8 +21,8 @@
 //! |--------------------------------|-------------------------|-------------|
 //! | `medley`                       | [`DistIdentity::Medley`]| refused     |
 //! | unset                          | [`DistIdentity::Unstamped`] | refused |
-//! | anything else                  | [`DistIdentity::Unknown`]   | refused |
-//! | *(dev build + test override)*  | [`DistIdentity::Upstream`]  | allowed |
+//! | anything else, blank included  | [`DistIdentity::Unknown`]   | refused |
+//! | *(unstamped + test override)*  | [`DistIdentity::Upstream`]  | allowed |
 //!
 //! A medley build refuses rather than updating because this fork ships through
 //! `install.sh` (GitHub releases, SHA-256 verified, launcher + `versions/`
@@ -75,11 +75,16 @@ pub enum DistIdentity {
 
 impl DistIdentity {
     /// Short machine-readable name, for `version --json` and diagnostics.
+    ///
+    /// A blank stamp reports `unknown` rather than an empty string: the field
+    /// is meant to be readable by a human debugging a build, and `""` says
+    /// nothing that `unknown` does not say better.
     pub fn name(&self) -> &str {
         match self {
             Self::Medley => MEDLEY_CHANNEL,
             Self::Upstream => UPSTREAM_CHANNEL,
             Self::Unstamped => "unknown",
+            Self::Unknown(raw) if raw.trim().is_empty() => "unknown",
             Self::Unknown(raw) => raw,
         }
     }
@@ -108,14 +113,24 @@ pub enum SelfUpdate {
 /// Pure identity resolution.
 ///
 /// `stamp` is the compile-time [`DIST_CHANNEL_STAMP`]; `test_override` is the
-/// run-time [`TEST_DIST_CHANNEL_ENV`] value. **A present stamp always wins** —
-/// that asymmetry is what keeps a published binary's identity out of the
+/// run-time [`TEST_DIST_CHANNEL_ENV`] value. **Any stamp at all wins** — that
+/// asymmetry is what keeps a published binary's identity out of the
 /// environment's reach.
+///
+/// "Any stamp at all" is deliberately the raw `Option`, not a trimmed one. A
+/// build that set `MEDLEY_CHANNEL=""` did try to declare an identity and got it
+/// wrong; treating that as *unstamped* would hand the environment a way to
+/// choose upstream on a build the pipeline had touched. A blank stamp is
+/// therefore ambiguous, and ambiguous never consults the override.
 pub fn resolve_identity(stamp: Option<&str>, test_override: Option<&str>) -> DistIdentity {
-    match non_empty(stamp) {
-        Some(value) => classify(value),
-        // Unstamped builds only: a dev build running the inherited update
-        // suites, or a developer reproducing a distribution's behaviour.
+    match stamp {
+        Some(raw) => match non_empty(Some(raw)) {
+            Some(value) => classify(value),
+            // Stamped, but with nothing usable in it.
+            None => DistIdentity::Unknown(raw.to_string()),
+        },
+        // Genuinely unstamped builds only: a dev build running the inherited
+        // update suites, or a developer reproducing a distribution's behaviour.
         None => match non_empty(test_override) {
             Some(value) => classify(value),
             None => DistIdentity::Unstamped,
@@ -147,6 +162,11 @@ pub fn decide(identity: &DistIdentity) -> SelfUpdate {
         DistIdentity::Upstream => SelfUpdate::Allowed,
         DistIdentity::Medley => SelfUpdate::Refused(RefusalReason::ForkBuild),
         DistIdentity::Unstamped => {
+            SelfUpdate::Refused(RefusalReason::AmbiguousIdentity { stamp: None })
+        }
+        // A blank stamp is reported as "no marker" rather than echoed: quoting
+        // an empty string back at the user explains nothing.
+        DistIdentity::Unknown(raw) if raw.trim().is_empty() => {
             SelfUpdate::Refused(RefusalReason::AmbiguousIdentity { stamp: None })
         }
         DistIdentity::Unknown(raw) => SelfUpdate::Refused(RefusalReason::AmbiguousIdentity {
@@ -224,17 +244,30 @@ mod tests {
                 DistIdentity::Unstamped,
                 SelfUpdate::Refused(RefusalReason::AmbiguousIdentity { stamp: None }),
             ),
-            // Empty/whitespace stamps are no stamp at all, not an identity.
+            // A blank stamp is a botched declaration, not the absence of one:
+            // ambiguous, and it must not fall through to the override.
             (
                 Some(""),
                 None,
-                DistIdentity::Unstamped,
+                DistIdentity::Unknown(String::new()),
                 SelfUpdate::Refused(RefusalReason::AmbiguousIdentity { stamp: None }),
             ),
             (
                 Some("   "),
                 None,
-                DistIdentity::Unstamped,
+                DistIdentity::Unknown("   ".to_string()),
+                SelfUpdate::Refused(RefusalReason::AmbiguousIdentity { stamp: None }),
+            ),
+            (
+                Some(""),
+                Some(UPSTREAM_CHANNEL),
+                DistIdentity::Unknown(String::new()),
+                SelfUpdate::Refused(RefusalReason::AmbiguousIdentity { stamp: None }),
+            ),
+            (
+                Some("   "),
+                Some(UPSTREAM_CHANNEL),
+                DistIdentity::Unknown("   ".to_string()),
                 SelfUpdate::Refused(RefusalReason::AmbiguousIdentity { stamp: None }),
             ),
             // A stamp from some other distribution is ambiguous, not trusted.
@@ -305,10 +338,21 @@ mod tests {
             );
         }
 
-        // Same for a stamp this binary does not know: still not upstream.
-        let identity = resolve_identity(Some("acme-grok"), Some(UPSTREAM_CHANNEL));
-        assert_eq!(identity, DistIdentity::Unknown("acme-grok".to_string()));
-        assert!(matches!(decide(&identity), SelfUpdate::Refused(_)));
+        // Every stamp that is not literally absent must resist the override —
+        // a malformed one most of all, since that is the case an attacker or a
+        // broken pipeline can most easily produce.
+        for stamp in ["acme-grok", "", "   ", "MEDLEY", "medley\u{0}"] {
+            let identity = resolve_identity(Some(stamp), Some(UPSTREAM_CHANNEL));
+            assert_ne!(
+                identity,
+                DistIdentity::Upstream,
+                "stamp {stamp:?} must not be overridable into upstream"
+            );
+            assert!(
+                matches!(decide(&identity), SelfUpdate::Refused(_)),
+                "stamp {stamp:?} with an upstream override must still refuse"
+            );
+        }
     }
 
     /// Channel names are matched exactly; casing is not a distribution.
@@ -373,5 +417,7 @@ mod tests {
         assert_eq!(DistIdentity::Upstream.name(), "upstream");
         assert_eq!(DistIdentity::Unstamped.name(), "unknown");
         assert_eq!(DistIdentity::Unknown("acme".to_string()).name(), "acme");
+        assert_eq!(DistIdentity::Unknown(String::new()).name(), "unknown");
+        assert_eq!(DistIdentity::Unknown("  ".to_string()).name(), "unknown");
     }
 }

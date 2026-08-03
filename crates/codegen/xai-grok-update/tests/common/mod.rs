@@ -35,6 +35,22 @@ use std::sync::OnceLock;
 // GROK_HOME isolation
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Select the upstream distribution identity for this test process.
+///
+/// These suites exercise the inherited upstream updater, which a fork build
+/// refuses to run at all (see `xai_grok_update::dist_channel`). Test binaries
+/// carry no `MEDLEY_CHANNEL` stamp, so they are allowed to select an identity;
+/// a stamped release binary ignores this variable entirely.
+///
+/// Called from both per-binary entry points — [`test_home`] and
+/// [`FakeBinGuard::install`] — so a test that reaches the updater through
+/// either one is covered regardless of the order tests happen to run in.
+/// Idempotent.
+pub fn use_upstream_dist_channel() {
+    // SAFETY: tests using these helpers must be `#[serial]`.
+    unsafe { std::env::set_var("GROK_TEST_DIST_CHANNEL", "upstream") };
+}
+
 /// Returns a process-wide test `GROK_HOME`, initialized exactly once per test
 /// binary. Once initialized, `xai_grok_config::grok_home()` will resolve to
 /// this directory for the lifetime of the process.
@@ -47,16 +63,11 @@ pub fn test_home() -> &'static PathBuf {
     HOME.get_or_init(|| {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.keep();
+        use_upstream_dist_channel();
         // SAFETY: called once at OnceLock init, before any other thread touches
         // these env vars. Tests using this helper must be `#[serial]`.
         unsafe {
             std::env::set_var("GROK_HOME", &path);
-            // The suites below exercise the inherited upstream updater, which
-            // a fork build refuses to run at all (see
-            // `xai_grok_update::dist_channel`). Test binaries are unstamped, so
-            // they may select the upstream identity; a stamped release binary
-            // ignores this variable entirely.
-            std::env::set_var("GROK_TEST_DIST_CHANNEL", "upstream");
             std::env::remove_var("GROK_TEST_VERSION");
             std::env::remove_var("NPM_TOKEN");
             std::env::remove_var("GROK_INSTALLER");
@@ -194,6 +205,11 @@ impl FakeBinGuard {
     where
         F: FnOnce(&Path) -> String,
     {
+        // Faking an installer on PATH means exercising the upstream update
+        // path, which is gated on distribution identity. Doing it here rather
+        // than only in `test_home` means suites that never touch `GROK_HOME`
+        // (the `install_npm` subprocess tests) are covered too.
+        use_upstream_dist_channel();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
         let body = script_body(&dir);

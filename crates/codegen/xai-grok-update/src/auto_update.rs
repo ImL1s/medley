@@ -841,9 +841,11 @@ pub async fn run_install_script(
     target: Option<&str>,
     update_config: &UpdateConfig,
 ) -> Result<()> {
-    // Last line of defence. Every caller above already checks, but this is the
-    // one function that overwrites the running binary, so it refuses on its own
-    // authority rather than trusting that a future caller remembered to ask.
+    // Refuses on its own authority rather than trusting that every caller
+    // remembered to ask. It is not the last line of defence — the public
+    // `install_internal_from_base*` and `install_npm_for_test` entry points
+    // skip this function entirely — so the irreversible leaves
+    // (`activate_verified_download`, `install_npm`) each carry the same check.
     if let Some(reason) = dist_channel::self_update_refusal() {
         anyhow::bail!("{reason}");
     }
@@ -1093,6 +1095,12 @@ async fn download_range(
 /// If the server provides a `Content-Length` header, a determinate bar is shown
 /// with bytes downloaded, total size, and ETA. Otherwise a spinner with a byte
 /// counter is used as a fallback.
+///
+/// Deliberately not gated by [`crate::dist_channel`]: this writes bytes to a
+/// path its caller chose and activates nothing, so on its own it cannot replace
+/// the installed CLI. The distribution check sits on
+/// [`activate_verified_download`], the step that repoints the managed
+/// entrypoint at a downloaded binary.
 #[doc(hidden)]
 pub async fn download_with_progress(url: &str, dest: &std::path::Path) -> Result<()> {
     // Try parallel byte-range first. Falls through to single-connection on any
@@ -1405,6 +1413,15 @@ async fn download_verified_from_base(
 /// binary and finish bookkeeping. Nothing here depends on which base URL
 /// served the download, so callers must not retry another base on failure.
 async fn activate_verified_download(download: &VerifiedDownload) -> Result<()> {
+    // Irreversible leaf. Downloading is recoverable — the bytes sit in a temp
+    // path nobody runs — but this function repoints the managed entrypoint at
+    // them. Both public install entry points (`install_internal_from_base` and
+    // `install_internal_from_bases`) reach here without passing through
+    // `run_install_script`, so the policy is enforced at the point of no
+    // return rather than at any one caller.
+    if let Some(reason) = dist_channel::self_update_refusal() {
+        anyhow::bail!("{reason}");
+    }
     let grok_home = grok_home();
     let download_dir = grok_home.join("downloads");
     let bin_dir = grok_home.join("bin");
@@ -2346,6 +2363,14 @@ pub fn install_npm_for_test(
 }
 
 fn install_npm(target: Option<&str>, channel: &str, npm_registry: Option<&str>) -> Result<()> {
+    // Irreversible leaf: everything below spawns `npm i -g @xai-official/grok`,
+    // which replaces the globally installed CLI. `install_npm_for_test` is a
+    // public door into this function, so it is gated here rather than only in
+    // `run_install_script`.
+    if let Some(reason) = dist_channel::self_update_refusal() {
+        anyhow::bail!("{reason}");
+    }
+
     // Warn on macOS about potential impact on other running processes.
     #[cfg(target_os = "macos")]
     warn_if_other_grok_processes_running();
@@ -2415,6 +2440,15 @@ fn install_npm(target: Option<&str>, channel: &str, npm_registry: Option<&str>) 
 }
 
 pub async fn apply_channel_switch(channel_switch: Option<&str>, update_config: &mut UpdateConfig) {
+    // The channel only selects between upstream's release pointers, which a
+    // build that refuses to self-update never reads. Persisting the switch
+    // would leave a setting that does nothing but claims otherwise — and
+    // `update --check --alpha` reaches this before the gated status call, so
+    // the check has to live here rather than at that one caller.
+    if let Some(reason) = dist_channel::self_update_refusal() {
+        tracing::debug!("self-update disabled for this build: {reason}");
+        return;
+    }
     if let Some(ch) = channel_switch
         && update_config.channel != ch
     {
