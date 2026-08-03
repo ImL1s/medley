@@ -1,6 +1,6 @@
 # Terminal Support and Troubleshooting
 
-Grok Build runs as a full-screen TUI. It relies on terminal support for color,
+Medley runs as a full-screen TUI. It relies on terminal support for color,
 clipboard, keyboard input, mouse input, and full-screen display. Terminals,
 multiplexers, containers, and SSH sessions can handle these features differently.
 
@@ -130,7 +130,7 @@ backup file so you can retrieve the text. Run `/doctor` for other copy options.
 #### Apple Terminal over SSH
 
 Apple Terminal does not support OSC 52, so a remote copy cannot reach the local
-clipboard. Each copy is still saved to a backup file (`~/.grok/last-copy.txt` by
+clipboard. Each copy is still saved to a backup file (`~/.medley/last-copy.txt` by
 default; override with `GROK_COPY_FILE`); the toast names that path when delivery
 is unverified or the clipboard is unreachable. You can also use `/copy <file>` or
 `/minimal`.
@@ -144,7 +144,8 @@ When an SSH session is not using `grok wrap`, Grok shows the one-time tip
 “Run `/doctor` for details and fixes.” The tip stops appearing after the session
 is launched through wrap. Turn it off with `/settings` → **Show contextual
 hints** → **SSH wrap**, or set `ssh_wrap = false` under
-`[ui.contextual_hints]` in `$GROK_HOME/config.toml`. This setting does not hide
+`[ui.contextual_hints]` in the state directory's `config.toml` (default
+`~/.medley/config.toml`). This setting does not hide
 the Doctor recommendation.
 
 For repeated SSH use, Doctor offers `grok doctor fix ssh-wrap`. It also shows
@@ -164,7 +165,7 @@ check.
 
 Zellij and tmux control mode can limit the alternate screen. Grok normally uses
 inline mode in those environments. Run `/doctor` to see the detected condition.
-You can configure `[terminal] alt_screen` in `~/.grok/pager.toml`, or run
+You can configure `[terminal] alt_screen` in `~/.medley/pager.toml`, or run
 `grok --no-alt-screen` to confirm inline mode works.
 
 ### Zellij keybindings interfere with Grok

@@ -43,7 +43,7 @@ Grok also scans home-level rules, regardless of where it starts. These roots are
 
 | Location | Notes |
 |----------|-------|
-| `$GROK_HOME/rules/` (default `~/.grok/rules/`) | Always scanned; applies to all projects |
+| `rules/` in the state directory (default `~/.medley/rules/`) | Always scanned; applies to all projects |
 | `~/.claude/rules/` | Controlled by `compat.claude.rules` |
 | `~/.cursor/rules/` | Controlled by `compat.cursor.rules` |
 
@@ -55,7 +55,7 @@ Home rules load first, in the table order, followed by project files from repo r
 
 Grok scans for project rules in this order:
 
-1. **Home rules**: `$GROK_HOME`, then enabled `~/.claude/` and `~/.cursor/` sources
+1. **Home rules**: the state directory, then enabled `~/.claude/` and `~/.cursor/` sources
 2. **Repo rules**: If inside a git repo, every directory from the repo root down to the current working directory (inclusive)
 3. **CWD-only**: If not inside a git repo, only the current working directory
 
@@ -201,7 +201,7 @@ Beyond AGENTS.md files, the `.grok/` directory in your project root can contain 
 
 | Path | Purpose |
 |------|---------|
-| `.grok/config.toml` | Project-scoped MCP servers, plugins, and permission rules (other settings load only from `~/.grok/config.toml`) |
+| `.grok/config.toml` | Project-scoped MCP servers, plugins, and permission rules (other settings load only from `~/.medley/config.toml`) |
 | `.grok/skills/` | Project-scoped skill definitions |
 | `.grok/plugins/` | Project-scoped plugins |
 | `.grok/agents/` | Project-scoped agent definitions |
@@ -234,7 +234,7 @@ This shows each project instruction file it finds, with its path and approximate
 
 4. **Use subdirectory scoping for large repos.** Different parts of a monorepo may have different conventions. Use per-directory AGENTS.md to scope rules appropriately.
 
-5. **Version control your rules.** Commit AGENTS.md to the repository so the whole team benefits. User-specific overrides belong in `~/.grok/` (global rules).
+5. **Version control your rules.** Commit AGENTS.md to the repository so the whole team benefits. User-specific overrides belong in `~/.medley/` (global rules).
 
 6. **Do not duplicate documentation.** AGENTS.md should contain actionable instructions, not a copy of your project's README. Link to external docs if needed.
 

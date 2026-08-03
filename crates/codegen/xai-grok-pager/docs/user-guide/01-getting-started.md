@@ -1,6 +1,6 @@
 # Getting Started
 
-Grok Build is a terminal-based AI coding assistant from SpaceXAI. It runs as a TUI (Terminal User Interface) that understands your codebase, executes shell commands, edits files, searches the web, and manages tasks.
+Medley is a terminal-based AI coding assistant: a community multi-provider fork of Grok Build, SpaceXAI's terminal coding agent. It runs as a TUI (Terminal User Interface) that understands your codebase, executes shell commands, edits files, searches the web, and manages tasks.
 
 You can use it interactively as a full-screen TUI, run it headlessly for scripting and CI/CD, or integrate it into editors via the Agent Client Protocol (ACP).
 
@@ -12,11 +12,14 @@ You can use it interactively as a full-screen TUI, run it headlessly for scripti
 > [Medley](https://github.com/ImL1s/grok-build), the community fork you are
 > reading these docs from. `x.ai/cli/install.sh`, `install.ps1`, and `grok update`
 > all fetch the official build; running them over a Medley install replaces it and
-> drops the fork's multi-provider features. Build Medley from source instead (see
-> the fork's README), and set `auto_update = false` under `[cli]` in
-> `~/.grok/config.toml`. Fork installer docs are tracked in
-> [#28](https://github.com/ImL1s/grok-build/issues/28), fork release artifacts in
-> [#29](https://github.com/ImL1s/grok-build/issues/29).
+> drops the fork's multi-provider features. Install Medley with the fork's own
+> [`install.sh`](https://github.com/ImL1s/grok-build#installing) — it ships the
+> binary as `medley` and keeps state in `~/.medley` — or build it from source.
+> Either way, set `auto_update = false` under `[cli]` in `~/.medley/config.toml`
+> so the inherited updater cannot swap the fork out. Fork release artifacts are
+> tracked in [#29](https://github.com/ImL1s/grok-build/issues/29), and replacing
+> the upstream installer text below in
+> [#28](https://github.com/ImL1s/grok-build/issues/28).
 
 Install the latest stable release (macOS, Linux, or Windows via Git Bash):
 
@@ -66,7 +69,7 @@ Start Grok by running:
 grok
 ```
 
-On first launch, Grok opens your browser to authenticate with grok.com. After you sign in, Grok stores your credentials in `~/.grok/auth.json`, where they persist across sessions. Grok refreshes your credentials automatically and prompts you to sign in again when they can no longer be renewed.
+On first launch, Grok opens your browser to authenticate with grok.com. After you sign in, Grok stores your credentials in `~/.medley/auth.json`, where they persist across sessions. Grok refreshes your credentials automatically and prompts you to sign in again when they can no longer be renewed.
 
 If you prefer API key authentication (e.g., for CI/CD or environments without a browser), set the `XAI_API_KEY` environment variable instead:
 
@@ -121,7 +124,7 @@ By default, Grok asks for permission before executing shell commands or editing 
 
 ### Sessions
 
-Every conversation is a **session**. Sessions are automatically saved to `~/.grok/sessions/` and can be resumed later. Each session tracks the full conversation history, tool calls, file edits, and task state.
+Every conversation is a **session**. Sessions are automatically saved to `~/.medley/sessions/` and can be resumed later. Each session tracks the full conversation history, tool calls, file edits, and task state.
 
 - Start a new session: `Ctrl+N` or `/new`
 - Resume a previous session: `/resume` in the TUI, or `--resume <ID>` from the CLI
@@ -246,9 +249,9 @@ grok -p "Review changes for bugs" --output-format json --yolo | jq -r '.text'
 Add per-project instructions by creating an `AGENTS.md` file in your repository. Grok reads these files and injects their contents as a project-instructions message at the start of the conversation:
 
 ```
-~/.grok/AGENTS.md           # Global rules (apply to all projects)
-<repo-root>/AGENTS.md       # Repository-level rules
-<cwd>/AGENTS.md             # Directory-level rules (highest priority)
+~/.medley/AGENTS.md     # Global rules (apply to all projects)
+<repo-root>/AGENTS.md   # Repository-level rules
+<cwd>/AGENTS.md         # Directory-level rules (highest priority)
 ```
 
 Deeper files take precedence. Grok also reads `CLAUDE.md` files for compatibility.
