@@ -31,11 +31,15 @@ fn is_github_actions() -> bool {
 /// `cargo:rerun-if-changed`. Returns `None` when `PATH` is unset or nothing in
 /// it matches, leaving the caller to decide what to do.
 fn protoc_on_path() -> Option<PathBuf> {
-    protoc_in_dirs(env::split_paths(&env::var_os("PATH")?))
+    protoc_in_dirs(
+        env::split_paths(&env::var_os("PATH")?),
+        env::current_dir().ok().as_deref(),
+    )
 }
 
 /// Pure half of [`protoc_on_path`]. Split out because `PATH` is process-global
-/// state: a test that set it would race every other test in the binary.
+/// state: a test that set it would race every other test in the binary. `cwd`
+/// is passed in for the same reason.
 ///
 /// Candidates are accepted only if they actually **run**, not merely exist.
 /// The OS skips unusable entries during its own `PATH` lookup, so a directory
@@ -43,8 +47,24 @@ fn protoc_on_path() -> Option<PathBuf> {
 /// `check_protoc_good("protoc")` — but picking it here would hand that path to
 /// `protoc_executable` and fail the build with `PermissionDenied`, having
 /// resolved a `protoc` the caller had already proven works.
-fn protoc_in_dirs(dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+///
+/// An empty `PATH` component means the current directory (POSIX), and joining
+/// one naively yields the bare name `protoc` — the very value this function
+/// exists to avoid returning. It would also defeat the runnability check
+/// above, because `Command::new` performs its own `PATH` lookup for a name
+/// with no separator: an unusable `protoc` in the working directory would be
+/// validated by a *different*, working one further down `PATH`, and the bare
+/// name handed back regardless. With no working directory to resolve against
+/// there is no path to return, so the component is skipped.
+fn protoc_in_dirs(dirs: impl IntoIterator<Item = PathBuf>, cwd: Option<&Path>) -> Option<PathBuf> {
     dirs.into_iter()
+        .filter_map(|dir| {
+            if dir.as_os_str().is_empty() {
+                cwd.map(Path::to_path_buf)
+            } else {
+                Some(dir)
+            }
+        })
         .map(|dir| dir.join("protoc"))
         .find(|candidate| {
             // `try_exists` first: cheap, and skips the subprocess for the
@@ -172,7 +192,7 @@ mod tests {
         let dir = stub_protoc_dir("resolvable");
         let protoc = dir.join("protoc");
 
-        let found = protoc_in_dirs([dir.clone()]).expect("stub is on the search path");
+        let found = protoc_in_dirs([dir.clone()], None).expect("stub is on the search path");
 
         assert_eq!(found, protoc);
         assert!(
@@ -195,7 +215,7 @@ mod tests {
     #[test]
     fn absent_candidates_are_skipped() {
         assert_eq!(
-            protoc_in_dirs([PathBuf::from("/nonexistent-aXbYcZ/bin")]),
+            protoc_in_dirs([PathBuf::from("/nonexistent-aXbYcZ/bin")], None),
             None
         );
     }
@@ -221,7 +241,7 @@ mod tests {
         std::fs::write(shadow.join("protoc"), b"not executable\n").expect("write shadow");
 
         assert_eq!(
-            protoc_in_dirs([shadow.clone(), good.clone()]),
+            protoc_in_dirs([shadow.clone(), good.clone()], None),
             Some(good.join("protoc")),
             "a protoc that cannot run must not shadow one that can"
         );
@@ -235,7 +255,7 @@ mod tests {
         std::fs::create_dir_all(dir_shadow.join("protoc")).expect("temp dir");
 
         assert_eq!(
-            protoc_in_dirs([dir_shadow.clone(), good.clone()]),
+            protoc_in_dirs([dir_shadow.clone(), good.clone()], None),
             Some(good.join("protoc")),
             "a directory named protoc must not shadow a real one"
         );
@@ -243,5 +263,40 @@ mod tests {
         for d in [good, shadow, dir_shadow] {
             std::fs::remove_dir_all(d).ok();
         }
+    }
+
+    /// `PATH=/usr/bin:` has three components, and the third is empty. POSIX
+    /// reads that as the current directory; `PathBuf::join` reads it as
+    /// nothing at all and produces the bare `protoc` — reintroducing exactly
+    /// the unresolvable value this module exists to eliminate, by a route the
+    /// runnability check cannot catch, since `Command::new("protoc")` would
+    /// happily validate it against some other directory on `PATH`.
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_path_entry_resolves_against_the_working_directory() {
+        let cwd = stub_protoc_dir("emptyentry");
+
+        let found =
+            protoc_in_dirs([PathBuf::new()], Some(&cwd)).expect("the working directory has one");
+
+        assert_eq!(found, cwd.join("protoc"));
+        assert_ne!(
+            found,
+            PathBuf::from("protoc"),
+            "an empty component must name the working directory, not collapse \
+             to the bare name"
+        );
+
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// With no working directory there is nothing for an empty component to
+    /// mean, and the bare name is not an acceptable substitute. A contract
+    /// assertion rather than a regression catch: the pre-fix code also
+    /// returned `None` here, because `protoc` does not resolve from the
+    /// package root — which is the whole problem.
+    #[test]
+    fn an_empty_path_entry_without_a_working_directory_is_skipped() {
+        assert_eq!(protoc_in_dirs([PathBuf::new()], None), None);
     }
 }

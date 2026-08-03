@@ -23,11 +23,24 @@ fn find_protoc_include_dir(protoc: Option<&Path>) -> Option<PathBuf> {
     let grandparent = parent.parent()?; // .../
     let include_dir = grandparent.join("include");
 
-    if include_dir.is_dir() {
-        Some(include_dir)
-    } else {
-        None
-    }
+    // Everything downstream needs this decoded — the `-I` flag is built with
+    // `format!`, and protoc's dependency output is read back as UTF-8 — so an
+    // undecodable include directory fails the build rather than being used.
+    //
+    // Discovering it at all is new. This is reached from a `protoc` resolved
+    // off `PATH`, which used to be the bare name: `parent()` of that is `""`
+    // and `parent()` of `""` is `None`, so the walk stopped here and no
+    // include directory was ever derived. Resolving the real path is what
+    // exposed the sibling `include`, so declining an undecodable one restores
+    // exactly what those builds had before, rather than trading a slow build
+    // for a broken one. Handling such a path end to end is worth doing, but it
+    // is a different change than this one: tracked in #88.
+    //
+    // Ahead of `is_dir` only because it answers without a syscall; the two
+    // gates are independent and either order gives the same result.
+    include_dir.to_str()?;
+
+    include_dir.is_dir().then_some(include_dir)
 }
 
 /// The `cargo:rerun-if-changed` value for a located `protoc`, or `None` when
@@ -390,5 +403,78 @@ mod tests {
             "an undecodable path must be skipped, not raised — the previous \
              code turned this into a build failure via `to_str()?`"
         );
+    }
+
+    /// Why this function had no reachable non-UTF-8 case until recently: the
+    /// `PATH` branch used to return the bare name, and the walk to a sibling
+    /// `include` dies on it. Resolving the real path is what made the rest of
+    /// this behaviour reachable at all.
+    #[test]
+    fn a_bare_protoc_name_derives_no_include_dir() {
+        assert_eq!(find_protoc_include_dir(Some(Path::new("protoc"))), None);
+        assert_eq!(find_protoc_include_dir(None), None);
+    }
+
+    #[test]
+    fn a_sibling_include_dir_is_found() {
+        let root = temp_dir_named("layout");
+        fs::create_dir_all(root.join("bin")).expect("bin");
+        fs::create_dir_all(root.join("include")).expect("include");
+        let protoc = root.join("bin").join("protoc");
+        fs::write(&protoc, b"").expect("write protoc");
+
+        assert_eq!(
+            find_protoc_include_dir(Some(&protoc)),
+            Some(root.join("include"))
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A contract assertion, not a regression catch — and worth labelling as
+    /// such, because it looks like one. The path does not exist, so `is_dir`
+    /// rejects it whether or not the decode gate is there; removing the gate
+    /// leaves this test green. Proving the gate needs a directory that exists
+    /// *and* cannot be decoded, which is the Linux-only test below.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_include_dir_is_declined() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let protoc = Path::new(OsStr::from_bytes(b"/opt/we\xffird/bin/protoc"));
+
+        assert_eq!(find_protoc_include_dir(Some(protoc)), None);
+    }
+
+    /// The half that actually pins the decode gate, and it can only run where
+    /// the filesystem accepts the name: APFS and HFS+ reject non-UTF-8
+    /// filenames with `Illegal byte sequence`, so this is unconstructible on
+    /// macOS. Without the gate the directory exists, `is_dir` accepts it, and
+    /// the build fails later in `emit_rerun_if_changed` — for a protoc that
+    /// runs perfectly well and that, before #87, derived no include directory
+    /// at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_existing_non_utf8_include_dir_is_declined() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let parent = temp_dir_named("nonutf8-layout");
+        let root = parent.join(OsStr::from_bytes(b"we\xffird"));
+        fs::create_dir_all(root.join("bin")).expect("bin");
+        fs::create_dir_all(root.join("include")).expect("include");
+        let protoc = root.join("bin").join("protoc");
+        fs::write(&protoc, b"").expect("write protoc");
+
+        assert!(
+            root.join("include").is_dir(),
+            "the point of this test is an include directory that exists and \
+             cannot be decoded; without the first half `is_dir` would reject \
+             it and the decode gate would go unexercised"
+        );
+        assert_eq!(find_protoc_include_dir(Some(&protoc)), None);
+
+        fs::remove_dir_all(&parent).ok();
     }
 }
