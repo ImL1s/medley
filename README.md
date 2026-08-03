@@ -1,6 +1,8 @@
 <div align="center">
 
-<h1>Medley</h1>
+<img src="docs/assets/logo.png" alt="Medley logo" width="128" height="128" />
+
+# Medley
 
 **A community multi-provider fork of [Grok Build](https://github.com/xai-org/grok-build).**
 
@@ -9,6 +11,10 @@ that reads your codebase, edits files, runs shell commands, searches the web,
 and manages long-running tasks — and adds provider choice on top of it: a
 provider-scoped OpenAI Codex login, any OpenAI-compatible endpoint, and keyless
 local models, each with its credentials kept in its own lane.
+
+<p>
+<img src="docs/assets/hero.jpg" alt="Medley: many providers, one terminal agent" width="920" />
+</p>
 
 [Fork notice](#fork-notice) ·
 [What Medley adds](#what-medley-adds) ·
