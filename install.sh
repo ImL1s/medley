@@ -122,19 +122,56 @@ resolve_version() {
     return
   fi
 
-  resolve_body="$(fetch_to_stdout "https://api.github.com/repos/${REPO}/releases/latest")" ||
-    die "could not reach the GitHub release API for ${REPO}. Set MEDLEY_VERSION to install a specific version."
+  # The fetch is unchanged from what this script has always done, and the
+  # `|| resolve_body=''` discards whatever a failed transfer left behind rather
+  # than parsing it. Everything below the parse only ever produces a *message* —
+  # this function grew a better diagnosis, not a new way to choose a version.
+  #
+  # What this is NOT is a strict 2xx gate, and the comment must not pretend
+  # otherwise: `--fail` errors on HTTP 400 and above, so a final 3xx can still
+  # exit zero carrying a body, and a downloader's internal retry can leave an
+  # earlier attempt's bytes on stdout ahead of the good ones. Both predate this
+  # change; closing them needs the response written to a file with its status
+  # asserted explicitly, which is more than a better error message should
+  # smuggle in. Tracked separately.
+  resolve_body="$(
+    fetch_to_stdout "https://api.github.com/repos/${REPO}/releases/latest"
+  )" || resolve_body=''
 
-  resolve_tag="$(
-    printf '%s\n' "$resolve_body" |
-      sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
-      head -n 1
-  )"
+  if [ -n "$resolve_body" ]; then
+    resolve_tag="$(
+      printf '%s\n' "$resolve_body" |
+        sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+        head -n 1
+    )"
 
-  [ -n "$resolve_tag" ] ||
-    die "${REPO} has no published release yet. Publish the draft release, or set MEDLEY_VERSION."
+    if [ -n "$resolve_tag" ]; then
+      printf '%s\n' "${resolve_tag#v}"
+      return
+    fi
+  fi
 
-  printf '%s\n' "${resolve_tag#v}"
+  # No tag. The downloader collapsed every reason into one exit code, and the
+  # old message picked the worst reading of it: GitHub answers 404 when a
+  # repository has no release published as latest, which this reported as an
+  # unreachable network. That is what it actually printed against this
+  # repository, whose only release was a prerelease.
+  #
+  # One extra request separates the two readings better than guessing does.
+  # It runs only here, so a successful install still costs a single request,
+  # and it cannot influence which version is installed — a tag has already
+  # returned above, and both branches below end in `die`.
+  #
+  # Deliberately not parsed: the error body. Reading it would mean drawing
+  # conclusions from a transfer that failed.
+  if fetch_to_stdout "https://api.github.com/repos/${REPO}" >/dev/null 2>&1; then
+    die "could not resolve the latest release of ${REPO}, though the repository responded. The likeliest cause is that nothing is published as latest yet — drafts and prereleases are both excluded, so publish the draft release the release workflow created. Otherwise GitHub returned something unusable; retry, or set MEDLEY_VERSION to install a specific tag."
+  fi
+  # No pointer at "the error above": Wget is invoked with --quiet, so on a
+  # curl-less host there is nothing above to point at. Promising a diagnosis
+  # this script did not produce is the same overclaiming the messages were just
+  # corrected for.
+  die "could not read ${REPO} from GitHub. Common causes: no network or DNS, a proxy or TLS interception, GitHub rate-limiting this host, an outage, or a repository that is private or does not exist. Retry later, check MEDLEY_REPO, or set MEDLEY_VERSION to install a specific tag."
 }
 
 # Collapse '.' and '..' textually. Only ever called on a path whose existing
