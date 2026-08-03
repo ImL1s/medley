@@ -165,14 +165,6 @@ not start, so the number above is asserted, not aspirational. Lowering it —
 static musl builds, or building against an older glibc in a container — is
 tracked in [#82](https://github.com/ImL1s/medley/issues/82).
 
-> [!IMPORTANT]
-> The installer resolves the **latest published release**, and this repository
-> has not published one carrying artifacts yet: the release workflow deliberately
-> uploads to a **draft** that a maintainer publishes by hand. Until a release is
-> published the one-liner above fails at the download step, and building from
-> source is the working path. Tracked in
-> [#29](https://github.com/ImL1s/medley/issues/29).
-
 ### Building from source
 
 Requirements:
