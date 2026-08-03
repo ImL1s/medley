@@ -157,10 +157,25 @@ resolve_version() {
   )"
 
   if [ -z "$resolve_tag" ]; then
-    # "no release published as latest" and "this repository does not exist"
-    # are both a 404 carrying the identical {"message":"Not Found"} body, so
-    # ask about the repository itself before blaming the release channel and
-    # telling someone with a typo in MEDLEY_REPO to go publish a draft.
+    # Every GitHub API refusal arrives as {"message": ...}, and they are not
+    # interchangeable. An unauthenticated client that has exhausted the hourly
+    # rate limit gets 403 with a body, which would otherwise fall through the
+    # 404 reasoning below and be reported as a missing repository.
+    resolve_message="$(
+      printf '%s\n' "$resolve_body" |
+        sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+        head -n 1
+    )"
+
+    if [ "$resolve_message" != "Not Found" ]; then
+      die "the GitHub release API rejected the request for ${REPO}${resolve_message:+ (${resolve_message})}. Set MEDLEY_VERSION to install a specific tag."
+    fi
+
+    # 404 stays ambiguous: "no release published as latest" and "this
+    # repository does not exist" carry a byte-identical body. Only the
+    # repository endpoint separates them, so ask it before telling someone
+    # with a typo in MEDLEY_REPO to go publish a draft release. Error path
+    # only — the success path still costs a single request.
     if fetch_to_stdout "https://api.github.com/repos/${REPO}" >/dev/null 2>&1; then
       die "${REPO} has no release published as latest. Drafts and prereleases are both excluded, so publish the draft release the release workflow created — or set MEDLEY_VERSION to install a specific tag."
     fi
