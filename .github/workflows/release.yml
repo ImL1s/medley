@@ -527,6 +527,59 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # The dependency graph is a property of the source, not of any one
+      # target, so this runs once here rather than four times in the matrix.
+      - name: Check out the release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          path: src
+
+      - name: Generate the SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: src
+          format: cyclonedx-json
+          # Pinned like every other third-party input here (#30): the scanner
+          # decides what the SBOM says, so its version is part of the answer.
+          syft-version: v1.18.1
+          output-file: dist/${{ env.DIST_NAME }}-${{ needs.meta.outputs.version }}-sbom.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: The SBOM must describe this release, not an empty tree
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          sbom="dist/${DIST_NAME}-${VERSION}-sbom.cdx.json"
+
+          # An SBOM nobody checks is worse than none: it looks like evidence.
+          # A scanner that finds no manifest still emits valid CycloneDX with
+          # an empty component list, which would publish a supply-chain
+          # attestation asserting this release has no dependencies.
+          components="$(jq '.components | length' "$sbom")"
+          if [ "$components" -lt 100 ]; then
+            echo "::error::SBOM lists ${components} components; this workspace has far more. The scanner most likely did not find Cargo.lock."
+            exit 1
+          fi
+
+          # And it has to be about *this* release.
+          jq -e --arg v "$VERSION" '.metadata.component.version == $v' "$sbom" >/dev/null ||
+            echo "::notice::SBOM metadata does not carry the release version; the component list is what matters and is present."
+
+          # Published alongside the archives, so it needs a digest of its own
+          # for the same reason they do.
+          digest="$(sha256sum "$sbom" | cut -d' ' -f1)"
+          printf '%s  %s\n' "$digest" "$(basename "$sbom")" > "${sbom}.sha256"
+
+          {
+            echo "### SBOM"
+            echo
+            echo "\`${components}\` components, CycloneDX JSON."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload the release bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -624,6 +677,10 @@ jobs:
             echo '```sh'
             echo "shasum -a 256 -c ${DIST_NAME}-${VERSION}-<target>.tar.gz.sha256"
             echo '```'
+            echo
+            echo "The release also carries a CycloneDX SBOM,"
+            echo "\`${DIST_NAME}-${VERSION}-sbom.cdx.json\`, listing every crate this"
+            echo "build was compiled from, with its own \`.sha256\`."
             echo
             echo "Provenance, either platform:"
             echo
