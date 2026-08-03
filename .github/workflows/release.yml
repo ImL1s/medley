@@ -47,6 +47,11 @@ env:
   CARGO_PACKAGE: xai-grok-pager-bin
   CARGO_BIN: xai-grok-pager
   DIST_NAME: medley
+  # The oldest glibc the published Linux archives are allowed to require. Set by
+  # the runner image the Linux targets build on (ubuntu-22.04 ships 2.35), and
+  # asserted per build so the promise in the README and the release notes cannot
+  # drift away from what shipped.
+  LINUX_GLIBC_FLOOR: "2.35"
   # Matches the version `bin/protoc` pins for local development, so release
   # builds and developer builds run the same code generator.
   PROTOC_VERSION: "29.3"
@@ -197,12 +202,21 @@ jobs:
             runner: macos-15-intel
             protoc_asset: osx-x86_64
             protoc_sha256: 9a788036d8f9854f7b03c305df4777cf0e54e5b081e25bf15252da87e0e90875
+          # Built on 22.04, not 24.04. A dynamically linked glibc binary runs
+          # only where glibc is at least as new as the one it was built
+          # against, and 24.04 ships 2.39 — which excludes Ubuntu 22.04 LTS
+          # (2.35), Debian 12 (2.36), and RHEL/Rocky 9 (2.34). The failure is
+          # not graceful: the archive downloads, its checksum verifies, the
+          # installer reports success, and the binary then dies on
+          # `GLIBC_2.38 not found`. Building on the older image lowers the
+          # floor to cover those distributions. The step after the build
+          # measures the floor that actually resulted.
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
+            runner: ubuntu-22.04
             protoc_asset: linux-x86_64
             protoc_sha256: 3e866620c5be27664f3d2fa2d656b5f3e09b5152b42f1bedbf427b333e90021a
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
             protoc_asset: linux-aarch_64
             protoc_sha256: 6427349140e01f06e049e707a58709a4f221ae73ab9a0425bc4a00c8d0e1ab32
     steps:
@@ -312,6 +326,45 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --release --locked --package "$CARGO_PACKAGE" --bin "$CARGO_BIN"
+
+      - name: Measure the glibc floor
+        if: runner.os == 'Linux'
+        # The runner image decides how old a distribution can run this archive,
+        # and it decides it silently: nothing about a 24.04 build looks
+        # different until it reaches a user on 22.04. Read the floor out of the
+        # binary and fail when it exceeds what the README and release notes
+        # promise, so raising it becomes a deliberate act rather than a side
+        # effect of a runner-label bump.
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          bin="target/release/${CARGO_BIN}"
+
+          # Versioned glibc symbols look like `GLIBC_2.34` in the dynamic
+          # symbol table; the highest one is the floor. `sort -V` orders
+          # 2.9 before 2.34, which a lexical sort would not.
+          versions="$(objdump -T "$bin" | sed -n 's/.*GLIBC_\([0-9][0-9.]*\).*/\1/p' | sort -uV)"
+
+          if [ -z "$versions" ]; then
+            echo "::error::found no versioned glibc symbols in ${bin}; the probe cannot vouch for anything, so it must not pass silently"
+            exit 1
+          fi
+
+          floor="$(printf '%s\n' "$versions" | tail -n 1)"
+          echo "Highest glibc symbol required by ${TARGET}: GLIBC_${floor}"
+
+          highest="$(printf '%s\n%s\n' "$floor" "$LINUX_GLIBC_FLOOR" | sort -V | tail -n 1)"
+          if [ "$highest" != "$LINUX_GLIBC_FLOOR" ]; then
+            echo "::error::${TARGET} requires GLIBC_${floor}, above the promised floor of ${LINUX_GLIBC_FLOOR}. Either build on an older runner image or update LINUX_GLIBC_FLOOR, the README, and the release notes together — users on older distributions get a checksum-verified archive that dies on 'GLIBC_${floor} not found'."
+            exit 1
+          fi
+
+          {
+            echo "### glibc floor — ${TARGET}"
+            echo
+            echo "Requires \`GLIBC_${floor}\`; promised floor is \`${LINUX_GLIBC_FLOOR}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Package the archive
         env:
@@ -520,6 +573,13 @@ jobs:
             echo
             echo "\`medley\` installs to \`~/.medley/bin\` and keeps its state in \`~/.medley\`."
             echo "An existing official \`grok\` installation is left untouched."
+            echo
+            echo "macOS 15+ on Apple silicon or Intel. Linux archives are dynamically"
+            echo "linked and need **glibc ${LINUX_GLIBC_FLOOR} or newer** — Ubuntu 22.04+,"
+            echo "Debian 12+, Fedora 36+. Distributions on an older glibc (RHEL/Rocky 9"
+            echo "and Amazon Linux 2023 are both 2.34, Debian 11 is 2.31) need a build"
+            echo "from source. The release job measures this floor out of the binary and"
+            echo "fails rather than shipping an archive that would not run."
             echo
             echo "### Verify"
             echo
