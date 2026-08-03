@@ -96,9 +96,11 @@ directory, so the two builds no longer collide by default. What still needs care
 - **State.** Medley resolves its state directory as `$MEDLEY_HOME` →
   `$GROK_HOME` → `~/.medley` when it exists → `~/.grok` when it exists and
   `~/.medley` does not → `~/.medley`. The installed `medley` launcher pins the
-  directory to `~/.medley` before the binary starts, so an installed Medley never
-  lands on `~/.grok`. A **source build** on a machine that already has `~/.grok`
-  does resolve to it until the migration below runs.
+  directory to its install location before the binary starts, so an installed
+  Medley does not fall through to `~/.grok` — **unless you have exported
+  `MEDLEY_HOME` or `GROK_HOME` yourself**, which the launcher deliberately leaves
+  alone so your choice wins. A **source build** has no launcher, so on a machine
+  that already has `~/.grok` it does resolve to it until the migration below runs.
 - **Migration.** When Medley resolves to `~/.grok`, the first interactive run
   offers a one-time **copy** into `~/.medley`; nothing is deleted and `~/.grok`
   is left as it was. Decline, and Medley writes a `.medley-keep-legacy` marker

@@ -4,7 +4,7 @@ This repository is **[ImL1s/grok-build](https://github.com/ImL1s/grok-build)**, 
 
 This file doubles as the Apache-2.0 §4(b) statement of modification: the "What's different from upstream" table below is the record of changes made to the upstream work.
 
-Release archives and [`install.sh`](install.sh) ship the binary as `medley` and install it under `~/.medley/bin`; a source build keeps the upstream cargo bin target name `xai-grok-pager`, which upstream installs ship as `grok`. State resolves to `~/.medley` (`MEDLEY_HOME`), falling back to `GROK_HOME` and then to an existing `~/.grok`, which the first interactive run offers to copy across. Renaming the application's own `GROK_*` environment variables is remaining scope on [#49](https://github.com/ImL1s/grok-build/issues/49).
+Release archives and [`install.sh`](install.sh) ship the binary as `medley` and install it under `~/.medley/bin`; a source build keeps the upstream cargo bin target name `xai-grok-pager`, which upstream installs ship as `grok`. State resolves in this order: `$MEDLEY_HOME`, `$GROK_HOME`, `~/.medley` when it exists, an existing `~/.grok` (which the first interactive run offers to copy across), then `~/.medley`. Renaming the application's own `GROK_*` environment variables is remaining scope on [#49](https://github.com/ImL1s/grok-build/issues/49).
 
 Remotes:
 
