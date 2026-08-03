@@ -86,12 +86,70 @@ fetch_to_file() {
   fi
 }
 
-fetch_to_stdout() {
+# Fetch into a file, and only succeed on a final 2xx.
+#
+# Exiting zero is weaker than "one complete 2xx response arrived", which is the
+# thing a version must never be read from anything less than:
+#
+#   * `curl --fail` errors on 400 and above, so a final **3xx** — a 300, or a
+#     302 with no Location for --location to follow — exits zero with its body
+#     intact.
+#   * A retry on a non-rewindable stdout transfer can *append*. GNU Wget resumes
+#     an interrupted transfer with `Range: bytes=N-`, so stdout carries the
+#     failed attempt's bytes ahead of the good ones and Wget still exits zero.
+#
+# Writing to a file makes a retry rewrite rather than append, and the status is
+# read rather than inferred. Leaves $2 untouched-or-garbage on failure; callers
+# must not read it unless this returned 0.
+fetch_checked() {
+  fc_url="$1"
+  fc_out="$2"
+  fc_status=''
+
   if [ "$DOWNLOADER" = curl ]; then
-    curl --fail --silent --show-error --location --retry 3 "$1"
+    # --write-out '%{http_code}' reports the *final* status after redirects.
+    fc_status="$(
+      curl --silent --show-error --location --retry 3 \
+        --output "$fc_out" --write-out '%{http_code}' "$fc_url" 2>/dev/null
+    )" || return 1
   else
-    wget --quiet --tries=3 --output-document=- "$1"
+    # Deliberately not --quiet: it suppresses --server-response as well, and
+    # then there is no status to check. stderr is captured instead, so the
+    # progress noise never reaches the user's terminal.
+    fc_headers="$(
+      wget --tries=3 --server-response --output-document="$fc_out" "$fc_url" 2>&1
+    )" || return 1
+    # Last status line wins: redirects print one per hop.
+    fc_status="$(
+      printf '%s\n' "$fc_headers" |
+        sed -n 's|^[[:space:]]*HTTP/[0-9.]*[[:space:]]\{1,\}\([0-9]\{3\}\).*|\1|p' |
+        tail -n 1
+    )"
+    # An unreadable status is not treated as failure here, and the asymmetry is
+    # deliberate rather than a shortcut.
+    #
+    # The two downloaders have different holes. curl's is the final 3xx that
+    # `--fail` lets through, which only an explicit status can catch — so for
+    # curl the status is required. Wget's is the retry that resumes with
+    # `Range:` and appends to the previous attempt, and writing to a file
+    # closes that whatever the status says, because a retry rewrites the file
+    # instead of extending a stream. Wget also exits non-zero on a 300 with no
+    # Location, so the 3xx case never reaches here in the first place.
+    #
+    # Requiring a parseable status from every wget in existence — GNU, BusyBox,
+    # whatever a minimal image ships — would trade a hole wget does not have
+    # for an install that fails outright on a downloader whose header format
+    # this script guessed wrong. The tag still has to look like a tag, and the
+    # body still comes from a file.
+    if [ -z "$fc_status" ]; then
+      return 0
+    fi
   fi
+
+  case "$fc_status" in
+  2??) return 0 ;;
+  *) return 1 ;;
+  esac
 }
 
 # Fork tags carry build metadata (v1.2.3+providers.4), and GitHub itself links
@@ -122,33 +180,35 @@ resolve_version() {
     return
   fi
 
-  # The fetch is unchanged from what this script has always done, and the
-  # `|| resolve_body=''` discards whatever a failed transfer left behind rather
-  # than parsing it. Everything below the parse only ever produces a *message* —
-  # this function grew a better diagnosis, not a new way to choose a version.
-  #
-  # What this is NOT is a strict 2xx gate, and the comment must not pretend
-  # otherwise: `--fail` errors on HTTP 400 and above, so a final 3xx can still
-  # exit zero carrying a body, and a downloader's internal retry can leave an
-  # earlier attempt's bytes on stdout ahead of the good ones. Both predate this
-  # change; closing them needs the response written to a file with its status
-  # asserted explicitly, which is more than a better error message should
-  # smuggle in. Tracked separately.
-  resolve_body="$(
-    fetch_to_stdout "https://api.github.com/repos/${REPO}/releases/latest"
-  )" || resolve_body=''
+  # Read into a file and require a 2xx, rather than parsing whatever a
+  # zero-exit transfer left on stdout. See `fetch_checked` for the two ways
+  # that inference was wrong. The file is created before the install phase's
+  # `cleanup` trap exists, so it is removed on every path out of here —
+  # including the `die`s below, which exit rather than return.
+  resolve_doc="$(mktemp "${TMPDIR:-/tmp}/medley-release.XXXXXX")" ||
+    die 'could not create a temporary file to read the release list into.'
 
-  if [ -n "$resolve_body" ]; then
+  resolve_tag=''
+  if fetch_checked "https://api.github.com/repos/${REPO}/releases/latest" "$resolve_doc"; then
     resolve_tag="$(
-      printf '%s\n' "$resolve_body" |
-        sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+      sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$resolve_doc" |
         head -n 1
     )"
+  fi
+  rm -f "$resolve_doc"
 
-    if [ -n "$resolve_tag" ]; then
-      printf '%s\n' "${resolve_tag#v}"
-      return
-    fi
+  # A captive portal's login page or a proxy error can contain the substring
+  # `tag_name` and still not be a release document. Every tag this repository
+  # publishes starts with `v` and a digit, so anything else is discarded
+  # instead of being installed.
+  case "$resolve_tag" in
+  v[0-9]*) ;;
+  *) resolve_tag='' ;;
+  esac
+
+  if [ -n "$resolve_tag" ]; then
+    printf '%s\n' "${resolve_tag#v}"
+    return
   fi
 
   # No tag. The downloader collapsed every reason into one exit code, and the
@@ -164,7 +224,7 @@ resolve_version() {
   #
   # Deliberately not parsed: the error body. Reading it would mean drawing
   # conclusions from a transfer that failed.
-  if fetch_to_stdout "https://api.github.com/repos/${REPO}" >/dev/null 2>&1; then
+  if fetch_checked "https://api.github.com/repos/${REPO}" /dev/null; then
     die "could not resolve the latest release of ${REPO}, though the repository responded. The likeliest cause is that nothing is published as latest yet — drafts and prereleases are both excluded, so publish the draft release the release workflow created. Otherwise GitHub returned something unusable; retry, or set MEDLEY_VERSION to install a specific tag."
   fi
   # No pointer at "the error above": Wget is invoked with --quiet, so on a
@@ -502,7 +562,7 @@ main() {
   [ -z "$doomed" ] || rm -rf "$doomed"
   doomed=''
 
-  say "Installed ${DIST_NAME} ${smoke} to ${INSTALL_DIR}/${DIST_NAME}"
+  say "Installed ${smoke} to ${INSTALL_DIR}/${DIST_NAME}"
 
   print_path_guidance
   say ''
