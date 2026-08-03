@@ -2308,6 +2308,11 @@ async fn async_main(args: PagerArgs, prepared_serve: Option<PreparedServe>) -> R
                         // and will refuse to self-update. Release packaging
                         // asserts on this field.
                         "distChannel": xai_grok_update::dist_channel::identity().name(),
+                        // Which upstream this fork was built on, and for what
+                        // machine. Both baked in at compile time: a binary has
+                        // to answer these without the repository beside it.
+                        "upstreamBase": xai_grok_version::UPSTREAM_BASE,
+                        "buildTarget": xai_grok_version::BUILD_TARGET,
                     });
                     println!("{}", serde_json::to_string(&payload)?);
                 } else {

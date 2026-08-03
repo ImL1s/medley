@@ -548,8 +548,25 @@ so it cannot be turned off from `config.toml` or the environment. Check which
 distribution a binary belongs to:
 
 ```bash
-medley version --json     # {"currentVersion":"…","channel":"…","distChannel":"medley"}
+medley version --json
 ```
+
+```json
+{
+  "currentVersion": "0.2.117+providers.1 (144d6ea)",
+  "channel": "unknown",
+  "distChannel": "medley",
+  "upstreamBase": "8d69c91f02bcacf01e98d5aebbf2f92547c45738",
+  "buildTarget": "aarch64-apple-darwin"
+}
+```
+
+`upstreamBase` is the Grok Build commit this fork was synced from, and
+`buildTarget` the triple the binary was compiled for — both baked in, so a
+binary answers them without its repository. Either reads `null` on a build with
+neither in scope, such as a vendored crate.
+
+`distChannel` is the marker itself:
 
 - `"medley"` — built by this fork's release pipeline. Refuses to self-update and
   points at the installer above.
@@ -560,6 +577,11 @@ medley version --json     # {"currentVersion":"…","channel":"…","distChannel
 - anything else — an unrecognised marker, reported verbatim. Refuses. `medley` is
   the only value the marker accepts; there is no value of `MEDLEY_CHANNEL` that
   re-enables the inherited updater.
+
+`channel` is a different question and is not that marker: it compares this build
+against the stable pointer the auto-updater caches. A medley build never
+self-updates, so it never writes that pointer and `channel` stays `"unknown"` —
+the honest answer, not a fault.
 
 An unstamped build — and only an unstamped build — honours
 `GROK_TEST_DIST_CHANNEL` to select an identity at run time. It exists so the
