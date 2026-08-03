@@ -650,8 +650,10 @@ grok -p "..." --no-auto-update
 case) counts as not set. The agent SDKs
 inject `GROK_DISABLE_AUTOUPDATER=1` for the non-leader agents they spawn (a falsy value in
 the SDK's isolation env keeps updates on), and the stdio agent skips its background update
-unless it runs from the managed install (`bin/grok` inside the state directory,
-by default `~/.medley/bin/grok`).
+unless it runs from the managed install, which is specifically `bin/grok` inside
+the state directory (`~/.medley/bin/grok` by default). The fork's installer writes
+`bin/medley`, not `bin/grok`, so an installed Medley never matches this check and
+always skips that background update — an inherited mismatch, not a setting.
 
 Update messages go to **stderr**. Stdout stays clean for `--output-format json`. See also [Environment Variables for Headless](#environment-variables-for-headless).
 

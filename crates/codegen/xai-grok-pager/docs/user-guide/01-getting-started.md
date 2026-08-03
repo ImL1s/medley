@@ -15,8 +15,10 @@ You can use it interactively as a full-screen TUI, run it headlessly for scripti
 > drops the fork's multi-provider features. Install Medley with the fork's own
 > [`install.sh`](https://github.com/ImL1s/grok-build#installing) — it ships the
 > binary as `medley` and keeps state in `~/.medley` — or build it from source.
-> Either way, set `auto_update = false` under `[cli]` in `~/.medley/config.toml`
-> so the inherited updater cannot swap the fork out. Fork release artifacts are
+> Either way, set `auto_update = false` under `[cli]` in the `config.toml` of
+> whichever state directory your install resolved to (`~/.medley/config.toml` by
+> default — see [Configuration](05-configuration.md#file-locations)) so the
+> inherited updater cannot swap the fork out. Fork release artifacts are
 > tracked in [#29](https://github.com/ImL1s/grok-build/issues/29), and replacing
 > the upstream installer text below in
 > [#28](https://github.com/ImL1s/grok-build/issues/28).

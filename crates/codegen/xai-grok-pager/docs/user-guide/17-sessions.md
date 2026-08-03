@@ -15,7 +15,7 @@ A session is a persistent conversation with full history. It includes:
 - Token usage and turn counts
 - Subagent sessions (when enabled)
 
-Sessions are identified by a unique session ID (a UUIDv7 when Grok generates it; a client may supply its own ID with `-s`) and stored on disk under `~/.medley/sessions/`. Set `MEDLEY_HOME` (or `GROK_HOME`, which is checked after it) to override the base directory; when neither is set, Grok uses `~/.medley` — see [Configuration](05-configuration.md#file-locations) for the full resolution order.
+Sessions are identified by a unique session ID (a UUIDv7 when Grok generates it; a client may supply its own ID with `-s`) and stored on disk under `~/.medley/sessions/`. Set `MEDLEY_HOME` (or `GROK_HOME`, which is checked after it) to override the base directory; when neither is set, Grok uses `~/.medley`, except that an existing `~/.grok` wins while `~/.medley` does not yet exist — see [Configuration](05-configuration.md#file-locations) for the full resolution order.
 
 ---
 

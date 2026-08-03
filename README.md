@@ -37,12 +37,12 @@ local models, each with its credentials kept in its own lane.
 > [`NOTICE.md`](NOTICE.md) for the full trademark and non-affiliation statement.
 
 > [!NOTE]
-> **The installed command is `medley`; a source build is still `grok`.** The
-> release archives and [`install.sh`](install.sh) ship the binary as `medley`
-> and install it under `~/.medley/bin`. A source build produces the upstream
-> cargo bin target `xai-grok-pager` — crate and bin names deliberately do not
-> change, see [Repository layout](#repository-layout) — which upstream installs
-> ship as `grok`. Command examples in this repository and throughout the user
+> **Three names for one binary.** The release archives and
+> [`install.sh`](install.sh) ship it as **`medley`**, installed under
+> `~/.medley/bin`. A **source build** produces the upstream cargo bin target
+> **`xai-grok-pager`** — crate and bin names deliberately do not change, see
+> [Repository layout](#repository-layout). Official **upstream** installs ship
+> that same target as **`grok`**. Command examples in this repository and throughout the user
 > guide are written as `grok …`; read them as "whatever you invoke your build
 > as".
 >
@@ -136,7 +136,8 @@ directory, so the two builds no longer collide by default. What still needs care
 [`install.sh`](install.sh) downloads the release archive for your platform,
 verifies its SHA-256 against the release checksums file, unpacks it under
 `~/.medley/versions/<version>/`, and writes a `medley` launcher into
-`~/.medley/bin` that pins the state directory to `~/.medley`:
+`~/.medley/bin` that supplies `~/.medley` as the state directory whenever you
+have not exported `MEDLEY_HOME` or `GROK_HOME` yourself:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ImL1s/grok-build/providers/install.sh | sh
@@ -149,7 +150,7 @@ curl -fsSL https://raw.githubusercontent.com/ImL1s/grok-build/providers/install.
 | `MEDLEY_HOME` | Where unpacked versions and state live (default: `~/.medley`) |
 | `MEDLEY_TARGET` | Force a target triple instead of detecting one |
 | `MEDLEY_REPO` | Source repository (default: `ImL1s/grok-build`) |
-| `MEDLEY_DRYRUN` | Set to `1` to print the plan without downloading anything |
+| `MEDLEY_DRYRUN` | Set to `1` to print the plan and skip the download, extraction, and install. The release version is still resolved first, so this queries the GitHub API unless `MEDLEY_VERSION` is also set |
 
 Releases are published for `aarch64`/`x86_64` macOS and Linux. The installer
 refuses to install into `~/.grok`, never touches an existing `grok` binary, and
