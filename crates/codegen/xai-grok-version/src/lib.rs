@@ -30,6 +30,22 @@ pub const TEST_DIST_CHANNEL_ENV: &str = "GROK_TEST_DIST_CHANNEL";
 /// right ones to install.
 pub const DIST_CHANNEL_STAMP: Option<&str> = option_env!("MEDLEY_CHANNEL");
 
+/// Target triple this binary was built for, from Cargo's `TARGET`.
+///
+/// `None` only if something built this crate without a build script running.
+/// There is no runtime equivalent: `std::env::consts` reports the arch and OS
+/// separately and cannot distinguish `gnu` from `musl`, which is precisely the
+/// distinction that decides whether a Linux archive runs on a given machine.
+pub const BUILD_TARGET: Option<&str> = option_env!("MEDLEY_BUILD_TARGET");
+
+/// Upstream commit this tree was synced from, read at build time from
+/// `SOURCE_REV` at the workspace root.
+///
+/// `None` for a build with no `SOURCE_REV` in scope — a vendored crate or a
+/// package tarball. A fork release states its base so "which upstream is this
+/// built on" is answerable from the binary alone, without the repository.
+pub const UPSTREAM_BASE: Option<&str> = option_env!("MEDLEY_UPSTREAM_BASE");
+
 /// [`TEST_VERSION_ENV`] override first, then [`VERSION`]. Trimmed so
 /// non-semver-aware callers can pass the result straight into parsing.
 pub fn installed() -> String {
@@ -92,5 +108,41 @@ mod tests {
         // display_version uses compiled VERSION — just verify the label appends
         assert_eq!(display_version(""), VERSION);
         assert!(display_version(" [stable]").ends_with("[stable]"));
+    }
+}
+
+#[cfg(test)]
+mod build_stamp_tests {
+    /// Both constants are wired through the build script, and a build script
+    /// that silently fails to set an env var leaves `option_env!` as `None` —
+    /// no compile error, no warning, just a field that reports null forever.
+    /// These assert the wiring, not the values.
+    #[test]
+    fn the_build_target_is_a_full_triple() {
+        let target = super::BUILD_TARGET.expect("Cargo always sets TARGET for build scripts");
+        assert!(
+            target.matches('-').count() >= 2,
+            "expected a triple like aarch64-apple-darwin, got {target:?} — \
+             arch and OS alone cannot tell gnu from musl"
+        );
+    }
+
+    /// Holds in a checkout, which is where tests run. A vendored or packaged
+    /// build has no `SOURCE_REV` and correctly reports `None`; that case
+    /// cannot be reached from here, so this only pins the checkout behaviour.
+    #[test]
+    fn the_upstream_base_is_a_commit_id() {
+        let base =
+            super::UPSTREAM_BASE.expect("SOURCE_REV sits at the workspace root of every checkout");
+        assert_eq!(
+            base.len(),
+            40,
+            "expected a full git object id, got {base:?}"
+        );
+        assert!(
+            base.bytes().all(|b| b.is_ascii_hexdigit()),
+            "expected hex, got {base:?}"
+        );
+        assert_eq!(base.trim(), base, "the trailing newline was not trimmed");
     }
 }
