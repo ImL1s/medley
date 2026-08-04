@@ -536,6 +536,7 @@ fn selected_model_unready_reason_reads_acp_meta() {
                         "ready": false,
                         "readinessReason": "missing DEEPSEEK_API_KEY",
                         "authClass": "env",
+                        "modelSlug": "deepseek-routing-slug",
                     }
                 },
                 {
@@ -574,6 +575,15 @@ fn selected_model_unready_reason_reads_acp_meta() {
     assert_eq!(
         super::selected_model_unready_reason(None, Some("deepseek-chat"), false),
         None
+    );
+    // `-m` accepts a routing slug too: `[model.alias] model = "provider-slug"`
+    // is selectable as `provider-slug`, and that selection has to find the
+    // same catalog entry the agent resolver would.
+    assert_eq!(
+        super::selected_model_unready_reason(Some(meta), Some("deepseek-routing-slug"), false)
+            .as_deref(),
+        Some("missing DEEPSEEK_API_KEY"),
+        "a slug-selected model must find its own reason"
     );
     // Resuming, continuing, or forking loads the model from the saved session
     // in `open_session`, which runs after `authenticate`. The catalog's current

@@ -6037,6 +6037,15 @@ pub(crate) fn to_acp_model_info(
                     "authClass".to_string(),
                     serde_json::Value::String(auth_class_for_entry(model).to_string()),
                 );
+                // The routing slug, which `-m` accepts alongside the catalog
+                // key and the display name. Without it a client that was given
+                // a slug cannot tell which catalog entry it selected, and ends
+                // up showing a generic message for a model it could have named
+                // precisely (#125).
+                map.insert(
+                    "modelSlug".to_string(),
+                    serde_json::Value::String(info.model.clone()),
+                );
                 map.insert("ready".to_string(), serde_json::Value::Bool(ready));
                 if let Some(reason) = readiness_reason {
                     map.insert(

@@ -479,9 +479,19 @@ fn selected_model_unready_reason(
         .and_then(|m| m.get("modelState"))
         .and_then(|v| serde_json::from_value(v.clone()).ok())?;
 
+    // `-m` accepts the catalog key, the display name, *or* the routing slug --
+    // a config like `[model.alias] model = "provider-slug"` is selectable by
+    // either. Matching only the first two misses a slug-selected model and
+    // falls back to the generic text for one we could have named exactly.
     let match_query = |query: &str| {
         state.available_models.iter().find(|m| {
-            m.model_id.0.as_ref().eq_ignore_ascii_case(query) || m.name.eq_ignore_ascii_case(query)
+            m.model_id.0.as_ref().eq_ignore_ascii_case(query)
+                || m.name.eq_ignore_ascii_case(query)
+                || m.meta
+                    .as_ref()
+                    .and_then(|meta| meta.get("modelSlug"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|slug| slug.eq_ignore_ascii_case(query))
         })
     };
 
