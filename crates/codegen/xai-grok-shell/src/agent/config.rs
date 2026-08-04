@@ -5754,6 +5754,18 @@ pub(crate) fn effective_model_route(
 /// NAME). Header *values* are never read here: this reports provenance only,
 /// so the result is safe to log or serialize (#110).
 fn explicit_credential_header(info: &ModelInfo) -> Option<(String, Option<String>)> {
+    explicit_credential_header_in(&info.extra_headers, &info.env_http_headers)
+}
+/// As [`explicit_credential_header`], but over the header maps alone.
+///
+/// The reconstruction seams (turn config, subagent inheritance) rebuild from a
+/// `SamplingConfig`, which carries the headers but not the model entry and not
+/// `credential_source` — so provenance there has to be re-derived rather than
+/// carried, and this is what they derive it from (#110).
+pub(crate) fn explicit_credential_header_in(
+    extra_headers: &IndexMap<String, String>,
+    env_http_headers: &IndexMap<String, String>,
+) -> Option<(String, Option<String>)> {
     fn is_credential_header(name: &str) -> bool {
         name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("x-api-key")
     }
@@ -5763,14 +5775,13 @@ fn explicit_credential_header(info: &ModelInfo) -> Option<(String, Option<String
     // made callers treat the model as authenticated and drop the ambient
     // credential in its favour, so the request went out with nothing at all.
     // `env_key` has always been resolved this way; this matches it.
-    if let Some((name, _)) = info
-        .extra_headers
+    if let Some((name, _)) = extra_headers
         .iter()
         .find(|(name, value)| is_credential_header(name) && !value.trim().is_empty())
     {
         return Some((name.to_ascii_lowercase(), None));
     }
-    info.env_http_headers
+    env_http_headers
         .iter()
         .find(|(name, var)| {
             is_credential_header(name)

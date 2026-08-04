@@ -1294,6 +1294,46 @@ async fn bootstrap_fork_without_parent_fails_open() {
         }
     }
 }
+/// #110: a parent authenticated only by a credential header the user
+/// declared must not have the session resolver wired onto its children. The
+/// parent's chat state carries the headers but not `credential_source`, so
+/// the provenance has to be re-derived here — and without it the child is
+/// still `NotByok`, the resolver attaches, and `SamplingClient::post` strips
+/// the declared header and sends under the xAI session instead.
+#[tokio::test]
+async fn subagent_inherits_declared_header_without_the_session_resolver() {
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.auth_method_id =
+        acp::AuthMethodId::new(crate::agent::auth_method::CACHED_TOKEN_AUTH_METHOD_ID);
+    ctx.auth = Some(crate::auth::GrokAuth {
+        key: "session-jwt".into(),
+        ..crate::auth::GrokAuth::test_default()
+    });
+    let chat = spawn_test_parent_chat_state("grok-4.5");
+    let mut cfg = chat
+        .get_sampling_config()
+        .await
+        .expect("test parent has a sampling config");
+    cfg.base_url = "https://api.x.ai/v1".to_string();
+    cfg.extra_headers
+        .insert("Authorization".into(), "Bearer vendor-sentinel".into());
+    chat.update_sampling_config(cfg);
+    ctx.parent_chat_state = Some(chat);
+
+    let (inherited, _) = super::read_parent_sampling_config(&ctx).await;
+    assert!(
+        inherited.bearer_resolver.is_none(),
+        "the parent session resolver must not replace a declared header"
+    );
+    assert_eq!(
+        inherited.credential_source,
+        Some(xai_grok_sampler::CredentialSource::ExplicitHeader {
+            header: "authorization".to_owned(),
+            env: None,
+        }),
+        "the provenance must survive the rebuild"
+    );
+}
 #[tokio::test]
 async fn bootstrap_fork_live_parent_chat_state_is_forked_with_marker() {
     use xai_grok_sampling_types::conversation::ConversationItem;

@@ -821,6 +821,16 @@ async fn read_parent_sampling_config(
             .unwrap_or(ctx.sampling_config.auth_scheme);
             let inherited_base_url = cfg.base_url.clone();
             let strip_guard = ctx.would_strip_fallback_key(creds.api_key.as_deref());
+            // #110: the parent config carries its headers but not
+            // `credential_source`, so a parent authenticated by a header the
+            // user declared arrives here with its provenance gone. Wiring the
+            // parent session resolver on top would make the sampler strip that
+            // header and send the child's requests under the session instead.
+            // Re-derive from the headers, which do survive the rebuild.
+            let declared_credential_header = crate::agent::config::explicit_credential_header_in(
+                &extra_headers,
+                &cfg.env_http_headers,
+            );
             let api_key = if auth_scheme == xai_grok_sampler::AuthScheme::None {
                 None
             } else {
@@ -837,7 +847,9 @@ async fn read_parent_sampling_config(
                 // External must not silently become derivable-first-party
                 // (and vice versa) across the subagent boundary.
                 endpoint_trust: cfg.endpoint_trust,
-                credential_source: None,
+                credential_source: declared_credential_header.clone().map(|(header, env)| {
+                    xai_grok_sampler::CredentialSource::ExplicitHeader { header, env }
+                }),
                 api_backend: cfg.api_backend,
                 auth_scheme,
                 extra_headers,
@@ -855,7 +867,9 @@ async fn read_parent_sampling_config(
                 user_id: ctx.sampling_config.user_id.clone(),
                 origin_client: ctx.sampling_config.origin_client.clone(),
                 attribution_callback: ctx.attribution_callback.clone(),
-                bearer_resolver: if auth_scheme == xai_grok_sampler::AuthScheme::None || strip_guard
+                bearer_resolver: if auth_scheme == xai_grok_sampler::AuthScheme::None
+                    || strip_guard
+                    || declared_credential_header.is_some()
                 {
                     None
                 } else {

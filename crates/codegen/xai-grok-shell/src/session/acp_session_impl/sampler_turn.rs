@@ -496,8 +496,19 @@ impl SessionActor {
         // also stay credential-free at turn reconstruct — this is the final
         // wire choke point (chat-state does not persist readiness).
         let mut auth_scheme = model_facts.auth_scheme;
-        let mut use_session_bearer_resolver =
-            gate.active() && auth_scheme != xai_grok_sampler::AuthScheme::None;
+        // #110: chat state carries the headers but not `credential_source`, so
+        // a model authenticated by a header the user declared arrives here with
+        // its provenance gone. It is still `NotByok`, so the gate would enable
+        // the session resolver and `SamplingClient::post` would strip the
+        // user's header and send under the xAI session instead. Re-derive the
+        // provenance from the headers, which chat state does keep.
+        let declared_credential_header = crate::agent::config::explicit_credential_header_in(
+            &cfg.extra_headers,
+            &cfg.env_http_headers,
+        );
+        let mut use_session_bearer_resolver = gate.active()
+            && declared_credential_header.is_none()
+            && auth_scheme != xai_grok_sampler::AuthScheme::None;
         let mut use_provider_bearer_resolver = cfg.api_backend
             == xai_grok_sampling_types::ApiBackend::CodexResponses
             && model_auth_provider.is_some()
@@ -589,7 +600,9 @@ impl SessionActor {
             temperature: cfg.temperature,
             top_p: cfg.top_p,
             endpoint_trust: cfg.endpoint_trust,
-            credential_source: None,
+            credential_source: declared_credential_header.map(|(header, env)| {
+                xai_grok_sampler::CredentialSource::ExplicitHeader { header, env }
+            }),
             api_backend: cfg.api_backend,
             auth_scheme,
             extra_headers,
