@@ -764,8 +764,20 @@ fn session_bearer_resolver(
     ctx: &SubagentSpawnContext,
     byok: crate::agent::auth_method::ModelByok,
     base_url: &str,
+    credential_source: Option<&xai_grok_sampler::CredentialSource>,
 ) -> Option<xai_grok_sampler::SharedBearerResolver> {
     use crate::agent::auth_method;
+    // #110: a credential header the user declared is terminal. Attaching a
+    // session resolver on top of one makes `SamplingClient::post` strip the
+    // header and send under the xAI session instead. The check lives here, in
+    // the one function every attach path goes through, rather than at each
+    // call site -- three of them had to be found one at a time by review.
+    if matches!(
+        credential_source,
+        Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
+    ) {
+        return None;
+    }
     auth_method::session_token_auth_gate(
         auth_method::is_session_based_method(&ctx.auth_method_id),
         byok,
@@ -782,11 +794,12 @@ fn inherited_bearer_resolver(
     ctx: &SubagentSpawnContext,
     model: &str,
     base_url: &str,
+    credential_source: Option<&xai_grok_sampler::CredentialSource>,
 ) -> Option<xai_grok_sampler::SharedBearerResolver> {
     let byok = crate::agent::config::resolve_model_auth_facts_and_provider(model)
         .0
         .byok;
-    session_bearer_resolver(ctx, byok, base_url)
+    session_bearer_resolver(ctx, byok, base_url, credential_source)
 }
 /// Read the parent session's actual current sampling config.
 ///
@@ -873,7 +886,7 @@ async fn read_parent_sampling_config(
                 {
                     None
                 } else {
-                    inherited_bearer_resolver(ctx, &cfg.model, &inherited_base_url)
+                    inherited_bearer_resolver(ctx, &cfg.model, &inherited_base_url, None)
                 },
                 supports_backend_search: ctx
                     .models_manager
@@ -927,7 +940,12 @@ async fn read_parent_sampling_config(
         fallback.bearer_resolver = if ctx.would_strip_fallback_key(fallback.api_key.as_deref()) {
             None
         } else {
-            inherited_bearer_resolver(ctx, &fallback.model, &fallback.base_url)
+            inherited_bearer_resolver(
+                ctx,
+                &fallback.model,
+                &fallback.base_url,
+                fallback.credential_source.as_ref(),
+            )
         };
     }
     fallback.supports_backend_search = ctx
@@ -998,6 +1016,7 @@ fn resolve_model_override_to_config(
                 crate::agent::auth_method::ModelByok::NotByok
             },
             &config.base_url,
+            config.credential_source.as_ref(),
         )
     } else {
         None
