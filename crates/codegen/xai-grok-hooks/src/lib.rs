@@ -40,6 +40,10 @@ pub mod config;
 pub mod discovery;
 pub mod dispatcher;
 mod env_expand;
+/// Re-exported so plugin loaders can re-expand a hook command against the
+/// same precedence rules the parser used — `extra` first, ambient second —
+/// instead of racing it with a second, weaker expansion. See #96.
+pub use env_expand::expand_env_vars_with_extra;
 pub mod error;
 pub mod event;
 pub mod matcher;

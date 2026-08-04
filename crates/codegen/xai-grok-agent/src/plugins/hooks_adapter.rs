@@ -7,8 +7,6 @@ use std::path::{Path, PathBuf};
 use xai_grok_hooks::config::{HookSpec, parse_hook_file};
 use xai_grok_hooks::event::HookEventName;
 
-use super::manifest::substitute_env_vars;
-
 /// Read, pre-filter, parse, and env-inject a plugin's hooks file.
 pub fn parse_plugin_hooks(
     hooks_path: &Path,
@@ -133,13 +131,18 @@ fn process_hooks_content(
         // the plugin hook then executes out of another plugin's data
         // directory, and fails open because that path usually exists.
         //
-        // `command_raw` is the pre-expansion source string, so substituting
-        // plugin tokens against it puts this back in the intended order:
-        // caller-supplied tokens first, ambient expansion only for what is
-        // left. See #96.
+        // `command_raw` is the pre-expansion source string. Re-expanding it
+        // through the parser's own function, against `spec.extra_env` — which
+        // by now holds the hook's declared `env` *and* the plugin tokens
+        // inserted above — restores the intended precedence in one pass:
+        // caller-supplied values win, ambient is the fallback.
+        //
+        // Not a second, weaker expansion: `expand_env_vars_in_string` does not
+        // see `extra_env`, so re-deriving the command with it would silently
+        // drop a hook's own declared `env` from its command. Same function,
+        // same precedence, same `${VAR:-x}` masking. See #96.
         if let Some(raw) = spec.command_raw.clone() {
-            let substituted = substitute_env_vars(&raw, plugin_root, plugin_data);
-            let expanded = xai_grok_config::expand_env_vars_in_string(&substituted);
+            let expanded = xai_grok_hooks::expand_env_vars_with_extra(&raw, &spec.extra_env);
             if Some(expanded.as_str())
                 != spec
                     .command
@@ -390,6 +393,48 @@ mod tests {
                 None => unsafe { std::env::remove_var(self.key) },
             }
         }
+    }
+
+    /// A hook's own declared `env` must survive the plugin-token pass.
+    ///
+    /// Regression guard for the #96 fix itself, not for #96. Re-deriving the
+    /// command from `command_raw` is only safe if it goes back through the
+    /// parser's expansion, which consults `extra_env`. An earlier draft of the
+    /// fix used `expand_env_vars_in_string`, which does not — that silently
+    /// dropped a hook's declared `env` from its own command while every #96
+    /// assertion still passed.
+    #[test]
+    #[serial_test::serial]
+    fn hook_declared_env_survives_the_plugin_token_pass() {
+        let _guard = EnvVarGuard::set("MY_TOOL", "/ambient/should-lose");
+
+        let value = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"hooks": [{
+                        "type": "command",
+                        "command": "${MY_TOOL}/run.sh ${CLAUDE_PLUGIN_ROOT}/cfg",
+                        "env": {"MY_TOOL": "/opt/declared"}
+                    }]}
+                ]
+            }
+        });
+
+        let (specs, warnings) =
+            parse_plugin_hooks_from_value(&value, "gb96-env", "/opt/p96", "/var/p96");
+
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        let cmd = specs[0]
+            .command
+            .as_ref()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        assert_eq!(
+            cmd, "/opt/declared/run.sh /opt/p96/cfg",
+            "the hook's declared env and the plugin token must both win over the ambient value"
+        );
     }
 
     /// #96: a plugin token must resolve to the value the caller supplied, never
