@@ -1036,6 +1036,18 @@ impl ApiBackend {
             Self::ChatCompletions | Self::Responses | Self::CodexResponses
         )
     }
+
+    /// Whether replayed reasoning must be stripped. Only the Messages API rejects thinking blocks sent without a top-level `thinking` config.
+    pub fn requires_reasoning_strip(&self) -> bool {
+        matches!(self, Self::Messages)
+    }
+
+    /// Whether [`ConversationRequest::prompt_cache_key`] reaches the wire. Only the Responses mapping sends it, so a key set elsewhere is inert.
+    ///
+    /// [`ConversationRequest::prompt_cache_key`]: crate::conversation::ConversationRequest::prompt_cache_key
+    pub fn forwards_prompt_cache_key(&self) -> bool {
+        matches!(self, Self::Responses)
+    }
 }
 
 /// Trust classification of the resolved inference endpoint, decided at
@@ -1272,6 +1284,9 @@ mod tests {
             temperature: None,
             top_p: None,
             api_backend: ApiBackend::default(),
+            // Fork field; irrelevant to what this test asserts (that `Debug`
+            // exposes no request credentials), so left unset.
+            endpoint_trust: None,
             extra_headers: indexmap::IndexMap::from([(
                 "authorization".to_owned(),
                 format!("Bearer {secret}"),

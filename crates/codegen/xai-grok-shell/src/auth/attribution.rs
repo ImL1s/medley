@@ -54,7 +54,14 @@ impl ShellAttribution {
         })
     }
 
-    pub fn new_tool_callback(
+    /// Tool-side counterpart of [`Self::new`]: returns
+    /// `Arc<dyn xai_grok_tools::Auth401AttributionCallback>` for the
+    /// `with_attribution_callback(...)` builder on each tool HTTP
+    /// client (`ImageGenClient`, `VideoGenClient`, `WebSearchClient`).
+    /// The two callbacks share the same underlying impl and emit the
+    /// same `auth_401_attribution` event format -- only the trait
+    /// signature differs (`SamplingConsumer` vs. `ToolConsumer`).
+    pub(crate) fn new_tool_callback(
         auth_manager: Arc<AuthManager>,
         session_id: Option<String>,
     ) -> Arc<dyn ToolAuth401AttributionCallback> {
@@ -346,14 +353,14 @@ mod tests {
         use tracing_subscriber::registry::LookupSpan;
 
         #[derive(Debug, Default, Clone)]
-        pub struct CapturedSpan {
+        pub(crate) struct CapturedSpan {
             pub name: String,
             pub fields_str: std::collections::BTreeMap<String, String>,
             pub fields_i64: std::collections::BTreeMap<String, i64>,
             pub fields_bool: std::collections::BTreeMap<String, bool>,
         }
 
-        pub struct SpanCollector {
+        pub(crate) struct SpanCollector {
             pub spans: std::sync::Arc<Mutex<Vec<CapturedSpan>>>,
         }
 

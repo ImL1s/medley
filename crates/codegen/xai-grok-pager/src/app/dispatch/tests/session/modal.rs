@@ -19,6 +19,12 @@ fn open_extensions_modal_no_session_sets_flag_no_fetches() {
     assert_eq!(count_extension_fetches(&effects), 0);
     assert!(app.agents[&id].pending_extensions_fetch);
     assert!(app.agents[&id].extensions_modal.is_some());
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::CreateSession { .. })),
+        "opening the modal must not create a session, got {effects:?}"
+    );
 }
 
 #[test]
@@ -343,29 +349,6 @@ fn late_success_after_default_switch_owner_close_cannot_mutate_or_persist() {
         app.agents[&survivor].session.models.current.as_ref(),
         Some(&original)
     );
-}
-
-#[test]
-fn extensions_modal_in_non_project_dir_creates_session() {
-    let mut app = project_picker_app();
-    dispatch(Action::NewSession, &mut app);
-    let id = AgentId(0);
-
-    let effects = dispatch(
-        Action::OpenExtensionsModal {
-            tab: crate::views::extensions_modal::ExtensionsTab::McpServers,
-            trigger: xai_grok_telemetry::events::ExtensionsModalTrigger::SlashCommand,
-        },
-        &mut app,
-    );
-
-    assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::CreateSession { .. })),
-        "session-less modal open must create the deferred session"
-    );
-    assert!(app.agents[&id].pending_extensions_fetch);
 }
 
 fn count_marketplace_fetches(effects: &[Effect]) -> usize {

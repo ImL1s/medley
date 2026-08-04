@@ -84,7 +84,6 @@ pub(crate) fn handle_ask_user_question(
                 LocalQuestionKind::FreeUsageUpsell { .. } => "SuperGrok upsell",
                 LocalQuestionKind::AgentTypeMismatch { .. } => "model switch",
                 LocalQuestionKind::AuthClassSwitch { .. } => "auth class switch",
-                LocalQuestionKind::ProjectSelect { .. } => "project select",
                 LocalQuestionKind::DoctorFix { .. } => "/doctor fix",
                 LocalQuestionKind::DeleteCurrentSession => "/delete",
             };
