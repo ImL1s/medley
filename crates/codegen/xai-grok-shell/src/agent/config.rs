@@ -5794,7 +5794,11 @@ fn classify_credential_source(
         return if credentials.api_key.is_some() {
             CredentialSource::XaiSession
         } else {
-            CredentialSource::Missing
+            // The arm fired but the session was absent, so there is no ambient
+            // credential and no gate to run. Same reasoning as the tail below.
+            explicit_credential_header(model.info())
+                .map(|(header, env)| CredentialSource::ExplicitHeader { header, env })
+                .unwrap_or(CredentialSource::Missing)
         };
     }
     if model.own_credential().is_some() {
@@ -5825,9 +5829,20 @@ fn classify_credential_source(
     }
     // Session tokens already returned above, so an ambient credential reaching
     // here came from `XAI_API_KEY` (or its legacy alias).
+    //
+    // The header arm has to sit *after* that, not before it. When an ambient
+    // credential is present the gate below is what strips it and relabels the
+    // route `ExplicitHeader`; naming the header here first would skip the gate
+    // and leave the ambient credential riding alongside the user's own auth.
+    // When there is no ambient credential there is nothing to strip and no
+    // gate to run, so this is the only place the label can come from -- and
+    // without it a header-authenticated model reads as `Missing` and gets
+    // treated as having no credential at all.
     match &credentials.api_key {
         Some(_) => CredentialSource::XaiApiKeyEnv,
-        None => CredentialSource::Missing,
+        None => explicit_credential_header(model.info())
+            .map(|(header, env)| CredentialSource::ExplicitHeader { header, env })
+            .unwrap_or(CredentialSource::Missing),
     }
 }
 pub(crate) fn sampling_config_for_model(
@@ -8668,6 +8683,39 @@ reasoning_effort = "low"
         let mut catalog = IndexMap::new();
         catalog.insert("image-describe".to_string(), entry);
 
+        // Both with and without an ambient credential to strip. The label has
+        // two sources -- the gate rewrites it when there is something ambient
+        // to remove, the classifier names it when there is not -- and a user
+        // whose only credential is the header they declared is exactly the
+        // case with nothing ambient. Getting only the first half right sends
+        // that user back to the active model instead of their provider.
+        for session in [Some("XAI_SESSION_SENTINEL"), None] {
+            let resolved = resolve_aux_model_sampling_config(
+                "image-describe",
+                &catalog,
+                &EndpointsConfig::default(),
+                session,
+                false,
+                None,
+                None,
+            )
+            .unwrap_or_else(|| {
+                panic!("a header-authenticated auxiliary model is usable (session: {session:?})")
+            });
+            assert_eq!(
+                resolved.base_url, "https://vision.vendor.example/v1",
+                "session: {session:?}"
+            );
+            assert_eq!(
+                resolved.credential_source,
+                Some(CredentialSource::ExplicitHeader {
+                    header: "authorization".to_owned(),
+                    env: None,
+                }),
+                "session: {session:?}"
+            );
+            assert_eq!(resolved.api_key, None, "session: {session:?}");
+        }
         let resolved = resolve_aux_model_sampling_config(
             "image-describe",
             &catalog,
