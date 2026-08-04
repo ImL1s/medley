@@ -1861,7 +1861,12 @@ fn test_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
             user_selectable: true,
             id: None,
             model: model_id.to_string(),
-            base_url: String::new(),
+            // A catalog entry always has a resolved endpoint in production
+            // (`ModelEntry::fallback` fills it from the endpoints config).
+            // Leaving it empty here made every fixture look like a
+            // credential-less non-first-party model once readiness started
+            // consulting the endpoint (#110).
+            base_url: crate::agent::config::EndpointsConfig::default().resolve_inference_base_url(),
             name: None,
             description: None,
             max_completion_tokens: None,

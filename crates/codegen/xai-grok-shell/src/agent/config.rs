@@ -5429,11 +5429,32 @@ pub(crate) fn resolve_aux_model_sampling_config(
             return None;
         }
     }
-    let xai_bearer = session_key
-        .map(|s| s.to_owned())
-        .or_else(|| crate::agent::auth_method::read_xai_api_key_env().ok())
-        .or_else(|| endpoints.deployment_key.clone());
-    if let Some(bearer) = xai_bearer {
+    // #110: everything this fallback can mint is an ambient xAI credential,
+    // so it may only target a first-party origin -- and a custom
+    // `models_base_url` points `resolve_inference_base_url()` anywhere the
+    // user likes. Decided before a bearer is even chosen: which of the three
+    // it would have been does not change the answer.
+    let inference_base = endpoints.resolve_inference_base_url();
+    let ambient = if !crate::util::is_xai_api_bearer_url(&inference_base) {
+        tracing::warn!(
+            aux_model = %model_id,
+            "auxiliary fallback refused: the inference base is not first-party xAI"
+        );
+        None
+    } else if let Some(session) = session_key {
+        Some((
+            session.to_owned(),
+            xai_grok_sampler::CredentialSource::XaiSession,
+        ))
+    } else if let Ok(key) = crate::agent::auth_method::read_xai_api_key_env() {
+        Some((key, xai_grok_sampler::CredentialSource::XaiApiKeyEnv))
+    } else {
+        endpoints
+            .deployment_key
+            .clone()
+            .map(|key| (key, xai_grok_sampler::CredentialSource::XaiDeploymentKey))
+    };
+    if let Some((bearer, ambient_source)) = ambient {
         let entry = ModelEntry {
             info: ModelInfo {
                 user_selectable: true,
@@ -5478,7 +5499,7 @@ pub(crate) fn resolve_aux_model_sampling_config(
             config_validation_errors: Vec::new(),
         };
         let credentials = resolve_credentials_enforced(&entry, session_key, disable_api_key_auth);
-        let sampler = sampling_config_for_model(
+        let mut sampler = sampling_config_for_model(
             &entry,
             credentials,
             alpha_test_key,
@@ -5486,6 +5507,11 @@ pub(crate) fn resolve_aux_model_sampling_config(
             None,
             None,
         );
+        // The synthetic entry above carries the ambient bearer as its *own*
+        // `api_key`, so the classifier inside the choke point reads it as
+        // `ModelApiKey` and the origin gate never looks at it. Correct the
+        // record here, which is the only place that knows what was minted.
+        sampler.credential_source = Some(ambient_source);
         return Some(sampler);
     }
     tracing::warn!(
@@ -5903,6 +5929,19 @@ pub(crate) fn resolve_web_search_sampling_config(
     endpoints: &EndpointsConfig,
 ) -> Option<SamplerConfig> {
     let resolved = if let Some(entry) = find_model_by_id(models, model_id).cloned() {
+        // #110: an unready model disables web search outright. The tempting
+        // repair -- send the request anyway with its credential stripped --
+        // hands the user's search query to a third-party origin and fails
+        // there regardless.
+        let (ready, reason) = model_readiness(&entry);
+        if !ready {
+            tracing::warn!(
+                web_search_model = %model_id,
+                reason = ?reason,
+                "web search model is not ready; disabling web search"
+            );
+            return None;
+        }
         let credentials = resolve_credentials_enforced(&entry, session_key, disable_api_key_auth);
         if credentials.api_key.is_none() && entry.effective_auth_provider().is_some() {
             tracing::warn!(
@@ -6121,6 +6160,28 @@ pub(crate) fn model_readiness(model: &ModelEntry) -> (bool, Option<String>) {
             .map(|name| format!("missing {name}"))
             .unwrap_or_else(|| "missing API key".to_string());
         return (false, Some(reason));
+    }
+    // #110. Reaching here means the model needs a bearer, declares no
+    // credential of its own, and named no env var we could point at. If its
+    // final origin is also somewhere the ambient xAI flow may not legally go,
+    // nothing can ever satisfy it -- so fail closed here, before a request
+    // exists to strip. `api_base_url` counts because the `XAI_API_KEY` branch
+    // targets it rather than `base_url`.
+    if explicit_credential_header(&model.info).is_none()
+        && !crate::util::is_xai_api_bearer_url(&model.info.base_url)
+        && !model
+            .api_base_url
+            .as_deref()
+            .is_some_and(crate::util::is_xai_api_bearer_url)
+    {
+        return (
+            false,
+            Some(format!(
+                "no credential for non-xAI endpoint {}: set api_key, env_key, or auth_provider \
+                 — or auth_scheme = \"none\" for a keyless local server",
+                provider_hint_for_url(&model.info.base_url)
+            )),
+        );
     }
     (true, None)
 }
@@ -8307,6 +8368,162 @@ reasoning_effort = "low"
         }
     }
 
+    /// #110: the auxiliary fallback mints an ambient xAI bearer
+    /// (session -> XAI_API_KEY -> deployment_key) against
+    /// `resolve_inference_base_url()`. A custom `models_base_url` points that
+    /// anywhere the user likes, so the fallback has to check where it is
+    /// about to send the account's own credential.
+    #[test]
+    #[serial]
+    fn aux_fallback_refuses_ambient_bearer_for_non_first_party_inference_base() {
+        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+        use xai_grok_test_support::EnvGuard;
+        let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+        let endpoints = EndpointsConfig {
+            models_base_url: Some("https://third-party.example/v1".into()),
+            ..EndpointsConfig::default()
+        };
+        let resolved = resolve_aux_model_sampling_config(
+            "image-describe",
+            &IndexMap::new(),
+            &endpoints,
+            Some("XAI_SESSION_SENTINEL"),
+            false,
+            None,
+            None,
+        );
+        assert!(
+            resolved.is_none(),
+            "ambient bearer routed to a non-first-party inference base"
+        );
+    }
+    /// The fallback stuffs its bearer into a synthetic entry's own `api_key`,
+    /// which `classify_credential_source` reads as `ModelApiKey` -- a label
+    /// that would carry an ambient credential straight past the origin gate.
+    /// The fallback therefore has to say what it actually minted.
+    #[test]
+    #[serial]
+    fn aux_fallback_labels_ambient_source() {
+        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+        use xai_grok_sampler::CredentialSource;
+        use xai_grok_test_support::EnvGuard;
+        let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+        let resolved = resolve_aux_model_sampling_config(
+            "image-describe",
+            &IndexMap::new(),
+            &EndpointsConfig::default(),
+            Some("XAI_SESSION_SENTINEL"),
+            false,
+            None,
+            None,
+        )
+        .expect("the first-party fallback still resolves");
+        assert_eq!(
+            resolved.credential_source,
+            Some(CredentialSource::XaiSession)
+        );
+    }
+    /// #110: an unready web-search model DISABLES web search. The wrong repair
+    /// is to send the request to the external origin with its credential
+    /// stripped -- that leaks the query to a third party and fails anyway.
+    #[test]
+    #[serial]
+    fn web_search_disables_for_unready_external_model() {
+        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+        use xai_grok_test_support::EnvGuard;
+        let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+        let mut catalog = IndexMap::new();
+        catalog.insert(
+            "search".to_string(),
+            test_model_entry("search", "https://search.example/v1", None, None, None),
+        );
+        let resolved = resolve_web_search_sampling_config(
+            "search",
+            &catalog,
+            Some("XAI_SESSION_SENTINEL"),
+            false,
+            None,
+            None,
+            &EndpointsConfig::default(),
+        );
+        assert!(
+            resolved.is_none(),
+            "an unready external web-search model must disable web search"
+        );
+    }
+    /// #110 (Layer 0): a model that needs a bearer, declares no credential of
+    /// its own, and points at an origin the ambient xAI flow could never
+    /// legally target can never be satisfied. Say so before a request exists,
+    /// rather than building one and stripping it at the choke point.
+    ///
+    /// The ready cases are the point of the test as much as the unready one:
+    /// each is a path that must keep working, and each was a way to get this
+    /// gate wrong.
+    #[test]
+    fn readiness_gate_fails_credential_less_non_first_party_models() {
+        let m = test_model_entry("ext", "https://api.openai.com/v1", None, None, None);
+        let (ready, reason) = model_readiness(&m);
+        assert!(!ready, "external no-key model must be unready");
+        let reason = reason.expect("unready must come with an actionable reason");
+        for hint in ["api_key", "env_key", "auth_provider", "auth_scheme"] {
+            assert!(
+                reason.contains(hint),
+                "the reason must name {hint} as a way out: {reason}"
+            );
+        }
+
+        // The issue's own reproduction.
+        let m = test_model_entry("local", "http://127.0.0.1:11434/v1", None, None, None);
+        assert!(!model_readiness(&m).0, "loopback no-key must be unready");
+
+        // Keyless local servers stay ready -- an acceptance criterion, and the
+        // whole reason `auth_scheme = "none"` exists.
+        let mut m = test_model_entry("local", "http://127.0.0.1:11434/v1", None, None, None);
+        m.info.auth_scheme = AuthScheme::None;
+        assert_eq!(model_readiness(&m), (true, None));
+
+        // First-party origins keep the existing ambient session flow.
+        let m = test_model_entry("xai", "https://api.x.ai/v1", None, None, None);
+        assert_eq!(model_readiness(&m), (true, None));
+        let m = test_model_entry(
+            "proxy",
+            crate::env::PROD_CLI_CHAT_PROXY_BASE_URL,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(model_readiness(&m), (true, None));
+
+        // A static key is a credential of its own.
+        let m = test_model_entry("byok", "https://api.openai.com/v1", Some("sk"), None, None);
+        assert_eq!(model_readiness(&m), (true, None));
+
+        // So is an explicitly declared credential header: the user brought
+        // their own auth, and this gate must not second-guess it.
+        let mut m = test_model_entry("hdr", "https://api.openai.com/v1", None, None, None);
+        m.info
+            .extra_headers
+            .insert("Authorization".into(), "Bearer user".into());
+        assert_eq!(model_readiness(&m), (true, None));
+
+        // Split routing: the XAI_API_KEY branch targets `api_base_url`, so a
+        // first-party one keeps the model satisfiable even when `base_url`
+        // is somewhere else entirely.
+        let m = test_model_entry(
+            "split",
+            "https://third.example/v1",
+            None,
+            None,
+            Some("https://api.x.ai/v1"),
+        );
+        assert_eq!(model_readiness(&m), (true, None));
+    }
     #[test]
     #[serial]
     fn resolve_credentials_empty_env_key_falls_through_to_session() {

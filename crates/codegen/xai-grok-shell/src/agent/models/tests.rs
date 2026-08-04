@@ -843,15 +843,15 @@ fn apply_refresh_result_only_updates_etag_on_success() {
     );
 }
 
+/// The production constructor rather than a hand-rolled copy of it.
+///
+/// The copy left `base_url` empty, which no catalog entry ever is in
+/// production -- `ModelEntry::fallback` fills it from the endpoints. That was
+/// invisible until readiness began consulting the endpoint (#110), at which
+/// point every fixture here became a credential-less non-first-party model
+/// and stopped being selectable.
 fn make_model_entry(model_id: &str) -> ModelEntry {
-    ModelEntry {
-        info: config::ModelInfo::fallback(model_id),
-        api_key: None,
-        env_key: None,
-        auth_provider: None,
-        api_base_url: None,
-        config_validation_errors: Vec::new(),
-    }
+    ModelEntry::fallback(model_id, &config::EndpointsConfig::default())
 }
 
 fn make_prefetched(ids: &[&str]) -> IndexMap<String, ModelEntry> {
@@ -1681,26 +1681,11 @@ fn default_model_skips_oauth_only_for_api_key_users() {
     let cfg = config::Config::default();
     let mut catalog = IndexMap::new();
 
-    let mut oauth_only = ModelEntry {
-        info: config::ModelInfo::fallback("oauth-only"),
-        api_key: None,
-        env_key: None,
-        auth_provider: None,
-        api_base_url: None,
-        config_validation_errors: Vec::new(),
-    };
+    let mut oauth_only = make_model_entry("oauth-only");
     oauth_only.info.supported_in_api = false;
     catalog.insert("oauth-only".to_string(), oauth_only);
 
-    let public = ModelEntry {
-        info: config::ModelInfo::fallback("public-model"),
-        api_key: None,
-        env_key: None,
-        auth_provider: None,
-        api_base_url: None,
-        config_validation_errors: Vec::new(),
-    };
-    catalog.insert("public-model".to_string(), public);
+    catalog.insert("public-model".to_string(), make_model_entry("public-model"));
 
     let (key, _, _) = resolve_default_model(&cfg, &catalog, false);
     assert_ne!(
