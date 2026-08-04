@@ -140,6 +140,13 @@ Grok resolves the API key in this order (skipped entirely when `auth_scheme = "n
 
 The `context_window` value tells Grok when to trigger auto-compaction. When you override a known model, Grok inherits that model's context window. When you define a new model and omit `context_window`, Grok defaults to 200,000 tokens, so set it explicitly to match your provider.
 
+To override the context window of a built-in model (like the `gpt-5.6-sol` preset) without affecting its routing or credentials, define a metadata-only override that specifies only `context_window` (issue #122):
+
+```toml
+[model."gpt-5.6-sol"]
+context_window = 400000
+```
+
 ### Global Default Headers
 
 To apply the same headers to *every* model in the catalog -- built-in, prefetched from `/v1/models`, or custom -- set them once under the global `[models]` section instead of repeating them per model:
@@ -165,7 +172,7 @@ inference_idle_timeout_secs = 600
 stream_tool_calls           = true
 ```
 
-This is a small, fixed set of environment-wide knobs. Settings that identify a specific model (`model`, `base_url`, `api_key`, `context_window`, ...) cannot be defaulted this way, and a few settings with their own dedicated configuration -- auto-compaction (`[session]`), the system-prompt label (`[agent]`), and reasoning effort (`[models].default_reasoning_effort`) -- keep their existing homes.
+This is a small, fixed set of environment-wide knobs. Settings that identify a specific model (`model`, `base_url`, `api_key`, `context_window`, ...) cannot be defaulted this way, and a few settings with their own dedicated configuration -- auto-compaction (`[session]` global default, which can also be set per-model or via env var), the system-prompt label (`[agent]`), and reasoning effort (the global default `[models].default_reasoning_effort`, which can also be overridden per-model) -- keep their existing homes. See [Reasoning Effort](#reasoning-effort) and [Auto-Compaction Threshold](#auto-compaction-threshold) below for details.
 
 > **Note on `stream_tool_calls`:** this one affects request *shape*, not just sampling. A few endpoints (some BYOK providers) expect it left unset; if a global `stream_tool_calls = true` causes problems for such a model, opt that model out with `stream_tool_calls = false` in its `[model.<id>]` block.
 
@@ -198,6 +205,83 @@ env_http_headers = { "X-Tenant-Token" = "GATEWAY_TENANT_TOKEN" }
 Grok reads each variable when it builds the client for a session and places the value in the request headers only, never on disk. A header is skipped when its variable is unset or blank, and a resolved value overrides an `extra_headers` entry of the same name. Use `extra_headers` for a static value and `env_http_headers` for one that comes from the environment.
 
 Both fields also work on a shared `[model_providers.<id>]` block. A model that points at a provider with `model_provider = "<id>"` inherits the provider's `query_params` and `env_http_headers` when it sets none of its own, matching how `extra_headers` is inherited.
+
+### Reasoning Effort
+
+For models that support reasoning effort levels, you can configure per-model parameters under `[model.<id>]`:
+
+* `supports_reasoning_effort` (boolean): Explicitly declares whether the model supports reasoning effort.
+  * For models using the **Messages (Anthropic-style)** backend, this is automatically enabled (`true`) and does not need to be declared.
+  * For **OpenAI-compatible** endpoints (e.g. Chat Completions or Responses backends), you must explicitly set `supports_reasoning_effort = true`.
+  * If a non-empty `reasoning_efforts` list is defined, support is automatically implied.
+* `reasoning_effort` (string): The default reasoning effort level to send on the wire.
+  * Valid effort levels (lowercase) are: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`.
+  * If this is omitted but `reasoning_efforts` is provided, Grok will automatically derive a default reasoning effort (preferring the option flagged as `default = true`, or falling back to the first defined option).
+* `reasoning_efforts` (array of strings or tables): Declares the list of reasoning effort levels selectable in the UI. Each entry can be:
+  * A bare string corresponding to the effort level, e.g. `"high"`.
+  * A table specifying details:
+    * `value` (string, required): The canonical effort level, e.g. `"high"`.
+    * `id` (string, optional): Presentation ID (defaults to the lowercase value).
+    * `label` (string, optional): Display label (defaults to the capitalized ID, e.g. `"High"`).
+    * `description` (string, optional): A short description of the effort level.
+    * `default` (boolean, optional): Whether this is the default effort level.
+
+#### Worked Example: OpenAI-compatible Provider (e.g. OpenAI o3-mini)
+
+```toml
+[model.my-reasoning-model]
+model = "o3-mini"
+base_url = "https://api.openai.com/v1"
+env_key = "OPENAI_API_KEY"
+supports_reasoning_effort = true
+reasoning_effort = "medium"
+reasoning_efforts = [
+    { value = "low", label = "Low Effort" },
+    { value = "medium", label = "Medium Effort", default = true },
+    { value = "high", label = "High Effort" }
+]
+```
+
+#### Worked Example: Messages Backend (Anthropic-style)
+
+Anthropic Messages backend models automatically enable `supports_reasoning_effort = true`:
+
+```toml
+[model.my-claude-reasoning]
+model = "claude-3-7-sonnet"
+base_url = "https://api.anthropic.com/v1"
+api_backend = "messages"
+auth_scheme = "x_api_key"
+env_key = "ANTHROPIC_API_KEY"
+reasoning_efforts = ["low", "medium", "high"]
+```
+
+#### Web Search and Backend Search
+
+* `supports_backend_search` (boolean): For custom models that support server-side search, set this to `true` (e.g. `supports_backend_search = true`). This tells the shell to allow server-side web search commands for this model (only effective when the build enables backend search).
+
+### Auto-Compaction Threshold
+
+Auto-compaction keeps your prompt history clean by summarizing or shrinking context when it fills up. The point at which compaction triggers is controlled by the auto-compaction threshold (expressed as a percentage of the context window, default is `85`). 
+
+This value can be configured at multiple levels. Grok resolves the active threshold using the following six-tier precedence (highest priority first):
+
+1. **Environment Variable**: `GROK_AUTO_COMPACT_THRESHOLD_PERCENT` (sets the threshold per-process).
+2. **Per-Model TOML Override**: `auto_compact_threshold_percent` in the model section, e.g. `[model.<id>] auto_compact_threshold_percent = 70`.
+3. **Session Global TOML**: `auto_compact_threshold_percent` in the global `[session]` section, e.g. `[session] auto_compact_threshold_percent = 80`.
+4. **Remote Settings Per-Model**: The default threshold set by the model provider’s catalog.
+5. **Remote Settings Global**: The global default threshold set by the remote environment.
+6. **Built-in Fallback**: The default value of `85`%.
+
+Example TOML configuration:
+
+```toml
+[session]
+auto_compact_threshold_percent = 80  # Global fallback for all models
+
+[model.my-model]
+auto_compact_threshold_percent = 70  # Override specifically for my-model
+```
 
 ---
 
