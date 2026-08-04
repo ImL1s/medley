@@ -8084,6 +8084,40 @@ reasoning_effort = "low"
             std::env::remove_var(alias);
         }
     }
+    /// #110 gate predicate: the origin gate uses the existing canonical
+    /// classifier `is_xai_api_bearer_url`, not `is_xai_api_url`. The two differ
+    /// on exactly the rows that matter here -- loopback and cleartext -- so
+    /// pin them, and a future edit to the helper surfaces as this test rather
+    /// than as an ambient credential on a local endpoint.
+    #[test]
+    fn ambient_gate_predicate_semantics() {
+        let allowed = [
+            "https://api.x.ai/v1",
+            crate::env::PROD_CLI_CHAT_PROXY_BASE_URL,
+        ];
+        let refused = [
+            "http://127.0.0.1:11434/v1", // loopback: the issue's own repro
+            "http://localhost:8080/v1",
+            "https://127.0.0.1:8443/v1", // loopback even with TLS
+            "http://api.x.ai/v1",        // cleartext: a bearer is never safe here
+            "https://api.openai.com/v1", // external
+            "https://evil.example/x.ai", // x.ai in the path, not the host
+            "not a url",
+        ];
+        for url in allowed {
+            assert!(
+                crate::util::is_xai_api_bearer_url(url),
+                "{url} must classify as first-party"
+            );
+        }
+        for url in refused {
+            assert!(
+                !crate::util::is_xai_api_bearer_url(url),
+                "{url} must NOT classify as first-party"
+            );
+        }
+    }
+
     #[test]
     #[serial]
     fn resolve_credentials_empty_env_key_falls_through_to_session() {

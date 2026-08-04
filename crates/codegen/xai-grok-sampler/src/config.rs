@@ -49,7 +49,7 @@ pub enum AuthScheme {
 /// protocol shape.
 // The trust classification lives in `xai-grok-sampling-types` so chat-state
 // configs can carry it from config resolution into request construction.
-pub use xai_grok_sampling_types::EndpointTrustClass;
+pub use xai_grok_sampling_types::{CredentialSource, EndpointTrustClass};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SamplerConfig {

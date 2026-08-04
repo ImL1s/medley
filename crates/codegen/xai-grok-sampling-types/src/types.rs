@@ -1073,6 +1073,41 @@ pub enum EndpointTrustClass {
     Local,
 }
 
+/// Which credential source won resolution for a model route (#110).
+///
+/// Carries only non-secret identifiers — environment-variable, provider, and
+/// header *names*. Never credential bytes, header values, account ids, or JWT
+/// material. That constraint is the point of the type: a route can be logged,
+/// serialized, and shown in `inspect` without a redaction pass, because there
+/// is nothing here to redact.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CredentialSource {
+    /// `auth_scheme = "none"`: deliberately unauthenticated.
+    None,
+    /// Static `api_key` on the model (or inherited provider) config.
+    ModelApiKey,
+    /// Resolved `env_key`; `name` is the environment variable that won.
+    ///
+    /// The winning name, not the configured one: `env_key` accepts a list, and
+    /// naming the first entry when a later alias supplied the value would send
+    /// a user to a variable they never set.
+    EnvKey { name: String },
+    /// Named `[auth_provider.*]`, including the OpenAI Codex profile.
+    AuthProvider { name: String },
+    /// Credential supplied directly by the user as a header, through
+    /// `extra_headers` or `env_http_headers`; `env` is the variable name for
+    /// the latter and `None` for a literal.
+    ExplicitHeader { header: String, env: Option<String> },
+    /// The ambient signed-in xAI session token.
+    XaiSession,
+    /// The ambient `XAI_API_KEY` environment variable.
+    XaiApiKeyEnv,
+    /// Nothing usable resolved. Distinct from [`Self::None`]: that one is a
+    /// choice, this one is a gap, and only this one blocks a route.
+    Missing,
+}
+
 /// Sampling client configuration (API key excluded — that stays in the client).
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct SamplingConfig {
