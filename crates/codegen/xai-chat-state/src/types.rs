@@ -256,6 +256,7 @@ mod tests {
                 temperature: None,
                 top_p: None,
                 api_backend: Default::default(),
+                endpoint_trust: None,
                 extra_headers: indexmap::IndexMap::from([(
                     "authorization".to_owned(),
                     format!("Bearer {alpha_key}"),
@@ -307,6 +308,7 @@ mod tests {
                 temperature: Some(0.7),
                 top_p: None,
                 api_backend: Default::default(),
+                endpoint_trust: None,
                 extra_headers: Default::default(),
                 query_params: Default::default(),
                 env_http_headers: Default::default(),
@@ -354,6 +356,7 @@ mod tests {
                 temperature: None,
                 top_p: None,
                 api_backend: Default::default(),
+                endpoint_trust: None,
                 extra_headers: Default::default(),
                 query_params: Default::default(),
                 env_http_headers: Default::default(),

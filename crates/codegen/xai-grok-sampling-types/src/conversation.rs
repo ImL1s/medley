@@ -2452,6 +2452,16 @@ mod tests {
                         .get("prompt_cache_key")
                         .is_some()
                 }
+                // The fork's backend is not in the loop above, so this arm is
+                // unreachable. Deliberately not folded into `Responses`: Codex
+                // borrows that wire shape, but whether its mapping actually
+                // emits `prompt_cache_key` -- and so whether
+                // `forwards_prompt_cache_key()` returning false for it is
+                // right -- is unverified. Asserting the equivalence here would
+                // hide that, and a 368-file sync is the wrong place to find out.
+                crate::ApiBackend::CodexResponses => {
+                    unreachable!("CodexResponses is not exercised by this loop")
+                }
                 crate::ApiBackend::Messages => {
                     let mapped = super::messages::build_messages_request(&request());
                     serde_json::to_value(&mapped)

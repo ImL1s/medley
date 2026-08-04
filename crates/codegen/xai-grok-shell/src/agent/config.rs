@@ -6388,7 +6388,6 @@ mod tests {
             grok_internal_otlp_traces_endpoint: Some(secret_url.clone()),
             grok_internal_otlp_headers: Some(secret.to_owned()),
             otel_traces_exporter: Some(secret.to_owned()),
-            asset_server_url: secret_url.clone(),
             management_api_key: Some(secret.to_owned()),
             gcs_service_account_key: Some(secret.to_owned()),
             ..EndpointsConfig::default()
@@ -7034,9 +7033,15 @@ reasoning_effort = "low"
         codex.auth_provider = Some(crate::auth::AuthProviderRef::openai_codex(manager));
         let catalog = IndexMap::from([("grok".into(), grok), ("codex".into(), codex)]);
 
-        let resolve = |model, session| {
-            resolve_model_to_sampling_config(model, &catalog, Some(session), None, None, None)
-                .expect("model resolves in the same running process")
+        // `resolve_model_to_sampling_config` was a thin wrapper upstream removed
+        // in 780d138. Inlined here rather than reintroduced: the three steps it
+        // performed are what this test is actually exercising.
+        let resolve = |model: &str, session: &str| {
+            let entry = find_model_by_id(&catalog, model)
+                .cloned()
+                .expect("model resolves in the same running process");
+            let credentials = resolve_credentials(&entry, Some(session));
+            sampling_config_for_model(&entry, credentials, None, None, None, None)
         };
         let first_grok = resolve("grok", "grok-session-1");
         let codex = resolve("codex", "must-not-reach-codex");

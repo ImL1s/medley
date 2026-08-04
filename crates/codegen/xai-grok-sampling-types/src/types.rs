@@ -1284,6 +1284,9 @@ mod tests {
             temperature: None,
             top_p: None,
             api_backend: ApiBackend::default(),
+            // Fork field; irrelevant to what this test asserts (that `Debug`
+            // exposes no request credentials), so left unset.
+            endpoint_trust: None,
             extra_headers: indexmap::IndexMap::from([(
                 "authorization".to_owned(),
                 format!("Bearer {secret}"),

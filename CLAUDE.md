@@ -27,6 +27,8 @@ CI runs on `providers` only. `main` moving triggers nothing.
 
 **A green test suite can mean a filter matched nothing.** CI wraps its hot-path filters in `run_nonzero`, which fails when a filter matches zero tests. `cargo test --exact <short-name>` matches nothing and exits 0 — it needs the full module path.
 
+**`cargo check --lib` does not compile `#[cfg(test)]` code.** Neither does clippy on `--lib`. A workspace can pass check, clippy, fmt, and a filtered hot-path run while the test build of the largest crate is broken — that is exactly what the 2026-08-04 upstream sync did, and only CI caught it. Run `cargo test --workspace --no-run` before pushing anything that touches shared types: it compiles every test target without running them, which is the cheapest way to find a fork test still calling something upstream deleted.
+
 **Isolating the install does not isolate the run.** When checking a built binary, pass `HOME` (or `MEDLEY_HOME`) to *every invocation*, not just to `install.sh`. Otherwise `grok_home()` falls back to the developer's `~/.grok` and answers plausibly wrong — `channel` reads `stable` instead of `unknown`, and nothing errors.
 
 **`~/.medley/bin/medley` is a launcher script, not the binary.** It bakes `MEDLEY_HOME` at install time. To test binary behaviour, run `~/.medley/versions/<v>/medley` directly. `file <path>` tells you which you have.

@@ -1155,7 +1155,11 @@ fn apply_deferred_switch_outcome_hard_blocks_unready() {
     let applied = apply_deferred_switch_outcome(
         agent,
         DeferredSwitchOutcome {
-            switch: Some((unready_id, None)),
+            switch: Some(crate::app::agent::DeferredModelSwitch {
+                model_id: unready_id,
+                effort: None,
+                prev_model_id: None,
+            }),
             effort_error: None,
         },
     );
@@ -1182,7 +1186,11 @@ fn apply_deferred_switch_outcome_hard_blocks_catalog_miss() {
     let applied = apply_deferred_switch_outcome(
         agent,
         DeferredSwitchOutcome {
-            switch: Some((unknown_id, None)),
+            switch: Some(crate::app::agent::DeferredModelSwitch {
+                model_id: unknown_id,
+                effort: None,
+                prev_model_id: None,
+            }),
             effort_error: None,
         },
     );

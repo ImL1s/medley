@@ -85,7 +85,11 @@ fn restored_session_applies_deferred_switch_before_draining_prompt_queue() {
     {
         let agent = app.agents.get_mut(&id).unwrap();
         agent.session.session_id = None;
-        agent.session.deferred_model_switch = Some((model_id.clone(), None));
+        agent.session.deferred_model_switch = Some(crate::app::agent::DeferredModelSwitch {
+            model_id: model_id.clone(),
+            effort: None,
+            prev_model_id: None,
+        });
         agent.session.enqueue_prompt("queued after restore".into());
     }
 

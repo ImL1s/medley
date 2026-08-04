@@ -272,6 +272,7 @@ mod tests {
             temperature: None,
             top_p: None,
             api_backend: Default::default(),
+            endpoint_trust: None,
             extra_headers: Default::default(),
             query_params: Default::default(),
             env_http_headers: Default::default(),

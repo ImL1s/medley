@@ -1096,7 +1096,11 @@ fn rapid_no_session_model_choices_coalesce_and_keep_original_rollback() {
     );
     assert_eq!(
         app.agents[&id].session.deferred_model_switch,
-        Some((model_c.clone(), None)),
+        Some(crate::app::agent::DeferredModelSwitch {
+            model_id: model_c.clone(),
+            effort: None,
+            prev_model_id: None,
+        }),
     );
 
     let effects = dispatch(
