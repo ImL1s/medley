@@ -18,6 +18,66 @@ fn test_manager() -> ModelsManager {
     .build()
 }
 
+/// #110: with an empty catalog, `sampling_config` synthesises a fallback
+/// entry against `models_base_url`. Pointed anywhere non-first-party that
+/// entry is credential-less and unready, and the choke point strips it — but
+/// stripping is not enough here. When the session path cannot resolve a model
+/// id it clones this construction-time config verbatim
+/// (`resolve_sampling_config_for_model`), and the readiness latch skips
+/// entries it cannot find, so the user's first prompt would be sent to that
+/// origin with no authentication. Unready has to mean unusable at this seam.
+#[test]
+fn construction_fallback_is_unusable_when_the_catalog_endpoint_is_external() {
+    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    use xai_grok_test_support::EnvGuard;
+    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+    let tmp = std::env::temp_dir().join("grok-test-fallback-origin");
+    let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
+    let mut cfg = config::Config::default();
+    cfg.endpoints.models_base_url = Some("https://third-party.example/v1".to_string());
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        IndexMap::new(),
+        acp::ModelId::new("default"),
+        auth_manager,
+        cfg,
+    )
+    .cache(test_cache_manager(&tmp))
+    .build();
+
+    let sampling = mgr.sampling_config();
+    assert!(
+        sampling.base_url.is_empty(),
+        "an unready construction fallback must not carry a usable endpoint, got {}",
+        sampling.base_url
+    );
+    assert_eq!(sampling.api_key, None, "and no credential with it");
+}
+
+/// The same seam on a first-party endpoint is the normal startup path and
+/// must keep working.
+#[test]
+fn construction_fallback_is_usable_on_a_first_party_endpoint() {
+    let tmp = std::env::temp_dir().join("grok-test-fallback-first-party");
+    let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        IndexMap::new(),
+        acp::ModelId::new("default"),
+        auth_manager,
+        config::Config::default(),
+    )
+    .cache(test_cache_manager(&tmp))
+    .build();
+
+    assert!(
+        !mgr.sampling_config().base_url.is_empty(),
+        "the first-party default is the normal startup path"
+    );
+}
+
 #[tokio::test]
 async fn catalog_retry_recovers_after_endpoint_returns() {
     use std::sync::atomic::{AtomicUsize, Ordering};

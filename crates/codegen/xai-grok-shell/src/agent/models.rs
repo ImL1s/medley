@@ -921,7 +921,7 @@ impl ModelsManager {
         let credentials =
             resolve_credentials(current_model, session_auth.as_ref().map(|a| a.key.as_str()));
 
-        sampling_config_for_model(
+        let mut sampling = sampling_config_for_model(
             current_model,
             credentials,
             config.endpoints.alpha_test_key.clone(),
@@ -930,7 +930,22 @@ impl ModelsManager {
                 config.endpoints.deployment_key.as_deref(),
             ),
             None,
-        )
+        );
+        // #110: this is not only a startup snapshot. When the session path
+        // cannot resolve a model id it clones this config verbatim
+        // (`resolve_sampling_config_for_model`), and the readiness latch skips
+        // entries it cannot find — so an unready model here would carry the
+        // user's first prompt to its endpoint with the credential stripped
+        // but the destination intact. Withhold the destination too: a config
+        // with no endpoint fails locally instead of reaching a stranger.
+        if !crate::agent::config::model_readiness(current_model).0 {
+            tracing::warn!(
+                model = current_model.info().model.as_str(),
+                "construction-time sampling config is not ready; withholding its endpoint"
+            );
+            sampling.base_url = String::new();
+        }
+        sampling
     }
 
     /// Disk-cache origin key for this manager's current endpoints/auth shape
