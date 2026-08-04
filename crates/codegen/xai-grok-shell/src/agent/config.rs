@@ -5605,7 +5605,17 @@ pub(crate) fn stamp_session_local_sampler_fields(
 ) {
     cfg.client_identifier = client_identifier;
     cfg.attribution_callback = active_session_config.attribution_callback.clone();
+    // A declared credential header is terminal (#110). Stamping a session
+    // resolver on top of one looks harmless here -- both URLs are first-party,
+    // nothing is overwritten in this function -- but `SamplingClient::post`
+    // then removes `Authorization`/`x-api-key` and inserts the live bearer,
+    // so the user's own credential is replaced by the session at send time.
+    let user_declared_header = matches!(
+        cfg.credential_source,
+        Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
+    );
     if cfg.bearer_resolver.is_none()
+        && !user_declared_header
         && cfg.auth_scheme != AuthScheme::None
         && active_session_config.auth_scheme != AuthScheme::None
         && crate::util::is_xai_api_bearer_url(&cfg.base_url)
@@ -7604,6 +7614,26 @@ reasoning_effort = "low"
         assert!(
             none_scheme.bearer_resolver.is_none(),
             "AuthScheme::None must never inherit the session bearer resolver"
+        );
+
+        // A credential header the user declared is terminal, even on a
+        // first-party URL where every other condition here passes. Stamping
+        // looks harmless at this seam -- nothing is overwritten in this
+        // function -- but `SamplingClient::post` later removes
+        // `Authorization`/`x-api-key` and inserts the live bearer, so the
+        // session would silently replace the user's own credential (#110).
+        let mut declared_header = SamplerConfig {
+            base_url: EndpointsConfig::default().resolve_inference_base_url(),
+            credential_source: Some(xai_grok_sampler::CredentialSource::ExplicitHeader {
+                header: "authorization".into(),
+                env: None,
+            }),
+            ..SamplerConfig::default()
+        };
+        stamp_session_local_sampler_fields(&mut declared_header, &session_cfg, None, None);
+        assert!(
+            declared_header.bearer_resolver.is_none(),
+            "a declared credential header must not be replaced by the session bearer"
         );
 
         let codex_session = SamplerConfig {
