@@ -122,11 +122,31 @@ fn process_hooks_content(
         );
         // Resolve plugin path placeholders at load time (mirrors managed_mcp)
         // so the command works regardless of the runner's spawn branch.
-        if let Some(cmd) = &spec.command {
-            let cmd_str = cmd.to_string_lossy();
-            let substituted = substitute_env_vars(&cmd_str, plugin_root, plugin_data);
+        //
+        // Start from `command_raw`, not from `spec.command`. `parse_hook_file`
+        // already expanded `spec.command` against the *ambient* environment
+        // (`xai-grok-hooks/src/config.rs`), and the plugin tokens are only
+        // inserted into `extra_env` a few lines above — after that expansion.
+        // So on a host that exports `CLAUDE_PLUGIN_DATA` (any host running
+        // Claude Code with plugins), `spec.command` arrives here with the
+        // ambient value already substituted in and no token left to replace:
+        // the plugin hook then executes out of another plugin's data
+        // directory, and fails open because that path usually exists.
+        //
+        // `command_raw` is the pre-expansion source string, so substituting
+        // plugin tokens against it puts this back in the intended order:
+        // caller-supplied tokens first, ambient expansion only for what is
+        // left. See #96.
+        if let Some(raw) = spec.command_raw.clone() {
+            let substituted = substitute_env_vars(&raw, plugin_root, plugin_data);
             let expanded = xai_grok_config::expand_env_vars_in_string(&substituted);
-            if expanded != cmd_str {
+            if Some(expanded.as_str())
+                != spec
+                    .command
+                    .as_ref()
+                    .map(|c| c.to_string_lossy())
+                    .as_deref()
+            {
                 spec.command = Some(PathBuf::from(expanded));
             }
         }
@@ -348,6 +368,84 @@ mod tests {
 
     /// Regression: plugin path placeholders must resolve at load time, else the
     /// runner's pre-spawn env check refuses to run the hook.
+    /// RAII guard: sets an env var, restores the prior value (or unsets) on
+    /// drop, so a test never leaves process-global env rewritten.
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    /// #96: a plugin token must resolve to the value the caller supplied, never
+    /// to whatever the surrounding process exports under the same name.
+    ///
+    /// The tokens are vendor-compat aliases, so on any host running Claude Code
+    /// with plugins `CLAUDE_PLUGIN_DATA` is exported — and `parse_hook_file`
+    /// expands the command against the ambient environment before this module
+    /// ever inserts the plugin values into `extra_env`. The failure is silent:
+    /// the hijacked path usually exists, so the wrong script runs and nothing
+    /// errors.
+    ///
+    /// Sets the variables deliberately rather than clearing them: clearing would
+    /// make this pass for the wrong reason on a machine that has none set.
+    #[test]
+    #[serial_test::serial]
+    fn plugin_tokens_beat_the_ambient_environment() {
+        let _root = EnvVarGuard::set("CLAUDE_PLUGIN_ROOT", "/ambient/wrong-root");
+        let _data = EnvVarGuard::set("CLAUDE_PLUGIN_DATA", "/ambient/wrong-data");
+
+        let value = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"hooks": [
+                        {"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/pre.sh"},
+                        {"type": "command", "command": "${CLAUDE_PLUGIN_DATA}/cache/post.sh"}
+                    ]}
+                ]
+            }
+        });
+
+        let (specs, warnings) =
+            parse_plugin_hooks_from_value(&value, "gb96-plugin", "/opt/p96", "/var/p96");
+
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        let commands: Vec<String> = specs
+            .iter()
+            .map(|s| s.command.as_ref().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            commands.contains(&"/opt/p96/hooks/pre.sh".to_string()),
+            "ambient CLAUDE_PLUGIN_ROOT won over the caller's value: {commands:?}"
+        );
+        assert!(
+            commands.contains(&"/var/p96/cache/post.sh".to_string()),
+            "ambient CLAUDE_PLUGIN_DATA won over the caller's value: {commands:?}"
+        );
+        for cmd in &commands {
+            assert!(
+                !cmd.starts_with("/ambient/"),
+                "hook resolved into the ambient environment's directory: {cmd}"
+            );
+        }
+    }
+
     #[test]
     fn parse_plugin_hooks_substitutes_plugin_root_in_command() {
         let value = serde_json::json!({
