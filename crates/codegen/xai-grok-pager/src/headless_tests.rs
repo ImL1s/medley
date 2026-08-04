@@ -552,28 +552,43 @@ fn selected_model_unready_reason_reads_acp_meta() {
     let meta = meta.as_object().unwrap();
 
     assert_eq!(
-        super::selected_model_unready_reason(Some(meta), None).as_deref(),
+        super::selected_model_unready_reason(Some(meta), None, false).as_deref(),
         Some("missing DEEPSEEK_API_KEY"),
         "current model unready reason must surface"
     );
     assert_eq!(
-        super::selected_model_unready_reason(Some(meta), Some("deepseek-chat")).as_deref(),
+        super::selected_model_unready_reason(Some(meta), Some("deepseek-chat"), false).as_deref(),
         Some("missing DEEPSEEK_API_KEY"),
     );
     // Preferred model wins over current when both are in the catalog.
     assert_eq!(
-        super::selected_model_unready_reason(Some(meta), Some("grok-4.5")),
+        super::selected_model_unready_reason(Some(meta), Some("grok-4.5"), false),
         None,
         "ready preferred model must not invent an unready reason"
     );
     // Display name match works like the models list / -m resolver.
     assert_eq!(
-        super::selected_model_unready_reason(Some(meta), Some("DeepSeek Chat")).as_deref(),
+        super::selected_model_unready_reason(Some(meta), Some("DeepSeek Chat"), false).as_deref(),
         Some("missing DEEPSEEK_API_KEY"),
     );
     assert_eq!(
-        super::selected_model_unready_reason(None, Some("deepseek-chat")),
+        super::selected_model_unready_reason(None, Some("deepseek-chat"), false),
         None
+    );
+    // Resuming, continuing, or forking loads the model from the saved session
+    // in `open_session`, which runs after `authenticate`. The catalog's current
+    // model is a different one, so naming its reason would send the user to fix
+    // a model they are not using.
+    assert_eq!(
+        super::selected_model_unready_reason(Some(meta), None, true),
+        None,
+        "a resumed run must not borrow the catalog default's reason"
+    );
+    // An explicit -m is still the model that will be used, resume or not.
+    assert_eq!(
+        super::selected_model_unready_reason(Some(meta), Some("deepseek-chat"), true).as_deref(),
+        Some("missing DEEPSEEK_API_KEY"),
+        "-m names the model regardless of how the session was opened"
     );
 }
 
@@ -594,7 +609,7 @@ fn unsupported_effort_user_note_names_model_and_switch() {
         "must name the config switch: {note}"
     );
     assert!(
-        note.contains("[model.deepseek-chat]"),
+        note.contains(r#"[model."deepseek-chat"]"#),
         "must name the config table: {note}"
     );
     assert!(

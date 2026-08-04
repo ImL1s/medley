@@ -473,6 +473,7 @@ fn auth_required_message(interactive: bool, model_unready_reason: Option<&str>) 
 fn selected_model_unready_reason(
     init_meta: Option<&acp::Meta>,
     preferred_model: Option<&str>,
+    resuming: bool,
 ) -> Option<String> {
     let state: acp::SessionModelState = init_meta
         .and_then(|m| m.get("modelState"))
@@ -484,7 +485,16 @@ fn selected_model_unready_reason(
         })
     };
 
+    // Without `-m`, the model actually used is the catalog's current one --
+    // except when resuming, continuing, or forking. Those load their model
+    // from the saved session in `open_session`, which runs *after*
+    // `authenticate`, so the catalog default here is simply a different model.
+    // Naming its reason would be confidently wrong, which is worse than the
+    // generic text: it would send the user to fix a model they are not using.
     let info = preferred_model.and_then(match_query).or_else(|| {
+        if resuming {
+            return None;
+        }
         state
             .available_models
             .iter()
@@ -502,8 +512,9 @@ async fn authenticate(
     default_auth_method_id: Option<&acp::AuthMethodId>,
     init_meta: Option<&acp::Meta>,
     preferred_model: Option<&str>,
+    resuming: bool,
 ) -> anyhow::Result<bool> {
-    let unready = selected_model_unready_reason(init_meta, preferred_model);
+    let unready = selected_model_unready_reason(init_meta, preferred_model, resuming);
     let method_id = crate::acp::select_eager_auth_method(auths, default_auth_method_id)
         .ok_or_else(|| {
             use std::io::IsTerminal;
@@ -682,7 +693,7 @@ async fn fork_then_open(
 fn unsupported_effort_user_note(model_id: &str) -> String {
     format!(
         "--effort/--reasoning-effort: model '{model_id}' does not support reasoning effort; \
-         ignoring. Set supports_reasoning_effort = true in [model.{model_id}] to enable it."
+         ignoring. Set supports_reasoning_effort = true in [model.\"{model_id}\"] to enable it."
     )
 }
 
@@ -927,6 +938,7 @@ pub async fn run_single_turn(
         default_auth_method_id.as_ref(),
         init_resp.meta.as_ref(),
         options.model.as_deref(),
+        options.resume.is_some() || options.continue_last_session || options.fork_session,
     )
     .await
     {

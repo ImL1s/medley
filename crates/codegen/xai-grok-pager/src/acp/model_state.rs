@@ -31,8 +31,13 @@ impl EffortTokenError {
             Self::Unsupported => {
                 // Name the config switch that turns effort on — the gate already
                 // knows; the defect was only that it did not say so.
+                // The key is quoted because model ids routinely contain dots
+                // (`grok-4.5`, `gpt-5.6-sol`), and TOML reads an unquoted
+                // `[model.grok-4.5]` as a nested table path rather than that
+                // literal key — so the unquoted form would create the wrong
+                // table and the setting would still not apply.
                 "current model does not support reasoning effort; \
-                 set supports_reasoning_effort = true in [model.<id>] to enable it"
+                 set supports_reasoning_effort = true in [model.\"<id>\"] to enable it"
                     .to_string()
             }
             Self::UnknownToken { token, offered } => {
@@ -494,7 +499,7 @@ mod tests {
             "must name the config switch that enables effort: {msg}"
         );
         assert!(
-            msg.contains("[model.<id>]"),
+            msg.contains(r#"[model."<id>"]"#),
             "must point at the per-model config table: {msg}"
         );
     }
