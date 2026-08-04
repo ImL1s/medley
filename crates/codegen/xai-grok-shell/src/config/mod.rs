@@ -1857,8 +1857,12 @@ pub fn validate_hooks_path(path: &str) -> Result<(), Box<dyn std::error::Error>>
         .map_err(|e: std::io::Error| format!("Cannot resolve hook path: {e}"))?;
     let canonical_home = dunce::canonicalize(&grok_home).unwrap_or_else(|_| grok_home.clone());
     if !canonical.starts_with(&canonical_home) {
+        // The label has to come from the resolved home like the path below it
+        // does. Written literally it said "must be under ~/.grok/" and then
+        // printed `~/.medley` in the same sentence.
         return Err(format!(
-            "Hook path must be under ~/.grok/ ({}). Got: {}",
+            "Hook path must be under {}/ ({}). Got: {}",
+            xai_grok_config::display_grok_home_prefix(),
             canonical_home.display(),
             canonical.display()
         )

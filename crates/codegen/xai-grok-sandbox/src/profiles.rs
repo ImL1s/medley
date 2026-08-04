@@ -446,12 +446,17 @@ impl ProfileName {
 
             Self::Custom(name) => {
                 let profile_config = config.profiles.get(name).ok_or_else(|| {
+                    // Only the first path is resolved. The second is the
+                    // project-local file, which this module really does read
+                    // from `<workspace>/.grok/sandbox.toml` (see `:129`), so
+                    // that one is literal on purpose.
                     anyhow::anyhow!(
                         "Custom sandbox profile '{name}' not found. \
-                         Define it in ~/.grok/sandbox.toml or .grok/sandbox.toml:\n\n\
+                         Define it in {user_profiles} or .grok/sandbox.toml:\n\n\
                          [profiles.{name}]\n\
                          extends = \"workspace\"\n\
-                         read_only = [\"/data\"]\n"
+                         read_only = [\"/data\"]\n",
+                        user_profiles = xai_grok_config::display_user_grok_path("sandbox.toml")
                     )
                 })?;
 
