@@ -216,6 +216,7 @@ For models that support reasoning effort levels, you can configure per-model par
   * If a non-empty `reasoning_efforts` list is defined, support is automatically implied.
 * `reasoning_effort` (string): The default reasoning effort level to send on the wire.
   * Valid effort levels (lowercase) are: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`.
+  * **On the Messages backend, `none` and `minimal` are not sent at all.** Both map to an omitted effort, so the request carries no `output_config.effort` and no adaptive thinking — the same wire shape as leaving `reasoning_effort` unset. Selecting `minimal` on an Anthropic-style model therefore does not pick a lower reasoning tier; it turns the field off. The remaining five behave as named.
   * If this is omitted but `reasoning_efforts` is provided, Grok will automatically derive a default reasoning effort (preferring the option flagged as `default = true`, or falling back to the first defined option).
 * `reasoning_efforts` (array of strings or tables): Declares the list of reasoning effort levels selectable in the UI. Each entry can be:
   * A bare string corresponding to the effort level, e.g. `"high"`.
