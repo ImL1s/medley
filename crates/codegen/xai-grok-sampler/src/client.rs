@@ -72,7 +72,12 @@ fn strip_codex_routing_headers(headers: &mut HeaderMap) {
 /// hosts (including the cli-chat-proxy) with real auth, then loopback, then
 /// external. Decided once at client construction and enforced at every
 /// request boundary.
-fn resolve_endpoint_trust(config: &SamplerConfig) -> EndpointTrustClass {
+///
+/// Public because it is the *only* trust classifier: anything that needs to
+/// describe or display where a request will go must ask this rather than
+/// re-derive it, or the two answers drift and the displayed one starts
+/// lying about the enforced one (#110).
+pub fn resolve_endpoint_trust(config: &SamplerConfig) -> EndpointTrustClass {
     if let Some(explicit) = config.endpoint_trust {
         return explicit;
     }

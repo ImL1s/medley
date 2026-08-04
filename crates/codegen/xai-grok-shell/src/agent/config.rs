@@ -5632,6 +5632,87 @@ pub(crate) fn resolve_chat_state_auth_type(
         .map(|r| r.auth_type)
         .unwrap_or(fallback)
 }
+/// Where a model's requests will go and what will authenticate them, with
+/// nothing in it that has to be redacted before display (#110).
+///
+/// Every field is a name, a class, or a sanitized origin -- never a
+/// credential, and never a URL that could carry one in its userinfo or query.
+/// That is the point: a consumer can log, serialize, or render this without
+/// knowing which of its fields used to be dangerous.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct EffectiveModelRoute {
+    /// The key the catalog knows this model by.
+    pub catalog_id: String,
+    /// The model string that actually goes on the wire, which a config
+    /// override can make different from `catalog_id`.
+    pub wire_model: String,
+    /// Scheme, host, port, and path. Userinfo, query, and fragment are gone
+    /// by construction.
+    pub sanitized_origin: String,
+    pub endpoint_trust: xai_grok_sampler::EndpointTrustClass,
+    pub credential_source: xai_grok_sampler::CredentialSource,
+    pub ready: bool,
+    /// Present exactly when `ready` is false, and actionable when present.
+    pub unready_reason: Option<String>,
+}
+/// Scheme + host [+ port] [+ path]. Userinfo, query, and fragment are dropped
+/// by construction, because both are places a credential is routinely carried
+/// and neither adds anything to a description of an origin (#110).
+pub(crate) fn sanitized_origin(url: &str) -> String {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return "<invalid-url>".to_owned();
+    };
+    let mut origin = format!(
+        "{}://{}",
+        parsed.scheme(),
+        parsed.host_str().unwrap_or("<no-host>")
+    );
+    if let Some(port) = parsed.port() {
+        origin.push_str(&format!(":{port}"));
+    }
+    let path = parsed.path().trim_end_matches('/');
+    if !path.is_empty() {
+        origin.push_str(path);
+    }
+    origin
+}
+/// Describe the route a model resolves to, as the sampler will see it.
+///
+/// Builds the very `SamplerConfig` the sampler would receive and asks the
+/// sampler to classify it, rather than re-deriving trust here. A second
+/// classifier would have to agree with the enforced one forever, and the
+/// first time they disagreed the displayed answer would start lying about
+/// the enforced one.
+pub(crate) fn effective_model_route(
+    catalog_id: &str,
+    model: &ModelEntry,
+    credentials: &ResolvedCredentials,
+) -> EffectiveModelRoute {
+    let (ready, unready_reason) = model_readiness(model);
+    // Copied field by field rather than by deriving `Clone` on
+    // `ResolvedCredentials`: that struct is inherited, and every edit to it is
+    // a permanent conflict on the weekly sync. The literal also fails to
+    // compile if upstream adds a field, which is the right way to find out.
+    let credentials = ResolvedCredentials {
+        api_key: credentials.api_key.clone(),
+        base_url: credentials.base_url.clone(),
+        auth_type: credentials.auth_type,
+        auth_scheme: credentials.auth_scheme,
+    };
+    let config = sampling_config_for_model(model, credentials, None, None, None, None);
+    EffectiveModelRoute {
+        catalog_id: catalog_id.to_owned(),
+        wire_model: config.model.clone(),
+        sanitized_origin: sanitized_origin(&config.base_url),
+        endpoint_trust: xai_grok_sampler::client::resolve_endpoint_trust(&config),
+        credential_source: config
+            .credential_source
+            .clone()
+            .unwrap_or(xai_grok_sampler::CredentialSource::Missing),
+        ready,
+        unready_reason,
+    }
+}
 /// An explicit, user-owned credential header declared on the model config
 /// (`extra_headers` / `env_http_headers`), as (lowercased header name, env
 /// NAME). Header *values* are never read here: this reports provenance only,
@@ -8368,6 +8449,71 @@ reasoning_effort = "low"
         }
     }
 
+    /// #110's typed seam. The fixture URL carries the same secret in three
+    /// places a URL can hide one -- userinfo, query, and (via the api_key) the
+    /// credential itself -- because the route's whole promise is that a
+    /// consumer may render it without knowing which field used to be
+    /// dangerous. Checked by sliding window, so a partial leak fails too.
+    #[test]
+    #[serial]
+    fn effective_model_route_is_secret_free_and_matches_the_sampler_inputs() {
+        use xai_grok_sampler::{CredentialSource, EndpointTrustClass};
+        const SECRET: &str = "route-secret-0123456789abcdef";
+
+        let mut model = test_model_entry(
+            "wire-model",
+            &format!("https://user:{SECRET}@api.example.com:8443/v1/x?api_key={SECRET}#frag"),
+            Some(SECRET),
+            None,
+            None,
+        );
+        model.info.api_backend = ApiBackend::ChatCompletions;
+        let creds = resolve_credentials(&model, None);
+        let route = effective_model_route("my-model", &model, &creds);
+
+        assert_eq!(route.catalog_id, "my-model");
+        assert_eq!(route.wire_model, "wire-model");
+        assert_eq!(route.sanitized_origin, "https://api.example.com:8443/v1/x");
+        assert_eq!(route.endpoint_trust, EndpointTrustClass::External);
+        assert_eq!(route.credential_source, CredentialSource::ModelApiKey);
+        assert!(route.ready, "a model with its own key is ready");
+
+        let json = serde_json::to_string(&route).expect("route serializes");
+        let debug = format!("{route:?}");
+        for rendered in [json, debug] {
+            for window in SECRET.as_bytes().windows(8) {
+                let window = std::str::from_utf8(window).expect("ascii");
+                assert!(
+                    !rendered.contains(window),
+                    "the route leaked the secret fragment {window}: {rendered}"
+                );
+            }
+        }
+    }
+    /// The route reports the trust class the sampler will enforce, because it
+    /// asks the sampler rather than deriving its own. These rows document what
+    /// that classification actually says for each shape of origin.
+    #[test]
+    #[serial]
+    fn effective_model_route_reports_the_enforced_trust_class() {
+        use xai_grok_sampler::EndpointTrustClass;
+        let cases = [
+            (
+                crate::env::PROD_CLI_CHAT_PROXY_BASE_URL,
+                EndpointTrustClass::FirstPartyXai,
+            ),
+            ("http://127.0.0.1:11434/v1", EndpointTrustClass::Local),
+            ("http://localhost:8080/v1", EndpointTrustClass::Local),
+            ("https://api.openai.com/v1", EndpointTrustClass::External),
+            ("not a url", EndpointTrustClass::External),
+        ];
+        for (url, want) in cases {
+            let model = test_model_entry("m", url, Some("own-key"), None, None);
+            let creds = resolve_credentials(&model, None);
+            let route = effective_model_route("m", &model, &creds);
+            assert_eq!(route.endpoint_trust, want, "{url}");
+        }
+    }
     /// #110: the auxiliary fallback mints an ambient xAI bearer
     /// (session -> XAI_API_KEY -> deployment_key) against
     /// `resolve_inference_base_url()`. A custom `models_base_url` points that

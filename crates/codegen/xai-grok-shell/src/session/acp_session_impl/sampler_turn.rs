@@ -1046,11 +1046,7 @@ impl SessionActor {
                 None
             };
         let auth_recovery_eligible = matches!(error.kind, SamplingErrorKind::Auth) && {
-            let gate = self.auth_gate(
-                &failed_model_id,
-                &failed_base_url,
-                failed_endpoint_trust,
-            );
+            let gate = self.auth_gate(&failed_model_id, &failed_base_url, failed_endpoint_trust);
             let eligible = gate.active();
             self.log_auth_gate_unknown("handle_sampling_failure", gate, &failed_base_url);
             if !eligible && auth_provider.is_none() {
