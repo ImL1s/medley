@@ -5399,6 +5399,21 @@ pub(crate) fn resolve_aux_model_sampling_config(
 ) -> Option<SamplerConfig> {
     let catalog_entry = find_model_by_id(models, model_id).cloned();
     if let Some(entry) = &catalog_entry {
+        // #110: readiness first, because the choke point rewrites an unready
+        // model's `auth_scheme` to `None` and the check further down reads
+        // `None` as "the user declared this keyless, use it". A route nothing
+        // can authenticate and a local server that wants no header are not
+        // the same thing, and conflating them hands callers an unauthenticated
+        // client instead of the documented fallback to the active model.
+        let (ready, reason) = model_readiness(entry);
+        if !ready {
+            tracing::warn!(
+                aux_model = %model_id,
+                reason = ?reason,
+                "auxiliary model is not ready; falling back to the active model"
+            );
+            return None;
+        }
         let credentials = resolve_credentials_enforced(entry, session_key, disable_api_key_auth);
         let sampler = sampling_config_for_model(
             entry,
@@ -8513,6 +8528,64 @@ reasoning_effort = "low"
             let route = effective_model_route("m", &model, &creds);
             assert_eq!(route.endpoint_trust, want, "{url}");
         }
+    }
+    /// #110 regression guard. Marking a model unready makes the choke point
+    /// rewrite its `auth_scheme` to `None`, and the auxiliary resolver reads
+    /// `None` as "the user declared this keyless, use it". Those two are not
+    /// the same thing: one is a route nothing can authenticate, the other is
+    /// a local server that wants no header. Conflating them hands an
+    /// unauthenticated client to image transcription, which then aborts the
+    /// whole turn instead of falling back to the active model.
+    #[test]
+    #[serial]
+    fn unready_aux_model_falls_back_instead_of_becoming_keyless() {
+        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+        use xai_grok_test_support::EnvGuard;
+        let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+        let mut catalog = IndexMap::new();
+        catalog.insert(
+            "image-describe".to_string(),
+            test_model_entry(
+                "image-describe",
+                "https://vision.example/v1",
+                None,
+                None,
+                None,
+            ),
+        );
+        let resolved = resolve_aux_model_sampling_config(
+            "image-describe",
+            &catalog,
+            &EndpointsConfig::default(),
+            Some("XAI_SESSION_SENTINEL"),
+            false,
+            None,
+            None,
+        );
+        assert!(
+            resolved.is_none(),
+            "an unready auxiliary model must fall back, not resolve as keyless"
+        );
+
+        // The genuine keyless case still resolves: `auth_scheme = "none"` is
+        // a declaration, and readiness honours it.
+        let mut keyless = test_model_entry("local", "http://127.0.0.1:11434/v1", None, None, None);
+        keyless.info.auth_scheme = AuthScheme::None;
+        let mut catalog = IndexMap::new();
+        catalog.insert("local".to_string(), keyless);
+        let resolved = resolve_aux_model_sampling_config(
+            "local",
+            &catalog,
+            &EndpointsConfig::default(),
+            Some("XAI_SESSION_SENTINEL"),
+            false,
+            None,
+            None,
+        )
+        .expect("a declared keyless auxiliary model still resolves");
+        assert_eq!(resolved.api_key, None, "keyless means no credential");
     }
     /// #110: the auxiliary fallback mints an ambient xAI bearer
     /// (session -> XAI_API_KEY -> deployment_key) against
