@@ -375,11 +375,11 @@ impl AuthMethodKind {
         matches!(self, Self::GrokCom | Self::Oidc)
     }
 
-    pub fn auth_error_message(self) -> &'static str {
+    pub fn auth_error_message(self) -> String {
         if self.is_session_based() {
-            AUTH_ERROR_SESSION_EXPIRED
+            AUTH_ERROR_SESSION_EXPIRED.to_owned()
         } else {
-            AUTH_ERROR_API_KEY
+            auth_error_api_key()
         }
     }
 }
@@ -445,7 +445,18 @@ pub fn session_token_auth_gate(
 pub const AUTH_ERROR_SESSION_EXPIRED: &str =
     "Session expired. Run `grok login` to re-authenticate.";
 
-pub const AUTH_ERROR_API_KEY: &str = "Authentication failed. Run `grok login`, set XAI_API_KEY, or add api_key to ~/.grok/config.toml.";
+/// Names the config file *this* install reads.
+///
+/// Was a `const`, which cannot interpolate — so it said `~/.grok/config.toml`
+/// on an install whose config lives in `~/.medley`. In the one message whose
+/// entire job is to tell you which file to edit, and which appears exactly
+/// when someone is going to follow it.
+pub fn auth_error_api_key() -> String {
+    format!(
+        "Authentication failed. Run `grok login`, set XAI_API_KEY, or add api_key to {}.",
+        xai_grok_config::display_user_grok_path("config.toml")
+    )
+}
 
 /// Next ACP method id when `cached_token` cannot proceed (missing / expired /
 /// legacy WebLogin), or `None` when fallthrough is forbidden.
@@ -512,7 +523,10 @@ pub fn cached_token_auth_method() -> acp::AuthMethod {
             acp::AuthMethodId::new(CACHED_TOKEN_AUTH_METHOD_ID),
             "cached_token".to_string(),
         )
-        .description(Some("Cached token from ~/.grok/auth.json".to_string())),
+        .description(Some(format!(
+            "Cached token from {}",
+            xai_grok_config::display_user_grok_path("auth.json")
+        ))),
     )
 }
 
@@ -1369,5 +1383,67 @@ mod tests {
         });
         assert_eq!(method_ids(&built), vec![GROK_COM_METHOD_ID]);
         assert!(built.default_auth_method_id.is_none());
+    }
+}
+
+#[cfg(test)]
+mod state_dir_message_tests {
+    /// The needle, assembled at run time.
+    ///
+    /// This module is inside a file it scans. Written as one literal it would
+    /// match itself, and the test would fail on a clean tree — the same
+    /// self-matching trap as a `pkill -f` pattern that appears in its own
+    /// command line.
+    fn legacy_prefix() -> String {
+        ["~/.", "grok"].concat()
+    }
+
+    /// No message this crate shows a user may name the state directory
+    /// literally.
+    ///
+    /// #84 swept these once and #112 found six it missed, four of them here.
+    /// A literal is right until someone sets `MEDLEY_HOME` or keeps an
+    /// existing `~/.grok`, and then it is a confident lie in exactly the
+    /// message whose job is to say where to look.
+    ///
+    /// Scans source, not rendered output: rendering resolves the *developer's*
+    /// state directory, so on a machine that still has the legacy directory a
+    /// correct message contains the legacy name and the assertion would fail
+    /// for being right.
+    ///
+    /// Comments are exempt — several explain this very problem. Scanning stops
+    /// at each file's `#[cfg(test)]`, since fixtures and assertions there name
+    /// the legacy path deliberately.
+    #[test]
+    fn no_user_facing_message_hardcodes_the_state_directory() {
+        let needle = legacy_prefix();
+        for (file, src) in [
+            ("agent/auth_method.rs", include_str!("auth_method.rs")),
+            ("config/mod.rs", include_str!("../config/mod.rs")),
+            (
+                "session/acp_session_impl/slash_exec.rs",
+                include_str!("../session/acp_session_impl/slash_exec.rs"),
+            ),
+            (
+                "session/acp_session_impl/session_setup.rs",
+                include_str!("../session/acp_session_impl/session_setup.rs"),
+            ),
+        ] {
+            for (idx, line) in src.lines().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed == "#[cfg(test)]" {
+                    break;
+                }
+                if trimmed.starts_with("//") || !line.contains(&needle) {
+                    continue;
+                }
+                panic!(
+                    "{file}:{} names the state directory literally in code. \
+                     Resolve it with xai_grok_config::display_user_grok_path \
+                     or display_grok_home_prefix — see #112.\n  {trimmed}",
+                    idx + 1
+                );
+            }
+        }
     }
 }
