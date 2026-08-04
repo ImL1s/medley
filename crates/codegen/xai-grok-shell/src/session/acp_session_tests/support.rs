@@ -1,5 +1,44 @@
 #![allow(dead_code)]
 use super::*;
+
+/// Run `f` on a thread with the same stack a real session thread gets.
+///
+/// Debug-built full-session turns compose futures larger than the default
+/// 2 MiB test-thread stack, and overflowing it aborts the whole test binary
+/// rather than failing one test. Measured floor for `handle_prompt` turns:
+/// 2.5 MiB still SIGABRTs, 3 MiB passes. Boxing the future does not help —
+/// it is built on the stack before the box moves it.
+///
+/// This borrows production's `SESSION_THREAD_STACK_SIZE` rather than naming
+/// its own number. A value tuned to today's measurement would leave under a
+/// MiB of headroom, and the next time the turn future grows the binary
+/// aborts again — the exact failure this exists to prevent. A suite-wide
+/// `RUST_MIN_STACK` would hide the same class of problem more thoroughly
+/// still.
+pub(crate) fn on_large_stack(f: impl FnOnce() + Send + 'static) {
+    let join = std::thread::Builder::new()
+        .name("handle_prompt_test".into())
+        .stack_size(SESSION_THREAD_STACK_SIZE)
+        .spawn(f)
+        .expect("spawn large-stack test thread");
+    match join.join() {
+        Ok(()) => {}
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+/// Current-thread tokio runtime + `LocalSet`, optional time pause.
+pub(crate) fn block_on_local(start_paused: bool, fut: impl std::future::Future<Output = ()>) {
+    let mut builder = tokio::runtime::Builder::new_current_thread();
+    builder.enable_all();
+    if start_paused {
+        builder.start_paused(true);
+    }
+    let rt = builder.build().expect("test runtime");
+    let local = tokio::task::LocalSet::new();
+    rt.block_on(local.run_until(fut));
+}
+
 /// Wrap `id` in a shared auth-method handle for `SessionActor` test literals
 /// (the field is now a shared live handle, not an owned id).
 pub(crate) fn test_auth_method_id(id: &str) -> crate::agent::auth_method::SharedAuthMethodId {

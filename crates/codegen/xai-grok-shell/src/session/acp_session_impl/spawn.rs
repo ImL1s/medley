@@ -9,6 +9,17 @@
 #![allow(clippy::items_after_test_module)]
 use super::*;
 use crate::remote::DEFAULT_CONTEXT_WINDOW;
+
+/// Stack for a session thread. A turn composes a deep future that a debug
+/// build lays out far larger than a release one, so this is sized for the
+/// debug case.
+///
+/// `pub(crate)` so the tests that drive a whole turn borrow the same number
+/// instead of picking their own. They overflowed the 2 MiB default and took
+/// the entire test binary down with them; a private copy would have to be
+/// re-tuned by hand every time this one moved, which is how the margin gets
+/// lost again.
+pub(crate) const SESSION_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
 /// Partition CLI `--allow` rules under the pin: blanket catch-all allows
 /// (`Allow(Any)` `*` / `**`, plus bare/match-all Bash/MCP/WebFetch grants — see
 /// `resolution::is_catchall_allow`) substitute for the blocked `--yolo`, so drop them when
@@ -2302,7 +2313,6 @@ pub(crate) async fn spawn_session_on_thread(
     >();
     let sid = session_info.id.0.to_string();
     let thread_name = format!("ses-{}", &sid[..sid.len().min(8)]);
-    const SESSION_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
     let join_handle = std::thread::Builder::new()
         .name(thread_name)
         .stack_size(SESSION_THREAD_STACK_SIZE)

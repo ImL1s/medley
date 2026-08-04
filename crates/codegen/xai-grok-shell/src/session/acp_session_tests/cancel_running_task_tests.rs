@@ -12,11 +12,10 @@ impl AsyncTerminalRunner for DummyTerminal {
         Err(TerminalError::Other("dummy terminal".into()))
     }
 }
-#[tokio::test(flavor = "current_thread")]
-async fn persist_ack_waits_for_disk_flush_before_success() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
+#[test]
+fn persist_ack_waits_for_disk_flush_before_success() {
+    on_large_stack(|| {
+        block_on_local(false, async {
             let tmp = tempfile::TempDir::new().unwrap();
             let session_dir = tmp.path().join("session");
             let cwd = AbsPathBuf::new(std::path::PathBuf::from("/tmp")).unwrap();
@@ -342,8 +341,8 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 "loaded chat history should contain the just-persisted prompt"
             );
             let _ = prompt_task.await.expect("prompt task should complete");
-        })
-        .await;
+        });
+    });
 }
 #[tokio::test(flavor = "current_thread")]
 async fn first_turn_memory_injection_persists_to_chat_history() {
@@ -467,11 +466,10 @@ async fn first_turn_memory_injection_persists_to_chat_history() {
         })
         .await;
 }
-#[tokio::test(flavor = "current_thread")]
-async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
+#[test]
+fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history() {
+    on_large_stack(|| {
+        block_on_local(false, async {
             let session_dir = tempfile::tempdir().expect("tempdir");
             let session_info = crate::session::info::Info {
                 id: acp::SessionId::new("persist-memory-disabled"),
@@ -811,8 +809,8 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                     .injection_count
                     .load(std::sync::atomic::Ordering::Relaxed)
             );
-        })
-        .await;
+        });
+    });
 }
 /// Hard teardown (`kill_background_tasks = true`, the subagent-shutdown path)
 /// aborts the running turn AND drains every queued prompt, responding
@@ -1415,14 +1413,15 @@ async fn actor_with_persistence_drain() -> std::sync::Arc<SessionActor> {
 /// `PromptOrigin::User` call site in `handle_prompt` and the relative ordering.
 /// Synchronizes on the persist-ack (fires after both items are pushed, before
 /// the model call), then aborts the turn so the dead-URL model call can't hang.
-#[tokio::test(flavor = "current_thread")]
-async fn handle_prompt_injects_interrupt_reminder_before_user_message() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
+#[test]
+fn handle_prompt_injects_interrupt_reminder_before_user_message() {
+    on_large_stack(|| {
+        block_on_local(false, async {
             let actor = actor_with_persistence_drain().await;
             actor.events.set_pending_interrupt_reminder();
-            let prompt_blocks = vec![acp::ContentBlock::Text(acp::TextContent::new("follow-up after interrupt".to_string()))];
+            let prompt_blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(
+                "follow-up after interrupt".to_string(),
+            ))];
             let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
             let actor_for_prompt = actor.clone();
             let prompt_task = tokio::task::spawn_local(async move {
@@ -1447,7 +1446,8 @@ async fn handle_prompt_injects_interrupt_reminder_before_user_message() {
             let user_idx = conv
                 .iter()
                 .position(|item| {
-                    matches!(item, ConversationItem::User(u) if u.synthetic_reason.is_none()) && item.text_content().contains("follow-up after interrupt")
+                    matches!(item, ConversationItem::User(u) if u.synthetic_reason.is_none())
+                        && item.text_content().contains("follow-up after interrupt")
                 })
                 .expect("the user message must be in the conversation");
             assert!(
@@ -1468,18 +1468,17 @@ async fn handle_prompt_injects_interrupt_reminder_before_user_message() {
             );
             assert!(!actor.events.take_pending_interrupt_reminder());
             prompt_task.abort();
-        })
-        .await;
+        });
+    });
 }
 /// Integration: a synthetic-origin turn (here `scheduler-fired-*`) driven
 /// between the abort and the user's resend must NOT consume the one-shot or
 /// inject the reminder — it has to survive to the next *genuine* user turn.
 /// Guards the `PromptOrigin::User` gate on the injection call.
-#[tokio::test(flavor = "current_thread")]
-async fn handle_prompt_synthetic_origin_preserves_interrupt_reminder() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
+#[test]
+fn handle_prompt_synthetic_origin_preserves_interrupt_reminder() {
+    on_large_stack(|| {
+        block_on_local(false, async {
             let actor = actor_with_persistence_drain().await;
             actor.events.set_pending_interrupt_reminder();
             let prompt_blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(
@@ -1517,8 +1516,8 @@ async fn handle_prompt_synthetic_origin_preserves_interrupt_reminder() {
                 "a synthetic-origin turn must not inject the interrupt reminder"
             );
             prompt_task.abort();
-        })
-        .await;
+        });
+    });
 }
 #[tokio::test(flavor = "current_thread")]
 async fn cancel_running_task_interactive_preserves_queued_work() {
