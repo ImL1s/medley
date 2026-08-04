@@ -165,12 +165,17 @@ fn spawn_model_persistence_ack(mut persistence_rx: mpsc::UnboundedReceiver<Persi
 /// uncatalogued model, so production resolution otherwise classifies it as
 /// unknown/custom and masks the session-method behavior these tests exercise.
 async fn pin_first_party_session_model(actor: &SessionActor) {
-    let model_id = actor
-        .chat_state_handle
-        .get_sampling_config()
-        .await
-        .map(|cfg| cfg.model)
-        .unwrap_or_default();
+    let cfg = actor.chat_state_handle.get_sampling_config().await;
+    let model_id = cfg.as_ref().map(|c| c.model.clone()).unwrap_or_default();
+    // Pin the *endpoint* too, not just the BYOK classification. Before #110 a
+    // `NotByok` model skipped the endpoint check entirely, so pinning the
+    // facts alone was enough to make this helper's name true. Now that the
+    // gate consults the endpoint on every arm, the fixture's cleartext
+    // localhost URL is precisely what "first party" excludes.
+    if let Some(mut cfg) = cfg {
+        cfg.base_url = "https://api.x.ai/v1".to_string();
+        actor.chat_state_handle.update_sampling_config(cfg);
+    }
     actor
         .model_auth_memo
         .replace(Some(crate::session::acp_session::ModelAuthMemo {
@@ -813,12 +818,18 @@ fn session_token_auth_gate_truth_table() {
         assert!(!gate(false, ModelByok::NotByok, fp));
         assert!(!gate(false, ModelByok::Byok, fp));
         assert!(!gate(false, ModelByok::Unknown, fp));
-        // Session method: a definite classification ignores the endpoint —
-        // NotByok always refreshes (only ever routes to the session endpoint),
-        // a genuine per-model Byok never does.
-        assert!(gate(true, ModelByok::NotByok, fp));
+        // Session method: a genuine per-model Byok never refreshes, on any
+        // endpoint.
         assert!(!gate(true, ModelByok::Byok, fp));
     }
+    // Session method + a model carrying no credential of its own: refresh only
+    // against a first-party host. `NotByok` used to ignore the endpoint on the
+    // reasoning that it "only ever routes to the session endpoint" — but it
+    // says nothing about where `base_url` points, and a catalog model with an
+    // overridden endpoint is `NotByok` and third-party at the same time. This
+    // arm was unconditionally `true` pre-fix (#110).
+    assert!(gate(true, ModelByok::NotByok, true));
+    assert!(!gate(true, ModelByok::NotByok, false));
     // Session method + Unknown BYOK: refresh only against a first-party xAI
     // host, so a transiently-unclassifiable config can't demote a live session
     // (the stale-token 401 regression) yet the session token never leaks to a

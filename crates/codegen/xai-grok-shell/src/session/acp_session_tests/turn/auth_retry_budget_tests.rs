@@ -125,6 +125,13 @@ async fn session_token_actor(
 ) -> (Arc<SessionActor>, XaiUpdates) {
     let sampling_cfg = xai_grok_sampler::SamplerConfig {
         base_url: server.url(),
+        // The mock serves plain HTTP on loopback, which the attach-side
+        // predicate refuses outright (#110) -- correctly, for a real endpoint.
+        // These tests are about the retry budget under session auth, so they
+        // say what they mean instead: this origin stands in for first-party
+        // xAI. Same field `resolve_endpoint_trust` already honours, so the
+        // shell gate and the sampler agree.
+        endpoint_trust: Some(xai_grok_sampler::EndpointTrustClass::FirstPartyXai),
         model: "test".to_string(),
         api_backend: xai_grok_sampler::ApiBackend::Responses,
         context_window: 256_000,
@@ -160,6 +167,9 @@ async fn session_token_actor(
         .await
         .expect("test actor has sampling config");
     cfg.base_url = server.url();
+    // Same declaration as the sampler config above, on the config the
+    // session-token gate actually reads (#110).
+    cfg.endpoint_trust = Some(xai_grok_sampling_types::EndpointTrustClass::FirstPartyXai);
     cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
     cfg.model = "test".to_string();
     actor.chat_state_handle.update_sampling_config(cfg);

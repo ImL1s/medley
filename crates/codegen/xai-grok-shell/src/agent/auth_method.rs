@@ -419,8 +419,14 @@ impl ModelByok {
 /// demote on `Unknown`). It refreshes when `endpoint_is_first_party` — the
 /// request targets a first-party host (cli-chat-proxy / first-party API),
 /// where sending the session token cannot leak to a third-party BYOK
-/// endpoint. A definite `NotByok` always refreshes (it only ever routes to
-/// the session endpoint); a definite `Byok` never does.
+/// endpoint. A definite `Byok` never refreshes.
+///
+/// `NotByok` used to refresh unconditionally, on the reasoning that it "only
+/// ever routes to the session endpoint". That does not hold in this fork:
+/// `NotByok` says the model declares no credential of its own, and says
+/// nothing about where its `base_url` points — a catalog model with an
+/// overridden endpoint is both `NotByok` and third-party. So it consults the
+/// endpoint too (#110).
 pub(crate) fn session_token_auth_gate(
     is_session_based_method: bool,
     model_byok: ModelByok,
@@ -428,7 +434,7 @@ pub(crate) fn session_token_auth_gate(
 ) -> bool {
     is_session_based_method
         && match model_byok {
-            ModelByok::NotByok => true,
+            ModelByok::NotByok => endpoint_is_first_party,
             ModelByok::Byok => false,
             ModelByok::Unknown => endpoint_is_first_party,
         }
@@ -561,6 +567,25 @@ mod tests {
     use crate::agent::config::{Config, resolve_model_list};
     use agent_client_protocol as acp;
     use serial_test::serial;
+
+    /// #110: `NotByok` says the model declares no credential of its own. It
+    /// does NOT say where the model's `base_url` points -- a catalog model
+    /// with an overridden endpoint is `NotByok` and third-party at the same
+    /// time. So the endpoint has to be consulted on this arm too, exactly as
+    /// it already is for `Unknown`; otherwise the turn-time resolver attaches
+    /// a live session bearer to whatever host the config named.
+    /// Only the arm #110 changed, kept next to the function so someone editing
+    /// the gate meets it. The full matrix -- non-session methods, `Byok`,
+    /// `Unknown` -- lives in
+    /// `session::acp_session::auth_error_no_retry_tests::session_token_auth_gate_truth_table`.
+    #[test]
+    fn session_token_auth_gate_requires_first_party_for_not_byok() {
+        assert!(
+            !session_token_auth_gate(true, ModelByok::NotByok, false),
+            "a session resolver must not attach on a non-first-party endpoint"
+        );
+        assert!(session_token_auth_gate(true, ModelByok::NotByok, true));
+    }
 
     /// When API-key credentials are advertiseable, fall through from a dead
     /// `cached_token` to non-interactive `xai.api_key` (not browser OAuth).
