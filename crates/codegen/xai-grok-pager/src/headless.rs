@@ -440,8 +440,17 @@ fn auto_respond_to_permissions(
     None
 }
 
-/// "Not signed in" error message, tailored to the session type.
-fn auth_required_message(interactive: bool) -> String {
+/// Auth/credential remediation when headless cannot authenticate.
+///
+/// When the selected model is already known to be unready for a credential
+/// reason (BYOK `env_key` missing, invalid `auth_scheme`, …), prefer that
+/// reason — it is the correct lane. Only fall back to the xAI session/login
+/// text when the model itself is ready (or unknown) and the session lane is
+/// genuinely the one at fault.
+fn auth_required_message(interactive: bool, model_unready_reason: Option<&str>) -> String {
+    if let Some(reason) = model_unready_reason.filter(|r| !r.is_empty()) {
+        return reason.to_string();
+    }
     if interactive {
         "Not signed in. Run `grok login` to authenticate \
          (or `grok login --device-code` if no browser is available)."
@@ -455,19 +464,73 @@ fn auth_required_message(interactive: bool) -> String {
     }
 }
 
+/// Readiness reason for the model headless is about to use, from initialize
+/// ACP meta — the same path `models` uses to annotate unready rows.
+///
+/// Prefers `preferred_model` (e.g. `-m`) when it resolves in the catalog;
+/// otherwise the agent's current/default model. `None` when the catalog is
+/// missing or the model is ready.
+fn selected_model_unready_reason(
+    init_meta: Option<&acp::Meta>,
+    preferred_model: Option<&str>,
+    resuming: bool,
+) -> Option<String> {
+    let state: acp::SessionModelState = init_meta
+        .and_then(|m| m.get("modelState"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())?;
+
+    // `-m` accepts the catalog key, the display name, *or* the routing slug --
+    // a config like `[model.alias] model = "provider-slug"` is selectable by
+    // either. Matching only the first two misses a slug-selected model and
+    // falls back to the generic text for one we could have named exactly.
+    let match_query = |query: &str| {
+        state.available_models.iter().find(|m| {
+            m.model_id.0.as_ref().eq_ignore_ascii_case(query)
+                || m.name.eq_ignore_ascii_case(query)
+                || m.meta
+                    .as_ref()
+                    .and_then(|meta| meta.get("modelSlug"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|slug| slug.eq_ignore_ascii_case(query))
+        })
+    };
+
+    // Without `-m`, the model actually used is the catalog's current one --
+    // except when resuming, continuing, or forking. Those load their model
+    // from the saved session in `open_session`, which runs *after*
+    // `authenticate`, so the catalog default here is simply a different model.
+    // Naming its reason would be confidently wrong, which is worse than the
+    // generic text: it would send the user to fix a model they are not using.
+    let info = preferred_model.and_then(match_query).or_else(|| {
+        if resuming {
+            return None;
+        }
+        state
+            .available_models
+            .iter()
+            .find(|m| m.model_id == state.current_model_id)
+    })?;
+
+    crate::slash::commands::model::unready_reason_from_model_meta(info.meta.as_ref())
+}
+
 /// Authenticate via the agent's `defaultAuthMethodId`, failing closed when none is available.
 /// Returns whether the selected method is API-key auth.
 async fn authenticate(
     acp_tx: &AcpAgentTx,
     auths: &[acp::AuthMethod],
     default_auth_method_id: Option<&acp::AuthMethodId>,
+    init_meta: Option<&acp::Meta>,
+    preferred_model: Option<&str>,
+    resuming: bool,
 ) -> anyhow::Result<bool> {
+    let unready = selected_model_unready_reason(init_meta, preferred_model, resuming);
     let method_id = crate::acp::select_eager_auth_method(auths, default_auth_method_id)
         .ok_or_else(|| {
             use std::io::IsTerminal;
             let interactive = std::io::stdin().is_terminal()
                 && !xai_grok_shell::util::clipboard::is_remote_session();
-            anyhow::anyhow!("{}", auth_required_message(interactive))
+            anyhow::anyhow!("{}", auth_required_message(interactive, unready.as_deref()))
         })?;
     let kind = AuthMethodKind::from_id(&method_id);
     // Prefer non-interactive methods only; interactive login is not usable headless.
@@ -475,7 +538,7 @@ async fn authenticate(
         use std::io::IsTerminal;
         let interactive =
             std::io::stdin().is_terminal() && !xai_grok_shell::util::clipboard::is_remote_session();
-        anyhow::bail!("{}", auth_required_message(interactive));
+        anyhow::bail!("{}", auth_required_message(interactive, unready.as_deref()));
     }
     let is_api_key_auth = kind.is_api_key();
     let _resp: acp::AuthenticateResponse = acp_send(
@@ -635,6 +698,15 @@ async fn fork_then_open(
     }
 }
 
+/// User-visible note when `--effort` is soft-dropped because the model does
+/// not advertise support. Names the config switch that enables it.
+fn unsupported_effort_user_note(model_id: &str) -> String {
+    format!(
+        "--effort/--reasoning-effort: model '{model_id}' does not support reasoning effort; \
+         ignoring. Set supports_reasoning_effort = true in [model.\"{model_id}\"] to enable it."
+    )
+}
+
 /// Apply `-m` / effort after session open. Effort is soft-ignored on a non-supporting
 /// model (still applying `-m`) but hard-fails on a genuinely unknown token.
 async fn apply_headless_model_and_effort(
@@ -678,6 +750,9 @@ async fn apply_headless_model_and_effort(
                     token,
                     "--effort/--reasoning-effort: model does not support reasoning effort; ignoring"
                 );
+                // Explicit CLI request: surface the config switch, not only a
+                // tracing line that never reaches the user.
+                eprintln!("{}", unsupported_effort_user_note(model_id.0.as_ref()));
                 None
             }
             Err(err) => anyhow::bail!("--effort/--reasoning-effort: {}", err.message()),
@@ -871,6 +946,9 @@ pub async fn run_single_turn(
         &acp_tx,
         &init_resp.auth_methods,
         default_auth_method_id.as_ref(),
+        init_resp.meta.as_ref(),
+        options.model.as_deref(),
+        options.resume.is_some() || options.continue_last_session || options.fork_session,
     )
     .await
     {
