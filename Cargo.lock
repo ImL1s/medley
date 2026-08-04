@@ -8245,9 +8245,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.14"
+version = "0.11.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
+checksum = "4fcb935c5bec503c2f0e306bdd3e58bb9029dcb14fa8d9ac76e3a5256ac0763e"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -8447,6 +8447,19 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "rcgen"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
+dependencies = [
+ "pem",
+ "ring",
+ "rustls-pki-types",
+ "time",
+ "yasna",
 ]
 
 [[package]]
@@ -13565,7 +13578,7 @@ dependencies = [
 
 [[package]]
 name = "xai-grok-pager"
-version = "0.2.117"
+version = "0.2.119"
 dependencies = [
  "agent-client-protocol",
  "ansi-to-tui",
@@ -13656,7 +13669,7 @@ dependencies = [
 
 [[package]]
 name = "xai-grok-pager-bin"
-version = "0.2.117"
+version = "0.2.119"
 dependencies = [
  "anyhow",
  "clap",
@@ -13924,7 +13937,7 @@ dependencies = [
 
 [[package]]
 name = "xai-grok-shell"
-version = "0.2.117"
+version = "0.2.119"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -14140,6 +14153,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64",
  "bytes",
  "chrono",
  "ctor",
@@ -14157,7 +14171,9 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "prost",
+ "rcgen",
  "reqwest 0.12.24",
+ "rustls",
  "sentry",
  "serde",
  "serde_json",
@@ -14173,6 +14189,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "webpki-roots 0.26.11",
  "whoami",
  "xai-file-utils",
  "xai-grok-auth",
@@ -14338,7 +14355,7 @@ dependencies = [
 
 [[package]]
 name = "xai-grok-version"
-version = "0.2.117"
+version = "0.2.119"
 dependencies = [
  "semver",
 ]
@@ -14776,6 +14793,15 @@ name = "yansi"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
+
+[[package]]
+name = "yasna"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
+dependencies = [
+ "time",
+]
 
 [[package]]
 name = "yoke"

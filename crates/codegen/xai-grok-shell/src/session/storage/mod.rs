@@ -591,22 +591,6 @@ impl UpdatesIterator {
         }))
     }
 
-    /// Create a new iterator starting at the given byte offset.
-    /// Returns None if the file doesn't exist.
-    /// Used for delta replay: read only updates appended after a known offset.
-    pub fn open_at(path: &Path, offset: u64) -> io::Result<Option<Self>> {
-        if !path.exists() {
-            return Ok(None);
-        }
-        let file = std::fs::File::open(path)?;
-        let mut reader = BufReader::new(file);
-        reader.seek(SeekFrom::Start(offset))?;
-        Ok(Some(Self {
-            reader,
-            line_buffer: String::new(),
-        }))
-    }
-
     /// Returns the current byte position in the underlying file.
     /// After iterating, this is the offset of the next unread byte (i.e., EOF
     /// if all updates were consumed). Used to record the replay end offset for

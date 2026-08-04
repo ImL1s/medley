@@ -57,7 +57,7 @@ use super::rewind::{
 };
 use super::session::foreign::dispatch_fetch_session_list;
 use super::session::fork::{
-    apply_persist_worktree_mode, dispatch_fork, dispatch_fork_resolved, dispatch_project_selected,
+    apply_persist_worktree_mode, dispatch_fork, dispatch_fork_resolved,
     dispatch_startup_fork_session,
 };
 use super::session::lifecycle::{
@@ -910,12 +910,11 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                 return vec![];
             };
             // Soft-confirm auth-class changes before switching.
-            let (prev_id, session_id, new_display, prev_class, new_class) = {
+            let (prev_id, new_display, prev_class, new_class) = {
                 let Some(agent) = app.agents.get(&id) else {
                     return vec![];
                 };
                 let prev_id = agent.session.models.current.clone();
-                let session_id = agent.session.session_id.clone();
                 let new_display = agent.session.models.display_name_for(&model_id);
                 let prev_class = prev_id
                     .as_ref()
@@ -937,7 +936,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                         )
                     })
                     .unwrap_or_default();
-                (prev_id, session_id, new_display, prev_class, new_class)
+                (prev_id, new_display, prev_class, new_class)
             };
             if let Some(reason) = app.agents.get(&id).and_then(|agent| {
                 crate::slash::commands::model::model_not_ready_reason(
@@ -967,9 +966,33 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             let Some(agent) = app.agents.get_mut(&id) else {
                 return vec![];
             };
-            let Some(session_id) = session_id else {
-                agent.session.deferred_model_switch = Some((model_id, effort));
-                return vec![];
+            let Some(session_id) = agent.session.session_id.clone() else {
+                let prev_model = agent.session.models.current.clone();
+                let prev_effort = agent.session.models.reasoning_effort;
+                agent.session.models.set_current(model_id.clone(), effort);
+                let resolved_effort = agent.session.models.reasoning_effort;
+                let unchanged =
+                    prev_model.as_ref() == Some(&model_id) && prev_effort == resolved_effort;
+                let rollback_prev = agent
+                    .session
+                    .deferred_model_switch
+                    .take()
+                    .and_then(|prior| prior.prev_model_id)
+                    .or(prev_model);
+                agent.session.deferred_model_switch =
+                    Some(crate::app::agent::DeferredModelSwitch {
+                        model_id: model_id.clone(),
+                        effort,
+                        prev_model_id: rollback_prev,
+                    });
+                return if unchanged {
+                    vec![]
+                } else {
+                    vec![Effect::PersistPreferredModel {
+                        model_id,
+                        reasoning_effort: resolved_effort,
+                    }]
+                };
             };
             let request_id = super::session::lifecycle::begin_model_switch_request(
                 &mut app.model_switch_transaction,
@@ -1262,11 +1285,6 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             );
             effects
         }
-        Action::ProjectSelected {
-            path,
-            stashed_prompt,
-            disable_picker,
-        } => dispatch_project_selected(app, path, stashed_prompt, disable_picker),
         Action::NewSessionAnswered {
             worktree,
             persist_mode,

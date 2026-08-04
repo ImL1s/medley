@@ -19,6 +19,12 @@ fn open_extensions_modal_no_session_sets_flag_no_fetches() {
     assert_eq!(count_extension_fetches(&effects), 0);
     assert!(app.agents[&id].pending_extensions_fetch);
     assert!(app.agents[&id].extensions_modal.is_some());
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::CreateSession { .. })),
+        "opening the modal must not create a session, got {effects:?}"
+    );
 }
 
 #[test]
