@@ -5989,7 +5989,7 @@ fn resolve_hidden_default_web_search_sampling_config(
     alpha_test_key: Option<String>,
     client_version: Option<String>,
     endpoints: &EndpointsConfig,
-) -> SamplerConfig {
+) -> Option<SamplerConfig> {
     let entry = ModelEntry {
         info: ModelInfo {
             id: None,
@@ -6031,15 +6031,28 @@ fn resolve_hidden_default_web_search_sampling_config(
         api_base_url: None,
         config_validation_errors: Vec::new(),
     };
+    // #110: the same rule the catalog arm applies. This entry is synthesised
+    // right here, so nothing upstream has vetted it -- and an unready one
+    // reaches the choke point, loses its credential, and would still carry
+    // the user's search query to whatever `models_base_url` names.
+    let (ready, reason) = model_readiness(&entry);
+    if !ready {
+        tracing::warn!(
+            web_search_model = %model_id,
+            reason = ?reason,
+            "the default web-search route is not ready; disabling web search"
+        );
+        return None;
+    }
     let credentials = resolve_credentials_enforced(&entry, session_key, disable_api_key_auth);
-    sampling_config_for_model(
+    Some(sampling_config_for_model(
         &entry,
         credentials,
         alpha_test_key,
         client_version,
         None,
         None,
-    )
+    ))
 }
 pub(crate) fn resolve_web_search_sampling_config(
     model_id: &str,
@@ -6081,14 +6094,14 @@ pub(crate) fn resolve_web_search_sampling_config(
             None,
         ))
     } else if model_id == crate::models::default_web_search_model() {
-        Some(resolve_hidden_default_web_search_sampling_config(
+        resolve_hidden_default_web_search_sampling_config(
             model_id,
             session_key,
             disable_api_key_auth,
             alpha_test_key,
             client_version,
             endpoints,
-        ))
+        )
     } else {
         None
     };
@@ -8744,6 +8757,55 @@ reasoning_effort = "low"
         assert_eq!(
             resolved.credential_source,
             Some(CredentialSource::XaiSession)
+        );
+    }
+    /// #110: the hidden default web-search route is the other arm of the same
+    /// function, and it synthesises its own entry rather than reading one from
+    /// the catalog. A `models_base_url` pointing anywhere non-first-party
+    /// makes that entry credential-less and unready, at which point the choke
+    /// point rewrites its `auth_scheme` to `None` -- and returning it anyway
+    /// sends the user's search query to that origin with no authentication,
+    /// which is what disabling web search exists to prevent.
+    #[test]
+    #[serial]
+    fn hidden_default_web_search_route_respects_readiness() {
+        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+        use xai_grok_test_support::EnvGuard;
+        let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+        let hidden_default = crate::models::default_web_search_model();
+        let external = EndpointsConfig {
+            models_base_url: Some("https://third-party.example/v1".into()),
+            ..EndpointsConfig::default()
+        };
+        let resolved = resolve_web_search_sampling_config(
+            hidden_default,
+            &IndexMap::new(),
+            Some("XAI_SESSION_SENTINEL"),
+            false,
+            None,
+            None,
+            &external,
+        );
+        assert!(
+            resolved.is_none(),
+            "the hidden default route must not send a search query to a non-first-party origin"
+        );
+
+        // The first-party default still resolves -- this is the normal path.
+        let resolved = resolve_web_search_sampling_config(
+            hidden_default,
+            &IndexMap::new(),
+            Some("XAI_SESSION_SENTINEL"),
+            false,
+            None,
+            None,
+            &EndpointsConfig::default(),
+        );
+        assert!(
+            resolved.is_some(),
+            "the first-party hidden default is the normal web-search path"
         );
     }
     /// #110: an unready web-search model DISABLES web search. The wrong repair
