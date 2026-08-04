@@ -470,3 +470,135 @@ fn parse_json_schema_rejects_non_objects_and_invalid_json() {
             .contains("invalid JSON")
     );
 }
+
+/// Unready BYOK model: remediation must name the missing key, not xAI login.
+#[test]
+fn auth_required_message_prefers_model_unready_reason() {
+    let msg = super::auth_required_message(false, Some("missing DEEPSEEK_API_KEY"));
+    assert_eq!(msg, "missing DEEPSEEK_API_KEY");
+    assert!(
+        !msg.contains("XAI_API_KEY"),
+        "must not point at the xAI env var when a model-lane reason is known: {msg}"
+    );
+    assert!(
+        !msg.contains("login"),
+        "must not send the user to session login for a BYOK gap: {msg}"
+    );
+
+    // Interactive vs non-interactive only matters for the session-lane fallback.
+    let interactive = super::auth_required_message(true, Some("missing DEEPSEEK_API_KEY"));
+    assert_eq!(interactive, "missing DEEPSEEK_API_KEY");
+}
+
+/// When the model is ready (or unknown), keep the session-lane sign-in text.
+#[test]
+fn auth_required_message_falls_back_to_session_login_when_no_unready_reason() {
+    let non_interactive = super::auth_required_message(false, None);
+    assert!(
+        non_interactive.contains("Not signed in"),
+        "msg={non_interactive}"
+    );
+    assert!(
+        non_interactive.contains("XAI_API_KEY"),
+        "session-lane fallback must still name XAI_API_KEY: {non_interactive}"
+    );
+    assert!(
+        non_interactive.contains("login --device-code"),
+        "msg={non_interactive}"
+    );
+
+    let empty_reason = super::auth_required_message(false, Some(""));
+    assert_eq!(
+        empty_reason, non_interactive,
+        "empty unready reason must not suppress the session-lane message"
+    );
+
+    let interactive = super::auth_required_message(true, None);
+    assert!(interactive.contains("Not signed in"), "msg={interactive}");
+    assert!(
+        interactive.contains("login"),
+        "interactive session-lane path must mention login: {interactive}"
+    );
+}
+
+/// Readiness reason is taken from initialize `modelState` meta — same source as
+/// the `models` list — for the preferred or current model.
+#[test]
+fn selected_model_unready_reason_reads_acp_meta() {
+    let meta = serde_json::json!({
+        "modelState": {
+            "currentModelId": "deepseek-chat",
+            "availableModels": [
+                {
+                    "modelId": "deepseek-chat",
+                    "name": "DeepSeek Chat",
+                    "_meta": {
+                        "ready": false,
+                        "readinessReason": "missing DEEPSEEK_API_KEY",
+                        "authClass": "env",
+                    }
+                },
+                {
+                    "modelId": "grok-4.5",
+                    "name": "Grok 4.5",
+                    "_meta": {
+                        "ready": true,
+                        "authClass": "session",
+                    }
+                }
+            ]
+        }
+    });
+    let meta = meta.as_object().unwrap();
+
+    assert_eq!(
+        super::selected_model_unready_reason(Some(meta), None).as_deref(),
+        Some("missing DEEPSEEK_API_KEY"),
+        "current model unready reason must surface"
+    );
+    assert_eq!(
+        super::selected_model_unready_reason(Some(meta), Some("deepseek-chat")).as_deref(),
+        Some("missing DEEPSEEK_API_KEY"),
+    );
+    // Preferred model wins over current when both are in the catalog.
+    assert_eq!(
+        super::selected_model_unready_reason(Some(meta), Some("grok-4.5")),
+        None,
+        "ready preferred model must not invent an unready reason"
+    );
+    // Display name match works like the models list / -m resolver.
+    assert_eq!(
+        super::selected_model_unready_reason(Some(meta), Some("DeepSeek Chat")).as_deref(),
+        Some("missing DEEPSEEK_API_KEY"),
+    );
+    assert_eq!(
+        super::selected_model_unready_reason(None, Some("deepseek-chat")),
+        None
+    );
+}
+
+/// `--effort` soft-drop must name the model and the config switch.
+#[test]
+fn unsupported_effort_user_note_names_model_and_switch() {
+    let note = super::unsupported_effort_user_note("deepseek-chat");
+    assert!(
+        note.contains("deepseek-chat"),
+        "must name the model: {note}"
+    );
+    assert!(
+        note.contains("does not support reasoning effort"),
+        "msg={note}"
+    );
+    assert!(
+        note.contains("supports_reasoning_effort = true"),
+        "must name the config switch: {note}"
+    );
+    assert!(
+        note.contains("[model.deepseek-chat]"),
+        "must name the config table: {note}"
+    );
+    assert!(
+        note.contains("ignoring"),
+        "soft-drop must still say the request was ignored: {note}"
+    );
+}

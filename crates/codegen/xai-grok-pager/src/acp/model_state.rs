@@ -28,7 +28,13 @@ pub(crate) enum EffortTokenError {
 impl EffortTokenError {
     pub(crate) fn message(&self) -> String {
         match self {
-            Self::Unsupported => "current model does not support reasoning effort".to_string(),
+            Self::Unsupported => {
+                // Name the config switch that turns effort on — the gate already
+                // knows; the defect was only that it did not say so.
+                "current model does not support reasoning effort; \
+                 set supports_reasoning_effort = true in [model.<id>] to enable it"
+                    .to_string()
+            }
             Self::UnknownToken { token, offered } => {
                 if offered.is_empty() {
                     format!(
@@ -474,6 +480,36 @@ mod tests {
         assert_eq!(opts[0].value, ReasoningEffort::Medium);
         assert_eq!(opts[1].id, "deep");
         assert_eq!(opts[1].description.as_deref(), Some("Max"));
+    }
+
+    #[test]
+    fn unsupported_effort_message_names_config_switch() {
+        let msg = EffortTokenError::Unsupported.message();
+        assert!(
+            msg.contains("does not support reasoning effort"),
+            "msg={msg}"
+        );
+        assert!(
+            msg.contains("supports_reasoning_effort = true"),
+            "must name the config switch that enables effort: {msg}"
+        );
+        assert!(
+            msg.contains("[model.<id>]"),
+            "must point at the per-model config table: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_effort_for_model_unsupported_surfaces_switch_in_message() {
+        let state = state_with_meta(None); // no supportsReasoningEffort meta
+        let id = state.current.clone().unwrap();
+        let err = state.resolve_effort_for_model(&id, "high").unwrap_err();
+        assert_eq!(err, EffortTokenError::Unsupported);
+        let msg = err.message();
+        assert!(
+            msg.contains("supports_reasoning_effort = true"),
+            "msg={msg}"
+        );
     }
 
     #[test]
