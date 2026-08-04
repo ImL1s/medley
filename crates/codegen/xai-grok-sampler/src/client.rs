@@ -807,11 +807,29 @@ impl SamplingClient {
         // Defense in depth (#110, Layer 3). The shell's choke point already
         // refuses to emit this pairing; making it unconstructable means a
         // later regression upstream of here cannot quietly reintroduce it.
-        // An explicit `endpoint_trust` still wins, via `resolve_endpoint_trust`
-        // above — declaring an origin trusted is the supported way to say so.
+        //
+        // The trust class alone is not enough here. It is scheme-agnostic by
+        // design — it decides *refusals*, where failing closed means treating
+        // a cleartext xAI host as first-party — so reusing it made this layer
+        // weaker than the choke point it backs up: an ambient credential
+        // bound to `http://api.x.ai/v1` constructed happily and went out over
+        // cleartext. Adding the scheme requirement composes the shell's
+        // bearer-safe predicate out of what is already here (the class
+        // already excludes loopback) rather than growing a third copy of the
+        // host rules. An explicit `endpoint_trust` still wins, because
+        // declaring an origin trusted is the supported way to say so.
+        //
         // The message names no secret: a refusal that prints what it refused
         // has not refused anything.
-        if !is_first_party
+        let ambient_origin_allowed = match config.endpoint_trust {
+            Some(trust) => trust == EndpointTrustClass::FirstPartyXai,
+            None => {
+                is_first_party
+                    && reqwest::Url::parse(&config.base_url)
+                        .is_ok_and(|url| url.scheme() == "https")
+            }
+        };
+        if !ambient_origin_allowed
             && config
                 .credential_source
                 .as_ref()
@@ -3152,7 +3170,15 @@ mod tests {
             CredentialSource::XaiApiKeyEnv,
             CredentialSource::XaiDeploymentKey,
         ] {
-            for base_url in ["https://api.openai.com/v1", "http://127.0.0.1:11434/v1"] {
+            for base_url in [
+                "https://api.openai.com/v1",
+                "http://127.0.0.1:11434/v1",
+                // An xAI host over cleartext. The trust class calls this
+                // first-party -- it is scheme-agnostic on purpose, because it
+                // decides *refusals* -- so classifying by trust alone made
+                // this layer weaker than the choke point it backs up.
+                "http://api.x.ai/v1",
+            ] {
                 let err = SamplingClient::new(SamplerConfig {
                     api_key: Some("XAI_SESSION_SENTINEL".to_string()),
                     base_url: base_url.to_string(),
