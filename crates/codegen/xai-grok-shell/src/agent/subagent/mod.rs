@@ -832,6 +832,7 @@ async fn read_parent_sampling_config(
                 // External must not silently become derivable-first-party
                 // (and vice versa) across the subagent boundary.
                 endpoint_trust: cfg.endpoint_trust,
+                credential_source: None,
                 api_backend: cfg.api_backend,
                 auth_scheme,
                 extra_headers,

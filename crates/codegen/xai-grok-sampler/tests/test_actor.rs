@@ -80,6 +80,7 @@ fn test_config(base_url: String, model: &str) -> SamplerConfig {
         // xAI endpoints; without this the metadata boundary classifies them
         // Local and disables first-party features (doom-loop check, x-grok-*).
         endpoint_trust: Some(EndpointTrustClass::FirstPartyXai),
+        credential_source: None,
         api_backend: ApiBackend::ChatCompletions,
         auth_scheme: Default::default(),
         extra_headers: IndexMap::new(),

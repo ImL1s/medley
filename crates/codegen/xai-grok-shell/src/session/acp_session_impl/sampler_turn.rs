@@ -573,6 +573,7 @@ impl SessionActor {
             temperature: cfg.temperature,
             top_p: cfg.top_p,
             endpoint_trust: cfg.endpoint_trust,
+            credential_source: None,
             api_backend: cfg.api_backend,
             auth_scheme,
             extra_headers,

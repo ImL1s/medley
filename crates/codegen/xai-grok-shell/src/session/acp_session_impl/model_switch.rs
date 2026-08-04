@@ -847,6 +847,7 @@ mod model_switch_transaction_tests {
             temperature: None,
             top_p: None,
             endpoint_trust: None,
+            credential_source: None,
             api_backend: crate::sampling::ApiBackend::ChatCompletions,
             auth_scheme: xai_grok_sampler::AuthScheme::None,
             extra_headers: Default::default(),

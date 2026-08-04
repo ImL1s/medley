@@ -2499,6 +2499,7 @@ mod tests {
             top_p: None,
             api_backend: ApiBackend::ChatCompletions,
             endpoint_trust: None,
+            credential_source: None,
             auth_scheme: AuthScheme::Bearer,
             extra_headers: IndexMap::new(),
             query_params: IndexMap::new(),

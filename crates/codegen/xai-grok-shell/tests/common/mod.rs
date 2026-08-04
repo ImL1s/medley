@@ -332,6 +332,7 @@ pub fn test_sampler_config(
         api_backend,
         auth_scheme: Default::default(),
         endpoint_trust: None,
+        credential_source: None,
         extra_headers: extra_headers
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))

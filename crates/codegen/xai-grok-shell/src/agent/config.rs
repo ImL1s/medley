@@ -5650,6 +5650,7 @@ pub(crate) fn sampling_config_for_model(
         temperature,
         top_p,
         endpoint_trust: None,
+        credential_source: None,
         api_backend,
         auth_scheme: credentials.auth_scheme,
         extra_headers,
