@@ -75,8 +75,11 @@ fn resolve_endpoint_trust(config: &SamplerConfig) -> EndpointTrustClass {
     if let Some(explicit) = config.endpoint_trust {
         return explicit;
     }
-    // The production cli-chat-proxy is first-party even though it lives on
-    // loopback — matched exactly, never by host class.
+    // The production cli-chat-proxy is matched by exact URL, never by host
+    // class, so a host that merely resembles it cannot claim first-party
+    // trust. It is a public https host — see `PROD_CLI_CHAT_PROXY_BASE_URL` —
+    // so it never reaches the loopback branch below, and the ordering here is
+    // about exactness, not about rescuing it from that branch.
     if crate::util::is_prod_cli_chat_proxy_url(&config.base_url) {
         return EndpointTrustClass::FirstPartyXai;
     }
