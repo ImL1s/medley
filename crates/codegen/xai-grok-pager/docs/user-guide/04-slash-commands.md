@@ -116,7 +116,7 @@ Switch models. Accepts a model ID or display name (case-insensitive), and for re
 
 ### `/effort <level>`
 
-Set reasoning effort on the **current** model without reselecting it. Levels are `low`, `medium`, `high`, and `xhigh`, and it only applies when the active model supports reasoning effort.
+Set reasoning effort on the **current** model without reselecting it. The canonical levels are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`, and a model may also advertise its own named options — run `/effort` with no argument to list the levels the active model actually accepts. It only applies when the active model supports reasoning effort; for a custom model, declare that support with `supports_reasoning_effort` or a `reasoning_efforts` list in its `[model.<id>]` block (see [Custom Models](11-custom-models.md#reasoning-effort)).
 
 ```
 /effort high

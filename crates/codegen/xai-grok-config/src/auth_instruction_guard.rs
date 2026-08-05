@@ -67,14 +67,23 @@ fn walk(dir: &std::path::Path, needles: &[String], out: &mut Scan) {
             continue;
         };
         out.files_scanned += 1;
-        for (idx, line) in content.lines().enumerate() {
+        let lines: Vec<&str> = content.lines().collect();
+        for (idx, line) in lines.iter().enumerate() {
             let trimmed = line.trim_start();
             // Doc and line comments describe behaviour rather than instructing
             // the user; block-comment bodies conventionally start with `*`.
             if trimmed.starts_with("//") || trimmed.starts_with('*') {
                 continue;
             }
-            if line.contains(EXEMPTION) {
+            // The marker may sit on the line itself or on the one above it:
+            // these literals are usually long, and forcing the marker inline
+            // makes the exemption harder to read than the thing it exempts.
+            let exempt = line.contains(EXEMPTION)
+                || idx
+                    .checked_sub(1)
+                    .and_then(|prev| lines.get(prev))
+                    .is_some_and(|prev| prev.contains(EXEMPTION));
+            if exempt {
                 continue;
             }
             if needles.iter().any(|n| line.contains(n.as_str())) {

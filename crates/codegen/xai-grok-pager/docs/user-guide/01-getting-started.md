@@ -82,6 +82,8 @@ grok
 
 See [Authentication](02-authentication.md) for the full set of auth options including OIDC, external auth providers, and device code flow.
 
+Signing in is only the xAI lane. As a multi-provider fork, Medley also runs against any OpenAI-compatible endpoint with a per-model key, a ChatGPT account via `grok login --provider openai-codex`, or a keyless local server such as Ollama — none of which need an xAI login. See [Custom Models](11-custom-models.md).
+
 ---
 
 ## Basic Interaction
@@ -268,3 +270,4 @@ Deeper files take precedence. Grok also reads `CLAUDE.md` files for compatibilit
 | [Keyboard Shortcuts](03-keyboard-shortcuts.md) | Complete reference for all key bindings |
 | [Slash Commands](04-slash-commands.md) | All available `/` commands |
 | [Configuration](05-configuration.md) | config.toml, pager.toml, environment variables |
+| [Custom Models](11-custom-models.md) | Other providers, per-model credentials, keyless local models |

@@ -121,6 +121,8 @@ env_http_headers = { "X-Tenant" = "TENANT_TOKEN" }    # Headers from env vars, r
 
 When `auth_scheme` is omitted, Grok uses `"bearer"`.
 
+A **first-party xAI origin** is `https://x.ai` or any `https://*.x.ai` host, plus the built-in xAI API endpoint — HTTPS only, never loopback, never cleartext. On every other origin the ambient fallback (session token, `XAI_API_KEY`) is withheld.
+
 **Invalid values fail closed.** If `auth_scheme` is misspelled or unsupported (for example `"bearer "` or `"noauth"`), Grok keeps the model entry but marks it **unready** with a validation error. The model picker and `/model` refuse to select it. New sessions, session restore, and ACP model switches also refuse to attach an unready model (they fall back or block prompts instead of silently using ambient Bearer credentials). No sampling request is sent for an unready selection. Grok does **not** silently fall back to `"bearer"` or `"none"` for bad values.
 
 **Duplicate routing slugs.** The catalog is keyed by each entry's config key (`[model.<key>]`). Two entries may share the same wire `model` slug but must use distinct catalog keys. Always pick models by their catalog key in config and `/model`; slug-only lookups can bind to the wrong entry when duplicates exist.
@@ -181,7 +183,7 @@ inference_idle_timeout_secs = 600
 stream_tool_calls           = true
 ```
 
-This is a small, fixed set of environment-wide knobs. Settings that identify a specific model (`model`, `base_url`, `api_key`, `context_window`, ...) cannot be defaulted this way, and a few settings with their own dedicated configuration -- auto-compaction (`[session]` global default, which can also be set per-model or via env var), the system-prompt label (`[agent]`), and reasoning effort (the global default `[models].default_reasoning_effort`, which can also be overridden per-model) -- keep their existing homes. See [Reasoning Effort](#reasoning-effort) and [Auto-Compaction Threshold](#auto-compaction-threshold) below for details.
+This is a small, fixed set of environment-wide knobs. Settings that identify a specific model (`model`, `base_url`, `api_key`, `context_window`, ...) cannot be defaulted this way, and a few settings with their own dedicated configuration -- auto-compaction (`[session]` global default, which can also be set per-model or via env var), the system-prompt label (`[agent]`), and reasoning effort (per-model `reasoning_effort` under `[model.<id>]`; `[models].default_reasoning_effort`, despite its name, applies only to the model named by `[models].default` and is stamped after per-model overrides, so on that one model the global value wins) -- keep their existing homes. See [Reasoning Effort](#reasoning-effort) and [Auto-Compaction Threshold](#auto-compaction-threshold) below for details.
 
 > **Note on `stream_tool_calls`:** this one affects request *shape*, not just sampling. A few endpoints (some BYOK providers) expect it left unset; if a global `stream_tool_calls = true` causes problems for such a model, opt that model out with `stream_tool_calls = false` in its `[model.<id>]` block.
 
@@ -222,7 +224,7 @@ For models that support reasoning effort levels, you can configure per-model par
 * `supports_reasoning_effort` (boolean): Explicitly declares whether the model supports reasoning effort.
   * For models using the **Messages (Anthropic-style)** backend, this is automatically enabled (`true`) and does not need to be declared.
   * For **OpenAI-compatible** endpoints (e.g. Chat Completions or Responses backends), you must explicitly set `supports_reasoning_effort = true`.
-  * If a non-empty `reasoning_efforts` list is defined, support is automatically implied.
+  * If a non-empty `reasoning_efforts` list is defined, support is automatically implied — this derive runs after per-model overrides merge, so the list turns support on even when `supports_reasoning_effort = false` was set explicitly.
 * `reasoning_effort` (string): The default reasoning effort level to send on the wire.
   * Valid effort levels (lowercase) are: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`.
   * **On the Messages backend, `none` and `minimal` are not sent at all.** Both map to an omitted effort, so the request carries no `output_config.effort` and no adaptive thinking — the same wire shape as leaving `reasoning_effort` unset. Selecting `minimal` on an Anthropic-style model therefore does not pick a lower reasoning tier; it turns the field off. The remaining five behave as named.
@@ -268,7 +270,7 @@ reasoning_efforts = ["low", "medium", "high"]
 
 #### Web Search and Backend Search
 
-* `supports_backend_search` (boolean): For custom models that support server-side search, set this to `true` (e.g. `supports_backend_search = true`). This tells the shell to allow server-side web search commands for this model (only effective when the build enables backend search).
+* `supports_backend_search` (boolean): For custom models that support server-side search, set this to `true` (e.g. `supports_backend_search = true`). This tells the shell to allow server-side web search for this model. Backend search is on by default; disable it globally with `[features].backend_tools = false` or the `GROK_BACKEND_SEARCH` environment variable. Hosted tools are only put on the wire by the Responses-family backends — Chat Completions and Messages requests never carry them, and the Codex backend excludes them — so set this only on a model using `api_backend = "responses"`. On any other backend the flag drops the local `web_search` tool without gaining server-side search.
 
 ### Auto-Compaction Threshold
 
@@ -579,7 +581,7 @@ Or via environment variable:
 export GROK_WEB_SEARCH_MODEL="grok-4.5"
 ```
 
-If you point web search at a custom model, you also need a `[model.*]` entry so Grok can reach it. Server-side ("backend") web search runs only when the model sets `supports_backend_search = true` (and the build enables backend search); it does not depend on `api_backend`:
+If you point web search at a custom model, you also need a `[model.*]` entry so Grok can reach it. Server-side ("backend") web search runs only when the model sets `supports_backend_search = true` and backend search is enabled (it is by default; `[features].backend_tools` / `GROK_BACKEND_SEARCH` control it), and only on the Responses-family backends — see [Web Search and Backend Search](#web-search-and-backend-search):
 
 ```toml
 [models]
@@ -587,6 +589,9 @@ web_search = "my-custom-model"
 
 [model.my-custom-model]
 model = "my-custom-model"
+base_url = "https://api.example.com/v1"
+api_backend = "responses"        # hosted tools only ride the Responses-family wire format
+env_key = "PROVIDER_API_KEY"
 supports_backend_search = true
 ```
 

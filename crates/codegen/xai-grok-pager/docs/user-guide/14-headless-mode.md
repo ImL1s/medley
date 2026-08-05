@@ -34,7 +34,7 @@ Grok processes the prompt, runs any necessary tools, and prints the result to st
 | `--tools <TOOLS>`       | Allowlist of built-in tools (comma-separated). MCP meta-tools remain available unless denied. Headless only. |
 | `--disallowed-tools <TOOLS>` | Denylist of built-in tools to remove (comma-separated). Supports `Agent` entries. Headless only. |
 | `--max-turns <N>`       | Maximum number of agentic turns before stopping. Headless only. |
-| `--reasoning-effort` / `--effort <LEVEL>` | Reasoning effort for reasoning models. Canonical levels: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (each a distinct tier; a model only accepts the levels its menu advertises). Also accepts per-model menu option ids (e.g. `deep` → mapped wire value), same as `/effort`. Works in TUI and headless. |
+| `--reasoning-effort` / `--effort <LEVEL>` | Reasoning effort for reasoning models. Canonical levels: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (each a distinct tier; a model only accepts the levels its menu advertises). Also accepts per-model menu option ids (e.g. `deep` → mapped wire value), same as `/effort`. Works in TUI and headless. On a model without reasoning-effort support the flag is dropped with a stderr note naming the `supports_reasoning_effort` config switch; an unknown level is a hard error. |
 | `--permission-mode <MODE>` | Permission mode. `bypassPermissions` enables always-approve (see [Permissions and safety](22-permissions-and-safety.md#permission-modes)); for deny-by-default use `defaultMode` in `.claude/settings.json`. |
 | `--allow <RULE>`        | Permission allow rule with glob patterns (repeatable). Works in TUI and headless. |
 | `--deny <RULE>`         | Permission deny rule with glob patterns (repeatable). Works in TUI and headless. |
@@ -542,7 +542,7 @@ Key environment variables that affect headless mode:
 
 | Variable        | Description                                                                                  |
 | --------------- | -------------------------------------------------------------------------------------------- |
-| `XAI_API_KEY`   | API key for authentication (required when no browser login)                                  |
+| `XAI_API_KEY`   | xAI API key, used when no xAI session token is active; only ever sent to first-party xAI origins. Other providers take their own per-model keys |
 | `MEDLEY_HOME`   | Override the state directory (default: `~/.medley`); checked first                           |
 | `GROK_HOME`     | Same, checked after `MEDLEY_HOME`; accepted for compatibility                                |
 | `GROK_LOG_FILE` | Path to a log file (used verbatim as the path; works in headless and TUI, honors `RUST_LOG`) |
@@ -572,10 +572,12 @@ grok -p "Run the test suite" --yolo
 
 For headless use, authenticate with one of:
 
-- **`XAI_API_KEY`**: simplest for CI. See [Environment Variables](#environment-variables-for-headless) above.
+- **`XAI_API_KEY`**: simplest for CI with xAI models. See [Environment Variables](#environment-variables-for-headless) above.
 - **`grok login --device-auth`** (or `--device-code`): no browser needed on the target machine.
   See [Authentication > Device Code Flow](02-authentication.md#device-code-flow).
 - **`grok login`**: browser-based OAuth2 on machines with a GUI.
+- **A custom model's own credential**: a `[model.<id>]` entry with `env_key` (or `api_key`) needs no login at all — export the provider's key (for example `OPENAI_API_KEY`) and select the model with `-m <id>`. Keyless local models (`auth_scheme = "none"`) need no credential either. See [Custom Models > Credential Resolution](11-custom-models.md#credential-resolution).
+- **`grok login --provider openai-codex`**: ChatGPT OAuth for the built-in Codex model. See [Authentication > OpenAI Codex](02-authentication.md#openai-codex-chatgpt-oauth).
 
 If you've previously logged in, cached credentials are used automatically.
 

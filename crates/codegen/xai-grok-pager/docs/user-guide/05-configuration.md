@@ -217,7 +217,8 @@ base_url = "https://api.example.com/v1"  # OpenAI-compatible endpoint
 name = "Display Name"                 # shown in model picker
 description = "Model description"      # optional
 api_key = "sk-..."                    # API key for this provider
-env_key = "XAI_API_KEY"               # env var(s) holding the API key; string or array (first set, non-empty wins)
+env_key = "PROVIDER_API_KEY"          # env var(s) holding the API key; string or array (first set, non-empty wins)
+auth_scheme = "bearer"                # "bearer" (default), "x_api_key", or "none" (keyless local servers)
 temperature = 0.7                     # sampling temperature (0.0-2.0)
 top_p = 0.95                          # nucleus sampling parameter
 max_completion_tokens = 8192          # max tokens per response
@@ -226,7 +227,7 @@ query_params = { api-version = "2026-07-22" } # query params appended to every r
 env_http_headers = { "X-Tenant" = "TENANT_TOKEN" }    # request headers from env vars, resolved at client build
 ```
 
-Credential resolution: `api_key` > `env_key` > signed-in session token > `XAI_API_KEY`. See [Custom Models](11-custom-models.md#request-query-parameters) for `query_params` and `env_http_headers`, and [Sandbox Mode](18-sandbox.md#shell-environment-policy) for `[shell_environment_policy]`, which restricts the environment variables tool subprocesses inherit.
+Credential resolution: `api_key` > `env_key` > a named `auth_provider` > an explicit credential header (`extra_headers` / `env_http_headers`) > — on first-party xAI origins only — the signed-in session token > `XAI_API_KEY`. A model pointing at a non-xAI origin with none of the first four is marked unready rather than sent an ambient xAI credential, and `auth_scheme = "none"` skips resolution entirely. See [Custom Models > Credential Resolution](11-custom-models.md#credential-resolution) for the full rules, [Custom Models](11-custom-models.md#request-query-parameters) for `query_params` and `env_http_headers`, and [Sandbox Mode](18-sandbox.md#shell-environment-policy) for `[shell_environment_policy]`, which restricts the environment variables tool subprocesses inherit.
 
 To override a built-in model, use its name as the section key and set only the fields you need:
 

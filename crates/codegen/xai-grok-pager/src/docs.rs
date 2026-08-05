@@ -224,6 +224,33 @@ pub fn default_howto_entries() -> Vec<DocEntry> {
         .collect()
 }
 
+/// Rewrite `` `grok …` `` command examples to name the program the user actually
+/// invoked.
+///
+/// These docs are compiled in as static markdown and then written to disk **for
+/// the model to read**, so an instruction here reaches both the user and the
+/// agent. #117 made the binary stop calling itself `grok` in its own messages;
+/// without this the shipped documentation still tells both of them to run a
+/// command that, on a machine with the official build installed, drives the
+/// *other* program — the exact failure that issue is about.
+///
+/// Scoped to backticked commands at a word boundary, so prose about the
+/// upstream product ("a fork of Grok Build"), model ids (`grok-4.5`), and paths
+/// like `~/.grok` are untouched. Returns `Cow::Borrowed` when the invoked name
+/// is already `grok`, so the common upstream case allocates nothing.
+fn rename_commands_to_invoked_program(content: &'static str) -> std::borrow::Cow<'static, str> {
+    let program = xai_grok_config::program_name::program_name();
+    if program == "grok" {
+        return std::borrow::Cow::Borrowed(content);
+    }
+    // Only ``​`grok `` — a backtick, the name, then a space before a subcommand.
+    let needle = concat!("`", "grok", " ");
+    if !content.contains(needle) {
+        return std::borrow::Cow::Borrowed(content);
+    }
+    std::borrow::Cow::Owned(content.replace(needle, &format!("`{program} ")))
+}
+
 /// Extract user-guide docs to `<grok_home>/docs/user-guide/`.
 ///
 /// Called from the pager binary startup so the model can read them from disk.
@@ -234,7 +261,8 @@ pub fn extract_user_guide_docs(grok_home: &std::path::Path) {
         return;
     }
     for doc in USER_GUIDE {
-        if let Err(e) = std::fs::write(docs_dir.join(doc.filename), doc.content) {
+        let content = rename_commands_to_invoked_program(doc.content);
+        if let Err(e) = std::fs::write(docs_dir.join(doc.filename), content.as_ref()) {
             tracing::debug!(error = %e, filename = doc.filename, "Failed to extract user-guide doc");
         }
     }
@@ -258,6 +286,61 @@ pub fn extract_user_guide_docs(grok_home: &std::path::Path) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod invoked_program_rename_tests {
+    use super::rename_commands_to_invoked_program;
+
+    /// The docs are written to disk for the model to read, so a command example
+    /// here is an instruction to both the user and the agent (#117).
+    #[test]
+    fn backticked_commands_are_renamed_and_prose_is_not() {
+        // Fixture for the rewriter under test, not an instruction this program
+        // emits. auth-instruction-guard: exempt
+        let src: &'static str = "Run `grok login` to sign in. \
+             A fork of Grok Build. Model `grok-4.5` lives in ~/.grok. \
+             See `grok mcp add --help`. The word grok alone is prose.";
+        let out = rename_commands_to_invoked_program(src);
+
+        // Under a unit test the invoked name is the test binary, which is
+        // exactly the property being tested: whatever we were invoked as.
+        let program = xai_grok_config::program_name::program_name();
+        if program == "grok" {
+            // Upstream-named build: borrowed, untouched, no allocation.
+            assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+            return;
+        }
+
+        assert!(
+            out.contains(&format!("`{program} login`")),
+            "a backticked command must name the invoked program: {out}"
+        );
+        assert!(
+            out.contains(&format!("`{program} mcp add --help`")),
+            "every backticked command, not just the first: {out}"
+        );
+        assert!(
+            out.contains("A fork of Grok Build"),
+            "prose about the upstream product must survive: {out}"
+        );
+        assert!(
+            out.contains("`grok-4.5`"),
+            "a model id is not a command: {out}"
+        );
+        assert!(out.contains("~/.grok"), "a path is not a command: {out}");
+        assert!(
+            out.contains("word grok alone"),
+            "unbackticked prose is not a command: {out}"
+        );
+    }
+
+    /// No `grok` commands at all must not allocate.
+    #[test]
+    fn content_without_commands_is_borrowed() {
+        let out = rename_commands_to_invoked_program("nothing to rewrite here");
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
     }
 }
 
@@ -348,9 +431,11 @@ mod tests {
         for doc in USER_GUIDE {
             let path = docs_dir.join(doc.filename);
             assert!(path.exists(), "Expected doc {} to exist", doc.filename);
+            // Compare against the rewritten content: what lands on disk names
+            // the invoked program, not the compiled-in `grok` (#117).
             assert_eq!(
                 std::fs::read_to_string(&path).unwrap(),
-                doc.content,
+                rename_commands_to_invoked_program(doc.content).as_ref(),
                 "Content mismatch for {}",
                 doc.filename
             );
