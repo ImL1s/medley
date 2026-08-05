@@ -10798,6 +10798,40 @@ reasoning_effort = "low"
     /// so needs a `GROK_HOME` the whole process agrees on, and neighbouring
     /// tests set that without serialising, so such a test passes alone and
     /// fails in the suite — worse than no test, because it looks like coverage.
+    /// `session_key` is only meaningful when the stored credential really is a
+    /// session token. `resolve_credentials`' third arm takes whatever it is
+    /// handed and stamps it `AuthType::SessionToken`, so passing a BYOK key
+    /// there re-labels it — and passing a real session token carries it to a
+    /// model that may point anywhere.
+    ///
+    /// The function documents the guard as the caller's job; this pins what
+    /// happens when a caller forgets, so the reason the guard exists survives
+    /// in a test rather than only in a doc comment (#136).
+    #[test]
+    fn a_key_passed_as_session_key_is_relabelled_a_session_token() {
+        let entry = test_model_entry("vendor", "https://vendor.example/v1", None, None, None);
+
+        // No own credential, no provider: the `session_key` arm is what fires.
+        let with_key = resolve_credentials(&entry, Some("not-actually-a-session-token"));
+        assert_eq!(
+            with_key.auth_type,
+            xai_chat_state::AuthType::SessionToken,
+            "the arm stamps whatever it is handed, which is why the caller must guard"
+        );
+        assert_eq!(
+            with_key.api_key.as_deref(),
+            Some("not-actually-a-session-token")
+        );
+
+        // Guarded correctly, the same model resolves without inheriting it.
+        let without = resolve_credentials(&entry, None);
+        assert_ne!(
+            without.auth_type,
+            xai_chat_state::AuthType::SessionToken,
+            "with no session key there is no session token to report"
+        );
+    }
+
     #[test]
     fn credential_source_for_an_unknown_model_is_none_not_no_credential() {
         let creds = ResolvedCredentials {
