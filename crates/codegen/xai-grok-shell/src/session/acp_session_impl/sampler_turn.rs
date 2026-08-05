@@ -48,6 +48,10 @@ struct SessionTokenAuthGate {
     /// gate off so session bearers are never attached or refreshed after a
     /// model switch to a keyless local endpoint.
     auth_scheme: xai_grok_sampler::AuthScheme,
+    /// The model is authenticated by a credential header the user declared.
+    /// That is terminal auth: the session must neither be attached on top of
+    /// it nor invoked to "recover" when the provider rejects it (#110).
+    declared_credential_header: bool,
 }
 impl SessionTokenAuthGate {
     /// Single place `is_session_based` / `endpoint_is_first_party` are derived,
@@ -58,6 +62,8 @@ impl SessionTokenAuthGate {
         base_url: &str,
         endpoint_trust: Option<xai_grok_sampler::EndpointTrustClass>,
         auth_scheme: xai_grok_sampler::AuthScheme,
+        extra_headers: &indexmap::IndexMap<String, String>,
+        env_http_headers: &indexmap::IndexMap<String, String>,
     ) -> Self {
         Self {
             is_session_based: auth_method_id
@@ -73,10 +79,19 @@ impl SessionTokenAuthGate {
                 None => crate::util::is_xai_api_bearer_url(base_url),
             },
             auth_scheme,
+            // Derived here rather than passed in, for the same reason
+            // `endpoint_is_first_party` is: a call site that has to remember
+            // to compute it is a call site that will eventually forget.
+            declared_credential_header: crate::agent::config::explicit_credential_header_in(
+                extra_headers,
+                env_http_headers,
+            )
+            .is_some(),
         }
     }
     fn active(self) -> bool {
-        if self.auth_scheme == xai_grok_sampler::AuthScheme::None {
+        if self.auth_scheme == xai_grok_sampler::AuthScheme::None || self.declared_credential_header
+        {
             return false;
         }
         crate::agent::auth_method::session_token_auth_gate(
@@ -394,6 +409,8 @@ impl SessionActor {
         model_id: &str,
         base_url: &str,
         endpoint_trust: Option<xai_grok_sampler::EndpointTrustClass>,
+        extra_headers: &indexmap::IndexMap<String, String>,
+        env_http_headers: &indexmap::IndexMap<String, String>,
     ) -> SessionTokenAuthGate {
         let facts = self.model_auth_facts(model_id);
         let auth_method = self.auth_method_id.load();
@@ -403,6 +420,8 @@ impl SessionActor {
             base_url,
             endpoint_trust,
             facts.auth_scheme,
+            extra_headers,
+            env_http_headers,
         )
     }
     /// Emit a unified-log breadcrumb whenever the session-token refresh gate is
@@ -488,6 +507,8 @@ impl SessionActor {
             &cfg.base_url,
             cfg.endpoint_trust,
             model_facts.auth_scheme,
+            &cfg.extra_headers,
+            &cfg.env_http_headers,
         );
         // Security boundary: never attach a live session bearer (or rely on
         // gate.active alone) when the active model is keyless — even if the
@@ -1046,11 +1067,18 @@ impl SessionActor {
             .data(detailed_message);
             return Err(acp_err);
         }
-        let (failed_model_id, failed_base_url, failed_endpoint_trust) = self
+        let (failed_model_id, failed_base_url, failed_endpoint_trust, failed_headers) = self
             .chat_state_handle
             .get_sampling_config()
             .await
-            .map(|c| (self.catalog_model_id_str(), c.base_url, c.endpoint_trust))
+            .map(|c| {
+                (
+                    self.catalog_model_id_str(),
+                    c.base_url,
+                    c.endpoint_trust,
+                    (c.extra_headers, c.env_http_headers),
+                )
+            })
             .unwrap_or_default();
         let auth_provider =
             if matches!(error.kind, SamplingErrorKind::Auth) || error.status_code == Some(401) {
@@ -1059,7 +1087,13 @@ impl SessionActor {
                 None
             };
         let auth_recovery_eligible = matches!(error.kind, SamplingErrorKind::Auth) && {
-            let gate = self.auth_gate(&failed_model_id, &failed_base_url, failed_endpoint_trust);
+            let gate = self.auth_gate(
+                &failed_model_id,
+                &failed_base_url,
+                failed_endpoint_trust,
+                &failed_headers.0,
+                &failed_headers.1,
+            );
             let eligible = gate.active();
             self.log_auth_gate_unknown("handle_sampling_failure", gate, &failed_base_url);
             if !eligible && auth_provider.is_none() {
@@ -1399,14 +1433,26 @@ impl SessionActor {
         if let Some(ref am) = self.auth_manager {
             let creds = self.chat_state_handle.get_credentials().await;
             let catalog_model_id = current_model_id.clone();
-            let (base_url, endpoint_trust) = self
+            let (base_url, endpoint_trust, headers) = self
                 .chat_state_handle
                 .get_sampling_config()
                 .await
-                .map(|c| (c.base_url, c.endpoint_trust))
+                .map(|c| {
+                    (
+                        c.base_url,
+                        c.endpoint_trust,
+                        (c.extra_headers, c.env_http_headers),
+                    )
+                })
                 .unwrap_or_default();
             if self
-                .auth_gate(&catalog_model_id, &base_url, endpoint_trust)
+                .auth_gate(
+                    &catalog_model_id,
+                    &base_url,
+                    endpoint_trust,
+                    &headers.0,
+                    &headers.1,
+                )
                 .active()
             {
                 match am.get_valid_token().await {

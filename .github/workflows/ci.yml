@@ -303,6 +303,8 @@ jobs:
           cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
             sampling_config_for_unready -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
+            credential_header -- --nocapture
+          cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
             invalid_auth_scheme -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
             relation_matrix_is_secret_free -- --nocapture
