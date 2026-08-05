@@ -1042,11 +1042,18 @@ impl ApiBackend {
         matches!(self, Self::Messages)
     }
 
-    /// Whether [`ConversationRequest::prompt_cache_key`] reaches the wire. Only the Responses mapping sends it, so a key set elsewhere is inert.
+    /// Whether [`ConversationRequest::prompt_cache_key`] reaches the wire, so a
+    /// key set for a backend that drops it can be told from a real cache miss.
+    ///
+    /// Codex counts because it has no mapping of its own: both backends
+    /// dispatch to `conversation_stream_responses`, and the shared
+    /// `CreateResponse` conversion copies the key. The sampler may replace the
+    /// *value* with a stable digest when identity headers are not sent, but the
+    /// field still goes out -- anonymised, not dropped (#120).
     ///
     /// [`ConversationRequest::prompt_cache_key`]: crate::conversation::ConversationRequest::prompt_cache_key
     pub fn forwards_prompt_cache_key(&self) -> bool {
-        matches!(self, Self::Responses)
+        matches!(self, Self::Responses | Self::CodexResponses)
     }
 }
 
