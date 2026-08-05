@@ -869,10 +869,17 @@ impl SamplingClient {
         // plus the Codex transport demands the Codex API origin — with no
         // test-only loopback arm, because a config carrying this label is
         // stating that real account material is attached (loopback mocks use
-        // unlabeled configs). `normalize_codex_base_url` below refuses the
-        // same pairing as a *transport* question; this refusal keys on the
-        // credential label, so a path that bypasses readiness cannot
-        // reinstate the leak.
+        // unlabeled configs).
+        //
+        // Its reach is narrower than it looks, and saying so here is the point:
+        // it keys on the credential *label*, and the persisted `SamplingConfig`
+        // carries no credential at all -- no `credential_source`, no `api_key`,
+        // no `auth_scheme` -- so every reconstruction seam re-derives provenance
+        // from headers alone and a provider bearer comes back **unlabelled**.
+        // On the main request path this refusal therefore cannot fire, and what
+        // actually stops that pairing is `normalize_codex_base_url` below, as a
+        // transport question. This is a backstop for paths that do carry the
+        // label, not for the turn loop. Closing the seam is #136.
         if is_codex
             && config
                 .credential_source

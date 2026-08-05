@@ -7601,6 +7601,12 @@ reasoning_effort = "low"
     /// `api_key` pointed at a foreign endpoint is the supported custom-
     /// provider path and must stay ready — provenance, not the presence of a
     /// credential, is what the origin binding keys on.
+    ///
+    /// Asserted twice, because the first version of this test was vacuous:
+    /// `test_model_entry` defaults `api_backend` to `ChatCompletions`, so it
+    /// never entered the Codex branch and passed unchanged on the parent
+    /// commit. The `CodexResponses` case is the one that actually reaches the
+    /// new gate.
     #[test]
     fn model_owned_api_key_to_a_foreign_endpoint_stays_ready() {
         let entry = test_model_entry(
@@ -7614,6 +7620,26 @@ reasoning_effort = "low"
             model_readiness(&entry),
             (true, None),
             "a key the user typed for that endpoint is none of the origin gate's business"
+        );
+
+        // Same key, same foreign origin, but now on the backend whose branch
+        // carries the origin gate. It must still not be the gate's business:
+        // the refusal is for *provider-scoped* credentials, and this one is
+        // the user's own. Unready here is acceptable only for the missing-
+        // provider reason, never for the origin.
+        let mut codex = test_model_entry(
+            "byok-codex",
+            "https://vendor.example/v1",
+            Some("sk-model-owned"),
+            None,
+            None,
+        );
+        codex.info.api_backend = ApiBackend::CodexResponses;
+        let (_, reason) = model_readiness(&codex);
+        let reason = reason.unwrap_or_default();
+        assert!(
+            !reason.contains("origin"),
+            "a model-owned key must never be refused for where it points, got: {reason}"
         );
     }
     #[test]
