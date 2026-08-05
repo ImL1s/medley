@@ -499,9 +499,6 @@ impl SessionActor {
             });
         let creds = self.chat_state_handle.get_credentials().await;
         let catalog_model_id = self.catalog_model_id_str();
-        // Cloned before `creds.api_key` is moved into the config below;
-        // the classifier needs to see the same value the wire will carry.
-        let creds_api_key_for_provenance = creds.api_key.clone();
         let (model_facts, model_auth_provider) = self.model_auth_state(&catalog_model_id);
         let auth_method = self.auth_method_id.load();
         let gate = SessionTokenAuthGate::new(
@@ -699,31 +696,6 @@ impl SessionActor {
         } else {
             None
         };
-        // Provenance is re-derived from the catalog, not from the headers.
-        // Chat state persists the destination but not the credential -- it has
-        // no `credential_source`, no `api_key`, no `auth_scheme` -- so a
-        // header-only inference brings an ambient or provider-scoped credential
-        // back **unlabelled**, and the construction guard keys on that label,
-        // so an absent one silently disarms it (#136).
-        //
-        // Falls back to the header-derived value when the catalog cannot
-        // answer. "Not in the catalog" must not be read as "no credential":
-        // that is the conflation #133 is about, and asserting it here would be
-        // the mistake this is undoing.
-        let credential_source = crate::agent::config::credential_source_for_model(
-            &catalog_model_id,
-            &crate::agent::config::ResolvedCredentials {
-                api_key: creds_api_key_for_provenance,
-                base_url: cfg.base_url.clone(),
-                auth_type: creds.auth_type,
-                auth_scheme: model_facts.auth_scheme,
-            },
-        )
-        .or_else(|| {
-            declared_credential_header.map(|(header, env)| {
-                xai_grok_sampler::CredentialSource::ExplicitHeader { header, env }
-            })
-        });
         SamplingConfig {
             api_key,
             base_url: cfg.base_url,
