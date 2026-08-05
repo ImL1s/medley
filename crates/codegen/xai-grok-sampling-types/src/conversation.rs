@@ -2437,6 +2437,7 @@ mod tests {
             crate::ApiBackend::ChatCompletions,
             crate::ApiBackend::Responses,
             crate::ApiBackend::Messages,
+            crate::ApiBackend::CodexResponses,
         ] {
             let on_wire = match backend {
                 crate::ApiBackend::Responses => {
@@ -2452,15 +2453,18 @@ mod tests {
                         .get("prompt_cache_key")
                         .is_some()
                 }
-                // The fork's backend is not in the loop above, so this arm is
-                // unreachable. Deliberately not folded into `Responses`: Codex
-                // borrows that wire shape, but whether its mapping actually
-                // emits `prompt_cache_key` -- and so whether
-                // `forwards_prompt_cache_key()` returning false for it is
-                // right -- is unverified. Asserting the equivalence here would
-                // hide that, and a 368-file sync is the wrong place to find out.
+                // Codex has no mapping of its own: `request_task.rs` dispatches
+                // `Responses | CodexResponses` to the same function, and the
+                // shared `CreateResponse` conversion copies the key. The #118
+                // sync left this arm `unreachable!` because that was unverified
+                // and a 368-file merge was the wrong place to find out; it has
+                // since been traced end to end, so the arm now asserts the
+                // equivalence instead of documenting the doubt (#120).
                 crate::ApiBackend::CodexResponses => {
-                    unreachable!("CodexResponses is not exercised by this loop")
+                    rs::CreateResponse::from(&request())
+                        .prompt_cache_key
+                        .as_deref()
+                        == Some("cache-key-1")
                 }
                 crate::ApiBackend::Messages => {
                     let mapped = super::messages::build_messages_request(&request());

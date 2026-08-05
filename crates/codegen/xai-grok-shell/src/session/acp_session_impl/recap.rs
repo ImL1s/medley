@@ -207,8 +207,9 @@ impl SessionActor {
     /// Temperature stays unset: cli-chat-proxy may inject a `thinking` config, and the Messages API then requires temperature == 1.
     fn parent_cached_request(&self, call: AuxCall) -> ConversationRequest {
         let session_id = self.session_info.id.to_string();
-        // Only the Responses mapping sends the cache key. On the other backends the conv id is what ties a call to its conversation,
+        // Only the Responses-shaped mappings send the cache key. On the other backends the conv id is what ties a call to its conversation,
         // so it has to stay the parent session id; the `btw-`/`recap-` label still shows up in `x_grok_req_id`.
+        // Codex takes the forwarding branch (#120) but transmits no conv id at all -- it skips `grok_headers.apply` -- so the choice is inert there.
         let conv_id = if call.backend.forwards_prompt_cache_key() {
             call.conv_id
         } else {

@@ -4068,6 +4068,88 @@ mod tests {
         );
     }
 
+    /// `forwards_prompt_cache_key()` claims Codex sends the key. This is the
+    /// only place that claim is observable end to end: the sampling-types
+    /// invariant test can prove the shared `CreateResponse` conversion copies
+    /// the field, but not that Codex *reaches* that conversion -- the dispatch
+    /// lives here, in another crate. Without this, a change giving Codex its
+    /// own mapping would leave that test green while the key stopped going out.
+    ///
+    /// The value on the wire is a digest, not the original: Codex resolves to
+    /// `EndpointTrustClass::External`, so `anonymize_prompt_cache_key` always
+    /// applies on this path. The field reaching the wire is what the predicate
+    /// promises, and the digest is an unsalted sha256, so cache affinity holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn codex_sends_the_prompt_cache_key_the_predicate_promises() {
+        use axum::Router;
+        use axum::body::Bytes;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        assert!(
+            ApiBackend::CodexResponses.forwards_prompt_cache_key(),
+            "precondition: the predicate under test must claim Codex forwards it"
+        );
+
+        let captured: Arc<Mutex<Option<Bytes>>> = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&captured);
+        let app = Router::new().route(
+            "/backend-api/codex/responses",
+            post(move |body: Bytes| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    *sink.lock().unwrap() = Some(body);
+                    ([(CONTENT_TYPE, "text/event-stream")], "data: [DONE]\n\n")
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let resolver = Arc::new(CodexCredentialResolver {
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let client = SamplingClient::new(SamplerConfig {
+            base_url: format!("http://{address}/backend-api/codex"),
+            api_backend: ApiBackend::CodexResponses,
+            bearer_resolver: Some(resolver),
+            ..minimal_config()
+        })
+        .expect("loopback Codex mock should be allowed in unit tests");
+
+        let mut request = CreateResponseWrapper::default();
+        request.inner.input =
+            rs::InputParam::Items(vec![rs::InputItem::EasyMessage(rs::EasyInputMessage {
+                r#type: rs::MessageType::Message,
+                role: rs::Role::User,
+                content: rs::EasyInputContent::Text("hello".to_owned()),
+            })]);
+        request.inner.prompt_cache_key = Some("session-abc".to_owned());
+
+        client
+            .create_response_stream(request)
+            .await
+            .expect("mock Codex request should start");
+
+        let body = captured.lock().unwrap().take().expect("request captured");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        let on_wire = body
+            .get("prompt_cache_key")
+            .and_then(serde_json::Value::as_str)
+            .expect("Codex must send prompt_cache_key; the predicate says it does");
+        assert_ne!(
+            on_wire, "session-abc",
+            "the raw key must not reach a non-first-party origin"
+        );
+        assert!(
+            !on_wire.is_empty(),
+            "an anonymised key is still a key: an empty value would be a dropped one"
+        );
+    }
+
     /// Regression for stale chat-state A / live provider B. The resolver puts
     /// B on the actual request; if B is rejected, the auth error must report
     /// `same_as_current` so the shell forces ServerRejected refresh instead of
