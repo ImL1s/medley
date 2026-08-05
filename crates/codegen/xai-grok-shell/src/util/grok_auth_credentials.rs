@@ -59,13 +59,21 @@ impl GrokAuthCredentials {
         self.auth_manager.as_ref()
     }
     /// Error hint for 401 responses, based on which credential was sent.
-    pub fn auth_error_hint(&self) -> &'static str {
+    pub fn auth_error_hint(&self) -> String {
         if self.deployment_key.is_some() {
             "Your GROK_DEPLOYMENT_KEY is invalid or expired. Please contact a team admin."
+                .to_owned()
         } else if self.user_token.is_some() {
-            "Your auth token is invalid or expired. Run `grok login` to re-authenticate."
+            crate::auth::with_login_instruction(
+                |prog| {
+                    format!(
+                        "Your auth token is invalid or expired. Run `{prog} login` to re-authenticate."
+                    )
+                },
+                "Your auth token is invalid or expired. Sign in again to re-authenticate.",
+            )
         } else {
-            "Not authenticated."
+            "Not authenticated.".to_owned()
         }
     }
     /// Return a snapshot with the live token from the internal `AuthManager`

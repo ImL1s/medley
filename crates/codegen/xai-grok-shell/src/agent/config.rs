@@ -6291,7 +6291,14 @@ pub(crate) fn model_readiness(model: &ModelEntry) -> (bool, Option<String>) {
         if !status.signed_in {
             return (
                 false,
-                Some("sign in with `grok login --provider openai-codex`".to_owned()),
+                Some(crate::auth::with_login_instruction(
+                    |prog| format!("sign in with `{prog} login --provider openai-codex`"),
+                    // No command name: an instruction with the binary amputated
+                    // ("run `login --provider openai-codex`") cannot be typed,
+                    // and the module's contract is that saying nothing beats
+                    // naming the wrong program.
+                    "not signed in to OpenAI Codex",
+                )),
             );
         }
         // An expired access token with a scoped refresh token is selectable:

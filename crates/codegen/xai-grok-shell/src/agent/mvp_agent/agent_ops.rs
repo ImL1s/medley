@@ -1674,9 +1674,9 @@ impl MvpAgent {
             let preferred = self.cfg.borrow().grok_com_config.preferred_method;
             let msg = match preferred {
                 Some(crate::auth::PreferredAuthMethod::ApiKey) => {
-                    auth_method::PREFERRED_API_KEY_UNAVAILABLE
+                    auth_method::PREFERRED_API_KEY_UNAVAILABLE.to_owned()
                 }
-                _ => auth_method::PREFERRED_OIDC_UNAVAILABLE,
+                _ => auth_method::preferred_oidc_unavailable(),
             };
             tracing::info!(%msg, "cached_token unavailable; preferred_method forbids fallthrough");
             xai_grok_telemetry::unified_log::warn(
@@ -2733,7 +2733,13 @@ impl MvpAgent {
         if relay_sync_enabled {
             tracing::info!("[grok] Relay sync: ENABLED");
         } else if tui_mode && relay_config_enabled && !has_xai_auth {
-            tracing::info!("[grok] Relay sync: DISABLED (no auth - run 'grok login' first)");
+            tracing::info!(
+                    "[grok] Relay sync: DISABLED (no auth - {})",
+                    crate::auth::with_login_instruction(
+                        |prog| format!("run `{prog} login` first"),
+                        "sign in first",
+                    )
+                );
         } else if tui_mode && !relay_config_enabled {
             tracing::debug!("Relay sync: DISABLED (not configured in config.toml or env)");
         } else {

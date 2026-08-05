@@ -2341,7 +2341,8 @@ fn format_session_info_session_auth_ignores_api_key_env() {
     assert!(!text.contains("Manage account and credits"), "{text}");
     assert!(!text.contains("Also present: XAI_API_KEY"), "{text}");
     assert!(!text.contains("console.x.ai"), "{text}");
-    assert!(!text.contains("grok login"), "{text}");
+    let check = format!("{prog} login", prog = crate::app::program_name());
+    assert!(!text.contains(&check), "{text}");
 }
 #[test]
 fn format_session_info_api_key_without_env() {
@@ -2350,8 +2351,9 @@ fn format_session_info_api_key_without_env() {
     assert!(text.contains("Auth method: API key\n"), "{text}");
     assert!(!text.contains("XAI_API_KEY"), "{text}");
     assert!(!text.contains("Manage account and credits"), "{text}");
+    let expected = format!("Run `{prog} login` to use your SuperGrok subscription instead.", prog = crate::app::program_name());
     assert!(
-            text.contains("Run `grok login` to use your SuperGrok subscription instead."),
+            text.contains(&expected),
             "{text}"
         );
     assert!(!text.contains("grok.com"), "{text}");
@@ -2362,8 +2364,9 @@ fn format_session_info_api_key_auth_suggests_grok_login() {
     let text = format_session_info(&info, None, false, true, true);
     assert!(text.contains("Auth method: API key (XAI_API_KEY)"), "{text}");
     assert!(!text.contains("Manage account and credits"), "{text}");
+    let expected = format!("Run `{prog} login` to use your SuperGrok subscription instead.", prog = crate::app::program_name());
     assert!(
-            text.contains("Run `grok login` to use your SuperGrok subscription instead."),
+            text.contains(&expected),
             "{text}"
         );
     assert!(!text.contains("Also present: XAI_API_KEY"), "{text}");
@@ -2378,7 +2381,8 @@ fn format_session_info_session_only_shows_oauth() {
     assert!(!text.contains("Manage account and credits"), "{text}");
     assert!(!text.contains("Also present: XAI_API_KEY"), "{text}");
     assert!(!text.contains("console.x.ai"), "{text}");
-    assert!(!text.contains("grok login"), "{text}");
+    let check = format!("{prog} login", prog = crate::app::program_name());
+    assert!(!text.contains(&check), "{text}");
 }
 #[test]
 fn format_session_info_shows_conversation_id_when_present() {

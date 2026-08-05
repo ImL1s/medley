@@ -4581,9 +4581,15 @@ fn format_auth_lines(is_api_key_auth: bool, api_key_env_set: bool) -> String {
         } else {
             "  Auth method: API key\n"
         };
-        return format!(
-            "{method}  Run `grok login` to use your SuperGrok subscription instead.\n"
-        );
+        let hint = match crate::app::program_name_for_instruction() {
+            Some(prog) => {
+                format!("  Run `{prog} login` to use your SuperGrok subscription instead.\n")
+            }
+            None => {
+                "  Sign in to use your SuperGrok subscription instead.\n".to_owned()
+            }
+        };
+        return format!("{method}{hint}");
     }
     String::from("  Auth method: OAuth\n")
 }

@@ -41,9 +41,7 @@ pub enum ManagedConfigError {
         "The deployment key was rejected. Confirm that GROK_DEPLOYMENT_KEY is set correctly and hasn't expired."
     )]
     DeploymentKeyRejected,
-    #[error(
-        "Your team sign-in was rejected. It may have expired or lack access. Run `grok login` to sign in again."
-    )]
+    #[error("{}", team_auth_rejected_msg())]
     TeamAuthRejected,
     #[error("The server returned an unexpected error (HTTP {status}). Try again in a few minutes.")]
     ServerError { status: u16 },
@@ -67,6 +65,17 @@ pub enum ManagedConfigError {
         home = xai_grok_config::display_grok_home_prefix()
     )]
     DiskWrite(#[from] std::io::Error),
+}
+
+fn team_auth_rejected_msg() -> String {
+    crate::auth::with_login_instruction(
+        |prog| {
+            format!(
+                "Your team sign-in was rejected. It may have expired or lack access. Run `{prog} login` to sign in again."
+            )
+        },
+        "Your team sign-in was rejected. It may have expired or lack access. Sign in again.",
+    )
 }
 
 impl ManagedConfigError {

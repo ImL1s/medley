@@ -13,6 +13,7 @@
 //! before merge. Requirements layers (#4–#6) may opt into fail-closed startup;
 //! see [`validate_requirements`].
 
+pub mod auth_instruction_guard;
 pub mod campaigns;
 pub mod config_override;
 pub mod display;
@@ -23,6 +24,7 @@ mod macos_managed;
 mod managed_cache;
 pub mod managed_text;
 mod paths;
+pub mod program_name;
 pub mod shell;
 pub mod signed_policy;
 pub mod state_dir;

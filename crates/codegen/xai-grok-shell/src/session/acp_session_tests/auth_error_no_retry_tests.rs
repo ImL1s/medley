@@ -639,13 +639,15 @@ async fn legacy_auth_hint_on_404_model_not_found() {
                 msg.contains("deprecated authentication method"),
                 "404 with WebLogin must include deprecation message, got: {msg}"
             );
+            let prog = xai_grok_config::program_name::program_name_for_instruction()
+                .expect("test binary argv0 is a plain program name");
             assert!(
-                msg.contains("grok logout"),
-                "hint must mention `grok logout`, got: {msg}"
+                msg.contains(&format!("`{prog} logout`")),
+                "hint must mention `{prog} logout`, got: {msg}"
             );
             assert!(
-                msg.contains("grok login"),
-                "hint must mention `grok login`, got: {msg}"
+                msg.contains(&format!("`{prog} login`")),
+                "hint must mention `{prog} login`, got: {msg}"
             );
             assert!(
                 msg.contains("Version:"),
@@ -710,13 +712,15 @@ async fn legacy_auth_hint_on_401_unauthorized() {
                 msg.contains("deprecated authentication method"),
                 "401 with WebLogin must include deprecation message, got: {msg}"
             );
+            let prog = xai_grok_config::program_name::program_name_for_instruction()
+                .expect("test binary argv0 is a plain program name");
             assert!(
-                msg.contains("grok logout"),
-                "hint must mention `grok logout`, got: {msg}"
+                msg.contains(&format!("`{prog} logout`")),
+                "hint must mention `{prog} logout`, got: {msg}"
             );
             assert!(
-                msg.contains("grok login"),
-                "hint must mention `grok login`, got: {msg}"
+                msg.contains(&format!("`{prog} login`")),
+                "hint must mention `{prog} login`, got: {msg}"
             );
         })
         .await;

@@ -21,6 +21,26 @@ const DEFAULT_DEVICE_POLL_INTERVAL_SECS: i32 = 5;
 const DEVICE_SLOW_DOWN_INCREMENT_SECS: u64 = 5;
 const MIN_DEVICE_CODE_EXPIRY_FALLBACK_SECS: i64 = 10 * 60;
 
+fn device_code_not_enabled_msg() -> String {
+    crate::auth::with_login_instruction(
+        |prog| {
+            format!(
+                "Device-code login is not available for this deployment. \
+                 Try `{prog} login` or set XAI_API_KEY instead."
+            )
+        },
+        "Device-code login is not available for this deployment. \
+         Sign in another way or set XAI_API_KEY instead.",
+    )
+}
+
+fn device_code_expired_msg() -> String {
+    crate::auth::with_login_instruction(
+        |prog| format!("Device code expired. Run `{prog} login --device-auth` again."),
+        "Device code expired. Sign in again.",
+    )
+}
+
 /// Only the 404 "no device endpoint" case is typed, because the login flow
 /// matches on it to fall back to loopback. Every other device-code failure
 /// stays a plain `anyhow` error: wrapping one in a `#[error(transparent)]`
@@ -28,10 +48,7 @@ const MIN_DEVICE_CODE_EXPIRY_FALLBACK_SECS: i64 = 10 * 60;
 /// transparent forwards `source()` past the error it wraps.
 #[derive(Debug, Error)]
 pub(crate) enum DeviceCodeError {
-    #[error(
-        "Device-code login is not available for this deployment. \
-         Try `grok login` or set XAI_API_KEY instead."
-    )]
+    #[error("{}", device_code_not_enabled_msg())]
     NotEnabled,
 }
 
@@ -246,7 +263,7 @@ pub(crate) async fn complete_device_code_login(
         tokio::time::sleep(poll_interval).await;
 
         if tokio::time::Instant::now() > deadline {
-            anyhow::bail!("Device code expired. Run `grok login --device-auth` again.");
+            anyhow::bail!("{}", device_code_expired_msg());
         }
 
         let resp = with_alpha_test_key(
@@ -293,7 +310,7 @@ pub(crate) async fn complete_device_code_login(
             }
             "expired_token" => {
                 tracing::warn!("device auth token expired");
-                anyhow::bail!("Device code expired. Run `grok login --device-auth` again.");
+                anyhow::bail!("{}", device_code_expired_msg());
             }
             _ => {
                 tracing::warn!("device auth token exchange failed");

@@ -1057,49 +1057,18 @@ fn strip_cur_dir(path: PathBuf) -> PathBuf {
         .filter(|component| !matches!(component, std::path::Component::CurDir))
         .collect()
 }
-/// Fallback when `argv[0]` is absent or unusable. Reached only outside a
-/// normal invocation, since a shell always supplies `argv[0]`.
-const FALLBACK_PROGRAM_NAME: &str = "grok";
-/// Whether `name` is a plain program name, safe to render into help output.
-///
-/// `argv[0]` is chosen by whoever execs us, and clap prints it into usage and
-/// error lines — so a name carrying control characters, escape sequences, or
-/// newlines could rewrite the surrounding terminal display. Screening it here
-/// keeps that out of the one string we take from the caller and print back.
-fn is_plain_program_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-}
-/// The name to call ourselves in usage and error lines: the file name of
-/// `argv[0]`, screened by [`is_plain_program_name`].
-///
-/// Upstream filtered this to the two names it ships under (`grok`, `agent`),
-/// so every other name fell through to the fallback. This fork ships the same
-/// binary as `medley`, which meant `medley --help` opened with `Usage: grok`
-/// — and, worse, that instructions like `grok login` came back as the answer
-/// on a machine where a real `grok` is also installed, where following them
-/// authenticates the *other* program and silently changes nothing here (#117).
-///
-/// Honouring `argv[0]` is also what makes the packaging-layer rename honest:
-/// the cargo bin target stays `xai-grok-pager` and the distribution name is
-/// applied when the archive is built, so the binary cannot know its own
-/// shipped name any other way.
-fn program_name_from_argv0(argv0: Option<&str>) -> String {
-    argv0
-        .map(std::path::Path::new)
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str())
-        .filter(|n| is_plain_program_name(n))
-        .unwrap_or(FALLBACK_PROGRAM_NAME)
-        .to_owned()
-}
+/// Re-export: lives in `xai-grok-config` so the shell crate can reach it too
+/// (dependency runs pager → shell; an accessor here would be unreachable).
+pub use xai_grok_config::program_name::{
+    FALLBACK_PROGRAM_NAME, program_name, program_name_for_instruction,
+};
+
 impl PagerArgs {
     /// Parse CLI arguments without applying side effects.
     pub fn parse_cli() -> Self {
-        let bin_name = program_name_from_argv0(std::env::args().next().as_deref());
+        // `program_name()` self-initializes from argv[0]; clap's bin_name is
+        // the same value so usage lines match what we call ourselves elsewhere.
+        let bin_name = program_name().to_owned();
         Self::parse_from(std::iter::once(bin_name).chain(std::env::args().skip(1)))
     }
     /// Apply launch-directory path anchoring and `--cwd` after early commands
@@ -1302,63 +1271,6 @@ impl PagerArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The program must call itself whatever it was invoked as. Pre-fix an
-    /// allowlist admitted only `grok`/`agent`, so this fork's own name fell
-    /// through and `medley --help` opened with `Usage: grok` (#117).
-    #[test]
-    fn program_name_is_taken_from_argv0_whatever_it_is() {
-        for (argv0, want) in [
-            ("medley", "medley"),
-            ("/usr/local/bin/medley", "medley"),
-            ("./medley", "medley"),
-            // Upstream's two names must keep working — this widens the rule,
-            // it does not swap one hardcoded name for another.
-            ("grok", "grok"),
-            ("agent", "agent"),
-            ("/opt/homebrew/bin/grok", "grok"),
-            // The raw cargo bin target, which is what a `cargo run` reports.
-            ("xai-grok-pager", "xai-grok-pager"),
-        ] {
-            assert_eq!(
-                program_name_from_argv0(Some(argv0)),
-                want,
-                "argv[0] {argv0:?} must render as {want:?}"
-            );
-        }
-    }
-
-    /// `argv[0]` is chosen by the caller and clap prints it into usage and
-    /// error output, so anything that could rewrite the terminal has to fall
-    /// back instead of being echoed.
-    #[test]
-    fn hostile_or_missing_argv0_falls_back_instead_of_being_printed() {
-        for argv0 in [
-            "",
-            "med\u{1b}[2Jley",  // escape sequence: clears the screen
-            "med\nUsage: sudo", // newline: forges a second output line
-            "med\u{7}ley",      // control character
-            "med ley",          // space: not a plain program name
-            "медley",           // non-ASCII
-        ] {
-            assert_eq!(
-                program_name_from_argv0(Some(argv0)),
-                FALLBACK_PROGRAM_NAME,
-                "argv[0] {argv0:?} must not reach the rendered usage line"
-            );
-        }
-        assert_eq!(program_name_from_argv0(None), FALLBACK_PROGRAM_NAME);
-        // A path with no file name component (trailing separator).
-        assert_eq!(program_name_from_argv0(Some("/usr/bin/")), "bin");
-        // Overlong names are refused rather than truncated: truncation would
-        // still put caller-chosen text in the usage line.
-        let long = "m".repeat(65);
-        assert_eq!(program_name_from_argv0(Some(&long)), FALLBACK_PROGRAM_NAME);
-        assert_eq!(
-            program_name_from_argv0(Some(&"m".repeat(64))),
-            "m".repeat(64)
-        );
-    }
 
     fn assert_no_secret_fragments(output: &str, sentinel: &str) {
         assert!(!output.contains(sentinel));
@@ -2076,5 +1988,17 @@ mod state_dir_help_tests {
             return trimmed.starts_with("fn ") || trimmed.starts_with("pub fn ");
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod auth_instruction_guard_tests {
+    /// Scans this crate's own `src/` — a guard in one crate cannot see another's.
+    #[test]
+    fn no_hardcoded_auth_instructions() {
+        xai_grok_config::auth_instruction_guard::assert_no_hardcoded_auth_instructions(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src"
+        ));
     }
 }
