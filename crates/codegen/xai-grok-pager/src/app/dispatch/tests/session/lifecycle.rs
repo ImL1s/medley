@@ -932,11 +932,8 @@ fn switch_model_deferred_when_no_session_id() {
         &mut app,
     );
     assert!(
-        matches!(
-            &effects[..],
-            [Effect::PersistPreferredModel { model_id: m, .. }] if m == &model_id
-        ),
-        "expected persist-only, got {effects:?}"
+        effects.is_empty(),
+        "pre-session pick must not persist until the deferred switch completes, got {effects:?}"
     );
     assert_eq!(
         app.agents[&id].session.models.current,
@@ -951,6 +948,286 @@ fn switch_model_deferred_when_no_session_id() {
         })
     );
     assert!(!app.agents[&id].session.model_switch_pending);
+}
+
+/// Pre-session pick must not write the preference; a failed deferred ACP
+/// switch must leave nothing to persist. Load-bearing against restoring the
+/// eager PersistPreferredModel at selection time in `Action::SwitchModel`.
+#[test]
+fn deferred_pre_session_pick_does_not_persist_when_switch_fails() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let model_a = acp::ModelId::new(std::sync::Arc::from("model-a"));
+    let model_b = acp::ModelId::new(std::sync::Arc::from("model-b"));
+    insert_ready_model(&mut app, id, &model_a);
+    insert_ready_model(&mut app, id, &model_b);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.session_id = None;
+        agent.session.models.set_current(model_a.clone(), None);
+    }
+
+    let pick_effects = dispatch(
+        Action::SwitchModel {
+            model_id: model_b.clone(),
+            effort: None,
+        },
+        &mut app,
+    );
+    assert!(
+        !pick_effects
+            .iter()
+            .any(|e| matches!(e, Effect::PersistPreferredModel { .. })),
+        "selection before a session exists must not persist: {pick_effects:?}"
+    );
+
+    let created = dispatch(
+        Action::TaskComplete(TaskResult::SessionCreated {
+            agent_id: id,
+            session_id: "deferred-fail-session".into(),
+            models: None,
+            scheduler_background_loops: None,
+        }),
+        &mut app,
+    );
+    assert!(
+        !created
+            .iter()
+            .any(|e| matches!(e, Effect::PersistPreferredModel { .. })),
+        "SessionCreated must not persist either: {created:?}"
+    );
+    let request_id = switch_model_request_id(&created);
+
+    let error = xai_grok_shell::agent::config::ModelSwitchHarnessError {
+        code: xai_grok_shell::agent::config::MODEL_SWITCH_REBUILD_FAILED.to_string(),
+        active_agent_type: "grok-build".into(),
+        required_agent_type: "cursor".into(),
+        model_id: model_b.0.to_string(),
+        reason: "agent_definition_unavailable".into(),
+    };
+    let failed = dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id: id,
+            model_id: model_b,
+            effort: None,
+            request_id,
+            result: Err(SwitchModelError::HarnessUnavailable {
+                error,
+                prev_model_id: Some(model_a.clone()),
+            }),
+            prev_model_id: Some(model_a),
+        }),
+        &mut app,
+    );
+    assert!(
+        !failed
+            .iter()
+            .any(|e| matches!(e, Effect::PersistPreferredModel { .. })),
+        "failed deferred switch must not persist: {failed:?}"
+    );
+}
+
+/// A pre-session pick when nothing is selected yet must still persist on
+/// success.
+///
+/// `current == None` before a session exists is a real state the codebase
+/// acknowledges, and it is reachable whenever the shell's broadcast current
+/// model is absent from the catalog -- stripped as unready, or removed from a
+/// custom one. The rollback target is then `None`, and without a pre-mutation
+/// snapshot the completion falls back to the *post*-mutation state, compares it
+/// against itself, and writes nothing.
+#[test]
+fn pre_session_pick_with_no_prior_model_still_persists() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let model_b = acp::ModelId::new(std::sync::Arc::from("model-b"));
+    insert_ready_model(&mut app, id, &model_b);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.session_id = None;
+        agent.session.models.current = None;
+    }
+
+    let pick = dispatch(
+        Action::SwitchModel {
+            model_id: model_b.clone(),
+            effort: None,
+        },
+        &mut app,
+    );
+    assert!(
+        !pick
+            .iter()
+            .any(|e| matches!(e, Effect::PersistPreferredModel { .. })),
+        "selection must defer persistence: {pick:?}"
+    );
+
+    let created = dispatch(
+        Action::TaskComplete(TaskResult::SessionCreated {
+            agent_id: id,
+            session_id: "no-prior-model-session".into(),
+            models: None,
+            scheduler_background_loops: None,
+        }),
+        &mut app,
+    );
+    let (request_id, prev_model_id) = switch_model_effect(&created);
+
+    let completed = dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id: id,
+            model_id: model_b.clone(),
+            effort: None,
+            request_id,
+            result: Ok(()),
+            prev_model_id,
+        }),
+        &mut app,
+    );
+    assert!(
+        completed.iter().any(|e| matches!(
+            e,
+            Effect::PersistPreferredModel { model_id, .. } if model_id == &model_b
+        )),
+        "a first-ever pick must reach disk once the switch succeeds: {completed:?}"
+    );
+}
+
+/// Changing only the reasoning effort before a session exists must persist too.
+///
+/// The model is unchanged, so the completion's decision rests entirely on the
+/// effort comparison -- and comparing a post-mutation snapshot against itself
+/// reports "unchanged" and writes nothing. The user sees the effort apply for
+/// the run and silently revert on the next launch, with no error and no
+/// confirmation either way.
+#[test]
+fn pre_session_effort_only_change_still_persists() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let model_a = acp::ModelId::new(std::sync::Arc::from("model-a"));
+    insert_ready_model(&mut app, id, &model_a);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.session_id = None;
+        agent.session.models.set_current(model_a.clone(), None);
+    }
+
+    let pick = dispatch(
+        Action::SwitchModel {
+            model_id: model_a.clone(),
+            effort: Some(xai_grok_shell::sampling::types::ReasoningEffort::High),
+        },
+        &mut app,
+    );
+    assert!(
+        !pick
+            .iter()
+            .any(|e| matches!(e, Effect::PersistPreferredModel { .. })),
+        "selection must defer persistence: {pick:?}"
+    );
+
+    let created = dispatch(
+        Action::TaskComplete(TaskResult::SessionCreated {
+            agent_id: id,
+            session_id: "effort-only-session".into(),
+            models: None,
+            scheduler_background_loops: None,
+        }),
+        &mut app,
+    );
+    let (request_id, prev_model_id) = switch_model_effect(&created);
+
+    let completed = dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id: id,
+            model_id: model_a.clone(),
+            effort: Some(xai_grok_shell::sampling::types::ReasoningEffort::High),
+            request_id,
+            result: Ok(()),
+            prev_model_id,
+        }),
+        &mut app,
+    );
+    assert!(
+        completed.iter().any(|e| matches!(
+            e,
+            Effect::PersistPreferredModel {
+                reasoning_effort: Some(xai_grok_shell::sampling::types::ReasoningEffort::High),
+                ..
+            }
+        )),
+        "an effort-only pick must reach disk once the switch succeeds: {completed:?}"
+    );
+}
+
+/// Guard against the worse bug: dropping the eager persist must not mean a
+/// successful deferred switch never writes the preference. Completion still
+/// owns PersistPreferredModel via handle_switch_model_complete.
+#[test]
+fn deferred_pre_session_pick_persists_after_switch_succeeds() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let model_a = acp::ModelId::new(std::sync::Arc::from("model-a"));
+    let model_b = acp::ModelId::new(std::sync::Arc::from("model-b"));
+    insert_ready_model(&mut app, id, &model_a);
+    insert_ready_model(&mut app, id, &model_b);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.session_id = None;
+        agent.session.models.set_current(model_a.clone(), None);
+    }
+
+    let pick_effects = dispatch(
+        Action::SwitchModel {
+            model_id: model_b.clone(),
+            effort: None,
+        },
+        &mut app,
+    );
+    assert!(
+        !pick_effects
+            .iter()
+            .any(|e| matches!(e, Effect::PersistPreferredModel { .. })),
+        "selection must defer persistence to completion: {pick_effects:?}"
+    );
+
+    let created = dispatch(
+        Action::TaskComplete(TaskResult::SessionCreated {
+            agent_id: id,
+            session_id: "deferred-ok-session".into(),
+            models: None,
+            scheduler_background_loops: None,
+        }),
+        &mut app,
+    );
+    // Thread the emitted `prev_model_id` rather than inventing one: that field
+    // decides `model_changed`/`unchanged`, so a hand-written value makes this
+    // pass by construction and blind to a wrong rollback snapshot.
+    let (request_id, prev_model_id) = switch_model_effect(&created);
+    assert_eq!(
+        prev_model_id.as_ref(),
+        Some(&model_a),
+        "the effect must carry the pre-mutation model as its rollback target"
+    );
+
+    let completed = dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id: id,
+            model_id: model_b.clone(),
+            effort: None,
+            request_id,
+            result: Ok(()),
+            prev_model_id,
+        }),
+        &mut app,
+    );
+    assert!(
+        completed.iter().any(|e| matches!(
+            e,
+            Effect::PersistPreferredModel { model_id, .. } if model_id == &model_b
+        )),
+        "successful deferred switch must persist the preference: {completed:?}"
+    );
 }
 #[test]
 fn deferred_switch_threads_stash_prev_into_effect() {

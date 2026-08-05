@@ -81,6 +81,24 @@ fn switch_model_request_id(effects: &[Effect]) -> u64 {
         .expect("expected a SwitchModel effect")
 }
 
+/// The `SwitchModel` effect as emitted, so a completion can be driven with the
+/// real `prev_model_id` rather than a hand-written one. That field decides
+/// `model_changed`/`unchanged`, so a test that invents it passes by
+/// construction and cannot catch a wrong rollback snapshot.
+fn switch_model_effect(effects: &[Effect]) -> (u64, Option<acp::ModelId>) {
+    effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::SwitchModel {
+                request_id,
+                prev_model_id,
+                ..
+            } => Some((*request_id, prev_model_id.clone())),
+            _ => None,
+        })
+        .expect("expected a SwitchModel effect")
+}
+
 fn test_app() -> AppView {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     AppView {

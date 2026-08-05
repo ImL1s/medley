@@ -963,16 +963,34 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                     &new_class,
                 );
             }
+            let Some(agent_view) = app.agents.get(&id) else {
+                return vec![];
+            };
+            let pre_session = agent_view.session.session_id.is_none();
+            if pre_session {
+                // Capture the rollback snapshot BEFORE mutating. The live path
+                // gets this for free -- `begin_model_switch_request` runs ahead
+                // of any `set_current` -- but this path applies the pick
+                // optimistically, so without a pre-mutation snapshot the
+                // completion compares the new state against itself, decides
+                // nothing changed, and persists nothing. `set_default_model_
+                // confirmed` already does this; the persist-on-success policy
+                // was adopted here without it.
+                if !super::session::lifecycle::begin_deferred_model_switch(app, id, false) {
+                    app.show_toast("Wait for the current model switch to finish");
+                    return vec![];
+                }
+            }
             let Some(agent) = app.agents.get_mut(&id) else {
                 return vec![];
             };
             let Some(session_id) = agent.session.session_id.clone() else {
+                // Update the display and stash for SessionCreated/SessionLoaded.
+                // Persistence happens on completion, via
+                // `handle_switch_model_complete`, so a switch the shell rejects
+                // leaves no preference behind.
                 let prev_model = agent.session.models.current.clone();
-                let prev_effort = agent.session.models.reasoning_effort;
                 agent.session.models.set_current(model_id.clone(), effort);
-                let resolved_effort = agent.session.models.reasoning_effort;
-                let unchanged =
-                    prev_model.as_ref() == Some(&model_id) && prev_effort == resolved_effort;
                 let rollback_prev = agent
                     .session
                     .deferred_model_switch
@@ -981,18 +999,11 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                     .or(prev_model);
                 agent.session.deferred_model_switch =
                     Some(crate::app::agent::DeferredModelSwitch {
-                        model_id: model_id.clone(),
+                        model_id,
                         effort,
                         prev_model_id: rollback_prev,
                     });
-                return if unchanged {
-                    vec![]
-                } else {
-                    vec![Effect::PersistPreferredModel {
-                        model_id,
-                        reasoning_effort: resolved_effort,
-                    }]
-                };
+                return vec![];
             };
             let request_id = super::session::lifecycle::begin_model_switch_request(
                 &mut app.model_switch_transaction,
