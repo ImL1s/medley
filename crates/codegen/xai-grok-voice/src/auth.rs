@@ -33,8 +33,7 @@ pub(crate) async fn require_bearer(auth: &SharedVoiceAuth) -> Result<String, Voi
                 ),
                 None => "not signed in — sign in, set XAI_API_KEY, or set a model api_key/env_key"
                     .to_owned(),
-            }
-            .into(),
+            },
         )
     })
 }
