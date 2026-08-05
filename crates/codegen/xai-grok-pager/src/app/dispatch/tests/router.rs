@@ -1814,12 +1814,15 @@ fn deferred_switch_updates_display_and_persists() {
         !agent.session.model_switch_pending,
         "nothing is in flight yet — the queue must not be blocked"
     );
+    // Persistence moved to completion: a pre-session pick whose deferred switch
+    // the shell later rejects must leave nothing on disk (#119). The success
+    // direction is covered by `deferred_pre_session_pick_persists_after_switch_
+    // succeeds`.
     assert!(
-        matches!(
-            &effects[..],
-            [Effect::PersistPreferredModel { model_id: m, .. }] if m == &model_id
-        ),
-        "expected a single PersistPreferredModel effect, got {effects:?}"
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::PersistPreferredModel { .. })),
+        "selection must not persist before the switch commits, got {effects:?}"
     );
     let effects = dispatch(
         Action::SwitchModel {
