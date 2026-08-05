@@ -722,7 +722,7 @@ pub(super) async fn run_session(
                                 // this path (#136).
                                 let session_key = (existing.auth_type
                                     == xai_chat_state::AuthType::SessionToken)
-                                    .then(|| existing.api_key.as_deref())
+                                    .then_some(existing.api_key.as_deref())
                                     .flatten();
                                 if let Some(r) = crate::agent::config::try_resolve_model_credentials(model_name.as_str(), session_key) {
                                     session.chat_state_handle.update_credentials(xai_chat_state::Credentials {
