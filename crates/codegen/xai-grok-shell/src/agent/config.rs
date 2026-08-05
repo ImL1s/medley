@@ -5815,6 +5815,33 @@ pub(crate) fn explicit_credential_header_in(
 /// its decision order — the inherited resolver itself stays untouched, so this
 /// costs no upstream-sync conflict. Carries names only, never bytes. Lives next
 /// to the gate below so the two cannot drift apart (#110).
+/// The credential provenance for `model_id`, re-derived from the catalog.
+///
+/// The reconstruction seams (turn config, subagent inheritance) rebuild from a
+/// persisted `SamplingConfig`, which carries the destination but **not** the
+/// credential: it has no `credential_source`, no `api_key`, no `auth_scheme`.
+/// So provenance there could only be inferred from the headers, and anything
+/// not carried as a header — an ambient session, an `env_key`, a provider
+/// bearer — came back unlabelled. The construction guard keys on that label, so
+/// an absent one silently disarms it (#136).
+///
+/// `None` when the catalog cannot answer: absent model, or config unavailable.
+/// Callers must then keep whatever they could derive locally rather than
+/// treating "unknown" as "no credential" — that is the same conflation #133 is
+/// about, and asserting it here would be the mistake this function exists to
+/// undo.
+pub(crate) fn credential_source_for_model(
+    model_id: &str,
+    credentials: &ResolvedCredentials,
+) -> Option<xai_grok_sampler::CredentialSource> {
+    if model_id.is_empty() {
+        return None;
+    }
+    with_resolved_model(model_id, |lookup| match lookup {
+        ModelLookup::Loaded(Some(entry)) => Some(classify_credential_source(entry, credentials)),
+        ModelLookup::Loaded(None) | ModelLookup::ConfigUnavailable => None,
+    })
+}
 fn classify_credential_source(
     model: &ModelEntry,
     credentials: &ResolvedCredentials,
@@ -10756,6 +10783,39 @@ reasoning_effort = "low"
         );
         assert!(cfg.api_key.is_none());
         assert_eq!(cfg.auth_scheme, AuthScheme::None);
+    }
+
+    /// The lookup contract of [`credential_source_for_model`]: it must answer
+    /// `None` when the catalog cannot speak for the model, so the caller keeps
+    /// whatever it derived locally.
+    ///
+    /// "Not in the catalog" is not "no credential" — that conflation is #133,
+    /// and making it here would turn the seam fix into the bug it is undoing.
+    ///
+    /// The positive direction (a known entry classifies correctly) is covered
+    /// by the `classify_credential_source` tests, which this delegates to
+    /// unchanged. It is deliberately not re-tested through this wrapper: doing
+    /// so needs a `GROK_HOME` the whole process agrees on, and neighbouring
+    /// tests set that without serialising, so such a test passes alone and
+    /// fails in the suite — worse than no test, because it looks like coverage.
+    #[test]
+    fn credential_source_for_an_unknown_model_is_none_not_no_credential() {
+        let creds = ResolvedCredentials {
+            api_key: Some("ambient-session-jwt".into()),
+            base_url: "https://vendor.example/v1".into(),
+            auth_type: xai_chat_state::AuthType::SessionToken,
+            auth_scheme: AuthScheme::Bearer,
+        };
+        assert_eq!(
+            credential_source_for_model("", &creds),
+            None,
+            "an empty model id names nothing the catalog could answer for"
+        );
+        assert_eq!(
+            credential_source_for_model("definitely-not-a-configured-model-6f1a2b", &creds),
+            None,
+            "an uncatalogued model must not be asserted to have no credential"
+        );
     }
 
     #[test]
