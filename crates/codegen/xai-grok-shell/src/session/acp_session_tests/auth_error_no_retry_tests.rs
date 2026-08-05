@@ -1486,6 +1486,139 @@ async fn prepare_refuses_unusable_external_but_allows_unknown() {
         .await;
 }
 
+/// A model the catalog does not have must reach the wire with no credential,
+/// **whatever the ACP auth method is**.
+///
+/// This is the test the first version of the tri-state did not have, and the
+/// gap was not incidental: its sibling builds the actor with `cached_token`,
+/// which is session-based, so the arm under test took a different branch and
+/// the loosening was never exercised. Here the method is `xai_api_key`, which
+/// is not session-based -- the case where the chat-state key was being retained
+/// and sent on to whatever `base_url` the session held.
+#[tokio::test(flavor = "current_thread")]
+async fn absent_from_catalog_strips_the_credential_for_every_auth_method() {
+    use crate::agent::auth_method::{ModelByok, ModelReadiness, UnknownReason};
+    use crate::agent::config::ModelAuthFacts;
+    use xai_grok_sampler::AuthScheme;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            for method in ["xai_api_key", "cached_token", "not-a-known-method"] {
+                let (_dir, am) = auth_manager_with_valid_token("session-token");
+                let (actor, _rx) = make_actor_with_method_and_credentials(
+                    Some(am),
+                    method,
+                    xai_chat_state::AuthType::ApiKey,
+                    "chat-state-key".to_string(),
+                )
+                .await;
+                if let Some(mut cfg) = actor.chat_state_handle.get_sampling_config().await {
+                    cfg.base_url = "https://vendor.example/v1".to_string();
+                    actor.chat_state_handle.update_sampling_config(cfg);
+                }
+                let model = actor
+                    .chat_state_handle
+                    .get_sampling_config()
+                    .await
+                    .map(|c| c.model)
+                    .unwrap_or_default();
+                actor
+                    .model_auth_memo
+                    .replace(Some(crate::session::acp_session::ModelAuthMemo {
+                        model_id: model,
+                        facts: ModelAuthFacts {
+                            byok: ModelByok::NotByok,
+                            auth_scheme: AuthScheme::Bearer,
+                            readiness: ModelReadiness::Unknown(UnknownReason::NotInCatalog),
+                        },
+                        provider: None,
+                    }));
+
+                let cfg = actor.reconstruct_full_config().await;
+
+                assert!(
+                    cfg.api_key.is_none(),
+                    "method {method:?}: a model absent from the catalog must not carry the \
+                     chat-state key to {}",
+                    cfg.base_url
+                );
+                assert_eq!(
+                    cfg.auth_scheme,
+                    AuthScheme::None,
+                    "method {method:?}: the scheme must be cleared with the credential"
+                );
+                assert!(
+                    cfg.bearer_resolver.is_none(),
+                    "method {method:?}: no resolver may survive"
+                );
+                assert_eq!(
+                    cfg.credential_source,
+                    Some(xai_grok_sampler::CredentialSource::Missing),
+                    "method {method:?}: the gap must be labelled, or SamplingClient::new \
+                     cannot back this up"
+                );
+            }
+        })
+        .await;
+}
+
+/// A transient catalog failure is not a verdict: it must leave a live session
+/// alone rather than de-credentialing the turn.
+///
+/// `CatalogUnavailable` and `UnidentifiedModel` were both `ready = true` before
+/// the tri-state. `session_token_auth_gate` documents that an `Unknown`
+/// classification must not demote a live session to non-refreshable api-key
+/// mode; clearing the resolvers here would do worse -- send nothing at all, and
+/// 401 every turn until restart.
+#[tokio::test(flavor = "current_thread")]
+async fn a_transient_catalog_failure_leaves_a_live_session_intact() {
+    use crate::agent::auth_method::{ModelByok, ModelReadiness, UnknownReason};
+    use crate::agent::config::ModelAuthFacts;
+    use xai_grok_sampler::AuthScheme;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            for reason in [
+                UnknownReason::CatalogUnavailable,
+                UnknownReason::UnidentifiedModel,
+            ] {
+                let (_dir, am) = auth_manager_with_valid_token("session-token");
+                let (actor, _rx) = make_actor_with_method_and_credentials(
+                    Some(am),
+                    "cached_token",
+                    xai_chat_state::AuthType::SessionToken,
+                    "session-jwt".to_string(),
+                )
+                .await;
+                pin_first_party_session_model(&actor).await;
+                actor
+                    .model_auth_memo
+                    .replace(Some(crate::session::acp_session::ModelAuthMemo {
+                        model_id: actor.catalog_model_id_str(),
+                        facts: ModelAuthFacts {
+                            byok: ModelByok::NotByok,
+                            auth_scheme: AuthScheme::Bearer,
+                            readiness: ModelReadiness::Unknown(reason),
+                        },
+                        provider: None,
+                    }));
+
+                let cfg = actor.reconstruct_full_config().await;
+
+                assert_ne!(
+                    cfg.auth_scheme,
+                    AuthScheme::None,
+                    "{reason:?}: a transient failure must not clear the scheme"
+                );
+                assert!(
+                    cfg.bearer_resolver.is_some() || cfg.api_key.is_some(),
+                    "{reason:?}: the live session must survive an unobtainable catalog"
+                );
+            }
+        })
+        .await;
+}
+
 /// Pre-flight session refresh must also stay off for `AuthScheme::None`, so a
 /// model switch cannot rewrite chat-state credentials with a live OIDC token.
 #[tokio::test(flavor = "current_thread")]

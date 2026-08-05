@@ -547,14 +547,44 @@ impl SessionActor {
         });
         match &model_facts.readiness {
             crate::agent::auth_method::ModelReadiness::Ready => {}
+            // The catalog answered and does not have this model. Before the
+            // tri-state this was `ready = false`, i.e. stripped unconditionally,
+            // and it must stay that way: this is the final wire choke point, and
+            // "the catalog does not know this model" is exactly as much reason
+            // to withhold as "chat state does not persist readiness" was. An
+            // earlier version of this arm withheld only for session-based ACP
+            // methods, which retained the chat-state key for `XAI_API_KEY`,
+            // keyless and unrecognised methods -- and left `credential_source`
+            // unset, so `SamplingClient::new` could not catch it either.
+            crate::agent::auth_method::ModelReadiness::Unknown(
+                crate::agent::auth_method::UnknownReason::NotInCatalog,
+            ) => {
+                tracing::warn!(
+                    model = %catalog_model_id,
+                    "reconstruct_full_config: model absent from the catalog; stripping credentials"
+                );
+                auth_scheme = xai_grok_sampler::AuthScheme::None;
+                use_session_bearer_resolver = false;
+                use_provider_bearer_resolver = false;
+                credential_source = Some(xai_grok_sampler::CredentialSource::Missing);
+            }
+            // Knowledge is temporarily unobtainable, or there is no identified
+            // target yet. Both were `ready = true` before the tri-state, and
+            // both must stay that way: `session_token_auth_gate` documents that
+            // an `Unknown` classification "must not demote a live session to
+            // non-refreshable api-key mode", and clearing the resolvers here
+            // does worse than that -- it sends no credential at all, so a
+            // half-written `config.toml` 401s every turn until restart.
+            //
+            // This is the distinction the three `UnknownReason` variants exist
+            // for. Collapsing them into one arm is what made the strip both
+            // fail open (above) and fail closed (here) at the same time.
             crate::agent::auth_method::ModelReadiness::Unknown(reason) => {
                 tracing::debug!(
                     model = %catalog_model_id,
                     unknown = reason.as_str(),
-                    "reconstruct_full_config: readiness unknown; refusing ambient credential borrow"
+                    "reconstruct_full_config: readiness unknown but not absent; leaving the session intact"
                 );
-                use_session_bearer_resolver = false;
-                use_provider_bearer_resolver = false;
             }
             crate::agent::auth_method::ModelReadiness::Unusable(reason) => {
                 tracing::warn!(
@@ -615,6 +645,12 @@ impl SessionActor {
         // `Unknown`: preserve a bound credential (declared header already in
         // `credential_source`, or chat-state key when we are not borrowing
         // ambient). Ambient session/provider borrow was disabled above.
+        // The first arm is what makes the strip unconditional: whatever cleared
+        // `auth_scheme` above -- Unusable, or absent from the catalog -- meant
+        // the credential too, for every auth method. An earlier version added a
+        // later arm asking whether the ACP method was session-based instead,
+        // which let the chat-state key through for `XAI_API_KEY`, keyless and
+        // unrecognised methods.
         let api_key = if auth_scheme == xai_grok_sampler::AuthScheme::None {
             None
         } else if use_provider_bearer_resolver {
@@ -625,14 +661,6 @@ impl SessionActor {
             self.auth_manager
                 .as_ref()
                 .and_then(|am| am.current_wire_valid().map(|a| a.key))
-        } else if model_facts.readiness.is_unknown()
-            && declared_credential_header.is_none()
-            && gate.is_session_based
-        {
-            // Unknown + session method: chat-state key is typically the ambient
-            // session snapshot — refuse to borrow it without catalog knowledge.
-            // A declared header was already captured in `credential_source`.
-            None
         } else {
             creds.api_key
         };

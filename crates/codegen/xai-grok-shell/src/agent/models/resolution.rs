@@ -132,8 +132,18 @@ pub(crate) fn resolve_default_model(
                 .or_else(|| catalog.iter().find(|(_, m)| m.model == pref.value))
             {
                 let (ready, reason) = crate::agent::config::model_readiness(entry);
+                // The visibility gates apply whether or not the model is ready.
+                // `allowed_models` / `hidden_models` / `supported_in_api` are
+                // about whether the user may select it at all, which is a
+                // different question from whether it works -- and an earlier
+                // version of this returned unready explicit prefs *before*
+                // checking them, so an env-var default could seat a model that
+                // `available()` does not even list. `validate_selectable` does
+                // not cover the env var, so this is the only gate on that path.
+                let selectable =
+                    entry.info.visible_for_auth(is_session_auth) && entry.info.user_selectable;
                 if !ready {
-                    if is_explicit {
+                    if is_explicit && selectable {
                         let reason = reason.unwrap_or_else(|| "model is not ready".to_owned());
                         tracing::error!(
                             model_id = %pref.value,
@@ -143,9 +153,11 @@ pub(crate) fn resolve_default_model(
                         );
                         return (key.clone(), entry.clone(), pref.source, Some(reason));
                     }
-                    // Remote / non-explicit preference: keep today's skip.
-                } else if entry.info.visible_for_auth(is_session_auth) && entry.info.user_selectable
-                {
+                    // Remote / non-explicit preference, or one the user may
+                    // not select: keep today's skip, which lets the campaign
+                    // recovery below reach `pre_campaign_default` rather than
+                    // stranding a cohort on a model it cannot authenticate.
+                } else if selectable {
                     return (key.clone(), entry.clone(), pref.source, None);
                 }
             }

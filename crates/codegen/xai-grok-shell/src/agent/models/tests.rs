@@ -1917,6 +1917,40 @@ fn resolve_default_model_keeps_explicit_unusable_preference() {
     );
 }
 
+/// Keeping an unusable explicit preference must not bypass the gates that say
+/// whether the user may select it at all.
+///
+/// `allowed_models` / `hidden_models` / `supported_in_api` answer a different
+/// question from "does it work", and an earlier version returned the unready
+/// preference *before* consulting them. `validate_selectable` guards
+/// `models.default` but not `GROK_DEFAULT_MODEL`, and `reselect_default_model`
+/// never calls it, so this is the only gate on that path — without it the
+/// session's current model can be one `available()` does not list, and
+/// `allowed_models` stops being a gate.
+#[test]
+fn an_unusable_preference_the_user_may_not_select_is_not_seated() {
+    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
+
+    let mut hidden = make_model_entry("hidden-custom");
+    hidden
+        .config_validation_errors
+        .push("invalid auth_scheme `not-a-scheme`".into());
+    hidden.info.user_selectable = false;
+    catalog.insert("hidden-custom".to_string(), hidden);
+
+    let usable = make_model_entry("usable");
+    catalog.insert("usable".to_string(), usable);
+
+    let mut cfg = config::Config::default();
+    cfg.models.default = Some("hidden-custom".to_string());
+
+    let (key, _, _, _) = resolve_default_model(&cfg, &catalog, true);
+    assert_ne!(
+        key, "hidden-custom",
+        "a model the user may not select must not be seated just because it was named"
+    );
+}
+
 /// When no preference is set and every selectable entry is unready, fall back
 /// to the bundled default sentinel rather than returning an unusable entry.
 #[test]
