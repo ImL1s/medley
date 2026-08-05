@@ -56,8 +56,10 @@ async fn handle_set(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
             error_class = "auth_resolution_failed",
             "privacy: auth resolution failed"
         );
-        acp::Error::auth_required()
-            .data("Authentication required. Run `grok login` to re-authenticate.")
+        acp::Error::auth_required().data(crate::auth::with_login_instruction(
+            |prog| format!("Authentication required. Run `{prog} login` to re-authenticate."),
+            "Authentication required. Sign in again to re-authenticate.",
+        ))
     })?;
 
     let proxy_url = agent.cfg.borrow().endpoints.proxy_url();

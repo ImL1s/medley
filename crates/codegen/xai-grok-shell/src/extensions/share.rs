@@ -170,13 +170,20 @@ async fn upload_share_data_to_gcs(
     }
 }
 
+fn share_disabled_message() -> String {
+    crate::auth::with_login_instruction(
+        |prog| format!("Share session is disabled. Run `{prog} login` to authenticate."),
+        "Share session is disabled. Sign in again to authenticate.",
+    )
+}
+
 fn require_xai_auth_for_share(
     auth_manager: &crate::auth::AuthManager,
 ) -> Result<crate::auth::GrokAuth, acp::Error> {
     super::auth_gate::require_xai_auth(
         auth_manager,
         "Authentication required to share session",
-        "Share session is disabled. Run `grok login` to authenticate.",
+        share_disabled_message(),
     )
 }
 
@@ -282,9 +289,6 @@ mod tests {
             .and_then(|v| v.as_str())
             .expect("auth_required error carries a data string");
 
-        assert_eq!(
-            data,
-            "Share session is disabled. Run `grok login` to authenticate."
-        );
+        assert_eq!(data, share_disabled_message());
     }
 }

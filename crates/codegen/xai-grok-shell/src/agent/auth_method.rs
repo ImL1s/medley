@@ -1,7 +1,7 @@
 use agent_client_protocol as acp;
 
 use crate::agent::config::ModelEntry;
-use crate::auth::PreferredAuthMethod;
+use crate::auth::{PreferredAuthMethod, with_login_instruction};
 
 /// Shared, live handle to the agent's current ACP auth method id.
 ///
@@ -440,8 +440,14 @@ pub(crate) fn session_token_auth_gate(
         }
 }
 
-pub const AUTH_ERROR_SESSION_EXPIRED: &str =
-    "Session expired. Run `grok login` to re-authenticate.";
+/// Was a `const`, which cannot call [`with_login_instruction`] to pick the
+/// right verb for the invoked name (#117).
+pub fn auth_error_session_expired() -> String {
+    with_login_instruction(
+        |prog| format!("Session expired. Run `{prog} login` to re-authenticate."),
+        "Session expired. Sign in again to re-authenticate.",
+    )
+}
 
 /// Names the config file *this* install reads.
 ///
@@ -450,9 +456,17 @@ pub const AUTH_ERROR_SESSION_EXPIRED: &str =
 /// entire job is to tell you which file to edit, and which appears exactly
 /// when someone is going to follow it.
 pub fn auth_error_api_key() -> String {
-    format!(
-        "Authentication failed. Run `grok login`, set XAI_API_KEY, or add api_key to {}.",
-        xai_grok_config::display_user_grok_path("config.toml")
+    with_login_instruction(
+        |prog| {
+            format!(
+                "Authentication failed. Run `{prog} login`, set XAI_API_KEY, or add api_key to {}.",
+                xai_grok_config::display_user_grok_path("config.toml")
+            )
+        },
+        &format!(
+            "Authentication failed. Sign in again, set XAI_API_KEY, or add api_key to {}.",
+            xai_grok_config::display_user_grok_path("config.toml")
+        ),
     )
 }
 
@@ -483,8 +497,16 @@ pub(crate) fn method_id_after_cached_token_unavailable(
 pub const PREFERRED_API_KEY_UNAVAILABLE: &str = "preferred_method=api_key but no API key is configured (set XAI_API_KEY or model api_key/env_key in config.toml).";
 
 /// Error when `preferred_method=oidc` but the session path cannot proceed.
-pub const PREFERRED_OIDC_UNAVAILABLE: &str =
-    "preferred_method=oidc but no session is available. Run `grok login` to authenticate.";
+pub fn preferred_oidc_unavailable() -> String {
+    with_login_instruction(
+        |prog| {
+            format!(
+                "preferred_method=oidc but no session is available. Run `{prog} login` to authenticate."
+            )
+        },
+        "preferred_method=oidc but no session is available. Sign in again to authenticate.",
+    )
+}
 
 pub const XAI_API_KEY_METHOD_ID: &str = "xai.api_key";
 pub(crate) fn xai_api_key_auth_method() -> acp::AuthMethod {

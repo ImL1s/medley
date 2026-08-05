@@ -1,19 +1,71 @@
 use std::borrow::Cow;
 
 use thiserror::Error;
+use xai_grok_config::program_name::program_name_for_instruction;
+
+/// Instruction to run login, or a command-free alternative when the invoked
+/// name is unusable (#117).
+pub(crate) fn with_login_instruction(
+    when_named: impl FnOnce(&str) -> String,
+    when_unnamed: &str,
+) -> String {
+    match program_name_for_instruction() {
+        Some(prog) => when_named(prog),
+        None => when_unnamed.to_owned(),
+    }
+}
+
+fn not_logged_in_msg() -> String {
+    with_login_instruction(
+        |prog| format!("Not logged in. Run `{prog} login`."),
+        "Not logged in. Sign in again.",
+    )
+}
+
+fn token_expired_msg() -> String {
+    with_login_instruction(
+        |prog| format!("Token expired. Run `{prog} login` to re-authenticate."),
+        "Token expired. Sign in again to re-authenticate.",
+    )
+}
+
+fn server_rejected_msg() -> String {
+    with_login_instruction(
+        |prog| format!("Authentication rejected by server. Run `{prog} login` to re-authenticate."),
+        "Authentication rejected by server. Sign in again to re-authenticate.",
+    )
+}
+
+fn pinned_team_suffix() -> String {
+    with_login_instruction(
+        |prog| format!(" Run `{prog} login` to sign in with the required team."),
+        " Sign in again with the required team.",
+    )
+}
+
+fn api_key_auth_disabled_msg() -> String {
+    with_login_instruction(
+        |prog| {
+            format!(
+                "API-key auth is disabled by your administrator. Run `{prog} login` to authenticate."
+            )
+        },
+        "API-key auth is disabled by your administrator. Sign in to authenticate.",
+    )
+}
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AuthError {
-    #[error("Not logged in. Run `grok login`.")]
+    #[error("{}", not_logged_in_msg())]
     NotLoggedIn,
 
     /// Token expired and no refresh authority available.
-    #[error("Token expired. Run `grok login` to re-authenticate.")]
+    #[error("{}", token_expired_msg())]
     TokenExpiredNoRefresh,
 
     /// Server rejected the token (401) with no recovery path.
-    #[error("Authentication rejected by server. Run `grok login` to re-authenticate.")]
+    #[error("{}", server_rejected_msg())]
     ServerRejectedNoRecovery,
 
     /// All recovery strategies exhausted.
@@ -22,11 +74,11 @@ pub enum AuthError {
 
     /// A session's team principal violates the `force_login_team_uuid` pin.
     /// `message` states which team is required vs. returned.
-    #[error("{message} Run `grok login` to sign in with the required team.")]
+    #[error("{}{}", .message, pinned_team_suffix())]
     PinnedTeamMismatch { message: String },
 
     /// Cached API-key session rejected because API-key auth is disabled.
-    #[error("API-key auth is disabled by your administrator. Run `grok login` to authenticate.")]
+    #[error("{}", api_key_auth_disabled_msg())]
     ApiKeyAuthDisabled,
 
     /// Outcome of a refresh-authority attempt. Recoverability (and, for
@@ -120,17 +172,32 @@ impl RefreshTokenFailedReason {
     /// in logs.
     pub(crate) fn user_message(self) -> Cow<'static, str> {
         match self {
-            Self::RefreshTokenRejected => {
-                "Your session has expired. Run `grok login` to sign in again.".into()
-            }
-            Self::ClientRejected => {
-                "Authentication is temporarily unavailable. Run `grok login` if this persists."
-                    .into()
-            }
+            Self::RefreshTokenRejected => with_login_instruction(
+                |prog| {
+                    format!("Your session has expired. Run `{prog} login` to sign in again.")
+                },
+                "Your session has expired. Sign in again.",
+            )
+            .into(),
+            Self::ClientRejected => with_login_instruction(
+                |prog| {
+                    format!(
+                        "Authentication is temporarily unavailable. Run `{prog} login` if this persists."
+                    )
+                },
+                "Authentication is temporarily unavailable. Sign in again if this persists.",
+            )
+            .into(),
             Self::ProviderInteractiveRequired => provider_login_message(None),
-            Self::Other => {
-                "Authentication could not be refreshed. Run `grok login` to sign in again.".into()
-            }
+            Self::Other => with_login_instruction(
+                |prog| {
+                    format!(
+                        "Authentication could not be refreshed. Run `{prog} login` to sign in again."
+                    )
+                },
+                "Authentication could not be refreshed. Sign in again.",
+            )
+            .into(),
         }
     }
 }

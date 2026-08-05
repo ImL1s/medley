@@ -283,7 +283,14 @@ async fn handle_get_billing(agent: &MvpAgent) -> ExtResult {
     let auth = super::auth_gate::require_xai_auth(
         &agent.auth_manager,
         "Authentication required to fetch billing data",
-        "Billing data requires auth with grok.com. Run `grok login` to authenticate.",
+        crate::auth::with_login_instruction(
+            |prog| {
+                format!(
+                    "Billing data requires auth with grok.com. Run `{prog} login` to authenticate."
+                )
+            },
+            "Billing data requires auth with grok.com. Sign in again to authenticate.",
+        ),
     )?;
 
     let proxy_base = agent.cli_chat_proxy_base_url();
@@ -340,7 +347,14 @@ async fn handle_get_auto_topup_rule(agent: &MvpAgent) -> ExtResult {
     let auth = super::auth_gate::require_xai_auth(
         &agent.auth_manager,
         "Authentication required to fetch auto top-up rule",
-        "Auto top-up data requires auth with grok.com. Run `grok login` to authenticate.",
+        crate::auth::with_login_instruction(
+            |prog| {
+                format!(
+                    "Auto top-up data requires auth with grok.com. Run `{prog} login` to authenticate."
+                )
+            },
+            "Auto top-up data requires auth with grok.com. Sign in again to authenticate.",
+        ),
     )?;
 
     let proxy_base = agent.cli_chat_proxy_base_url();

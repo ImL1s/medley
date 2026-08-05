@@ -434,9 +434,21 @@ pub async fn run_headless(
     use crate::agent::relay::spawn_relay_connection_with_callback;
     use tokio_util::sync::CancellationToken;
 
-    // Headless's only transport is the relay (no IPC fallback), so a session is required.
-    const HEADLESS_NO_SESSION: &str = "Headless mode requires a grok.com session. \
-        Run `grok login` to sign in, or use `grok agent stdio` for API-key access.";
+    // Headless's only transport is the relay (no IPC fallback), so a session is
+    // required. Was a `const`, which cannot call `with_login_instruction` to
+    // pick the right verb for the invoked name (#117).
+    fn headless_no_session() -> String {
+        crate::auth::with_login_instruction(
+            |prog| {
+                format!(
+                    "Headless mode requires a grok.com session. \
+                     Run `{prog} login` to sign in, or use `{prog} agent stdio` for API-key access."
+                )
+            },
+            "Headless mode requires a grok.com session. \
+             Sign in, or use API-key access instead.",
+        )
+    }
 
     // Clean up orphaned upload queue temp files from previous sessions (best-effort).
     // Uses DEFAULT_MAX_AGE to stay in sync with the upload queue's retry policy.
@@ -469,7 +481,7 @@ pub async fn run_headless(
             && ctx.auth_provider_command.is_none()
             && crate::auth::try_ensure_fresh_auth(ctx).await.is_none()
         {
-            anyhow::bail!("{HEADLESS_NO_SESSION}");
+            anyhow::bail!("{}", headless_no_session());
         }
         run_auth_flow(
             &auth_manager,
@@ -527,7 +539,7 @@ pub async fn run_headless(
     let Some(relay_config) =
         relay_config_for_session(Some(&auth), &agent_config, &shared_auth_manager)
     else {
-        anyhow::bail!("{HEADLESS_NO_SESSION}");
+        anyhow::bail!("{}", headless_no_session());
     };
 
     // Capture the grok build URL for the first-connection callback

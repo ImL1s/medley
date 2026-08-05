@@ -1674,9 +1674,9 @@ impl MvpAgent {
             let preferred = self.cfg.borrow().grok_com_config.preferred_method;
             let msg = match preferred {
                 Some(crate::auth::PreferredAuthMethod::ApiKey) => {
-                    auth_method::PREFERRED_API_KEY_UNAVAILABLE
+                    auth_method::PREFERRED_API_KEY_UNAVAILABLE.to_owned()
                 }
-                _ => auth_method::PREFERRED_OIDC_UNAVAILABLE,
+                _ => auth_method::preferred_oidc_unavailable(),
             };
             tracing::info!(%msg, "cached_token unavailable; preferred_method forbids fallthrough");
             xai_grok_telemetry::unified_log::warn(

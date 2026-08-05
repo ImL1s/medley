@@ -1219,11 +1219,19 @@ impl SessionActor {
         let auth_mode_str = format!("{auth_mode:?}");
         let client_version = xai_grok_version::VERSION;
         if auth_mode == crate::auth::AuthMode::WebLogin {
+            let fix_instruction = crate::auth::with_login_instruction(
+                |prog| {
+                    format!(
+                        "run `{prog} logout` then `{prog} login` to re-authenticate with OAuth2."
+                    )
+                },
+                "log out then sign in again to re-authenticate with OAuth2.",
+            );
             let msg = format!(
                 "{detailed_message}\n\n\
                  You are using a deprecated authentication method (WebLogin).\n\
                  This auth method is no longer supported and will cause errors.\n\n\
-                 To fix: run `grok logout` then `grok login` to re-authenticate with OAuth2.\n\n\
+                 To fix: {fix_instruction}\n\n\
                  Version: {client_version}"
             );
             self.log_terminal_failure("legacy_auth", error.status_code, &msg);
@@ -1294,20 +1302,27 @@ impl SessionActor {
         // message verbatim, on a stricter condition (it also requires a live
         // credential when an external provider mints sessions).
         let (error_type, detailed_message) = if codex_retry_exhausted {
+            let sign_in_hint = crate::auth::with_login_instruction(
+                |prog| format!("Sign in again with `{prog} login --provider openai-codex`."),
+                "Sign in again with the OpenAI Codex login flow.",
+            );
             (
                 "auth",
                 format!(
                     "{detailed_message}\n\nOpenAI Codex rejected the refreshed credential. \
-                     Sign in again with `grok login --provider openai-codex`."
+                     {sign_in_hint}"
                 ),
             )
         } else if is_codex_provider && error_type == "auth" {
+            let sign_in_hint = crate::auth::with_login_instruction(
+                |prog| format!("sign in again with `{prog} login --provider openai-codex`."),
+                "sign in again with the OpenAI Codex login flow.",
+            );
             (
                 "auth",
                 format!(
                     "{detailed_message}\n\nOpenAI Codex authentication could not recover. \
-                     Retry once after a network interruption; if it persists, sign in again with \
-                     `grok login --provider openai-codex`."
+                     Retry once after a network interruption; if it persists, {sign_in_hint}"
                 ),
             )
         } else {

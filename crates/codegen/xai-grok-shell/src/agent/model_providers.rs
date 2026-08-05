@@ -1411,9 +1411,17 @@ mod tests {
         let (ready, reason) = crate::agent::config::model_readiness(&model);
         assert!(!ready, "the preset must not be selectable before login");
         let reason = reason.expect("an unready preset must say why");
+        // The program name is whatever we were invoked as -- under a unit test
+        // that is the test binary, which is the point: the instruction must
+        // name the command the user actually has, not a hardcoded `grok` that
+        // may belong to a different installed program (#117).
+        let expected = format!(
+            "{} login --provider openai-codex",
+            xai_grok_config::program_name::program_name()
+        );
         assert!(
-            reason.contains("grok login --provider openai-codex"),
-            "the reason must name the login command, got: {reason}"
+            reason.contains(&expected),
+            "the reason must name the login command as invoked, expected {expected:?}, got: {reason}"
         );
     }
 

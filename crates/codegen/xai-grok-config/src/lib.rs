@@ -23,6 +23,7 @@ mod macos_managed;
 mod managed_cache;
 pub mod managed_text;
 mod paths;
+pub mod program_name;
 pub mod shell;
 pub mod signed_policy;
 pub mod state_dir;

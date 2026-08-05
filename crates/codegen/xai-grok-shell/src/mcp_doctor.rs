@@ -284,7 +284,12 @@ async fn try_discover_managed_servers() -> (ConfigSourceStatus, Vec<DiscoveredSe
 
     let token = match auth_manager.get_valid_token().await {
         Ok(key) => key,
-        Err(_) => return managed_skipped("auth expired — run `grok login`"),
+        Err(_) => {
+            return managed_skipped(crate::auth::with_login_instruction(
+                |prog| format!("auth expired — run `{prog} login`"),
+                "auth expired — sign in again",
+            ));
+        }
     };
 
     let proxy_url = crate::agent::config::EndpointsConfig::from_effective_config().proxy_url();

@@ -134,10 +134,14 @@ pub(crate) fn map_sampling_err_to_acp(err: SamplingError) -> acp::Error {
                 let message = if message.contains("requires a Grok subscription")
                     && crate::agent::auth_method::has_xai_api_key_env()
                 {
+                    let logout_hint = crate::auth::with_login_instruction(
+                        |prog| format!("run `{prog} logout` or type /logout in the TUI"),
+                        "log out (type /logout in the TUI)",
+                    );
                     format!(
                         "{message}\n\nYou have an API key set (XAI_API_KEY). \
                          Your cached OAuth session is being used instead. \
-                         To use your API key, run `grok logout` or type /logout in the TUI."
+                         To use your API key, {logout_hint}."
                     )
                 } else {
                     message
@@ -691,9 +695,11 @@ mod tests {
             let acp_err = map_sampling_err_to_acp(err);
             let data = acp_err.data.unwrap();
             let msg = data.as_str().unwrap();
+            let prog = xai_grok_config::program_name::program_name_for_instruction()
+                .expect("test binary argv0 is a plain program name");
             assert!(
-                msg.contains("grok logout"),
-                "should suggest grok logout when API key is available: {msg}"
+                msg.contains(&format!("`{prog} logout`")),
+                "should suggest `{prog} logout` when API key is available: {msg}"
             );
             assert!(
                 msg.contains("/logout"),
