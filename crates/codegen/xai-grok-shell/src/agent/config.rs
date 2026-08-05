@@ -5968,8 +5968,16 @@ pub(crate) fn sampling_config_for_model(
         // freeze its access token into an auxiliary config: the resolver also
         // carries the account id and observes refresh-token rotation.
         config.api_key = None;
+        // …and an unready model gets no resolver either. The `!ready` block
+        // above strips the credential and labels the gap `Missing`, but this
+        // block used to run regardless and hand back a live provider bearer —
+        // so the fail-closed strip was not monotonic, and an unready Codex
+        // model left this function credentialed after being sterilised. That
+        // is the same defect class as every other #110 finding: a downstream
+        // section that does not know about the state the strip introduces.
         let resolver = model
             .effective_auth_provider()
+            .filter(|_| ready)
             .filter(|provider| provider.openai_codex_status().is_some());
         config.credential_source = Some(match resolver {
             Some(provider) => xai_grok_sampler::CredentialSource::AuthProvider {
@@ -10330,6 +10338,62 @@ reasoning_effort = "low"
             meta.get("readinessReason")
         );
         assert_eq!(meta["authScheme"], "bearer");
+    }
+
+    /// The `!ready` strip has to be monotonic: nothing below it may hand a
+    /// credential back.
+    ///
+    /// Fifteenth #110 finding. The strip cleared the credential and labelled
+    /// the gap `Missing`, and then the Codex block ran unconditionally and
+    /// installed a live provider bearer resolver — so an unready Codex model
+    /// left this function credentialed after being sterilised. Neither the L1
+    /// origin gate nor `SamplingClient::new` catches that, because both key on
+    /// `is_ambient_xai()` and an `AuthProvider` source is not ambient xAI.
+    ///
+    /// Note the fixture is *signed out*, and pre-fix that was not enough: the
+    /// resolver filter asked only whether a Codex status existed, never
+    /// whether it was usable.
+    #[test]
+    fn unready_codex_model_is_not_re_credentialed_after_the_strip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = std::sync::Arc::new(crate::auth::AuthManager::new(
+            dir.path(),
+            Default::default(),
+        ));
+        let mut model = test_model_entry("codex", "https://vendor.example/v1", None, None, None);
+        model.info.api_backend = ApiBackend::CodexResponses;
+        model.auth_provider = Some(crate::auth::AuthProviderRef::openai_codex(manager));
+
+        assert!(
+            !model_readiness(&model).0,
+            "precondition: a signed-out Codex provider must read as unready"
+        );
+
+        let cfg = sampling_config_for_model(
+            &model,
+            ResolvedCredentials {
+                api_key: Some("ambient-session-jwt".into()),
+                base_url: "https://vendor.example/v1".into(),
+                auth_type: xai_chat_state::AuthType::SessionToken,
+                auth_scheme: AuthScheme::Bearer,
+            },
+            None,
+            None,
+            Some("deploy".into()),
+            Some("user".into()),
+        );
+
+        assert!(
+            cfg.bearer_resolver.is_none(),
+            "an unready model must not leave this function with a live bearer resolver"
+        );
+        assert_eq!(
+            cfg.credential_source,
+            Some(xai_grok_sampler::CredentialSource::Missing),
+            "the strip labelled the gap Missing; nothing below it may relabel it as a credential"
+        );
+        assert!(cfg.api_key.is_none());
+        assert_eq!(cfg.auth_scheme, AuthScheme::None);
     }
 
     #[test]
