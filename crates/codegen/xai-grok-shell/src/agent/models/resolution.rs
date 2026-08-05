@@ -52,11 +52,17 @@ pub(crate) fn is_campaign_only_flip(
 }
 
 /// Pick the default model: CLI > env > config > remote-settings hint, falling
+/// back to the first ready selectable entry (or the bundled sentinel).
+///
+/// An **explicit** configured preference that is present in the catalog but
+/// unusable is kept as the selection and reported via the fourth return value
+/// — never silently swapped for another model (#131). A preference absent from
+/// the catalog (unknown) keeps today's fallback behaviour.
 pub(crate) fn resolve_default_model(
     cfg: &config::Config,
     catalog: &IndexMap<String, ModelEntry>,
     is_session_auth: bool,
-) -> (String, ModelEntry, config::ConfigSource) {
+) -> (String, ModelEntry, config::ConfigSource, Option<String>) {
     let visible: IndexMap<String, ModelEntry> = catalog
         .iter()
         .filter(|(_, e)| {
@@ -106,22 +112,50 @@ pub(crate) fn resolve_default_model(
     match &model_pref {
         None => {
             let (key, first) = first_or_fallback();
-            (key, first, config::ConfigSource::Default)
+            (key, first, config::ConfigSource::Default, None)
         }
         Some(pref) => {
+            let is_explicit = matches!(
+                pref.source,
+                config::ConfigSource::Cli
+                    | config::ConfigSource::Env
+                    | config::ConfigSource::Config
+            );
+            // Honour the configured id against the full catalog first, before
+            // the ready-only `visible` filter. An explicit preference that is
+            // present but unusable must not be silently replaced (#131).
+            if let Some((key, entry)) = catalog
+                .get_key_value(&pref.value)
+                .or_else(|| catalog.iter().find(|(_, m)| m.model == pref.value))
+            {
+                let (ready, reason) = crate::agent::config::model_readiness(entry);
+                if !ready {
+                    if is_explicit {
+                        let reason = reason
+                            .clone()
+                            .unwrap_or_else(|| "model is not ready".to_owned());
+                        tracing::error!(
+                            model_id = %pref.value,
+                            source = %pref.source,
+                            %reason,
+                            "configured default model is not ready; keeping it selected (not swapping)"
+                        );
+                        return (key.clone(), entry.clone(), pref.source, Some(reason));
+                    }
+                    // Remote / non-explicit preference: keep today's skip.
+                } else if entry.info.visible_for_auth(is_session_auth) && entry.info.user_selectable
+                {
+                    return (key.clone(), entry.clone(), pref.source, None);
+                }
+            }
+
             let found = visible
                 .get_key_value(&pref.value)
                 .or_else(|| visible.iter().find(|(_, m)| m.model == pref.value));
 
             if let Some((key, entry)) = found {
-                (key.clone(), entry.clone(), pref.source)
+                (key.clone(), entry.clone(), pref.source, None)
             } else {
-                let is_explicit = matches!(
-                    pref.source,
-                    config::ConfigSource::Cli
-                        | config::ConfigSource::Env
-                        | config::ConfigSource::Config
-                );
                 if is_explicit {
                     tracing::warn!(
                         model_id = %pref.value, source = %pref.source,
@@ -149,10 +183,15 @@ pub(crate) fn resolve_default_model(
                         unavailable = %pref.value, fallback = %prev,
                         "campaign-driven default unavailable in catalog; recovering the pre-campaign default"
                     );
-                    return (key.clone(), entry.clone(), config::ConfigSource::Config);
+                    return (
+                        key.clone(),
+                        entry.clone(),
+                        config::ConfigSource::Config,
+                        None,
+                    );
                 }
                 let (key, first) = first_or_fallback();
-                (key, first, config::ConfigSource::Default)
+                (key, first, config::ConfigSource::Default, None)
             }
         }
     }

@@ -513,9 +513,11 @@ impl SessionActor {
         // Security boundary: never attach a live session bearer (or rely on
         // gate.active alone) when the active model is keyless — even if the
         // ACP method is still session-based after a model switch.
-        // Unready catalog entries (invalid auth_scheme / missing BYOK) must
+        // Unusable catalog entries (invalid auth_scheme / missing BYOK) must
         // also stay credential-free at turn reconstruct — this is the final
-        // wire choke point (chat-state does not persist readiness).
+        // wire choke point (chat-state does not persist readiness). `Unknown`
+        // (not in the catalog) is stripped conservatively too, but must not
+        // be refused as unusable (#133).
         let mut auth_scheme = model_facts.auth_scheme;
         // #110: chat state carries the headers but not `credential_source`, so
         // a model authenticated by a header the user declared arrives here with
@@ -534,14 +536,23 @@ impl SessionActor {
             == xai_grok_sampling_types::ApiBackend::CodexResponses
             && model_auth_provider.is_some()
             && auth_scheme != xai_grok_sampler::AuthScheme::None;
-        if !model_facts.ready {
+        let mut credential_source = declared_credential_header.map(|(header, env)| {
+            xai_grok_sampler::CredentialSource::ExplicitHeader { header, env }
+        });
+        if model_facts.readiness.must_strip_credentials() {
             tracing::warn!(
                 model = %catalog_model_id,
+                readiness = model_facts.readiness.as_str(),
                 "reconstruct_full_config: active model not ready; stripping credentials"
             );
             auth_scheme = xai_grok_sampler::AuthScheme::None;
             use_session_bearer_resolver = false;
             use_provider_bearer_resolver = false;
+            // Only `Unusable` is a declared gap. `Unknown` stays unlabelled so
+            // a Missing-keyed refusal cannot fire on uncatalogued models (#133).
+            if model_facts.readiness.is_unusable() {
+                credential_source = Some(xai_grok_sampler::CredentialSource::Missing);
+            }
         }
         self.log_auth_gate_unknown("reconstruct_full_config", gate, &cfg.base_url);
         // Refresh before taking the initial bearer snapshot. The dynamic
@@ -597,14 +608,16 @@ impl SessionActor {
         } else {
             creds.api_key
         };
-        let deployment_id = if model_facts.ready {
+        // Identity headers: only attach when the catalog says Ready. Unknown
+        // fails closed (conservative); Unusable must never carry them.
+        let deployment_id = if model_facts.readiness.allows_identity() {
             crate::managed_config::resolve_deployment_id(
                 crate::managed_config::resolve_deployment_key().as_deref(),
             )
         } else {
             None
         };
-        let user_id = if model_facts.ready {
+        let user_id = if model_facts.readiness.allows_identity() {
             self.auth_manager
                 .as_ref()
                 .and_then(|am| am.current_or_expired())
@@ -621,9 +634,7 @@ impl SessionActor {
             temperature: cfg.temperature,
             top_p: cfg.top_p,
             endpoint_trust: cfg.endpoint_trust,
-            credential_source: declared_credential_header.map(|(header, env)| {
-                xai_grok_sampler::CredentialSource::ExplicitHeader { header, env }
-            }),
+            credential_source,
             api_backend: cfg.api_backend,
             auth_scheme,
             extra_headers,
@@ -853,6 +864,7 @@ impl SessionActor {
     ) -> Result<xai_grok_sampler::SamplingClient, acp::Error> {
         self.refresh_token_if_expired().await;
         let mut full_config = self.reconstruct_full_config().await;
+        self.refuse_unusable_external_route(&full_config)?;
         full_config.force_http1 = force_http1;
         let sampling_client =
             xai_grok_sampler::SamplingClient::new(full_config).map_err(|e| self.to_acp_error(e))?;
@@ -869,9 +881,10 @@ impl SessionActor {
     /// newly issued session token. The previous client cache inside
     /// the sampler actor is invalidated automatically by
     /// `update_config`.
-    pub(crate) async fn prepare_sampler_for_turn(&self) {
+    pub(crate) async fn prepare_sampler_for_turn(&self) -> Result<(), acp::Error> {
         self.refresh_token_if_expired().await;
         let mut sampler_config = self.reconstruct_full_config().await;
+        self.refuse_unusable_external_route(&sampler_config)?;
         if self.tool_context.task_output_token_budget.is_some()
             || self.tool_context.sampler_retry_only_before_output
         {
@@ -879,6 +892,40 @@ impl SessionActor {
         }
         sampler_config.idle_timeout_secs = Some(self.inference_idle_timeout.as_secs());
         self.sampler_handle.update_config(sampler_config);
+        Ok(())
+    }
+    /// #133: a catalogued-but-unusable model pointed at a non-xAI origin must
+    /// fail locally before a request is built. Key on `Unusable` alone —
+    /// `Unknown` (uncatalogued) must still proceed.
+    fn refuse_unusable_external_route(&self, config: &SamplingConfig) -> Result<(), acp::Error> {
+        use crate::agent::auth_method::ModelReadiness;
+        let catalog_model_id = self.catalog_model_id_str();
+        let facts = self.model_auth_facts(&catalog_model_id);
+        if facts.readiness != ModelReadiness::Unusable {
+            return Ok(());
+        }
+        let first_party = match config.endpoint_trust {
+            Some(xai_grok_sampler::EndpointTrustClass::FirstPartyXai) => true,
+            Some(_) => false,
+            None => crate::util::is_xai_api_bearer_url(&config.base_url),
+        };
+        if first_party {
+            return Ok(());
+        }
+        let reason = self
+            .models_manager
+            .models()
+            .get(catalog_model_id.as_str())
+            .and_then(|entry| crate::agent::config::model_readiness(entry).1)
+            .unwrap_or_else(|| "model is not ready".to_owned());
+        tracing::warn!(
+            model = %catalog_model_id,
+            %reason,
+            "refusing unusable model on a non-first-party endpoint"
+        );
+        Err(acp::Error::invalid_params().data(format!(
+            "model '{catalog_model_id}' is not ready ({reason})"
+        )))
     }
     /// Fold an auth remedy into a turn failure: its advice becomes the tail of
     /// the message, and its `turn_error_type` the classification the client
@@ -1146,7 +1193,7 @@ impl SessionActor {
                     Some(self.session_info.id.0.as_ref()),
                     None,
                 );
-                self.prepare_sampler_for_turn().await;
+                self.prepare_sampler_for_turn().await?;
                 return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
                     credential: error.credential,
                     store: RecoveredStore::SessionToken,
@@ -1174,7 +1221,7 @@ impl SessionActor {
                 .try_provider_401_recovery(provider, error.credential)
                 .await
             {
-                self.prepare_sampler_for_turn().await;
+                self.prepare_sampler_for_turn().await?;
                 return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
                     credential: error.credential,
                     store: RecoveredStore::AuthProvider,
@@ -1353,7 +1400,7 @@ impl SessionActor {
         request: ConversationRequest,
         codex_retry_available: bool,
     ) -> Result<SamplerTurnOutcome, acp::Error> {
-        self.prepare_sampler_for_turn().await;
+        self.prepare_sampler_for_turn().await?;
         let stream_drained_rx = {
             let (tx, rx) = tokio::sync::oneshot::channel();
             *self.turn_stream_drained.lock() = Some(tx);

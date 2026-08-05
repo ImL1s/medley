@@ -187,7 +187,7 @@ async fn session_token_actor(
             facts: crate::agent::config::ModelAuthFacts {
                 byok: crate::agent::auth_method::ModelByok::NotByok,
                 auth_scheme: Default::default(),
-                ready: true,
+                readiness: crate::agent::auth_method::ModelReadiness::Ready,
             },
             provider: None,
         }));

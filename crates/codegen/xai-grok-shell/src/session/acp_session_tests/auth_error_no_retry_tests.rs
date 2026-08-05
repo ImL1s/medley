@@ -183,7 +183,7 @@ async fn pin_first_party_session_model(actor: &SessionActor) {
             facts: crate::agent::config::ModelAuthFacts {
                 byok: crate::agent::auth_method::ModelByok::NotByok,
                 auth_scheme: xai_grok_sampler::AuthScheme::Bearer,
-                ready: true,
+                readiness: crate::agent::auth_method::ModelReadiness::Ready,
             },
             provider: None,
         }));
@@ -1070,7 +1070,7 @@ async fn codex_401_forces_one_refresh_one_retry_then_second_401_is_terminal() {
                     facts: crate::agent::config::ModelAuthFacts {
                         byok: crate::agent::auth_method::ModelByok::NotByok,
                         auth_scheme: xai_grok_sampler::AuthScheme::Bearer,
-                        ready: true,
+                        readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: Some(provider),
                 }));
@@ -1232,7 +1232,7 @@ async fn model_auth_memo_serves_cached_status_and_keys_on_model() {
                     facts: ModelAuthFacts {
                         byok: ModelByok::Byok,
                         auth_scheme: Default::default(),
-                        ready: true,
+                        readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
                 }));
@@ -1277,7 +1277,7 @@ async fn reconstruct_full_config_no_bearer_resolver_for_byok_model_on_session_me
                     facts: ModelAuthFacts {
                         byok: ModelByok::Byok,
                         auth_scheme: Default::default(),
-                        ready: true,
+                        readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
                 }));
@@ -1328,7 +1328,7 @@ async fn reconstruct_full_config_no_bearer_resolver_for_none_auth_scheme_on_sess
                         // is what must suppress the resolver.
                         byok: ModelByok::NotByok,
                         auth_scheme: AuthScheme::None,
-                        ready: true,
+                        readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
                 }));
@@ -1381,7 +1381,7 @@ async fn reconstruct_full_config_strips_credentials_when_model_not_ready() {
                     facts: ModelAuthFacts {
                         byok: ModelByok::NotByok,
                         auth_scheme: AuthScheme::Bearer,
-                        ready: false,
+                        readiness: crate::agent::auth_method::ModelReadiness::Unusable,
                     },
                     provider: None,
                 }));
@@ -1396,6 +1396,85 @@ async fn reconstruct_full_config_strips_credentials_when_model_not_ready() {
             assert!(cfg.api_key.is_none());
             assert!(cfg.user_id.is_none());
             assert!(cfg.deployment_id.is_none());
+            assert_eq!(
+                cfg.credential_source,
+                Some(xai_grok_sampler::CredentialSource::Missing),
+                "Unusable must label the gap Missing so a refusal can key on it"
+            );
+        })
+        .await;
+}
+
+/// #133 load-bearing: refusal keys on `Unusable` alone. An `Unknown`
+/// (uncatalogued) model must still prepare; a catalogued-unusable model on a
+/// non-first-party origin must fail locally naming the reason. If this is
+/// weakened back to `!ready` / `must_strip_credentials`, the Unknown arm
+/// fails the same way the 13 fixture tests did.
+#[tokio::test(flavor = "current_thread")]
+async fn prepare_refuses_unusable_external_but_allows_unknown() {
+    use crate::agent::auth_method::{ModelByok, ModelReadiness};
+    use crate::agent::config::ModelAuthFacts;
+    use xai_grok_sampler::AuthScheme;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_dir, am) = auth_manager_with_valid_token("session-token");
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                Some(am),
+                "cached_token",
+                xai_chat_state::AuthType::SessionToken,
+                "stale-session-jwt".to_string(),
+            )
+            .await;
+
+            let mut cfg = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("sampling config");
+            // Non-first-party origin: the refusal only fires off-xAI.
+            cfg.base_url = "https://vendor.example/v1".to_string();
+            let model = cfg.model.clone();
+            actor.chat_state_handle.update_sampling_config(cfg);
+
+            // Unknown (uncatalogued): must still prepare.
+            actor
+                .model_auth_memo
+                .replace(Some(crate::session::acp_session::ModelAuthMemo {
+                    model_id: model.clone(),
+                    facts: ModelAuthFacts {
+                        byok: ModelByok::NotByok,
+                        auth_scheme: AuthScheme::Bearer,
+                        readiness: ModelReadiness::Unknown,
+                    },
+                    provider: None,
+                }));
+            actor
+                .prepare_chat_completion(false)
+                .await
+                .expect("Unknown readiness must not refuse an uncatalogued model");
+
+            // Unusable: must fail locally with the readiness reason.
+            actor
+                .model_auth_memo
+                .replace(Some(crate::session::acp_session::ModelAuthMemo {
+                    model_id: model,
+                    facts: ModelAuthFacts {
+                        byok: ModelByok::NotByok,
+                        auth_scheme: AuthScheme::Bearer,
+                        readiness: ModelReadiness::Unusable,
+                    },
+                    provider: None,
+                }));
+            let err = actor
+                .prepare_chat_completion(false)
+                .await
+                .expect_err("Unusable on a non-first-party origin must refuse");
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("not ready") || msg.to_lowercase().contains("unusable"),
+                "refusal must name unreadiness, got {msg}"
+            );
         })
         .await;
 }
@@ -1432,7 +1511,7 @@ async fn refresh_token_if_expired_skips_session_refresh_for_none_auth_scheme() {
                     facts: ModelAuthFacts {
                         byok: ModelByok::NotByok,
                         auth_scheme: AuthScheme::None,
-                        ready: true,
+                        readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
                 }));
@@ -1486,7 +1565,7 @@ async fn reconstruct_full_config_uses_catalog_key_for_none_alias_with_shared_wir
                     facts: ModelAuthFacts {
                         byok: ModelByok::NotByok,
                         auth_scheme: AuthScheme::None,
-                        ready: true,
+                        readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
                 }));
@@ -1539,7 +1618,7 @@ async fn set_session_model_preserves_catalog_key_for_none_alias_with_shared_wire
                     facts: ModelAuthFacts {
                         byok: ModelByok::NotByok,
                         auth_scheme: AuthScheme::Bearer,
-                        ready: true,
+                        readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
                 }));
@@ -1598,7 +1677,7 @@ async fn set_session_model_preserves_catalog_key_for_none_alias_with_shared_wire
                     facts: ModelAuthFacts {
                         byok: ModelByok::NotByok,
                         auth_scheme: AuthScheme::None,
-                        ready: true,
+                        readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
                 }));
@@ -1732,7 +1811,7 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                     facts: ModelAuthFacts {
                         byok: ModelByok::NotByok,
                         auth_scheme: Default::default(),
-                        ready: true,
+                        readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
                 }));
@@ -1811,7 +1890,7 @@ async fn seed_provider_memo(actor: &Arc<SessionActor>, provider: crate::auth::Au
             facts: crate::agent::config::ModelAuthFacts {
                 byok: crate::agent::auth_method::ModelByok::Byok,
                 auth_scheme: Default::default(),
-                ready: true,
+                readiness: crate::agent::auth_method::ModelReadiness::Ready,
             },
             provider: Some(provider),
         }));

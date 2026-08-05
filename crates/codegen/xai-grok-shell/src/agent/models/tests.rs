@@ -480,7 +480,7 @@ fn default_model_honors_allowlist_when_no_default_set() {
             "#,
     );
     let catalog = resolve_model_catalog(&cfg, None);
-    let (_key, entry, _src) = resolve_default_model(&cfg, &catalog, true);
+    let (_key, entry, _src, _) = resolve_default_model(&cfg, &catalog, true);
     assert!(
         entry.info.user_selectable,
         "picked non-selectable {}",
@@ -1470,7 +1470,7 @@ fn unavailable_campaign_default_falls_back_to_config_default() {
     cfg.models.default = Some("missing-model".to_string());
     cfg.models.default_is_campaign_driven = true;
     cfg.models.pre_campaign_default = Some("real-model".to_string());
-    let (key, _, _) = resolve_default_model(&cfg, &catalog, true);
+    let (key, _, _, _) = resolve_default_model(&cfg, &catalog, true);
     assert_eq!(
         key, "real-model",
         "must fall back to the pre-campaign default"
@@ -1480,13 +1480,13 @@ fn unavailable_campaign_default_falls_back_to_config_default() {
     cfg2.models.default = Some("missing-model".to_string());
     cfg2.models.default_is_campaign_driven = true;
     cfg2.models.pre_campaign_default = Some("also-missing".to_string());
-    let (key2, _, _) = resolve_default_model(&cfg2, &catalog, true);
+    let (key2, _, _, _) = resolve_default_model(&cfg2, &catalog, true);
     assert_eq!(&key2, catalog.keys().next().unwrap());
 
     let mut cfg3 = config::Config::default();
     cfg3.models.default = Some("missing-model".to_string());
     cfg3.models.pre_campaign_default = Some("real-model".to_string());
-    let (key3, _, _) = resolve_default_model(&cfg3, &catalog, true);
+    let (key3, _, _, _) = resolve_default_model(&cfg3, &catalog, true);
     assert_eq!(
         &key3,
         catalog.keys().next().unwrap(),
@@ -1500,7 +1500,7 @@ fn unavailable_campaign_default_falls_back_to_config_default() {
     cfg4.models.default = Some("campaign-model".to_string());
     cfg4.models.default_is_campaign_driven = true;
     cfg4.models.pre_campaign_default = Some("real-model".to_string());
-    let (key4, _, _) = resolve_default_model(&cfg4, &catalog, true);
+    let (key4, _, _, _) = resolve_default_model(&cfg4, &catalog, true);
     assert_eq!(
         &key4,
         catalog.keys().next().unwrap(),
@@ -1747,14 +1747,14 @@ fn default_model_skips_oauth_only_for_api_key_users() {
 
     catalog.insert("public-model".to_string(), make_model_entry("public-model"));
 
-    let (key, _, _) = resolve_default_model(&cfg, &catalog, false);
+    let (key, _, _, _) = resolve_default_model(&cfg, &catalog, false);
     assert_ne!(
         key, "oauth-only",
         "API-key default must not be an OAuth-only model"
     );
     assert_eq!(key, "public-model");
 
-    let (key, _, _) = resolve_default_model(&cfg, &catalog, true);
+    let (key, _, _, _) = resolve_default_model(&cfg, &catalog, true);
     assert!(
         key == "oauth-only" || key == "public-model",
         "OAuth user should be able to use either model as default"
@@ -1886,12 +1886,57 @@ fn resolve_default_model_prefers_id_over_model_slug() {
     let mut cfg = config::Config::default();
     cfg.models.default = Some("grok-build".to_string());
 
-    let (key, _, _) = resolve_default_model(&cfg, &catalog, true);
+    let (key, _, _, _) = resolve_default_model(&cfg, &catalog, true);
     assert_eq!(key, "grok-build", "must match id, not first slug hit");
 }
 
-/// When every selectable catalog entry is unready, do not return any of
-/// them via the empty-visible fallback — use the bundled default sentinel.
+/// #131: an explicit configured default that is catalogued but unusable must
+/// stay selected and report the readiness reason — never silently swap.
+#[test]
+fn resolve_default_model_keeps_explicit_unusable_and_reports_reason() {
+    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
+    let mut custom = make_model_entry("custom");
+    custom
+        .config_validation_errors
+        .push("invalid auth_scheme `not-a-scheme`".into());
+    catalog.insert("custom".to_string(), custom);
+    // A ready alternative that the old path would have silently swapped to.
+    catalog.insert("other".to_string(), make_model_entry("other"));
+
+    let mut cfg = config::Config::default();
+    cfg.models.default = Some("custom".to_string());
+
+    let (key, entry, _, reason) = resolve_default_model(&cfg, &catalog, true);
+    assert_eq!(key, "custom", "must keep the explicit unusable preference");
+    assert!(
+        !crate::agent::config::model_readiness(&entry).0,
+        "kept entry must still be unready"
+    );
+    let reason = reason.expect("must surface the unreadiness reason");
+    assert!(
+        reason.contains("invalid auth_scheme"),
+        "reason must name the validation failure, got {reason}"
+    );
+}
+
+/// A configured default absent from the catalog (Unknown) keeps today's
+/// fallback to a ready selectable entry (#131 / #133).
+#[test]
+fn resolve_default_model_falls_back_when_preferred_absent_from_catalog() {
+    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
+    catalog.insert("other".to_string(), make_model_entry("other"));
+
+    let mut cfg = config::Config::default();
+    cfg.models.default = Some("missing-model".to_string());
+
+    let (key, entry, _, reason) = resolve_default_model(&cfg, &catalog, true);
+    assert_eq!(key, "other");
+    assert!(reason.is_none());
+    assert!(crate::agent::config::model_readiness(&entry).0);
+}
+
+/// When every selectable catalog entry is unready and there is no explicit
+/// preference, use the bundled default sentinel rather than an unready entry.
 #[test]
 fn resolve_default_model_falls_back_when_all_selectable_unready() {
     let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
@@ -1901,13 +1946,14 @@ fn resolve_default_model_falls_back_when_all_selectable_unready() {
         .push("invalid auth_scheme `not-a-scheme`".into());
     catalog.insert("custom".to_string(), custom);
 
-    let mut cfg = config::Config::default();
-    cfg.models.default = Some("custom".to_string());
+    let cfg = config::Config::default();
+    // No models.default — empty preference takes the first_or_fallback path.
 
-    let (key, entry, _) = resolve_default_model(&cfg, &catalog, true);
+    let (key, entry, _, reason) = resolve_default_model(&cfg, &catalog, true);
+    assert!(reason.is_none());
     assert_ne!(
         key, "custom",
-        "must not keep an unready preferred/selectable model"
+        "must not keep an unready selectable model when nothing was configured"
     );
     assert_eq!(key, crate::models::default_model());
     assert!(

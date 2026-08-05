@@ -403,6 +403,54 @@ impl ModelByok {
     }
 }
 
+/// Catalog readiness for a model id, distinct from BYOK.
+///
+/// `ModelAuthFacts` used to collapse this into a bool, so "catalogued but
+/// failed readiness" and "not in the catalog" both read as `!ready`. A
+/// refusal keyed on that bool then also refused every uncatalogued model
+/// (#133). Same shape as [`ModelByok`]: a definite answer when the catalog
+/// speaks, `Unknown` when it is silent or unavailable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ModelReadiness {
+    /// Catalog entry present and `model_readiness` passed.
+    Ready,
+    /// Catalog entry present and `model_readiness` failed (missing BYOK,
+    /// invalid `auth_scheme`, non-xAI origin with no credential, …).
+    Unusable,
+    /// Model absent from the catalog, config unloadable, or no model id yet.
+    Unknown,
+}
+
+impl ModelReadiness {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Unusable => "unusable",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Selection / availability: only a definite ready entry counts.
+    pub fn is_ready(self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    /// Refusal keys on this alone — never on [`Self::Unknown`] (#133).
+    pub fn is_unusable(self) -> bool {
+        matches!(self, Self::Unusable)
+    }
+
+    /// Credential / identity attach: fail closed when the catalog is silent.
+    pub fn allows_identity(self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    /// Strip ambient credentials for anything that is not definitely ready.
+    pub fn must_strip_credentials(self) -> bool {
+        !matches!(self, Self::Ready)
+    }
+}
+
 /// Whether this session+model uses a refreshable session token.
 ///
 /// Gates on stable inputs, not `Credentials.auth_type`: that field collapses
