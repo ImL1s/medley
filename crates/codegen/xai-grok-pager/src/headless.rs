@@ -451,16 +451,19 @@ fn auth_required_message(interactive: bool, model_unready_reason: Option<&str>) 
     if let Some(reason) = model_unready_reason.filter(|r| !r.is_empty()) {
         return reason.to_string();
     }
+    let prog = crate::app::program_name();
     if interactive {
-        "Not signed in. Run `grok login` to authenticate \
-         (or `grok login --device-code` if no browser is available)."
-            .to_string()
+        format!(
+            "Not signed in. Run `{prog} login` to authenticate \
+             (or `{prog} login --device-code` if no browser is available)."
+        )
     } else {
-        "Not signed in. To authenticate without a browser, run:\n  \
-         grok login --device-code\n\n\
-         Alternatively, set the XAI_API_KEY environment variable \
-         or run `grok login` on a machine with a browser."
-            .to_string()
+        format!(
+            "Not signed in. To authenticate without a browser, run:\n  \
+             {prog} login --device-code\n\n\
+             Alternatively, set the XAI_API_KEY environment variable \
+             or run `{prog} login` on a machine with a browser."
+        )
     }
 }
 

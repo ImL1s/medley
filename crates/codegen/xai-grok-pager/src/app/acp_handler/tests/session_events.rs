@@ -523,9 +523,11 @@
         apply_retry_state(
             &RetryState::Failed {
                 error_type: "legacy_auth".into(),
-                message: "Unauthorized (401) ... deprecated authentication method (WebLogin) ... \
-                          run `grok logout` then `grok login`"
-                    .into(),
+                message: format!(
+                    "Unauthorized (401) ... deprecated authentication method (WebLogin) ... \
+                     run `{prog} logout` then `{prog} login`",
+                    prog = crate::app::program_name()
+                ),
             },
             &mut session,
             &mut scrollback, false);

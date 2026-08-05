@@ -410,9 +410,10 @@ async fn run_upload(
                 "trace_cmd: no upload credentials available"
             );
             anyhow::bail!(
-                "No upload credentials. Run `grok login` or set a deployment key. \
+                "No upload credentials. Run `{prog} login` or set a deployment key. \
                  See {} for upload overrides.",
-                crate::util::display_user_grok_path("docs/user-guide")
+                crate::util::display_user_grok_path("docs/user-guide"),
+                prog = crate::app::program_name(),
             );
         }
     };

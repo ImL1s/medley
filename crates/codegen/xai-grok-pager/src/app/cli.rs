@@ -1060,6 +1060,16 @@ fn strip_cur_dir(path: PathBuf) -> PathBuf {
 /// Fallback when `argv[0]` is absent or unusable. Reached only outside a
 /// normal invocation, since a shell always supplies `argv[0]`.
 const FALLBACK_PROGRAM_NAME: &str = "grok";
+
+static PROGRAM_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Returns the stored program name, or the fallback name if unset.
+pub fn program_name() -> &'static str {
+    PROGRAM_NAME
+        .get()
+        .map(|s| s.as_str())
+        .unwrap_or(FALLBACK_PROGRAM_NAME)
+}
 /// Whether `name` is a plain program name, safe to render into help output.
 ///
 /// `argv[0]` is chosen by whoever execs us, and clap prints it into usage and
@@ -1100,6 +1110,7 @@ impl PagerArgs {
     /// Parse CLI arguments without applying side effects.
     pub fn parse_cli() -> Self {
         let bin_name = program_name_from_argv0(std::env::args().next().as_deref());
+        let _ = PROGRAM_NAME.set(bin_name.clone());
         Self::parse_from(std::iter::once(bin_name).chain(std::env::args().skip(1)))
     }
     /// Apply launch-directory path anchoring and `--cwd` after early commands
@@ -2076,5 +2087,70 @@ mod state_dir_help_tests {
             return trimmed.starts_with("fn ") || trimmed.starts_with("pub fn ");
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod auth_instruction_guard_tests {
+    use std::fs;
+    use std::path::Path;
+
+    #[test]
+    fn no_hardcoded_grok_login_or_auth() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let src_dir = Path::new(manifest_dir).join("src");
+        let mut errors = Vec::new();
+
+        let login_needle = format!("{} {}", "`grok", "login");
+        let auth_needle = format!("{} {}", "`grok", "auth");
+
+        scan_dir(&src_dir, &login_needle, &auth_needle, &mut errors);
+
+        if !errors.is_empty() {
+            panic!(
+                "Found hardcoded auth instructions in the following files:\n{}\nUse the program_name() accessor instead.",
+                errors.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn test_program_name_fallback_safe() {
+        let name = crate::app::program_name();
+        assert!(
+            name == "grok"
+                || name == "xai-grok-pager"
+                || name == "medley"
+                || name == "bin"
+                || name.contains("cli_rs")
+                || name.contains("test")
+        );
+    }
+
+    fn scan_dir(dir: &Path, login_needle: &str, auth_needle: &str, errors: &mut Vec<String>) {
+        if !dir.is_dir() {
+            return;
+        }
+        for entry in fs::read_dir(dir).expect("read_dir") {
+            let entry = entry.expect("entry");
+            let path = entry.path();
+            if path.is_dir() {
+                scan_dir(&path, login_needle, auth_needle, errors);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let content = fs::read_to_string(&path).expect("read file");
+                for (idx, line) in content.lines().enumerate() {
+                    let trimmed = line.trim_start();
+                    if trimmed.starts_with("//")
+                        || trimmed.starts_with("///")
+                        || trimmed.starts_with("*")
+                    {
+                        continue;
+                    }
+                    if line.contains(login_needle) || line.contains(auth_needle) {
+                        errors.push(format!("{}:{} -> {}", path.display(), idx + 1, trimmed));
+                    }
+                }
+            }
+        }
     }
 }
