@@ -967,12 +967,12 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                 return vec![];
             };
             let Some(session_id) = agent.session.session_id.clone() else {
+                // Update the display and stash for SessionCreated/SessionLoaded.
+                // Do not persist here — the deferred Effect::SwitchModel completes
+                // via handle_switch_model_complete, which emits PersistPreferredModel
+                // only on success (same contract as the live-session path).
                 let prev_model = agent.session.models.current.clone();
-                let prev_effort = agent.session.models.reasoning_effort;
                 agent.session.models.set_current(model_id.clone(), effort);
-                let resolved_effort = agent.session.models.reasoning_effort;
-                let unchanged =
-                    prev_model.as_ref() == Some(&model_id) && prev_effort == resolved_effort;
                 let rollback_prev = agent
                     .session
                     .deferred_model_switch
@@ -981,18 +981,11 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                     .or(prev_model);
                 agent.session.deferred_model_switch =
                     Some(crate::app::agent::DeferredModelSwitch {
-                        model_id: model_id.clone(),
+                        model_id,
                         effort,
                         prev_model_id: rollback_prev,
                     });
-                return if unchanged {
-                    vec![]
-                } else {
-                    vec![Effect::PersistPreferredModel {
-                        model_id,
-                        reasoning_effort: resolved_effort,
-                    }]
-                };
+                return vec![];
             };
             let request_id = super::session::lifecycle::begin_model_switch_request(
                 &mut app.model_switch_transaction,
