@@ -1,4 +1,4 @@
-use crate::agent::auth_method::ModelByok;
+use crate::agent::auth_method::{ModelByok, ModelReadiness, UnknownReason, UnusableReason};
 use crate::agent::model_providers::{
     ModelProviderConfig, OPENAI_CODEX_PROVIDER_ID, auth_config_issues, model_provider_auth_name,
     parse_model_providers,
@@ -5304,22 +5304,24 @@ pub(crate) fn try_resolve_model_credentials(
     );
     Some(credentials)
 }
-/// Per-model auth facts (BYOK status + auth scheme) from one effective-config
-/// load, memoized by the session actor.
-#[derive(Clone, Copy)]
+/// Per-model auth facts (BYOK status + auth scheme + readiness) from one
+/// effective-config load, memoized by the session actor.
+#[derive(Clone)]
 pub(crate) struct ModelAuthFacts {
     pub byok: ModelByok,
     pub auth_scheme: AuthScheme,
-    /// `false` when the catalog entry is unready (invalid auth_scheme, missing
-    /// BYOK, …). Turn-time reconstruct must treat this as a hard credential strip.
-    pub ready: bool,
+    /// Tri-state catalog readiness. `Unusable` is the only state a turn-time
+    /// refusal may key on; `Unknown` (absent / unloadable / unidentified)
+    /// must not be treated as unusable (#133).
+    pub readiness: ModelReadiness,
 }
 /// Resolve `model_id` to its auth facts and auth-provider reference from one
 /// effective-config load; both ride the same memo (see
-/// `SessionActor::model_auth_memo`). Load/parse failure → `byok = Unknown`;
-/// model absent from the catalog → `NotByok`. An empty `model_id` (no sampling
-/// config yet) → `Unknown`, not `NotByok`, so the gate isn't activated for an
-/// unidentified model.
+/// `SessionActor::model_auth_memo`). Load/parse failure → `byok = Unknown` and
+/// `readiness = Unknown(CatalogUnavailable)`; model absent from the catalog →
+/// `NotByok` + `Unknown(NotInCatalog)` (not `Unusable`). An empty `model_id`
+/// (no sampling config yet) → `Unknown` on both, so the gate isn't activated
+/// for an unidentified model.
 pub(crate) fn resolve_model_auth_facts_and_provider(
     model_id: &str,
 ) -> (ModelAuthFacts, Option<crate::auth::AuthProviderRef>) {
@@ -5328,7 +5330,7 @@ pub(crate) fn resolve_model_auth_facts_and_provider(
             ModelAuthFacts {
                 byok: ModelByok::Unknown,
                 auth_scheme: AuthScheme::default(),
-                ready: true,
+                readiness: ModelReadiness::Unknown(UnknownReason::UnidentifiedModel),
             },
             None,
         );
@@ -5340,11 +5342,7 @@ pub(crate) fn resolve_model_auth_facts_and_provider(
                 ModelLookup::Loaded(Some(e)) => e.info().auth_scheme,
                 _ => AuthScheme::default(),
             },
-            ready: match lookup {
-                ModelLookup::Loaded(Some(e)) => model_readiness(e).0,
-                ModelLookup::Loaded(None) => false,
-                ModelLookup::ConfigUnavailable => true,
-            },
+            readiness: readiness_from_lookup(&lookup),
         };
         let provider = match lookup {
             ModelLookup::Loaded(Some(e)) => e.effective_auth_provider().cloned(),
@@ -5353,10 +5351,32 @@ pub(crate) fn resolve_model_auth_facts_and_provider(
         (facts, provider)
     })
 }
+fn readiness_from_lookup(lookup: &ModelLookup<'_>) -> ModelReadiness {
+    match lookup {
+        ModelLookup::Loaded(Some(e)) => {
+            let (ready, reason) = model_readiness(e);
+            if ready {
+                ModelReadiness::Ready
+            } else {
+                ModelReadiness::Unusable(UnusableReason(
+                    reason.unwrap_or_else(|| "model is not ready".to_owned()),
+                ))
+            }
+        }
+        // Absent from a loaded catalog is not "declared unusable" (#133).
+        ModelLookup::Loaded(None) => ModelReadiness::Unknown(UnknownReason::NotInCatalog),
+        ModelLookup::ConfigUnavailable => {
+            ModelReadiness::Unknown(UnknownReason::CatalogUnavailable)
+        }
+    }
+}
 fn byok_from_lookup(lookup: &ModelLookup) -> ModelByok {
     match lookup {
         ModelLookup::ConfigUnavailable => ModelByok::Unknown,
         ModelLookup::Loaded(Some(e)) if e.has_own_credentials() => ModelByok::Byok,
+        // Absent models stay NotByok (not Unknown): session_token_auth_gate
+        // treats NotByok and Unknown identically, and flipping this to Unknown
+        // would make an absent model inherit the previous model's memo facts.
         ModelLookup::Loaded(_) => ModelByok::NotByok,
     }
 }
@@ -9457,11 +9477,43 @@ reasoning_effort = "low"
     }
     #[test]
     fn resolve_model_auth_facts_empty_model_id_is_unknown() {
+        let facts = resolve_model_auth_facts_and_provider("").0;
+        assert_eq!(facts.byok, ModelByok::Unknown);
         assert_eq!(
-            resolve_model_auth_facts_and_provider("").0.byok,
-            ModelByok::Unknown
+            facts.readiness,
+            ModelReadiness::Unknown(UnknownReason::UnidentifiedModel)
         );
     }
+
+    /// #133: absence from the catalog is `Unknown(NotInCatalog)`, not
+    /// `Unusable`. A refusal keyed on the old `!ready` bool refused both.
+    #[test]
+    fn readiness_from_lookup_preserves_unknown_reasons() {
+        assert_eq!(
+            readiness_from_lookup(&ModelLookup::ConfigUnavailable),
+            ModelReadiness::Unknown(UnknownReason::CatalogUnavailable),
+        );
+        assert_eq!(
+            readiness_from_lookup(&ModelLookup::Loaded(None)),
+            ModelReadiness::Unknown(UnknownReason::NotInCatalog),
+        );
+        let ready = test_model_entry("m", "https://api.x.ai/v1", None, None, None);
+        assert_eq!(
+            readiness_from_lookup(&ModelLookup::Loaded(Some(&ready))),
+            ModelReadiness::Ready,
+        );
+        let mut unusable = test_model_entry("bad", "https://vendor.example/v1", None, None, None);
+        unusable
+            .config_validation_errors
+            .push("invalid auth_scheme `not-a-scheme`".into());
+        match readiness_from_lookup(&ModelLookup::Loaded(Some(&unusable))) {
+            ModelReadiness::Unusable(reason) => {
+                assert!(reason.as_str().contains("invalid auth_scheme"));
+            }
+            other => panic!("expected Unusable, got {other:?}"),
+        }
+    }
+
     #[test]
     fn user_override_adds_api_key_to_default_model() {
         let dm = crate::models::default_model();

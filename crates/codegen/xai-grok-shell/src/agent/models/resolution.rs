@@ -52,12 +52,21 @@ pub(crate) fn is_campaign_only_flip(
 }
 
 /// Pick the default model: CLI > env > config > remote-settings hint, falling
+/// back when the preference is missing from the catalog.
+///
+/// The fourth return value is `Some(reason)` when an *explicit* configured
+/// preference is present in the catalog but unusable (#131): the id is kept
+/// (no silent substitute) and callers surface the readiness reason.
 pub(crate) fn resolve_default_model(
     cfg: &config::Config,
     catalog: &IndexMap<String, ModelEntry>,
     is_session_auth: bool,
-) -> (String, ModelEntry, config::ConfigSource) {
-    let visible: IndexMap<String, ModelEntry> = catalog
+) -> (String, ModelEntry, config::ConfigSource, Option<String>) {
+    // Visible ≠ ready (#133/#131): auth-gated listing must not collapse onto
+    // the readiness bool. Ready entries are a separate filter used only when
+    // picking a fallback substitute. ACP listing (`available_models` /
+    // `to_acp_model_info`) keeps unready entries labelled via meta.
+    let ready_visible: IndexMap<String, ModelEntry> = catalog
         .iter()
         .filter(|(_, e)| {
             e.info.visible_for_auth(is_session_auth)
@@ -77,7 +86,7 @@ pub(crate) fn resolve_default_model(
     );
 
     let first_or_fallback = || -> (String, ModelEntry) {
-        if let Some((key, first)) = visible.first() {
+        if let Some((key, first)) = ready_visible.first() {
             return (key.clone(), first.clone());
         }
         if let Some((key, entry)) = catalog
@@ -106,22 +115,48 @@ pub(crate) fn resolve_default_model(
     match &model_pref {
         None => {
             let (key, first) = first_or_fallback();
-            (key, first, config::ConfigSource::Default)
+            (key, first, config::ConfigSource::Default, None)
         }
         Some(pref) => {
-            let found = visible
+            let is_explicit = matches!(
+                pref.source,
+                config::ConfigSource::Cli
+                    | config::ConfigSource::Env
+                    | config::ConfigSource::Config
+            );
+            // Honour the configured id against the full catalog first, before
+            // the ready-only filter. An explicit preference that is present
+            // but unusable must not be silently replaced (#131).
+            if let Some((key, entry)) = catalog
                 .get_key_value(&pref.value)
-                .or_else(|| visible.iter().find(|(_, m)| m.model == pref.value));
+                .or_else(|| catalog.iter().find(|(_, m)| m.model == pref.value))
+            {
+                let (ready, reason) = crate::agent::config::model_readiness(entry);
+                if !ready {
+                    if is_explicit {
+                        let reason = reason.unwrap_or_else(|| "model is not ready".to_owned());
+                        tracing::error!(
+                            model_id = %pref.value,
+                            source = %pref.source,
+                            %reason,
+                            "configured default model is not ready; keeping it selected (not swapping)"
+                        );
+                        return (key.clone(), entry.clone(), pref.source, Some(reason));
+                    }
+                    // Remote / non-explicit preference: keep today's skip.
+                } else if entry.info.visible_for_auth(is_session_auth) && entry.info.user_selectable
+                {
+                    return (key.clone(), entry.clone(), pref.source, None);
+                }
+            }
+
+            let found = ready_visible
+                .get_key_value(&pref.value)
+                .or_else(|| ready_visible.iter().find(|(_, m)| m.model == pref.value));
 
             if let Some((key, entry)) = found {
-                (key.clone(), entry.clone(), pref.source)
+                (key.clone(), entry.clone(), pref.source, None)
             } else {
-                let is_explicit = matches!(
-                    pref.source,
-                    config::ConfigSource::Cli
-                        | config::ConfigSource::Env
-                        | config::ConfigSource::Config
-                );
                 if is_explicit {
                     tracing::warn!(
                         model_id = %pref.value, source = %pref.source,
@@ -141,18 +176,23 @@ pub(crate) fn resolve_default_model(
                         .pre_campaign_default
                         .as_deref()
                         .filter(|s| !s.is_empty())
-                    && let Some((key, entry)) = visible
+                    && let Some((key, entry)) = ready_visible
                         .get_key_value(prev)
-                        .or_else(|| visible.iter().find(|(_, m)| m.model == prev))
+                        .or_else(|| ready_visible.iter().find(|(_, m)| m.model == prev))
                 {
                     tracing::info!(
                         unavailable = %pref.value, fallback = %prev,
                         "campaign-driven default unavailable in catalog; recovering the pre-campaign default"
                     );
-                    return (key.clone(), entry.clone(), config::ConfigSource::Config);
+                    return (
+                        key.clone(),
+                        entry.clone(),
+                        config::ConfigSource::Config,
+                        None,
+                    );
                 }
                 let (key, first) = first_or_fallback();
-                (key, first, config::ConfigSource::Default)
+                (key, first, config::ConfigSource::Default, None)
             }
         }
     }
