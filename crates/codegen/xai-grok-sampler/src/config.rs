@@ -49,7 +49,7 @@ pub enum AuthScheme {
 /// protocol shape.
 // The trust classification lives in `xai-grok-sampling-types` so chat-state
 // configs can carry it from config resolution into request construction.
-pub use xai_grok_sampling_types::EndpointTrustClass;
+pub use xai_grok_sampling_types::{CredentialSource, EndpointTrustClass};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SamplerConfig {
@@ -68,6 +68,15 @@ pub struct SamplerConfig {
     /// `Local`, and everything else is `External`.
     #[serde(default)]
     pub endpoint_trust: Option<EndpointTrustClass>,
+    /// Which source produced `api_key`, for the construction-time origin
+    /// assertion (#110). `None` means a legacy or deserialized config that
+    /// predates the field, and is never asserted against — absence has to be
+    /// distinguishable from a known-safe source, or old sessions would trip
+    /// a check they cannot answer.
+    ///
+    /// Names only, never bytes: see [`CredentialSource`].
+    #[serde(default)]
+    pub credential_source: Option<CredentialSource>,
     /// Extra request headers applied verbatim. The sampler never inspects
     /// the URL to derive headers; callers (the session) inject proxy auth
     /// and other access headers here before constructing the config.
@@ -151,6 +160,8 @@ impl std::fmt::Debug for SamplerConfig {
             .field("model", &self.model)
             .field("auth_scheme", &self.auth_scheme)
             .field("endpoint_trust", &self.endpoint_trust)
+            // Safe to print in full: the enum carries names, not values.
+            .field("credential_source", &self.credential_source)
             .field("extra_header_count", &self.extra_headers.len())
             .field("query_param_count", &self.query_params.len())
             .field("env_http_header_count", &self.env_http_headers.len())
@@ -196,6 +207,7 @@ impl Default for SamplerConfig {
             api_backend: ApiBackend::default(),
             auth_scheme: AuthScheme::default(),
             endpoint_trust: None,
+            credential_source: None,
             extra_headers: IndexMap::new(),
             query_params: IndexMap::new(),
             env_http_headers: IndexMap::new(),
@@ -390,6 +402,21 @@ mod tests {
     }
 
     /// Configs serialized before the field existed must keep deserializing.
+    #[test]
+    /// A session stored before #110 has no `credential_source`. It must load
+    /// as `None` rather than fail, and `None` must stay distinguishable from
+    /// a resolved source -- the construction-time assertion skips the former
+    /// and enforces the latter.
+    fn config_without_credential_source_deserializes_to_none() {
+        let mut stripped = serde_json::to_value(SamplerConfig::default()).unwrap();
+        stripped
+            .as_object_mut()
+            .unwrap()
+            .remove("credential_source");
+        let config: SamplerConfig = serde_json::from_value(stripped).unwrap();
+        assert!(config.credential_source.is_none());
+    }
+
     #[test]
     fn config_without_doom_loop_recovery_deserializes_to_none() {
         let mut stripped = serde_json::to_value(SamplerConfig::default()).unwrap();

@@ -1073,6 +1073,61 @@ pub enum EndpointTrustClass {
     Local,
 }
 
+/// Which credential source won resolution for a model route (#110).
+///
+/// Carries only non-secret identifiers — environment-variable, provider, and
+/// header *names*. Never credential bytes, header values, account ids, or JWT
+/// material. That constraint is the point of the type: a route can be logged,
+/// serialized, and shown in `inspect` without a redaction pass, because there
+/// is nothing here to redact.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CredentialSource {
+    /// `auth_scheme = "none"`: deliberately unauthenticated.
+    None,
+    /// Static `api_key` on the model (or inherited provider) config.
+    ModelApiKey,
+    /// Resolved `env_key`; `name` is the environment variable that won.
+    ///
+    /// The winning name, not the configured one: `env_key` accepts a list, and
+    /// naming the first entry when a later alias supplied the value would send
+    /// a user to a variable they never set.
+    EnvKey { name: String },
+    /// Named `[auth_provider.*]`, including the OpenAI Codex profile.
+    AuthProvider { name: String },
+    /// Credential supplied directly by the user as a header, through
+    /// `extra_headers` or `env_http_headers`; `env` is the variable name for
+    /// the latter and `None` for a literal.
+    ExplicitHeader { header: String, env: Option<String> },
+    /// The ambient signed-in xAI session token.
+    XaiSession,
+    /// The ambient `XAI_API_KEY` environment variable.
+    XaiApiKeyEnv,
+    /// Ambient managed deployment key (`GROK_DEPLOYMENT_KEY`), reached as the
+    /// last arm of the auxiliary-model bearer fallback.
+    XaiDeploymentKey,
+    /// Nothing usable resolved. Distinct from [`Self::None`]: that one is a
+    /// choice, this one is a gap, and only this one blocks a route.
+    Missing,
+}
+
+impl CredentialSource {
+    /// Ambient first-party xAI credentials: nothing about the model asked for
+    /// them, so they must never travel to a non-first-party origin (#110).
+    ///
+    /// The deployment key belongs here even though the main resolver never
+    /// yields it. The auxiliary path mints a bearer as
+    /// `session -> XAI_API_KEY -> deployment_key` and stuffs the winner into a
+    /// synthetic entry's own `api_key`, so all three arrive as inference
+    /// credentials and all three are ambient.
+    pub fn is_ambient_xai(&self) -> bool {
+        matches!(
+            self,
+            Self::XaiSession | Self::XaiApiKeyEnv | Self::XaiDeploymentKey
+        )
+    }
+}
+
 /// Sampling client configuration (API key excluded — that stays in the client).
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct SamplingConfig {
@@ -1623,5 +1678,53 @@ mod tests {
         let inner: &dyn TraceContext = &*cloned_trace;
         let downcast = inner.as_any().downcast_ref::<TestTrace>().unwrap();
         assert_eq!(downcast.0, "trace-data");
+    }
+
+    /// Every `CredentialSource` has a deliberate answer to "is this an ambient
+    /// xAI credential", because that answer is what the #110 origin gate reads
+    /// to decide whether a credential may leave for a third-party host.
+    ///
+    /// The `match` below has no wildcard arm on purpose: adding a variant
+    /// stops compiling here until someone classifies it, and the list above is
+    /// in the same function so it gets updated in the same edit. A variant
+    /// that silently defaults to "not ambient" is a credential that silently
+    /// skips the gate.
+    #[test]
+    fn is_ambient_xai_is_decided_for_every_variant() {
+        let all = [
+            CredentialSource::None,
+            CredentialSource::ModelApiKey,
+            CredentialSource::EnvKey {
+                name: "SOME_KEY".to_owned(),
+            },
+            CredentialSource::AuthProvider {
+                name: "provider".to_owned(),
+            },
+            CredentialSource::ExplicitHeader {
+                header: "authorization".to_owned(),
+                env: None,
+            },
+            CredentialSource::XaiSession,
+            CredentialSource::XaiApiKeyEnv,
+            CredentialSource::XaiDeploymentKey,
+            CredentialSource::Missing,
+        ];
+        for source in &all {
+            let ambient = match source {
+                // Nothing about the model asked for these; they are the
+                // signed-in user's own first-party credentials.
+                CredentialSource::XaiSession
+                | CredentialSource::XaiApiKeyEnv
+                | CredentialSource::XaiDeploymentKey => true,
+                // Declared by the model's own configuration, or absent.
+                CredentialSource::None
+                | CredentialSource::ModelApiKey
+                | CredentialSource::EnvKey { .. }
+                | CredentialSource::AuthProvider { .. }
+                | CredentialSource::ExplicitHeader { .. }
+                | CredentialSource::Missing => false,
+            };
+            assert_eq!(source.is_ambient_xai(), ambient, "{source:?}");
+        }
     }
 }

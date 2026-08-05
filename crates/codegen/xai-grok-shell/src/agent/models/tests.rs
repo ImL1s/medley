@@ -18,6 +18,66 @@ fn test_manager() -> ModelsManager {
     .build()
 }
 
+/// #110: with an empty catalog, `sampling_config` synthesises a fallback
+/// entry against `models_base_url`. Pointed anywhere non-first-party that
+/// entry is credential-less and unready, and the choke point strips it — but
+/// stripping is not enough here. When the session path cannot resolve a model
+/// id it clones this construction-time config verbatim
+/// (`resolve_sampling_config_for_model`), and the readiness latch skips
+/// entries it cannot find, so the user's first prompt would be sent to that
+/// origin with no authentication. Unready has to mean unusable at this seam.
+#[test]
+fn construction_fallback_is_unusable_when_the_catalog_endpoint_is_external() {
+    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    use xai_grok_test_support::EnvGuard;
+    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+    let tmp = std::env::temp_dir().join("grok-test-fallback-origin");
+    let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
+    let mut cfg = config::Config::default();
+    cfg.endpoints.models_base_url = Some("https://third-party.example/v1".to_string());
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        IndexMap::new(),
+        acp::ModelId::new("default"),
+        auth_manager,
+        cfg,
+    )
+    .cache(test_cache_manager(&tmp))
+    .build();
+
+    let sampling = mgr.sampling_config();
+    assert!(
+        sampling.base_url.is_empty(),
+        "an unready construction fallback must not carry a usable endpoint, got {}",
+        sampling.base_url
+    );
+    assert_eq!(sampling.api_key, None, "and no credential with it");
+}
+
+/// The same seam on a first-party endpoint is the normal startup path and
+/// must keep working.
+#[test]
+fn construction_fallback_is_usable_on_a_first_party_endpoint() {
+    let tmp = std::env::temp_dir().join("grok-test-fallback-first-party");
+    let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        IndexMap::new(),
+        acp::ModelId::new("default"),
+        auth_manager,
+        config::Config::default(),
+    )
+    .cache(test_cache_manager(&tmp))
+    .build();
+
+    assert!(
+        !mgr.sampling_config().base_url.is_empty(),
+        "the first-party default is the normal startup path"
+    );
+}
+
 #[tokio::test]
 async fn catalog_retry_recovers_after_endpoint_returns() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -843,15 +903,15 @@ fn apply_refresh_result_only_updates_etag_on_success() {
     );
 }
 
+/// The production constructor rather than a hand-rolled copy of it.
+///
+/// The copy left `base_url` empty, which no catalog entry ever is in
+/// production -- `ModelEntry::fallback` fills it from the endpoints. That was
+/// invisible until readiness began consulting the endpoint (#110), at which
+/// point every fixture here became a credential-less non-first-party model
+/// and stopped being selectable.
 fn make_model_entry(model_id: &str) -> ModelEntry {
-    ModelEntry {
-        info: config::ModelInfo::fallback(model_id),
-        api_key: None,
-        env_key: None,
-        auth_provider: None,
-        api_base_url: None,
-        config_validation_errors: Vec::new(),
-    }
+    ModelEntry::fallback(model_id, &config::EndpointsConfig::default())
 }
 
 fn make_prefetched(ids: &[&str]) -> IndexMap<String, ModelEntry> {
@@ -1681,26 +1741,11 @@ fn default_model_skips_oauth_only_for_api_key_users() {
     let cfg = config::Config::default();
     let mut catalog = IndexMap::new();
 
-    let mut oauth_only = ModelEntry {
-        info: config::ModelInfo::fallback("oauth-only"),
-        api_key: None,
-        env_key: None,
-        auth_provider: None,
-        api_base_url: None,
-        config_validation_errors: Vec::new(),
-    };
+    let mut oauth_only = make_model_entry("oauth-only");
     oauth_only.info.supported_in_api = false;
     catalog.insert("oauth-only".to_string(), oauth_only);
 
-    let public = ModelEntry {
-        info: config::ModelInfo::fallback("public-model"),
-        api_key: None,
-        env_key: None,
-        auth_provider: None,
-        api_base_url: None,
-        config_validation_errors: Vec::new(),
-    };
-    catalog.insert("public-model".to_string(), public);
+    catalog.insert("public-model".to_string(), make_model_entry("public-model"));
 
     let (key, _, _) = resolve_default_model(&cfg, &catalog, false);
     assert_ne!(

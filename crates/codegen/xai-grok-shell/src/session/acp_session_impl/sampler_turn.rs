@@ -48,6 +48,10 @@ struct SessionTokenAuthGate {
     /// gate off so session bearers are never attached or refreshed after a
     /// model switch to a keyless local endpoint.
     auth_scheme: xai_grok_sampler::AuthScheme,
+    /// The model is authenticated by a credential header the user declared.
+    /// That is terminal auth: the session must neither be attached on top of
+    /// it nor invoked to "recover" when the provider rejects it (#110).
+    declared_credential_header: bool,
 }
 impl SessionTokenAuthGate {
     /// Single place `is_session_based` / `endpoint_is_first_party` are derived,
@@ -56,18 +60,38 @@ impl SessionTokenAuthGate {
         auth_method_id: Option<&acp::AuthMethodId>,
         model_byok: crate::agent::auth_method::ModelByok,
         base_url: &str,
+        endpoint_trust: Option<xai_grok_sampler::EndpointTrustClass>,
         auth_scheme: xai_grok_sampler::AuthScheme,
+        extra_headers: &indexmap::IndexMap<String, String>,
+        env_http_headers: &indexmap::IndexMap<String, String>,
     ) -> Self {
         Self {
             is_session_based: auth_method_id
                 .is_some_and(crate::agent::auth_method::is_session_based_method),
             model_byok,
-            endpoint_is_first_party: crate::util::is_xai_api_url(base_url),
+            // An explicit trust class wins, mirroring `resolve_endpoint_trust`
+            // in the sampler, so the two layers cannot disagree about the same
+            // config. Otherwise derive it from the URL with the *attach-side*
+            // predicate: https required and loopback refused, unlike the
+            // refusal-side `is_xai_api_url` this used to call (#110).
+            endpoint_is_first_party: match endpoint_trust {
+                Some(trust) => trust == xai_grok_sampler::EndpointTrustClass::FirstPartyXai,
+                None => crate::util::is_xai_api_bearer_url(base_url),
+            },
             auth_scheme,
+            // Derived here rather than passed in, for the same reason
+            // `endpoint_is_first_party` is: a call site that has to remember
+            // to compute it is a call site that will eventually forget.
+            declared_credential_header: crate::agent::config::explicit_credential_header_in(
+                extra_headers,
+                env_http_headers,
+            )
+            .is_some(),
         }
     }
     fn active(self) -> bool {
-        if self.auth_scheme == xai_grok_sampler::AuthScheme::None {
+        if self.auth_scheme == xai_grok_sampler::AuthScheme::None || self.declared_credential_header
+        {
             return false;
         }
         crate::agent::auth_method::session_token_auth_gate(
@@ -380,14 +404,24 @@ impl SessionActor {
     /// (`base_url` keeps an `Unknown` BYOK status refreshable only
     /// against first-party xAI hosts). Also inactive for
     /// [`xai_grok_sampler::AuthScheme::None`].
-    fn auth_gate(&self, model_id: &str, base_url: &str) -> SessionTokenAuthGate {
+    fn auth_gate(
+        &self,
+        model_id: &str,
+        base_url: &str,
+        endpoint_trust: Option<xai_grok_sampler::EndpointTrustClass>,
+        extra_headers: &indexmap::IndexMap<String, String>,
+        env_http_headers: &indexmap::IndexMap<String, String>,
+    ) -> SessionTokenAuthGate {
         let facts = self.model_auth_facts(model_id);
         let auth_method = self.auth_method_id.load();
         SessionTokenAuthGate::new(
             auth_method.as_deref(),
             facts.byok,
             base_url,
+            endpoint_trust,
             facts.auth_scheme,
+            extra_headers,
+            env_http_headers,
         )
     }
     /// Emit a unified-log breadcrumb whenever the session-token refresh gate is
@@ -471,7 +505,10 @@ impl SessionActor {
             auth_method.as_deref(),
             model_facts.byok,
             &cfg.base_url,
+            cfg.endpoint_trust,
             model_facts.auth_scheme,
+            &cfg.extra_headers,
+            &cfg.env_http_headers,
         );
         // Security boundary: never attach a live session bearer (or rely on
         // gate.active alone) when the active model is keyless — even if the
@@ -480,8 +517,19 @@ impl SessionActor {
         // also stay credential-free at turn reconstruct — this is the final
         // wire choke point (chat-state does not persist readiness).
         let mut auth_scheme = model_facts.auth_scheme;
-        let mut use_session_bearer_resolver =
-            gate.active() && auth_scheme != xai_grok_sampler::AuthScheme::None;
+        // #110: chat state carries the headers but not `credential_source`, so
+        // a model authenticated by a header the user declared arrives here with
+        // its provenance gone. It is still `NotByok`, so the gate would enable
+        // the session resolver and `SamplingClient::post` would strip the
+        // user's header and send under the xAI session instead. Re-derive the
+        // provenance from the headers, which chat state does keep.
+        let declared_credential_header = crate::agent::config::explicit_credential_header_in(
+            &cfg.extra_headers,
+            &cfg.env_http_headers,
+        );
+        let mut use_session_bearer_resolver = gate.active()
+            && declared_credential_header.is_none()
+            && auth_scheme != xai_grok_sampler::AuthScheme::None;
         let mut use_provider_bearer_resolver = cfg.api_backend
             == xai_grok_sampling_types::ApiBackend::CodexResponses
             && model_auth_provider.is_some()
@@ -573,6 +621,9 @@ impl SessionActor {
             temperature: cfg.temperature,
             top_p: cfg.top_p,
             endpoint_trust: cfg.endpoint_trust,
+            credential_source: declared_credential_header.map(|(header, env)| {
+                xai_grok_sampler::CredentialSource::ExplicitHeader { header, env }
+            }),
             api_backend: cfg.api_backend,
             auth_scheme,
             extra_headers,
@@ -1016,11 +1067,18 @@ impl SessionActor {
             .data(detailed_message);
             return Err(acp_err);
         }
-        let (failed_model_id, failed_base_url) = self
+        let (failed_model_id, failed_base_url, failed_endpoint_trust, failed_headers) = self
             .chat_state_handle
             .get_sampling_config()
             .await
-            .map(|c| (self.catalog_model_id_str(), c.base_url))
+            .map(|c| {
+                (
+                    self.catalog_model_id_str(),
+                    c.base_url,
+                    c.endpoint_trust,
+                    (c.extra_headers, c.env_http_headers),
+                )
+            })
             .unwrap_or_default();
         let auth_provider =
             if matches!(error.kind, SamplingErrorKind::Auth) || error.status_code == Some(401) {
@@ -1029,7 +1087,13 @@ impl SessionActor {
                 None
             };
         let auth_recovery_eligible = matches!(error.kind, SamplingErrorKind::Auth) && {
-            let gate = self.auth_gate(&failed_model_id, &failed_base_url);
+            let gate = self.auth_gate(
+                &failed_model_id,
+                &failed_base_url,
+                failed_endpoint_trust,
+                &failed_headers.0,
+                &failed_headers.1,
+            );
             let eligible = gate.active();
             self.log_auth_gate_unknown("handle_sampling_failure", gate, &failed_base_url);
             if !eligible && auth_provider.is_none() {
@@ -1369,13 +1433,28 @@ impl SessionActor {
         if let Some(ref am) = self.auth_manager {
             let creds = self.chat_state_handle.get_credentials().await;
             let catalog_model_id = current_model_id.clone();
-            let base_url = self
+            let (base_url, endpoint_trust, headers) = self
                 .chat_state_handle
                 .get_sampling_config()
                 .await
-                .map(|c| c.base_url)
+                .map(|c| {
+                    (
+                        c.base_url,
+                        c.endpoint_trust,
+                        (c.extra_headers, c.env_http_headers),
+                    )
+                })
                 .unwrap_or_default();
-            if self.auth_gate(&catalog_model_id, &base_url).active() {
+            if self
+                .auth_gate(
+                    &catalog_model_id,
+                    &base_url,
+                    endpoint_trust,
+                    &headers.0,
+                    &headers.1,
+                )
+                .active()
+            {
                 match am.get_valid_token().await {
                     Ok(key) => {
                         if creds.api_key.as_deref() != Some(&key) {

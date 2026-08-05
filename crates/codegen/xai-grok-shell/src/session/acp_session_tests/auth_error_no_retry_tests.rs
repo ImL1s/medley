@@ -165,12 +165,17 @@ fn spawn_model_persistence_ack(mut persistence_rx: mpsc::UnboundedReceiver<Persi
 /// uncatalogued model, so production resolution otherwise classifies it as
 /// unknown/custom and masks the session-method behavior these tests exercise.
 async fn pin_first_party_session_model(actor: &SessionActor) {
-    let model_id = actor
-        .chat_state_handle
-        .get_sampling_config()
-        .await
-        .map(|cfg| cfg.model)
-        .unwrap_or_default();
+    let cfg = actor.chat_state_handle.get_sampling_config().await;
+    let model_id = cfg.as_ref().map(|c| c.model.clone()).unwrap_or_default();
+    // Pin the *endpoint* too, not just the BYOK classification. Before #110 a
+    // `NotByok` model skipped the endpoint check entirely, so pinning the
+    // facts alone was enough to make this helper's name true. Now that the
+    // gate consults the endpoint on every arm, the fixture's cleartext
+    // localhost URL is precisely what "first party" excludes.
+    if let Some(mut cfg) = cfg {
+        cfg.base_url = "https://api.x.ai/v1".to_string();
+        actor.chat_state_handle.update_sampling_config(cfg);
+    }
     actor
         .model_auth_memo
         .replace(Some(crate::session::acp_session::ModelAuthMemo {
@@ -813,12 +818,18 @@ fn session_token_auth_gate_truth_table() {
         assert!(!gate(false, ModelByok::NotByok, fp));
         assert!(!gate(false, ModelByok::Byok, fp));
         assert!(!gate(false, ModelByok::Unknown, fp));
-        // Session method: a definite classification ignores the endpoint —
-        // NotByok always refreshes (only ever routes to the session endpoint),
-        // a genuine per-model Byok never does.
-        assert!(gate(true, ModelByok::NotByok, fp));
+        // Session method: a genuine per-model Byok never refreshes, on any
+        // endpoint.
         assert!(!gate(true, ModelByok::Byok, fp));
     }
+    // Session method + a model carrying no credential of its own: refresh only
+    // against a first-party host. `NotByok` used to ignore the endpoint on the
+    // reasoning that it "only ever routes to the session endpoint" — but it
+    // says nothing about where `base_url` points, and a catalog model with an
+    // overridden endpoint is `NotByok` and third-party at the same time. This
+    // arm was unconditionally `true` pre-fix (#110).
+    assert!(gate(true, ModelByok::NotByok, true));
+    assert!(!gate(true, ModelByok::NotByok, false));
     // Session method + Unknown BYOK: refresh only against a first-party xAI
     // host, so a transiently-unclassifiable config can't demote a live session
     // (the stale-token 401 regression) yet the session token never leaks to a
@@ -860,6 +871,66 @@ async fn sampler_401_session_method_with_stale_api_key_auth_type_still_recovers(
             assert!(
                 called.load(Ordering::SeqCst),
                 "the OIDC refresher must be invoked for a session-based method"
+            );
+        })
+        .await;
+}
+
+/// A 401 for a credential the session does not own must surface, not trigger
+/// session recovery.
+///
+/// Thirteenth #110 review finding. `sampling_config_for_model` already declined
+/// to wire the session bearer resolver for a model authenticated by a
+/// user-declared header, but this path asked the gate directly, so a provider
+/// rejecting the *user's* key refreshed the xAI session and retried with the
+/// same rejected header — hiding the real failure behind a retry.
+///
+/// Asserted as a pair: without the control case, a fixture that never reaches
+/// the gate at all would satisfy the negative assertion and prove nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn sampler_401_does_not_session_recover_a_user_declared_credential_header() {
+    async fn recovers(declared_header: Option<(&str, &str)>) -> bool {
+        let called = Arc::new(AtomicBool::new(false));
+        let refresher: Arc<dyn crate::auth::refresh::TokenRefresher> =
+            Arc::new(AlwaysSucceedRefresher {
+                called: called.clone(),
+            });
+        let (_dir, am) = auth_manager_with_refresher(refresher);
+        let (actor, _rx) = make_actor_with_method_and_credentials(
+            Some(am),
+            "cached_token",
+            xai_chat_state::AuthType::ApiKey,
+            "session-jwt".to_string(),
+        )
+        .await;
+        pin_first_party_session_model(&actor).await;
+        if let Some((name, value)) = declared_header {
+            let mut cfg = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("fixture sampling config");
+            cfg.extra_headers
+                .insert(name.to_string(), value.to_string());
+            actor.chat_state_handle.update_sampling_config(cfg);
+        }
+        matches!(
+            actor.handle_sampling_failure(auth_error()).await,
+            Ok(SamplerFailureRecovery::RefreshAuthAndResubmit { .. })
+        )
+    }
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            assert!(
+                recovers(None).await,
+                "control: a first-party session model with no declared header must still \
+                 recover, or the negative case below is vacuous"
+            );
+            assert!(
+                !recovers(Some(("Authorization", "Bearer user-provider-key"))).await,
+                "a 401 rejecting the user's own credential header must be surfaced, not \
+                 answered by refreshing the xAI session and retrying the same header"
             );
         })
         .await;
@@ -1481,6 +1552,7 @@ async fn set_session_model_preserves_catalog_key_for_none_alias_with_shared_wire
                 temperature: None,
                 top_p: None,
                 endpoint_trust: None,
+                credential_source: None,
                 api_backend: crate::sampling::ApiBackend::ChatCompletions,
                 auth_scheme: AuthScheme::None,
                 extra_headers: Default::default(),
@@ -1574,6 +1646,7 @@ async fn handle_set_session_model_clears_credentials_for_none() {
                 temperature: None,
                 top_p: None,
                 endpoint_trust: None,
+                credential_source: None,
                 api_backend: crate::sampling::ApiBackend::ChatCompletions,
                 auth_scheme: AuthScheme::None,
                 extra_headers: Default::default(),
@@ -1674,6 +1747,7 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                 temperature: None,
                 top_p: None,
                 endpoint_trust: None,
+                credential_source: None,
                 api_backend: crate::sampling::ApiBackend::ChatCompletions,
                 auth_scheme: Default::default(),
                 extra_headers: Default::default(),
@@ -1779,6 +1853,7 @@ async fn switch_to_first_party_model_drops_minted_provider_token() {
                 temperature: None,
                 top_p: None,
                 endpoint_trust: None,
+                credential_source: None,
                 api_backend: crate::sampling::ApiBackend::ChatCompletions,
                 auth_scheme: Default::default(),
                 extra_headers: Default::default(),

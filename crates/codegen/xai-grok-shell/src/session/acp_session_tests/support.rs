@@ -252,7 +252,12 @@ pub(crate) async fn create_test_actor_ex(
     let chat_state_handle = xai_chat_state::ChatStateActor::spawn(
         vec![],
         xai_grok_sampling_types::SamplingConfig {
-            base_url: "http://localhost".to_string(),
+            // A placeholder rather than a listening endpoint. It used to be
+            // `http://localhost`, which classified as first-party only because
+            // the old predicate accepted loopback; #110 made the attach-side
+            // check reject cleartext and loopback, which silently turned every
+            // session-token fixture built here into a third-party one.
+            base_url: "https://api.x.ai/v1".to_string(),
             model: "test".to_string(),
             max_completion_tokens: None,
             temperature: None,

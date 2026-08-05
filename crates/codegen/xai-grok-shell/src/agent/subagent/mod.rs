@@ -742,10 +742,14 @@ fn subagent_model_resolution_context(
         "agent": agent_name,
         "priority": priority,
         "child_model": resolved_id.0.as_ref(),
-        "child_endpoint_is_first_party": crate::util::is_xai_api_url(&resolved.base_url),
+        // Same predicate the resolver gate uses (#110). This record exists to
+        // explain why a subagent did or did not inherit a credential, so a
+        // looser notion of "first party" here would contradict the decision
+        // it is documenting.
+        "child_endpoint_is_first_party": crate::util::is_xai_api_bearer_url(&resolved.base_url),
         "child_credential_present": resolved.api_key.is_some(),
         "parent_model": &parent.model,
-        "parent_endpoint_is_first_party": crate::util::is_xai_api_url(&parent.base_url),
+        "parent_endpoint_is_first_party": crate::util::is_xai_api_bearer_url(&parent.base_url),
         "parent_credential_present": parent.api_key.is_some(),
         "keys_match": keys_match,
     })
@@ -760,12 +764,25 @@ fn session_bearer_resolver(
     ctx: &SubagentSpawnContext,
     byok: crate::agent::auth_method::ModelByok,
     base_url: &str,
+    credential_source: Option<&xai_grok_sampler::CredentialSource>,
 ) -> Option<xai_grok_sampler::SharedBearerResolver> {
     use crate::agent::auth_method;
+    // #110: a credential header the user declared is terminal. Attaching a
+    // session resolver on top of one makes `SamplingClient::post` strip the
+    // header and send under the xAI session instead. The check lives here, in
+    // the one function every attach path goes through, rather than at each
+    // call site -- three of them had to be found one at a time by review.
+    if matches!(
+        credential_source,
+        Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
+    ) {
+        return None;
+    }
     auth_method::session_token_auth_gate(
         auth_method::is_session_based_method(&ctx.auth_method_id),
         byok,
-        crate::util::is_xai_api_url(base_url),
+        // Attach-side predicate: https required, loopback refused (#110).
+        crate::util::is_xai_api_bearer_url(base_url),
     )
     .then(|| {
         crate::auth::credential_provider::WireValidBearerResolver::shared(ctx.auth_manager.clone())
@@ -777,11 +794,12 @@ fn inherited_bearer_resolver(
     ctx: &SubagentSpawnContext,
     model: &str,
     base_url: &str,
+    credential_source: Option<&xai_grok_sampler::CredentialSource>,
 ) -> Option<xai_grok_sampler::SharedBearerResolver> {
     let byok = crate::agent::config::resolve_model_auth_facts_and_provider(model)
         .0
         .byok;
-    session_bearer_resolver(ctx, byok, base_url)
+    session_bearer_resolver(ctx, byok, base_url, credential_source)
 }
 /// Read the parent session's actual current sampling config.
 ///
@@ -816,6 +834,16 @@ async fn read_parent_sampling_config(
             .unwrap_or(ctx.sampling_config.auth_scheme);
             let inherited_base_url = cfg.base_url.clone();
             let strip_guard = ctx.would_strip_fallback_key(creds.api_key.as_deref());
+            // #110: the parent config carries its headers but not
+            // `credential_source`, so a parent authenticated by a header the
+            // user declared arrives here with its provenance gone. Wiring the
+            // parent session resolver on top would make the sampler strip that
+            // header and send the child's requests under the session instead.
+            // Re-derive from the headers, which do survive the rebuild.
+            let declared_credential_header = crate::agent::config::explicit_credential_header_in(
+                &extra_headers,
+                &cfg.env_http_headers,
+            );
             let api_key = if auth_scheme == xai_grok_sampler::AuthScheme::None {
                 None
             } else {
@@ -832,6 +860,9 @@ async fn read_parent_sampling_config(
                 // External must not silently become derivable-first-party
                 // (and vice versa) across the subagent boundary.
                 endpoint_trust: cfg.endpoint_trust,
+                credential_source: declared_credential_header.clone().map(|(header, env)| {
+                    xai_grok_sampler::CredentialSource::ExplicitHeader { header, env }
+                }),
                 api_backend: cfg.api_backend,
                 auth_scheme,
                 extra_headers,
@@ -849,11 +880,13 @@ async fn read_parent_sampling_config(
                 user_id: ctx.sampling_config.user_id.clone(),
                 origin_client: ctx.sampling_config.origin_client.clone(),
                 attribution_callback: ctx.attribution_callback.clone(),
-                bearer_resolver: if auth_scheme == xai_grok_sampler::AuthScheme::None || strip_guard
+                bearer_resolver: if auth_scheme == xai_grok_sampler::AuthScheme::None
+                    || strip_guard
+                    || declared_credential_header.is_some()
                 {
                     None
                 } else {
-                    inherited_bearer_resolver(ctx, &cfg.model, &inherited_base_url)
+                    inherited_bearer_resolver(ctx, &cfg.model, &inherited_base_url, None)
                 },
                 supports_backend_search: ctx
                     .models_manager
@@ -874,7 +907,7 @@ async fn read_parent_sampling_config(
                 None,
                 Some(serde_json::json!({
                     "parent_model": &inherited.model,
-                    "parent_endpoint_is_first_party": crate::util::is_xai_api_url(&inherited.base_url),
+                    "parent_endpoint_is_first_party": crate::util::is_xai_api_bearer_url(&inherited.base_url),
                     "parent_credential_present": inherited.api_key.is_some(),
                     "session_model_id": model_id.0.as_ref(),
                     "global_model_id": global_model_id.0.as_ref(),
@@ -893,7 +926,7 @@ async fn read_parent_sampling_config(
         None,
         Some(serde_json::json!({
             "parent_model": &ctx.sampling_config.model,
-            "parent_endpoint_is_first_party": crate::util::is_xai_api_url(&ctx.sampling_config.base_url),
+            "parent_endpoint_is_first_party": crate::util::is_xai_api_bearer_url(&ctx.sampling_config.base_url),
             "parent_credential_present": ctx.sampling_config.api_key.is_some(),
             "source": "spawn_context_baseline",
             "has_chat_state": ctx.parent_chat_state.is_some(),
@@ -907,7 +940,12 @@ async fn read_parent_sampling_config(
         fallback.bearer_resolver = if ctx.would_strip_fallback_key(fallback.api_key.as_deref()) {
             None
         } else {
-            inherited_bearer_resolver(ctx, &fallback.model, &fallback.base_url)
+            inherited_bearer_resolver(
+                ctx,
+                &fallback.model,
+                &fallback.base_url,
+                fallback.credential_source.as_ref(),
+            )
         };
     }
     fallback.supports_backend_search = ctx
@@ -978,6 +1016,7 @@ fn resolve_model_override_to_config(
                 crate::agent::auth_method::ModelByok::NotByok
             },
             &config.base_url,
+            config.credential_source.as_ref(),
         )
     } else {
         None
@@ -989,7 +1028,7 @@ fn resolve_model_override_to_config(
             "model_id": model_id,
             "canonical_model": canonical_model_id.0.as_ref(),
             "resolved_model_raw": &config.model,
-            "endpoint_is_first_party": crate::util::is_xai_api_url(&config.base_url),
+            "endpoint_is_first_party": crate::util::is_xai_api_bearer_url(&config.base_url),
             "credential_present": config.api_key.is_some(),
             "has_own_credentials": entry.has_own_credentials(),
             "has_session_key": has_session_key,

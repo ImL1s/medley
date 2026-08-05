@@ -1957,6 +1957,40 @@ fn resolve_model_override_wires_resolver_for_fresh_and_hard_expired_session_keys
         assert!(config.bearer_resolver.is_some(), "key={key}");
     }
 }
+/// #110: the pinned-model override path is a separate branch from live
+/// parent inheritance, and it wires the parent session resolver too. A pinned
+/// model authenticated only by a header the user declared must not get one:
+/// `SamplingClient::post` treats the resolver as the sole auth source and
+/// removes the declared header before sending.
+#[test]
+fn resolve_model_override_keeps_a_declared_header_over_the_session() {
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.auth_method_id =
+        acp::AuthMethodId::new(crate::agent::auth_method::CACHED_TOKEN_AUTH_METHOD_ID);
+    ctx.auth = Some(crate::auth::GrokAuth {
+        key: "session-jwt".into(),
+        ..crate::auth::GrokAuth::test_default()
+    });
+    let mut entry = test_model_entry("grok-4.5");
+    entry
+        .info
+        .extra_headers
+        .insert("Authorization".into(), "Bearer vendor-sentinel".into());
+    ctx.available_models.insert("grok-4.5".to_string(), entry);
+
+    let (config, _) = resolve_model_override_to_config("grok-4.5", &ctx).unwrap();
+    assert!(
+        config.bearer_resolver.is_none(),
+        "a declared header must not be replaced by the session resolver"
+    );
+    assert_eq!(
+        config.credential_source,
+        Some(xai_grok_sampler::CredentialSource::ExplicitHeader {
+            header: "authorization".to_owned(),
+            env: None,
+        })
+    );
+}
 /// `would_strip_fallback_key` on the override path. `XAI_API_KEY`'s
 /// presence varies by environment, so assert the rule itself rather
 /// than one branch of it.

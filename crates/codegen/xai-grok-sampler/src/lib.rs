@@ -37,8 +37,8 @@ pub use actor::SamplerActor;
 pub use attribution::{Auth401AttributionCallback, SamplingConsumer, SharedAttributionCallback};
 pub use client::{ApiBackend, SamplingClient, user_agent_string_for};
 pub use config::{
-    AuthScheme, BearerResolver, EndpointTrustClass, HeaderInjector, OriginClientInfo, RetryPolicy,
-    SamplerConfig, SharedBearerResolver, SharedHeaderInjector,
+    AuthScheme, BearerResolver, CredentialSource, EndpointTrustClass, HeaderInjector,
+    OriginClientInfo, RetryPolicy, SamplerConfig, SharedBearerResolver, SharedHeaderInjector,
 };
 pub use doom_loop::DoomLoopSignalCollector;
 pub use events::{SamplingChannel, SamplingErrorInfo, SamplingErrorKind, SamplingEvent};

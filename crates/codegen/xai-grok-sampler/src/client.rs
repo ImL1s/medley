@@ -72,7 +72,12 @@ fn strip_codex_routing_headers(headers: &mut HeaderMap) {
 /// hosts (including the cli-chat-proxy) with real auth, then loopback, then
 /// external. Decided once at client construction and enforced at every
 /// request boundary.
-fn resolve_endpoint_trust(config: &SamplerConfig) -> EndpointTrustClass {
+///
+/// Public because it is the *only* trust classifier: anything that needs to
+/// describe or display where a request will go must ask this rather than
+/// re-derive it, or the two answers drift and the displayed one starts
+/// lying about the enforced one (#110).
+pub fn resolve_endpoint_trust(config: &SamplerConfig) -> EndpointTrustClass {
     if let Some(explicit) = config.endpoint_trust {
         return explicit;
     }
@@ -799,6 +804,41 @@ impl SamplingClient {
     pub fn new(config: SamplerConfig) -> Result<Self> {
         let endpoint_trust = resolve_endpoint_trust(&config);
         let is_first_party = matches!(endpoint_trust, EndpointTrustClass::FirstPartyXai);
+        // Defense in depth (#110, Layer 3). The shell's choke point already
+        // refuses to emit this pairing; making it unconstructable means a
+        // later regression upstream of here cannot quietly reintroduce it.
+        //
+        // The trust class alone is not enough here. It is scheme-agnostic by
+        // design — it decides *refusals*, where failing closed means treating
+        // a cleartext xAI host as first-party — so reusing it made this layer
+        // weaker than the choke point it backs up: an ambient credential
+        // bound to `http://api.x.ai/v1` constructed happily and went out over
+        // cleartext. Adding the scheme requirement composes the shell's
+        // bearer-safe predicate out of what is already here (the class
+        // already excludes loopback) rather than growing a third copy of the
+        // host rules. An explicit `endpoint_trust` still wins, because
+        // declaring an origin trusted is the supported way to say so.
+        //
+        // The message names no secret: a refusal that prints what it refused
+        // has not refused anything.
+        let ambient_origin_allowed = match config.endpoint_trust {
+            Some(trust) => trust == EndpointTrustClass::FirstPartyXai,
+            None => {
+                is_first_party
+                    && reqwest::Url::parse(&config.base_url)
+                        .is_ok_and(|url| url.scheme() == "https")
+            }
+        };
+        if !ambient_origin_allowed
+            && config
+                .credential_source
+                .as_ref()
+                .is_some_and(xai_grok_sampling_types::CredentialSource::is_ambient_xai)
+        {
+            return Err(SamplingError::InvalidConfiguration(
+                "ambient xAI credential is not allowed for a non-first-party endpoint",
+            ));
+        }
         let is_codex = matches!(config.api_backend, ApiBackend::CodexResponses);
         if is_codex && !config.query_params.is_empty() {
             return Err(SamplingError::InvalidConfiguration(
@@ -2499,6 +2539,7 @@ mod tests {
             top_p: None,
             api_backend: ApiBackend::ChatCompletions,
             endpoint_trust: None,
+            credential_source: None,
             auth_scheme: AuthScheme::Bearer,
             extra_headers: IndexMap::new(),
             query_params: IndexMap::new(),
@@ -3115,6 +3156,134 @@ mod tests {
         );
     }
 
+    #[test]
+    /// #110 Layer 3. The choke point in the shell already refuses to emit this
+    /// combination; this makes it unrepresentable, so a later regression
+    /// upstream of here cannot quietly reintroduce it. The error names no
+    /// secret -- a refusal that prints the credential it refused is not a
+    /// refusal.
+    #[test]
+    fn ambient_xai_credential_cannot_construct_for_non_first_party_endpoint() {
+        use crate::config::CredentialSource;
+        for source in [
+            CredentialSource::XaiSession,
+            CredentialSource::XaiApiKeyEnv,
+            CredentialSource::XaiDeploymentKey,
+        ] {
+            for base_url in [
+                "https://api.openai.com/v1",
+                "http://127.0.0.1:11434/v1",
+                // An xAI host over cleartext. The trust class calls this
+                // first-party -- it is scheme-agnostic on purpose, because it
+                // decides *refusals* -- so classifying by trust alone made
+                // this layer weaker than the choke point it backs up.
+                "http://api.x.ai/v1",
+            ] {
+                let err = SamplingClient::new(SamplerConfig {
+                    api_key: Some("XAI_SESSION_SENTINEL".to_string()),
+                    base_url: base_url.to_string(),
+                    credential_source: Some(source.clone()),
+                    ..minimal_config()
+                })
+                .expect_err("an ambient credential must not construct here");
+                let rendered = format!("{err}");
+                assert!(
+                    !rendered.contains("SENTINEL"),
+                    "the error leaked the credential: {rendered}"
+                );
+            }
+        }
+    }
+    /// The other side of the same rule: a credential the model declared is
+    /// none of this layer's business, and an ambient one is fine where it
+    /// belongs.
+    #[test]
+    fn non_ambient_sources_and_first_party_ambient_still_construct() {
+        use crate::config::CredentialSource;
+        SamplingClient::new(SamplerConfig {
+            api_key: Some("sk-provider".to_string()),
+            base_url: "https://api.openai.com/v1".to_string(),
+            credential_source: Some(CredentialSource::ModelApiKey),
+            ..minimal_config()
+        })
+        .expect("a model-owned key on an external endpoint is the BYOK case");
+
+        SamplingClient::new(SamplerConfig {
+            api_key: Some("session".to_string()),
+            base_url: "https://api.x.ai/v1".to_string(),
+            credential_source: Some(CredentialSource::XaiSession),
+            ..minimal_config()
+        })
+        .expect("an ambient credential on a first-party origin is the normal flow");
+    }
+    /// A model-declared key reaches its own provider untouched, and nothing
+    /// ambient rides along. Built rather than sent: the built request carries
+    /// exactly the headers that would go on the wire, which is what is being
+    /// asserted here.
+    ///
+    /// For the origin the issue reproduces against, ambient absence is proven
+    /// twice over and more strongly than a capture could: the shell's choke
+    /// point hands this layer a keyless config, and an ambient-source config
+    /// cannot construct a client at all. The request cannot exist to be
+    /// captured.
+    #[test]
+    fn declared_provider_key_reaches_the_wire_without_anything_ambient() {
+        use crate::config::CredentialSource;
+        let client = SamplingClient::new(SamplerConfig {
+            api_key: Some("provider-key-sentinel".to_string()),
+            base_url: "http://127.0.0.1:11434/v1".to_string(),
+            credential_source: Some(CredentialSource::ModelApiKey),
+            api_backend: ApiBackend::ChatCompletions,
+            ..minimal_config()
+        })
+        .expect("a declared provider key is this layer's normal BYOK case");
+        let req = client
+            .post("http://127.0.0.1:11434/v1/chat/completions")
+            .0
+            .build()
+            .expect("build request");
+        assert_eq!(
+            req.headers()[AUTHORIZATION],
+            "Bearer provider-key-sentinel",
+            "the model's own key must reach its own provider"
+        );
+        let rendered = format!("{:?}", req.headers());
+        for ambient in ["XAI_SESSION_SENTINEL", "XAI_API_KEY_SENTINEL"] {
+            assert!(
+                !rendered.contains(ambient),
+                "an ambient credential rode along: {rendered}"
+            );
+        }
+    }
+    /// `auth_scheme = "none"` is the keyless local-server case and an
+    /// acceptance criterion of #110: no credential header of any kind, not an
+    /// empty one.
+    #[test]
+    fn auth_scheme_none_sends_no_credential_header_at_all() {
+        let client = SamplingClient::new(SamplerConfig {
+            api_key: Some("must-not-be-sent".to_string()),
+            base_url: "http://127.0.0.1:11434/v1".to_string(),
+            auth_scheme: AuthScheme::None,
+            api_backend: ApiBackend::ChatCompletions,
+            ..minimal_config()
+        })
+        .expect("keyless local servers stay constructible");
+        let req = client
+            .post("http://127.0.0.1:11434/v1/chat/completions")
+            .0
+            .build()
+            .expect("build request");
+        assert!(
+            req.headers().get(AUTHORIZATION).is_none(),
+            "auth_scheme = none must send no Authorization header"
+        );
+        assert!(
+            req.headers()
+                .get(HeaderName::from_static("x-api-key"))
+                .is_none(),
+            "auth_scheme = none must send no x-api-key header"
+        );
+    }
     #[test]
     fn third_party_base_url_omits_xai_identity_headers_even_with_bearer() {
         let cfg = SamplerConfig {

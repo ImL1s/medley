@@ -115,7 +115,7 @@ env_http_headers = { "X-Tenant" = "TENANT_TOKEN" }    # Headers from env vars, r
 
 | Value | Behavior |
 |-------|----------|
-| `"bearer"` | Default. Sends `Authorization: Bearer <key>` from `api_key` / `env_key` / session / ambient fallback. |
+| `"bearer"` | Default. Sends `Authorization: Bearer <key>` from `api_key` / `env_key`. The ambient fallback (your session token or `XAI_API_KEY`) applies **only when the final effective URL is a first-party xAI origin**. |
 | `"x_api_key"` | Sends `x-api-key: <key>` (Anthropic-style) instead of Bearer. Use with `env_key` or `api_key`. |
 | `"none"` | Sends **no** auth header. Required for keyless local servers so ambient xAI credentials are not attached. |
 
@@ -133,8 +133,17 @@ Grok resolves the API key in this order (skipped entirely when `auth_scheme = "n
 
 1. The `api_key` field in the model config
 2. The environment variable(s) named by `env_key` — a single string or an array of names. The first set, non-empty value wins (for example `env_key = ["ANTHROPIC_AUTH_TOKEN", "LC_ANTHROPIC_AUTH_TOKEN"]` for SSH `LC_*` forwarding)
-3. Your signed-in session token (from `grok login`), for a model with no `api_key`/`env_key` of its own
-4. The `XAI_API_KEY` environment variable (global fallback; Grok also accepts `GROK_CODE_XAI_API_KEY` for backward compatibility)
+3. A named `auth_provider` — the provider owns auth for this model. If its credential is unavailable the request fails closed and **never** falls back to xAI credentials
+4. An explicit `Authorization` or `x-api-key` header supplied through `extra_headers` or `env_http_headers` — treated as auth you own, so no ambient credential is ever added underneath it
+5. **First-party xAI origins only:** your signed-in session token (from `grok login`)
+6. **First-party xAI origins only:** the `XAI_API_KEY` environment variable (`GROK_CODE_XAI_API_KEY` is also accepted, for backward compatibility)
+
+A model whose final effective URL — after `model_provider`, `base_url`, and `api_base_url` are merged — is **not** a first-party xAI origin, and which declares none of sources 1–4, is marked **unready**. The picker dims it, `/model` and ACP switches reject it, and no request is sent. Your session token and `XAI_API_KEY` are never attached to a non-xAI endpoint, and no unauthenticated request is sent in their place.
+
+**If a configuration relied on the old fallback:**
+
+- Talking to an external provider: set `env_key = "PROVIDER_API_KEY"`, or `api_key`, or `auth_provider`, or an explicit credential header.
+- Running a keyless local server (Ollama, LM Studio, llama.cpp): set `auth_scheme = "none"`.
 
 ### Context Window
 
@@ -462,7 +471,7 @@ env_key = "PROVIDER_API_KEY"
 
 ### Local models (`auth_scheme = "none"`)
 
-Keyless local servers need an explicit `auth_scheme = "none"`. Without it, Grok may still inherit ambient xAI credentials (session token or `XAI_API_KEY`) and attach a Bearer header the local server does not expect.
+Keyless local servers need an explicit `auth_scheme = "none"`. Without it the entry declares Bearer auth with no credential to satisfy it, and is marked **unready** — ambient xAI credentials are never attached to a local endpoint.
 
 Tools, reasoning, images, and structured output depend on what the local server and model support; Grok does not invent capabilities the backend lacks.
 

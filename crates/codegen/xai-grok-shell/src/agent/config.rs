@@ -5399,6 +5399,21 @@ pub(crate) fn resolve_aux_model_sampling_config(
 ) -> Option<SamplerConfig> {
     let catalog_entry = find_model_by_id(models, model_id).cloned();
     if let Some(entry) = &catalog_entry {
+        // #110: readiness first, because the choke point rewrites an unready
+        // model's `auth_scheme` to `None` and the check further down reads
+        // `None` as "the user declared this keyless, use it". A route nothing
+        // can authenticate and a local server that wants no header are not
+        // the same thing, and conflating them hands callers an unauthenticated
+        // client instead of the documented fallback to the active model.
+        let (ready, reason) = model_readiness(entry);
+        if !ready {
+            tracing::warn!(
+                aux_model = %model_id,
+                reason = ?reason,
+                "auxiliary model is not ready; falling back to the active model"
+            );
+            return None;
+        }
         let credentials = resolve_credentials_enforced(entry, session_key, disable_api_key_auth);
         let sampler = sampling_config_for_model(
             entry,
@@ -5418,7 +5433,18 @@ pub(crate) fn resolve_aux_model_sampling_config(
             );
             return None;
         }
-        if sampler.api_key.is_some() || sampler.auth_scheme == AuthScheme::None {
+        // `ExplicitHeader` belongs here alongside the other two. The choke
+        // point clears `api_key` when the user declared their own credential
+        // header, so "has no api_key" no longer means "has no credential" --
+        // and falling through from here discards the configured endpoint and
+        // mints an ambient xAI client in its place (#110).
+        if sampler.api_key.is_some()
+            || sampler.auth_scheme == AuthScheme::None
+            || matches!(
+                sampler.credential_source,
+                Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
+            )
+        {
             return Some(sampler);
         }
         if entry.effective_auth_provider().is_some() {
@@ -5429,11 +5455,32 @@ pub(crate) fn resolve_aux_model_sampling_config(
             return None;
         }
     }
-    let xai_bearer = session_key
-        .map(|s| s.to_owned())
-        .or_else(|| crate::agent::auth_method::read_xai_api_key_env().ok())
-        .or_else(|| endpoints.deployment_key.clone());
-    if let Some(bearer) = xai_bearer {
+    // #110: everything this fallback can mint is an ambient xAI credential,
+    // so it may only target a first-party origin -- and a custom
+    // `models_base_url` points `resolve_inference_base_url()` anywhere the
+    // user likes. Decided before a bearer is even chosen: which of the three
+    // it would have been does not change the answer.
+    let inference_base = endpoints.resolve_inference_base_url();
+    let ambient = if !crate::util::is_xai_api_bearer_url(&inference_base) {
+        tracing::warn!(
+            aux_model = %model_id,
+            "auxiliary fallback refused: the inference base is not first-party xAI"
+        );
+        None
+    } else if let Some(session) = session_key {
+        Some((
+            session.to_owned(),
+            xai_grok_sampler::CredentialSource::XaiSession,
+        ))
+    } else if let Ok(key) = crate::agent::auth_method::read_xai_api_key_env() {
+        Some((key, xai_grok_sampler::CredentialSource::XaiApiKeyEnv))
+    } else {
+        endpoints
+            .deployment_key
+            .clone()
+            .map(|key| (key, xai_grok_sampler::CredentialSource::XaiDeploymentKey))
+    };
+    if let Some((bearer, ambient_source)) = ambient {
         let entry = ModelEntry {
             info: ModelInfo {
                 user_selectable: true,
@@ -5478,7 +5525,7 @@ pub(crate) fn resolve_aux_model_sampling_config(
             config_validation_errors: Vec::new(),
         };
         let credentials = resolve_credentials_enforced(&entry, session_key, disable_api_key_auth);
-        let sampler = sampling_config_for_model(
+        let mut sampler = sampling_config_for_model(
             &entry,
             credentials,
             alpha_test_key,
@@ -5486,6 +5533,11 @@ pub(crate) fn resolve_aux_model_sampling_config(
             None,
             None,
         );
+        // The synthetic entry above carries the ambient bearer as its *own*
+        // `api_key`, so the classifier inside the choke point reads it as
+        // `ModelApiKey` and the origin gate never looks at it. Correct the
+        // record here, which is the only place that knows what was minted.
+        sampler.credential_source = Some(ambient_source);
         return Some(sampler);
     }
     tracing::warn!(
@@ -5553,7 +5605,17 @@ pub(crate) fn stamp_session_local_sampler_fields(
 ) {
     cfg.client_identifier = client_identifier;
     cfg.attribution_callback = active_session_config.attribution_callback.clone();
+    // A declared credential header is terminal (#110). Stamping a session
+    // resolver on top of one looks harmless here -- both URLs are first-party,
+    // nothing is overwritten in this function -- but `SamplingClient::post`
+    // then removes `Authorization`/`x-api-key` and inserts the live bearer,
+    // so the user's own credential is replaced by the session at send time.
+    let user_declared_header = matches!(
+        cfg.credential_source,
+        Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
+    );
     if cfg.bearer_resolver.is_none()
+        && !user_declared_header
         && cfg.auth_scheme != AuthScheme::None
         && active_session_config.auth_scheme != AuthScheme::None
         && crate::util::is_xai_api_bearer_url(&cfg.base_url)
@@ -5606,6 +5668,204 @@ pub(crate) fn resolve_chat_state_auth_type(
         .map(|r| r.auth_type)
         .unwrap_or(fallback)
 }
+/// Where a model's requests will go and what will authenticate them, with
+/// nothing in it that has to be redacted before display (#110).
+///
+/// Every field is a name, a class, or a sanitized origin -- never a
+/// credential, and never a URL that could carry one in its userinfo or query.
+/// That is the point: a consumer can log, serialize, or render this without
+/// knowing which of its fields used to be dangerous.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct EffectiveModelRoute {
+    /// The key the catalog knows this model by.
+    pub catalog_id: String,
+    /// The model string that actually goes on the wire, which a config
+    /// override can make different from `catalog_id`.
+    pub wire_model: String,
+    /// Scheme, host, port, and path. Userinfo, query, and fragment are gone
+    /// by construction.
+    pub sanitized_origin: String,
+    pub endpoint_trust: xai_grok_sampler::EndpointTrustClass,
+    pub credential_source: xai_grok_sampler::CredentialSource,
+    pub ready: bool,
+    /// Present exactly when `ready` is false, and actionable when present.
+    pub unready_reason: Option<String>,
+}
+/// Scheme + host [+ port] [+ path]. Userinfo, query, and fragment are dropped
+/// by construction, because both are places a credential is routinely carried
+/// and neither adds anything to a description of an origin (#110).
+pub(crate) fn sanitized_origin(url: &str) -> String {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return "<invalid-url>".to_owned();
+    };
+    let mut origin = format!(
+        "{}://{}",
+        parsed.scheme(),
+        parsed.host_str().unwrap_or("<no-host>")
+    );
+    if let Some(port) = parsed.port() {
+        origin.push_str(&format!(":{port}"));
+    }
+    let path = parsed.path().trim_end_matches('/');
+    if !path.is_empty() {
+        origin.push_str(path);
+    }
+    origin
+}
+/// Describe the route a model resolves to, as the sampler will see it.
+///
+/// Builds the very `SamplerConfig` the sampler would receive and asks the
+/// sampler to classify it, rather than re-deriving trust here. A second
+/// classifier would have to agree with the enforced one forever, and the
+/// first time they disagreed the displayed answer would start lying about
+/// the enforced one.
+pub(crate) fn effective_model_route(
+    catalog_id: &str,
+    model: &ModelEntry,
+    credentials: &ResolvedCredentials,
+) -> EffectiveModelRoute {
+    let (ready, unready_reason) = model_readiness(model);
+    // Copied field by field rather than by deriving `Clone` on
+    // `ResolvedCredentials`: that struct is inherited, and every edit to it is
+    // a permanent conflict on the weekly sync. The literal also fails to
+    // compile if upstream adds a field, which is the right way to find out.
+    let credentials = ResolvedCredentials {
+        api_key: credentials.api_key.clone(),
+        base_url: credentials.base_url.clone(),
+        auth_type: credentials.auth_type,
+        auth_scheme: credentials.auth_scheme,
+    };
+    let config = sampling_config_for_model(model, credentials, None, None, None, None);
+    EffectiveModelRoute {
+        catalog_id: catalog_id.to_owned(),
+        wire_model: config.model.clone(),
+        sanitized_origin: sanitized_origin(&config.base_url),
+        endpoint_trust: xai_grok_sampler::client::resolve_endpoint_trust(&config),
+        credential_source: config
+            .credential_source
+            .clone()
+            .unwrap_or(xai_grok_sampler::CredentialSource::Missing),
+        ready,
+        unready_reason,
+    }
+}
+/// An explicit, user-owned credential header declared on the model config
+/// (`extra_headers` / `env_http_headers`), as (lowercased header name, env
+/// NAME). Header *values* are never read here: this reports provenance only,
+/// so the result is safe to log or serialize (#110).
+fn explicit_credential_header(info: &ModelInfo) -> Option<(String, Option<String>)> {
+    explicit_credential_header_in(&info.extra_headers, &info.env_http_headers)
+}
+/// As [`explicit_credential_header`], but over the header maps alone.
+///
+/// The reconstruction seams (turn config, subagent inheritance) rebuild from a
+/// `SamplingConfig`, which carries the headers but not the model entry and not
+/// `credential_source` — so provenance there has to be re-derived rather than
+/// carried, and this is what they derive it from (#110).
+pub(crate) fn explicit_credential_header_in(
+    extra_headers: &IndexMap<String, String>,
+    env_http_headers: &IndexMap<String, String>,
+) -> Option<(String, Option<String>)> {
+    fn is_credential_header(name: &str) -> bool {
+        name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("x-api-key")
+    }
+    // A declared header only counts once it can actually carry something. An
+    // empty literal, or a mapping to an unset environment variable, is a
+    // credential the sampler will silently skip -- and reporting it anyway
+    // made callers treat the model as authenticated and drop the ambient
+    // credential in its favour, so the request went out with nothing at all.
+    // `env_key` has always been resolved this way; this matches it.
+    if let Some((name, _)) = extra_headers
+        .iter()
+        .find(|(name, value)| is_credential_header(name) && !value.trim().is_empty())
+    {
+        return Some((name.to_ascii_lowercase(), None));
+    }
+    env_http_headers
+        .iter()
+        .find(|(name, var)| {
+            is_credential_header(name)
+                && std::env::var(var)
+                    .ok()
+                    .is_some_and(|v| !v.trim().is_empty())
+        })
+        .map(|(name, var)| (name.to_ascii_lowercase(), Some(var.clone())))
+}
+/// Name the credential `resolve_credentials` actually handed over, by replaying
+/// its decision order — the inherited resolver itself stays untouched, so this
+/// costs no upstream-sync conflict. Carries names only, never bytes. Lives next
+/// to the gate below so the two cannot drift apart (#110).
+fn classify_credential_source(
+    model: &ModelEntry,
+    credentials: &ResolvedCredentials,
+) -> xai_grok_sampler::CredentialSource {
+    use xai_grok_sampler::CredentialSource;
+    if credentials.auth_scheme == AuthScheme::None {
+        return CredentialSource::None;
+    }
+    // This arm must stay first. Only two paths produce `SessionToken` — the
+    // ambient-session arm of `resolve_credentials` and the
+    // `disable_api_key_auth` swap in `enforce_disable_api_key_auth` — and both
+    // leave the ambient xAI session sitting in `api_key`. That swap keys off
+    // `auth_type` plus `is_xai_api_url`, which accepts loopback, so it can fire
+    // on a model that *also* carries its own credential. Asking
+    // `own_credential()` first would then label a session token `ModelApiKey`
+    // and walk it straight past the origin gate below.
+    if credentials.auth_type == xai_chat_state::AuthType::SessionToken {
+        return if credentials.api_key.is_some() {
+            CredentialSource::XaiSession
+        } else {
+            // The arm fired but the session was absent, so there is no ambient
+            // credential and no gate to run. Same reasoning as the tail below.
+            explicit_credential_header(model.info())
+                .map(|(header, env)| CredentialSource::ExplicitHeader { header, env })
+                .unwrap_or(CredentialSource::Missing)
+        };
+    }
+    if model.own_credential().is_some() {
+        return if model
+            .api_key
+            .as_deref()
+            .is_some_and(|k| !k.trim().is_empty())
+        {
+            CredentialSource::ModelApiKey
+        } else {
+            let name = model
+                .env_key
+                .as_ref()
+                .and_then(|keys| {
+                    keys.names()
+                        .into_iter()
+                        .find(|n| std::env::var(n).ok().is_some_and(|v| !v.trim().is_empty()))
+                })
+                .unwrap_or_default()
+                .to_owned();
+            CredentialSource::EnvKey { name }
+        };
+    }
+    if let Some(provider) = model.auth_provider.as_ref() {
+        return CredentialSource::AuthProvider {
+            name: provider.name.clone(),
+        };
+    }
+    // Session tokens already returned above, so an ambient credential reaching
+    // here came from `XAI_API_KEY` (or its legacy alias).
+    //
+    // The header arm has to sit *after* that, not before it. When an ambient
+    // credential is present the gate below is what strips it and relabels the
+    // route `ExplicitHeader`; naming the header here first would skip the gate
+    // and leave the ambient credential riding alongside the user's own auth.
+    // When there is no ambient credential there is nothing to strip and no
+    // gate to run, so this is the only place the label can come from -- and
+    // without it a header-authenticated model reads as `Missing` and gets
+    // treated as having no credential at all.
+    match &credentials.api_key {
+        Some(_) => CredentialSource::XaiApiKeyEnv,
+        None => explicit_credential_header(model.info())
+            .map(|(header, env)| CredentialSource::ExplicitHeader { header, env })
+            .unwrap_or(CredentialSource::Missing),
+    }
+}
 pub(crate) fn sampling_config_for_model(
     model: &ModelEntry,
     credentials: ResolvedCredentials,
@@ -5616,6 +5876,33 @@ pub(crate) fn sampling_config_for_model(
 ) -> SamplerConfig {
     let (ready, reason) = model_readiness(model);
     let mut credentials = credentials;
+    let mut source = classify_credential_source(model, &credentials);
+    // #110 origin binding. Whatever the resolver handed over, an ambient xAI
+    // credential is usable only against a first-party, bearer-safe origin.
+    // The predicate is `is_xai_api_bearer_url`, not `is_xai_api_url`: this is
+    // the attach side, so it demands https and refuses loopback outright.
+    // An explicitly declared credential header is the user's own auth and wins
+    // on every origin — an ambient credential must never slide underneath it.
+    if source.is_ambient_xai() {
+        let explicit = explicit_credential_header(model.info());
+        let first_party = crate::util::is_xai_api_bearer_url(&credentials.base_url);
+        if !first_party {
+            tracing::error!(
+                model = %model.info().model,
+                source = ?source,
+                "sampling_config_for_model: stripping ambient xAI credential for non-first-party origin"
+            );
+        }
+        if !first_party || explicit.is_some() {
+            credentials.api_key = None;
+            source = match explicit {
+                Some((header, env)) => {
+                    xai_grok_sampler::CredentialSource::ExplicitHeader { header, env }
+                }
+                None => xai_grok_sampler::CredentialSource::Missing,
+            };
+        }
+    }
     // Fail-closed choke point: every SamplerConfig must go through here.
     // Unready models (invalid auth_scheme, missing BYOK, …) must never keep
     // ambient session / env credentials that could leak to a custom base_url.
@@ -5627,6 +5914,7 @@ pub(crate) fn sampling_config_for_model(
         );
         credentials.api_key = None;
         credentials.auth_scheme = AuthScheme::None;
+        source = xai_grok_sampler::CredentialSource::Missing;
         deployment_id = None;
         user_id = None;
     }
@@ -5650,6 +5938,7 @@ pub(crate) fn sampling_config_for_model(
         temperature,
         top_p,
         endpoint_trust: None,
+        credential_source: Some(source.clone()),
         api_backend,
         auth_scheme: credentials.auth_scheme,
         extra_headers,
@@ -5679,10 +5968,29 @@ pub(crate) fn sampling_config_for_model(
         // freeze its access token into an auxiliary config: the resolver also
         // carries the account id and observes refresh-token rotation.
         config.api_key = None;
-        config.bearer_resolver = model
+        // …and an unready model gets no resolver either. The `!ready` block
+        // above strips the credential and labels the gap `Missing`, but this
+        // block used to run regardless and hand back a live provider bearer —
+        // so the fail-closed strip was not monotonic, and an unready Codex
+        // model left this function credentialed after being sterilised. That
+        // is the same defect class as every other #110 finding: a downstream
+        // section that does not know about the state the strip introduces.
+        let resolver = model
             .effective_auth_provider()
-            .filter(|provider| provider.openai_codex_status().is_some())
-            .map(crate::auth::AuthProviderRef::bearer_resolver);
+            .filter(|_| ready)
+            .filter(|provider| provider.openai_codex_status().is_some());
+        config.credential_source = Some(match resolver {
+            Some(provider) => xai_grok_sampler::CredentialSource::AuthProvider {
+                name: provider.name.clone(),
+            },
+            // `api_key` was just cleared unconditionally. A source that named
+            // it would now describe a credential this config no longer holds,
+            // and the ambient labels are exactly the ones an origin check keys
+            // on. Header-based and already-absent sources are untouched.
+            None if source.is_ambient_xai() => xai_grok_sampler::CredentialSource::Missing,
+            None => source,
+        });
+        config.bearer_resolver = resolver.map(crate::auth::AuthProviderRef::bearer_resolver);
     }
     config
 }
@@ -5725,7 +6033,7 @@ fn resolve_hidden_default_web_search_sampling_config(
     alpha_test_key: Option<String>,
     client_version: Option<String>,
     endpoints: &EndpointsConfig,
-) -> SamplerConfig {
+) -> Option<SamplerConfig> {
     let entry = ModelEntry {
         info: ModelInfo {
             id: None,
@@ -5767,15 +6075,28 @@ fn resolve_hidden_default_web_search_sampling_config(
         api_base_url: None,
         config_validation_errors: Vec::new(),
     };
+    // #110: the same rule the catalog arm applies. This entry is synthesised
+    // right here, so nothing upstream has vetted it -- and an unready one
+    // reaches the choke point, loses its credential, and would still carry
+    // the user's search query to whatever `models_base_url` names.
+    let (ready, reason) = model_readiness(&entry);
+    if !ready {
+        tracing::warn!(
+            web_search_model = %model_id,
+            reason = ?reason,
+            "the default web-search route is not ready; disabling web search"
+        );
+        return None;
+    }
     let credentials = resolve_credentials_enforced(&entry, session_key, disable_api_key_auth);
-    sampling_config_for_model(
+    Some(sampling_config_for_model(
         &entry,
         credentials,
         alpha_test_key,
         client_version,
         None,
         None,
-    )
+    ))
 }
 pub(crate) fn resolve_web_search_sampling_config(
     model_id: &str,
@@ -5787,6 +6108,19 @@ pub(crate) fn resolve_web_search_sampling_config(
     endpoints: &EndpointsConfig,
 ) -> Option<SamplerConfig> {
     let resolved = if let Some(entry) = find_model_by_id(models, model_id).cloned() {
+        // #110: an unready model disables web search outright. The tempting
+        // repair -- send the request anyway with its credential stripped --
+        // hands the user's search query to a third-party origin and fails
+        // there regardless.
+        let (ready, reason) = model_readiness(&entry);
+        if !ready {
+            tracing::warn!(
+                web_search_model = %model_id,
+                reason = ?reason,
+                "web search model is not ready; disabling web search"
+            );
+            return None;
+        }
         let credentials = resolve_credentials_enforced(&entry, session_key, disable_api_key_auth);
         if credentials.api_key.is_none() && entry.effective_auth_provider().is_some() {
             tracing::warn!(
@@ -5804,14 +6138,14 @@ pub(crate) fn resolve_web_search_sampling_config(
             None,
         ))
     } else if model_id == crate::models::default_web_search_model() {
-        Some(resolve_hidden_default_web_search_sampling_config(
+        resolve_hidden_default_web_search_sampling_config(
             model_id,
             session_key,
             disable_api_key_auth,
             alpha_test_key,
             client_version,
             endpoints,
-        ))
+        )
     } else {
         None
     };
@@ -6005,6 +6339,39 @@ pub(crate) fn model_readiness(model: &ModelEntry) -> (bool, Option<String>) {
             .map(|name| format!("missing {name}"))
             .unwrap_or_else(|| "missing API key".to_string());
         return (false, Some(reason));
+    }
+    // #110. Reaching here means the model needs a bearer, declares no
+    // credential of its own, and named no env var we could point at. If its
+    // final origin is also somewhere the ambient xAI flow may not legally go,
+    // nothing can ever satisfy it -- so fail closed here, before a request
+    // exists to strip. `api_base_url` counts because the `XAI_API_KEY` branch
+    // targets it rather than `base_url`.
+    // The two ambient arms target different URLs -- the session goes to
+    // `base_url`, `XAI_API_KEY` to `api_base_url` when one is set -- and this
+    // function cannot see which credential is live. So every route either arm
+    // could take has to be safe. Accepting one safe route left the model
+    // selectable while the other arm routed somewhere the choke point strips,
+    // which produced a ready model that sends unauthenticated requests.
+    let ambient_destinations = [
+        model.info.base_url.as_str(),
+        model
+            .api_base_url
+            .as_deref()
+            .unwrap_or(&model.info.base_url),
+    ];
+    if explicit_credential_header(&model.info).is_none()
+        && !ambient_destinations
+            .iter()
+            .all(|url| crate::util::is_xai_api_bearer_url(url))
+    {
+        return (
+            false,
+            Some(format!(
+                "no credential for non-xAI endpoint {}: set api_key, env_key, or auth_provider \
+                 — or auth_scheme = \"none\" for a keyless local server",
+                provider_hint_for_url(&model.info.base_url)
+            )),
+        );
     }
     (true, None)
 }
@@ -7277,6 +7644,26 @@ reasoning_effort = "low"
             "AuthScheme::None must never inherit the session bearer resolver"
         );
 
+        // A credential header the user declared is terminal, even on a
+        // first-party URL where every other condition here passes. Stamping
+        // looks harmless at this seam -- nothing is overwritten in this
+        // function -- but `SamplingClient::post` later removes
+        // `Authorization`/`x-api-key` and inserts the live bearer, so the
+        // session would silently replace the user's own credential (#110).
+        let mut declared_header = SamplerConfig {
+            base_url: EndpointsConfig::default().resolve_inference_base_url(),
+            credential_source: Some(xai_grok_sampler::CredentialSource::ExplicitHeader {
+                header: "authorization".into(),
+                env: None,
+            }),
+            ..SamplerConfig::default()
+        };
+        stamp_session_local_sampler_fields(&mut declared_header, &session_cfg, None, None);
+        assert!(
+            declared_header.bearer_resolver.is_none(),
+            "a declared credential header must not be replaced by the session bearer"
+        );
+
         let codex_session = SamplerConfig {
             base_url: "https://chatgpt.com/backend-api/codex".into(),
             api_backend: ApiBackend::CodexResponses,
@@ -7923,23 +8310,32 @@ reasoning_effort = "low"
         );
         assert_eq!(sampling_config.base_url, "https://test.api/v1");
     }
+    /// A model with no credential of its own falls back to the ambient one --
+    /// but only against a first-party origin. Both halves are pinned here so
+    /// the fallback stays covered and the #110 boundary stays explicit; the
+    /// third-party case is where this test asserted the leak before the gate.
     #[test]
     fn sampling_config_uses_fallback_when_no_model_api_key() {
-        let model = test_model_entry("test-model", "https://test.api/v1", None, None, None);
-        let sampling_config = sampling_config_for_model(
-            &model,
-            ResolvedCredentials {
-                api_key: Some("fallback-key".to_string()),
-                base_url: model.info().base_url.clone(),
-                auth_type: xai_chat_state::AuthType::ApiKey,
-                auth_scheme: AuthScheme::Bearer,
-            },
-            None,
-            None,
-            None,
-            None,
-        );
-        assert_eq!(sampling_config.api_key, Some("fallback-key".to_string()));
+        for (base_url, expected) in [
+            ("https://api.x.ai/v1", Some("fallback-key".to_string())),
+            ("https://test.api/v1", None),
+        ] {
+            let model = test_model_entry("test-model", base_url, None, None, None);
+            let sampling_config = sampling_config_for_model(
+                &model,
+                ResolvedCredentials {
+                    api_key: Some("fallback-key".to_string()),
+                    base_url: model.info().base_url.clone(),
+                    auth_type: xai_chat_state::AuthType::ApiKey,
+                    auth_scheme: AuthScheme::Bearer,
+                },
+                None,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(sampling_config.api_key, expected, "at {base_url}");
+        }
     }
     #[test]
     fn default_models_dual_endpoint_routing() {
@@ -8092,6 +8488,592 @@ reasoning_effort = "low"
             std::env::remove_var(primary);
             std::env::remove_var(alias);
         }
+    }
+    /// #110 core regression pin: whatever `resolve_credentials` hands over,
+    /// the choke point must not emit an ambient xAI credential for a
+    /// non-first-party final origin -- on any backend.
+    ///
+    /// Both origins here are from the issue: a third-party HTTPS endpoint and
+    /// the loopback reproduction. The session sentinel is asserted absent from
+    /// the rendered `Debug` too, because a credential that is cleared from the
+    /// field but printed in a diagnostic has not actually been withheld.
+    ///
+    /// `deployment_id` / `user_id` are deliberately *not* asserted here. They
+    /// are identity, not credentials, and this function hands trust
+    /// classification to the sampler on purpose -- it emits
+    /// `endpoint_trust: None` so `resolve_endpoint_trust` decides, using a
+    /// predicate that already classifies loopback as `Local`. Re-deriving that
+    /// here would create a second predicate to keep in sync forever. The
+    /// invariant is pinned where it holds, over this same origin, by
+    /// `xai_grok_sampler::client`'s
+    /// `third_party_base_url_omits_xai_identity_headers_even_with_bearer`.
+    #[test]
+    #[serial]
+    fn choke_point_strips_ambient_credentials_for_non_first_party_origins() {
+        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+        use xai_grok_sampler::CredentialSource;
+        use xai_grok_test_support::EnvGuard;
+
+        const SESSION: &str = "XAI_SESSION_SENTINEL";
+        let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+        for backend in [
+            ApiBackend::ChatCompletions,
+            ApiBackend::Responses,
+            ApiBackend::Messages,
+        ] {
+            for base_url in ["https://api.openai.com/v1", "http://127.0.0.1:11434/v1"] {
+                let mut model = test_model_entry("ext", base_url, None, None, None);
+                model.info.api_backend = backend.clone();
+                let config = sampling_config_for_model(
+                    &model,
+                    resolve_credentials(&model, Some(SESSION)),
+                    None,
+                    None,
+                    Some("deployment-sentinel".to_owned()),
+                    Some("user-sentinel".to_owned()),
+                );
+
+                assert_eq!(
+                    config.api_key, None,
+                    "session token reached {backend:?} at {base_url}"
+                );
+                assert_eq!(
+                    config.credential_source,
+                    Some(CredentialSource::Missing),
+                    "{backend:?} at {base_url}"
+                );
+                let rendered = format!("{config:?}");
+                assert!(
+                    !rendered.contains(SESSION),
+                    "the session token survived into Debug output: {rendered}"
+                );
+            }
+        }
+    }
+
+    /// #110 gate predicate: the origin gate uses the existing canonical
+    /// classifier `is_xai_api_bearer_url`, not `is_xai_api_url`. The two differ
+    /// on exactly the rows that matter here -- loopback and cleartext -- so
+    /// pin them, and a future edit to the helper surfaces as this test rather
+    /// than as an ambient credential on a local endpoint.
+    #[test]
+    fn ambient_gate_predicate_semantics() {
+        let allowed = [
+            "https://api.x.ai/v1",
+            crate::env::PROD_CLI_CHAT_PROXY_BASE_URL,
+        ];
+        let refused = [
+            "http://127.0.0.1:11434/v1", // loopback: the issue's own repro
+            "http://localhost:8080/v1",
+            "https://127.0.0.1:8443/v1", // loopback even with TLS
+            "http://api.x.ai/v1",        // cleartext: a bearer is never safe here
+            "https://api.openai.com/v1", // external
+            "https://evil.example/x.ai", // x.ai in the path, not the host
+            "not a url",
+        ];
+        for url in allowed {
+            assert!(
+                crate::util::is_xai_api_bearer_url(url),
+                "{url} must classify as first-party"
+            );
+        }
+        for url in refused {
+            assert!(
+                !crate::util::is_xai_api_bearer_url(url),
+                "{url} must NOT classify as first-party"
+            );
+        }
+    }
+
+    /// #110's typed seam. The fixture URL carries the same secret in three
+    /// places a URL can hide one -- userinfo, query, and (via the api_key) the
+    /// credential itself -- because the route's whole promise is that a
+    /// consumer may render it without knowing which field used to be
+    /// dangerous. Checked by sliding window, so a partial leak fails too.
+    #[test]
+    #[serial]
+    fn effective_model_route_is_secret_free_and_matches_the_sampler_inputs() {
+        use xai_grok_sampler::{CredentialSource, EndpointTrustClass};
+        const SECRET: &str = "route-secret-0123456789abcdef";
+
+        let mut model = test_model_entry(
+            "wire-model",
+            &format!("https://user:{SECRET}@api.example.com:8443/v1/x?api_key={SECRET}#frag"),
+            Some(SECRET),
+            None,
+            None,
+        );
+        model.info.api_backend = ApiBackend::ChatCompletions;
+        let creds = resolve_credentials(&model, None);
+        let route = effective_model_route("my-model", &model, &creds);
+
+        assert_eq!(route.catalog_id, "my-model");
+        assert_eq!(route.wire_model, "wire-model");
+        assert_eq!(route.sanitized_origin, "https://api.example.com:8443/v1/x");
+        assert_eq!(route.endpoint_trust, EndpointTrustClass::External);
+        assert_eq!(route.credential_source, CredentialSource::ModelApiKey);
+        assert!(route.ready, "a model with its own key is ready");
+
+        let json = serde_json::to_string(&route).expect("route serializes");
+        let debug = format!("{route:?}");
+        for rendered in [json, debug] {
+            for window in SECRET.as_bytes().windows(8) {
+                let window = std::str::from_utf8(window).expect("ascii");
+                assert!(
+                    !rendered.contains(window),
+                    "the route leaked the secret fragment {window}: {rendered}"
+                );
+            }
+        }
+    }
+    /// The route reports the trust class the sampler will enforce, because it
+    /// asks the sampler rather than deriving its own. These rows document what
+    /// that classification actually says for each shape of origin.
+    #[test]
+    #[serial]
+    fn effective_model_route_reports_the_enforced_trust_class() {
+        use xai_grok_sampler::EndpointTrustClass;
+        let cases = [
+            (
+                crate::env::PROD_CLI_CHAT_PROXY_BASE_URL,
+                EndpointTrustClass::FirstPartyXai,
+            ),
+            ("http://127.0.0.1:11434/v1", EndpointTrustClass::Local),
+            ("http://localhost:8080/v1", EndpointTrustClass::Local),
+            ("https://api.openai.com/v1", EndpointTrustClass::External),
+            ("not a url", EndpointTrustClass::External),
+        ];
+        for (url, want) in cases {
+            let model = test_model_entry("m", url, Some("own-key"), None, None);
+            let creds = resolve_credentials(&model, None);
+            let route = effective_model_route("m", &model, &creds);
+            assert_eq!(route.endpoint_trust, want, "{url}");
+        }
+    }
+    /// #110 regression guard. Marking a model unready makes the choke point
+    /// rewrite its `auth_scheme` to `None`, and the auxiliary resolver reads
+    /// `None` as "the user declared this keyless, use it". Those two are not
+    /// the same thing: one is a route nothing can authenticate, the other is
+    /// a local server that wants no header. Conflating them hands an
+    /// unauthenticated client to image transcription, which then aborts the
+    /// whole turn instead of falling back to the active model.
+    #[test]
+    #[serial]
+    fn unready_aux_model_falls_back_instead_of_becoming_keyless() {
+        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+        use xai_grok_test_support::EnvGuard;
+        let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+        let mut catalog = IndexMap::new();
+        catalog.insert(
+            "image-describe".to_string(),
+            test_model_entry(
+                "image-describe",
+                "https://vision.example/v1",
+                None,
+                None,
+                None,
+            ),
+        );
+        let resolved = resolve_aux_model_sampling_config(
+            "image-describe",
+            &catalog,
+            &EndpointsConfig::default(),
+            Some("XAI_SESSION_SENTINEL"),
+            false,
+            None,
+            None,
+        );
+        assert!(
+            resolved.is_none(),
+            "an unready auxiliary model must fall back, not resolve as keyless"
+        );
+
+        // The genuine keyless case still resolves: `auth_scheme = "none"` is
+        // a declaration, and readiness honours it.
+        let mut keyless = test_model_entry("local", "http://127.0.0.1:11434/v1", None, None, None);
+        keyless.info.auth_scheme = AuthScheme::None;
+        let mut catalog = IndexMap::new();
+        catalog.insert("local".to_string(), keyless);
+        let resolved = resolve_aux_model_sampling_config(
+            "local",
+            &catalog,
+            &EndpointsConfig::default(),
+            Some("XAI_SESSION_SENTINEL"),
+            false,
+            None,
+            None,
+        )
+        .expect("a declared keyless auxiliary model still resolves");
+        assert_eq!(resolved.api_key, None, "keyless means no credential");
+    }
+    /// #110: a model whose auth is a credential header the user declared has
+    /// `api_key: None` by design -- the choke point clears the ambient bytes
+    /// so nothing slides underneath the user's own auth. The auxiliary
+    /// resolver's success test predates that state and reads it as "no
+    /// credential, fall through", which discards the configured vendor
+    /// endpoint and mints an ambient xAI client instead. The user's image
+    /// then goes to xAI, with their session token, and not to the provider
+    /// they configured.
+    #[test]
+    #[serial]
+    fn aux_model_with_declared_header_keeps_its_own_route() {
+        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+        use xai_grok_sampler::CredentialSource;
+        use xai_grok_test_support::EnvGuard;
+        let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+        let mut entry = test_model_entry(
+            "image-describe",
+            "https://vision.vendor.example/v1",
+            None,
+            None,
+            None,
+        );
+        entry
+            .info
+            .extra_headers
+            .insert("Authorization".into(), "Bearer vendor-sentinel".into());
+        let mut catalog = IndexMap::new();
+        catalog.insert("image-describe".to_string(), entry);
+
+        // Both with and without an ambient credential to strip. The label has
+        // two sources -- the gate rewrites it when there is something ambient
+        // to remove, the classifier names it when there is not -- and a user
+        // whose only credential is the header they declared is exactly the
+        // case with nothing ambient. Getting only the first half right sends
+        // that user back to the active model instead of their provider.
+        for session in [Some("XAI_SESSION_SENTINEL"), None] {
+            let resolved = resolve_aux_model_sampling_config(
+                "image-describe",
+                &catalog,
+                &EndpointsConfig::default(),
+                session,
+                false,
+                None,
+                None,
+            )
+            .unwrap_or_else(|| {
+                panic!("a header-authenticated auxiliary model is usable (session: {session:?})")
+            });
+            assert_eq!(
+                resolved.base_url, "https://vision.vendor.example/v1",
+                "session: {session:?}"
+            );
+            assert_eq!(
+                resolved.credential_source,
+                Some(CredentialSource::ExplicitHeader {
+                    header: "authorization".to_owned(),
+                    env: None,
+                }),
+                "session: {session:?}"
+            );
+            assert_eq!(resolved.api_key, None, "session: {session:?}");
+        }
+        let resolved = resolve_aux_model_sampling_config(
+            "image-describe",
+            &catalog,
+            &EndpointsConfig::default(),
+            Some("XAI_SESSION_SENTINEL"),
+            false,
+            None,
+            None,
+        )
+        .expect("a header-authenticated auxiliary model is usable");
+
+        assert_eq!(
+            resolved.base_url, "https://vision.vendor.example/v1",
+            "the configured vendor endpoint must not be replaced by the xAI inference base"
+        );
+        assert_eq!(
+            resolved.credential_source,
+            Some(CredentialSource::ExplicitHeader {
+                header: "authorization".to_owned(),
+                env: None,
+            })
+        );
+        assert_eq!(resolved.api_key, None, "no ambient credential underneath");
+        assert_eq!(
+            resolved
+                .extra_headers
+                .get("Authorization")
+                .map(String::as_str),
+            Some("Bearer vendor-sentinel"),
+            "the user's own auth must survive"
+        );
+    }
+    /// #110: the auxiliary fallback mints an ambient xAI bearer
+    /// (session -> XAI_API_KEY -> deployment_key) against
+    /// `resolve_inference_base_url()`. A custom `models_base_url` points that
+    /// anywhere the user likes, so the fallback has to check where it is
+    /// about to send the account's own credential.
+    #[test]
+    #[serial]
+    fn aux_fallback_refuses_ambient_bearer_for_non_first_party_inference_base() {
+        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+        use xai_grok_test_support::EnvGuard;
+        let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+        let endpoints = EndpointsConfig {
+            models_base_url: Some("https://third-party.example/v1".into()),
+            ..EndpointsConfig::default()
+        };
+        let resolved = resolve_aux_model_sampling_config(
+            "image-describe",
+            &IndexMap::new(),
+            &endpoints,
+            Some("XAI_SESSION_SENTINEL"),
+            false,
+            None,
+            None,
+        );
+        assert!(
+            resolved.is_none(),
+            "ambient bearer routed to a non-first-party inference base"
+        );
+    }
+    /// The fallback stuffs its bearer into a synthetic entry's own `api_key`,
+    /// which `classify_credential_source` reads as `ModelApiKey` -- a label
+    /// that would carry an ambient credential straight past the origin gate.
+    /// The fallback therefore has to say what it actually minted.
+    #[test]
+    #[serial]
+    fn aux_fallback_labels_ambient_source() {
+        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+        use xai_grok_sampler::CredentialSource;
+        use xai_grok_test_support::EnvGuard;
+        let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+        let resolved = resolve_aux_model_sampling_config(
+            "image-describe",
+            &IndexMap::new(),
+            &EndpointsConfig::default(),
+            Some("XAI_SESSION_SENTINEL"),
+            false,
+            None,
+            None,
+        )
+        .expect("the first-party fallback still resolves");
+        assert_eq!(
+            resolved.credential_source,
+            Some(CredentialSource::XaiSession)
+        );
+    }
+    /// #110: the hidden default web-search route is the other arm of the same
+    /// function, and it synthesises its own entry rather than reading one from
+    /// the catalog. A `models_base_url` pointing anywhere non-first-party
+    /// makes that entry credential-less and unready, at which point the choke
+    /// point rewrites its `auth_scheme` to `None` -- and returning it anyway
+    /// sends the user's search query to that origin with no authentication,
+    /// which is what disabling web search exists to prevent.
+    #[test]
+    #[serial]
+    fn hidden_default_web_search_route_respects_readiness() {
+        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+        use xai_grok_test_support::EnvGuard;
+        let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+        let hidden_default = crate::models::default_web_search_model();
+        let external = EndpointsConfig {
+            models_base_url: Some("https://third-party.example/v1".into()),
+            ..EndpointsConfig::default()
+        };
+        let resolved = resolve_web_search_sampling_config(
+            hidden_default,
+            &IndexMap::new(),
+            Some("XAI_SESSION_SENTINEL"),
+            false,
+            None,
+            None,
+            &external,
+        );
+        assert!(
+            resolved.is_none(),
+            "the hidden default route must not send a search query to a non-first-party origin"
+        );
+
+        // The first-party default still resolves -- this is the normal path.
+        let resolved = resolve_web_search_sampling_config(
+            hidden_default,
+            &IndexMap::new(),
+            Some("XAI_SESSION_SENTINEL"),
+            false,
+            None,
+            None,
+            &EndpointsConfig::default(),
+        );
+        assert!(
+            resolved.is_some(),
+            "the first-party hidden default is the normal web-search path"
+        );
+    }
+    /// #110: an unready web-search model DISABLES web search. The wrong repair
+    /// is to send the request to the external origin with its credential
+    /// stripped -- that leaks the query to a third party and fails anyway.
+    #[test]
+    #[serial]
+    fn web_search_disables_for_unready_external_model() {
+        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+        use xai_grok_test_support::EnvGuard;
+        let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+        let mut catalog = IndexMap::new();
+        catalog.insert(
+            "search".to_string(),
+            test_model_entry("search", "https://search.example/v1", None, None, None),
+        );
+        let resolved = resolve_web_search_sampling_config(
+            "search",
+            &catalog,
+            Some("XAI_SESSION_SENTINEL"),
+            false,
+            None,
+            None,
+            &EndpointsConfig::default(),
+        );
+        assert!(
+            resolved.is_none(),
+            "an unready external web-search model must disable web search"
+        );
+    }
+    /// #110 (Layer 0): a model that needs a bearer, declares no credential of
+    /// its own, and points at an origin the ambient xAI flow could never
+    /// legally target can never be satisfied. Say so before a request exists,
+    /// rather than building one and stripping it at the choke point.
+    ///
+    /// The ready cases are the point of the test as much as the unready one:
+    /// each is a path that must keep working, and each was a way to get this
+    /// gate wrong.
+    #[test]
+    fn readiness_gate_fails_credential_less_non_first_party_models() {
+        let m = test_model_entry("ext", "https://api.openai.com/v1", None, None, None);
+        let (ready, reason) = model_readiness(&m);
+        assert!(!ready, "external no-key model must be unready");
+        let reason = reason.expect("unready must come with an actionable reason");
+        for hint in ["api_key", "env_key", "auth_provider", "auth_scheme"] {
+            assert!(
+                reason.contains(hint),
+                "the reason must name {hint} as a way out: {reason}"
+            );
+        }
+
+        // The issue's own reproduction.
+        let m = test_model_entry("local", "http://127.0.0.1:11434/v1", None, None, None);
+        assert!(!model_readiness(&m).0, "loopback no-key must be unready");
+
+        // Keyless local servers stay ready -- an acceptance criterion, and the
+        // whole reason `auth_scheme = "none"` exists.
+        let mut m = test_model_entry("local", "http://127.0.0.1:11434/v1", None, None, None);
+        m.info.auth_scheme = AuthScheme::None;
+        assert_eq!(model_readiness(&m), (true, None));
+
+        // First-party origins keep the existing ambient session flow.
+        let m = test_model_entry("xai", "https://api.x.ai/v1", None, None, None);
+        assert_eq!(model_readiness(&m), (true, None));
+        let m = test_model_entry(
+            "proxy",
+            crate::env::PROD_CLI_CHAT_PROXY_BASE_URL,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(model_readiness(&m), (true, None));
+
+        // A static key is a credential of its own.
+        let m = test_model_entry("byok", "https://api.openai.com/v1", Some("sk"), None, None);
+        assert_eq!(model_readiness(&m), (true, None));
+
+        // So is an explicitly declared credential header: the user brought
+        // their own auth, and this gate must not second-guess it.
+        let mut m = test_model_entry("hdr", "https://api.openai.com/v1", None, None, None);
+        m.info
+            .extra_headers
+            .insert("Authorization".into(), "Bearer user".into());
+        assert_eq!(model_readiness(&m), (true, None));
+
+        // Split routing: the two ambient arms target different URLs -- the
+        // session goes to `base_url`, `XAI_API_KEY` to `api_base_url` -- and
+        // readiness cannot see which credential is live. One safe route is
+        // therefore not enough: if either arm could land somewhere the
+        // credential must be stripped, the model would be selectable and then
+        // send an unauthenticated request. Both directions fail closed.
+        let m = test_model_entry(
+            "split-external-base",
+            "https://third.example/v1",
+            None,
+            None,
+            Some("https://api.x.ai/v1"),
+        );
+        assert!(
+            !model_readiness(&m).0,
+            "the session arm would route to the external base_url"
+        );
+        let m = test_model_entry(
+            "split-external-api-base",
+            "https://api.x.ai/v1",
+            None,
+            None,
+            Some("https://third.example/v1"),
+        );
+        assert!(
+            !model_readiness(&m).0,
+            "the XAI_API_KEY arm would route to the external api_base_url"
+        );
+        // Both first-party is the case that stays ready.
+        let m = test_model_entry(
+            "split-both-first-party",
+            "https://api.x.ai/v1",
+            None,
+            None,
+            Some("https://api.x.ai/v1"),
+        );
+        assert_eq!(model_readiness(&m), (true, None));
+    }
+    /// #110: a credential header wired to an environment variable is only a
+    /// credential when that variable actually has a value. Reporting it from
+    /// the mapping alone made the model ready *and* made the choke point drop
+    /// the ambient credential in its favour, while the sampler skipped the
+    /// unset header -- so the request went out with no authentication at all.
+    /// `env_key` has always been resolved this way; this brings the header
+    /// path in line with it.
+    #[test]
+    #[serial]
+    fn declared_credential_header_needs_its_env_var_set() {
+        use xai_grok_test_support::EnvGuard;
+        const VAR: &str = "GROK_TEST_DECLARED_AUTH_HEADER";
+
+        let mut model = test_model_entry("hdr", "https://api.openai.com/v1", None, None, None);
+        model
+            .info
+            .env_http_headers
+            .insert("Authorization".into(), VAR.into());
+
+        let _unset = EnvGuard::unset(VAR);
+        assert!(
+            !model_readiness(&model).0,
+            "an unset credential header cannot authenticate anything"
+        );
+
+        let _blank = EnvGuard::set(VAR, "   ");
+        assert!(
+            !model_readiness(&model).0,
+            "a blank credential header is no better than an unset one"
+        );
+
+        let _set = EnvGuard::set(VAR, "Bearer real-token");
+        assert_eq!(
+            model_readiness(&model),
+            (true, None),
+            "a resolvable credential header is the user's own auth"
+        );
     }
     #[test]
     #[serial]
@@ -9367,6 +10349,62 @@ reasoning_effort = "low"
         assert_eq!(meta["authScheme"], "bearer");
     }
 
+    /// The `!ready` strip has to be monotonic: nothing below it may hand a
+    /// credential back.
+    ///
+    /// Fifteenth #110 finding. The strip cleared the credential and labelled
+    /// the gap `Missing`, and then the Codex block ran unconditionally and
+    /// installed a live provider bearer resolver — so an unready Codex model
+    /// left this function credentialed after being sterilised. Neither the L1
+    /// origin gate nor `SamplingClient::new` catches that, because both key on
+    /// `is_ambient_xai()` and an `AuthProvider` source is not ambient xAI.
+    ///
+    /// Note the fixture is *signed out*, and pre-fix that was not enough: the
+    /// resolver filter asked only whether a Codex status existed, never
+    /// whether it was usable.
+    #[test]
+    fn unready_codex_model_is_not_re_credentialed_after_the_strip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = std::sync::Arc::new(crate::auth::AuthManager::new(
+            dir.path(),
+            Default::default(),
+        ));
+        let mut model = test_model_entry("codex", "https://vendor.example/v1", None, None, None);
+        model.info.api_backend = ApiBackend::CodexResponses;
+        model.auth_provider = Some(crate::auth::AuthProviderRef::openai_codex(manager));
+
+        assert!(
+            !model_readiness(&model).0,
+            "precondition: a signed-out Codex provider must read as unready"
+        );
+
+        let cfg = sampling_config_for_model(
+            &model,
+            ResolvedCredentials {
+                api_key: Some("ambient-session-jwt".into()),
+                base_url: "https://vendor.example/v1".into(),
+                auth_type: xai_chat_state::AuthType::SessionToken,
+                auth_scheme: AuthScheme::Bearer,
+            },
+            None,
+            None,
+            Some("deploy".into()),
+            Some("user".into()),
+        );
+
+        assert!(
+            cfg.bearer_resolver.is_none(),
+            "an unready model must not leave this function with a live bearer resolver"
+        );
+        assert_eq!(
+            cfg.credential_source,
+            Some(xai_grok_sampler::CredentialSource::Missing),
+            "the strip labelled the gap Missing; nothing below it may relabel it as a credential"
+        );
+        assert!(cfg.api_key.is_none());
+        assert_eq!(cfg.auth_scheme, AuthScheme::None);
+    }
+
     #[test]
     fn sampling_config_for_unready_model_strips_ambient_credentials() {
         let (_, models) = resolve_models_from_toml(
@@ -10134,17 +11172,47 @@ reasoning_effort = "low"
             None,
             Some("https://api.x.ai/v1"),
         );
-        let sampling = resolve_sampling(&model_no_key, Some("session-key"));
+        // Which arm wins and whether its credential may travel are separate
+        // axes, so they are pinned separately. Priority first, on a
+        // first-party origin where an ambient credential survives.
+        let model_first_party = test_model_entry(
+            "test",
+            "https://api.x.ai/v1",
+            None,
+            None,
+            Some("https://api.x.ai/v1"),
+        );
+        let sampling = resolve_sampling(&model_first_party, Some("session-key"));
         assert_eq!(
             sampling.api_key.as_deref(),
             Some("session-key"),
             "session token should beat env key when model has no own credentials"
         );
+        // Same winning arm, non-first-party origin: the session token is
+        // withheld (#110). Routing is unaffected -- `base_url` still decides
+        // where the request goes, it just goes there unauthenticated.
+        let sampling = resolve_sampling(&model_no_key, Some("session-key"));
+        assert_eq!(
+            sampling.api_key, None,
+            "session token must not be attached for a non-first-party base_url"
+        );
         assert_eq!(
             sampling.base_url, "https://proxy.api/v1",
             "session auth should use base_url, not api_base_url"
         );
-        let sampling = resolve_sampling(&model_no_key, None);
+        // Which URL the env-key arm selects, pinned on a model where both
+        // ambient routes are first-party. `model_no_key` can no longer carry
+        // it: readiness fails closed when *either* arm could land on a
+        // non-first-party origin, because it cannot see which credential is
+        // live (#110).
+        let model_split_first_party = test_model_entry(
+            "test",
+            crate::env::PROD_CLI_CHAT_PROXY_BASE_URL,
+            None,
+            None,
+            Some("https://api.x.ai/v1"),
+        );
+        let sampling = resolve_sampling(&model_split_first_party, None);
         assert_eq!(
             sampling.api_key.as_deref(),
             Some("env-key"),
@@ -10155,7 +11223,7 @@ reasoning_effort = "low"
             "env key should route to api_base_url"
         );
         unsafe { std::env::remove_var("XAI_API_KEY") };
-        let sampling = resolve_sampling(&model_no_key, None);
+        let sampling = resolve_sampling(&model_split_first_party, None);
         assert!(
             sampling.api_key.is_none(),
             "no credentials available → api_key should be None"
