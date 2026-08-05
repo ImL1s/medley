@@ -1133,6 +1133,20 @@ impl CredentialSource {
             Self::XaiSession | Self::XaiApiKeyEnv | Self::XaiDeploymentKey
         )
     }
+
+    /// Provider-scoped credentials: ambient account material the model's own
+    /// configuration never asked for by value, so it may travel only to an
+    /// origin that provider's credential is valid for — first-party xAI
+    /// origins for the ambient xAI variants (#110), the provider's own API
+    /// origin for a named `[auth_provider.*]` such as OpenAI Codex (#135).
+    ///
+    /// `ModelApiKey`, `EnvKey`, and `ExplicitHeader` are deliberately *not*
+    /// scoped: the user typed that credential for that endpoint, so pointing
+    /// it anywhere — including a foreign custom provider — is the supported
+    /// BYOK case and must keep working.
+    pub fn is_provider_scoped(&self) -> bool {
+        self.is_ambient_xai() || matches!(self, Self::AuthProvider { .. })
+    }
 }
 
 /// Sampling client configuration (API key excluded — that stays in the client).
@@ -1732,6 +1746,52 @@ mod tests {
                 | CredentialSource::Missing => false,
             };
             assert_eq!(source.is_ambient_xai(), ambient, "{source:?}");
+        }
+    }
+
+    /// Same discipline as [`is_ambient_xai_is_decided_for_every_variant`] for
+    /// the wider #135 question "is this credential scoped to one provider's
+    /// origin": every variant has a deliberate answer, and the wildcard-free
+    /// `match` makes a new variant fail to compile until it is classified.
+    /// A variant that silently defaulted to "not scoped" would be a
+    /// credential that silently skips the origin binding.
+    #[test]
+    fn is_provider_scoped_is_decided_for_every_variant() {
+        let all = [
+            CredentialSource::None,
+            CredentialSource::ModelApiKey,
+            CredentialSource::EnvKey {
+                name: "SOME_KEY".to_owned(),
+            },
+            CredentialSource::AuthProvider {
+                name: "provider".to_owned(),
+            },
+            CredentialSource::ExplicitHeader {
+                header: "authorization".to_owned(),
+                env: None,
+            },
+            CredentialSource::XaiSession,
+            CredentialSource::XaiApiKeyEnv,
+            CredentialSource::XaiDeploymentKey,
+            CredentialSource::Missing,
+        ];
+        for source in &all {
+            let scoped = match source {
+                // Ambient account material: usable only against an origin the
+                // providing account's credential is valid for.
+                CredentialSource::XaiSession
+                | CredentialSource::XaiApiKeyEnv
+                | CredentialSource::XaiDeploymentKey
+                | CredentialSource::AuthProvider { .. } => true,
+                // Typed by the user for the endpoint they configured, a
+                // deliberate no-auth choice, or no credential at all.
+                CredentialSource::None
+                | CredentialSource::ModelApiKey
+                | CredentialSource::EnvKey { .. }
+                | CredentialSource::ExplicitHeader { .. }
+                | CredentialSource::Missing => false,
+            };
+            assert_eq!(source.is_provider_scoped(), scoped, "{source:?}");
         }
     }
 }

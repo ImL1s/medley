@@ -6263,6 +6263,24 @@ fn provider_hint_for_url(base_url: &str) -> String {
     }
 }
 
+/// #135 origin binding for the built-in OpenAI Codex provider: its bearer is
+/// scoped to the Codex API *origin* (scheme, host, port), so any path on
+/// that origin is in bounds and everything else is out. Compared against the
+/// constant the preset installs rather than a re-typed host, so the two
+/// cannot drift apart.
+fn is_codex_provider_origin(base_url: &str) -> bool {
+    let parsed = reqwest::Url::parse(base_url);
+    let codex = reqwest::Url::parse(crate::auth::openai_codex::CODEX_API_BASE_URL);
+    match (parsed, codex) {
+        (Ok(parsed), Ok(codex)) => {
+            parsed.scheme() == "https"
+                && parsed.host_str() == codex.host_str()
+                && parsed.port() == codex.port()
+        }
+        _ => false,
+    }
+}
+
 /// Picker readiness: keyless and typical xAI catalog stay selectable; BYOK
 /// models that declare `env_key`/`api_key` but lack a resolved value are not.
 pub(crate) fn model_readiness(model: &ModelEntry) -> (bool, Option<String>) {
@@ -6276,6 +6294,25 @@ pub(crate) fn model_readiness(model: &ModelEntry) -> (bool, Option<String>) {
                 Some("missing OpenAI Codex credential provider".to_owned()),
             );
         };
+        // #135. This branch returns early, above the #110 origin check at the
+        // bottom of the function, and every other check here is about the
+        // credential rather than the destination. The Codex bearer is
+        // provider-scoped: valid only for the Codex API origin. Without this
+        // gate a `model_provider = "openai-codex"` model whose `base_url`
+        // points at an arbitrary host read as ready and handed a live account
+        // credential to that host.
+        if !is_codex_provider_origin(&model.info.base_url) {
+            return (
+                false,
+                Some(format!(
+                    "OpenAI Codex credential is scoped to the Codex API origin, not {}: \
+                     point base_url at {} — or set api_key / env_key without \
+                     model_provider = \"openai-codex\" for a custom endpoint",
+                    provider_hint_for_url(&model.info.base_url),
+                    crate::auth::openai_codex::CODEX_API_BASE_URL,
+                )),
+            );
+        }
         let Some(status) = provider.openai_codex_status() else {
             return (
                 false,
@@ -7490,6 +7527,94 @@ reasoning_effort = "low"
                 "{reason:?} must explain the reauthentication requirement"
             );
         }
+    }
+    /// #135. A signed-in Codex model whose `base_url` points at a foreign
+    /// host must not read as ready: the provider credential is scoped to the
+    /// Codex API origin, and this branch returns before the #110 check at the
+    /// bottom of `model_readiness`. The expired-but-refreshable arm is
+    /// covered too — it returns early above the credential-validity checks.
+    #[test]
+    fn codex_model_pointed_at_a_foreign_origin_is_not_ready() {
+        let codex_auth =
+            |key: &str, expires_at: chrono::DateTime<chrono::Utc>| crate::auth::GrokAuth {
+                key: key.to_owned(),
+                auth_mode: crate::auth::AuthMode::OpenAiCodex,
+                refresh_token: Some("codex-refresh".into()),
+                expires_at: Some(expires_at),
+                oidc_issuer: Some(crate::auth::openai_codex::ISSUER.into()),
+                oidc_client_id: Some(crate::auth::openai_codex::CLIENT_ID.into()),
+                account_id: Some("codex-account".into()),
+                ..crate::auth::GrokAuth::default()
+            };
+        for (label, auth) in [
+            (
+                "signed in",
+                codex_auth(
+                    "codex-access",
+                    chrono::Utc::now() + chrono::Duration::hours(1),
+                ),
+            ),
+            (
+                "expired but refreshable",
+                codex_auth(
+                    "codex-access",
+                    chrono::Utc::now() - chrono::Duration::hours(1),
+                ),
+            ),
+        ] {
+            let temp = tempfile::tempdir().expect("temporary auth home");
+            let manager = Arc::new(crate::auth::AuthManager::new_openai_codex(temp.path()));
+            manager.hot_swap(auth);
+
+            let mut entry =
+                test_model_entry("codex-model", "https://vendor.example/v1", None, None, None);
+            entry.info.api_backend = ApiBackend::CodexResponses;
+            entry.info.auth_scheme = AuthScheme::Bearer;
+            entry.auth_provider = Some(crate::auth::AuthProviderRef::openai_codex(manager));
+
+            let (ready, reason) = model_readiness(&entry);
+            assert!(
+                !ready,
+                "{label}: a Codex credential must never read as ready for a foreign origin"
+            );
+            let reason = reason.expect("a readiness refusal names the problem");
+            assert!(
+                reason.contains("scoped to the Codex API origin"),
+                "{label}: unexpected reason: {reason}"
+            );
+            assert!(
+                reason.contains("api_key"),
+                "{label}: the reason must name the supported way out: {reason}"
+            );
+
+            // The same credential at its own origin stays ready.
+            entry.info.base_url = crate::auth::openai_codex::CODEX_API_BASE_URL.to_owned();
+            assert_eq!(
+                model_readiness(&entry),
+                (true, None),
+                "{label}: the Codex origin is where this credential belongs"
+            );
+        }
+    }
+
+    /// The #135 regression that would hurt users most: a model-owned
+    /// `api_key` pointed at a foreign endpoint is the supported custom-
+    /// provider path and must stay ready — provenance, not the presence of a
+    /// credential, is what the origin binding keys on.
+    #[test]
+    fn model_owned_api_key_to_a_foreign_endpoint_stays_ready() {
+        let entry = test_model_entry(
+            "byok",
+            "https://vendor.example/v1",
+            Some("sk-model-owned"),
+            None,
+            None,
+        );
+        assert_eq!(
+            model_readiness(&entry),
+            (true, None),
+            "a key the user typed for that endpoint is none of the origin gate's business"
+        );
     }
     #[test]
     fn codex_aux_sampler_without_native_resolver_fails_closed() {
