@@ -445,8 +445,11 @@ pub async fn run_headless(
                      Run `{prog} login` to sign in, or use `{prog} agent stdio` for API-key access."
                 )
             },
+            // Names the subcommand but not the binary: `agent stdio` is
+            // actionable on its own, and the binary name is the part we must
+            // not guess at.
             "Headless mode requires a grok.com session. \
-             Sign in, or use API-key access instead.",
+             Sign in, or use the `agent stdio` subcommand for API-key access.",
         )
     }
 

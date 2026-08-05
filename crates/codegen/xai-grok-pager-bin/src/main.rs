@@ -261,7 +261,12 @@ async fn run_setup_command(json: bool) {
     if !managed_config::has_principal() {
         eprintln!("No deployment key or team sign-in found.");
         eprintln!();
-        eprintln!("To install managed configuration, sign in with a team using `grok login`,");
+        match prog_for_instruction() {
+            Some(prog) => eprintln!(
+                "To install managed configuration, sign in with a team using `{prog} login`,"
+            ),
+            None => eprintln!("To install managed configuration, sign in with a team,"),
+        }
         eprintln!("or set a deployment key:");
         eprintln!();
         if cfg!(unix) {
@@ -269,7 +274,9 @@ async fn run_setup_command(json: bool) {
         } else {
             eprintln!("  $env:GROK_DEPLOYMENT_KEY=\"<your-key>\"");
         }
-        eprintln!("  grok setup");
+        if let Some(prog) = prog_for_instruction() {
+            eprintln!("  {prog} setup");
+        }
         eprintln!();
         eprintln!("Or add the key to ~/.grok/config.toml:");
         eprintln!();
@@ -308,8 +315,13 @@ async fn run_setup_command(json: bool) {
             );
         }
         SetupOutcome::Skipped => {
+            let retry = match prog_for_instruction() {
+                Some(prog) => format!("Run `{prog} setup` again."),
+                None => "Run setup again.".to_owned(),
+            };
             eprintln!(
-                "Managed configuration was not applied this run (another process held the apply lock, or the credential changed during the fetch). Run `grok setup` again."
+                "Managed configuration was not applied this run (another process held the \
+                 apply lock, or the credential changed during the fetch). {retry}"
             );
         }
         SetupOutcome::Failed(e) => {
@@ -552,10 +564,16 @@ async fn run_workspace_mgmt(args: WorkspaceMgmtArgs) -> Result<()> {
             )
         }
         WorkspaceGate::Unknown => {
+            let (subject, hint) = match prog_for_instruction() {
+                Some(prog) => (
+                    format!("`{prog} workspace`"),
+                    format!(" (run `{prog} login` if you are signed out)"),
+                ),
+                None => ("the workspace command".to_owned(), String::new()),
+            };
             anyhow::bail!(
-                "Could not load your settings for `grok workspace`. Check your \
-             network connection (run `grok login` if you are signed out), then \
-             try again."
+                "Could not load your settings for {subject}. Check your network \
+                 connection{hint}, then try again."
             )
         }
     }
@@ -658,7 +676,10 @@ async fn workspace_start(
     ensure_authenticated(
         &agent_config.grok_com_config,
         false,
-        Some("No cached credentials found. Run `grok login` first."),
+        Some(&match prog_for_instruction() {
+            Some(prog) => format!("No cached credentials found. Run `{prog} login` first."),
+            None => "No cached credentials found. Sign in first.".to_owned(),
+        }),
     )
     .await?;
     let env_urls = LeaderEnvUrls::from(&agent_config.grok_com_config);
@@ -1788,19 +1809,32 @@ fn codex_auth_status_json(
     })
 }
 
-fn codex_auth_status_text(
-    status: &xai_grok_shell::auth::openai_codex::CodexAuthStatus,
-) -> &'static str {
+/// `Some(name)` only when `argv[0]` gave a usable one; the caller must then
+/// phrase the message without a command. Naming the fallback would point at a
+/// *different program that may be installed* (#117).
+fn prog_for_instruction() -> Option<&'static str> {
+    xai_grok_config::program_name::program_name_for_instruction()
+}
+
+fn codex_auth_status_text(status: &xai_grok_shell::auth::openai_codex::CodexAuthStatus) -> String {
+    // `String`, not `&'static str`: the command has to name the program the
+    // user actually invoked. With both binaries installed, `grok login` here
+    // authenticates the *other* one (#117).
+    let login = |what: &str| match xai_grok_config::program_name::program_name_for_instruction() {
+        Some(prog) => format!("{what} (run `{prog} login --provider openai-codex`)"),
+        // No command name rather than the wrong one; the text already says
+        // which provider is meant, and an instruction with the binary
+        // amputated cannot be typed.
+        None => what.to_owned(),
+    };
     if status.permanent_failure {
-        "OpenAI Codex: credential refresh failed; sign in again (run `grok login --provider openai-codex`)"
-    } else if status.signed_in && !status.expired {
-        "OpenAI Codex: signed in and ready"
-    } else if status.signed_in && status.refreshable {
-        "OpenAI Codex: signed in; credential refreshes before the next request"
-    } else if status.signed_in {
-        "OpenAI Codex: credential expired (run `grok login --provider openai-codex`)"
+        login("OpenAI Codex: credential refresh failed; sign in again")
+    } else if status.expired {
+        login("OpenAI Codex: credential expired")
+    } else if !status.signed_in {
+        login("OpenAI Codex: signed out")
     } else {
-        "OpenAI Codex: signed out (run `grok login --provider openai-codex`)"
+        "OpenAI Codex: signed in".to_owned()
     }
 }
 /// Return freed-but-retained jemalloc pages to the OS.
@@ -4264,5 +4298,18 @@ mod tests {
             Err("boom".to_string()),
             "Err output must pass through unchanged",
         );
+    }
+}
+
+#[cfg(test)]
+mod auth_instruction_guard_tests {
+    /// This crate owns `main()`, so it carries the first messages a user sees.
+    /// A guard in the library crates cannot see it.
+    #[test]
+    fn no_hardcoded_auth_instructions() {
+        xai_grok_config::auth_instruction_guard::assert_no_hardcoded_auth_instructions(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src"
+        ));
     }
 }

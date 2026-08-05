@@ -246,3 +246,17 @@ impl AuthError {
         matches!(self, AuthError::Refresh(RefreshTokenError::Transient(_)))
     }
 }
+
+#[cfg(test)]
+mod auth_instruction_guard_tests {
+    /// Scans this crate's own `src/`. A guard in the pager cannot see this
+    /// crate, and this crate holds the routine 401/expiry copy — the messages
+    /// a user is most likely to be reading when they are told to sign in.
+    #[test]
+    fn no_hardcoded_auth_instructions() {
+        xai_grok_config::auth_instruction_guard::assert_no_hardcoded_auth_instructions(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src"
+        ));
+    }
+}

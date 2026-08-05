@@ -13,6 +13,7 @@
 //! before merge. Requirements layers (#4–#6) may opt into fail-closed startup;
 //! see [`validate_requirements`].
 
+pub mod auth_instruction_guard;
 pub mod campaigns;
 pub mod config_override;
 pub mod display;

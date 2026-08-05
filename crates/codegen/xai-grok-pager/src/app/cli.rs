@@ -1993,52 +1993,12 @@ mod state_dir_help_tests {
 
 #[cfg(test)]
 mod auth_instruction_guard_tests {
-    use std::fs;
-    use std::path::Path;
-
+    /// Scans this crate's own `src/` — a guard in one crate cannot see another's.
     #[test]
-    fn no_hardcoded_grok_login_or_auth() {
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let src_dir = Path::new(manifest_dir).join("src");
-        let mut errors = Vec::new();
-
-        let login_needle = format!("{} {}", "`grok", "login");
-        let auth_needle = format!("{} {}", "`grok", "auth");
-
-        scan_dir(&src_dir, &login_needle, &auth_needle, &mut errors);
-
-        if !errors.is_empty() {
-            panic!(
-                "Found hardcoded auth instructions in the following files:\n{}\nUse the program_name() accessor instead.",
-                errors.join("\n")
-            );
-        }
-    }
-
-    fn scan_dir(dir: &Path, login_needle: &str, auth_needle: &str, errors: &mut Vec<String>) {
-        if !dir.is_dir() {
-            return;
-        }
-        for entry in fs::read_dir(dir).expect("read_dir") {
-            let entry = entry.expect("entry");
-            let path = entry.path();
-            if path.is_dir() {
-                scan_dir(&path, login_needle, auth_needle, errors);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
-                let content = fs::read_to_string(&path).expect("read file");
-                for (idx, line) in content.lines().enumerate() {
-                    let trimmed = line.trim_start();
-                    if trimmed.starts_with("//")
-                        || trimmed.starts_with("///")
-                        || trimmed.starts_with("*")
-                    {
-                        continue;
-                    }
-                    if line.contains(login_needle) || line.contains(auth_needle) {
-                        errors.push(format!("{}:{} -> {}", path.display(), idx + 1, trimmed));
-                    }
-                }
-            }
-        }
+    fn no_hardcoded_auth_instructions() {
+        xai_grok_config::auth_instruction_guard::assert_no_hardcoded_auth_instructions(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src"
+        ));
     }
 }

@@ -722,8 +722,13 @@ mod tests {
             let acp_err = map_sampling_err_to_acp(err);
             let data = acp_err.data.unwrap();
             let msg = data.as_str().unwrap();
+            // Assert on the verb, not on a literal `grok logout`: production
+            // now renders the invoked name, so a hardcoded-name needle here
+            // would be tautologically true and would pass even if the hint
+            // were emitted unconditionally -- which is exactly what this test
+            // exists to catch.
             assert!(
-                !msg.contains("grok logout"),
+                !msg.contains("logout"),
                 "should NOT suggest logout when no API key is available: {msg}"
             );
         });
@@ -744,7 +749,7 @@ mod tests {
             let data = acp_err.data.unwrap();
             let msg = data.as_str().unwrap();
             assert!(
-                !msg.contains("grok logout"),
+                !msg.contains("logout"),
                 "should NOT suggest logout for non-subscription 403: {msg}"
             );
         });

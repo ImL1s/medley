@@ -1600,7 +1600,7 @@ async fn refresh_chain_demotes_when_attributed_tried_rt_differs_from_disk() {
     assert!(
         mgr.permanent_failure().is_none(),
         "demotion must not record a sticky verdict that locks out every \
-         sibling process until the user re-runs `grok login`",
+         sibling process until the user re-runs `grok login`", // auth-instruction-guard: exempt — test narrative, not user-facing copy
     );
 }
 

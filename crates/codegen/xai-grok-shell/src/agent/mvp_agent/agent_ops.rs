@@ -2733,7 +2733,13 @@ impl MvpAgent {
         if relay_sync_enabled {
             tracing::info!("[grok] Relay sync: ENABLED");
         } else if tui_mode && relay_config_enabled && !has_xai_auth {
-            tracing::info!("[grok] Relay sync: DISABLED (no auth - run 'grok login' first)");
+            tracing::info!(
+                    "[grok] Relay sync: DISABLED (no auth - {})",
+                    crate::auth::with_login_instruction(
+                        |prog| format!("run `{prog} login` first"),
+                        "sign in first",
+                    )
+                );
         } else if tui_mode && !relay_config_enabled {
             tracing::debug!("Relay sync: DISABLED (not configured in config.toml or env)");
         } else {

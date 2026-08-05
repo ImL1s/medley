@@ -78,6 +78,16 @@ pub fn default_auth_path() -> anyhow::Result<PathBuf> {
     Ok(grok.join("auth.json"))
 }
 
+/// `Run `<prog>` login first.` naming the invoked program, or a command-free
+/// equivalent when `argv[0]` gave nothing usable — the fallback would name a
+/// *different program that may be installed* (#117).
+fn login_hint() -> String {
+    match xai_grok_config::program_name::program_name_for_instruction() {
+        Some(prog) => format!("Run `{prog} login` first."),
+        None => "Sign in first.".to_owned(),
+    }
+}
+
 /// Read the active OIDC entry and its scope key. The key is threaded to the
 /// refresh write so rotation updates exactly the entry that was read.
 ///
@@ -88,8 +98,9 @@ pub fn default_auth_path() -> anyhow::Result<PathBuf> {
 fn read_auth_entry(path: &Path) -> anyhow::Result<(String, AuthEntry)> {
     if !path.exists() {
         anyhow::bail!(
-            "No auth credentials found at {}. Run `grok login` first.",
-            path.display()
+            "No auth credentials found at {}. {}",
+            path.display(),
+            login_hint()
         );
     }
 
@@ -110,8 +121,9 @@ fn read_auth_entry(path: &Path) -> anyhow::Result<(String, AuthEntry)> {
         })
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "no OIDC auth entry found in {}. Run `grok login` first.",
-                path.display()
+                "no OIDC auth entry found in {}. {}",
+                path.display(),
+                login_hint()
             )
         })
 }
