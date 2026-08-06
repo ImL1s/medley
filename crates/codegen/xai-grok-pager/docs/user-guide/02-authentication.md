@@ -1,6 +1,6 @@
 # Authentication
 
-Grok supports several authentication methods, including interactive browser login, enterprise single sign-on (SSO), and headless CI/CD runners.
+Grok supports several authentication methods, including interactive browser login, enterprise single sign-on (SSO), and headless CI/CD runners. The flows on this page sign you into the **xAI** lane (plus the separate OpenAI Codex login below). A custom model with its own `api_key` / `env_key` / `auth_provider`, or a keyless local model with `auth_scheme = "none"`, needs no sign-in at all — see [Custom Models](11-custom-models.md#credential-resolution).
 
 > **Fork note (Medley).** The [OpenAI Codex](#openai-codex-chatgpt-oauth) provider
 > below exists only in [Medley](https://github.com/ImL1s/medley), a community
@@ -139,6 +139,8 @@ grok
 ```
 
 Grok uses the API key as a fallback when no session token is active. If you have already signed in interactively, the stored session token takes precedence. To fall back to the API key, run `grok logout` or delete `~/.medley/auth.json`.
+
+This section covers the xAI lane. Other providers take their own per-model keys (`api_key` / `env_key` under `[model.<id>]`), which win over any session token — see [Custom Models > Credential Resolution](11-custom-models.md#credential-resolution).
 
 ---
 
@@ -375,8 +377,12 @@ Grok picks up changes to `~/.medley/auth.json` automatically. If you update cred
 Grok resolves credentials for each request in this order, highest to lowest:
 
 1. **Per-model `api_key` or `env_key`** -- set under `[model.<name>]` in `config.toml`. Wins whenever present.
-2. **Active session token** -- obtained through browser, OIDC/OAuth2, or external-provider login and stored in `~/.medley/auth.json`.
-3. **`XAI_API_KEY`** -- fallback when no session token is active.
+2. **A named `auth_provider`** -- when the model names one, that provider owns auth for the model; if its credential is unavailable the request fails closed and never falls back to xAI credentials.
+3. **An explicit credential header** -- an `Authorization` or `x-api-key` header from `extra_headers` / `env_http_headers`.
+4. **Active session token** -- obtained through browser, OIDC/OAuth2, or external-provider login and stored in `~/.medley/auth.json`. First-party xAI origins only.
+5. **`XAI_API_KEY`** -- fallback when no session token is active. First-party xAI origins only.
+
+Models with `auth_scheme = "none"` skip this chain entirely, and a model pointing at a non-xAI origin with none of sources 1–3 is marked unready rather than sent an ambient xAI credential. See [Custom Models > Credential Resolution](11-custom-models.md#credential-resolution) for the full rules.
 
 When more than one login flow is configured, Grok populates the session token from the first available source, highest to lowest:
 
