@@ -391,3 +391,34 @@ jobs:
             catalog_miss -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
             toctou -- --nocapture
+
+      # #167: `kill_leaders` had zero coverage, which is why the summary could
+      # contradict itself. These three cover the pure seams it was split into.
+      # Quoted name: an unquoted `#167` truncates the YAML value at the comment
+      # marker.
+      - name: 'leaders kill summary and PID guard (issue #167)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
+            format_kill_leaders_summary -- --nocapture
+          run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
+            leader_kill_action -- --nocapture
+          run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
+            format_leader_held_guidance -- --nocapture
+          # `reclaim_` rather than the NotFound test alone: this branch's two
+          # mutation-proven invariant tests (`reclaim_removes_a_lock_no_process_holds`,
+          # `reclaim_refuses_a_lock_a_live_process_holds`) matched no filter either.
+          run_nonzero -p xai-grok-shell --lib reclaim_ -- --nocapture
