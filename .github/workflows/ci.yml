@@ -354,3 +354,33 @@ jobs:
             catalog_miss -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
             toctou -- --nocapture
+
+      # #160: three of the four tests this branch adds matched no filter. The
+      # fourth, `web_search_resolves_an_env_backed_credential_header`, is
+      # already selected by the existing `credential_header` filter. Written
+      # out rather than looped so the #171 check can see them. Quoted name: an
+      # unquoted `#160` truncates at the comment marker.
+      - name: 'web_search env header forwarding (issue #160)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib spawn_gates_web_search -- --nocapture
+          run_nonzero -p xai-grok-shell --lib spawn_forwards_env_http_headers -- --nocapture
+          run_nonzero -p xai-grok-shell --lib web_search_env_header_overrides -- --nocapture
+          run_nonzero -p xai-grok-shell --lib env_backed_credential_header -- --nocapture
+          # Also this PR's earlier commit, whose three tests matched nothing either.
+          run_nonzero -p xai-grok-shell --lib keeps_web_search_and_is_told_nothing -- --nocapture
+          run_nonzero -p xai-grok-shell --lib credential_less_route -- --nocapture
+          run_nonzero -p xai-grok-shell --lib invents_no_bearer -- --nocapture
