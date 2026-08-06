@@ -709,7 +709,22 @@ pub(super) async fn run_session(
                                 session.chat_state_handle.update_sampling_config(cfg);
 
                                 let existing = session.chat_state_handle.get_credentials().await;
-                                if let Some(r) = crate::agent::config::try_resolve_model_credentials(model_name.as_str(), existing.api_key.as_deref()) {
+                                // `session_key` may only be passed when the
+                                // stored credential really is a session token
+                                // -- `try_resolve_model_credentials` documents
+                                // that and says callers must guard it. Passing
+                                // it unconditionally re-labels whatever the
+                                // previous model left behind as
+                                // `AuthType::SessionToken` and carries it to the
+                                // new one: a BYOK key becomes a "session token",
+                                // and a real session token reaches a model that
+                                // may point anywhere, with no origin strip on
+                                // this path (#136).
+                                let session_key = (existing.auth_type
+                                    == xai_chat_state::AuthType::SessionToken)
+                                    .then_some(existing.api_key.as_deref())
+                                    .flatten();
+                                if let Some(r) = crate::agent::config::try_resolve_model_credentials(model_name.as_str(), session_key) {
                                     session.chat_state_handle.update_credentials(xai_chat_state::Credentials {
                                         api_key: r.api_key,
                                         auth_type: r.auth_type,
