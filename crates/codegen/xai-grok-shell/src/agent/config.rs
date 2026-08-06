@@ -6449,16 +6449,40 @@ pub(crate) fn model_readiness(model: &ModelEntry) -> (bool, Option<String>) {
             .iter()
             .all(|url| crate::util::is_xai_api_bearer_url(url))
     {
+        // Name the origin(s) the ambient flow must not reach. Prefer a refused
+        // URL over a safe sibling (split base_url / api_base_url), and keep the
+        // string secret-free via `sanitized_origin` (#123).
+        let refused_origin = ambient_destinations
+            .iter()
+            .copied()
+            .find(|url| !crate::util::is_xai_api_bearer_url(url))
+            .unwrap_or(model.info.base_url.as_str());
         return (
             false,
-            Some(format!(
-                "no credential for non-xAI endpoint {}: set api_key, env_key, or auth_provider \
-                 — or auth_scheme = \"none\" for a keyless local server",
-                provider_hint_for_url(&model.info.base_url)
-            )),
+            Some(
+                crate::agent::auth_method::auth_error_ambient_origin_refused(&sanitized_origin(
+                    refused_origin,
+                )),
+            ),
         );
     }
     (true, None)
+}
+
+/// Resolve the catalog entry for `model_id` and return its readiness reason
+/// when unready. Used by turn-time auth-error mapping so an origin refusal
+/// (or any other unready cause) is not rewritten as "Session expired" (#123).
+pub(crate) fn unready_reason_for_model_id(model_id: &str) -> Option<String> {
+    if model_id.is_empty() {
+        return None;
+    }
+    with_resolved_model(model_id, |lookup| match lookup {
+        ModelLookup::Loaded(Some(entry)) => {
+            let (ready, reason) = model_readiness(entry);
+            if ready { None } else { reason }
+        }
+        ModelLookup::Loaded(None) | ModelLookup::ConfigUnavailable => None,
+    })
 }
 
 pub(crate) fn to_acp_model_info(
@@ -9267,6 +9291,73 @@ reasoning_effort = "low"
         );
         assert_eq!(model_readiness(&m), (true, None));
     }
+
+    /// #123 option 3: when an ambient credential is present but the model's
+    /// origin is not xAI, the readiness reason must name the origin refusal —
+    /// not a generic authentication-failure string. Without this, the strip
+    /// looks like "Session expired" / "not authenticated" and the user cannot
+    /// tell a config mistake from an expired login.
+    #[test]
+    #[serial]
+    fn readiness_reason_names_origin_refusal_when_ambient_credential_present() {
+        use crate::agent::auth_method::{
+            LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR, auth_error_api_key,
+            auth_error_session_expired,
+        };
+        use xai_grok_test_support::EnvGuard;
+
+        const ORIGIN: &str = "https://gateway.internal/v1";
+        let _g = EnvGuard::set(XAI_API_KEY_ENV_VAR, "ambient-xai-sentinel-must-not-leak");
+        let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+        let model = test_model_entry("gateway", ORIGIN, None, None, None);
+        let (ready, reason) = model_readiness(&model);
+        assert!(
+            !ready,
+            "non-xAI origin must stay unready even with ambient creds"
+        );
+        let reason = reason.expect("unready must carry an origin-refusal reason");
+
+        assert!(
+            reason.contains("https://gateway.internal/v1") || reason.contains("gateway.internal"),
+            "reason must name the refused origin: {reason}"
+        );
+        assert!(
+            reason.contains("withheld") && reason.to_ascii_lowercase().contains("xai"),
+            "reason must say the xAI credential was withheld: {reason}"
+        );
+        // Must not look like the generic auth-failure constructors.
+        assert_ne!(reason, auth_error_session_expired());
+        assert_ne!(reason, auth_error_api_key());
+        for generic in [
+            "Session expired",
+            "Authentication failed",
+            "Not signed in",
+            "not authenticated",
+            "no credential for non-xAI endpoint",
+        ] {
+            assert!(
+                !reason.contains(generic),
+                "must not surface generic auth failure {generic:?}: {reason}"
+            );
+        }
+
+        // The ambient sentinel must not appear in the reason (or any prefix of it).
+        assert!(
+            !reason.contains("ambient-xai-sentinel"),
+            "reason must not leak credential bytes: {reason}"
+        );
+
+        // Route report agrees: unready for origin refusal, credential stripped.
+        let creds = resolve_credentials(&model, Some("session-sentinel-must-not-leak"));
+        let route = effective_model_route("gateway", &model, &creds);
+        assert!(!route.ready);
+        assert_eq!(route.unready_reason.as_deref(), Some(reason.as_str()));
+        let rendered = format!("{route:?}");
+        assert!(!rendered.contains("ambient-xai-sentinel"));
+        assert!(!rendered.contains("session-sentinel"));
+    }
+
     /// #110: a credential header wired to an environment variable is only a
     /// credential when that variable actually has a value. Reporting it from
     /// the mapping alone made the model ready *and* made the choke point drop

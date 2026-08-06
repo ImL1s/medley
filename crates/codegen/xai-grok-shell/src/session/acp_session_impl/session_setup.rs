@@ -14,11 +14,19 @@ impl SessionActor {
         if err.is_auth_error() {
             let method_guard = self.auth_method_id.load();
             let method = method_guard.as_deref();
-            let msg = if method.is_some_and(crate::agent::auth_method::is_session_based_method) {
-                crate::agent::auth_method::auth_error_session_expired()
-            } else {
-                crate::agent::auth_method::auth_error_api_key()
-            };
+            // An unready model (including ambient-origin refusal, #123) already
+            // has an actionable readiness reason. Prefer that over the generic
+            // session-expired / api-key messages: a withheld credential is not
+            // an expired login, and a config typo is not either.
+            let catalog_model_id = self.catalog_model_id_str();
+            let msg = crate::agent::config::unready_reason_for_model_id(&catalog_model_id)
+                .unwrap_or_else(|| {
+                    if method.is_some_and(crate::agent::auth_method::is_session_based_method) {
+                        crate::agent::auth_method::auth_error_session_expired()
+                    } else {
+                        crate::agent::auth_method::auth_error_api_key()
+                    }
+                });
             xai_grok_telemetry::unified_log::error(
                 "sampling auth error",
                 Some(self.session_info.id.0.as_ref()),
