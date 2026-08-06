@@ -207,28 +207,6 @@ fn normalize_codex_base_url(base_url: &str) -> Result<String> {
     ))
 }
 
-/// Origin the built-in Codex provider's credential is valid for (#135).
-///
-/// An *origin* check — scheme, host, port — because the credential is scoped
-/// to the account's origin, not to a path on it. Derived from
-/// [`CODEX_BASE_URL`] rather than a re-typed host so the two cannot drift
-/// apart. Unlike [`normalize_codex_base_url`] there is deliberately no
-/// test-only loopback arm: this predicate runs only when the config declares
-/// a provider credential source, and that declaration means real account
-/// material is attached in every build.
-fn is_codex_credential_origin(base_url: &str) -> bool {
-    let url = reqwest::Url::parse(base_url);
-    let codex = reqwest::Url::parse(CODEX_BASE_URL);
-    match (url, codex) {
-        (Ok(url), Ok(codex)) => {
-            url.scheme() == "https"
-                && url.host_str() == codex.host_str()
-                && url.port() == codex.port()
-        }
-        _ => false,
-    }
-}
-
 fn retain_codex_headers(
     headers: &mut HeaderMap,
     authorization: Option<HeaderValue>,
@@ -862,35 +840,6 @@ impl SamplingClient {
             ));
         }
         let is_codex = matches!(config.api_backend, ApiBackend::CodexResponses);
-        // Defense in depth (#135), the provider-scoped counterpart of the
-        // #110 gate above: a named auth provider's bearer is valid only for
-        // that provider's own origin. The built-in Codex provider is the one
-        // whose live resolver this crate attaches, so its credential label
-        // plus the Codex transport demands the Codex API origin — with no
-        // test-only loopback arm, because a config carrying this label is
-        // stating that real account material is attached (loopback mocks use
-        // unlabeled configs).
-        //
-        // Its reach is narrower than it looks, and saying so here is the point:
-        // it keys on the credential *label*, and the persisted `SamplingConfig`
-        // carries no credential at all -- no `credential_source`, no `api_key`,
-        // no `auth_scheme` -- so every reconstruction seam re-derives provenance
-        // from headers alone and a provider bearer comes back **unlabelled**.
-        // On the main request path this refusal therefore cannot fire, and what
-        // actually stops that pairing is `normalize_codex_base_url` below, as a
-        // transport question. This is a backstop for paths that do carry the
-        // label, not for the turn loop. Closing the seam is #136.
-        if is_codex
-            && config
-                .credential_source
-                .as_ref()
-                .is_some_and(xai_grok_sampling_types::CredentialSource::is_provider_scoped)
-            && !is_codex_credential_origin(&config.base_url)
-        {
-            return Err(SamplingError::InvalidConfiguration(
-                "provider-scoped OpenAI Codex credential is not allowed for a non-Codex endpoint",
-            ));
-        }
         if is_codex && !config.query_params.is_empty() {
             return Err(SamplingError::InvalidConfiguration(
                 "OpenAI Codex transport does not accept query parameters",
@@ -3245,51 +3194,6 @@ mod tests {
             }
         }
     }
-    /// #135 Layer 3. The shell's readiness gate refuses to mark this pairing
-    /// ready; making it unconstructable means a path that bypasses readiness
-    /// cannot reinstate the leak. The loopback case is the load-bearing one:
-    /// `normalize_codex_base_url` accepts loopback in test builds for mock
-    /// transports, so only the credential-label gate refuses it here. The
-    /// error names no secret -- a refusal that prints the credential it
-    /// refused is not a refusal.
-    #[test]
-    fn provider_scoped_codex_credential_cannot_construct_for_a_non_codex_endpoint() {
-        use crate::config::CredentialSource;
-        for base_url in [
-            "https://vendor.example/v1",
-            "http://127.0.0.1:9/backend-api/codex",
-        ] {
-            let err = SamplingClient::new(SamplerConfig {
-                api_key: None,
-                base_url: base_url.to_string(),
-                api_backend: ApiBackend::CodexResponses,
-                credential_source: Some(CredentialSource::AuthProvider {
-                    name: "openai-codex".to_owned(),
-                }),
-                ..minimal_config()
-            })
-            .expect_err("a provider-scoped credential must not construct for a foreign origin");
-            let rendered = format!("{err}");
-            assert!(
-                rendered.contains("provider-scoped"),
-                "unexpected refusal for {base_url}: {rendered}"
-            );
-        }
-
-        // The same provider label at the credential's own origin is the
-        // normal Codex flow and must keep constructing.
-        SamplingClient::new(SamplerConfig {
-            api_key: None,
-            base_url: CODEX_BASE_URL.to_string(),
-            api_backend: ApiBackend::CodexResponses,
-            credential_source: Some(CredentialSource::AuthProvider {
-                name: "openai-codex".to_owned(),
-            }),
-            ..minimal_config()
-        })
-        .expect("a provider credential at its own origin is the normal flow");
-    }
-
     /// The other side of the same rule: a credential the model declared is
     /// none of this layer's business, and an ambient one is fine where it
     /// belongs.

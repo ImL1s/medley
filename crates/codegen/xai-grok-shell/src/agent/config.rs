@@ -6294,13 +6294,23 @@ pub(crate) fn model_readiness(model: &ModelEntry) -> (bool, Option<String>) {
                 Some("missing OpenAI Codex credential provider".to_owned()),
             );
         };
-        // #135. This branch returns early, above the #110 origin check at the
-        // bottom of the function, and every other check here is about the
-        // credential rather than the destination. The Codex bearer is
-        // provider-scoped: valid only for the Codex API origin. Without this
-        // gate a `model_provider = "openai-codex"` model whose `base_url`
-        // points at an arbitrary host read as ready and handed a live account
-        // credential to that host.
+        // Confirm this is the built-in Codex provider before any origin
+        // advice. A non-native `auth_provider` (user token helper) on a
+        // `codex_responses` backend must not be told to send its bearer to
+        // chatgpt.com.
+        let Some(status) = provider.openai_codex_status() else {
+            return (
+                false,
+                Some("invalid OpenAI Codex credential provider".to_owned()),
+            );
+        };
+        // #135. The native Codex bearer is provider-scoped: valid only for
+        // the Codex API origin. Without this gate a model_provider =
+        // "openai-codex" model whose base_url points at an arbitrary host
+        // read as ready and handed a live account credential to that host.
+        // Runs only after openai_codex_status() has confirmed a native
+        // Codex credential, and before the expired-refreshable early ready
+        // return so a foreign origin is never marked ready.
         if !is_codex_provider_origin(&model.info.base_url) {
             return (
                 false,
@@ -6313,12 +6323,6 @@ pub(crate) fn model_readiness(model: &ModelEntry) -> (bool, Option<String>) {
                 )),
             );
         }
-        let Some(status) = provider.openai_codex_status() else {
-            return (
-                false,
-                Some("invalid OpenAI Codex credential provider".to_owned()),
-            );
-        };
         if status.permanent_failure {
             return (
                 false,
@@ -7597,16 +7601,18 @@ reasoning_effort = "low"
         }
     }
 
-    /// The #135 regression that would hurt users most: a model-owned
-    /// `api_key` pointed at a foreign endpoint is the supported custom-
-    /// provider path and must stay ready — provenance, not the presence of a
-    /// credential, is what the origin binding keys on.
+    /// A model-owned `api_key` pointed at a foreign endpoint is the supported
+    /// custom-provider path and must stay ready — provenance, not the presence
+    /// of a credential, is what the origin binding keys on.
     ///
-    /// Asserted twice, because the first version of this test was vacuous:
-    /// `test_model_entry` defaults `api_backend` to `ChatCompletions`, so it
-    /// never entered the Codex branch and passed unchanged on the parent
-    /// commit. The `CodexResponses` case is the one that actually reaches the
-    /// new gate.
+    /// The CodexResponses half was deleted: with `auth_provider: None` the
+    /// readiness path returns "missing OpenAI Codex credential provider"
+    /// eight lines above the origin gate, so asserting `!reason.contains("origin")`
+    /// was vacuous. Building a state that is ready under CodexResponses while
+    /// still exercising "own api_key at a foreign origin" is not honest —
+    /// that branch always requires a provider and, for a native Codex
+    /// provider, the origin gate correctly refuses a foreign base_url. Task 4
+    /// covers the real non-native-provider regression instead.
     #[test]
     fn model_owned_api_key_to_a_foreign_endpoint_stays_ready() {
         let entry = test_model_entry(
@@ -7621,25 +7627,54 @@ reasoning_effort = "low"
             (true, None),
             "a key the user typed for that endpoint is none of the origin gate's business"
         );
+    }
 
-        // Same key, same foreign origin, but now on the backend whose branch
-        // carries the origin gate. It must still not be the gate's business:
-        // the refusal is for *provider-scoped* credentials, and this one is
-        // the user's own. Unready here is acceptable only for the missing-
-        // provider reason, never for the origin.
-        let mut codex = test_model_entry(
-            "byok-codex",
-            "https://vendor.example/v1",
-            Some("sk-model-owned"),
+    /// #135 Task 4. A CodexResponses model that uses a *non-native* auth
+    /// provider (the user's own token helper) must not be told the OpenAI
+    /// Codex credential is scoped to chatgpt.com. That advice only applies
+    /// when `openai_codex_status()` has confirmed a native Codex credential;
+    /// otherwise the origin gate would push the helper's bearer at the
+    /// Codex API origin.
+    #[test]
+    fn non_native_auth_provider_on_codex_backend_is_not_told_to_use_codex_origin() {
+        let provider = crate::auth::AuthProviderRef::new(
+            "user-token-helper".into(),
+            crate::auth::AuthProviderConfig {
+                command: "printf helper-token".into(),
+                args: None,
+                token_ttl_secs: Some(3600),
+                timeout_secs: None,
+                cwd: None,
+            },
+        );
+        let mut entry = test_model_entry(
+            "custom-codex-transport",
+            "https://codex.internal/v1",
+            None,
             None,
             None,
         );
-        codex.info.api_backend = ApiBackend::CodexResponses;
-        let (_, reason) = model_readiness(&codex);
-        let reason = reason.unwrap_or_default();
+        entry.info.api_backend = ApiBackend::CodexResponses;
+        entry.info.auth_scheme = AuthScheme::Bearer;
+        entry.auth_provider = Some(provider);
+
+        let (ready, reason) = model_readiness(&entry);
         assert!(
-            !reason.contains("origin"),
-            "a model-owned key must never be refused for where it points, got: {reason}"
+            !ready,
+            "a non-native provider is not a signed-in Codex credential"
+        );
+        let reason = reason.expect("readiness refusal must name the problem");
+        assert!(
+            !reason.contains("scoped to the Codex API origin"),
+            "must not claim a Codex origin binding for a non-native provider, got: {reason}"
+        );
+        assert!(
+            !reason.contains("chatgpt.com"),
+            "must not tell the user to point base_url at chatgpt.com for their own helper, got: {reason}"
+        );
+        assert!(
+            !reason.contains(crate::auth::openai_codex::CODEX_API_BASE_URL),
+            "must not suggest the Codex API base URL for a non-native provider, got: {reason}"
         );
     }
     #[test]
