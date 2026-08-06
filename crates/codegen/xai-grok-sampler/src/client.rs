@@ -3156,7 +3156,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// #110 Layer 3. The choke point in the shell already refuses to emit this
     /// combination; this makes it unrepresentable, so a later regression
     /// upstream of here cannot quietly reintroduce it. The error names no
@@ -4129,7 +4128,11 @@ mod tests {
             })]);
         request.inner.prompt_cache_key = Some("session-abc".to_owned());
 
-        client
+        // The assertion is about what went out on the wire, so the response
+        // stream is never read. Bind it rather than dropping it inline: the
+        // stream is `must_use`, and an unbound `.expect(...)` fails clippy
+        // under `-D warnings`.
+        let _started = client
             .create_response_stream(request)
             .await
             .expect("mock Codex request should start");
