@@ -170,6 +170,22 @@ fn headless_subagent_spawned_and_finished_parse() {
     ));
 }
 
+/// #44: wire decode of `{"sessionUpdate":"attempt_discarded"}` on the headless
+/// xAI session_notification path.
+#[test]
+fn headless_attempt_discarded_parses_from_wire() {
+    let notif = make_ext_notif(
+        "x.ai/session_notification",
+        serde_json::json!({
+            "sessionUpdate": "attempt_discarded",
+        }),
+    );
+    assert!(
+        matches!(handle_ext_notification(&notif), ExtEvent::AttemptDiscarded),
+        "attempt_discarded must decode to ExtEvent::AttemptDiscarded"
+    );
+}
+
 #[test]
 fn headless_response_completed_parses_per_response_fields() {
     let notif = make_ext_notif(

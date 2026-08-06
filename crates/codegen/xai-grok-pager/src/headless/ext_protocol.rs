@@ -33,13 +33,24 @@ fn session_update_tag(params: &str) -> Option<String> {
 
 pub(crate) enum ExtEvent {
     None,
-    TaskBackgrounded { task_id: String, is_monitor: bool },
-    TaskCompleted { task_id: String },
-    SubagentSpawned { subagent_id: String },
-    SubagentFinished { subagent_id: String },
+    TaskBackgrounded {
+        task_id: String,
+        is_monitor: bool,
+    },
+    TaskCompleted {
+        task_id: String,
+    },
+    SubagentSpawned {
+        subagent_id: String,
+    },
+    SubagentFinished {
+        subagent_id: String,
+    },
     MonitorEvent,
     Lifecycle(Lifecycle),
     Stream(Box<StreamEvent>),
+    /// Drop buffered output for a sampling attempt that will be retried.
+    AttemptDiscarded,
 }
 
 pub(crate) fn handle_ext_notification(
@@ -211,6 +222,8 @@ fn decode_session_notification(method: &str, params: &str) -> ExtEvent {
             #[serde(default)]
             stop_sequence: Option<String>,
         },
+        /// Streaming attempt abandoned for retry; drop buffered attempt text.
+        AttemptDiscarded,
         #[serde(other)]
         Other,
     }
@@ -283,6 +296,7 @@ fn decode_session_notification(method: &str, params: &str) -> ExtEvent {
             signature,
             stop_sequence,
         })),
+        XaiUpdate::AttemptDiscarded => ExtEvent::AttemptDiscarded,
         // Background lifecycle tag on the wrong carrier: log loudly, but a
         // genuinely unknown display tag stays a clean ignore.
         XaiUpdate::Other => {

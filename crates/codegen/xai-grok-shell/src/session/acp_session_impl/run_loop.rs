@@ -368,6 +368,23 @@ pub(super) async fn run_session(
                     if let Some(event) = maybe_event {
                         match event {
                             SessionEvent::Notification(notification) => {
+                                // Retraction for a discarded sampling attempt:
+                                // drop any still-buffered text/thought/tool-delta
+                                // chunks for that attempt (do NOT flush them to
+                                // clients — that would reintroduce the duplicate
+                                // this event exists to prevent), then forward the
+                                // retraction so already-emitted UI can unwind.
+                                if matches!(
+                                    &notification,
+                                    SessionNotification::Xai(n) if matches!(
+                                        n.update,
+                                        crate::extensions::notification::SessionUpdate::AttemptDiscarded
+                                    )
+                                ) {
+                                    let _ = replay_buffer.flush();
+                                    session.emit_buffered(notification).await;
+                                    continue;
+                                }
                                 let out = replay_buffer.consume_chunk(notification);
                                 match out {
                                     None => {}

@@ -93,6 +93,17 @@ pub enum SamplingEvent {
         metrics: InferenceLatencyStats,
     },
 
+    /// A streamed attempt is being abandoned and will be retried.
+    ///
+    /// Emitted immediately before [`SamplingEvent::Retrying`] whenever the
+    /// retry loop discards an attempt that may already have forwarded
+    /// `ChannelToken` / `ToolCallDelta` / backend-tool events to the session.
+    /// Consumers must drop any buffered or displayed content for this attempt
+    /// (text, reasoning, and partial tool-call state) so a successful retry
+    /// does not re-stream duplicates. A discard with no prior streamed content
+    /// is a no-op for consumers.
+    AttemptDiscarded { request_id: RequestId },
+
     /// Request is being retried.
     Retrying {
         request_id: RequestId,

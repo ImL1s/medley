@@ -473,6 +473,38 @@ impl MessagesReducer {
             end_session_id
         }
     }
+
+    /// Drop the current unflushed response so a retry cannot re-emit its content.
+    ///
+    /// Does **not** flush assistant frames or partial envelopes — that would
+    /// re-surface the abandoned attempt. Already-flushed frames from prior
+    /// accepted responses in this turn are left alone. Contract for consumers:
+    /// drop everything received since the last accepted boundary / turn start.
+    fn discard_open_attempt(&mut self) {
+        // Tool-use ids only in the unflushed frame would otherwise get synthetic
+        // error tool_results at finish; remove them with the blocks.
+        let discarded_tool_ids: Vec<String> = self
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { id, .. } | ContentBlock::ServerToolUse { id, .. } => {
+                    Some(id.clone())
+                }
+                ContentBlock::WebSearchToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                _ => None,
+            })
+            .collect();
+        for id in discarded_tool_ids {
+            self.pending_client_tool_uses.remove(&id);
+            self.backend_web_search_calls.remove(&id);
+        }
+        self.blocks.clear();
+        self.open_kind = None;
+        self.open_text.clear();
+        self.open_signature = None;
+        self.framing = PartialFraming::Idle;
+        self.response.reset();
+    }
 }
 
 impl Reducer for MessagesReducer {
@@ -680,6 +712,10 @@ impl Reducer for MessagesReducer {
                 }
             }
             StreamEvent::Lifecycle(_) | StreamEvent::Plan(_) => {}
+            StreamEvent::AttemptDiscarded => {
+                self.discard_open_attempt();
+                out.push(to_line(&MessagesLine::AttemptDiscarded));
+            }
         }
         out
     }

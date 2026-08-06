@@ -6,7 +6,7 @@
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Instant;
-use xai_grok_shell::session::storage::{ReplayEmission, stream_replay_updates_at};
+use xai_grok_shell::session::storage::{ReplayEmission, ReplayUpdate, stream_replay_updates_at};
 /// Enriched subagent tracking info.
 ///
 /// Keyed by `child_session_id` in `AgentView::subagent_sessions`.
@@ -184,10 +184,21 @@ pub(crate) fn replay_inherited_updates(
         is_replay: true,
         ..Default::default()
     };
-    let outcome = match stream_replay_updates_at(child_session_id, &home, |update| {
-        child_view
-            .session
-            .handle_update(update, &replay_meta, &mut child_view.scrollback);
+    // Covers the subagent inherited-scrollback path only (not main-session
+    // resume, which uses `forward_raw_replay_line`). AttemptDiscarded must be
+    // applied here or a discarded-then-retried child stream double-renders.
+    let outcome = match stream_replay_updates_at(child_session_id, &home, |update| match update {
+        ReplayUpdate::Acp(update) => {
+            child_view
+                .session
+                .handle_update(update, &replay_meta, &mut child_view.scrollback);
+        }
+        ReplayUpdate::AttemptDiscarded => {
+            child_view
+                .session
+                .tracker
+                .discard_streamed_attempt(&mut child_view.scrollback);
+        }
     }) {
         Ok(outcome) => outcome,
         Err(e) => {
