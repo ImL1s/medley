@@ -173,13 +173,15 @@ async fn session_token_actor(
     cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
     cfg.model = "test".to_string();
     actor.chat_state_handle.update_sampling_config(cfg);
-    actor
-        .chat_state_handle
-        .update_credentials(xai_chat_state::Credentials::bound(
-            None,
-            xai_chat_state::AuthType::SessionToken,
-            xai_grok_sampler::CredentialSource::Missing,
-        ));
+    // `rebind`, not a fresh `bound(..)`: the old two-field assignment preserved
+    // `alpha_test_key` / `client_version`, and a new value would silently drop
+    // them. The other two migrated sites use `rebind` for the same reason.
+    let existing = actor.chat_state_handle.get_credentials().await;
+    actor.chat_state_handle.update_credentials(existing.rebind(
+        None,
+        xai_chat_state::AuthType::SessionToken,
+        xai_grok_sampler::CredentialSource::Missing,
+    ));
 
     // Definite NotByok: the session-token gate must stay active against the
     // loopback mock URL (an `Unknown` would demand a first-party host).

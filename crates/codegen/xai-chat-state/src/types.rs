@@ -315,12 +315,18 @@ impl Credentials {
     /// [`CredentialSource::XaiSession`] — the only production path that
     /// historically wrote a key onto empty credentials was session refresh.
     ///
-    /// This is the one place provenance is *inferred* rather than known, so it
-    /// is deliberately the fail-closed guess: `XaiSession` is ambient, and the
-    /// Layer-3 guard refuses ambient sources on any non-first-party origin. A
-    /// provider mint landing here would be over-restricted, never
-    /// under-restricted. Step 2 of #136 revisits every write site and should
-    /// remove the inference entirely by having callers state the source.
+    /// **That branch is unreachable from production today.** Every caller --
+    /// the cold mint and 401 re-mint in `set_chat_api_key`, session refresh,
+    /// and `config.toml` reload -- runs against an actor whose credentials were
+    /// already bound by `spawn_session_actor` before the state existed, and
+    /// `restore_snapshot` only ever carries in-memory credentials forward. It
+    /// exists to make the function total, not because a mint lands here.
+    ///
+    /// Were it reachable, `XaiSession` is the fail-closed choice: it is
+    /// ambient, and the Layer-3 guard refuses ambient sources on any
+    /// non-first-party origin, so the guess over-restricts. That reasoning is
+    /// why this variant and not another -- it is not a claim about current
+    /// behaviour.
     pub fn replace_api_key(&mut self, key: String) {
         match &mut self.auth {
             StoredAuth::Bound { api_key, .. } => {
@@ -344,12 +350,6 @@ impl Credentials {
         }
     }
 
-    /// Drop the secret *and* its provenance (back to empty auth). Keeps
-    /// alpha/client_version. Used by tests that fully reset auth material.
-    pub fn clear_auth(&mut self) {
-        self.auth = StoredAuth::None;
-    }
-
     fn is_empty(&self) -> bool {
         self.api_key().is_none() && self.alpha_test_key.is_none()
     }
@@ -357,10 +357,25 @@ impl Credentials {
 
 impl std::fmt::Debug for Credentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured rather than read through `api_key()`. The credential
+        // observability guard proves this impl is presence-only by matching
+        // `self.api_key` followed immediately by `.is_some()`; an accessor call
+        // puts `()` in between, the match fails, and the impl is reported as
+        // exposing raw data. Going through the accessor would have blinded a
+        // gate that exists to catch exactly this kind of change -- and it did:
+        // CI caught this, review did not.
+        let (key_present, auth_type, source) = match &self.auth {
+            StoredAuth::None => (false, AuthType::default(), None),
+            StoredAuth::Bound {
+                api_key,
+                auth_type,
+                source,
+            } => (api_key.is_some(), *auth_type, Some(source)),
+        };
         f.debug_struct("Credentials")
-            .field("api_key_present", &self.api_key().is_some())
-            .field("auth_type", &self.auth_type())
-            .field("source", &self.source())
+            .field("api_key_present", &key_present)
+            .field("auth_type", &auth_type)
+            .field("source", &source)
             .field("alpha_test_key_present", &self.alpha_test_key.is_some())
             .field("client_version_present", &self.client_version.is_some())
             .finish()

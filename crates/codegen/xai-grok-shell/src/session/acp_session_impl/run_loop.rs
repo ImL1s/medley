@@ -724,28 +724,7 @@ pub(super) async fn run_session(
                                     == xai_chat_state::AuthType::SessionToken)
                                     .then_some(existing.api_key())
                                     .flatten();
-                                if let Some(r) = crate::agent::config::try_resolve_model_credentials(model_name.as_str(), session_key) {
-                                    // Best-effort source from auth_type alone:
-                                    // this path never ran `classify_credential_source`
-                                    // before either (credentials had no source field).
-                                    // SessionToken → XaiSession; ApiKey with key →
-                                    // ModelApiKey (may actually be env/ambient — step 2-3).
-                                    let source = match r.auth_type {
-                                        xai_chat_state::AuthType::SessionToken => {
-                                            if r.api_key.is_some() {
-                                                xai_grok_sampler::CredentialSource::XaiSession
-                                            } else {
-                                                xai_grok_sampler::CredentialSource::Missing
-                                            }
-                                        }
-                                        xai_chat_state::AuthType::ApiKey => {
-                                            if r.api_key.is_some() {
-                                                xai_grok_sampler::CredentialSource::ModelApiKey
-                                            } else {
-                                                xai_grok_sampler::CredentialSource::Missing
-                                            }
-                                        }
-                                    };
+                                if let Some((r, source)) = crate::agent::config::try_resolve_model_credentials_with_source(model_name.as_str(), session_key) {
                                     session.chat_state_handle.update_credentials(
                                         existing.rebind(r.api_key, r.auth_type, source),
                                     );
