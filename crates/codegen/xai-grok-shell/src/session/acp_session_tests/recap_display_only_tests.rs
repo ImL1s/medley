@@ -119,6 +119,9 @@ async fn side_question_routes_on_the_session_id_when_the_key_is_not_forwarded() 
             let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
             cfg.base_url = server.url();
             cfg.api_backend = xai_grok_sampling_types::ApiBackend::ChatCompletions;
+            // Loopback mock stands in for a first-party endpoint; without this
+            // the metadata boundary strips x-grok-* correlation headers.
+            cfg.endpoint_trust = Some(xai_grok_sampling_types::EndpointTrustClass::FirstPartyXai);
             actor.chat_state_handle.update_sampling_config(cfg);
 
             actor.chat_state_handle.replace_conversation(vec![
@@ -1057,6 +1060,10 @@ async fn side_question_request_rides_parent_prompt_cache() {
             let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
             cfg.base_url = server.url();
             cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+            // Loopback mock stands in for a first-party endpoint; without this
+            // the metadata boundary strips x-grok-* correlation headers.
+            // Same fixture as `recap_request_rides_parent_prompt_cache`.
+            cfg.endpoint_trust = Some(xai_grok_sampling_types::EndpointTrustClass::FirstPartyXai);
             actor.chat_state_handle.update_sampling_config(cfg);
 
             actor.chat_state_handle.replace_conversation(vec![

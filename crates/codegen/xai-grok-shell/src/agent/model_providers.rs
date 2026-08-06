@@ -377,7 +377,9 @@ mod tests {
 
     #[test]
     fn provider_debug_is_presence_only() {
-        let secret = "GB002-provider-config-secret-0123456789abcdef";
+        // Sentinel must not share an 8-byte window with Debug field names
+        // (`auth_provider_present`, `api_key_present`, …) or the scan false-fails.
+        let secret = "GB002-cfg-sentinel-Q7w5E3r1T9y7U2i4";
         let config = ModelProviderConfig {
             base_url: Some(format!(
                 "https://user:{secret}@example.test/?token={secret}"
@@ -432,9 +434,15 @@ mod tests {
             model.has_own_credentials(),
             "a custom endpoint without a credential is BYOK, not session-authed"
         );
-        assert_eq!(
-            resolve_credentials(model, Some("session-jwt")).api_key,
-            None,
+        // `assert!(..is_none())`, not `assert_eq!(.., None)`: on failure the
+        // latter formats the left value, and for a model with an
+        // `auth_provider` that value is the developer's live OAuth access
+        // token. A test that prints the credential it is guarding is not a
+        // guard.
+        assert!(
+            resolve_credentials(model, Some("session-jwt"))
+                .api_key
+                .is_none(),
             "the session token must not leak to the provider's custom endpoint"
         );
     }
@@ -886,9 +894,10 @@ mod tests {
         let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
         let resolved = resolve_model_list(&cfg, None);
         let model = resolved.get("via-gateway").expect("model should exist");
-        assert_eq!(
-            resolve_credentials(model, Some("session-jwt")).api_key,
-            None,
+        assert!(
+            resolve_credentials(model, Some("session-jwt"))
+                .api_key
+                .is_none(),
             "an unresolved declared credential must not fall back to the session token"
         );
     }
@@ -956,9 +965,10 @@ mod tests {
             effective.config.command.is_empty(),
             "the fail-closed ref is unusable"
         );
-        assert_eq!(
-            resolve_credentials(model, Some("session-jwt")).api_key,
-            None,
+        assert!(
+            resolve_credentials(model, Some("session-jwt"))
+                .api_key
+                .is_none(),
             "must not fall back to the session token"
         );
     }
@@ -984,9 +994,10 @@ mod tests {
         let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
         let resolved = resolve_model_list(&cfg, None);
         let model = resolved.get("via-gateway").expect("model should exist");
-        assert_eq!(
-            resolve_credentials(model, Some("session-jwt")).api_key,
-            None,
+        assert!(
+            resolve_credentials(model, Some("session-jwt"))
+                .api_key
+                .is_none(),
             "a fail-closed ref must never resolve a colliding auth_provider table"
         );
         let effective = model
@@ -1312,9 +1323,8 @@ mod tests {
                 .as_ref()
                 .is_some_and(crate::auth::AuthProviderRef::is_fail_closed)
         );
-        assert_eq!(
-            resolve_credentials(isolated, None).api_key,
-            None,
+        assert!(
+            resolve_credentials(isolated, None).api_key.is_none(),
             "even a live native Codex token is detached from a custom-origin entry"
         );
     }
@@ -1506,9 +1516,10 @@ mod tests {
                 .map(|provider| provider.name.as_str()),
             Some(OPENAI_CODEX_PROVIDER_ID)
         );
-        assert_eq!(
-            resolve_credentials(model, Some("xai-session-token")).api_key,
-            None,
+        assert!(
+            resolve_credentials(model, Some("xai-session-token"))
+                .api_key
+                .is_none(),
             "the xAI session token must never authenticate a Codex-keyed model"
         );
     }
