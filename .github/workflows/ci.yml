@@ -354,3 +354,26 @@ jobs:
             catalog_miss -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
             toctou -- --nocapture
+
+      # #162: the restore-direction and the tombstone-wall cases. The
+      # pre-existing `workflow_restore_rejects_symlinks_and_caps_run_count`
+      # stays green under both defects, so `workflow_restore` as one filter
+      # covers all three and the two new ones carry the protection. Quoted
+      # name: an unquoted `#162` truncates at the comment marker.
+      - name: 'Workflow restore ordering and scan budget (issue #162)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib workflow_restore -- --nocapture
