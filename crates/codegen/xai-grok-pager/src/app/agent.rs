@@ -901,22 +901,38 @@ impl AgentSession {
     /// Stash a model pick made before the session id exists, keeping the
     /// rollback target of the *first* pick in a rapid sequence.
     ///
-    /// `prev_model_id` is where a failed switch returns to, and across rapid
-    /// picks it stays the target the first pick captured — not the model the
-    /// previous pick optimistically installed, which the user only passed
-    /// through.
+    /// Only `prev_model_id` coalesces. `model_id` and `effort` are last-wins,
+    /// so a staged effort from the dashboard is dropped when the user then
+    /// picks the same model with no effort. Pre-existing, but the name reads
+    /// like the whole struct is preserved.
     ///
-    /// The `.or(prev_model_id)` tail is deliberate, not an oversight. A prior
-    /// whose target is `None` is a CLI seed (`--model X`), which had nothing to
-    /// roll back to when it was stashed; once its model is on screen, the
-    /// honest target for the next pick is what is displayed.
-    /// `deferred_switch_overwritten_by_second_switch` and
-    /// `pick_over_cli_seed_keeps_display_as_rollback_target` both pin that.
+    /// The observable effect is on the **success** path, not the failure path.
+    /// A failed switch restores the display from `ModelSwitchRollback`, which
+    /// `begin_deferred_model_switch` captures with `get_or_insert_with` and so
+    /// already holds the first pick's predecessor. What reads `prev_model_id`
+    /// is `handle_switch_model_complete`'s `model_changed`, in preference to
+    /// that snapshot: without coalescing, A→B→A through the settings modal
+    /// reported "Switched to A" and emitted `PersistPreferredModel` for a model
+    /// that never changed.
     ///
-    /// Both pre-session entry points go through here (`Action::SwitchModel`'s
-    /// router arm and `set_default_model_confirmed`). They used to disagree:
-    /// only the router coalesced, so the settings path overwrote the target
-    /// with the model its own previous pick had just installed.
+    /// The `.or(prev_model_id)` tail is right for two of the three ways a prior
+    /// can hold `None` — a CLI seed (`app_view.rs`) and the dashboard's
+    /// effort-only push (`dashboard.rs`), neither of which ever captured a
+    /// target, so the displayed model is the honest one. It is **wrong** for
+    /// the third: a first pre-session pick made while nothing is displayed
+    /// captures `None` legitimately, and the next pick then adopts the model
+    /// the first pick installed. That is #143, it is still live, and this
+    /// two-state field cannot tell "never captured" from "captured nothing".
+    /// Reachable without any CLI seed: `acp/model_state.rs` sets `current` to
+    /// `None` whenever the shell's reported model is absent from
+    /// `available_models`, leaving the catalog populated.
+    ///
+    /// Both pre-session *pick* entry points go through here
+    /// (`Action::SwitchModel`'s router arm and `set_default_model_confirmed`).
+    /// They used to disagree: only the router coalesced, so the settings path
+    /// overwrote the target with the model its own previous pick had just
+    /// installed. `dashboard.rs` is a third pre-session writer and deliberately
+    /// does not — it overwrites the stash outright to beat a CLI `-m`.
     pub(crate) fn stash_deferred_model_switch(
         &mut self,
         model_id: acp::ModelId,

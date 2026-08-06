@@ -1834,9 +1834,13 @@ pub(in crate::app::dispatch) fn set_default_model_confirmed(
         // `EventLoop::on_session_created` to apply once the session
         // id materialises. Assigning the field directly here is what let this
         // path disagree with the router's: it overwrote the rollback target
-        // with the model the *previous* rapid pick had just installed, so a
-        // failure returned to an intermediate rather than to where the user
-        // started.
+        // with the model the *previous* rapid pick had just installed.
+        //
+        // The display-layer rollback was never the casualty — that runs off
+        // `ModelSwitchRollback`, which already coalesces. What broke is
+        // `model_changed` in `handle_switch_model_complete`, which prefers
+        // `prev_model_id`: A→B→A from this modal reported "Switched to A" and
+        // persisted a preference for a model that had not changed.
         agent
             .session
             .stash_deferred_model_switch(new_id, None, prev_id);
