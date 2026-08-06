@@ -1032,15 +1032,40 @@ impl SessionActor {
             });
         }
         let arc_client = std::sync::Arc::new(new_client);
-        let _ = arc_client
-            .arm_liveness_watcher(xai_grok_mcp::liveness::DEFAULT_POLL_INTERVAL)
-            .await;
+        // Insert BEFORE arming the watcher, and arm as the last thing this
+        // function does. `tokio::time::interval` ticks immediately (see
+        // `xai-grok-mcp/src/liveness.rs`), so a server that exits at handshake
+        // can have its `TransportClosed` emitted the instant the watcher is
+        // armed. Arming first left two windows open; this order closes both:
+        //
+        // - The `mcp_state` lock is an `.await`, and the dispatcher takes that
+        //   same lock every coalesce window. A death classified inside that
+        //   window is measured against the PREVIOUS client's `last_ready_at`,
+        //   and once that is older than `STABILITY_WINDOW` the not-early
+        //   branch resets the early-death counter — refunding the budget of a
+        //   crash-looping server, which is issue #45 returning.
+        // - A `TransportClosed` for a client not yet in `owned_clients` is one
+        //   `drop_dead_clients` cannot find in order to evict it.
+        //
+        // The window this opens instead — a live client that is briefly
+        // unwatched — is strictly the lesser problem: an unwatched live client
+        // is merely not yet monitored, whereas an unfindable dead one cannot
+        // be cleaned up at all. That asymmetry is why the swap goes this way
+        // round rather than the other.
+        //
+        // Nothing may `.await` between the arm below and the caller's
+        // `note_ready` (`auto_restart_stdio`'s `Ok` arm records it
+        // synchronously); `arm_liveness_watcher` spawns and returns without
+        // awaiting again, so returning straight into `Ok(())` preserves that.
         {
             let mut mcp_state = self.mcp_state.lock().await;
             mcp_state
                 .owned_clients
-                .insert(server.to_string(), arc_client);
+                .insert(server.to_string(), std::sync::Arc::clone(&arc_client));
         }
+        let _ = arc_client
+            .arm_liveness_watcher(xai_grok_mcp::liveness::DEFAULT_POLL_INTERVAL)
+            .await;
         Ok(())
     }
     pub(super) async fn maybe_inject_mcp_connecting_reminder(&self) {
@@ -1696,6 +1721,21 @@ impl SessionActor {
                     .collect();
                 for c in mcp_clients {
                     let arc = std::sync::Arc::new(c);
+                    // Arms BEFORE inserting — deliberately the opposite of
+                    // `respawn_stdio`, which must insert first. Both are
+                    // correct, for a reason specific to this site: the
+                    // `mcp_state` guard taken above is held across this whole
+                    // loop, so the dispatcher cannot acquire the lock and
+                    // observe a client that is watched but not yet in
+                    // `owned_clients`. `respawn_stdio` re-locks between the
+                    // two, which is exactly the window it has to avoid.
+                    //
+                    // The early-death budget is safe here too: this is the
+                    // initial handshake, so `ensure_initialized` already
+                    // emitted `Ready` before this loop, and `flush_window`
+                    // applies it (`note_recovery_ready`) before
+                    // `maybe_schedule_restart` classifies any death from the
+                    // same coalesce window.
                     let _ = arc
                         .arm_liveness_watcher(xai_grok_mcp::liveness::DEFAULT_POLL_INTERVAL)
                         .await;

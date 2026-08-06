@@ -2576,6 +2576,22 @@ impl crate::session::mcp_restart::RestartActions for SessionRestartActions {
             .unwrap_or_else(|e| e.into_inner())
             .end_restart(server);
     }
+    fn note_ready(&self, server: &str) {
+        self.shutdown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .note_ready(server);
+    }
+    fn classify_death(
+        &self,
+        server: &str,
+        kind: xai_grok_mcp::servers::McpClientEventKind,
+    ) -> crate::session::mcp_restart::DeathDisposition {
+        self.shutdown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .classify_death(server, kind)
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalBackendKind {
