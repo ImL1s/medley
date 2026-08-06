@@ -288,6 +288,60 @@ impl LeaderLock {
     }
 }
 
+/// Outcome of [`reclaim_lock_if_unheld`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReclaimOutcome {
+    /// Nobody held the flock, so the file was orphaned and has been removed.
+    Removed,
+    /// A live process holds the flock. The file was left alone.
+    HeldByLiveProcess,
+    /// Could not tell (no such file, permissions, or another I/O error).
+    /// Treated as "do not touch" — the same as `HeldByLiveProcess` for safety.
+    Indeterminate,
+}
+
+/// Remove a leader lock file, but **only** if no live process holds its flock.
+///
+/// This is the safe replacement for "the PID doesn't look like ours, so the
+/// lock must be stale" (issue #167). Occupancy, not identity, is what makes
+/// deletion safe: a lock file whose flock nobody holds is orphaned by
+/// definition, and one whose flock is held has a live owner no matter what any
+/// PID or process name suggests. Deleting the latter is what produced two live
+/// leaders — the holder keeps its flock on the now-unlinked inode while the
+/// next client creates a fresh file and acquires the flock on the new one.
+///
+/// Deliberately name-free and `/proc`-free, so it behaves identically on macOS
+/// and Linux. That is why this does not reuse a process-inspection helper: the
+/// answer must not depend on the platform or on what the binary is called.
+///
+/// The unlink happens **while still holding the flock**, so there is no window
+/// in which a new leader could acquire this inode between the probe and the
+/// removal. A leader starting after the unlink creates a new file and locks
+/// that instead, which is the intended recovery.
+///
+/// Opens existing-only: this must never create the very file it is deciding
+/// whether to delete.
+pub fn reclaim_lock_if_unheld(lock_path: &Path) -> ReclaimOutcome {
+    let file = match OpenOptions::new().read(true).write(true).open(lock_path) {
+        Ok(f) => f,
+        Err(_) => return ReclaimOutcome::Indeterminate,
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            // Still holding the lock here: unlink before releasing.
+            let removed = fs::remove_file(lock_path).is_ok();
+            let _ = FileExt::unlock(&file);
+            if removed {
+                ReclaimOutcome::Removed
+            } else {
+                ReclaimOutcome::Indeterminate
+            }
+        }
+        Err(e) if is_lock_contended(&e) => ReclaimOutcome::HeldByLiveProcess,
+        Err(_) => ReclaimOutcome::Indeterminate,
+    }
+}
+
 #[cfg(test)]
 impl LeaderLock {
     /// Bind a lock to explicit paths for tests running outside the default home.
@@ -325,6 +379,67 @@ mod tests {
             temp.path().join("leader.lock"),
             temp.path().join("leader.sock"),
         )
+    }
+
+    /// Issue #167: a lock file nobody holds is orphaned by definition, and
+    /// reclaiming it is the *only* cleanup this command may do.
+    #[test]
+    fn reclaim_removes_a_lock_no_process_holds() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("leader.lock");
+        fs::write(&path, "4000000000").unwrap();
+
+        assert_eq!(reclaim_lock_if_unheld(&path), ReclaimOutcome::Removed);
+        assert!(!path.exists(), "an orphaned lock file must be removed");
+    }
+
+    /// Issue #167, the invariant that must not be weakened: a lock file whose
+    /// flock a live process holds is NEVER removed. Deleting it is precisely
+    /// what produced two live leaders — the holder keeps its flock on the
+    /// unlinked inode while the next client locks a freshly created one.
+    ///
+    /// `fs2` uses `flock(2)`, which is per open-file-description rather than
+    /// per-process, so a second handle to the same path contends even from
+    /// inside this test — no subprocess needed, and it behaves the same on
+    /// macOS and Linux.
+    #[test]
+    fn reclaim_refuses_a_lock_a_live_process_holds() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("leader.lock");
+        fs::write(&path, "1234").unwrap();
+
+        // Stand in for the live leader still holding its lock.
+        let holder = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        holder.try_lock_exclusive().expect("holder acquires flock");
+
+        assert_eq!(
+            reclaim_lock_if_unheld(&path),
+            ReclaimOutcome::HeldByLiveProcess,
+            "a held lock must never be reclaimed, whatever the PID or the \
+             process name suggests",
+        );
+        assert!(
+            path.exists(),
+            "the live holder's lock file must survive — removing it is the \
+             step that produces a second leader",
+        );
+
+        FileExt::unlock(&holder).unwrap();
+    }
+
+    /// A path that is not there cannot be reclaimed, and must not be created
+    /// by the attempt — the probe opens existing-only.
+    #[test]
+    fn reclaim_is_indeterminate_for_a_missing_lock_file() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("absent.lock");
+
+        assert_eq!(reclaim_lock_if_unheld(&path), ReclaimOutcome::Indeterminate,);
+        assert!(!path.exists(), "probing must not create the lock file");
     }
 
     #[test]

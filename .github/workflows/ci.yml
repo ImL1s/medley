@@ -309,6 +309,43 @@ jobs:
           run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
             issue8_agent_serve_security_ -- --nocapture
 
+      - name: "Leader kill safety (issue #167)"
+        # `leaders kill` used to ask "is this process named grok?", which is
+        # false for the shipped `medley` binary — so it deleted a LIVE leader's
+        # lock and socket without signalling it, and the next client acquired
+        # the flock on a fresh inode: two live leaders from a command whose
+        # purpose is to leave none.
+        #
+        # These pin the two invariants that replaced it: a socket-verified live
+        # leader is signalled and its files are never touched, and a lock file
+        # is reclaimed only when no live process holds its flock. Neither
+        # consults a process name, so neither can rot on the next rename.
+        #
+        # Needed because ci.yml has no unfiltered job (#171): the only other
+        # xai-grok-pager-bin invocation filters on `issue8_agent_serve_security_`,
+        # so without this step these tests would run nowhere. `run_nonzero`
+        # fails on a zero-match filter, so renaming them breaks CI loudly
+        # instead of silently dropping the coverage.
+        env:
+          PROTOC: protoc
+        run: |
+          set -o pipefail
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
+              echo "test filter matched zero tests: $*" >&2
+              rm -f "$output"
+              return 1
+            }
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
+            leaders_kill -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            leader::lock::tests::reclaim -- --nocapture
+
       - name: Shell auth + readiness meta
         env:
           PROTOC: protoc

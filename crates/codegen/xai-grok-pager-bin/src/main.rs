@@ -376,6 +376,44 @@ async fn run_leader_mgmt(args: LeaderMgmtArgs) -> Result<()> {
         }
     }
 }
+/// What `leaders kill` should do with one discovered candidate.
+///
+/// Issue #167. The old code asked one question — "is this process named
+/// `grok`?" — of two situations that need different questions, and got the
+/// answer wrong for both once the shipped command became `medley`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaderKillAction {
+    /// A live leader answered its control socket. Signal this PID; never touch
+    /// its files.
+    Signal(u32),
+    /// Nothing answered. The lock file is the only evidence left, so reclaim it
+    /// **only** if no live process holds its flock.
+    ReclaimLockIfUnheld,
+    /// Neither a live leader nor a lock file to reason about.
+    Skip,
+}
+
+/// Decide what to do for one candidate, from the two facts that matter.
+///
+/// `live_pid` is `Some` exactly when discovery reached the leader over its
+/// control socket (`live_info`, which is only ever set by a successful
+/// `GetLeaderInfo`). That is a live handshake with something speaking our
+/// protocol on our socket — and the codebase already treats it as sufficient
+/// to kill on: `leader::kill_stale_reachable_leaders` signals exactly these
+/// PIDs with no identity check at all. Asking `is_grok_process` here as well
+/// was both weaker evidence and a different policy from the one we ship.
+///
+/// Pure, and note what it does NOT take: no process name, no `/proc`, no
+/// platform. There is no name in this decision to get wrong on the next
+/// rename, which is the defect this replaces.
+fn leader_kill_action(live_pid: Option<u32>, has_lock_path: bool) -> LeaderKillAction {
+    match (live_pid, has_lock_path) {
+        (Some(pid), _) => LeaderKillAction::Signal(pid),
+        (None, true) => LeaderKillAction::ReclaimLockIfUnheld,
+        (None, false) => LeaderKillAction::Skip,
+    }
+}
+
 async fn kill_leaders() -> Result<()> {
     let leaders = xai_grok_shell::leader::discover_leaders().await;
     if leaders.is_empty() {
@@ -384,27 +422,63 @@ async fn kill_leaders() -> Result<()> {
     }
     let mut killed = 0u32;
     let mut cleaned = 0u32;
+    let mut left_alone = 0u32;
     for d in &leaders {
-        let Some(pid) = leader_pid(d) else {
-            continue;
-        };
-        if !xai_grok_shell::util::is_grok_process(pid) {
-            if let Some(ref lock) = d.lock_path {
-                eprintln!("  PID {pid} is not a grok process, removing stale lock");
-                let _ = std::fs::remove_file(lock);
-                cleaned += 1;
+        let live_pid = d.live_info.as_ref().map(|li| li.pid);
+        match leader_kill_action(live_pid, d.lock_path.is_some()) {
+            LeaderKillAction::Skip => continue,
+            LeaderKillAction::Signal(pid) => {
+                eprintln!("  Killing leader PID {pid}");
+                if let Err(e) = xai_grok_shell::util::kill_process_by_pid(pid) {
+                    eprintln!("  warning: failed to terminate PID {pid}: {e}");
+                    continue;
+                }
+                killed += 1;
             }
-            if let Some(ref sock) = d.socket_path {
-                let _ = std::fs::remove_file(sock);
+            LeaderKillAction::ReclaimLockIfUnheld => {
+                let Some(ref lock) = d.lock_path else {
+                    continue;
+                };
+                match xai_grok_shell::leader::reclaim_lock_if_unheld(lock) {
+                    xai_grok_shell::leader::ReclaimOutcome::Removed => {
+                        eprintln!("  No process holds {}, removed stale lock", lock.display());
+                        if let Some(ref sock) = d.socket_path {
+                            let _ = std::fs::remove_file(sock);
+                        }
+                        cleaned += 1;
+                    }
+                    xai_grok_shell::leader::ReclaimOutcome::HeldByLiveProcess => {
+                        // Deleting this is what produces two live leaders: the
+                        // holder keeps its flock on the unlinked inode while
+                        // the next client locks a freshly created one.
+                        let pid = d
+                            .pid_from_lock
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| "unknown".into());
+                        eprintln!(
+                            "  A live process still holds {} but is not answering its \
+                             control socket; left alone (lock file NOT removed).",
+                            lock.display(),
+                        );
+                        eprintln!(
+                            "    The lock file records PID {pid}. If you are sure it is \
+                             the wedged leader, signal it directly: kill {pid}",
+                        );
+                        left_alone += 1;
+                    }
+                    xai_grok_shell::leader::ReclaimOutcome::Indeterminate => {
+                        eprintln!(
+                            "  Could not determine whether {} is still held; left alone.",
+                            lock.display(),
+                        );
+                        left_alone += 1;
+                    }
+                }
             }
-            continue;
         }
-        eprintln!("  Killing leader PID {pid}");
-        if let Err(e) = xai_grok_shell::util::kill_process_by_pid(pid) {
-            eprintln!("  warning: failed to terminate PID {pid}: {e}");
-            continue;
-        }
-        killed += 1;
+    }
+    if left_alone > 0 {
+        eprintln!("Left {left_alone} lock(s) alone (see above).");
     }
     if killed > 0 {
         eprintln!("Killed {killed} leader process(es).");
@@ -2969,6 +3043,74 @@ async fn signal_leaders_to_relaunch(installed_version: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #167, the bug itself: a **live** leader must be signalled, never
+    /// have its lock file deleted out from under it.
+    ///
+    /// The old code asked `is_grok_process`, which is false for the shipped
+    /// `medley` binary, and took the cleanup branch — unlinking the lock and
+    /// socket of a leader that was answering its control socket, and never
+    /// signalling it. The holder kept its flock on the unlinked inode, the next
+    /// client created a fresh file and locked that, and the run ended with two
+    /// live leaders from a command whose entire purpose was to leave none.
+    ///
+    /// The presence of a lock path must not change this: that is exactly the
+    /// input that used to divert a live leader into the destructive branch.
+    #[test]
+    fn leaders_kill_signals_a_live_leader_and_never_touches_its_files() {
+        assert_eq!(
+            leader_kill_action(Some(4242), true),
+            LeaderKillAction::Signal(4242),
+            "a socket-verified live leader is signalled even when a lock file \
+             exists — deleting that file is the #167 bug",
+        );
+        assert_eq!(
+            leader_kill_action(Some(4242), false),
+            LeaderKillAction::Signal(4242),
+        );
+    }
+
+    /// A candidate nothing answered is not assumed dead: the lock file is
+    /// probed, and reclaimed only if no live process holds its flock. This is
+    /// what keeps "clean up a genuinely stale lock" working without
+    /// reintroducing the unconditional delete.
+    #[test]
+    fn leaders_kill_probes_the_lock_when_no_leader_answered() {
+        assert_eq!(
+            leader_kill_action(None, true),
+            LeaderKillAction::ReclaimLockIfUnheld,
+        );
+    }
+
+    /// Nothing answered and there is no lock file to reason about, so there is
+    /// nothing this command may safely do.
+    #[test]
+    fn leaders_kill_skips_a_candidate_with_neither_leader_nor_lock() {
+        assert_eq!(leader_kill_action(None, false), LeaderKillAction::Skip);
+    }
+
+    /// Issue #167: the decision must not depend on what the binary is called.
+    ///
+    /// This is structural rather than observational — `leader_kill_action`
+    /// takes no process name, no PID to inspect, and no platform. There is no
+    /// name in it to be wrong about after the next rename, which is how the
+    /// original check failed. The loop pins that the two facts it does take
+    /// fully determine the outcome.
+    #[test]
+    fn leaders_kill_decision_is_independent_of_program_name() {
+        for has_lock in [true, false] {
+            assert_eq!(
+                leader_kill_action(Some(7), has_lock),
+                LeaderKillAction::Signal(7),
+                "a live leader is signalled whatever it is called",
+            );
+        }
+        assert_eq!(
+            leader_kill_action(None, true),
+            LeaderKillAction::ReclaimLockIfUnheld,
+            "the fallback probes occupancy, which no rename can change",
+        );
+    }
 
     #[tokio::test]
     async fn codex_login_cancel_signal_reaches_login_future() {
