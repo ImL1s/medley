@@ -1401,13 +1401,9 @@ fn deferred_model_switch_blocked_by_other_agent_toasts_and_restores_display() {
     let restored = display.as_ref() == Some(&model_old);
     let told = toast == Some("Wait for the current model switch to finish");
 
-    assert!(
-        emitted_switch || (restored && told),
-        "deferred switch must not be silently dropped: need SwitchModel OR \
-         (display restored + wait toast); got emitted_switch={emitted_switch} \
-         display={display:?} toast={toast:?} effects={effects:?}",
-    );
-    // This admission-blocked setup is the reject path — assert the strong form.
+    // This admission-blocked setup is the reject path — assert the strong form
+    // directly. (The weaker `emitted_switch || (restored && told)` this used to
+    // lead with was dead: the strong form implies it.)
     assert!(
         !emitted_switch && restored && told,
         "other-agent transaction must block SwitchModel and restore+toast; \
@@ -1424,6 +1420,114 @@ fn deferred_model_switch_blocked_by_other_agent_toasts_and_restores_display() {
         Some(id_a),
         "agent A's in-flight transaction must remain undisturbed",
     );
+}
+
+/// The two ways the restore step got the target wrong.
+///
+/// `empty_snapshot`: nothing was displayed before the pick, so the rollback
+/// snapshot holds `session_model_id: None`. Testing that inner `Option` and
+/// falling through left the display showing the model that never started —
+/// the #142 symptom, inside the fix for #142. Clearing is the honest restore,
+/// and it is what `restore_model_switch_mirrors` already does.
+///
+/// `server_spoke`: `SessionCreated` carried the session's own models, which
+/// overwrite `agent.session.models` immediately before the reject path runs.
+/// The snapshot predates that — it was captured at pick time — so honouring it
+/// sets the display to a model the session is *not* running. Same bug class,
+/// opposite direction.
+#[test]
+fn a_refused_deferred_switch_restores_the_truth_not_a_stale_snapshot() {
+    for case in ["empty_snapshot", "server_spoke"] {
+        let mut app = test_app_with_agent();
+        let id_a = AgentId(0);
+        let id_b = AgentId(1);
+        let model_old = acp::ModelId::new(std::sync::Arc::from("model-old"));
+        let model_new = acp::ModelId::new(std::sync::Arc::from("model-new"));
+        let server_model = acp::ModelId::new(std::sync::Arc::from("server-model"));
+        let session_b = make_test_agent_session(&app, id_b, "agent-b");
+        app.agents
+            .insert(id_b, AgentView::new(session_b, ScrollbackState::new()));
+        app.next_agent_id = 2;
+        for m in [&model_old, &model_new, &server_model] {
+            insert_ready_model(&mut app, id_a, m);
+            insert_ready_model(&mut app, id_b, m);
+        }
+        // Agent A holds the global slot, so agent B's request is refused.
+        app.model_switch_transaction = Some(crate::app::app_view::ModelSwitchTransaction {
+            owner_agent_id: id_a,
+            request_id: Some(99),
+            app_models_optimistic: false,
+            app_model_id: Some(model_old.clone()),
+            app_reasoning_effort: None,
+        });
+
+        let empty_snapshot = case == "empty_snapshot";
+        app.active_view = ActiveView::Agent(id_b);
+        {
+            let agent = app.agents.get_mut(&id_b).unwrap();
+            agent.session.session_id = None;
+            agent.session.models.set_current(model_new.clone(), None);
+            agent.session.deferred_model_switch = Some(crate::app::agent::DeferredModelSwitch {
+                model_id: model_new.clone(),
+                effort: None,
+                prev_model_id: Some(model_old.clone()),
+            });
+            agent.session.model_switch_rollback = Some(crate::app::agent::ModelSwitchRollback {
+                request_id: None,
+                session_model_id: if empty_snapshot {
+                    None
+                } else {
+                    Some(model_old.clone())
+                },
+                session_reasoning_effort: None,
+            });
+        }
+
+        let models = (!empty_snapshot).then(|| {
+            acp::SessionModelState::new(
+                server_model.clone(),
+                [&model_old, &model_new, &server_model]
+                    .into_iter()
+                    .map(|m| acp::ModelInfo::new(m.clone(), m.0.to_string()))
+                    .collect::<Vec<_>>(),
+            )
+        });
+        dispatch(
+            Action::TaskComplete(TaskResult::SessionCreated {
+                agent_id: id_b,
+                session_id: acp::SessionId::new("b-session"),
+                models,
+                scheduler_background_loops: None,
+            }),
+            &mut app,
+        );
+
+        let display = app.agents[&id_b].session.models.current.clone();
+        if empty_snapshot {
+            assert_eq!(
+                display, None,
+                "{case}: nothing was displayed before the pick, so the refused \
+                 switch must clear the display rather than leave it showing \
+                 model-new, which never started"
+            );
+        } else {
+            assert_eq!(
+                display.as_ref(),
+                Some(&server_model),
+                "{case}: the server just said this session runs server-model; \
+                 restoring the pick-time snapshot would display a model the \
+                 session is not running"
+            );
+        }
+        assert_eq!(
+            app.agents[&id_b]
+                .toast
+                .as_ref()
+                .map(|(msg, _)| msg.as_str()),
+            Some("Wait for the current model switch to finish"),
+            "{case}: consumed means said-so, in both shapes"
+        );
+    }
 }
 
 #[test]
