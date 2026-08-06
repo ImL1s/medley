@@ -303,9 +303,20 @@ impl SessionActor {
         (fresh, provider)
     }
     /// The single writer of a provider mint/rotation into chat-state credentials.
-    async fn set_chat_api_key(&self, new_key: String) {
-        let mut creds = self.chat_state_handle.get_credentials().await;
-        creds.replace_api_key(new_key);
+    ///
+    /// Uses [`Credentials::rebind`] rather than [`Credentials::replace_api_key`]:
+    /// the secret being written is provider-minted, not a rotation of whatever
+    /// label chat-state already holds (which may be `Missing` from a pre-login
+    /// spawn). Preserving that label would lie about provenance (#136).
+    async fn set_chat_api_key(&self, new_key: String, provider_name: &str) {
+        let creds = self.chat_state_handle.get_credentials().await;
+        let creds = creds.rebind(
+            Some(new_key),
+            xai_chat_state::AuthType::ApiKey,
+            xai_grok_sampler::CredentialSource::AuthProvider {
+                name: provider_name.to_string(),
+            },
+        );
         self.chat_state_handle.update_credentials(creds);
     }
     /// Pre-turn arm for a provider-backed model: mint on a cold cache,
@@ -325,7 +336,7 @@ impl SessionActor {
                     cold = current_key.is_none(),
                     "auth provider token rotated pre-turn"
                 );
-                self.set_chat_api_key(new_key).await;
+                self.set_chat_api_key(new_key, &provider.name).await;
             }
             crate::auth::ProviderRefreshOutcome::Unchanged => {}
             crate::auth::ProviderRefreshOutcome::MintFailed => {
@@ -396,7 +407,7 @@ impl SessionActor {
             Some(self.session_info.id.0.as_ref()),
             None,
         );
-        self.set_chat_api_key(new_key).await;
+        self.set_chat_api_key(new_key, &provider.name).await;
         true
     }
     /// Gate inputs for `model_id` routed to `base_url`. See
@@ -522,12 +533,19 @@ impl SessionActor {
         //   when not borrowing ambient); refuse to BORROW session/provider
         //   ambient without catalog knowledge.
         let mut auth_scheme = model_facts.auth_scheme;
-        // #110: chat state carries the headers but not `credential_source`, so
-        // a model authenticated by a header the user declared arrives here with
-        // its provenance gone. It is still `NotByok`, so the gate would enable
-        // the session resolver and `SamplingClient::post` would strip the
-        // user's header and send under the xAI session instead. Re-derive the
-        // provenance from the headers, which chat state does keep.
+        // #110 / #136 steps 2-3: a model authenticated by a header the user
+        // declared used to arrive here with its provenance gone (chat-state
+        // `SamplingConfig` keeps headers, not the label). It is still
+        // `NotByok`, so the gate would enable the session resolver and
+        // `SamplingClient::post` would strip the user's header and send under
+        // the xAI session instead.
+        //
+        // Prefer the header re-derivation when it yields something (the
+        // declared header is still in the maps and still goes out). Fall back
+        // to the provenance step 1 bound onto `Credentials` with the secret —
+        // without that, every ordinary Ready-model turn (session-token and
+        // BYOK alike) emits `credential_source: None`, which is the #151 hole
+        // on `Unknown(CatalogUnavailable)`.
         let declared_credential_header = crate::agent::config::explicit_credential_header_in(
             &cfg.extra_headers,
             &cfg.env_http_headers,
@@ -539,12 +557,15 @@ impl SessionActor {
             == xai_grok_sampling_types::ApiBackend::CodexResponses
             && model_auth_provider.is_some()
             && auth_scheme != xai_grok_sampler::AuthScheme::None;
-        let mut credential_source = declared_credential_header.as_ref().map(|(header, env)| {
-            xai_grok_sampler::CredentialSource::ExplicitHeader {
-                header: header.clone(),
-                env: env.clone(),
-            }
-        });
+        let mut credential_source = declared_credential_header
+            .as_ref()
+            .map(
+                |(header, env)| xai_grok_sampler::CredentialSource::ExplicitHeader {
+                    header: header.clone(),
+                    env: env.clone(),
+                },
+            )
+            .or_else(|| creds.source_cloned());
         match &model_facts.readiness {
             crate::agent::auth_method::ModelReadiness::Ready => {}
             // The catalog answered and does not have this model. Before the
@@ -566,14 +587,18 @@ impl SessionActor {
                 auth_scheme = xai_grok_sampler::AuthScheme::None;
                 use_session_bearer_resolver = false;
                 use_provider_bearer_resolver = false;
-                // `.or`, not an assignment: a declared credential header is
-                // the user's own auth, it is still in `extra_headers` and
-                // still goes out, so overwriting the label with `Missing`
-                // would have the config claim it carries nothing while
-                // carrying that. `agent/config.rs` preserves `ExplicitHeader`
-                // at the same decision.
-                credential_source =
-                    credential_source.or(Some(xai_grok_sampler::CredentialSource::Missing));
+                // Credentials are gone. Label the gap `Missing`, except a
+                // declared credential header which still ships in
+                // `extra_headers` and must keep its label (same as
+                // `agent/config.rs`). Do not keep a stored ambient/BYOK
+                // source: that would claim a credential the strip just
+                // removed.
+                if !matches!(
+                    credential_source,
+                    Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
+                ) {
+                    credential_source = Some(xai_grok_sampler::CredentialSource::Missing);
+                }
             }
             // Knowledge is temporarily unobtainable, or there is no identified
             // target yet. Both were `ready = true` before the tri-state, and
@@ -586,6 +611,11 @@ impl SessionActor {
             // This is the distinction the three `UnknownReason` variants exist
             // for. Collapsing them into one arm is what made the strip both
             // fail open (above) and fail closed (here) at the same time.
+            //
+            // #151: the chat-state key survives here, so the stored source
+            // (set above) must survive with it — previously this path left
+            // `credential_source: None` and L3 could not refuse ambient bytes
+            // on an external origin.
             crate::agent::auth_method::ModelReadiness::Unknown(reason) => {
                 tracing::debug!(
                     model = %catalog_model_id,
@@ -603,10 +633,16 @@ impl SessionActor {
                 use_session_bearer_resolver = false;
                 use_provider_bearer_resolver = false;
                 // Label the gap on Unusable alone, never on Unknown (#133).
-                // `.or` preserves a declared credential header for the same
-                // reason as the arm above: it still ships in `extra_headers`.
-                credential_source =
-                    credential_source.or(Some(xai_grok_sampler::CredentialSource::Missing));
+                // Preserve only a declared credential header (still in
+                // `extra_headers`); overwrite any other stored source with
+                // `Missing` so the config does not claim a credential the
+                // strip just removed.
+                if !matches!(
+                    credential_source,
+                    Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
+                ) {
+                    credential_source = Some(xai_grok_sampler::CredentialSource::Missing);
+                }
             }
         }
         self.log_auth_gate_unknown("reconstruct_full_config", gate, &cfg.base_url);
@@ -1632,8 +1668,15 @@ impl SessionActor {
                 match am.get_valid_token().await {
                     Ok(key) => {
                         if creds.api_key() != Some(key.as_str()) {
-                            let mut creds = creds;
-                            creds.replace_api_key(key);
+                            // Ambient xAI session JWT — rebind, do not
+                            // `replace_api_key`. Chat-state may still carry
+                            // `Missing` from a pre-login spawn; preserving that
+                            // label would disarm L3 (#136 / #151).
+                            let creds = creds.rebind(
+                                Some(key),
+                                xai_chat_state::AuthType::SessionToken,
+                                xai_grok_sampler::CredentialSource::XaiSession,
+                            );
                             self.chat_state_handle.update_credentials(creds);
                         }
                         self.clear_auth_compact_suppression();
@@ -1710,7 +1753,7 @@ impl SessionActor {
             remaining_secs,
             "JWT near expiry, refreshing from config.toml"
         );
-        let Some(new_key) = self.reload_api_key_from_config(&current_model_id) else {
+        let Some((new_key, source)) = self.reload_api_key_from_config(&current_model_id) else {
             return;
         };
         if key == &new_key {
@@ -1728,11 +1771,26 @@ impl SessionActor {
             key_len = new_key.len(),
             "Refreshed API token from config.toml"
         );
-        let mut creds = self.chat_state_handle.get_credentials().await;
-        creds.replace_api_key(new_key);
+        // Honesty, not the ambient-bytes bug fixed above. `reload_api_key_from_config`
+        // reads only `[model.*]`'s own `api_key`/`env_key`, so this site can never
+        // write ambient session bytes. Under `replace_api_key` its worst case is
+        // labelling those non-ambient bytes with whatever provenance the session
+        // already held (e.g. `XaiSession` after a first-party model later gains
+        // its own key) — over-restricting, the safe direction, and today without
+        // behavioural consequence. Rebind so the stored source matches which
+        // own-credential arm actually resolved.
+        let creds = self.chat_state_handle.get_credentials().await;
+        let creds = creds.rebind(Some(new_key), xai_chat_state::AuthType::ApiKey, source);
         self.chat_state_handle.update_credentials(creds);
     }
-    fn reload_api_key_from_config(&self, current_model_id: &str) -> Option<String> {
+    /// Resolve the model's own credential from config.toml, plus the
+    /// [`CredentialSource`] for whichever `first_own_credential` arm won:
+    /// non-empty `api_key` → `ModelApiKey`; else the winning `env_key`
+    /// variable → `EnvKey { name }`.
+    fn reload_api_key_from_config(
+        &self,
+        current_model_id: &str,
+    ) -> Option<(String, xai_grok_sampler::CredentialSource)> {
         let raw_config = crate::config::load_effective_config()
             .map_err(|e| tracing::warn!(error = %e, "Failed to reload config"))
             .ok()?;
@@ -1752,18 +1810,33 @@ impl SessionActor {
             );
             return None;
         };
-        let key = crate::agent::config::first_own_credential(
-            model.api_key.as_deref(),
-            model.env_key.as_ref(),
-        );
-        if key.is_none() {
-            tracing::warn!(
-                model = %current_model_id,
-                env_key = ?model.env_key,
-                "No api_key or env_key resolved for model"
-            );
+        // Same two arms as `first_own_credential`, with the source that arm implies.
+        if let Some(key) = model.api_key.as_deref().filter(|k| !k.trim().is_empty()) {
+            return Some((
+                key.to_owned(),
+                xai_grok_sampler::CredentialSource::ModelApiKey,
+            ));
         }
-        key
+        if let Some(env_keys) = model.env_key.as_ref() {
+            for name in env_keys.names() {
+                if let Ok(value) = std::env::var(name)
+                    && !value.trim().is_empty()
+                {
+                    return Some((
+                        value,
+                        xai_grok_sampler::CredentialSource::EnvKey {
+                            name: name.to_owned(),
+                        },
+                    ));
+                }
+            }
+        }
+        tracing::warn!(
+            model = %current_model_id,
+            env_key = ?model.env_key,
+            "No api_key or env_key resolved for model"
+        );
+        None
     }
     /// Propagate the model-reported token usage from a turn response into
     /// chat state, the per-prompt usage ledger, and per-turn signals.
