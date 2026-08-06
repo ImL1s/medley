@@ -65,8 +65,12 @@ impl xai_grok_tools::implementations::grok_build::task::coordinator::ChildRunner
                     snapshot_ref: None,
                 };
             };
+            // Discarded on purpose: a subagent inherits the parent's tools and
+            // has no scrollback of its own, so a disable notice here would be
+            // addressed to nobody. The parent already told the user.
+            let mut ignored_disable_reason = None;
             ctx.web_search_sampling_config = this
-                .prepare_web_search_sampling_config_preflight()
+                .prepare_web_search_sampling_config_preflight(&mut ignored_disable_reason)
                 .await;
             ctx.parent_mcp_pool = handle.snapshot_mcp_pool().await;
             ctx.client_hooks = handle.snapshot_client_hooks().await;

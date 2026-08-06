@@ -6070,7 +6070,7 @@ fn resolve_hidden_default_web_search_sampling_config(
     alpha_test_key: Option<String>,
     client_version: Option<String>,
     endpoints: &EndpointsConfig,
-) -> Option<SamplerConfig> {
+) -> Result<SamplerConfig, WebSearchDisabled> {
     let entry = ModelEntry {
         info: ModelInfo {
             id: None,
@@ -6118,15 +6118,16 @@ fn resolve_hidden_default_web_search_sampling_config(
     // the user's search query to whatever `models_base_url` names.
     let (ready, reason) = model_readiness(&entry);
     if !ready {
+        let reason = reason.unwrap_or_else(|| "model is not ready".to_owned());
         tracing::warn!(
             web_search_model = %model_id,
-            reason = ?reason,
+            reason = %reason,
             "the default web-search route is not ready; disabling web search"
         );
-        return None;
+        return Err(WebSearchDisabled::new(model_id, reason));
     }
     let credentials = resolve_credentials_enforced(&entry, session_key, disable_api_key_auth);
-    Some(sampling_config_for_model(
+    Ok(sampling_config_for_model(
         &entry,
         credentials,
         alpha_test_key,
@@ -6135,7 +6136,39 @@ fn resolve_hidden_default_web_search_sampling_config(
         None,
     ))
 }
-pub(crate) fn resolve_web_search_sampling_config(
+/// Why `web_search` was withheld from the session toolset.
+///
+/// Resolution failures used to end in a bare `None` plus `tracing::warn!` —
+/// the shell knew, the user did not (#57). Callers that disable the tool must
+/// surface [`Self::user_notice`] once on a user-visible channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WebSearchDisabled {
+    /// Model id that was tried (config / env / baked default).
+    pub model_id: String,
+    /// Actionable rejection reason (readiness, catalog miss, missing creds, …).
+    pub reason: String,
+}
+
+impl WebSearchDisabled {
+    fn new(model_id: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            model_id: model_id.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// One-line notice naming the model and why it was rejected.
+    pub fn user_notice(&self) -> String {
+        format!(
+            "web_search is unavailable: model \"{}\" could not be used ({})",
+            self.model_id, self.reason
+        )
+    }
+}
+
+/// Detailed web-search resolution. `Err` carries the model id and why the
+/// tool must be withheld — the value that becomes the user-visible notice.
+pub(crate) fn resolve_web_search_sampling_config_result(
     model_id: &str,
     models: &IndexMap<String, ModelEntry>,
     session_key: Option<&str>,
@@ -6143,7 +6176,7 @@ pub(crate) fn resolve_web_search_sampling_config(
     alpha_test_key: Option<String>,
     client_version: Option<String>,
     endpoints: &EndpointsConfig,
-) -> Option<SamplerConfig> {
+) -> Result<SamplerConfig, WebSearchDisabled> {
     let resolved = if let Some(entry) = find_model_by_id(models, model_id).cloned() {
         // #110: an unready model disables web search outright. The tempting
         // repair -- send the request anyway with its credential stripped --
@@ -6151,22 +6184,24 @@ pub(crate) fn resolve_web_search_sampling_config(
         // there regardless.
         let (ready, reason) = model_readiness(&entry);
         if !ready {
+            let reason = reason.unwrap_or_else(|| "model is not ready".to_owned());
             tracing::warn!(
                 web_search_model = %model_id,
-                reason = ?reason,
+                reason = %reason,
                 "web search model is not ready; disabling web search"
             );
-            return None;
+            return Err(WebSearchDisabled::new(model_id, reason));
         }
         let credentials = resolve_credentials_enforced(&entry, session_key, disable_api_key_auth);
         if credentials.api_key.is_none() && entry.effective_auth_provider().is_some() {
+            let reason = "auth provider has no cached token".to_owned();
             tracing::warn!(
                 web_search_model = %model_id,
                 "web search model uses an auth provider with no cached token; disabling web search"
             );
-            return None;
+            return Err(WebSearchDisabled::new(model_id, reason));
         }
-        Some(sampling_config_for_model(
+        Ok(sampling_config_for_model(
             &entry,
             credentials,
             alpha_test_key,
@@ -6184,15 +6219,69 @@ pub(crate) fn resolve_web_search_sampling_config(
             endpoints,
         )
     } else {
-        None
-    };
-    if resolved.is_none() {
         tracing::warn!(
             web_search_model = %model_id,
             "configured web_search model not found; disabling web search"
         );
+        Err(WebSearchDisabled::new(
+            model_id,
+            "not found in the model catalog",
+        ))
+    }?;
+    Ok(crate::tools::config::web_search_sampling_config(resolved))
+}
+
+/// User-visible disable details when `web_search` would be dropped for this
+/// model. Covers resolve failures and the spawn-time "resolved but no API key"
+/// arm (same condition that builds `WebSearchConfig::Disabled`).
+pub(crate) fn web_search_disable_details(
+    model_id: &str,
+    models: &IndexMap<String, ModelEntry>,
+    session_key: Option<&str>,
+    disable_api_key_auth: bool,
+    alpha_test_key: Option<String>,
+    client_version: Option<String>,
+    endpoints: &EndpointsConfig,
+) -> Option<WebSearchDisabled> {
+    match resolve_web_search_sampling_config_result(
+        model_id,
+        models,
+        session_key,
+        disable_api_key_auth,
+        alpha_test_key,
+        client_version,
+        endpoints,
+    ) {
+        Err(disabled) => Some(disabled),
+        // spawn.rs disables when `api_key` is missing even if a bearer
+        // resolver is present — mirror that so the notice matches reality.
+        Ok(cfg) if cfg.api_key.is_none() => Some(WebSearchDisabled::new(
+            model_id,
+            "no API key or session credential available",
+        )),
+        Ok(_) => None,
     }
-    resolved.map(crate::tools::config::web_search_sampling_config)
+}
+
+pub(crate) fn resolve_web_search_sampling_config(
+    model_id: &str,
+    models: &IndexMap<String, ModelEntry>,
+    session_key: Option<&str>,
+    disable_api_key_auth: bool,
+    alpha_test_key: Option<String>,
+    client_version: Option<String>,
+    endpoints: &EndpointsConfig,
+) -> Option<SamplerConfig> {
+    resolve_web_search_sampling_config_result(
+        model_id,
+        models,
+        session_key,
+        disable_api_key_auth,
+        alpha_test_key,
+        client_version,
+        endpoints,
+    )
+    .ok()
 }
 
 /// Refresh-aware web-search resolver. Codex web search ultimately crosses the
@@ -6208,23 +6297,53 @@ pub async fn resolve_web_search_sampling_config_preflight(
     client_version: Option<String>,
     endpoints: &EndpointsConfig,
 ) -> Option<SamplerConfig> {
+    resolve_web_search_sampling_config_preflight_result(
+        model_id,
+        models,
+        session_key,
+        disable_api_key_auth,
+        alpha_test_key,
+        client_version,
+        endpoints,
+    )
+    .await
+    .ok()
+}
+
+/// Like [`resolve_web_search_sampling_config_preflight`], but preserves the
+/// disable reason for the user-visible notice path (#57).
+pub(crate) async fn resolve_web_search_sampling_config_preflight_result(
+    model_id: &str,
+    models: &IndexMap<String, ModelEntry>,
+    session_key: Option<&str>,
+    disable_api_key_auth: bool,
+    alpha_test_key: Option<String>,
+    client_version: Option<String>,
+    endpoints: &EndpointsConfig,
+) -> Result<SamplerConfig, WebSearchDisabled> {
     let codex = find_model_by_id(models, model_id)
         .is_some_and(|entry| entry.info.api_backend == ApiBackend::CodexResponses);
     if codex {
-        let entry = find_model_by_id(models, model_id)?;
-        let provider = entry.effective_auth_provider()?;
-        provider.openai_codex_status()?;
+        let entry = find_model_by_id(models, model_id)
+            .ok_or_else(|| WebSearchDisabled::new(model_id, "not found in the model catalog"))?;
+        let provider = entry.effective_auth_provider().ok_or_else(|| {
+            WebSearchDisabled::new(model_id, "missing OpenAI Codex credential provider")
+        })?;
+        provider.openai_codex_status().ok_or_else(|| {
+            WebSearchDisabled::new(model_id, "invalid OpenAI Codex credential provider")
+        })?;
         let current = provider.cached_token();
         let _ = provider.ensure_fresh_token(current.as_deref()).await;
         if provider.cached_credential().is_none() {
+            let reason = "Codex credential refresh failed".to_owned();
             tracing::warn!(
                 web_search_model = %model_id,
                 "Codex web-search credential refresh failed; disabling web search"
             );
-            return None;
+            return Err(WebSearchDisabled::new(model_id, reason));
         }
     }
-    let mut config = resolve_web_search_sampling_config(
+    let mut config = resolve_web_search_sampling_config_result(
         model_id,
         models,
         session_key,
@@ -6234,7 +6353,11 @@ pub async fn resolve_web_search_sampling_config_preflight(
         endpoints,
     )?;
     if codex {
-        let credential = config.bearer_resolver.as_ref()?.current_credential()?;
+        let credential = config
+            .bearer_resolver
+            .as_ref()
+            .and_then(|r| r.current_credential())
+            .ok_or_else(|| WebSearchDisabled::new(model_id, "Codex credential is unavailable"))?;
         config.api_key = Some(credential.access_token);
         if let Some(account_id) = credential.account_id {
             config
@@ -6242,7 +6365,7 @@ pub async fn resolve_web_search_sampling_config_preflight(
                 .insert("chatgpt-account-id".to_owned(), account_id);
         }
     }
-    Some(config)
+    Ok(config)
 }
 /// Wire string for [`AuthScheme`] in ACP model `_meta` (`authScheme`).
 fn auth_scheme_meta_value(scheme: AuthScheme) -> &'static str {
@@ -6355,7 +6478,12 @@ pub(crate) fn model_readiness(model: &ModelEntry) -> (bool, Option<String>) {
                     "OpenAI Codex credential is scoped to the Codex API origin, not {}: \
                      point base_url at {} — or set api_key / env_key without \
                      model_provider = \"openai-codex\" for a custom endpoint",
-                    provider_hint_for_url(&model.info.base_url),
+                    // `sanitized_origin`, not `provider_hint_for_url`: the
+                    // latter echoes the raw `base_url` when `Url::parse` fails,
+                    // and #57 promotes this reason from an opt-in log to the
+                    // terminal. A key pasted into `base_url` by mistake would
+                    // otherwise be printed back.
+                    sanitized_origin(&model.info.base_url),
                     crate::auth::openai_codex::CODEX_API_BASE_URL,
                 )),
             );
@@ -9196,6 +9324,51 @@ reasoning_effort = "low"
         assert!(
             resolved.is_none(),
             "an unready external web-search model must disable web search"
+        );
+    }
+    /// #57: when web_search is dropped because its model is unready, the
+    /// user-visible notice must name the model id and the rejection reason.
+    /// Tracing alone is not enough — the tool simply disappears from the
+    /// advertised set with no scrollback / startup signal.
+    #[test]
+    #[serial]
+    fn web_search_disable_user_notice_names_model_and_reason_when_unready() {
+        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+        use xai_grok_test_support::EnvGuard;
+        let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+        let mut catalog = IndexMap::new();
+        catalog.insert(
+            "search".to_string(),
+            test_model_entry("search", "https://search.example/v1", None, None, None),
+        );
+        let (_, readiness_reason) = model_readiness(catalog.get("search").unwrap());
+        let readiness_reason = readiness_reason.expect("unready model must carry a reason");
+
+        // `web_search_disable_details` + `user_notice()`, which is what
+        // production runs. This used to call a `web_search_disable_user_notice`
+        // wrapper that had no production caller, so the test exercised a path
+        // the binary never took.
+        let notice = web_search_disable_details(
+            "search",
+            &catalog,
+            Some("XAI_SESSION_SENTINEL"),
+            false,
+            None,
+            None,
+            &EndpointsConfig::default(),
+        )
+        .expect("unready web_search model must produce a user-visible notice")
+        .user_notice();
+
+        assert!(
+            notice.contains("search"),
+            "notice must name the tried model id: {notice}"
+        );
+        assert!(
+            notice.contains(readiness_reason.as_str()),
+            "notice must include the readiness reason ({readiness_reason}): {notice}"
         );
     }
     /// #110 (Layer 0): a model that needs a bearer, declares no credential of

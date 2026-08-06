@@ -2259,6 +2259,32 @@ impl MvpAgent {
                 .await;
         }
     }
+    /// Surface a one-shot scrollback notice when `web_search` was withheld (#57).
+    pub(super) async fn send_web_search_disabled(
+        &self,
+        session_id: &acp::SessionId,
+        model_id: &str,
+        reason: &str,
+        message: &str,
+    ) {
+        let notification = crate::extensions::notification::SessionNotification {
+            session_id: session_id.clone(),
+            update: crate::extensions::notification::SessionUpdate::WebSearchDisabled {
+                model_id: model_id.to_owned(),
+                reason: reason.to_owned(),
+                message: message.to_owned(),
+            },
+            meta: None,
+        };
+        if let Ok(params) = serde_json::value::to_raw_value(&notification) {
+            let _ = self
+                .gateway
+                .ext_notification(
+                    acp::ExtNotification::new("x.ai/session_notification", params.into()),
+                )
+                .await;
+        }
+    }
     /// Pure id → entry resolver (the `allowed_models` gate lives in `set_session_model`).
     pub(crate) fn resolve_model_id(
         &self,
@@ -2597,8 +2623,14 @@ impl MvpAgent {
         );
         Some(cfg)
     }
+    /// The `Err` is carried out through `disable_reason` rather than dropped.
+    /// Re-resolving it later took the non-preflight path and could report a
+    /// different -- and wrong -- cause: an expired-but-refreshable Codex
+    /// credential is deliberately `ready`, so a failed refresh came back as
+    /// "auth provider has no cached token" when there was one (#57).
     pub(super) async fn prepare_web_search_sampling_config_preflight(
         &self,
+        disable_reason: &mut Option<config::WebSearchDisabled>,
     ) -> Option<SamplingConfig> {
         let (model_id, disable_api_key_auth, alpha_test_key, client_version, endpoints) = {
             let cfg = self.cfg.borrow();
@@ -2612,7 +2644,7 @@ impl MvpAgent {
         };
         let models = self.models_manager.models();
         let session = self.current_or_buffered_auth();
-        let mut cfg = config::resolve_web_search_sampling_config_preflight(
+        let mut cfg = config::resolve_web_search_sampling_config_preflight_result(
             &model_id,
             &models,
             session.as_ref().map(|a| a.key.as_str()),
@@ -2621,7 +2653,9 @@ impl MvpAgent {
             client_version,
             &endpoints,
         )
-        .await?;
+        .await
+        .map_err(|disabled| *disable_reason = Some(disabled))
+        .ok()?;
         inject_proxy_headers(
             &mut cfg.extra_headers,
             cfg.client_version.as_deref(),
@@ -2842,6 +2876,7 @@ impl MvpAgent {
                 RefCell::new(std::collections::HashSet::new()),
             ),
             supervisor_started: std::cell::Cell::new(false),
+            web_search_disabled_notified: std::cell::Cell::new(false),
             settings_reapply_in_flight: std::rc::Rc::new(std::cell::Cell::new(false)),
             post_auth_settings_in_flight: std::rc::Rc::new(std::cell::Cell::new(false)),
             announcements_gen: std::cell::Cell::new(0),
@@ -4717,9 +4752,45 @@ impl MvpAgent {
             .find(|entry| entry.info.model == sampling_config.model)
             .and_then(|entry| entry.info.max_retries);
         let origin_client = self.origin_client_info_from_meta(init.meta.as_ref());
+        let disable_web_search = self.cfg.borrow().disable_web_search;
+        let mut web_search_disable_reason = None;
         let web_search_sampling_config = self
-            .prepare_web_search_sampling_config_preflight()
+            .prepare_web_search_sampling_config_preflight(&mut web_search_disable_reason)
             .await;
+        // #57: silent disable is the failure mode — capture a user-visible
+        // notice now (before spawn) and emit it once the session exists.
+        // Skip when the user explicitly passed `--disable-web-search`.
+        let web_search_disable_notice = if disable_web_search {
+            None
+        } else {
+            let needs_notice = web_search_sampling_config
+                .as_ref()
+                .is_none_or(|cfg| cfg.api_key.is_none());
+            if !needs_notice {
+                None
+            } else if let Some(reason) = web_search_disable_reason {
+                // The preflight already resolved this and knows why. Using its
+                // answer, rather than resolving a second time, is what keeps
+                // the notice truthful -- see the note on the preflight fn.
+                Some(reason)
+            } else {
+                // Resolution succeeded but produced no usable key, which the
+                // preflight reports as `Ok`. Only this arm needs the
+                // non-preflight describe.
+                let cfg = self.cfg.borrow();
+                let models = self.models_manager.models();
+                let session = self.current_or_buffered_auth();
+                config::web_search_disable_details(
+                    &cfg.web_search_model,
+                    &models,
+                    session.as_ref().map(|a| a.key.as_str()),
+                    cfg.grok_com_config.api_key_auth_disabled(),
+                    cfg.endpoints.alpha_test_key.clone(),
+                    cfg.client_version.clone(),
+                    &cfg.endpoints,
+                )
+            }
+        };
         let image_gen_config = self.prepare_image_gen_config();
         let video_gen_config = self.prepare_video_gen_config();
         let app_builder_deployer_config = self.prepare_app_builder_deployer_config();
@@ -4734,7 +4805,6 @@ impl MvpAgent {
             )
             .unwrap_or_else(|| self.cfg.borrow().resolve_ask_user_question().value);
         let client_hooks = crate::extensions::hooks::parse_client_hooks(session_meta);
-        let disable_web_search = self.cfg.borrow().disable_web_search;
         let todo_gate = self.cfg.borrow().todo_gate;
         let remote_settings_for_spawn = self.cfg.borrow().remote_settings.clone();
         let laziness_debug_log_for_spawn = self.cfg.borrow().laziness_debug_log.clone();
@@ -5024,6 +5094,21 @@ impl MvpAgent {
         };
         self.session_registry.set_thread(&session_info.id, session_thread);
         tracing::debug!(session_id = %session_info.id.0, "spawn_session_on_thread complete");
+        // Once per process. `spawn_and_register_session` also serves
+        // `load_session`, so an unguarded notice repeats on every `/resume`
+        // and every reconnect-driven reload -- and it carries `meta: None`,
+        // so the pager's `event_seq` dedup cannot catch the repeat either.
+        if let Some(disabled) = web_search_disable_notice
+            && !self.web_search_disabled_notified.replace(true)
+        {
+            self.send_web_search_disabled(
+                &session_info.id,
+                &disabled.model_id,
+                &disabled.reason,
+                &disabled.user_notice(),
+            )
+            .await;
+        }
         self.set_session_live_state(&session_info.id, SessionLiveState::IdleResident);
         self.ensure_session_supervisor();
         self.heap_profile_set_session_id(&session_info.id.0);

@@ -842,6 +842,17 @@ pub enum SessionUpdate {
     /// Prompt images dropped before send (integrity / upscale-cap). The
     /// model is told via a system-reminder; this surfaces them to the UI.
     ImageDropped { notes: Vec<String> },
+    /// `web_search` was withheld from the toolset because its model could not
+    /// be resolved or was not ready (#57). Shown once as a system scrollback
+    /// line so the silent disable is legible.
+    WebSearchDisabled {
+        /// Model id that was tried.
+        model_id: String,
+        /// Actionable rejection reason.
+        reason: String,
+        /// Pre-formatted user-facing notice (model + reason).
+        message: String,
+    },
     /// Memory file listing for the pager's /memory modal.
     MemoryFiles { files: Vec<MemoryFileInfo> },
     WorkflowUpdated {
