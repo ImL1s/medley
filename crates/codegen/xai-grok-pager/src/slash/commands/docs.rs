@@ -81,7 +81,9 @@ impl SlashCommand for DocsCommand {
         match find_doc(trimmed) {
             Some(doc) => CommandResult::Action(Action::ShowReleaseNotes {
                 title: doc.title.into(),
-                content: doc.content.into(),
+                // Not `doc.content`: `/docs <title>` is a fifth reader, and it
+                // renders the same file the on-disk copy renames.
+                content: crate::docs::doc_content(doc).into(),
             }),
             None => CommandResult::Error(format!(
                 "Unknown docs target {trimmed:?}. Try /docs, /docs web, or a guide title (e.g. /docs Getting Started)."

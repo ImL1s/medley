@@ -10,7 +10,12 @@ pub struct Doc {
     pub filename: &'static str,
     pub title: &'static str,
     pub description: &'static str,
-    pub content: &'static str,
+    /// Deliberately not `pub`. Every reader must go through [`doc_content`],
+    /// which applies the invoked-program rename; a direct read ships the
+    /// upstream `grok …` commands. Five separate readers had to be found and
+    /// fixed by hand before this was closed off — the compiler is a better
+    /// guard than a checklist.
+    content: &'static str,
 }
 
 /// Owned variant for the TUI doc picker (backward compat).
@@ -298,10 +303,29 @@ fn rename_commands_to_invoked_program(content: &'static str) -> std::borrow::Cow
     // Reset at a blank line and at a fence, so one unbalanced backtick can
     // never poison the rest of the document.
     let mut in_span = false;
+    let mut fence_is_data = false;
     let mut changed = false;
     for line in content.split_inclusive('\n') {
         let trimmed = line.trim_start();
         let is_fence = trimmed.starts_with("```") || trimmed.starts_with("~~~");
+        if is_fence {
+            // A data fence holds values, not commands. `{"vendor": "grok
+            // build"}` in a json block is a string the reader must not see
+            // rewritten. Bare fences stay command text: they are overwhelmingly
+            // shell here, and treating them as data would reopen the gap this
+            // whole function exists to close.
+            fence_is_data = matches!(
+                trimmed
+                    .trim_start_matches(['`', '~'])
+                    .trim()
+                    .split(|c: char| !c.is_ascii_alphanumeric())
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "json" | "toml" | "yaml" | "yml" | "ini" | "xml" | "csv" | "jsonc"
+            );
+        }
         if is_fence || trimmed.trim_end().is_empty() {
             in_span = false;
         }
@@ -310,6 +334,13 @@ fn rename_commands_to_invoked_program(content: &'static str) -> std::borrow::Cow
         // bare command text.
         let rewritten = if is_fence || !in_fence {
             rename_in_code_spans(line, program, &mut in_span)
+        } else if fence_is_data {
+            // A data fence holds values, but its comments still cite commands:
+            // `09-plugins.md` has a toml comment saying "(from `grok plugin
+            // list`)". Backticks are the reader's own mark for "this is a
+            // command", so honour them and leave bare words alone.
+            let mut fence_span = false;
+            rename_in_code_spans(line, program, &mut fence_span)
         } else {
             rename_words_in_code(line, program)
         };
@@ -331,7 +362,9 @@ fn rename_commands_to_invoked_program(content: &'static str) -> std::borrow::Cow
 /// rather than the command: `grok-4.5`, `xai-grok-pager`, `.grok/config.toml`,
 /// `grok.com`, `groknight`.
 fn is_name_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/')
+    // `$` is here for `$grok` -- a shell variable, not the program. `$ grok`
+    // (the prompt form) is unaffected: the byte before the name is the space.
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/' | b'$')
 }
 
 /// Whether `grok` starts at `i` as a command: a word on its own, followed by a
@@ -347,9 +380,18 @@ fn grok_is_command_at(bytes: &[u8], i: usize) -> bool {
     if i > 0 && is_name_byte(bytes[i - 1]) {
         return false;
     }
+    // Shell delimiters count, not just whitespace: `grok;`, `grok | jq`,
+    // `grok && echo done`, `$(grok)` and a `grok\` line continuation are all
+    // invocations. None appear in the guide today, and both this predicate and
+    // the corpus test's detector shared the narrower boundary -- so the first
+    // doc to use one would have shipped an un-renamed command with nothing to
+    // catch it.
     match bytes.get(i + 4) {
         None => true,
-        Some(&b) => matches!(b, b' ' | b'`' | b'\n' | b'\r'),
+        Some(&b) => matches!(
+            b,
+            b' ' | b'\t' | b'`' | b'\n' | b'\r' | b';' | b'|' | b'&' | b')' | b'\\'
+        ),
     }
 }
 
@@ -522,16 +564,73 @@ mod invoked_program_rename_tests {
             let left_ok = i == 0
                 || !(bytes[i - 1].is_ascii_alphanumeric()
                     || matches!(bytes[i - 1], b'-' | b'_' | b'.' | b'/'));
-            if !left_ok || bytes.get(i + 4) != Some(&b' ') {
+            if !left_ok {
                 return false;
             }
-            let next = line[i + 5..]
-                .split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .trim_matches('`');
-            next.starts_with('-') || SUBCOMMANDS.contains(&next)
+            match bytes.get(i + 4) {
+                // A shell delimiter right after the name is an invocation on
+                // its own; there is no subcommand to inspect.
+                Some(b';' | b'|' | b'&' | b')' | b'\\') => true,
+                Some(b' ' | b'\t') => {
+                    let next = line[i + 5..]
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or_default()
+                        .trim_matches('`');
+                    next.starts_with('-') || SUBCOMMANDS.contains(&next)
+                }
+                _ => false,
+            }
         })
+    }
+
+    /// A fence is not automatically command text.
+    ///
+    /// Treating every fenced line as a command rewrote data: `"grok build"` as
+    /// a JSON string value became `"medley build"`, and the shell variable
+    /// `$grok` became `$medley`. But a data fence's *comments* still cite
+    /// commands — `09-plugins.md` has a toml comment reading "(from `grok
+    /// plugin list`)" — so a blanket skip loses those. Backticks are the
+    /// reader's own mark for "this is a command"; inside a data fence they are
+    /// the only mark honoured.
+    #[test]
+    fn data_fences_rename_only_what_is_backticked() {
+        // Fixtures for the rewriter under test, not instructions this program
+        // emits.
+        let src: &'static str = concat!(
+            "```json\n",
+            "{\"vendor\": \"grok build\", \"note\": \"see `grok doctor`\"}\n",
+            "```\n\n```bash\n",
+            // auth-instruction-guard: exempt
+            "$grok login\n",
+            // auth-instruction-guard: exempt
+            "$ grok login\n```\n",
+        );
+        let out = rename_commands_to_invoked_program(src);
+        let program = xai_grok_config::program_name::program_name();
+        if program == "grok" {
+            assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+            return;
+        }
+
+        assert!(
+            out.contains("\"grok build\""),
+            "a bare value in a data fence is data, not a command: {out}"
+        );
+        assert!(
+            out.contains(&format!("`{program} doctor`")),
+            "a backticked command in a data fence's comment is still a \
+             command: {out}"
+        );
+        assert!(
+            // auth-instruction-guard: exempt
+            out.contains("$grok login"),
+            "`$grok` is a shell variable, not the program: {out}"
+        );
+        assert!(
+            out.contains(&format!("$ {program} login")),
+            "`$ grok` is the prompt form and must still be renamed: {out}"
+        );
     }
 
     /// The regression test for the fenced-block miss.
