@@ -4341,3 +4341,116 @@ fn session_list_nonempty_partial_modal_toasts_in_chat_mode_only() {
         "Build-mode modal non-empty degraded list stays silent"
     );
 }
+
+/// An adopted model must be persisted, from **either** entry point.
+///
+/// `/model X` on an agent with no session yet and on one with a live session
+/// are the same user action; the shell answers `IncompatibleAgent` to both, and
+/// the replacement session adopts the model in both. Gating persistence on
+/// `app_models_optimistic` — which only `set_default_model_confirmed` sets —
+/// meant the model ran and the preference was dropped on both, and an earlier
+/// fix closed only the pre-session one.
+#[test]
+fn model_mismatch_adoption_persists_model_from_either_entry_point() {
+    for pre_session in [false, true] {
+        adoption_persists_model(pre_session);
+    }
+}
+
+fn adoption_persists_model(pre_session: bool) {
+    let mut app = test_app_with_agent();
+    let source_id = AgentId(0);
+    if pre_session {
+        app.agents.get_mut(&source_id).unwrap().unbind_session_id();
+    }
+
+    let model_id = acp::ModelId::new("cursor-model");
+    app.models.available.insert(
+        model_id.clone(),
+        acp::ModelInfo::new(model_id.clone(), model_id.0.to_string()),
+    );
+    insert_ready_model(&mut app, source_id, &model_id);
+
+    let router_effects = dispatch(
+        Action::SwitchModel {
+            model_id: model_id.clone(),
+            effort: None,
+        },
+        &mut app,
+    );
+
+    // Pre-session the pick is stashed and the request opens at `SessionCreated`;
+    // with a live session the router opens it immediately.
+    let request_id = if pre_session {
+        assert!(router_effects.is_empty());
+        let created_effects = dispatch(
+            Action::TaskComplete(TaskResult::SessionCreated {
+                agent_id: source_id,
+                session_id: "source-session".into(),
+                models: None,
+                scheduler_background_loops: None,
+            }),
+            &mut app,
+        );
+        switch_model_request_id(&created_effects)
+    } else {
+        switch_model_request_id(&router_effects)
+    };
+
+    let err = xai_grok_shell::agent::config::ModelSwitchIncompatibleAgentError {
+        code: "MODEL_SWITCH_INCOMPATIBLE_AGENT".into(),
+        active_agent_type: "grok-build".into(),
+        required_agent_type: "cursor".into(),
+        model_id: "cursor-model".into(),
+        suggestion: "start_new_session".into(),
+    };
+    let _mismatch_effects = dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id: source_id,
+            model_id: model_id.clone(),
+            effort: None,
+            request_id,
+            result: Err(SwitchModelError::IncompatibleAgent {
+                error: err,
+                prev_model_id: None,
+            }),
+            prev_model_id: None,
+        }),
+        &mut app,
+    );
+
+    let _accept_effects = dispatch(
+        Action::AgentTypeMismatchAnswered {
+            source_id,
+            start_new: true,
+            model_id: model_id.clone(),
+            effort: None,
+        },
+        &mut app,
+    );
+
+    let ActiveView::Agent(replacement_id) = app.active_view else {
+        panic!("replacement must become active");
+    };
+    assert_ne!(replacement_id, source_id);
+
+    let replacement_created_effects = dispatch(
+        Action::TaskComplete(TaskResult::SessionCreated {
+            agent_id: replacement_id,
+            session_id: "replacement-session".into(),
+            models: None,
+            scheduler_background_loops: None,
+        }),
+        &mut app,
+    );
+
+    assert!(
+        replacement_created_effects.iter().any(|e| matches!(
+            e,
+            Effect::PersistPreferredModel { model_id: id, .. } if id == &model_id
+        )),
+        "pre_session={pre_session}: PersistPreferredModel must be emitted for \
+         the adopted model — the model runs either way, so dropping the \
+         preference on one entry point and keeping it on the other is the bug"
+    );
+}
