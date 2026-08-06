@@ -325,3 +325,30 @@ jobs:
             catalog_miss -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
             toctou -- --nocapture
+
+      # #159: a runtime-only model was judged absent by a config-only lookup,
+      # and the turn stripped its credentials. Filters written out rather than
+      # looped, so the #171 check can see them. Quoted name: an unquoted `#159`
+      # truncates at the comment marker.
+      - name: 'Runtime-catalog lookup and memo generation (issue #159)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib runtime_catalog -- --nocapture
+          run_nonzero -p xai-grok-shell --lib runtime_only_catalog -- --nocapture
+          run_nonzero -p xai-grok-shell --lib config_only_miss -- --nocapture
+          run_nonzero -p xai-grok-shell --lib memoized_as_definite -- --nocapture
+          run_nonzero -p xai-grok-shell --lib catalog_refresh_that_drops -- --nocapture
+          run_nonzero -p xai-grok-shell --lib bundled_fallback_rebuild -- --nocapture
