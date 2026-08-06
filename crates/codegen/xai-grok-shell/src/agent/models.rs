@@ -952,6 +952,10 @@ impl ModelsManager {
         self.inner
             .user_selected_model
             .store(false, Ordering::Relaxed);
+        // The catalog just became empty, which is a content change like any
+        // other -- without this a memo taken under the previous identity stays
+        // valid at the same generation and is served after the wipe (#159).
+        self.bump_catalog_generation();
     }
 
     /// Build a `SamplingConfig` from the current model + auth state.

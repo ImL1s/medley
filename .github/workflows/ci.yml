@@ -352,3 +352,9 @@ jobs:
           run_nonzero -p xai-grok-shell --lib memoized_as_definite -- --nocapture
           run_nonzero -p xai-grok-shell --lib catalog_refresh_that_drops -- --nocapture
           run_nonzero -p xai-grok-shell --lib bundled_fallback_rebuild -- --nocapture
+          # `agent::models` as a module filter: the generation asserts added to
+          # the pre-existing `rebuild_updates_models_and_available` live there
+          # and matched no name-based filter, so that guard ran nowhere. A new
+          # assertion in an old unfiltered test is invisible to the #171 check,
+          # which looks for added `#[test]` attributes.
+          run_nonzero -p xai-grok-shell --lib agent::models -- --nocapture
