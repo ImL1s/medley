@@ -1128,14 +1128,14 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
         if let Some(directive) = agent.pending_first_prompt.take() {
             agent.session.enqueue_prompt_front(directive);
         }
-        let deferred_request_id = deferred.as_ref().and_then(|_| {
-            crate::app::dispatch::session::lifecycle::begin_model_switch_request(
+        let deferred_request_id =
+            crate::app::dispatch::session::lifecycle::begin_or_reject_deferred_model_switch(
                 &mut app.model_switch_transaction,
+                &mut app.models,
                 agent_id,
-                &mut agent.session,
-                &app.models,
-            )
-        });
+                agent,
+                &deferred,
+            );
         let drain = maybe_drain_queue(agent);
         let page_flip_entry = drain.page_flip_entry;
         effects.extend(drain.effects);

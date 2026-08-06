@@ -1327,6 +1327,105 @@ fn deferred_model_switch_applied_on_session_created() {
     )));
 }
 
+/// When another agent holds `app.model_switch_transaction`, applying a
+/// pre-session deferred pick must not silently drop the intent: either emit
+/// `Effect::SwitchModel`, or restore the displayed model and toast the same
+/// "Wait for the current model switch to finish" message the live path uses.
+#[test]
+fn deferred_model_switch_blocked_by_other_agent_toasts_and_restores_display() {
+    let mut app = test_app_with_agent();
+    let id_a = AgentId(0);
+    let id_b = AgentId(1);
+    let model_old = acp::ModelId::new(std::sync::Arc::from("model-old"));
+    let model_new = acp::ModelId::new(std::sync::Arc::from("model-new"));
+    let session_b = make_test_agent_session(&app, id_b, "agent-b");
+    app.agents
+        .insert(id_b, AgentView::new(session_b, ScrollbackState::new()));
+    app.next_agent_id = 2;
+    insert_ready_model(&mut app, id_a, &model_old);
+    insert_ready_model(&mut app, id_a, &model_new);
+    insert_ready_model(&mut app, id_b, &model_old);
+    insert_ready_model(&mut app, id_b, &model_new);
+
+    // Agent A owns an in-flight model switch (global admission slot busy).
+    app.model_switch_transaction = Some(crate::app::app_view::ModelSwitchTransaction {
+        owner_agent_id: id_a,
+        request_id: Some(99),
+        app_models_optimistic: false,
+        app_model_id: Some(model_old.clone()),
+        app_reasoning_effort: None,
+    });
+
+    // Agent B: pre-session pick of model_new while display still shows it.
+    app.active_view = ActiveView::Agent(id_b);
+    {
+        let agent = app.agents.get_mut(&id_b).unwrap();
+        agent.session.session_id = None;
+        agent.session.models.set_current(model_new.clone(), None);
+        agent.session.deferred_model_switch = Some(crate::app::agent::DeferredModelSwitch {
+            model_id: model_new.clone(),
+            effort: None,
+            prev_model_id: Some(model_old.clone()),
+        });
+        agent.session.model_switch_rollback = Some(crate::app::agent::ModelSwitchRollback {
+            request_id: None,
+            session_model_id: Some(model_old.clone()),
+            session_reasoning_effort: None,
+        });
+    }
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SessionCreated {
+            agent_id: id_b,
+            session_id: acp::SessionId::new("b-session"),
+            models: None,
+            scheduler_background_loops: None,
+        }),
+        &mut app,
+    );
+
+    let emitted_switch = effects.iter().any(|e| {
+        matches!(
+            e,
+            Effect::SwitchModel {
+                agent_id,
+                ..
+            } if *agent_id == id_b
+        )
+    });
+    let display = app.agents[&id_b].session.models.current.clone();
+    let toast = app.agents[&id_b]
+        .toast
+        .as_ref()
+        .map(|(msg, _)| msg.as_str());
+    let restored = display.as_ref() == Some(&model_old);
+    let told = toast == Some("Wait for the current model switch to finish");
+
+    assert!(
+        emitted_switch || (restored && told),
+        "deferred switch must not be silently dropped: need SwitchModel OR \
+         (display restored + wait toast); got emitted_switch={emitted_switch} \
+         display={display:?} toast={toast:?} effects={effects:?}",
+    );
+    // This admission-blocked setup is the reject path — assert the strong form.
+    assert!(
+        !emitted_switch && restored && told,
+        "other-agent transaction must block SwitchModel and restore+toast; \
+         got emitted_switch={emitted_switch} display={display:?} toast={toast:?}",
+    );
+    assert!(
+        app.agents[&id_b].session.deferred_model_switch.is_none(),
+        "stash must stay consumed (consume-and-say-so)",
+    );
+    assert_eq!(
+        app.model_switch_transaction
+            .as_ref()
+            .map(|t| t.owner_agent_id),
+        Some(id_a),
+        "agent A's in-flight transaction must remain undisturbed",
+    );
+}
+
 #[test]
 fn rapid_no_session_model_choices_coalesce_and_keep_original_rollback() {
     use super::super::super::settings::setters::set_default_model_confirmed;
