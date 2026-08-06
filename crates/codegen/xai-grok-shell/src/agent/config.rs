@@ -5903,9 +5903,9 @@ pub(crate) fn sampling_config_for_model(
     // the attach side, so it demands https and refuses loopback outright.
     // An explicitly declared credential header is the user's own auth and wins
     // on every origin — an ambient credential must never slide underneath it.
+    let first_party = crate::util::is_xai_api_bearer_url(&credentials.base_url);
     if source.is_ambient_xai() {
         let explicit = explicit_credential_header(model.info());
-        let first_party = crate::util::is_xai_api_bearer_url(&credentials.base_url);
         if !first_party {
             tracing::error!(
                 model = %model.info().model,
@@ -5935,6 +5935,23 @@ pub(crate) fn sampling_config_for_model(
         credentials.api_key = None;
         credentials.auth_scheme = AuthScheme::None;
         source = xai_grok_sampler::CredentialSource::Missing;
+        deployment_id = None;
+        user_id = None;
+    }
+    // `x-grok-deployment-id` / `x-grok-user-id` carry the user's xAI account
+    // identity, so they belong only with a first-party destination and a
+    // first-party credential. The turn path gates them this way
+    // (`identity_in_scope`, `sampler_turn.rs`); this seam gated on `ready`
+    // alone, so a *Ready* BYOK model on an external origin still carried them
+    // to a third party -- and this seam is the one that serves aux models,
+    // image-describe, the auto-mode classifier and subagent spawn.
+    if !first_party
+        || credentials.auth_scheme == AuthScheme::None
+        || matches!(
+            source,
+            xai_grok_sampler::CredentialSource::ExplicitHeader { .. }
+        )
+    {
         deployment_id = None;
         user_id = None;
     }

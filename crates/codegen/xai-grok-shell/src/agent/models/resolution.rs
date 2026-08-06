@@ -124,12 +124,28 @@ pub(crate) fn resolve_default_model(
                     | config::ConfigSource::Env
                     | config::ConfigSource::Config
             );
+            // A campaign-driven default arrives over the wire into the same
+            // `Config` slot a user's own choice occupies, so `pref.source`
+            // alone cannot tell them apart. Keeping an unready *user* choice
+            // selected is #131's whole point; keeping an unready *pushed* one
+            // strands the cohort on a model it cannot authenticate until
+            // someone hand-edits config -- which is the exact failure
+            // `pre_campaign_default` exists to undo.
+            let campaign_driven = cfg.models.default_is_campaign_driven
+                && matches!(pref.source, config::ConfigSource::Config);
             // Honour the configured id against the full catalog first, before
             // the ready-only filter. An explicit preference that is present
             // but unusable must not be silently replaced (#131).
+            //
+            // `.rev()` on the slug scan, not plain `.find()`: duplicate
+            // routing slugs under distinct keys are first-class here (the
+            // `auto` A/B alias), and `resolve_catalog_key` and
+            // `selectable_catalog_key_for_persisted` both take the last match.
+            // Taking the first here would seat a different entry than every
+            // other lookup in this module resolves to.
             if let Some((key, entry)) = catalog
                 .get_key_value(&pref.value)
-                .or_else(|| catalog.iter().find(|(_, m)| m.model == pref.value))
+                .or_else(|| catalog.iter().rev().find(|(_, m)| m.model == pref.value))
             {
                 let (ready, reason) = crate::agent::config::model_readiness(entry);
                 // The visibility gates apply whether or not the model is ready.
@@ -143,7 +159,7 @@ pub(crate) fn resolve_default_model(
                 let selectable =
                     entry.info.visible_for_auth(is_session_auth) && entry.info.user_selectable;
                 if !ready {
-                    if is_explicit && selectable {
+                    if is_explicit && selectable && !campaign_driven {
                         let reason = reason.unwrap_or_else(|| "model is not ready".to_owned());
                         tracing::error!(
                             model_id = %pref.value,
@@ -153,10 +169,13 @@ pub(crate) fn resolve_default_model(
                         );
                         return (key.clone(), entry.clone(), pref.source, Some(reason));
                     }
-                    // Remote / non-explicit preference, or one the user may
-                    // not select: keep today's skip, which lets the campaign
-                    // recovery below reach `pre_campaign_default` rather than
-                    // stranding a cohort on a model it cannot authenticate.
+                    // Remote / campaign-driven / non-explicit preference, or
+                    // one the user may not select: skip, so the campaign
+                    // recovery below reaches `pre_campaign_default` rather
+                    // than stranding a cohort on a model it cannot
+                    // authenticate. An unready model is absent from
+                    // `ready_visible`, so falling through here lands in the
+                    // `found == None` branch where that recovery lives.
                 } else if selectable {
                     return (key.clone(), entry.clone(), pref.source, None);
                 }

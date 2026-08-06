@@ -566,7 +566,14 @@ impl SessionActor {
                 auth_scheme = xai_grok_sampler::AuthScheme::None;
                 use_session_bearer_resolver = false;
                 use_provider_bearer_resolver = false;
-                credential_source = Some(xai_grok_sampler::CredentialSource::Missing);
+                // `.or`, not an assignment: a declared credential header is
+                // the user's own auth, it is still in `extra_headers` and
+                // still goes out, so overwriting the label with `Missing`
+                // would have the config claim it carries nothing while
+                // carrying that. `agent/config.rs` preserves `ExplicitHeader`
+                // at the same decision.
+                credential_source =
+                    credential_source.or(Some(xai_grok_sampler::CredentialSource::Missing));
             }
             // Knowledge is temporarily unobtainable, or there is no identified
             // target yet. Both were `ready = true` before the tri-state, and
@@ -595,9 +602,11 @@ impl SessionActor {
                 auth_scheme = xai_grok_sampler::AuthScheme::None;
                 use_session_bearer_resolver = false;
                 use_provider_bearer_resolver = false;
-                // Label the gap so a Missing-keyed refusal can fire on Unusable
-                // alone — never on Unknown (#133).
-                credential_source = Some(xai_grok_sampler::CredentialSource::Missing);
+                // Label the gap on Unusable alone, never on Unknown (#133).
+                // `.or` preserves a declared credential header for the same
+                // reason as the arm above: it still ships in `extra_headers`.
+                credential_source =
+                    credential_source.or(Some(xai_grok_sampler::CredentialSource::Missing));
             }
         }
         self.log_auth_gate_unknown("reconstruct_full_config", gate, &cfg.base_url);
@@ -925,7 +934,16 @@ impl SessionActor {
     ) -> Result<xai_grok_sampler::SamplingClient, acp::Error> {
         self.refresh_token_if_expired().await;
         let mut full_config = self.reconstruct_full_config().await;
-        self.refuse_unusable_external_route(&full_config)?;
+        if let Err(message) = self.unusable_external_route(&full_config) {
+            // Deliberately not `fail_turn_unusable_route`. This seam serves
+            // compaction, goals, memory-dream and the laziness classifier --
+            // background work, not a user turn. A `RetryState::Failed` here
+            // would tell the pager a turn failed when none was running and
+            // fire the `agent_error` hook for housekeeping. Callers that do
+            // owe the client a terminal report send their own, as
+            // `compaction.rs` does.
+            return Err(acp::Error::invalid_params().data(message));
+        }
         full_config.force_http1 = force_http1;
         let sampling_client =
             xai_grok_sampler::SamplingClient::new(full_config).map_err(|e| self.to_acp_error(e))?;
@@ -945,7 +963,9 @@ impl SessionActor {
     pub(crate) async fn prepare_sampler_for_turn(&self) -> Result<(), acp::Error> {
         self.refresh_token_if_expired().await;
         let mut sampler_config = self.reconstruct_full_config().await;
-        self.refuse_unusable_external_route(&sampler_config)?;
+        if let Err(message) = self.unusable_external_route(&sampler_config) {
+            return Err(self.fail_turn_unusable_route(message).await);
+        }
         if self.tool_context.task_output_token_budget.is_some()
             || self.tool_context.sampler_retry_only_before_output
         {
@@ -958,7 +978,41 @@ impl SessionActor {
     /// #133: a catalogued-but-unusable model pointed at a non-xAI origin must
     /// fail locally before a request is built. Key on `Unusable` alone —
     /// `Unknown` (uncatalogued / unloadable) must still proceed.
-    fn refuse_unusable_external_route(&self, config: &SamplingConfig) -> Result<(), acp::Error> {
+    /// Terminal failure for a route refused before any request is built.
+    ///
+    /// `run_turn_via_sampler` documents that every `Err` it returns has
+    /// **already been reported**, and `handle_sampling_failure` is itself the
+    /// terminal reporter. Both reach `prepare_sampler_for_turn` through `?`,
+    /// so returning unreported from there would break that postcondition at
+    /// three call sites.
+    ///
+    /// The user still sees a turn-failed block either way -- the pager's
+    /// PromptResponse arm is a catch-all and none of its suppression flags
+    /// fire for this error type. What reporting buys is the rest of the
+    /// terminal contract: `log_terminal_failure` emits `turn.terminal_failure`
+    /// to the unified log, and `RetryState::Failed` is what raises the
+    /// `agent_error` hook. Without it this failure class is the only terminal
+    /// one that is invisible to telemetry and to user hooks.
+    ///
+    /// `model_not_ready` rather than `auth`: `is_reauthable_failure` keys on
+    /// `auth`, and an unusable model configuration is not an auth failure --
+    /// raising `/login` would send the user to fix the wrong thing.
+    async fn fail_turn_unusable_route(&self, message: String) -> acp::Error {
+        const ERROR_TYPE: &str = "model_not_ready";
+        self.log_terminal_failure(ERROR_TYPE, None, &message);
+        self.send_xai_notification(XaiSessionUpdate::RetryState(
+            crate::extensions::notification::RetryState::Failed {
+                error_type: ERROR_TYPE.to_owned(),
+                message: message.clone(),
+            },
+        ))
+        .await;
+        acp::Error::invalid_params().data(message)
+    }
+    /// `Err(reason)` when this route must be refused. Returns the message
+    /// rather than a built `acp::Error` so the single caller reports it before
+    /// propagating -- see [`Self::fail_turn_unusable_route`].
+    fn unusable_external_route(&self, config: &SamplingConfig) -> Result<(), String> {
         let catalog_model_id = self.catalog_model_id_str();
         let facts = self.model_auth_facts(&catalog_model_id);
         let Some(reason) = facts.readiness.unusable_reason() else {
@@ -977,9 +1031,9 @@ impl SessionActor {
             %reason,
             "refusing unusable model on a non-first-party endpoint"
         );
-        Err(acp::Error::invalid_params().data(format!(
+        Err(format!(
             "model '{catalog_model_id}' is not ready ({reason})"
-        )))
+        ))
     }
     /// Fold an auth remedy into a turn failure: its advice becomes the tail of
     /// the message, and its `turn_error_type` the classification the client

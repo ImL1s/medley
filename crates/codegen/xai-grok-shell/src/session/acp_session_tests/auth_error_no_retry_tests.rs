@@ -1554,8 +1554,8 @@ async fn absent_from_catalog_strips_the_credential_for_every_auth_method() {
                 assert_eq!(
                     cfg.credential_source,
                     Some(xai_grok_sampler::CredentialSource::Missing),
-                    "method {method:?}: the gap must be labelled, or SamplingClient::new \
-                     cannot back this up"
+                    "method {method:?}: the gap must be labelled so the config \
+                     does not still claim a credential it no longer carries"
                 );
             }
         })
