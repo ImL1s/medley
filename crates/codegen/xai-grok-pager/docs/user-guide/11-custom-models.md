@@ -149,14 +149,32 @@ A model whose final effective URL — after `model_provider`, `base_url`, and `a
 
 ### Context Window
 
-The `context_window` value tells Grok when to trigger auto-compaction. When you override a known model, Grok inherits that model's context window. When you define a new model and omit `context_window`, Grok defaults to 200,000 tokens, so set it explicitly to match your provider.
+The `context_window` value is the total the context bar shows and the basis for
+auto-compaction. It is **local configuration**, not a live report from the
+provider. Catalog models often inherit a window from the remote model list or
+response metadata; a built-in preset such as OpenAI Codex's `gpt-5.6-sol`
+ships a conservative figure in the binary, and that is what the bar displays
+until you override it.
 
-To override the context window of a built-in model (like the `gpt-5.6-sol` preset) without affecting its routing or credentials, define a metadata-only override that specifies only `context_window` (issue #122):
+When you override a known model, Grok inherits that model's context window.
+When you define a new model and omit `context_window`, Grok defaults to
+200,000 tokens, so set it explicitly to match your provider.
+
+If the context bar looks too low for a built-in model — or auto-compaction
+fires earlier than the provider still accepts — set a metadata-only override
+in the **global** config. Specifying only `context_window` keeps the preset's
+routing and credential:
 
 ```toml
 [model."gpt-5.6-sol"]
 context_window = 400000
 ```
+
+The `400000` above is an example override, not a claimed provider capacity.
+Use a value accurate for the model and account you are calling. See
+[OpenAI Codex](#openai-codex-chatgpt-subscription) for the same shape on the
+Codex preset, and [Auto-Compaction Threshold](#auto-compaction-threshold) if
+you only need to move the trigger point without changing the window.
 
 ### Global Default Headers
 
@@ -380,13 +398,25 @@ picker from a fresh install, listed as unready with the reason `sign in with
 grok login --provider openai-codex` until the credential above exists, and
 selectable once it does. Nothing has to be written to `config.toml` for it.
 
-To retune the preset, declare the same catalog key in the global config — it
-edits the preset in place rather than adding a second entry:
+The context bar's total for this preset is a **local default** shipped with
+the binary, not a figure ChatGPT reported on the wire.
+Auto-compaction uses the same number, so an under-reported window compacts
+early and throws away context the provider would still have accepted. When the
+bar looks wrong, raise it with a metadata-only override in the **global**
+config — see [Context Window](#context-window):
+
+```toml
+[model."gpt-5.6-sol"]
+context_window = 400000 # example only; use a value accurate for your account
+```
+
+To retune other metadata (display name, and so on), declare the same catalog
+key the same way; it edits the preset in place rather than adding a second
+entry:
 
 ```toml
 [model."gpt-5.6-sol"]
 name = "OpenAI Codex"
-context_window = 200000 # the preset's value; raise it if your account allows more
 ```
 
 An override like that names no endpoint and no credential, so it keeps the
@@ -645,6 +675,13 @@ telemetry = false
 ---
 
 ## Troubleshooting
+
+### Context bar shows 200K for Codex / auto-compact fires early
+
+The built-in `gpt-5.6-sol` preset's context window is a local default, not a
+provider-reported capacity. Override it in the global config — see
+[Context Window](#context-window) — or move only the compaction trigger with
+[Auto-Compaction Threshold](#auto-compaction-threshold).
 
 ### Model Not Found
 

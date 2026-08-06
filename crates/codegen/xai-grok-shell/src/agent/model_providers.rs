@@ -12,10 +12,26 @@ pub const OPENAI_CODEX_PROVIDER_ID: &str = "openai-codex";
 /// replaces the preset in place instead of adding a second entry.
 pub const OPENAI_CODEX_PRESET_MODEL_ID: &str = "gpt-5.6-sol";
 
-/// Conservative context window for the preset. Codex-side metadata is not
-/// discoverable from the CLI, and under-reporting only makes auto-compact fire
-/// earlier, so this matches the value the custom-models guide has always used
-/// in its Codex example.
+/// Conservative context window for the preset, and a guess.
+///
+/// Under-reporting only makes auto-compact fire earlier, which is the safe
+/// direction — but the figure is far enough off that the context bar reads as
+/// the model's real capacity and sessions compact long before they need to
+/// (#122). A user can correct it with a metadata-only `[model."gpt-5.6-sol"]`
+/// override; the custom-models guide documents how.
+///
+/// This comment used to assert that "Codex-side metadata is not discoverable
+/// from the CLI". **That is false.** Codex exposes `GET {base}/models` against
+/// the same `chatgpt.com/backend-api/codex` base this fork already uses, and
+/// its payload carries `context_window` and `max_context_window`. This fork
+/// does not fetch that catalog — the Codex path only hardcodes this constant.
+/// Fetching it would remove the guess rather than move it, and costs one
+/// authenticated probe to confirm the payload shape.
+///
+/// It also used to say the value "matches the value the custom-models guide
+/// has always used in its Codex example". Nothing enforced that coupling and
+/// the guide's example has since changed, so the claim is dropped rather than
+/// re-stated.
 const OPENAI_CODEX_PRESET_CONTEXT_WINDOW: u64 = 200_000;
 
 fn openai_codex_provider() -> ModelProviderConfig {
