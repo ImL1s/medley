@@ -297,14 +297,23 @@ impl ModelsManager {
             validate_selectable(cfg, &catalog)?;
         }
 
-        let (current_model_key, current_model, model_source) =
+        let (current_model_key, current_model, model_source, unready_default_reason) =
             resolve_default_model(cfg, &catalog, is_session_auth);
 
-        tracing::info!(
-            model_id = %current_model.model,
-            source = %model_source,
-            "default model resolved"
-        );
+        if let Some(reason) = &unready_default_reason {
+            tracing::error!(
+                model_id = %current_model.model,
+                source = %model_source,
+                %reason,
+                "default model resolved to an unusable configured preference"
+            );
+        } else {
+            tracing::info!(
+                model_id = %current_model.model,
+                source = %model_source,
+                "default model resolved"
+            );
+        }
 
         let current_model_id = acp::ModelId::new(Arc::from(current_model_key));
 
@@ -421,6 +430,10 @@ impl ModelsManager {
     /// that `allowed_models` or `hidden_models` filters out must not count —
     /// otherwise the login screen is skipped for a model `/model` cannot
     /// reach, stranding the session on a default xAI model with no credential.
+    ///
+    /// Only *known usable* Codex entries count here. Unready entries still
+    /// appear in [`Self::available`] labelled via `ready` /
+    /// `readinessReason` meta — visible and available are not one bool (#133).
     pub(crate) fn has_selectable_openai_codex_model(&self) -> bool {
         let is_session_auth = self.is_session_auth();
         self.models().values().any(|entry| {
@@ -931,16 +944,21 @@ impl ModelsManager {
             ),
             None,
         );
-        // #110: this is not only a startup snapshot. When the session path
-        // cannot resolve a model id it clones this config verbatim
+        // #110 / #131: this is not only a startup snapshot. When the session
+        // path cannot resolve a model id it clones this config verbatim
         // (`resolve_sampling_config_for_model`), and the readiness latch skips
         // entries it cannot find — so an unready model here would carry the
         // user's first prompt to its endpoint with the credential stripped
         // but the destination intact. Withhold the destination too: a config
         // with no endpoint fails locally instead of reaching a stranger.
-        if !crate::agent::config::model_readiness(current_model).0 {
-            tracing::warn!(
+        // Catalog-unavailable / unknown ids are handled upstream by keeping
+        // the configured id and deferring validation; this path always has a
+        // concrete catalog entry, so `!ready` here means Unusable.
+        if let (false, reason) = crate::agent::config::model_readiness(current_model) {
+            let reason = reason.unwrap_or_else(|| "model is not ready".to_owned());
+            tracing::error!(
                 model = current_model.info().model.as_str(),
+                %reason,
                 "construction-time sampling config is not ready; withholding its endpoint"
             );
             sampling.base_url = String::new();
@@ -1187,7 +1205,7 @@ impl ModelsManager {
         if !needs_reselection {
             return;
         }
-        let (key, _, source) = {
+        let (key, _, source, _) = {
             let cat = self.inner.catalog.read();
             let models = &cat.models;
             resolve_default_model(config, models, self.is_session_auth())
@@ -1202,7 +1220,7 @@ impl ModelsManager {
 
     /// Re-resolve the default model against the current catalog.
     fn reselect_default_model(&self, config: &config::Config) {
-        let (key, _, source) = {
+        let (key, _, source, unready_reason) = {
             let cat = self.inner.catalog.read();
             let models = &cat.models;
             resolve_default_model(config, models, self.is_session_auth())
@@ -1210,10 +1228,17 @@ impl ModelsManager {
         let new_id = acp::ModelId::new(Arc::from(key));
         let current = self.inner.current_model_id.read().clone();
         if current.0.as_ref() != new_id.0.as_ref() {
-            tracing::info!(
-                old = %current.0, new = %new_id.0, source = %source,
-                "re-resolved default model after catalog populated"
-            );
+            if let Some(reason) = &unready_reason {
+                tracing::error!(
+                    old = %current.0, new = %new_id.0, source = %source, %reason,
+                    "re-resolved default model to an unusable configured preference"
+                );
+            } else {
+                tracing::info!(
+                    old = %current.0, new = %new_id.0, source = %source,
+                    "re-resolved default model after catalog populated"
+                );
+            }
             self.set_current_model_id_internal(new_id);
         }
     }

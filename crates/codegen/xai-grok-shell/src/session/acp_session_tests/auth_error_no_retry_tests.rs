@@ -183,7 +183,7 @@ async fn pin_first_party_session_model(actor: &SessionActor) {
             facts: crate::agent::config::ModelAuthFacts {
                 byok: crate::agent::auth_method::ModelByok::NotByok,
                 auth_scheme: xai_grok_sampler::AuthScheme::Bearer,
-                ready: true,
+                readiness: crate::agent::auth_method::ModelReadiness::Ready,
             },
             provider: None,
         }));
@@ -1074,7 +1074,7 @@ async fn codex_401_forces_one_refresh_one_retry_then_second_401_is_terminal() {
                     facts: crate::agent::config::ModelAuthFacts {
                         byok: crate::agent::auth_method::ModelByok::NotByok,
                         auth_scheme: xai_grok_sampler::AuthScheme::Bearer,
-                        ready: true,
+                        readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: Some(provider),
                 }));
@@ -1236,7 +1236,7 @@ async fn model_auth_memo_serves_cached_status_and_keys_on_model() {
                     facts: ModelAuthFacts {
                         byok: ModelByok::Byok,
                         auth_scheme: Default::default(),
-                        ready: true,
+                        readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
                 }));
@@ -1281,7 +1281,7 @@ async fn reconstruct_full_config_no_bearer_resolver_for_byok_model_on_session_me
                     facts: ModelAuthFacts {
                         byok: ModelByok::Byok,
                         auth_scheme: Default::default(),
-                        ready: true,
+                        readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
                 }));
@@ -1332,7 +1332,7 @@ async fn reconstruct_full_config_no_bearer_resolver_for_none_auth_scheme_on_sess
                         // is what must suppress the resolver.
                         byok: ModelByok::NotByok,
                         auth_scheme: AuthScheme::None,
-                        ready: true,
+                        readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
                 }));
@@ -1385,7 +1385,9 @@ async fn reconstruct_full_config_strips_credentials_when_model_not_ready() {
                     facts: ModelAuthFacts {
                         byok: ModelByok::NotByok,
                         auth_scheme: AuthScheme::Bearer,
-                        ready: false,
+                        readiness: crate::agent::auth_method::ModelReadiness::Unusable(
+                            crate::agent::auth_method::UnusableReason("model is not ready".into()),
+                        ),
                     },
                     provider: None,
                 }));
@@ -1400,6 +1402,325 @@ async fn reconstruct_full_config_strips_credentials_when_model_not_ready() {
             assert!(cfg.api_key.is_none());
             assert!(cfg.user_id.is_none());
             assert!(cfg.deployment_id.is_none());
+            assert_eq!(
+                cfg.credential_source,
+                Some(xai_grok_sampler::CredentialSource::Missing),
+                "Unusable must label the gap Missing so a refusal can key on it"
+            );
+        })
+        .await;
+}
+
+/// #133 load-bearing: refusal keys on `Unusable` alone. An `Unknown`
+/// (uncatalogued) model must still prepare; a catalogued-unusable model on a
+/// non-first-party origin must fail locally naming the reason. If this is
+/// weakened back to treating Unknown like Unusable, the Unknown arm fails.
+#[tokio::test(flavor = "current_thread")]
+async fn prepare_refuses_unusable_external_but_allows_unknown() {
+    use crate::agent::auth_method::{ModelByok, ModelReadiness, UnknownReason, UnusableReason};
+    use crate::agent::config::ModelAuthFacts;
+    use xai_grok_sampler::AuthScheme;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_dir, am) = auth_manager_with_valid_token("session-token");
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                Some(am),
+                "cached_token",
+                xai_chat_state::AuthType::SessionToken,
+                "stale-session-jwt".to_string(),
+            )
+            .await;
+
+            let mut cfg = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("sampling config");
+            cfg.base_url = "https://vendor.example/v1".to_string();
+            cfg.endpoint_trust = Some(xai_grok_sampler::EndpointTrustClass::External);
+            let model = cfg.model.clone();
+            actor.chat_state_handle.update_sampling_config(cfg);
+
+            // Unknown (uncatalogued): must still prepare.
+            actor
+                .model_auth_memo
+                .replace(Some(crate::session::acp_session::ModelAuthMemo {
+                    model_id: model.clone(),
+                    facts: ModelAuthFacts {
+                        byok: ModelByok::NotByok,
+                        auth_scheme: AuthScheme::Bearer,
+                        readiness: ModelReadiness::Unknown(UnknownReason::NotInCatalog),
+                    },
+                    provider: None,
+                }));
+            actor
+                .prepare_chat_completion(false)
+                .await
+                .expect("Unknown (uncatalogued) must not be refused");
+
+            // Unusable on a non-first-party origin: must refuse naming the reason.
+            actor
+                .model_auth_memo
+                .replace(Some(crate::session::acp_session::ModelAuthMemo {
+                    model_id: model,
+                    facts: ModelAuthFacts {
+                        byok: ModelByok::NotByok,
+                        auth_scheme: AuthScheme::Bearer,
+                        readiness: ModelReadiness::Unusable(UnusableReason(
+                            "invalid auth_scheme `not-a-scheme`".into(),
+                        )),
+                    },
+                    provider: None,
+                }));
+            let err = actor
+                .prepare_chat_completion(false)
+                .await
+                .expect_err("Unusable external must be refused");
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("not ready") && msg.contains("invalid auth_scheme"),
+                "refusal must name the model readiness reason, got: {msg}"
+            );
+        })
+        .await;
+}
+
+/// The turn path owes the client a terminal report; the auxiliary path does not.
+///
+/// `run_turn_via_sampler` documents that every `Err` it returns has already
+/// been reported via `RetryState::Failed`, so the refusal added for #133 has to
+/// send one before propagating. `prepare_chat_completion` must **not**: it
+/// serves compaction, goals, memory-dream and the laziness classifier, and
+/// announcing a failed turn for background work would be a lie.
+///
+/// The existing refusal test drives only `prepare_chat_completion` and asserts
+/// on the error text, so neither half of this was covered.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unusable_route_reports_on_the_turn_path_and_stays_quiet_on_the_aux_path() {
+    use crate::agent::auth_method::{ModelByok, ModelReadiness, UnusableReason};
+    use crate::agent::config::ModelAuthFacts;
+    use xai_grok_sampler::AuthScheme;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_dir, am) = auth_manager_with_valid_token("session-token");
+            let (actor, mut rx) = make_actor_with_method_and_credentials(
+                Some(am),
+                "cached_token",
+                xai_chat_state::AuthType::SessionToken,
+                "stale-session-jwt".to_string(),
+            )
+            .await;
+
+            let mut cfg = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("sampling config");
+            cfg.base_url = "https://vendor.example/v1".to_string();
+            cfg.endpoint_trust = Some(xai_grok_sampler::EndpointTrustClass::External);
+            let model = cfg.model.clone();
+            actor.chat_state_handle.update_sampling_config(cfg);
+            actor
+                .model_auth_memo
+                .replace(Some(crate::session::acp_session::ModelAuthMemo {
+                    model_id: model,
+                    facts: ModelAuthFacts {
+                        byok: ModelByok::NotByok,
+                        auth_scheme: AuthScheme::Bearer,
+                        readiness: ModelReadiness::Unusable(UnusableReason(
+                            "invalid auth_scheme `not-a-scheme`".into(),
+                        )),
+                    },
+                    provider: None,
+                }));
+
+            // `RetryState` reaches the client through the persistence channel
+            // as a session update, which is how the compaction tests observe it.
+            let drain =
+                |rx: &mut mpsc::UnboundedReceiver<crate::session::persistence::PersistenceMsg>| {
+                    let mut seen: Vec<(String, String)> = Vec::new();
+                    while let Ok(msg) = rx.try_recv() {
+                        if let crate::session::persistence::PersistenceMsg::Update(
+                            crate::session::storage::SessionUpdate::Xai(notif),
+                        ) = msg
+                            && let crate::extensions::notification::SessionUpdate::RetryState(
+                                crate::extensions::notification::RetryState::Failed {
+                                    error_type,
+                                    message,
+                                },
+                            ) = &notif.update
+                        {
+                            seen.push((error_type.clone(), message.clone()));
+                        }
+                    }
+                    seen
+                };
+            // Anything queued during actor construction is not ours.
+            drain(&mut rx);
+
+            actor
+                .prepare_sampler_for_turn()
+                .await
+                .expect_err("an unusable external route must refuse");
+            let after_turn = drain(&mut rx);
+            assert!(
+                after_turn
+                    .iter()
+                    .any(|(t, m)| t == "model_not_ready" && m.contains("invalid auth_scheme")),
+                "the turn path owes one RetryState::Failed naming the reason; got {after_turn:?}"
+            );
+            assert!(
+                !after_turn.iter().any(|(t, _)| t == "auth"),
+                "must not classify as auth: an unusable model config is not an \
+                 expired login, and `auth` is what raises the re-auth prompt; \
+                 got {after_turn:?}"
+            );
+
+            actor
+                .prepare_chat_completion(false)
+                .await
+                .expect_err("the aux path must refuse too");
+            let after_aux = drain(&mut rx);
+            assert!(
+                after_aux.is_empty(),
+                "compaction, goals and memory-dream are not turns; reporting a \
+                 turn failure for them would be a lie; got {after_aux:?}"
+            );
+        })
+        .await;
+}
+
+/// A model the catalog does not have must reach the wire with no credential,
+/// **whatever the ACP auth method is**.
+///
+/// This is the test the first version of the tri-state did not have, and the
+/// gap was not incidental: its sibling builds the actor with `cached_token`,
+/// which is session-based, so the arm under test took a different branch and
+/// the loosening was never exercised. Here the method is `xai_api_key`, which
+/// is not session-based -- the case where the chat-state key was being retained
+/// and sent on to whatever `base_url` the session held.
+#[tokio::test(flavor = "current_thread")]
+async fn absent_from_catalog_strips_the_credential_for_every_auth_method() {
+    use crate::agent::auth_method::{ModelByok, ModelReadiness, UnknownReason};
+    use crate::agent::config::ModelAuthFacts;
+    use xai_grok_sampler::AuthScheme;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            for method in ["xai_api_key", "cached_token", "not-a-known-method"] {
+                let (_dir, am) = auth_manager_with_valid_token("session-token");
+                let (actor, _rx) = make_actor_with_method_and_credentials(
+                    Some(am),
+                    method,
+                    xai_chat_state::AuthType::ApiKey,
+                    "chat-state-key".to_string(),
+                )
+                .await;
+                if let Some(mut cfg) = actor.chat_state_handle.get_sampling_config().await {
+                    cfg.base_url = "https://vendor.example/v1".to_string();
+                    actor.chat_state_handle.update_sampling_config(cfg);
+                }
+                let model = actor
+                    .chat_state_handle
+                    .get_sampling_config()
+                    .await
+                    .map(|c| c.model)
+                    .unwrap_or_default();
+                actor
+                    .model_auth_memo
+                    .replace(Some(crate::session::acp_session::ModelAuthMemo {
+                        model_id: model,
+                        facts: ModelAuthFacts {
+                            byok: ModelByok::NotByok,
+                            auth_scheme: AuthScheme::Bearer,
+                            readiness: ModelReadiness::Unknown(UnknownReason::NotInCatalog),
+                        },
+                        provider: None,
+                    }));
+
+                let cfg = actor.reconstruct_full_config().await;
+
+                assert!(
+                    cfg.api_key.is_none(),
+                    "method {method:?}: a model absent from the catalog must not carry the \
+                     chat-state key to {}",
+                    cfg.base_url
+                );
+                assert_eq!(
+                    cfg.auth_scheme,
+                    AuthScheme::None,
+                    "method {method:?}: the scheme must be cleared with the credential"
+                );
+                assert!(
+                    cfg.bearer_resolver.is_none(),
+                    "method {method:?}: no resolver may survive"
+                );
+                assert_eq!(
+                    cfg.credential_source,
+                    Some(xai_grok_sampler::CredentialSource::Missing),
+                    "method {method:?}: the gap must be labelled so the config \
+                     does not still claim a credential it no longer carries"
+                );
+            }
+        })
+        .await;
+}
+
+/// A transient catalog failure is not a verdict: it must leave a live session
+/// alone rather than de-credentialing the turn.
+///
+/// `CatalogUnavailable` and `UnidentifiedModel` were both `ready = true` before
+/// the tri-state. `session_token_auth_gate` documents that an `Unknown`
+/// classification must not demote a live session to non-refreshable api-key
+/// mode; clearing the resolvers here would do worse -- send nothing at all, and
+/// 401 every turn until restart.
+#[tokio::test(flavor = "current_thread")]
+async fn a_transient_catalog_failure_leaves_a_live_session_intact() {
+    use crate::agent::auth_method::{ModelByok, ModelReadiness, UnknownReason};
+    use crate::agent::config::ModelAuthFacts;
+    use xai_grok_sampler::AuthScheme;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            for reason in [
+                UnknownReason::CatalogUnavailable,
+                UnknownReason::UnidentifiedModel,
+            ] {
+                let (_dir, am) = auth_manager_with_valid_token("session-token");
+                let (actor, _rx) = make_actor_with_method_and_credentials(
+                    Some(am),
+                    "cached_token",
+                    xai_chat_state::AuthType::SessionToken,
+                    "session-jwt".to_string(),
+                )
+                .await;
+                pin_first_party_session_model(&actor).await;
+                actor
+                    .model_auth_memo
+                    .replace(Some(crate::session::acp_session::ModelAuthMemo {
+                        model_id: actor.catalog_model_id_str(),
+                        facts: ModelAuthFacts {
+                            byok: ModelByok::NotByok,
+                            auth_scheme: AuthScheme::Bearer,
+                            readiness: ModelReadiness::Unknown(reason),
+                        },
+                        provider: None,
+                    }));
+
+                let cfg = actor.reconstruct_full_config().await;
+
+                assert_ne!(
+                    cfg.auth_scheme,
+                    AuthScheme::None,
+                    "{reason:?}: a transient failure must not clear the scheme"
+                );
+                assert!(
+                    cfg.bearer_resolver.is_some() || cfg.api_key.is_some(),
+                    "{reason:?}: the live session must survive an unobtainable catalog"
+                );
+            }
         })
         .await;
 }
@@ -1436,7 +1757,7 @@ async fn refresh_token_if_expired_skips_session_refresh_for_none_auth_scheme() {
                     facts: ModelAuthFacts {
                         byok: ModelByok::NotByok,
                         auth_scheme: AuthScheme::None,
-                        ready: true,
+                        readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
                 }));
@@ -1490,7 +1811,7 @@ async fn reconstruct_full_config_uses_catalog_key_for_none_alias_with_shared_wir
                     facts: ModelAuthFacts {
                         byok: ModelByok::NotByok,
                         auth_scheme: AuthScheme::None,
-                        ready: true,
+                        readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
                 }));
@@ -1543,7 +1864,7 @@ async fn set_session_model_preserves_catalog_key_for_none_alias_with_shared_wire
                     facts: ModelAuthFacts {
                         byok: ModelByok::NotByok,
                         auth_scheme: AuthScheme::Bearer,
-                        ready: true,
+                        readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
                 }));
@@ -1602,7 +1923,7 @@ async fn set_session_model_preserves_catalog_key_for_none_alias_with_shared_wire
                     facts: ModelAuthFacts {
                         byok: ModelByok::NotByok,
                         auth_scheme: AuthScheme::None,
-                        ready: true,
+                        readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
                 }));
@@ -1736,7 +2057,7 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                     facts: ModelAuthFacts {
                         byok: ModelByok::NotByok,
                         auth_scheme: Default::default(),
-                        ready: true,
+                        readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
                 }));
@@ -1815,7 +2136,7 @@ async fn seed_provider_memo(actor: &Arc<SessionActor>, provider: crate::auth::Au
             facts: crate::agent::config::ModelAuthFacts {
                 byok: crate::agent::auth_method::ModelByok::Byok,
                 auth_scheme: Default::default(),
-                ready: true,
+                readiness: crate::agent::auth_method::ModelReadiness::Ready,
             },
             provider: Some(provider),
         }));

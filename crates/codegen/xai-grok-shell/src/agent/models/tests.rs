@@ -480,7 +480,7 @@ fn default_model_honors_allowlist_when_no_default_set() {
             "#,
     );
     let catalog = resolve_model_catalog(&cfg, None);
-    let (_key, entry, _src) = resolve_default_model(&cfg, &catalog, true);
+    let (_key, entry, _src, _) = resolve_default_model(&cfg, &catalog, true);
     assert!(
         entry.info.user_selectable,
         "picked non-selectable {}",
@@ -1470,7 +1470,7 @@ fn unavailable_campaign_default_falls_back_to_config_default() {
     cfg.models.default = Some("missing-model".to_string());
     cfg.models.default_is_campaign_driven = true;
     cfg.models.pre_campaign_default = Some("real-model".to_string());
-    let (key, _, _) = resolve_default_model(&cfg, &catalog, true);
+    let (key, _, _, _) = resolve_default_model(&cfg, &catalog, true);
     assert_eq!(
         key, "real-model",
         "must fall back to the pre-campaign default"
@@ -1480,13 +1480,13 @@ fn unavailable_campaign_default_falls_back_to_config_default() {
     cfg2.models.default = Some("missing-model".to_string());
     cfg2.models.default_is_campaign_driven = true;
     cfg2.models.pre_campaign_default = Some("also-missing".to_string());
-    let (key2, _, _) = resolve_default_model(&cfg2, &catalog, true);
+    let (key2, _, _, _) = resolve_default_model(&cfg2, &catalog, true);
     assert_eq!(&key2, catalog.keys().next().unwrap());
 
     let mut cfg3 = config::Config::default();
     cfg3.models.default = Some("missing-model".to_string());
     cfg3.models.pre_campaign_default = Some("real-model".to_string());
-    let (key3, _, _) = resolve_default_model(&cfg3, &catalog, true);
+    let (key3, _, _, _) = resolve_default_model(&cfg3, &catalog, true);
     assert_eq!(
         &key3,
         catalog.keys().next().unwrap(),
@@ -1500,12 +1500,63 @@ fn unavailable_campaign_default_falls_back_to_config_default() {
     cfg4.models.default = Some("campaign-model".to_string());
     cfg4.models.default_is_campaign_driven = true;
     cfg4.models.pre_campaign_default = Some("real-model".to_string());
-    let (key4, _, _) = resolve_default_model(&cfg4, &catalog, true);
+    let (key4, _, _, _) = resolve_default_model(&cfg4, &catalog, true);
     assert_eq!(
         &key4,
         catalog.keys().next().unwrap(),
         "a CLI pref miss must not detour through pre_campaign_default"
     );
+}
+
+/// A campaign-driven default that is *present* in the catalog but unready must
+/// still recover the pre-campaign default.
+///
+/// #131 keeps an explicit unready preference selected instead of silently
+/// swapping it, which is right for a choice the user made. A campaign default
+/// lands in the same `ConfigSource::Config` slot without the user choosing
+/// anything, so counting it as explicit turns one bad remote push into a
+/// cohort that cannot complete a turn until somebody hand-edits config --
+/// which is the exact failure `pre_campaign_default` exists to undo.
+///
+/// Every case in `unavailable_campaign_default_falls_back_to_config_default`
+/// uses a preference *absent* from the catalog. That reaches the recovery
+/// through the catalog-miss branch and so never exercised this one.
+#[test]
+fn an_unready_campaign_default_recovers_the_pre_campaign_default() {
+    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
+    let mut pushed = make_model_entry("pushed-model");
+    pushed
+        .config_validation_errors
+        .push("invalid auth_scheme `not-a-scheme`".into());
+    catalog.insert("pushed-model".to_string(), pushed);
+    catalog.insert("real-model".to_string(), make_model_entry("real-model"));
+
+    let mut cfg = config::Config::default();
+    cfg.models.default = Some("pushed-model".to_string());
+    cfg.models.default_is_campaign_driven = true;
+    cfg.models.pre_campaign_default = Some("real-model".to_string());
+
+    let (key, _, _, reason) = resolve_default_model(&cfg, &catalog, true);
+    assert_eq!(
+        key, "real-model",
+        "a pushed default that cannot authenticate must not strand the cohort"
+    );
+    assert!(
+        reason.is_none(),
+        "recovering is not a failure to report to the user: {reason:?}"
+    );
+
+    // The same broken entry, chosen by the user instead of pushed, is still
+    // kept selected and reported. That is #131, and this fix must not undo it.
+    let mut chosen = config::Config::default();
+    chosen.models.default = Some("pushed-model".to_string());
+    chosen.models.pre_campaign_default = Some("real-model".to_string());
+    let (key, _, _, reason) = resolve_default_model(&chosen, &catalog, true);
+    assert_eq!(
+        key, "pushed-model",
+        "an explicit user choice that is broken stays selected"
+    );
+    assert!(reason.is_some(), "and the user is told why");
 }
 
 // ── ModelFetchAuth::resolve priority tests ──────────────────────
@@ -1747,14 +1798,14 @@ fn default_model_skips_oauth_only_for_api_key_users() {
 
     catalog.insert("public-model".to_string(), make_model_entry("public-model"));
 
-    let (key, _, _) = resolve_default_model(&cfg, &catalog, false);
+    let (key, _, _, _) = resolve_default_model(&cfg, &catalog, false);
     assert_ne!(
         key, "oauth-only",
         "API-key default must not be an OAuth-only model"
     );
     assert_eq!(key, "public-model");
 
-    let (key, _, _) = resolve_default_model(&cfg, &catalog, true);
+    let (key, _, _, _) = resolve_default_model(&cfg, &catalog, true);
     assert!(
         key == "oauth-only" || key == "public-model",
         "OAuth user should be able to use either model as default"
@@ -1886,14 +1937,14 @@ fn resolve_default_model_prefers_id_over_model_slug() {
     let mut cfg = config::Config::default();
     cfg.models.default = Some("grok-build".to_string());
 
-    let (key, _, _) = resolve_default_model(&cfg, &catalog, true);
+    let (key, _, _, _) = resolve_default_model(&cfg, &catalog, true);
     assert_eq!(key, "grok-build", "must match id, not first slug hit");
 }
 
-/// When every selectable catalog entry is unready, do not return any of
-/// them via the empty-visible fallback — use the bundled default sentinel.
+/// #131: an explicit configured default that is catalogued-but-unusable must
+/// be kept (no silent substitute), with the readiness reason returned.
 #[test]
-fn resolve_default_model_falls_back_when_all_selectable_unready() {
+fn resolve_default_model_keeps_explicit_unusable_preference() {
     let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
     let mut custom = make_model_entry("custom");
     custom
@@ -1904,10 +1955,71 @@ fn resolve_default_model_falls_back_when_all_selectable_unready() {
     let mut cfg = config::Config::default();
     cfg.models.default = Some("custom".to_string());
 
-    let (key, entry, _) = resolve_default_model(&cfg, &catalog, true);
+    let (key, entry, _, reason) = resolve_default_model(&cfg, &catalog, true);
+    assert_eq!(key, "custom", "must keep the explicit unusable preference");
+    assert!(
+        !crate::agent::config::model_readiness(&entry).0,
+        "kept entry must still be unusable"
+    );
+    let reason = reason.expect("must surface the readiness reason");
+    assert!(
+        reason.contains("invalid auth_scheme"),
+        "unexpected reason: {reason}"
+    );
+}
+
+/// Keeping an unusable explicit preference must not bypass the gates that say
+/// whether the user may select it at all.
+///
+/// `allowed_models` / `hidden_models` / `supported_in_api` answer a different
+/// question from "does it work", and an earlier version returned the unready
+/// preference *before* consulting them. `validate_selectable` guards
+/// `models.default` but not `GROK_DEFAULT_MODEL`, and `reselect_default_model`
+/// never calls it, so this is the only gate on that path — without it the
+/// session's current model can be one `available()` does not list, and
+/// `allowed_models` stops being a gate.
+#[test]
+fn an_unusable_preference_the_user_may_not_select_is_not_seated() {
+    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
+
+    let mut hidden = make_model_entry("hidden-custom");
+    hidden
+        .config_validation_errors
+        .push("invalid auth_scheme `not-a-scheme`".into());
+    hidden.info.user_selectable = false;
+    catalog.insert("hidden-custom".to_string(), hidden);
+
+    let usable = make_model_entry("usable");
+    catalog.insert("usable".to_string(), usable);
+
+    let mut cfg = config::Config::default();
+    cfg.models.default = Some("hidden-custom".to_string());
+
+    let (key, _, _, _) = resolve_default_model(&cfg, &catalog, true);
+    assert_ne!(
+        key, "hidden-custom",
+        "a model the user may not select must not be seated just because it was named"
+    );
+}
+
+/// When no preference is set and every selectable entry is unready, fall back
+/// to the bundled default sentinel rather than returning an unusable entry.
+#[test]
+fn resolve_default_model_falls_back_when_all_selectable_unready() {
+    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
+    let mut custom = make_model_entry("custom");
+    custom
+        .config_validation_errors
+        .push("invalid auth_scheme `not-a-scheme`".into());
+    catalog.insert("custom".to_string(), custom);
+
+    let cfg = config::Config::default(); // no explicit preference
+
+    let (key, entry, _, reason) = resolve_default_model(&cfg, &catalog, true);
+    assert!(reason.is_none());
     assert_ne!(
         key, "custom",
-        "must not keep an unready preferred/selectable model"
+        "must not pick an unready selectable model as the implicit default"
     );
     assert_eq!(key, crate::models::default_model());
     assert!(

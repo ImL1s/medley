@@ -56,13 +56,16 @@ impl AuthStatus {
         }
         // Last before "nothing": every xAI-side credential above outranks it,
         // so reaching here is what makes the "no xAI credential" wording true.
-        if models
+        // Split candidate (a Codex profile exists) from known-usable (readiness
+        // passed): Unknown/unready must NOT count as authenticated (#133).
+        let has_codex_candidate = models.values().any(|entry| entry.is_openai_codex_profile());
+        let has_known_usable = models
             .values()
-            .any(|entry| entry.is_openai_codex_profile() && model_readiness(entry).0)
-        {
-            return Self::OpenAiCodex;
+            .any(|entry| entry.is_openai_codex_profile() && model_readiness(entry).0);
+        match (has_codex_candidate, has_known_usable) {
+            (_, true) => Self::OpenAiCodex,
+            (true, false) | (false, false) => Self::NotAuthenticated,
         }
-        Self::NotAuthenticated
     }
 }
 

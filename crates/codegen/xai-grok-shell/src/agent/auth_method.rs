@@ -403,6 +403,96 @@ impl ModelByok {
     }
 }
 
+/// Why [`ModelReadiness::Unusable`]: the catalog entry failed
+/// [`crate::agent::config::model_readiness`]. Kept as a string so the
+/// refusal / default-resolution surfaces can name the same reason the
+/// picker already shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UnusableReason(pub String);
+
+impl UnusableReason {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Why [`ModelReadiness::Unknown`]. These are not interchangeable: an
+/// absent catalog entry, an unloadable catalog, and an empty model id
+/// want different attach / refusal behaviour (#133).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnknownReason {
+    /// Effective config loaded; `model_id` is not in the catalog.
+    NotInCatalog,
+    /// Config load/parse failed — readiness knowledge is unobtainable.
+    CatalogUnavailable,
+    /// No identified model yet (empty sampling-config model id).
+    UnidentifiedModel,
+}
+
+impl UnknownReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotInCatalog => "not_in_catalog",
+            Self::CatalogUnavailable => "catalog_unavailable",
+            Self::UnidentifiedModel => "unidentified_model",
+        }
+    }
+}
+
+/// Catalog readiness for a model id, distinct from BYOK.
+///
+/// `ModelAuthFacts` used to collapse this into a bool, so "catalogued but
+/// failed readiness" and "not in the catalog" both read as `!ready`. A
+/// refusal keyed on that bool then also refused every uncatalogued model
+/// (#133). Same shape as [`ModelByok`], with the unknown *reason*
+/// preserved so readers can tell absence from unobtainable knowledge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ModelReadiness {
+    /// Catalog entry present and `model_readiness` passed.
+    Ready,
+    /// Catalog entry present and `model_readiness` failed.
+    Unusable(UnusableReason),
+    /// No definite catalog answer — see [`UnknownReason`].
+    Unknown(UnknownReason),
+}
+
+impl ModelReadiness {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Unusable(_) => "unusable",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    /// Refusal keys on this alone — never on [`Self::Unknown`] (#133).
+    pub fn is_unusable(&self) -> bool {
+        matches!(self, Self::Unusable(_))
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown(_))
+    }
+
+    pub fn unusable_reason(&self) -> Option<&str> {
+        match self {
+            Self::Unusable(reason) => Some(reason.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn unknown_reason(&self) -> Option<UnknownReason> {
+        match self {
+            Self::Unknown(reason) => Some(*reason),
+            _ => None,
+        }
+    }
+}
+
 /// Whether this session+model uses a refreshable session token.
 ///
 /// Gates on stable inputs, not `Credentials.auth_type`: that field collapses
