@@ -100,10 +100,11 @@ async fn web_search_uses_model_override_from_config_end_to_end() {
         state_path: std::env::temp_dir().join("grok-web-search-e2e/state.json"),
         memory_backend: None,
         web_search_config: xai_grok_tools::implementations::web_search::WebSearchConfig::Enabled {
-            api_key: web_search_sampling.api_key.clone().unwrap(),
+            api_key: web_search_sampling.api_key.clone(),
             base_url: web_search_sampling.base_url.clone(),
             model: web_search_sampling.model.clone(),
             extra_headers: web_search_sampling.extra_headers.clone(),
+            env_http_headers: web_search_sampling.env_http_headers.clone(),
             // The optional extra access key is no longer carried on
             // `SamplerConfig`. The shell-level value flows in via
             // `Credentials` at session-spawn time; in this self-contained
@@ -144,6 +145,134 @@ async fn web_search_uses_model_override_from_config_end_to_end() {
     assert_eq!(
         request.get("model").and_then(|v| v.as_str()),
         Some(web_search_model.as_str())
+    );
+
+    server.abort();
+}
+
+/// #160: enabling `web_search` for a header-authenticated model is only half
+/// the fix. The credential the user supplied has to reach the wire, and the
+/// bearer they never supplied must not.
+///
+/// The negative half is the load-bearing one. `extra_headers` are applied after
+/// the bearer, so an invented `Authorization` would be overwritten for the
+/// `authorization` flavour and the bug would hide — but an `x-api-key` route
+/// would ship a bogus empty bearer alongside its real credential. Reverting
+/// `api_key` to a `String` fails the `AUTHORIZATION` assertion below.
+#[tokio::test]
+async fn web_search_sends_an_explicit_header_and_invents_no_bearer() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<axum::http::HeaderMap>();
+    async fn handle_request(
+        State(tx): State<tokio::sync::mpsc::UnboundedSender<axum::http::HeaderMap>>,
+        headers: axum::http::HeaderMap,
+        Json(_body): Json<Value>,
+    ) -> Json<Value> {
+        let _ = tx.send(headers);
+        Json(json!({
+            "id": "resp_test",
+            "object": "response",
+            "created_at": 1234567890,
+            "status": "completed",
+            "model": "hdr-search",
+            "output": [{
+                "type": "message",
+                "id": "msg_1",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "search result",
+                    "annotations": []
+                }]
+            }]
+        }))
+    }
+    let app = Router::new()
+        .route("/responses", post(handle_request))
+        .with_state(tx);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let builder = crate::tools::bridge::ToolBridge::get_builder();
+    let config = ToolServerConfig {
+        tools: vec![ToolConfig {
+            id: "GrokBuild:web_search".into(),
+            params: None,
+            name_override: None,
+            params_name_overrides: None,
+            description_override: None,
+            behavior_version: None,
+            kind: None,
+        }],
+        behavior_preset: None,
+    };
+    let fs: std::sync::Arc<dyn AsyncFileSystem> = std::sync::Arc::new(LocalFs);
+    let terminal: std::sync::Arc<dyn TerminalBackend> =
+        std::sync::Arc::new(LocalTerminalBackend::new());
+    let ctx = SessionContext {
+        backend: terminal,
+        fs,
+        cwd: std::env::temp_dir(),
+        session_folder: std::env::temp_dir().join("grok-web-search-hdr"),
+        session_env: std::sync::Arc::new(std::collections::HashMap::new()),
+        notification_handle: ToolNotificationHandle::noop(),
+        owner_session_id: None,
+        subagent: None,
+        parent_scheduler_handle: None,
+        skills: vec![],
+        state_path: std::env::temp_dir().join("grok-web-search-hdr/state.json"),
+        memory_backend: None,
+        // Exactly what `spawn.rs` now produces for an `ExplicitHeader` route:
+        // no bearer, credential in the headers.
+        web_search_config: xai_grok_tools::implementations::web_search::WebSearchConfig::Enabled {
+            api_key: None,
+            base_url: format!("http://{addr}"),
+            model: "hdr-search".to_string(),
+            extra_headers: [("x-api-key".to_string(), "user-supplied-key".to_string())]
+                .into_iter()
+                .collect(),
+            env_http_headers: Default::default(),
+            alpha_test_key: None,
+            api_key_provider: None,
+        },
+        web_fetch_config: Default::default(),
+        lsp: None,
+        image_gen_config: Default::default(),
+        video_gen_config: Default::default(),
+        app_builder_deployer_config: Default::default(),
+        api_key_provider: None,
+        auth_provider: None,
+        attribution_callback: None,
+        system_reminder_tag: xai_grok_tools::reminders::DEFAULT_REMINDER_TAG,
+    };
+    let bridge = crate::tools::bridge::ToolBridge::finalize_builder(builder, config, ctx)
+        .await
+        .expect("finalize_builder should succeed");
+    let result = bridge
+        .call(
+            "web_search",
+            json!({ "query": "test query" }),
+            "web-search-hdr",
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "web_search should succeed: {:?}",
+        result.err()
+    );
+
+    let headers = rx.recv().await.expect("mock server should receive request");
+    assert_eq!(
+        headers.get("x-api-key").and_then(|v| v.to_str().ok()),
+        Some("user-supplied-key"),
+        "the user's credential header must reach the request"
+    );
+    assert!(
+        headers.get(axum::http::header::AUTHORIZATION).is_none(),
+        "no bearer may be invented for a route that supplied its own header",
     );
 
     server.abort();

@@ -4786,9 +4786,13 @@ impl MvpAgent {
         let web_search_disable_notice = if disable_web_search {
             None
         } else {
+            // Same predicate as the spawn path and the reason text, so the
+            // notice fires exactly when web_search is really disabled. Asking
+            // `api_key.is_none()` here notified users who were authenticated
+            // by an explicit header and whose search still worked (#160).
             let needs_notice = web_search_sampling_config
                 .as_ref()
-                .is_none_or(|cfg| cfg.api_key.is_none());
+                .is_none_or(|cfg| !config::has_usable_credential(cfg));
             if !needs_notice {
                 None
             } else if let Some(reason) = web_search_disable_reason {

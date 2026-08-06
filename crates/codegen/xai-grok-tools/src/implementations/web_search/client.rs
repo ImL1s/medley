@@ -154,6 +154,7 @@ impl WebSearchClient {
             base_url,
             model,
             extra_headers,
+            env_http_headers,
             alpha_test_key,
             api_key_provider,
         } = config
@@ -165,15 +166,24 @@ impl WebSearchClient {
         };
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
-                xai_tool_runtime::ToolError::execution(
-                    xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                    format!("Invalid API key for header: {e}"),
-                )
-            })?,
-        );
+        // Only attach a bearer when the route actually has one. A
+        // header-authenticated model (`CredentialSource::ExplicitHeader`)
+        // carries its credential in `extra_headers` instead, and inventing an
+        // empty `Bearer` for it is not harmless: the `authorization` flavour
+        // would have it overwritten by the loop below, but the `x-api-key`
+        // flavour would send the bogus bearer alongside the real credential.
+        // The sampler skips it the same way for its own `Option` key (#160).
+        if let Some(api_key) = api_key {
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
+                    xai_tool_runtime::ToolError::execution(
+                        xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+                        format!("Invalid API key for header: {e}"),
+                    )
+                })?,
+            );
+        }
         for (key, value) in extra_headers {
             let header_name = HeaderName::from_bytes(key.as_bytes()).map_err(|e| {
                 xai_tool_runtime::ToolError::execution(
@@ -187,6 +197,35 @@ impl WebSearchClient {
                     format!("Invalid header value for '{key}': {e}"),
                 )
             })?;
+            headers.insert(header_name, header_value);
+        }
+        // Resolved here, not folded into `extra_headers` upstream, so an
+        // env-sourced secret never enters the config struct — the same reason
+        // the sampler resolves its own `env_http_headers` at client build.
+        // Applied after `extra_headers` so an env-backed header wins over a
+        // literal of the same name, matching the sampler's order. Unset, blank
+        // and unrepresentable entries are skipped rather than failing the
+        // build: a mapping to a variable the user has not exported is a
+        // configuration the sampler already tolerates (#160).
+        for (key, env_var) in env_http_headers {
+            let Ok(value) = std::env::var(env_var) else {
+                continue;
+            };
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            let (Ok(header_name), Ok(header_value)) = (
+                HeaderName::from_bytes(key.as_bytes()),
+                HeaderValue::from_str(value),
+            ) else {
+                tracing::warn!(
+                    header = %key,
+                    env_var = %env_var,
+                    "skipping env_http_header with an invalid header name or value"
+                );
+                continue;
+            };
             headers.insert(header_name, header_value);
         }
         let _ = alpha_test_key;
@@ -626,10 +665,11 @@ mod tests {
     #[test]
     fn test_new_client_uses_configured_model() {
         let config = WebSearchConfig::Enabled {
-            api_key: "test-key".to_string(),
+            api_key: Some("test-key".to_string()),
             base_url: "https://api.x.ai/v1".to_string(),
             model: "custom-enterprise-model".to_string(),
             extra_headers: IndexMap::new(),
+            env_http_headers: Default::default(),
             alpha_test_key: None,
             api_key_provider: None,
         };
@@ -661,10 +701,11 @@ mod tests {
         let cb = std::sync::Arc::new(CountingCallback::default());
         let cb_dyn: crate::attribution::SharedAttributionCallback = cb.clone();
         let config = WebSearchConfig::Enabled {
-            api_key: "ignored".to_string(),
+            api_key: Some("ignored".to_string()),
             base_url: "https://api.x.ai/v1".to_string(),
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
+            env_http_headers: Default::default(),
             alpha_test_key: None,
             api_key_provider: None,
         };
@@ -686,10 +727,11 @@ mod tests {
     #[test]
     fn record_401_attribution_is_noop_without_callback() {
         let config = WebSearchConfig::Enabled {
-            api_key: "test-key".to_string(),
+            api_key: Some("test-key".to_string()),
             base_url: "https://api.x.ai/v1".to_string(),
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
+            env_http_headers: Default::default(),
             alpha_test_key: None,
             api_key_provider: None,
         };
@@ -931,10 +973,11 @@ mod tests {
 
     fn codex_config(base_url: &str) -> WebSearchConfig {
         WebSearchConfig::Enabled {
-            api_key: "stale-codex-key".to_string(),
+            api_key: Some("stale-codex-key".to_string()),
             base_url: base_url.to_string(),
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
+            env_http_headers: Default::default(),
             alpha_test_key: None,
             api_key_provider: Some(std::sync::Arc::new(ScopedProvider)),
         }
@@ -1104,10 +1147,11 @@ mod tests {
 
         let scoped: SharedApiKeyProvider = std::sync::Arc::new(ScopedProvider);
         let config = WebSearchConfig::Enabled {
-            api_key: "stale-codex-key".to_string(),
+            api_key: Some("stale-codex-key".to_string()),
             base_url: server.uri(),
             model: "codex-model".to_string(),
             extra_headers: IndexMap::new(),
+            env_http_headers: Default::default(),
             alpha_test_key: None,
             api_key_provider: Some(scoped),
         };
@@ -1163,10 +1207,11 @@ mod tests {
             let provider = std::sync::Arc::new(RecoveringCodexProvider::default());
             let scoped: SharedApiKeyProvider = provider.clone();
             let config = WebSearchConfig::Enabled {
-                api_key: "snapshot-codex-key".to_string(),
+                api_key: Some("snapshot-codex-key".to_string()),
                 base_url: server.uri(),
                 model: "codex-model".to_string(),
                 extra_headers: IndexMap::new(),
+                env_http_headers: Default::default(),
                 alpha_test_key: None,
                 api_key_provider: Some(scoped),
             };
@@ -1220,10 +1265,11 @@ mod tests {
         let provider = std::sync::Arc::new(RecoveringCodexProvider::default());
         let scoped: SharedApiKeyProvider = provider.clone();
         let config = WebSearchConfig::Enabled {
-            api_key: "snapshot-codex-key".to_string(),
+            api_key: Some("snapshot-codex-key".to_string()),
             base_url: server.uri(),
             model: "codex-model".to_string(),
             extra_headers: IndexMap::new(),
+            env_http_headers: Default::default(),
             alpha_test_key: None,
             api_key_provider: Some(scoped),
         };
@@ -1266,7 +1312,7 @@ mod tests {
             .mount(&server)
             .await;
         let config = WebSearchConfig::Enabled {
-            api_key: "generic-key".to_string(),
+            api_key: Some("generic-key".to_string()),
             base_url: server.uri(),
             model: "generic-model".to_string(),
             extra_headers: IndexMap::from([
@@ -1277,6 +1323,7 @@ mod tests {
                 ("x-openai-fedramp".to_string(), "true".to_string()),
                 ("originator".to_string(), "codex_cli_rs".to_string()),
             ]),
+            env_http_headers: Default::default(),
             alpha_test_key: None,
             api_key_provider: Some(std::sync::Arc::new(GenericScopedProvider)),
         };
@@ -1328,10 +1375,11 @@ mod tests {
             .mount(&server)
             .await;
         let config = WebSearchConfig::Enabled {
-            api_key: "static-key-from-config".to_string(),
+            api_key: Some("static-key-from-config".to_string()),
             base_url: server.uri(),
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
+            env_http_headers: Default::default(),
             alpha_test_key: None,
             api_key_provider: None,
         };
@@ -1381,10 +1429,11 @@ mod tests {
             .mount(&server)
             .await;
         let config = WebSearchConfig::Enabled {
-            api_key: "model-static-key".to_string(),
+            api_key: Some("model-static-key".to_string()),
             base_url: server.uri(),
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
+            env_http_headers: Default::default(),
             alpha_test_key: None,
             api_key_provider: None,
         };
@@ -1414,10 +1463,11 @@ mod tests {
         }
 
         let config = WebSearchConfig::Enabled {
-            api_key: "stale-static-key".to_string(),
+            api_key: Some("stale-static-key".to_string()),
             base_url: "https://api.x.ai/v1".to_string(),
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
+            env_http_headers: Default::default(),
             alpha_test_key: None,
             api_key_provider: None,
         };
@@ -1445,10 +1495,11 @@ mod tests {
 
     fn production_proxy_client_with_local_transport(base_url: String) -> WebSearchClient {
         let config = WebSearchConfig::Enabled {
-            api_key: "stale-static-key".to_string(),
+            api_key: Some("stale-static-key".to_string()),
             base_url: xai_grok_env::PROD_CLI_CHAT_PROXY_BASE_URL.to_string(),
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
+            env_http_headers: Default::default(),
             alpha_test_key: None,
             api_key_provider: None,
         };
@@ -1629,10 +1680,11 @@ mod tests {
             ("user-agent".to_string(), "codex_cli_rs/0.0.0".to_string()),
         ]);
         let config = WebSearchConfig::Enabled {
-            api_key: "snapshot-codex-key".to_string(),
+            api_key: Some("snapshot-codex-key".to_string()),
             base_url: server.uri(),
             model: "test-model".to_string(),
             extra_headers,
+            env_http_headers: Default::default(),
             alpha_test_key: None,
             api_key_provider: Some(scoped),
         };
@@ -1665,13 +1717,14 @@ mod tests {
         let scoped: SharedApiKeyProvider = std::sync::Arc::new(NoneProvider);
         let default: SharedApiKeyProvider = std::sync::Arc::new(DefaultProvider);
         let config = WebSearchConfig::Enabled {
-            api_key: "stale-codex-snapshot".to_string(),
+            api_key: Some("stale-codex-snapshot".to_string()),
             base_url: server.uri(),
             model: "test-model".to_string(),
             extra_headers: IndexMap::from([(
                 "chatgpt-account-id".to_string(),
                 "stale-codex-account".to_string(),
             )]),
+            env_http_headers: Default::default(),
             alpha_test_key: None,
             api_key_provider: Some(scoped),
         };
@@ -1713,10 +1766,11 @@ mod tests {
 
         let scoped: SharedApiKeyProvider = std::sync::Arc::new(ScopedProvider);
         let config = WebSearchConfig::Enabled {
-            api_key: "stale-codex-key".to_string(),
+            api_key: Some("stale-codex-key".to_string()),
             base_url: server.uri(),
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
+            env_http_headers: Default::default(),
             alpha_test_key: None,
             api_key_provider: Some(scoped),
         };
@@ -1754,10 +1808,11 @@ mod tests {
             .await;
 
         let config = WebSearchConfig::Enabled {
-            api_key: "static-key".to_string(),
+            api_key: Some("static-key".to_string()),
             base_url: server.uri(),
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
+            env_http_headers: Default::default(),
             alpha_test_key: None,
             api_key_provider: None,
         };
@@ -1794,10 +1849,11 @@ mod tests {
 
         let scoped: SharedApiKeyProvider = std::sync::Arc::new(ScopedProvider);
         let config = WebSearchConfig::Enabled {
-            api_key: "stale-codex-key".to_string(),
+            api_key: Some("stale-codex-key".to_string()),
             base_url: source.uri(),
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
+            env_http_headers: Default::default(),
             alpha_test_key: None,
             api_key_provider: Some(scoped),
         };
@@ -1854,10 +1910,11 @@ mod tests {
         });
         let callback = std::sync::Arc::new(CountingCallback::default());
         let config = WebSearchConfig::Enabled {
-            api_key: "static-fallback".into(),
+            api_key: Some("static-fallback".into()),
             base_url: server.uri(),
             model: "test-model".into(),
             extra_headers: IndexMap::new(),
+            env_http_headers: Default::default(),
             alpha_test_key: None,
             api_key_provider: Some(provider),
         };
@@ -1880,10 +1937,11 @@ mod tests {
     async fn transport_failure_never_exposes_credential_bearing_url() {
         let secret = "ZXCVBNMASDFGHJKL0123456789";
         let config = WebSearchConfig::Enabled {
-            api_key: "api-key".into(),
+            api_key: Some("api-key".into()),
             base_url: format!("http://127.0.0.1:0/path/{secret}?token={secret}"),
             model: "test-model".into(),
             extra_headers: IndexMap::new(),
+            env_http_headers: Default::default(),
             alpha_test_key: None,
             api_key_provider: None,
         };
