@@ -193,6 +193,7 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
         | XaiSessionUpdate::AutoCompactCancelled { .. }
         | XaiSessionUpdate::RetryState(_)
         | XaiSessionUpdate::ImageDropped { .. }
+        | XaiSessionUpdate::WebSearchDisabled { .. }
         | XaiSessionUpdate::MemoryFlushCompleted { .. }
         | XaiSessionUpdate::MemoryDreamCompleted { .. }
         | XaiSessionUpdate::MemorySessionSaved { .. }) => {
@@ -1227,6 +1228,19 @@ pub(super) fn apply_session_event(
         XaiSessionUpdate::ImageDropped { notes } => {
             let message = notes.join("\n");
             tracing::info!("Image dropped: {message}");
+            scrollback.push_block(RenderBlock::system(message));
+            true
+        }
+        XaiSessionUpdate::WebSearchDisabled {
+            model_id,
+            reason,
+            message,
+        } => {
+            tracing::warn!(
+                web_search_model = %model_id,
+                reason = %reason,
+                "web_search disabled; surfacing user notice"
+            );
             scrollback.push_block(RenderBlock::system(message));
             true
         }
