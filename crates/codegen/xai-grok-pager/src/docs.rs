@@ -779,6 +779,47 @@ mod tests {
         }
     }
 
+    /// #122: the Codex preset's context bar total is a local default. The
+    /// custom-models guide is where a user (and the model reading
+    /// `<grok_home>/docs/`) looks when that number looks wrong — keep the
+    /// metadata-only override discoverable there.
+    #[test]
+    fn custom_models_guide_documents_codex_context_window_override() {
+        let doc = USER_GUIDE
+            .iter()
+            .find(|d| d.filename == "11-custom-models.md")
+            .expect("custom-models guide must be in USER_GUIDE");
+        let content = doc.content;
+        assert!(
+            content.contains("local default") && content.contains("context bar"),
+            "custom-models guide must say the Codex context-bar total is a local default, \
+             not a provider-reported figure"
+        );
+        // Every `400000` must carry an example marker on the same line or in
+        // the sentence that follows. This page is written to `<grok_home>/docs/`
+        // for the model to read, so an unqualified number is an instruction to
+        // use that number -- and #122 is explicit that the real capacity must
+        // not be guessed.
+        //
+        // Asserting the *disclaimers* rather than the override block: the block
+        // and the value both predate this change (there was already a
+        // `[model."gpt-5.6-sol"]` example tagged "(issue #122)"), so asserting
+        // their presence guards nothing. And with several occurrences, a
+        // whole-file `contains` is satisfied by any one survivor.
+        for (idx, _) in content.match_indices("400000") {
+            let line_start = content[..idx].rfind('\n').map_or(0, |n| n + 1);
+            let window_end = content[idx..]
+                .match_indices('\n')
+                .nth(3)
+                .map_or(content.len(), |(off, _)| idx + off);
+            let window = &content[line_start..window_end];
+            assert!(
+                window.contains("example"),
+                "every `400000` in the guide must be marked as an example; this one is not:\n{window}"
+            );
+        }
+    }
+
     #[test]
     fn user_guide_entries_have_no_duplicates() {
         let mut seen = std::collections::HashSet::new();
