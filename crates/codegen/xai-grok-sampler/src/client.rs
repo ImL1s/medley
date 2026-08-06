@@ -829,12 +829,20 @@ impl SamplingClient {
                         .is_ok_and(|url| url.scheme() == "https")
             }
         };
-        if !ambient_origin_allowed
-            && config
-                .credential_source
-                .as_ref()
-                .is_some_and(xai_grok_sampling_types::CredentialSource::is_ambient_xai)
-        {
+        // Labelled ambient, or ambient bytes under a post-strip ExplicitHeader
+        // label (#180). ExplicitHeader alone is legitimate header auth and must
+        // keep working; only the inconsistent pair (label + api_key bytes) is
+        // treated as ambient so a re-injection upstream cannot disarm this gate.
+        let ambient_credential_present = config
+            .credential_source
+            .as_ref()
+            .is_some_and(xai_grok_sampling_types::CredentialSource::is_ambient_xai)
+            || (config.api_key.is_some()
+                && matches!(
+                    config.credential_source.as_ref(),
+                    Some(xai_grok_sampling_types::CredentialSource::ExplicitHeader { .. })
+                ));
+        if !ambient_origin_allowed && ambient_credential_present {
             return Err(SamplingError::InvalidConfiguration(
                 "ambient xAI credential is not allowed for a non-first-party endpoint",
             ));
@@ -3957,6 +3965,118 @@ mod tests {
         assert!(headers.get(OPENAI_FEDRAMP).is_none());
         assert_eq!(headers[ORIGINATOR], "grok_build");
         assert_eq!(headers[USER_AGENT], "grok-shell/test");
+    }
+
+    /// #180: an ambient xAI session token that has been *labelled*
+    /// `ExplicitHeader` must not reach an external origin.
+    ///
+    /// `ExplicitHeader` is a **post-strip** label. `sampling_config_for_model`
+    /// (shell, `agent/config.rs`) writes it only after `credentials.api_key =
+    /// None`, so it means "the ambient credential has been removed and the
+    /// user's declared header is the only auth". The shell's turn seam
+    /// re-derives the same label from the header maps *before* any strip, so
+    /// the label can describe the config while `api_key` still holds ambient
+    /// bytes.
+    ///
+    /// That mislabel disarms L3: the refusal below keys on
+    /// `CredentialSource::is_ambient_xai()`, which is false for
+    /// `ExplicitHeader`. And a declared `x-api-key` does not occupy the
+    /// `Authorization` slot that `AuthScheme::Bearer` writes, so the two do
+    /// not collide — both go out.
+    ///
+    /// The assertion is deliberately about the wire rather than about which
+    /// layer refuses: a fix may either decline to construct the route or drop
+    /// the credential, and both satisfy "the ambient token does not go out".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ambient_token_labelled_explicit_header_must_not_reach_an_external_origin() {
+        use axum::Router;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        const AMBIENT_SESSION_JWT: &str = "ambient-xai-session-jwt";
+        const DECLARED_VENDOR_KEY: &str = "sk-vendor-declared";
+
+        let captured: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&captured);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |headers: HeaderMap| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    *sink.lock().unwrap() = Some(headers);
+                    ([(CONTENT_TYPE, "text/event-stream")], "data: [DONE]\n\n")
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut extra_headers = IndexMap::new();
+        extra_headers.insert("x-api-key".to_string(), DECLARED_VENDOR_KEY.to_string());
+
+        let built = SamplingClient::new(SamplerConfig {
+            base_url: format!("http://{address}"),
+            api_key: Some(AMBIENT_SESSION_JWT.to_string()),
+            auth_scheme: AuthScheme::Bearer,
+            // The mislabel under test: the bytes in `api_key` are ambient,
+            // while the label claims the user's own header is the credential.
+            credential_source: Some(xai_grok_sampling_types::CredentialSource::ExplicitHeader {
+                header: "x-api-key".to_string(),
+                env: None,
+            }),
+            extra_headers,
+            endpoint_trust: Some(EndpointTrustClass::External),
+            ..minimal_config()
+        });
+
+        // Property: ambient session bytes must not leave for an external origin.
+        // Either L3 refuses construction with the ambient-origin refusal, or
+        // construction succeeds and the wire has no ambient token. An unexamined
+        // `Err` early-return would green on unrelated construction failures.
+        const AMBIENT_ORIGIN_REFUSAL: &str =
+            "ambient xAI credential is not allowed for a non-first-party endpoint";
+        let client = match built {
+            Ok(client) => client,
+            Err(SamplingError::InvalidConfiguration(msg)) if msg == AMBIENT_ORIGIN_REFUSAL => {
+                return;
+            }
+            Err(other) => {
+                panic!(
+                    "SamplingClient::new failed for a reason other than the ambient-origin \
+                     refusal (property not examined): {other:?}"
+                );
+            }
+        };
+
+        let _started = client
+            .chat_completion_stream(minimal_chat_request())
+            .await
+            .expect("mock chat/completions request should start");
+
+        let headers = captured.lock().unwrap().take().expect("request captured");
+        assert!(
+            headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+                == Some(DECLARED_VENDOR_KEY),
+            "precondition: the user's declared header is what authenticates this route"
+        );
+        let authorization = headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            !authorization.contains(AMBIENT_SESSION_JWT),
+            "an ambient xAI session token reached an external origin under an \
+             `ExplicitHeader` label. That label is only written after the \
+             ambient credential is stripped, so writing it while `api_key` \
+             still holds ambient bytes disarms L3's `is_ambient_xai` refusal. \
+             (Value withheld: a refusal that prints what it refused has not \
+             refused anything.)"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
