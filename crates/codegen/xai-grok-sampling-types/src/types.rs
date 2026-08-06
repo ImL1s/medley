@@ -1114,7 +1114,20 @@ pub enum CredentialSource {
     /// last arm of the auxiliary-model bearer fallback.
     XaiDeploymentKey,
     /// Nothing usable resolved. Distinct from [`Self::None`]: that one is a
-    /// choice, this one is a gap, and only this one blocks a route.
+    /// choice, this one is a gap.
+    ///
+    /// It does **not** block a route, and must not be made to. This label is
+    /// written both where the route is genuinely refused (an `Unusable` model)
+    /// and where it must keep working (a model absent from the catalog, which
+    /// #133 requires to behave exactly as before). A blanket
+    /// `Missing => refuse` in `SamplingClient::new` would therefore break
+    /// every uncatalogued model and reproduce the regressions #133 exists to
+    /// prevent. An earlier version of this comment claimed "only this one
+    /// blocks a route", which no reader implemented and which would have been
+    /// a trap for the first one who did.
+    ///
+    /// What it buys is honesty: a config carrying no credential no longer
+    /// claims a source it does not have.
     Missing,
 }
 

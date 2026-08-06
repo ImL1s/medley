@@ -1486,6 +1486,112 @@ async fn prepare_refuses_unusable_external_but_allows_unknown() {
         .await;
 }
 
+/// The turn path owes the client a terminal report; the auxiliary path does not.
+///
+/// `run_turn_via_sampler` documents that every `Err` it returns has already
+/// been reported via `RetryState::Failed`, so the refusal added for #133 has to
+/// send one before propagating. `prepare_chat_completion` must **not**: it
+/// serves compaction, goals, memory-dream and the laziness classifier, and
+/// announcing a failed turn for background work would be a lie.
+///
+/// The existing refusal test drives only `prepare_chat_completion` and asserts
+/// on the error text, so neither half of this was covered.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unusable_route_reports_on_the_turn_path_and_stays_quiet_on_the_aux_path() {
+    use crate::agent::auth_method::{ModelByok, ModelReadiness, UnusableReason};
+    use crate::agent::config::ModelAuthFacts;
+    use xai_grok_sampler::AuthScheme;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_dir, am) = auth_manager_with_valid_token("session-token");
+            let (actor, mut rx) = make_actor_with_method_and_credentials(
+                Some(am),
+                "cached_token",
+                xai_chat_state::AuthType::SessionToken,
+                "stale-session-jwt".to_string(),
+            )
+            .await;
+
+            let mut cfg = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("sampling config");
+            cfg.base_url = "https://vendor.example/v1".to_string();
+            cfg.endpoint_trust = Some(xai_grok_sampler::EndpointTrustClass::External);
+            let model = cfg.model.clone();
+            actor.chat_state_handle.update_sampling_config(cfg);
+            actor
+                .model_auth_memo
+                .replace(Some(crate::session::acp_session::ModelAuthMemo {
+                    model_id: model,
+                    facts: ModelAuthFacts {
+                        byok: ModelByok::NotByok,
+                        auth_scheme: AuthScheme::Bearer,
+                        readiness: ModelReadiness::Unusable(UnusableReason(
+                            "invalid auth_scheme `not-a-scheme`".into(),
+                        )),
+                    },
+                    provider: None,
+                }));
+
+            // `RetryState` reaches the client through the persistence channel
+            // as a session update, which is how the compaction tests observe it.
+            let drain =
+                |rx: &mut mpsc::UnboundedReceiver<crate::session::persistence::PersistenceMsg>| {
+                    let mut seen: Vec<(String, String)> = Vec::new();
+                    while let Ok(msg) = rx.try_recv() {
+                        if let crate::session::persistence::PersistenceMsg::Update(
+                            crate::session::storage::SessionUpdate::Xai(notif),
+                        ) = msg
+                            && let crate::extensions::notification::SessionUpdate::RetryState(
+                                crate::extensions::notification::RetryState::Failed {
+                                    error_type,
+                                    message,
+                                },
+                            ) = &notif.update
+                        {
+                            seen.push((error_type.clone(), message.clone()));
+                        }
+                    }
+                    seen
+                };
+            // Anything queued during actor construction is not ours.
+            drain(&mut rx);
+
+            actor
+                .prepare_sampler_for_turn()
+                .await
+                .expect_err("an unusable external route must refuse");
+            let after_turn = drain(&mut rx);
+            assert!(
+                after_turn
+                    .iter()
+                    .any(|(t, m)| t == "model_not_ready" && m.contains("invalid auth_scheme")),
+                "the turn path owes one RetryState::Failed naming the reason; got {after_turn:?}"
+            );
+            assert!(
+                !after_turn.iter().any(|(t, _)| t == "auth"),
+                "must not classify as auth: an unusable model config is not an \
+                 expired login, and `auth` is what raises the re-auth prompt; \
+                 got {after_turn:?}"
+            );
+
+            actor
+                .prepare_chat_completion(false)
+                .await
+                .expect_err("the aux path must refuse too");
+            let after_aux = drain(&mut rx);
+            assert!(
+                after_aux.is_empty(),
+                "compaction, goals and memory-dream are not turns; reporting a \
+                 turn failure for them would be a lie; got {after_aux:?}"
+            );
+        })
+        .await;
+}
+
 /// A model the catalog does not have must reach the wire with no credential,
 /// **whatever the ACP auth method is**.
 ///
