@@ -969,7 +969,9 @@ mod tests {
     /// payload boundary.
     #[test]
     fn payload_drops_full_handshake_reason() {
-        let secret = "GB002-mcp-handshake-Q7w5E3r1T9y7";
+        // Sentinel must not share an 8-byte window with the snake_case reason
+        // enum (`handshake_failed`) or the scan false-fails on the status field.
+        let secret = "GB002-mcp-proxy502-Q7w5E3r1T9y7";
         let key = ("linear".to_string(), McpClientEventKind::HandshakeFailed);
         let ev = McpClientEvent::HandshakeFailed {
             server: "linear".to_string(),

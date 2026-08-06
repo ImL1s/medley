@@ -682,22 +682,32 @@ impl JsonlStorageAdapter {
             }
             Err(error) => return Err(error),
         };
+        // Cap applies to successfully restored runs, not raw dirents: a
+        // symlink / invalid sibling must not steal a slot from a valid run
+        // (see workflow_restore_rejects_symlinks_and_caps_run_count).
+        //
+        // Bound the scan too. `remove()` writes a `cleared` marker and deletes
+        // `state.json` but leaves the directory, so a long-lived session
+        // accumulates tombstones forever and an unbounded walk pays two
+        // `symlink_metadata` calls for each of them on every load.
+        const MAX_SCANNED_WORKFLOW_ENTRIES: usize = MAX_RESTORED_WORKFLOW_RUNS * 8;
         let mut entries: Vec<_> = std::fs::read_dir(&workflows_dir)?
             .filter_map(Result::ok)
-            .take(MAX_RESTORED_WORKFLOW_RUNS.saturating_add(1))
             .collect();
-        let entries_truncated = entries.len() > MAX_RESTORED_WORKFLOW_RUNS;
-        entries.truncate(MAX_RESTORED_WORKFLOW_RUNS);
         entries.sort_by_key(|entry| entry.file_name());
-        if entries_truncated {
-            tracing::warn!(
-                path = %workflows_dir.display(),
-                limit = MAX_RESTORED_WORKFLOW_RUNS,
-                "workflow restore run-count cap reached; ignoring remaining entries"
-            );
-        }
         let mut restored = Vec::new();
-        for entry in entries {
+        let mut skipped_after_cap = false;
+        // Newest first. Run ids are `wf_` + a UUIDv7 `simple()`, whose leading
+        // 48 bits are a big-endian millisecond timestamp rendered as
+        // fixed-width hex -- so lexicographic order *is* chronological order,
+        // and walking ascending would keep the oldest runs and silently drop
+        // everything recent. For a resume feature that is exactly backwards.
+        // Display order is unaffected: the consumer re-sorts by `history.first().at`.
+        for entry in entries.into_iter().rev().take(MAX_SCANNED_WORKFLOW_ENTRIES) {
+            if restored.len() >= MAX_RESTORED_WORKFLOW_RUNS {
+                skipped_after_cap = true;
+                break;
+            }
             let run_dir = entry.path();
             let Ok(run_meta) = std::fs::symlink_metadata(&run_dir) else {
                 continue;
@@ -772,6 +782,13 @@ impl JsonlStorageAdapter {
                 script,
                 args,
             });
+        }
+        if skipped_after_cap {
+            tracing::warn!(
+                path = %workflows_dir.display(),
+                limit = MAX_RESTORED_WORKFLOW_RUNS,
+                "workflow restore run-count cap reached; ignoring remaining entries"
+            );
         }
         Ok(restored)
     }

@@ -846,9 +846,10 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         symlink(&project, &linked).unwrap();
         let path = save_project_workflow(&linked, "safe", &script("safe")).unwrap();
+        // Both sides must be canonicalized: on macOS `/var` → `/private/var`.
         assert_eq!(
             dunce::canonicalize(path).unwrap(),
-            project.join(".grok/workflows/safe.rhai")
+            dunce::canonicalize(project.join(".grok/workflows/safe.rhai")).unwrap()
         );
     }
 
