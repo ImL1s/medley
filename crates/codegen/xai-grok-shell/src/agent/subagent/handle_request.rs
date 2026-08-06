@@ -815,12 +815,17 @@ pub(crate) async fn run_shell_child(
     );
     let model_has_own_creds = model_entry.is_some_and(|entry| entry.has_own_credentials());
     let inherited_auth_type = subagent_auth_type(model_entry, &ctx.auth_method_id);
-    let credentials = xai_chat_state::Credentials {
-        api_key: effective_sampling_config.api_key.clone(),
-        auth_type: inherited_auth_type,
-        alpha_test_key: ctx.alpha_test_key.clone(),
-        client_version: effective_sampling_config.client_version.clone(),
-    };
+    let source = effective_sampling_config
+        .credential_source
+        .clone()
+        .unwrap_or(xai_grok_sampler::CredentialSource::Missing);
+    let credentials = xai_chat_state::Credentials::bound(
+        effective_sampling_config.api_key.clone(),
+        inherited_auth_type,
+        source,
+    )
+    .with_alpha_test_key(ctx.alpha_test_key.clone())
+    .with_client_version(effective_sampling_config.client_version.clone());
     xai_grok_telemetry::unified_log::info(
         "subagent spawn credentials",
         None,

@@ -978,7 +978,7 @@ impl SessionActor {
         );
         let model_id = sampling_config.map(|c| c.model);
         let resolved_model_id = model_metadata.resolved_model_id;
-        let client_version = credentials.client_version;
+        let client_version = credentials.client_version_cloned();
 
         use crate::session::feedback_manager::{SessionFeedbackData, SubmitOutcome};
         let outcome = self

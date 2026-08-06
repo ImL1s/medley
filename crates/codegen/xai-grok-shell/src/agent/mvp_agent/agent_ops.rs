@@ -4805,16 +4805,25 @@ impl MvpAgent {
         let (mut handle, permission_events_rx, agent_system_prompt, session_thread) = {
             let _timer = crate::instrumentation_timer!("session.spawn_actor_call");
             let session_key = self.auth_manager.current_or_expired().map(|a| a.key);
-            let credentials = xai_chat_state::Credentials {
-                api_key: sampling_config.api_key.clone(),
-                auth_type: crate::agent::config::resolve_chat_state_auth_type(
-                    sampling_config.model.as_str(),
-                    session_key.as_deref(),
-                    self.auth_type(),
-                ),
-                alpha_test_key: self.alpha_test_key(),
-                client_version: sampling_config.client_version.clone(),
-            };
+            let auth_type = crate::agent::config::resolve_chat_state_auth_type(
+                sampling_config.model.as_str(),
+                session_key.as_deref(),
+                self.auth_type(),
+            );
+            // Source is whatever prepare already classified onto SamplerConfig
+            // — same label the wire path would see; chat-state now stores it
+            // with the secret instead of dropping it at the actor boundary.
+            let source = sampling_config
+                .credential_source
+                .clone()
+                .unwrap_or(xai_grok_sampler::CredentialSource::Missing);
+            let credentials = xai_chat_state::Credentials::bound(
+                sampling_config.api_key.clone(),
+                auth_type,
+                source,
+            )
+            .with_alpha_test_key(self.alpha_test_key())
+            .with_client_version(sampling_config.client_version.clone());
             let attribution_callback: Option<
                 xai_grok_sampler::SharedAttributionCallback,
             > = Some(

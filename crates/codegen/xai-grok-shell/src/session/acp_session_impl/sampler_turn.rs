@@ -305,7 +305,7 @@ impl SessionActor {
     /// The single writer of a provider mint/rotation into chat-state credentials.
     async fn set_chat_api_key(&self, new_key: String) {
         let mut creds = self.chat_state_handle.get_credentials().await;
-        creds.api_key = Some(new_key);
+        creds.replace_api_key(new_key);
         self.chat_state_handle.update_credentials(creds);
     }
     /// Pre-turn arm for a provider-backed model: mint on a cold cache,
@@ -619,7 +619,7 @@ impl SessionActor {
         let mut extra_headers = cfg.extra_headers;
         crate::agent::config::inject_url_derived_headers(
             &mut extra_headers,
-            creds.alpha_test_key.as_deref(),
+            creds.alpha_test_key(),
             &cfg.base_url,
         );
         let compaction_at_tokens = self.compaction_at_tokens.get();
@@ -671,7 +671,7 @@ impl SessionActor {
                 .as_ref()
                 .and_then(|am| am.current_wire_valid().map(|a| a.key))
         } else {
-            creds.api_key
+            creds.api_key_cloned()
         };
         // Identity headers: gate on endpoint + credential-provider scope, not
         // catalog readiness (#133). Omit when no first-party identity is in play.
@@ -711,7 +711,7 @@ impl SessionActor {
             query_params: cfg.query_params.clone(),
             env_http_headers: cfg.env_http_headers.clone(),
             context_window: cfg.context_window.get(),
-            client_version: creds.client_version,
+            client_version: creds.client_version_cloned(),
             reasoning_effort: cfg.reasoning_effort,
             force_http1: false,
             max_retries: Some(self.max_retries),
@@ -893,8 +893,8 @@ impl SessionActor {
             &endpoints,
             session_key.as_deref(),
             disable_api_key_auth,
-            creds.alpha_test_key.clone(),
-            creds.client_version.clone(),
+            creds.alpha_test_key_cloned(),
+            creds.client_version_cloned(),
         )
         .await
     }
@@ -1591,7 +1591,11 @@ impl SessionActor {
         if let Some(provider) = self.model_auth_provider(&current_model_id)
             && provider.name == crate::agent::model_providers::OPENAI_CODEX_PROVIDER_ID
         {
-            let current_key = self.chat_state_handle.get_credentials().await.api_key;
+            let current_key = self
+                .chat_state_handle
+                .get_credentials()
+                .await
+                .api_key_cloned();
             self.refresh_provider_token_pre_turn(
                 &provider,
                 current_key.as_deref(),
@@ -1627,9 +1631,9 @@ impl SessionActor {
             {
                 match am.get_valid_token().await {
                     Ok(key) => {
-                        if creds.api_key.as_deref() != Some(&key) {
+                        if creds.api_key() != Some(key.as_str()) {
                             let mut creds = creds;
-                            creds.api_key = Some(key);
+                            creds.replace_api_key(key);
                             self.chat_state_handle.update_credentials(creds);
                         }
                         self.clear_auth_compact_suppression();
@@ -1637,9 +1641,9 @@ impl SessionActor {
                     }
                     Err(e) => {
                         let hard_expired = !am.has_usable_token();
-                        if hard_expired && creds.api_key.is_some() {
+                        if hard_expired && creds.api_key().is_some() {
                             let mut cleared = creds;
-                            cleared.api_key = None;
+                            cleared.clear_api_key();
                             self.chat_state_handle.update_credentials(cleared);
                         }
                         tracing::warn!(
@@ -1671,7 +1675,7 @@ impl SessionActor {
         use crate::auth::{is_jwt_expired_or_near, parse_jwt_expiration};
         const REFRESH_THRESHOLD: chrono::Duration = chrono::Duration::minutes(5);
         let creds = self.chat_state_handle.get_credentials().await;
-        let current_key = creds.api_key;
+        let current_key = creds.api_key_cloned();
         if let Some(provider) = self.model_auth_provider(&current_model_id) {
             self.refresh_provider_token_pre_turn(
                 &provider,
@@ -1725,7 +1729,7 @@ impl SessionActor {
             "Refreshed API token from config.toml"
         );
         let mut creds = self.chat_state_handle.get_credentials().await;
-        creds.api_key = Some(new_key);
+        creds.replace_api_key(new_key);
         self.chat_state_handle.update_credentials(creds);
     }
     fn reload_api_key_from_config(&self, current_model_id: &str) -> Option<String> {
