@@ -2282,3 +2282,219 @@ fn filtered_out_codex_model_does_not_count_as_selectable() {
         "a hidden_models-hidden Codex model must not suppress the login screen"
     );
 }
+
+/// #131 helpers: a ready entry (first-party origin needs no declared
+/// credential) and a manager built over a fixed catalog.
+fn ready_entry(slug: &str) -> ModelEntry {
+    let mut info = config::ModelInfo::fallback(slug);
+    info.base_url = "https://api.x.ai/v1".to_string();
+    ModelEntry {
+        info,
+        api_key: None,
+        env_key: None,
+        auth_provider: None,
+        api_base_url: None,
+        config_validation_errors: Vec::new(),
+    }
+}
+
+fn manager_over(cfg: &config::Config, catalog: IndexMap<String, ModelEntry>) -> ModelsManager {
+    let tmp = std::env::temp_dir().join("grok-test-models-131");
+    let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
+    ModelsManager::from_config(cfg, Some(catalog), auth_manager)
+        .expect("manager construction should succeed")
+}
+
+/// #131: a configured default **absent from the catalog** is still substituted,
+/// and that substitution is now reported — the configured id and the
+/// configuration that supplied it.
+///
+/// This is the case no client can reconstruct: the substitute occupies
+/// `currentModelId`, and the configured model is not in `availableModels` to be
+/// looked up because it is not in the catalog at all.
+///
+/// The selection itself is asserted unchanged. This reports the decision; it
+/// does not remake it.
+#[test]
+fn absent_configured_default_is_substituted_and_reported() {
+    let mut cfg = config::Config::default();
+    cfg.models.default = Some("typo-provider".to_string());
+
+    let mut catalog = IndexMap::new();
+    catalog.insert("grok-4".to_string(), ready_entry("grok-4"));
+
+    let mgr = manager_over(&cfg, catalog);
+
+    // Unchanged: a substitute is still seated, exactly as before.
+    assert_ne!(
+        mgr.current_model_id().0.as_ref(),
+        "typo-provider",
+        "an absent preference is still substituted — this change reports, it does not select"
+    );
+
+    let reported = mgr
+        .substituted_preference()
+        .expect("an absent configured default must be reported");
+    assert_eq!(reported.configured, "typo-provider");
+    assert_eq!(
+        reported.source_wire(),
+        "config",
+        "a `[models] default` preference is reported as coming from config"
+    );
+}
+
+/// #131 counterweight: a configured default that is **honoured** must produce
+/// no substitution field — including the kept-but-unready case, which #145
+/// already covers through `readinessReason`. A field that appeared for a
+/// preference the user did get would describe a rejection that never happened.
+#[test]
+fn honoured_configured_default_reports_no_substitution() {
+    // Ready and present.
+    let mut cfg = config::Config::default();
+    cfg.models.default = Some("grok-4".to_string());
+    let mut catalog = IndexMap::new();
+    catalog.insert("grok-4".to_string(), ready_entry("grok-4"));
+    let mgr = manager_over(&cfg, catalog);
+    assert_eq!(mgr.current_model_id().0.as_ref(), "grok-4");
+    assert!(
+        mgr.substituted_preference().is_none(),
+        "a honoured preference is not a substitution"
+    );
+
+    // Present but unready: #145 keeps it selected, so it was not substituted
+    // either — and its reason already travels per-model.
+    let mut cfg = config::Config::default();
+    cfg.models.default = Some("byo-provider".to_string());
+    let mut unready = config::ModelInfo::fallback("byo-provider");
+    unready.base_url = "https://api.third-party.example/v1".to_string();
+    let mut catalog = IndexMap::new();
+    catalog.insert(
+        "byo-provider".to_string(),
+        ModelEntry {
+            info: unready,
+            api_key: None,
+            env_key: None,
+            auth_provider: None,
+            api_base_url: None,
+            config_validation_errors: Vec::new(),
+        },
+    );
+    catalog.insert("grok-4".to_string(), ready_entry("grok-4"));
+    let mgr = manager_over(&cfg, catalog);
+    assert_eq!(
+        mgr.current_model_id().0.as_ref(),
+        "byo-provider",
+        "#145 keeps an unready explicit preference selected"
+    );
+    assert!(
+        mgr.substituted_preference().is_none(),
+        "kept-but-unready is not a substitution; its reason travels as readinessReason"
+    );
+}
+
+/// #131: a campaign-driven default that goes missing must not be reported as
+/// the user's configuration being rejected. They never wrote it, and naming it
+/// would send them to edit a line that is not theirs.
+#[test]
+fn campaign_driven_default_is_not_reported_as_the_users_choice() {
+    let mut cfg = config::Config::default();
+    cfg.models.default = Some("pushed-model".to_string());
+    cfg.models.default_is_campaign_driven = true;
+
+    let mut catalog = IndexMap::new();
+    catalog.insert("grok-4".to_string(), ready_entry("grok-4"));
+
+    let mgr = manager_over(&cfg, catalog);
+    assert!(
+        mgr.substituted_preference().is_none(),
+        "a pushed default is not the user's configuration"
+    );
+}
+
+/// #131: for a configured default that is present in the catalog but
+/// **unready**, the readiness reason already reaches the client — through
+/// per-model `readinessReason` in `modelState.availableModels`, not through
+/// `unready_default_reason`, which is log-only.
+///
+/// This is why the kept case needs no new wire field. The issue predates #145,
+/// and #145 keeping the model instead of swapping it is exactly what makes
+/// `currentModelId` *be* the configured model, which is what makes the
+/// per-model path sufficient. What #131 still owes the user is the case this
+/// chain cannot reach: a configured default **absent** from the catalog, which
+/// no client can look up because it is not there to look up.
+///
+/// Asserted link by link on purpose: if this breaks, the failure names which
+/// link moved rather than only "the reason stopped arriving".
+#[test]
+fn configured_unready_default_already_publishes_its_reason_per_model() {
+    use crate::agent::config::model_readiness;
+    use crate::agent::models::resolution::available_models;
+
+    let mut cfg = config::Config::default();
+    cfg.models.default = Some("byo-provider".to_string());
+
+    // Credential-less against a non-first-party origin: unready with no
+    // dependence on ambient environment, so the assertions below are about the
+    // chain rather than about the machine running them.
+    let mut info = config::ModelInfo::fallback("byo-provider");
+    info.base_url = "https://api.third-party.example/v1".to_string();
+    let mut catalog = IndexMap::new();
+    catalog.insert(
+        "byo-provider".to_string(),
+        ModelEntry {
+            info,
+            api_key: None,
+            env_key: None,
+            auth_provider: None,
+            api_base_url: None,
+            config_validation_errors: Vec::new(),
+        },
+    );
+
+    // Link 0 — the model really is unready, and readiness produced a reason.
+    let (ready, reason) = model_readiness(&catalog["byo-provider"]);
+    assert!(
+        !ready,
+        "precondition: credential-less external model is unready"
+    );
+    let reason = reason.expect("an unready model must carry an actionable reason");
+
+    // Link 1 (#145) — an explicit configured preference is KEPT, not swapped,
+    // so the selected model *is* the one the user configured.
+    let (key, _entry, source, unready) = resolve_default_model(&cfg, &catalog, true);
+    assert_eq!(
+        key, "byo-provider",
+        "#145: an unready explicit preference is kept, not substituted"
+    );
+    assert!(
+        matches!(source, config::ConfigSource::Config),
+        "a `[models] default` preference reports source Config, got {source:?}"
+    );
+    assert_eq!(
+        unready.as_deref(),
+        Some(reason.as_str()),
+        "the same reason is handed back to the caller"
+    );
+
+    // Link 2 — readiness is NOT a filter on the ACP listing, so the model the
+    // user configured is still there for a client to look up.
+    let available = available_models(&catalog, true);
+    let listed = available
+        .get(&acp::ModelId::new(key.as_str()))
+        .expect("unready entries stay in availableModels (#133)");
+
+    // Link 3 — and it carries the reason, in the field the pager and headless
+    // already read via `unready_reason_from_model_meta`.
+    let meta = listed.meta.as_ref().expect("listed model carries meta");
+    assert_eq!(
+        meta.get("ready").and_then(serde_json::Value::as_bool),
+        Some(false),
+        "the listing marks it unready"
+    );
+    assert_eq!(
+        meta.get("readinessReason")
+            .and_then(serde_json::Value::as_str),
+        Some(reason.as_str()),
+        "the reason the client renders is the reason readiness computed"
+    );
+}

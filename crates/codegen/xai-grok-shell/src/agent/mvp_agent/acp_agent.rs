@@ -519,7 +519,12 @@ impl acp::Agent for MvpAgent {
                 .auth_methods(auth_methods)
                 .meta({
                     let metadata = parse_json_object_env("GROK_AGENT_METADATA");
-                    serde_json::json!({
+                    // #131. Only set when the configured default was absent from
+                    // the catalog; a preference that was honoured — including one
+                    // kept while unready — leaves this `None`, and the key is
+                    // omitted rather than sent as null.
+                    let substituted_default = self.models_manager.substituted_preference();
+                    let mut init_meta = serde_json::json!({
                     "grokShell": true,
                     // Re-deriving this precedence client-side has regressed OIDC
                     // refresh, so clients consume the agent's choice from here.
@@ -549,7 +554,19 @@ impl acp::Agent for MvpAgent {
                     "voiceMode": self.cfg.borrow().is_voice_mode_enabled(),
                 })
                         .as_object()
-                        .cloned()
+                        .cloned();
+                    if let Some(map) = init_meta.as_mut()
+                        && let Some(substituted) = substituted_default
+                    {
+                        map.insert(
+                            SUBSTITUTED_DEFAULT_MODEL_META_KEY.to_string(),
+                            serde_json::json!({
+                                "configuredModelId": substituted.configured,
+                                "source": substituted.source_wire(),
+                            }),
+                        );
+                    }
+                    init_meta
                 }),
         )
     }

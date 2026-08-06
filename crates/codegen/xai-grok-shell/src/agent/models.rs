@@ -114,6 +114,11 @@ struct Inner {
     catalog: RwLock<CatalogState>,
     current_model_id: RwLock<acp::ModelId>,
     current_reasoning_effort: RwLock<Option<ReasoningEffort>>,
+    /// Set when the user's configured default was absent from the catalog and a
+    /// substitute was seated (#131). Refreshed at every `resolve_default_model`
+    /// call site, so a catalog that arrives late corrects a verdict taken
+    /// against an emptier one rather than leaving it stale.
+    substituted_preference: RwLock<Option<resolution::SubstitutedPreference>>,
     // ── Owned context for self-contained refresh ────────────────
     auth_manager: Arc<AuthManager>,
     cfg: RwLock<config::Config>,
@@ -215,6 +220,7 @@ impl ModelsManagerBuilder {
                 }),
                 current_model_id: RwLock::new(self.current_model_id),
                 current_reasoning_effort: RwLock::new(current_reasoning_effort),
+                substituted_preference: RwLock::new(None),
                 auth_manager: self.auth_manager,
                 cfg: RwLock::new(self.cfg),
                 fetch_auth: RwLock::new(fetch_auth),
@@ -324,6 +330,7 @@ impl ModelsManager {
             auth_manager,
             cfg.clone(),
         );
+        mgr.record_substituted_preference(cfg, model_source);
         if has_prefetched {
             mgr.inner.catalog.write().has_fetched_real_catalog = true;
         }
@@ -469,6 +476,29 @@ impl ModelsManager {
 
     pub fn current_model_id(&self) -> acp::ModelId {
         self.inner.current_model_id.read().clone()
+    }
+
+    /// The configured default that was substituted because it was absent from
+    /// the catalog, if that happened (#131). `None` covers every other outcome,
+    /// including a preference kept-but-unready — that one is already reported
+    /// per-model as `readinessReason` in `availableModels`.
+    pub(crate) fn substituted_preference(&self) -> Option<resolution::SubstitutedPreference> {
+        self.inner.substituted_preference.read().clone()
+    }
+
+    /// Refresh the substitution verdict from a resolution that just ran.
+    ///
+    /// Called at every `resolve_default_model` site rather than only at
+    /// construction: the catalog is populated asynchronously, so a verdict
+    /// taken against an empty catalog would otherwise accuse the user of
+    /// configuring a model that had simply not loaded yet.
+    fn record_substituted_preference(
+        &self,
+        cfg: &config::Config,
+        resolved_source: config::ConfigSource,
+    ) {
+        *self.inner.substituted_preference.write() =
+            resolution::substituted_preference(cfg, resolved_source);
     }
 
     pub(crate) fn set_current_model_id(&self, id: acp::ModelId) {
@@ -1215,6 +1245,7 @@ impl ModelsManager {
             old = %current.0, new = %new_id.0, source = %source,
             "current model not in new catalog, reselecting default"
         );
+        self.record_substituted_preference(config, source);
         self.set_current_model_id_internal(new_id);
     }
 
@@ -1226,6 +1257,11 @@ impl ModelsManager {
             resolve_default_model(config, models, self.is_session_auth())
         };
         let new_id = acp::ModelId::new(Arc::from(key));
+        // Recorded whether or not the selection changes: the catalog landing is
+        // exactly when an "absent" verdict taken against an emptier catalog
+        // becomes wrong, and that correction is independent of whether the
+        // resolved key moved.
+        self.record_substituted_preference(config, source);
         let current = self.inner.current_model_id.read().clone();
         if current.0.as_ref() != new_id.0.as_ref() {
             if let Some(reason) = &unready_reason {
