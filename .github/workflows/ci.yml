@@ -211,6 +211,35 @@ jobs:
           run_nonzero -p xai-grok-update --lib self_update -- --nocapture
           run_nonzero -p xai-grok-update --test test_dist_channel_gate -- --nocapture
 
+      - name: Leader lock identity (Linux-only /proc probe)
+        # The leader auto-kill path proves "is this OUR process" by checking
+        # that the PID holds an open descriptor on the lock file (issue #158).
+        # The safety half — never evict a process we cannot prove is ours — is
+        # a pure unit test that runs everywhere. The POSITIVE half needs
+        # /proc/<pid>/fd, so it is #[cfg(target_os = "linux")] and cannot run
+        # on the macOS machines this project is developed on. Without this
+        # step it would run nowhere at all, and "eviction can now fire" would
+        # ship with zero executions of the test proving it can.
+        #
+        # run_nonzero fails on a zero-match filter, so this also catches the
+        # test later being renamed, moved, or cfg'd out — the exact way it
+        # silently stopped being covered before.
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
+              echo "test filter matched zero tests: $*" >&2
+              rm -f "$output"
+              return 1
+            }
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib holder_has_lock_file_open -- --nocapture
+
       - name: Restricted subagent capability boundaries
         env:
           PROTOC: protoc
