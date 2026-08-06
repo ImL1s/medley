@@ -1363,6 +1363,27 @@ pub(in crate::app::dispatch) fn handle_session_created(
         // intent before `apply_deferred_model_switch` clears the rollback;
         // unlike an effort override, this path must not issue a redundant ACP
         // switch merely to obtain a persistence receipt.
+        // Ownership alone, not `app_models_optimistic` (#144).
+        //
+        // That flag means "app.models was mutated optimistically and must be
+        // rolled back", and only `set_default_model_confirmed` sets it. Gating
+        // persistence on it meant an adopted model was written to disk from the
+        // settings modal and silently dropped from `/model` -- both entry
+        // points, pre-session and with-session.
+        //
+        // What this actually needs to know is "a switch transaction was handed
+        // to this fresh agent and it has no stash of its own", which is exactly
+        // the two conjuncts above plus ownership. A transaction only survives
+        // to a new agent's `SessionCreated` by way of the `IncompatibleAgent`
+        // handoff, because every other terminal path drops it: completion
+        // nulls it, refusal `take_if`s it, abort takes it, and this block nulls
+        // it after persisting.
+        //
+        // An earlier attempt added a `preference_persistence_deferred` flag
+        // instead. It closed the pre-session entry only, and once the
+        // with-session entry needed it too the flag was true at every
+        // constructor -- which is ownership, spelled with an extra field that
+        // could go stale.
         let replacement_default = (!app_chat_mode
             && !agent.chat_kind
             && !agent.app_chat_mode
@@ -1370,9 +1391,7 @@ pub(in crate::app::dispatch) fn handle_session_created(
             && app
                 .model_switch_transaction
                 .as_ref()
-                .is_some_and(|transaction| {
-                    transaction.owner_agent_id == agent_id && transaction.app_models_optimistic
-                }))
+                .is_some_and(|transaction| transaction.owner_agent_id == agent_id))
         .then(|| {
             agent
                 .session
