@@ -269,38 +269,13 @@ pub fn is_grok_process(pid: u32) -> bool {
         cmd.status().is_ok_and(|s| s.success())
     }
 }
-/// Stricter [`is_grok_process`] for the auto-kill zombie path: on macOS/BSD it
-/// name-matches via `ps` (not liveness-only), so eviction never SIGKILLs a
-/// recycled PID now owned by an unrelated process. Linux/Windows already match
-/// exactly, so this delegates there. Use the permissive [`is_grok_process`] for
-/// operator-driven `grok leaders kill`.
-pub fn is_grok_process_strict(pid: u32) -> bool {
-    #[cfg(all(not(target_os = "linux"), not(windows)))]
-    {
-        let mut cmd = std::process::Command::new("ps");
-        cmd.args(["-p", &pid.to_string(), "-o", "comm="])
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        xai_tty_utils::detach_std_command(&mut cmd);
-        match cmd.output() {
-            Ok(out) if out.status.success() => {
-                let comm = String::from_utf8_lossy(&out.stdout);
-                comm.lines()
-                    .next()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                    .and_then(|line| std::path::Path::new(line).file_name())
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.to_ascii_lowercase().contains("grok"))
-            }
-            _ => false,
-        }
-    }
-    #[cfg(any(target_os = "linux", windows))]
-    {
-        is_grok_process(pid)
-    }
-}
+// `is_grok_process_strict` lived here: a name-matching gate for the leader
+// auto-kill zombie path. Removed with its only caller in issue #158 — the
+// shipped command is `medley`, so "is this named grok" was permanently false
+// and auto-kill silently never fired. The eviction path now proves identity
+// without a name (see `leader::holder_has_lock_file_open`). Deliberately not
+// replaced with a `medley`-aware variant: that would defer the same failure to
+// the next rename.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,11 +379,6 @@ mod tests {
     fn is_grok_process_self_true_impossible_pid_false() {
         assert!(is_grok_process(std::process::id()));
         assert!(!is_grok_process(u32::MAX));
-    }
-    #[test]
-    fn is_grok_process_strict_self_true_impossible_pid_false() {
-        assert!(is_grok_process_strict(std::process::id()));
-        assert!(!is_grok_process_strict(u32::MAX));
     }
     #[cfg(unix)]
     #[test]
