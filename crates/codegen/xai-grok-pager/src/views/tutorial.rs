@@ -384,7 +384,9 @@ pub fn render_tutorial(buf: &mut Buffer, area: Rect, st: &mut TutorialState, com
                 area,
                 &mut st.window,
                 doc.title,
-                doc.content,
+                // Not `doc.content`: commands must name the invoked program,
+                // the same as the copy written to `<grok_home>/docs/`.
+                crate::docs::doc_content(doc),
                 &mut st.scroll,
                 &mut st.cached_lines,
                 compact,

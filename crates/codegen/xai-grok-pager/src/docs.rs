@@ -27,7 +27,9 @@ impl From<&Doc> for DocEntry {
         Self {
             title: d.title.into(),
             description: d.description.into(),
-            content: d.content,
+            // Not `d.content`: the picker must show the same text the on-disk
+            // copy has. See [`doc_content`].
+            content: doc_content(d),
         }
     }
 }
@@ -207,7 +209,39 @@ pub fn all_titles() -> impl Iterator<Item = &'static str> {
 
 /// Returns the content of a how-to document by exact title match (case-insensitive).
 pub fn get_howto_doc(title: &str) -> Option<&'static str> {
-    find_doc(title).map(|d| d.content)
+    find_doc(title).map(doc_content)
+}
+
+/// A doc's body as the reader should see it, with command examples renamed.
+///
+/// Every path that puts a doc in front of a user or the model goes through
+/// here: the copies written to `<grok_home>/docs/`, the TUI doc picker, the
+/// tutorial's "go deeper" view, and [`get_howto_doc`]. Renaming only at write
+/// time — which is what the first version did — left the in-app viewer showing
+/// `grok login` for the very file whose on-disk copy said `medley login`.
+///
+/// Computed once. `Box::leak` is deliberate: the set is fixed and small, the
+/// strings live as long as the process, and every reader needs `&'static str`.
+pub fn doc_content(doc: &Doc) -> &'static str {
+    static RENAMED: std::sync::OnceLock<std::collections::HashMap<&'static str, &'static str>> =
+        std::sync::OnceLock::new();
+    RENAMED
+        .get_or_init(|| {
+            USER_GUIDE
+                .iter()
+                .chain(REFERENCE_DOCS.iter())
+                .filter_map(|d| match rename_commands_to_invoked_program(d.content) {
+                    // Borrowed means nothing was rewritten; the static is fine.
+                    std::borrow::Cow::Borrowed(_) => None,
+                    std::borrow::Cow::Owned(renamed) => {
+                        Some((d.filename, &*Box::leak(renamed.into_boxed_str())))
+                    }
+                })
+                .collect()
+        })
+        .get(doc.filename)
+        .copied()
+        .unwrap_or(doc.content)
 }
 
 /// Returns a list of available how-to titles for the model to choose from.
@@ -234,21 +268,148 @@ pub fn default_howto_entries() -> Vec<DocEntry> {
 /// command that, on a machine with the official build installed, drives the
 /// *other* program — the exact failure that issue is about.
 ///
-/// Scoped to backticked commands at a word boundary, so prose about the
-/// upstream product ("a fork of Grok Build"), model ids (`grok-4.5`), and paths
-/// like `~/.grok` are untouched. Returns `Cow::Borrowed` when the invoked name
-/// is already `grok`, so the common upstream case allocates nothing.
+/// Two positions count as a command, and only one of them is a backtick span:
+///
+/// * the leading token of a line inside a fenced code block, optionally behind
+///   a `$ ` or `> ` prompt. This is the copy-pasteable form, and in this guide
+///   it is the *majority* of the references — an earlier version of this
+///   function required a literal backtick before the name and so left every
+///   fenced block untouched, which put `grok login` in a bash block four lines
+///   above `medley login` in the prose of `02-authentication.md`.
+/// * `grok` at a word boundary inside a backtick span, followed by a space or
+///   by the closing backtick. Not only as the span's first token: the guide has
+///   `` `sign in with grok login --provider openai-codex` ``, which the binary
+///   itself prints with the invoked name.
+///
+/// The word-boundary rule is what keeps prose about the upstream product ("a
+/// fork of Grok Build"), model ids (`grok-4.5`), `grok.com`, `xai-grok-pager`,
+/// `GROK_HOME` and `~/.grok` untouched. Returns `Cow::Borrowed` when the
+/// invoked name is already `grok`, so the common upstream case allocates
+/// nothing.
 fn rename_commands_to_invoked_program(content: &'static str) -> std::borrow::Cow<'static, str> {
     let program = xai_grok_config::program_name::program_name();
-    if program == "grok" {
+    if program == "grok" || !content.contains("grok") {
         return std::borrow::Cow::Borrowed(content);
     }
-    // Only ``​`grok `` — a backtick, the name, then a space before a subcommand.
-    let needle = concat!("`", "grok", " ");
-    if !content.contains(needle) {
-        return std::borrow::Cow::Borrowed(content);
+    let mut out = String::with_capacity(content.len());
+    let mut in_fence = false;
+    // A code span may wrap across lines, and the guide has one that does:
+    // ``the reason `sign in with`` / ``grok login --provider openai-codex` ``.
+    // Reset at a blank line and at a fence, so one unbalanced backtick can
+    // never poison the rest of the document.
+    let mut in_span = false;
+    let mut changed = false;
+    for line in content.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let is_fence = trimmed.starts_with("```") || trimmed.starts_with("~~~");
+        if is_fence || trimmed.trim_end().is_empty() {
+            in_span = false;
+        }
+        // A fence delimiter carries an info string and prose carries backtick
+        // spans; the span scanner handles both. Only the interior of a fence is
+        // bare command text.
+        let rewritten = if is_fence || !in_fence {
+            rename_in_code_spans(line, program, &mut in_span)
+        } else {
+            rename_words_in_code(line, program)
+        };
+        if is_fence {
+            in_fence = !in_fence;
+            in_span = false;
+        }
+        changed |= rewritten != line;
+        out.push_str(&rewritten);
     }
-    std::borrow::Cow::Owned(content.replace(needle, &format!("`{program} ")))
+    if changed {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(content)
+    }
+}
+
+/// Bytes that, immediately beside `grok`, mean it is part of a longer name
+/// rather than the command: `grok-4.5`, `xai-grok-pager`, `.grok/config.toml`,
+/// `grok.com`, `groknight`.
+fn is_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/')
+}
+
+/// Whether `grok` starts at `i` as a command: a word on its own, followed by a
+/// space (a subcommand or flag follows) or by the end of its span.
+///
+/// `GROK_HOME` is excluded by the comparison being case-sensitive, and no URL
+/// can match because a URL has no space in it and its `grok` is always preceded
+/// by `/` or `.`.
+fn grok_is_command_at(bytes: &[u8], i: usize) -> bool {
+    if bytes.get(i..i + 4) != Some(b"grok".as_slice()) {
+        return false;
+    }
+    if i > 0 && is_name_byte(bytes[i - 1]) {
+        return false;
+    }
+    match bytes.get(i + 4) {
+        None => true,
+        Some(&b) => matches!(b, b' ' | b'`' | b'\n' | b'\r'),
+    }
+}
+
+/// Rewrite command positions inside the backtick spans of one line.
+///
+/// `in_span` carries across lines because a code span may wrap; the caller
+/// resets it at paragraph and fence boundaries.
+fn rename_in_code_spans(line: &str, program: &str, in_span: &mut bool) -> String {
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            // Consume the whole run, so a ``double-backtick span`` toggles once
+            // and keeps its delimiters balanced.
+            let start = i;
+            while i < bytes.len() && bytes[i] == b'`' {
+                i += 1;
+            }
+            out.push_str(&line[start..i]);
+            *in_span = !*in_span;
+            continue;
+        }
+        if *in_span && grok_is_command_at(bytes, i) {
+            out.push_str(program);
+            i += 4;
+            continue;
+        }
+        let len = line[i..].chars().next().map_or(1, char::len_utf8);
+        out.push_str(&line[i..i + len]);
+        i += len;
+    }
+    out
+}
+
+/// Rewrite every command position on a line inside a fenced code block.
+///
+/// Not just the leading token. In the shipped guide the name also appears
+/// behind an env-var prefix (`GROK_AGENT_SECRET='…' grok agent serve`), inside
+/// a substitution (`RESULT=$(grok -p …)`), in a `#` comment, and in an ASCII
+/// table cell — all of which a reader copies and a model imitates.
+///
+/// Inside a code block a standalone `grok` is the program, so the word
+/// boundaries carry the whole burden here; they are what keep `/tmp/grok.log`
+/// and `GROK_AGENT_SECRET` intact.
+fn rename_words_in_code(line: &str, program: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if grok_is_command_at(bytes, i) {
+            out.push_str(program);
+            i += 4;
+            continue;
+        }
+        let len = line[i..].chars().next().map_or(1, char::len_utf8);
+        out.push_str(&line[i..i + len]);
+        i += len;
+    }
+    out
 }
 
 /// Extract user-guide docs to `<grok_home>/docs/user-guide/`.
@@ -261,8 +422,8 @@ pub fn extract_user_guide_docs(grok_home: &std::path::Path) {
         return;
     }
     for doc in USER_GUIDE {
-        let content = rename_commands_to_invoked_program(doc.content);
-        if let Err(e) = std::fs::write(docs_dir.join(doc.filename), content.as_ref()) {
+        let content = doc_content(doc);
+        if let Err(e) = std::fs::write(docs_dir.join(doc.filename), content) {
             tracing::debug!(error = %e, filename = doc.filename, "Failed to extract user-guide doc");
         }
     }
@@ -341,6 +502,155 @@ mod invoked_program_rename_tests {
     fn content_without_commands_is_borrowed() {
         let out = rename_commands_to_invoked_program("nothing to rewrite here");
         assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+    }
+
+    /// Subcommands this CLI actually has. Used by the corpus scan below to tell
+    /// a command from the word "grok" in a sentence.
+    const SUBCOMMANDS: &[&str] = &[
+        "login", "logout", "auth", "inspect", "plugin", "doctor", "wrap", "update", "sessions",
+        "mcp", "agent", "models", "init", "setup", "config", "export", "worktree", "review",
+    ];
+
+    /// Does this line still invoke `grok` as a program?
+    ///
+    /// Written independently of `grok_is_command_at` on purpose: a detector
+    /// that shares the implementation's predicate passes by construction and
+    /// would have missed exactly the gap this test exists for.
+    pub(super) fn still_invokes_grok(line: &str) -> bool {
+        let bytes = line.as_bytes();
+        line.match_indices("grok").any(|(i, _)| {
+            let left_ok = i == 0
+                || !(bytes[i - 1].is_ascii_alphanumeric()
+                    || matches!(bytes[i - 1], b'-' | b'_' | b'.' | b'/'));
+            if !left_ok || bytes.get(i + 4) != Some(&b' ') {
+                return false;
+            }
+            let next = line[i + 5..]
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .trim_matches('`');
+            next.starts_with('-') || SUBCOMMANDS.contains(&next)
+        })
+    }
+
+    /// The regression test for the fenced-block miss.
+    ///
+    /// The first version required a literal backtick before the name, so it
+    /// rewrote 88 spans and left 137 — including every fenced code block, which
+    /// is the form a reader copies and a model imitates. `02-authentication.md`
+    /// shipped `grok login` inside a bash fence four lines above `medley login`
+    /// in its own prose.
+    ///
+    /// This walks the real shipped guide, not a fixture. The previous tests all
+    /// used hand-written strings, which is why none of them noticed.
+    #[test]
+    fn no_command_in_the_shipped_guide_still_invokes_grok() {
+        let program = xai_grok_config::program_name::program_name();
+        if program == "grok" {
+            return;
+        }
+        let mut offenders = Vec::new();
+        for doc in super::USER_GUIDE.iter().chain(super::REFERENCE_DOCS.iter()) {
+            for (n, line) in super::doc_content(doc).lines().enumerate() {
+                if still_invokes_grok(line) {
+                    offenders.push(format!("{}:{}: {}", doc.filename, n + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "{} command reference(s) still name `grok` after the rename, so the \
+             docs written for the model to read tell it to run a different \
+             program:\n{}",
+            offenders.len(),
+            offenders.join("\n")
+        );
+
+        // The other direction, so this test cannot be satisfied by renaming
+        // more aggressively. These are the things in the corpus that contain
+        // "grok" and are *not* the command; every one must survive untouched,
+        // with the same count it has in the source.
+        let renamed: String = super::USER_GUIDE
+            .iter()
+            .chain(super::REFERENCE_DOCS.iter())
+            .map(|doc| super::doc_content(doc))
+            .collect();
+        let source: String = super::USER_GUIDE
+            .iter()
+            .chain(super::REFERENCE_DOCS.iter())
+            .map(|doc| doc.content)
+            .collect();
+        for needle in [
+            "grok-4.5",
+            "grok.com",
+            ".grok/",
+            "~/.grok",
+            "GROK_HOME",
+            "xai-grok-pager",
+            "Grok Build",
+        ] {
+            assert_eq!(
+                renamed.matches(needle).count(),
+                source.matches(needle).count(),
+                "{needle:?} is not a command and must survive the rename intact"
+            );
+        }
+    }
+
+    /// The fenced form specifically, since that is the whole of the gap.
+    #[test]
+    fn fenced_blocks_and_bare_spans_are_renamed() {
+        // Fixtures for the rewriter under test, not instructions this program
+        // emits. The guard reads physical lines, so each one that names a
+        // command carries its own marker.
+        let src: &'static str = concat!(
+            "Intro.\n\n```bash\n",
+            // auth-instruction-guard: exempt
+            "grok login\n",
+            "$ grok mcp add x\n```\n\n",
+            // auth-instruction-guard: exempt
+            "Then run `grok`. The reason `sign in with grok login --provider x`.\n",
+            // auth-instruction-guard: exempt
+            "Not a command: grok login in plain prose, `grok-4.5`, `grok.com`.\n",
+        );
+        let out = rename_commands_to_invoked_program(src);
+        let program = xai_grok_config::program_name::program_name();
+        if program == "grok" {
+            assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+            return;
+        }
+
+        assert!(
+            out.contains(&format!("\n{program} login\n")),
+            "a fenced command line must be renamed: {out}"
+        );
+        assert!(
+            out.contains(&format!("$ {program} mcp add x")),
+            "a fenced command behind a shell prompt must be renamed: {out}"
+        );
+        assert!(
+            out.contains(&format!("run `{program}`.")),
+            "a bare backticked name is still an invocation: {out}"
+        );
+        assert!(
+            out.contains(&format!("sign in with {program} login")),
+            "the name need not be the span's first token — the binary prints \
+             this exact sentence with the invoked name: {out}"
+        );
+        assert!(
+            out.contains("```bash\n"),
+            "the fence delimiter and its info string must survive: {out}"
+        );
+        assert!(
+            // auth-instruction-guard: exempt
+            out.contains("grok login in plain prose"),
+            "outside a span or a fence it is prose, not a command: {out}"
+        );
+        assert!(
+            out.contains("`grok-4.5`") && out.contains("`grok.com`"),
+            "a model id and a domain are not commands: {out}"
+        );
     }
 }
 
@@ -428,17 +738,41 @@ mod tests {
 
         extract_user_guide_docs(tmp.path());
 
+        let program = xai_grok_config::program_name::program_name();
         for doc in USER_GUIDE {
             let path = docs_dir.join(doc.filename);
             assert!(path.exists(), "Expected doc {} to exist", doc.filename);
-            // Compare against the rewritten content: what lands on disk names
-            // the invoked program, not the compiled-in `grok` (#117).
+            let on_disk = std::fs::read_to_string(&path).unwrap();
+
+            // What lands on disk is what every other reader gets. Asserting
+            // against `doc_content` rather than against the rewriter directly
+            // is the point: the bug was the write path and the TUI path
+            // disagreeing, and only this comparison can see that.
             assert_eq!(
-                std::fs::read_to_string(&path).unwrap(),
-                rename_commands_to_invoked_program(doc.content).as_ref(),
+                on_disk,
+                doc_content(doc),
                 "Content mismatch for {}",
                 doc.filename
             );
+
+            // Independent of the rewriter: whatever it did, nothing on disk may
+            // still tell the model to run a program the user does not have.
+            // Comparing against `rename_commands_to_invoked_program(...)` alone
+            // -- which this test used to do -- passes with the function body
+            // replaced by the identity.
+            if program != "grok" {
+                let left = on_disk
+                    .lines()
+                    .filter(|l| super::invoked_program_rename_tests::still_invokes_grok(l))
+                    .collect::<Vec<_>>();
+                assert!(
+                    left.is_empty(),
+                    "{} still ships {} `grok` command(s) on disk:\n{}",
+                    doc.filename,
+                    left.len(),
+                    left.join("\n")
+                );
+            }
         }
         assert!(
             !docs_dir.join("99-removed.md").exists(),
