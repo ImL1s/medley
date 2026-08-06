@@ -354,3 +354,29 @@ jobs:
             catalog_miss -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
             toctou -- --nocapture
+
+      # #161: the web_search disable notice now rides the session response
+      # `_meta` instead of a notification. Two filters because the tests split
+      # across "disable" and "notice" naming: `web_search_disable` catches the
+      # shell publisher and the pager's render-once cases, `web_search_notice`
+      # catches the take_session drop and the no-notice negative.
+      - name: 'web_search disable notice (issue #161)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib web_search_disable -- --nocapture
+          run_nonzero -p xai-grok-shell --lib web_search_notice -- --nocapture
+          run_nonzero -p xai-grok-pager --lib web_search_disable -- --nocapture
+          run_nonzero -p xai-grok-pager --lib web_search_notice -- --nocapture
