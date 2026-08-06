@@ -32,8 +32,16 @@ pub fn run(args: ExportArgs) -> Result<()> {
         ..Default::default()
     };
 
+    use xai_grok_shell::session::storage::ReplayUpdate;
     for update in updates {
-        tracker.handle_update(update, &replay_meta, &mut scrollback);
+        match update {
+            ReplayUpdate::Acp(update) => {
+                tracker.handle_update(update, &replay_meta, &mut scrollback);
+            }
+            ReplayUpdate::AttemptDiscarded => {
+                tracker.discard_streamed_attempt(&mut scrollback);
+            }
+        }
     }
 
     let blocks: Vec<_> = (0..scrollback.len())

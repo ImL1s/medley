@@ -453,6 +453,94 @@ async fn load_rebuilds_chat_history_from_updates() {
             "rebuilt cache carries the transcript text"
         );
 }
+
+/// #44 F1: persisted AttemptDiscarded must make rebuild_chat_history keep
+/// the retry text once (not hellohello) when both attempts are on disk.
+///
+/// Path covered: **chat_history rebuild** (`ChatReducer` via `load_session`),
+/// not subagent `stream_replay_updates_at` (see
+/// `attempt_discarded_persist_then_stream_replay_subagent_path` for that).
+/// Writer is the real `JsonlStorageAdapter::append_update`.
+#[tokio::test]
+async fn rebuild_chat_history_honors_attempt_discarded() {
+    use agent_client_protocol::{
+        ContentBlock, ContentChunk, SessionUpdate as Acp, TextContent,
+    };
+    use crate::extensions::notification::{
+        SessionNotification as XaiNotif, SessionUpdate as XaiUpdate,
+    };
+    let temp_dir = TempDir::new().unwrap();
+    let info = create_test_info();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    adapter.init_session(&info, default_model_id()).await.unwrap();
+    let text = |s: &str| {
+        ContentChunk::new(ContentBlock::Text(TextContent::new(s.to_string())))
+    };
+    let notify = |u| {
+        SessionUpdate::Acp(Box::new(acp::SessionNotification::new(
+            info.id.clone(),
+            u,
+        )))
+    };
+    adapter
+        .append_update(&info, &notify(Acp::UserMessageChunk(text("hi"))))
+        .await
+        .unwrap();
+    adapter
+        .append_update(&info, &notify(Acp::AgentMessageChunk(text("hello"))))
+        .await
+        .unwrap();
+    adapter
+        .append_update(
+            &info,
+            &SessionUpdate::Xai(Box::new(XaiNotif {
+                session_id: info.id.clone(),
+                update: XaiUpdate::AttemptDiscarded,
+                meta: None,
+            })),
+        )
+        .await
+        .unwrap();
+    adapter
+        .append_update(&info, &notify(Acp::AgentMessageChunk(text("hello"))))
+        .await
+        .unwrap();
+
+    // (a) raw file must double-stream the attempt text (fixture is load-bearing).
+    let updates_path = adapter.session_dir(&info).join("updates.jsonl");
+    let raw = std::fs::read_to_string(&updates_path).unwrap();
+    assert!(
+        raw.matches("hello").count() >= 2,
+        "updates.jsonl must contain both attempts; raw:\n{raw}"
+    );
+    assert!(
+        raw.contains("attempt_discarded"),
+        "updates.jsonl must contain the retraction; raw:\n{raw}"
+    );
+
+    // Force rebuild from updates alone.
+    let chat_path = adapter.session_dir(&info).join("chat_history.jsonl");
+    let _ = std::fs::remove_file(&chat_path);
+    let loaded = adapter.load_session(&info).await.unwrap();
+    let assistant_texts: Vec<String> = loaded
+        .chat_history
+        .iter()
+        .filter_map(|item| match item {
+            ConversationItem::Assistant(a) => Some(a.content.to_string()),
+            _ => None,
+        })
+        .collect();
+    // (b) rebuilt ConversationItem list keeps the text once.
+    assert_eq!(
+        assistant_texts,
+        vec!["hello".to_string()],
+        "ChatReducer must retract the abandoned attempt; got {assistant_texts:?}"
+    );
+    assert!(
+        !assistant_texts.iter().any(|t| t == "hellohello"),
+        "concatenated attempts must not appear in rebuilt history"
+    );
+}
 #[tokio::test]
 async fn workflow_run_manifest_round_trips_and_clear_tombstone_wins() {
     use crate::session::workflow::store::{

@@ -3,6 +3,119 @@
 use super::*;
 use pretty_assertions::assert_eq;
 
+/// #44: discarded attempt emits one `attempt_discarded` line between abandoned
+/// deltas and the retry; the final flushed frame contains retry text once.
+#[test]
+fn messages_attempt_discarded_between_abandoned_and_retry_text() {
+    let mut r = messages(false);
+    let mut abandoned = r.reduce(StreamEvent::AgentMessage("hello".into()));
+    // Default mode buffers text until flush — no assistant line yet, but the
+    // retraction line still ships so a consumer watching the stream can act.
+    let discard = r.reduce(StreamEvent::AttemptDiscarded);
+    assert_eq!(discard, vec![json!({"type": "attempt_discarded"})]);
+    abandoned.extend(discard);
+    let retry = r.reduce(StreamEvent::AgentMessage("hello".into()));
+    abandoned.extend(retry);
+    assert_eq!(
+        abandoned
+            .iter()
+            .filter(|l| l["type"] == "attempt_discarded")
+            .count(),
+        1
+    );
+    // Position: the sole attempt_discarded is the first non-init line that is
+    // not text accumulation (default mode emits init on first content).
+    let types: Vec<&str> = abandoned
+        .iter()
+        .map(|l| l["type"].as_str().unwrap())
+        .collect();
+    let discard_idx = types
+        .iter()
+        .position(|t| *t == "attempt_discarded")
+        .expect("retraction present");
+    assert!(
+        discard_idx > 0,
+        "retraction must follow init (or abandoned content): {types:?}"
+    );
+    // Flush after successful retry → single "hello", not "hellohello".
+    let msg = r
+        .flush_assistant(Some("end_turn"))
+        .expect("assistant after retry");
+    let blocks = msg["message"]["content"].as_array().unwrap();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0]["text"], "hello");
+}
+
+/// #44 with partials: abandoned content_block_delta lines are already on the
+/// wire before the retraction; retry streams after it.
+#[test]
+fn messages_partials_attempt_discarded_between_deltas() {
+    let mut r = messages(true);
+    let first = r.reduce(StreamEvent::AgentMessage("hello".into()));
+    assert!(
+        first.iter().any(|l| {
+            l["type"] == "stream_event" && l["event"]["type"] == "content_block_delta"
+        }),
+        "fixture must emit abandoned deltas: {first:?}"
+    );
+    let mid = r.reduce(StreamEvent::AttemptDiscarded);
+    assert_eq!(
+        mid.iter()
+            .filter(|l| l["type"] == "attempt_discarded")
+            .count(),
+        1
+    );
+    let second = r.reduce(StreamEvent::AgentMessage("hello".into()));
+    assert!(
+        second.iter().any(|l| {
+            l["type"] == "stream_event" && l["event"]["type"] == "content_block_delta"
+        }),
+        "retry must stream deltas after retraction: {second:?}"
+    );
+    // Concatenate full stream order: abandoned deltas → retraction → retry deltas.
+    let mut all = first;
+    all.extend(mid);
+    all.extend(second);
+    let discard_idx = all
+        .iter()
+        .position(|l| l["type"] == "attempt_discarded")
+        .unwrap();
+    let first_delta_idx = all
+        .iter()
+        .position(|l| l["type"] == "stream_event" && l["event"]["type"] == "content_block_delta")
+        .unwrap();
+    let last_delta_idx = all
+        .iter()
+        .rposition(|l| l["type"] == "stream_event" && l["event"]["type"] == "content_block_delta")
+        .unwrap();
+    assert!(
+        first_delta_idx < discard_idx && discard_idx < last_delta_idx,
+        "retraction must sit between abandoned and retry deltas; order={:?}",
+        all.iter()
+            .map(|l| l["type"].as_str().unwrap())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        all.iter()
+            .filter(|l| l["type"] == "attempt_discarded")
+            .count(),
+        1
+    );
+}
+
+/// Accepted messages stream has no attempt_discarded line.
+#[test]
+fn messages_accepted_attempt_emits_no_attempt_discarded() {
+    let mut r = messages(false);
+    let out = r.reduce(StreamEvent::AgentMessage("once only".into()));
+    assert!(
+        out.iter().all(|l| l["type"] != "attempt_discarded"),
+        "accepted stream must not retract: {out:?}"
+    );
+    let msg = r.flush_assistant(Some("end_turn")).unwrap();
+    assert_eq!(msg["message"]["content"][0]["text"], "once only");
+}
+
 #[test]
 fn messages_groups_thinking_and_coalesced_text() {
     let mut r = messages(false);

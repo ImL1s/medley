@@ -18,8 +18,10 @@ use crate::metrics::InferenceLatencyStats;
 /// Returns `Ok((response, metrics))` on the first
 /// [`SamplingEvent::Completed`] and `Err(error)` on the first
 /// [`SamplingEvent::Failed`]. Intermediate events (deltas, retries,
-/// metadata) are silently consumed -- this function is for callers
-/// that only need the final result.
+/// [`SamplingEvent::AttemptDiscarded`], metadata) are silently consumed
+/// -- this function is for callers that only need the final result.
+/// Ignoring `AttemptDiscarded` is correct here: the collector never
+/// surfaces intermediate text, so there is nothing to retract.
 ///
 /// If the stream ends without yielding either terminal event,
 /// returns an `Err` of kind [`SamplingErrorKind::Api`] indicating

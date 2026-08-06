@@ -356,6 +356,17 @@ pub(crate) mod chat_rebuild {
                     self.needs_truncate = true;
                     Vec::new()
                 }
+                // #44: abandoned sampling attempt — drop unflushed agent text
+                // and tool-call registrations so a retried stream does not
+                // concatenate into chat_history / model context on rebuild.
+                XaiUpdate::AttemptDiscarded => {
+                    self.agent_text.clear();
+                    self.has_agent_content = false;
+                    for tc in self.agent_tool_calls.drain(..) {
+                        self.tool_args.remove(tc.id.as_ref());
+                    }
+                    Vec::new()
+                }
                 _ => Vec::new(), // DiffReview, MemoryFlush, etc. not needed
             }
         }
@@ -1592,11 +1603,32 @@ pub fn strip_context_wrappers(update: acp::SessionUpdate) -> acp::SessionUpdate 
 //   - production, streaming (bounded): `stream_replay_updates_at`
 //   - tests, explicit grok home:       `load_updates_for_replay_at` (typed reference)
 
-/// Load replay-ready typed ACP updates for a session, or `None` when the
-/// session or its `updates.jsonl` is missing.
-pub fn load_updates_for_replay(
-    session_id: &str,
-) -> std::io::Result<Option<Vec<acp::SessionUpdate>>> {
+/// One unit of replay-ready content for UI rehydration (scrollback, export).
+///
+/// Distinct from the on-disk [`SessionUpdate`]: rewind markers are consumed by
+/// the filter and never appear here; most other xAI kinds (compaction signals,
+/// tool-call deltas, …) are intentionally dropped because they have no
+/// scrollback effect on this path. [`ReplayUpdate::AttemptDiscarded`] **is**
+/// forwarded so a discarded-then-retried sampling attempt does not double-render
+/// on subagent inherited replay or export (#44). Without it, this sink was a
+/// hard type barrier: only `acp::SessionUpdate` could be delivered, so a
+/// persisted xAI retraction could never reach the pager's
+/// `discard_streamed_attempt`.
+// Unit `AttemptDiscarded` next to the large ACP payload trips
+// `large_enum_variant`; boxing ACP would churn every replay call site for no
+// hot-path win (this enum is only built during cold rehydrate/export).
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReplayUpdate {
+    /// Standard ACP session update (context wrappers already stripped).
+    Acp(acp::SessionUpdate),
+    /// Abandoned sampling attempt — drop in-progress agent/thought/tool UI.
+    AttemptDiscarded,
+}
+
+/// Load replay-ready updates for a session, or `None` when the session or its
+/// `updates.jsonl` is missing.
+pub fn load_updates_for_replay(session_id: &str) -> std::io::Result<Option<Vec<ReplayUpdate>>> {
     let Some(session_dir) =
         crate::session::persistence::find_persisted_session_dir_by_id_result(session_id)?
     else {
@@ -1618,7 +1650,7 @@ pub fn load_updates_for_replay(
 pub fn load_updates_for_replay_at(
     session_id: &str,
     grok_home: &std::path::Path,
-) -> std::io::Result<Option<Vec<acp::SessionUpdate>>> {
+) -> std::io::Result<Option<Vec<ReplayUpdate>>> {
     let Some(updates_path) = resolve_replay_updates_path(session_id, grok_home)? else {
         return Ok(None);
     };
@@ -1632,14 +1664,12 @@ fn replay_updates_path_in_dir(session_dir: &std::path::Path) -> Option<std::path
     updates_path.exists().then_some(updates_path)
 }
 
-/// Collect every replay-ready ACP update from `updates_path` into a `Vec`, the
+/// Collect every replay-ready update from `updates_path` into a `Vec`, the
 /// materializing counterpart of the streaming [`for_each_replay_update_in_file`].
-fn collect_replay_updates(
-    updates_path: &std::path::Path,
-) -> std::io::Result<Vec<acp::SessionUpdate>> {
-    let mut acp_updates: Vec<acp::SessionUpdate> = Vec::new();
-    for_each_replay_update_in_file(updates_path, |u| acp_updates.push(u))?;
-    Ok(acp_updates)
+fn collect_replay_updates(updates_path: &std::path::Path) -> std::io::Result<Vec<ReplayUpdate>> {
+    let mut updates: Vec<ReplayUpdate> = Vec::new();
+    for_each_replay_update_in_file(updates_path, |u| updates.push(u))?;
+    Ok(updates)
 }
 
 /// Resolve `updates.jsonl` for `session_id` under `grok_home`, or `None` when
@@ -1670,7 +1700,7 @@ pub enum ReplayEmission {
     Empty,
 }
 
-/// Invoke `f` once per replay-ready ACP update for a session under `grok_home`,
+/// Invoke `f` once per replay-ready update for a session under `grok_home`,
 /// never building the full typed `Vec`. Reads the session's JSONL transcript
 /// directly; a non-JSONL backend would need its own bounded replay.
 ///
@@ -1680,16 +1710,21 @@ pub enum ReplayEmission {
 /// it. Streaming holds one typed update at a time, so peak drops to about the
 /// file size.
 ///
-/// `Empty` folds the missing-session, missing-file, and no-ACP-updates cases;
-/// the typed `load_updates_for_replay_at` keeps them distinct (`Ok(None)` vs
-/// `Ok(Some(vec![]))`) since it returns the parsed contents rather than a purge
-/// signal.
+/// `Empty` folds the missing-session, missing-file, and no-forwarded-updates
+/// cases; the typed `load_updates_for_replay_at` keeps them distinct
+/// (`Ok(None)` vs `Ok(Some(vec![]))`) since it returns the parsed contents
+/// rather than a purge signal.
 ///
 /// The sink is infallible by design: replay only rehydrates UI scrollback, a
 /// best-effort step, so failing to apply one update must neither abort the
 /// stream nor surface an error. I/O errors from reading the file still
 /// propagate via the `Result`.
-pub fn stream_replay_updates_at<F: FnMut(acp::SessionUpdate)>(
+///
+/// **Callers:** subagent inherited scrollback
+/// (`xai-grok-pager` `replay_inherited_updates`) and export. Main-session
+/// resume uses a different path (`forward_raw_replay_line`), which already
+/// forwards xAI as `ExtNotification`.
+pub fn stream_replay_updates_at<F: FnMut(ReplayUpdate)>(
     session_id: &str,
     grok_home: &std::path::Path,
     f: F,
@@ -1706,8 +1741,8 @@ pub fn stream_replay_updates_at<F: FnMut(acp::SessionUpdate)>(
 
 // Rewind can drop earlier lines, so surviving lines are held until the end of
 // the file; one `String` plus `&str` slices keeps that minimal. Output matches
-// the typed load. Returns whether any ACP update was forwarded.
-fn for_each_replay_update_in_file<F: FnMut(acp::SessionUpdate)>(
+// the typed load. Returns whether any update was forwarded.
+fn for_each_replay_update_in_file<F: FnMut(ReplayUpdate)>(
     updates_path: &std::path::Path,
     mut f: F,
 ) -> std::io::Result<bool> {
@@ -1722,14 +1757,24 @@ fn for_each_replay_update_in_file<F: FnMut(acp::SessionUpdate)>(
     let mut forwarded = false;
     for line in live {
         match SessionUpdateEnvelope::from_str(line) {
-            // Only ACP updates replay.
             Ok(SessionUpdate::Acp(notif)) => {
                 forwarded = true;
-                f(strip_context_wrappers(notif.update));
+                f(ReplayUpdate::Acp(strip_context_wrappers(notif.update)));
             }
-            // Xai extensions (rewind markers, compaction signals) are consumed
-            // by the filter and intentionally dropped (matching the typed load).
-            Ok(SessionUpdate::Xai(_)) => {}
+            // Most xAI extensions (rewind markers, compaction signals, tool
+            // deltas) are consumed by the filter or have no scrollback effect
+            // here and are intentionally dropped. AttemptDiscarded must pass:
+            // without it, subagent/export replay cannot retract abandoned
+            // attempt text (#44 type barrier).
+            Ok(SessionUpdate::Xai(n)) => {
+                if matches!(
+                    n.update,
+                    crate::extensions::notification::SessionUpdate::AttemptDiscarded
+                ) {
+                    forwarded = true;
+                    f(ReplayUpdate::AttemptDiscarded);
+                }
+            }
             // Best-effort: an unparseable line (e.g. a partially written trailing
             // line) is skipped rather than aborting replay; the typed load drops
             // it too. Logged for diagnostics.
@@ -3390,7 +3435,9 @@ mod tests {
 
     /// End-to-end: the streaming core (`for_each_replay_update_in_file`, what
     /// `stream_replay_updates_at` wraps) applies rewind over a real file and
-    /// yields the same survivors as the typed parse-all path.
+    /// yields the same survivors as the typed parse-all path (including
+    /// [`ReplayUpdate::AttemptDiscarded`], which must not be dropped like
+    /// other xAI kinds).
     #[test]
     fn streaming_replay_applies_rewind_like_the_typed_path() {
         let u1 = acp_envelope(
@@ -3419,24 +3466,94 @@ mod tests {
         let forwarded = for_each_replay_update_in_file(&path, |u| streamed.push(u)).unwrap();
         assert!(forwarded);
 
-        // Typed reference: parse all, rewind-filter, map ACP survivors.
+        // Typed reference: parse all, rewind-filter, map to ReplayUpdate
+        // (ACP survivors + AttemptDiscarded; other Xai dropped).
         let typed: Vec<SessionUpdate> = raw
             .lines()
             .map(|l| SessionUpdateEnvelope::from_str(l).unwrap())
             .collect();
-        let reference: Vec<acp::SessionUpdate> = filter_rewind_updates(typed)
+        let reference: Vec<ReplayUpdate> = filter_rewind_updates(typed)
             .into_iter()
             .filter_map(|u| match u {
-                SessionUpdate::Acp(notif) => Some(strip_context_wrappers(notif.update)),
+                SessionUpdate::Acp(notif) => {
+                    Some(ReplayUpdate::Acp(strip_context_wrappers(notif.update)))
+                }
+                SessionUpdate::Xai(n)
+                    if matches!(
+                        n.update,
+                        crate::extensions::notification::SessionUpdate::AttemptDiscarded
+                    ) =>
+                {
+                    Some(ReplayUpdate::AttemptDiscarded)
+                }
                 SessionUpdate::Xai(_) => None,
             })
             .collect();
 
-        let ser = |u: &acp::SessionUpdate| serde_json::to_string(u).unwrap();
+        let ser = |u: &ReplayUpdate| match u {
+            ReplayUpdate::Acp(a) => format!("acp:{}", serde_json::to_string(a).unwrap()),
+            ReplayUpdate::AttemptDiscarded => "xai:attempt_discarded".into(),
+        };
         assert_eq!(
             streamed.iter().map(ser).collect::<Vec<_>>(),
             reference.iter().map(ser).collect::<Vec<_>>(),
         );
+    }
+
+    /// #44 type barrier: AttemptDiscarded must be forwarded by both the
+    /// streaming and typed materialize paths (not dropped like other Xai).
+    #[test]
+    fn streaming_and_typed_replay_forward_attempt_discarded() {
+        let user = acp_envelope(
+            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hi"}}"#,
+        );
+        let a1 = acp_envelope(
+            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello"}}"#,
+        );
+        let discard = xai_envelope(r#"{"sessionUpdate":"attempt_discarded"}"#);
+        let a2 = acp_envelope(
+            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello"}}"#,
+        );
+        let raw = format!("{user}\n{a1}\n{discard}\n{a2}\n");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(UPDATES_FILE);
+        std::fs::write(&path, &raw).unwrap();
+
+        let mut streamed = Vec::new();
+        for_each_replay_update_in_file(&path, |u| streamed.push(u)).unwrap();
+
+        let typed: Vec<SessionUpdate> = raw
+            .lines()
+            .map(|l| SessionUpdateEnvelope::from_str(l).unwrap())
+            .collect();
+        let reference: Vec<ReplayUpdate> = filter_rewind_updates(typed)
+            .into_iter()
+            .filter_map(|u| match u {
+                SessionUpdate::Acp(notif) => {
+                    Some(ReplayUpdate::Acp(strip_context_wrappers(notif.update)))
+                }
+                SessionUpdate::Xai(n)
+                    if matches!(
+                        n.update,
+                        crate::extensions::notification::SessionUpdate::AttemptDiscarded
+                    ) =>
+                {
+                    Some(ReplayUpdate::AttemptDiscarded)
+                }
+                SessionUpdate::Xai(_) => None,
+            })
+            .collect();
+
+        assert_eq!(streamed, reference);
+        assert!(
+            streamed
+                .iter()
+                .any(|u| matches!(u, ReplayUpdate::AttemptDiscarded)),
+            "AttemptDiscarded must not be dropped by the type barrier"
+        );
+        // Two agent chunks + discard + user = 4.
+        assert_eq!(streamed.len(), 4);
     }
 
     // ── prepare_replay_lines tests ───────────────────────────────────────────

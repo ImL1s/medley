@@ -84,6 +84,8 @@ enum AcpLine {
     ImageCompressed {
         message: String,
     },
+    /// Sampling attempt abandoned; drop stream content since the last accepted boundary.
+    AttemptDiscarded,
 }
 
 /// `streaming-json` terminal `end` line (spend fields merged in by the caller).
@@ -150,6 +152,7 @@ impl Reducer for AcpReducer {
                     signature,
                 })];
             }
+            StreamEvent::AttemptDiscarded => AcpLine::AttemptDiscarded,
         };
         vec![to_line(&line)]
     }

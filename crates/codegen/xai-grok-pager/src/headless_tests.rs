@@ -471,6 +471,123 @@ fn parse_json_schema_rejects_non_objects_and_invalid_json() {
     );
 }
 
+/// #44: Plain/Json never emit an `attempt_discarded` wire line (no reducer);
+/// they only clear buffers. Streaming formats route the event through the
+/// reducer (covered by acp/messages reducer tests for wire shape + position).
+#[test]
+fn plain_and_json_attempt_discard_do_not_use_streaming_reducer() {
+    for format in [super::OutputFormat::Plain, super::OutputFormat::Json] {
+        let mut emitter = super::HeadlessEmitter::new(format, false);
+        assert!(
+            emitter.reducer.is_none(),
+            "{format:?} must have no streaming reducer (no wire line path)"
+        );
+        emitter.on_text_chunk("hello");
+        emitter.on_attempt_discarded();
+        assert!(
+            emitter.text_buffer.is_empty(),
+            "{format:?} must clear buffer on discard"
+        );
+        emitter.on_text_chunk("hello");
+        assert_eq!(emitter.text_buffer, "hello");
+    }
+}
+
+/// Streaming formats install a reducer so `on_attempt_discarded` can emit
+/// the retraction line (shape proven on the reducers themselves).
+#[test]
+fn streaming_formats_install_reducer_for_attempt_discard_path() {
+    for format in [
+        super::OutputFormat::StreamingJson,
+        super::OutputFormat::StreamingMessagesJson,
+    ] {
+        let emitter = super::HeadlessEmitter::new(format, false);
+        assert!(
+            emitter.reducer.is_some(),
+            "{format:?} must own a reducer for attempt_discarded emission"
+        );
+    }
+}
+
+/// #44: headless plain printer drops discarded-attempt text; final buffer is
+/// the retry once. Trailing-newline shape is covered by the pure normalizer.
+#[test]
+fn plain_attempt_discard_then_retry_text_once_with_single_trailing_newline() {
+    let mut emitter = super::HeadlessEmitter::new(super::OutputFormat::Plain, false);
+    emitter.on_text_chunk("hello");
+    emitter.on_attempt_discarded();
+    emitter.on_text_chunk("hello");
+    assert_eq!(emitter.text_buffer, "hello");
+    assert_eq!(
+        super::normalize_plain_trailing_newline(emitter.text_buffer.clone()),
+        "hello\n"
+    );
+    emitter.on_end("end_turn", "sess", "req");
+    assert!(
+        emitter.text_buffer.is_empty(),
+        "on_end must consume the buffer"
+    );
+}
+
+/// Discard after multi-chunk attempt text clears the whole attempt.
+#[test]
+fn plain_attempt_discard_clears_multi_chunk_buffer() {
+    let mut emitter = super::HeadlessEmitter::new(super::OutputFormat::Plain, false);
+    emitter.on_text_chunk("hel");
+    emitter.on_text_chunk("lo");
+    assert_eq!(emitter.text_buffer, "hello");
+    emitter.on_attempt_discarded();
+    assert!(emitter.text_buffer.is_empty());
+    emitter.on_text_chunk("world");
+    assert_eq!(emitter.text_buffer, "world");
+}
+
+/// Accepted attempt (no discard) keeps every chunk for the final print.
+#[test]
+fn plain_accepted_attempt_keeps_all_chunks() {
+    let mut emitter = super::HeadlessEmitter::new(super::OutputFormat::Plain, false);
+    emitter.on_text_chunk("once ");
+    emitter.on_text_chunk("only");
+    assert_eq!(emitter.text_buffer, "once only");
+    assert_eq!(
+        super::normalize_plain_trailing_newline(emitter.text_buffer.clone()),
+        "once only\n"
+    );
+}
+
+/// Pure normalizer: exactly one trailing newline regardless of model output.
+#[test]
+fn normalize_plain_trailing_newline_is_exactly_one() {
+    assert_eq!(super::normalize_plain_trailing_newline(String::new()), "\n");
+    assert_eq!(
+        super::normalize_plain_trailing_newline("hello".into()),
+        "hello\n"
+    );
+    assert_eq!(
+        super::normalize_plain_trailing_newline("hello\n".into()),
+        "hello\n"
+    );
+    assert_eq!(
+        super::normalize_plain_trailing_newline("hello\n\n\n".into()),
+        "hello\n"
+    );
+}
+
+/// F5: plain on_error must keep buffered text (not drop all output on failure).
+#[test]
+fn plain_on_error_keeps_buffered_attempt_text() {
+    let mut emitter = super::HeadlessEmitter::new(super::OutputFormat::Plain, false);
+    emitter.on_text_chunk("partial doc body");
+    assert_eq!(emitter.text_buffer, "partial doc body");
+    // on_error flushes then clears; we cannot intercept stdout, but the buffer
+    // must be consumed so a subsequent on_end cannot re-print it.
+    emitter.on_error("rate limited", None);
+    assert!(
+        emitter.text_buffer.is_empty(),
+        "on_error must flush (and clear) the plain buffer so output is not lost"
+    );
+}
+
 /// Unready BYOK model: remediation must name the missing key, not xAI login.
 #[test]
 fn auth_required_message_prefers_model_unready_reason() {

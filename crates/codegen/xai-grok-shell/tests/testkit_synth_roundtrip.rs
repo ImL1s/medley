@@ -2,15 +2,16 @@
 //! with [`synth::prepare_session`], then confirm the production replay reader
 //! parses every persisted update back with the right per-kind counts.
 //!
-//! `load_updates_for_replay_at` is the typed reader and keeps every update
-//! (only `Xai` updates are dropped); the redundant-ACU skip is a later
-//! line-based step in the client replay path, not asserted here.
+//! `load_updates_for_replay_at` is the typed reader and keeps every ACP update
+//! (plus `AttemptDiscarded`; other `Xai` updates are dropped); the
+//! redundant-ACU skip is a later line-based step in the client replay path,
+//! not asserted here.
 
 use agent_client_protocol as acp;
 use tempfile::TempDir;
 
 use xai_grok_shell::session::storage::{
-    JsonlStorageAdapter, StorageAdapter, load_updates_for_replay_at,
+    JsonlStorageAdapter, ReplayUpdate, StorageAdapter, load_updates_for_replay_at,
 };
 use xai_grok_shell::session::testkit::synth::{self, SessionSpec};
 
@@ -37,7 +38,14 @@ async fn synth_replay_roundtrip_parses_every_persisted_update() {
         .expect("load_updates_for_replay_at")
         .unwrap_or_default();
 
-    let count = |pred: fn(&acp::SessionUpdate) -> bool| replayed.iter().filter(|u| pred(u)).count();
+    let acp_only: Vec<&acp::SessionUpdate> = replayed
+        .iter()
+        .filter_map(|u| match u {
+            ReplayUpdate::Acp(a) => Some(a),
+            ReplayUpdate::AttemptDiscarded => None,
+        })
+        .collect();
+    let count = |pred: fn(&acp::SessionUpdate) -> bool| acp_only.iter().filter(|u| pred(u)).count();
     let users = count(|u| matches!(u, acp::SessionUpdate::UserMessageChunk(_)));
     let acus = count(|u| matches!(u, acp::SessionUpdate::AvailableCommandsUpdate(_)));
     let agents = count(|u| matches!(u, acp::SessionUpdate::AgentMessageChunk(_)));
@@ -54,9 +62,9 @@ async fn synth_replay_roundtrip_parses_every_persisted_update() {
         "every agent chunk is preserved"
     );
     assert_eq!(
-        replayed.len(),
+        acp_only.len(),
         spec.turns * (1 + spec.acu_per_turn + spec.agent_chunks_per_turn),
-        "no update is dropped or duplicated by the typed replay reader"
+        "no ACP update is dropped or duplicated by the typed replay reader"
     );
 }
 
