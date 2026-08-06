@@ -386,6 +386,8 @@ enum LeaderKillAction {
     /// A live leader answered its control socket. Signal this PID; never touch
     /// its files.
     Signal(u32),
+    /// A leader reported a PID that is implausible (e.g. 0 or > i32::MAX).
+    ImplausiblePid(u32),
     /// Nothing answered. The lock file is the only evidence left, so reclaim it
     /// **only** if no live process holds its flock.
     ReclaimLockIfUnheld,
@@ -408,10 +410,63 @@ enum LeaderKillAction {
 /// rename, which is the defect this replaces.
 fn leader_kill_action(live_pid: Option<u32>, has_lock_path: bool) -> LeaderKillAction {
     match (live_pid, has_lock_path) {
-        (Some(pid), _) => LeaderKillAction::Signal(pid),
+        (Some(pid), _) => {
+            if pid != 0 && pid <= i32::MAX as u32 {
+                LeaderKillAction::Signal(pid)
+            } else {
+                LeaderKillAction::ImplausiblePid(pid)
+            }
+        }
         (None, true) => LeaderKillAction::ReclaimLockIfUnheld,
         (None, false) => LeaderKillAction::Skip,
     }
+}
+
+/// Formats the final summary message and returns the success verdict.
+fn format_kill_leaders_summary(killed: u32, cleaned: u32, left_alone: u32) -> (String, bool) {
+    let success = left_alone == 0;
+    let summary = match (killed > 0, cleaned > 0, left_alone > 0) {
+        (false, false, false) => "No live leader processes found.".to_string(),
+        (false, false, true) => {
+            format!("No leader processes killed. Left {left_alone} lock(s) alone.")
+        }
+        (false, true, false) => {
+            format!("No live leader processes found (cleaned up {cleaned} stale lock(s)).")
+        }
+        (false, true, true) => format!(
+            "No leader processes killed (cleaned up {cleaned} stale lock(s), left {left_alone} lock(s) alone)."
+        ),
+        (true, false, false) => format!("Killed {killed} leader process(es)."),
+        (true, false, true) => {
+            format!("Killed {killed} leader process(es). Left {left_alone} lock(s) alone.")
+        }
+        (true, true, false) => {
+            format!("Killed {killed} leader process(es) (cleaned up {cleaned} stale lock(s)).")
+        }
+        (true, true, true) => format!(
+            "Killed {killed} leader process(es) (cleaned up {cleaned} stale lock(s), left {left_alone} lock(s) alone)."
+        ),
+    };
+    (summary, success)
+}
+
+/// Formats the guidance when a lock file is held by a live process.
+fn format_leader_held_guidance(lock_path: &str, pid_from_lock: Option<u32>) -> String {
+    let mut out = format!(
+        "  A live process still holds {lock_path} but is not answering its control socket; left alone (lock file NOT removed)."
+    );
+    if let Some(pid) = pid_from_lock {
+        out.push_str(&format!(
+            "\n    The lock file records PID {pid}. Note that this PID may be recycled. \
+             If you are sure it is the wedged leader, signal it directly: kill {pid}"
+        ));
+    } else {
+        out.push_str(&format!(
+            "\n    No PID is recorded in the lock file. Find the process holding the lock \
+             (e.g., using `lsof {lock_path}`) and terminate it manually."
+        ));
+    }
+    out
 }
 
 async fn kill_leaders() -> Result<()> {
@@ -435,6 +490,10 @@ async fn kill_leaders() -> Result<()> {
                 }
                 killed += 1;
             }
+            LeaderKillAction::ImplausiblePid(pid) => {
+                eprintln!("  Leader reported implausible PID {pid}; not signalling.");
+                left_alone += 1;
+            }
             LeaderKillAction::ReclaimLockIfUnheld => {
                 let Some(ref lock) = d.lock_path else {
                     continue;
@@ -447,23 +506,23 @@ async fn kill_leaders() -> Result<()> {
                         }
                         cleaned += 1;
                     }
+                    xai_grok_shell::leader::ReclaimOutcome::NotFound => {
+                        // Deliberately touches nothing. The `Removed` arm above
+                        // may unlink the socket because reclaim held the flock
+                        // an instant earlier, so it knows the path was orphaned.
+                        // Here we never held it: the lock file was already gone
+                        // when we looked, which says nothing about who owns the
+                        // socket path *now*. A leader that started between
+                        // discovery and this check has created its own lock and
+                        // bound its own socket, and unlinking it would leave it
+                        // running and unreachable -- the failure #183 describes,
+                        // with even less justification than the case that filed it.
+                        eprintln!("  Lock file {} is already gone.", lock.display());
+                    }
                     xai_grok_shell::leader::ReclaimOutcome::HeldByLiveProcess => {
-                        // Deleting this is what produces two live leaders: the
-                        // holder keeps its flock on the unlinked inode while
-                        // the next client locks a freshly created one.
-                        let pid = d
-                            .pid_from_lock
-                            .map(|p| p.to_string())
-                            .unwrap_or_else(|| "unknown".into());
-                        eprintln!(
-                            "  A live process still holds {} but is not answering its \
-                             control socket; left alone (lock file NOT removed).",
-                            lock.display(),
-                        );
-                        eprintln!(
-                            "    The lock file records PID {pid}. If you are sure it is \
-                             the wedged leader, signal it directly: kill {pid}",
-                        );
+                        let path_str = lock.to_string_lossy();
+                        let guidance = format_leader_held_guidance(&path_str, d.pid_from_lock);
+                        eprintln!("{guidance}");
                         left_alone += 1;
                     }
                     xai_grok_shell::leader::ReclaimOutcome::Indeterminate => {
@@ -477,15 +536,14 @@ async fn kill_leaders() -> Result<()> {
             }
         }
     }
-    if left_alone > 0 {
-        eprintln!("Left {left_alone} lock(s) alone (see above).");
-    }
-    if killed > 0 {
-        eprintln!("Killed {killed} leader process(es).");
-    } else if cleaned > 0 {
-        eprintln!("No live leader processes found (cleaned up {cleaned} stale lock(s)).");
-    } else {
-        eprintln!("No live leader processes found.");
+    let (summary, success) = format_kill_leaders_summary(killed, cleaned, left_alone);
+    eprintln!("{summary}");
+    if !success {
+        // We use an explicit std::process::exit(1) here instead of returning an Err
+        // because returning an Err to async_main causes it to print a redundant
+        // "Error: <msg>" via anyhow, which results in ugly double-printing after our
+        // detailed summary message has already been written to stderr.
+        std::process::exit(1);
     }
     Ok(())
 }
@@ -3110,6 +3168,104 @@ mod tests {
             LeaderKillAction::ReclaimLockIfUnheld,
             "the fallback probes occupancy, which no rename can change",
         );
+    }
+
+    #[test]
+    fn test_format_kill_leaders_summary_all_combinations() {
+        // Combinations of (killed, cleaned, left_alone):
+        // 1. (0, 0, 0)
+        let (s, ok) = format_kill_leaders_summary(0, 0, 0);
+        assert_eq!(s, "No live leader processes found.");
+        assert!(ok);
+
+        // 2. (0, 0, 1)
+        let (s, ok) = format_kill_leaders_summary(0, 0, 1);
+        assert_eq!(s, "No leader processes killed. Left 1 lock(s) alone.");
+        assert!(!ok);
+
+        // 3. (0, 1, 0)
+        let (s, ok) = format_kill_leaders_summary(0, 1, 0);
+        assert_eq!(
+            s,
+            "No live leader processes found (cleaned up 1 stale lock(s))."
+        );
+        assert!(ok);
+
+        // 4. (0, 1, 1)
+        let (s, ok) = format_kill_leaders_summary(0, 1, 1);
+        assert_eq!(
+            s,
+            "No leader processes killed (cleaned up 1 stale lock(s), left 1 lock(s) alone)."
+        );
+        assert!(!ok);
+
+        // 5. (1, 0, 0)
+        let (s, ok) = format_kill_leaders_summary(1, 0, 0);
+        assert_eq!(s, "Killed 1 leader process(es).");
+        assert!(ok);
+
+        // 6. (1, 0, 1)
+        let (s, ok) = format_kill_leaders_summary(1, 0, 1);
+        assert_eq!(s, "Killed 1 leader process(es). Left 1 lock(s) alone.");
+        assert!(!ok);
+
+        // 7. (1, 1, 0)
+        let (s, ok) = format_kill_leaders_summary(1, 1, 0);
+        assert_eq!(
+            s,
+            "Killed 1 leader process(es) (cleaned up 1 stale lock(s))."
+        );
+        assert!(ok);
+
+        // 8. (1, 1, 1)
+        let (s, ok) = format_kill_leaders_summary(1, 1, 1);
+        assert_eq!(
+            s,
+            "Killed 1 leader process(es) (cleaned up 1 stale lock(s), left 1 lock(s) alone)."
+        );
+        assert!(!ok);
+    }
+
+    #[test]
+    fn test_leader_kill_action_pid_boundaries() {
+        // normal PID
+        assert_eq!(
+            leader_kill_action(Some(42), true),
+            LeaderKillAction::Signal(42)
+        );
+
+        // pid == 0
+        assert_eq!(
+            leader_kill_action(Some(0), true),
+            LeaderKillAction::ImplausiblePid(0)
+        );
+
+        // pid == u32::MAX
+        assert_eq!(
+            leader_kill_action(Some(u32::MAX), true),
+            LeaderKillAction::ImplausiblePid(u32::MAX)
+        );
+
+        // pid == i32::MAX as u32
+        let max_i32_u32 = i32::MAX as u32;
+        assert_eq!(
+            leader_kill_action(Some(max_i32_u32), true),
+            LeaderKillAction::Signal(max_i32_u32)
+        );
+    }
+
+    #[test]
+    fn test_format_leader_held_guidance_branches() {
+        // known PID
+        let g_known = format_leader_held_guidance("leader.lock", Some(42));
+        assert!(g_known.contains("records PID 42"));
+        assert!(g_known.contains("kill 42"));
+        assert!(g_known.contains("recycled"));
+
+        // unknown PID
+        let g_unknown = format_leader_held_guidance("leader.lock", None);
+        assert!(g_unknown.contains("No PID is recorded"));
+        assert!(!g_unknown.contains("kill "));
     }
 
     #[tokio::test]
