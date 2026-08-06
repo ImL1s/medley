@@ -1896,6 +1896,57 @@ async fn read_parent_sampling_config_live_never_strips_a_fallback_key() {
         );
     assert_eq!(config.api_key.as_deref(), Some("xai-env-fallback"));
 }
+/// #136 steps 2–3: the live parent inherit must surface the provenance
+/// bound onto parent credentials when no declared header is present.
+/// Header re-derivation alone left ordinary session-token parents
+/// unlabelled (`None`), which is the under-restricting direction for L3.
+#[tokio::test]
+async fn read_parent_sampling_config_live_carries_stored_session_source() {
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.auth_method_id = acp::AuthMethodId::new(
+        crate::agent::auth_method::CACHED_TOKEN_AUTH_METHOD_ID,
+    );
+    let chat = spawn_test_parent_chat_state("grok-4.5");
+    if let Some(mut cfg) = chat.get_sampling_config().await {
+        cfg.base_url = "https://api.x.ai/v1".to_string();
+        chat.update_sampling_config(cfg);
+    }
+    chat.update_credentials(xai_chat_state::Credentials::bound(
+        Some("parent-session-jwt".to_string()),
+        xai_chat_state::AuthType::SessionToken,
+        xai_grok_sampler::CredentialSource::XaiSession,
+    ));
+    ctx.parent_chat_state = Some(chat);
+    let (config, _) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(
+        config.credential_source,
+        Some(xai_grok_sampler::CredentialSource::XaiSession),
+        "live inherit must re-emit the parent's stored provenance, not None"
+    );
+    assert_eq!(config.api_key.as_deref(), Some("parent-session-jwt"));
+}
+/// Same as the session case for a BYOK parent key.
+#[tokio::test]
+async fn read_parent_sampling_config_live_carries_stored_byok_source() {
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.auth_method_id = acp::AuthMethodId::new(
+        crate::agent::auth_method::XAI_API_KEY_METHOD_ID,
+    );
+    let chat = spawn_test_parent_chat_state("grok-4.5");
+    chat.update_credentials(xai_chat_state::Credentials::bound(
+        Some("parent-byok-key".to_string()),
+        xai_chat_state::AuthType::ApiKey,
+        xai_grok_sampler::CredentialSource::ModelApiKey,
+    ));
+    ctx.parent_chat_state = Some(chat);
+    let (config, _) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(
+        config.credential_source,
+        Some(xai_grok_sampler::CredentialSource::ModelApiKey),
+        "live inherit must re-emit the parent's stored BYOK provenance, not None"
+    );
+    assert_eq!(config.api_key.as_deref(), Some("parent-byok-key"));
+}
 /// `would_strip_fallback_key` on the inherit-fallback path: the baseline
 /// keeps the env `XAI_API_KEY` even while `auth_type` flips to
 /// `SessionToken`, and no resolver may displace it.

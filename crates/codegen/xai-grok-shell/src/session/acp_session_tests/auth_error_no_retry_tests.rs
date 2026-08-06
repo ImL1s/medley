@@ -957,6 +957,88 @@ async fn sampler_401_oidc_method_with_stale_api_key_auth_type_still_recovers() {
         .await;
 }
 
+/// #136 steps 2–3: a Ready session-token turn must re-emit the provenance
+/// step 1 bound onto chat-state credentials. Header re-derivation alone
+/// yields `None` on every ordinary turn (chat state keeps headers, not the
+/// label); without the stored fall-back L3 sees an unlabelled ambient key.
+#[tokio::test(flavor = "current_thread")]
+async fn reconstruct_full_config_ready_session_token_carries_stored_source() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_dir, am) = auth_manager_with_valid_token("session-token");
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                Some(am),
+                "cached_token",
+                xai_chat_state::AuthType::SessionToken,
+                "session-jwt".to_string(),
+            )
+            .await;
+            pin_first_party_session_model(&actor).await;
+
+            let cfg = actor.reconstruct_full_config().await;
+
+            assert_eq!(
+                cfg.credential_source,
+                Some(xai_grok_sampler::CredentialSource::XaiSession),
+                "Ready session-token turn must surface the stored provenance, not None"
+            );
+            assert!(
+                cfg.api_key.is_some() || cfg.bearer_resolver.is_some(),
+                "the live session credential must still be on the wire config"
+            );
+        })
+        .await;
+}
+
+/// #136 steps 2–3: a Ready BYOK turn must re-emit `ModelApiKey` from the
+/// stored source. Same hole as the session-token case — header maps alone
+/// cannot recover a non-header credential's provenance.
+#[tokio::test(flavor = "current_thread")]
+async fn reconstruct_full_config_ready_byok_carries_stored_source() {
+    use crate::agent::auth_method::ModelByok;
+    use crate::agent::config::ModelAuthFacts;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                None,
+                "xai.api_key",
+                xai_chat_state::AuthType::ApiKey,
+                "byok-model-key".to_string(),
+            )
+            .await;
+            let model = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .map(|c| c.model)
+                .unwrap_or_default();
+            actor
+                .model_auth_memo
+                .replace(Some(crate::session::acp_session::ModelAuthMemo {
+                    model_id: model,
+                    facts: ModelAuthFacts {
+                        byok: ModelByok::Byok,
+                        auth_scheme: xai_grok_sampler::AuthScheme::Bearer,
+                        readiness: crate::agent::auth_method::ModelReadiness::Ready,
+                    },
+                    provider: None,
+                }));
+
+            let cfg = actor.reconstruct_full_config().await;
+
+            assert_eq!(
+                cfg.credential_source,
+                Some(xai_grok_sampler::CredentialSource::ModelApiKey),
+                "Ready BYOK turn must surface the stored provenance, not None"
+            );
+            assert_eq!(cfg.api_key.as_deref(), Some("byok-model-key"));
+            assert!(cfg.bearer_resolver.is_none());
+        })
+        .await;
+}
+
 /// Without the live bearer resolver here the sampler would sign requests with
 /// the stale buffered token.
 #[tokio::test(flavor = "current_thread")]
@@ -1117,6 +1199,17 @@ async fn pre_flight_refresh_heals_session_method_with_stale_api_key_auth_type() 
                 Some("fresh-session-token"),
                 "session-based pre-flight refresh must heal a stale api_key with the live token"
             );
+            let creds = actor.chat_state_handle.get_credentials().await;
+            assert_eq!(
+                creds.auth_type(),
+                xai_chat_state::AuthType::SessionToken,
+                "the refresh must heal the stale ApiKey auth_type, not just the secret"
+            );
+            assert_eq!(
+                creds.source_cloned(),
+                Some(xai_grok_sampler::CredentialSource::XaiSession),
+                "an ambient session token must not keep a ModelApiKey label"
+            );
         })
         .await;
 }
@@ -1174,6 +1267,21 @@ async fn session_born_on_api_key_recovers_after_oidc_login_without_restart() {
                 actor.chat_state_handle.get_credentials().await.api_key(),
                 Some("fresh-oidc-token"),
                 "the stale api_key must be healed with the fresh OIDC token"
+            );
+            let creds = actor.chat_state_handle.get_credentials().await;
+            assert_eq!(
+                creds.auth_type(),
+                xai_chat_state::AuthType::SessionToken,
+                "the refresh must heal the stale ApiKey auth_type, not just the secret"
+            );
+            assert_eq!(
+                creds.source_cloned(),
+                Some(xai_grok_sampler::CredentialSource::XaiSession),
+                "an ambient session token must not keep a ModelApiKey label"
+            );
+            assert_eq!(
+                actor.reconstruct_full_config().await.credential_source,
+                Some(xai_grok_sampler::CredentialSource::XaiSession),
             );
         })
         .await;
@@ -1690,7 +1798,211 @@ async fn a_transient_catalog_failure_leaves_a_live_session_intact() {
                     cfg.bearer_resolver.is_some() || cfg.api_key.is_some(),
                     "{reason:?}: the live session must survive an unobtainable catalog"
                 );
+                // #151: the key survives, so its stored provenance must too.
+                // Before step 3 this was None on CatalogUnavailable and L3
+                // could not refuse ambient bytes on an external origin.
+                assert_eq!(
+                    cfg.credential_source,
+                    Some(xai_grok_sampler::CredentialSource::XaiSession),
+                    "{reason:?}: surviving chat-state credential must keep its stored source"
+                );
             }
+        })
+        .await;
+}
+
+/// #136 / #151 load-bearing: `Unknown(CatalogUnavailable)` on an *external*
+/// origin must refuse an ambient xAI credential at L3 (`SamplingClient::new`).
+///
+/// The first-party assertion in the sibling test only proves the label was
+/// carried — #151's hole cannot occur on `api.x.ai`. This one asserts the
+/// route is actually refused.
+///
+/// Construction goes through the open-then-login path: credentials start as
+/// `Missing` (pre-auth spawn), then the session-refresh writer installs the
+/// live JWT. With rebind the stored source becomes `XaiSession` and L3 fires;
+/// with `replace_api_key` the label stays `Missing`, L3 is disarmed, and this
+/// test fails.
+#[tokio::test(flavor = "current_thread")]
+async fn catalog_unavailable_external_refuses_ambient_session_credential() {
+    use crate::agent::auth_method::{ModelByok, ModelReadiness, UnknownReason};
+    use crate::agent::config::ModelAuthFacts;
+    use xai_grok_sampler::AuthScheme;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_dir, am) = auth_manager_with_valid_token("ambient-session-jwt");
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                Some(am),
+                "cached_token",
+                xai_chat_state::AuthType::SessionToken,
+                "unused-initial".to_string(),
+            )
+            .await;
+            // Pre-login spawn: production always pairs `Missing` with
+            // `api_key: None`. In-session auth then writes the live JWT.
+            actor
+                .chat_state_handle
+                .update_credentials(xai_chat_state::Credentials::bound(
+                    None,
+                    xai_chat_state::AuthType::SessionToken,
+                    xai_grok_sampler::CredentialSource::Missing,
+                ));
+            // Gate must be active for the refresh writer: first-party Ready.
+            pin_first_party_session_model(&actor).await;
+            actor.refresh_token_if_expired().await;
+            assert_eq!(
+                actor
+                    .chat_state_handle
+                    .get_credentials()
+                    .await
+                    .source_cloned(),
+                Some(xai_grok_sampler::CredentialSource::XaiSession),
+                "session-refresh writer must rebind ambient provenance, not preserve Missing"
+            );
+            assert_eq!(
+                actor.chat_state_handle.get_credentials().await.api_key(),
+                Some("ambient-session-jwt"),
+            );
+
+            // The #151 hole: catalog unobtainable + external origin + ambient bytes.
+            let mut cfg = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("sampling config");
+            cfg.base_url = "https://vendor.example/v1".to_string();
+            cfg.endpoint_trust = Some(xai_grok_sampler::EndpointTrustClass::External);
+            let model = cfg.model.clone();
+            actor.chat_state_handle.update_sampling_config(cfg);
+            actor
+                .model_auth_memo
+                .replace(Some(crate::session::acp_session::ModelAuthMemo {
+                    model_id: model,
+                    facts: ModelAuthFacts {
+                        byok: ModelByok::NotByok,
+                        auth_scheme: AuthScheme::Bearer,
+                        readiness: ModelReadiness::Unknown(UnknownReason::CatalogUnavailable),
+                    },
+                    provider: None,
+                }));
+
+            let cfg = actor.reconstruct_full_config().await;
+            assert_eq!(
+                cfg.credential_source,
+                Some(xai_grok_sampler::CredentialSource::XaiSession),
+                "CatalogUnavailable must keep the stored ambient source with the surviving key"
+            );
+            assert!(
+                cfg.api_key.is_some() || cfg.bearer_resolver.is_some(),
+                "the ambient credential must still be on the reconstructed config"
+            );
+
+            let err = xai_grok_sampler::SamplingClient::new(cfg)
+                .expect_err("L3 must refuse an ambient xAI credential on a non-first-party origin");
+            let rendered = format!("{err}");
+            assert!(
+                rendered.contains("ambient xAI credential is not allowed"),
+                "refusal must name the ambient-origin rule, got: {rendered}"
+            );
+            assert!(
+                !rendered.contains("ambient-session-jwt"),
+                "the error leaked the credential: {rendered}"
+            );
+        })
+        .await;
+}
+
+/// Same refusal as [`catalog_unavailable_external_refuses_ambient_session_credential`],
+/// but External comes only from a non-first-party `base_url` with
+/// `endpoint_trust: None` — the production arm at
+/// `SamplingClient::new` (`xai-grok-sampler` URL-derived trust), not the
+/// explicit-`Some(External)` match arm the sibling exercises.
+#[tokio::test(flavor = "current_thread")]
+async fn catalog_unavailable_url_derived_external_refuses_ambient_session_credential() {
+    use crate::agent::auth_method::{ModelByok, ModelReadiness, UnknownReason};
+    use crate::agent::config::ModelAuthFacts;
+    use xai_grok_sampler::AuthScheme;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_dir, am) = auth_manager_with_valid_token("ambient-session-jwt");
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                Some(am),
+                "cached_token",
+                xai_chat_state::AuthType::SessionToken,
+                "unused-initial".to_string(),
+            )
+            .await;
+            actor
+                .chat_state_handle
+                .update_credentials(xai_chat_state::Credentials::bound(
+                    None,
+                    xai_chat_state::AuthType::SessionToken,
+                    xai_grok_sampler::CredentialSource::Missing,
+                ));
+            pin_first_party_session_model(&actor).await;
+            actor.refresh_token_if_expired().await;
+            assert_eq!(
+                actor
+                    .chat_state_handle
+                    .get_credentials()
+                    .await
+                    .source_cloned(),
+                Some(xai_grok_sampler::CredentialSource::XaiSession),
+                "session-refresh writer must rebind ambient provenance, not preserve Missing"
+            );
+
+            let mut cfg = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("sampling config");
+            cfg.base_url = "https://vendor.example/v1".to_string();
+            // Production writes `endpoint_trust: None` and lets L3 derive
+            // External from the URL. Do not set Some(External) here.
+            cfg.endpoint_trust = None;
+            let model = cfg.model.clone();
+            actor.chat_state_handle.update_sampling_config(cfg);
+            actor
+                .model_auth_memo
+                .replace(Some(crate::session::acp_session::ModelAuthMemo {
+                    model_id: model,
+                    facts: ModelAuthFacts {
+                        byok: ModelByok::NotByok,
+                        auth_scheme: AuthScheme::Bearer,
+                        readiness: ModelReadiness::Unknown(UnknownReason::CatalogUnavailable),
+                    },
+                    provider: None,
+                }));
+
+            let cfg = actor.reconstruct_full_config().await;
+            assert!(
+                cfg.endpoint_trust.is_none(),
+                "fixture must leave trust unset so L3 takes the URL-derived arm"
+            );
+            assert_eq!(
+                cfg.credential_source,
+                Some(xai_grok_sampler::CredentialSource::XaiSession),
+                "CatalogUnavailable must keep the stored ambient source with the surviving key"
+            );
+            assert!(
+                cfg.api_key.is_some() || cfg.bearer_resolver.is_some(),
+                "the ambient credential must still be on the reconstructed config"
+            );
+
+            let err = xai_grok_sampler::SamplingClient::new(cfg).expect_err(
+                "L3 must refuse an ambient xAI credential on a URL-derived external origin",
+            );
+            let rendered = format!("{err}");
+            assert!(
+                rendered.contains("ambient xAI credential is not allowed"),
+                "refusal must name the ambient-origin rule, got: {rendered}"
+            );
+            assert!(
+                !rendered.contains("ambient-session-jwt"),
+                "the error leaked the credential: {rendered}"
+            );
         })
         .await;
 }

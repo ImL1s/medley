@@ -834,18 +834,32 @@ async fn read_parent_sampling_config(
             .unwrap_or(ctx.sampling_config.auth_scheme);
             let inherited_base_url = cfg.base_url.clone();
             let strip_guard = ctx.would_strip_fallback_key(creds.api_key());
-            // #110: the parent config carries its headers but not
-            // `credential_source`, so a parent authenticated by a header the
-            // user declared arrives here with its provenance gone. Wiring the
-            // parent session resolver on top would make the sampler strip that
-            // header and send the child's requests under the session instead.
-            // Re-derive from the headers, which do survive the rebuild.
-            // (Step 1 stores source on Credentials; this path still re-derives
-            // for SamplerConfig so wire behaviour is unchanged.)
+            // #110 / #136 steps 2-3: the parent chat-state `SamplingConfig`
+            // carries headers but not `credential_source`. Prefer re-deriving
+            // an `ExplicitHeader` from the header maps (still the live wire
+            // proof that a declared header is present); fall back to the
+            // provenance step 1 bound onto parent `Credentials` so ordinary
+            // session-token / BYOK parents no longer arrive unlabelled.
+            //
+            // Passing that source into `inherited_bearer_resolver` also gates
+            // the session resolver when the stored label is `ExplicitHeader`
+            // even if the env var has since been unset (header re-derivation
+            // yields nothing). The child then has neither key nor resolver and
+            // gets a 401 — conservative, and consistent with #110 treating a
+            // declared header as terminal auth.
             let declared_credential_header = crate::agent::config::explicit_credential_header_in(
                 &extra_headers,
                 &cfg.env_http_headers,
             );
+            let credential_source = declared_credential_header
+                .clone()
+                .map(
+                    |(header, env)| xai_grok_sampler::CredentialSource::ExplicitHeader {
+                        header,
+                        env,
+                    },
+                )
+                .or_else(|| creds.source_cloned());
             let api_key = if auth_scheme == xai_grok_sampler::AuthScheme::None {
                 None
             } else {
@@ -862,9 +876,7 @@ async fn read_parent_sampling_config(
                 // External must not silently become derivable-first-party
                 // (and vice versa) across the subagent boundary.
                 endpoint_trust: cfg.endpoint_trust,
-                credential_source: declared_credential_header.clone().map(|(header, env)| {
-                    xai_grok_sampler::CredentialSource::ExplicitHeader { header, env }
-                }),
+                credential_source: credential_source.clone(),
                 api_backend: cfg.api_backend,
                 auth_scheme,
                 extra_headers,
@@ -888,7 +900,12 @@ async fn read_parent_sampling_config(
                 {
                     None
                 } else {
-                    inherited_bearer_resolver(ctx, &cfg.model, &inherited_base_url, None)
+                    inherited_bearer_resolver(
+                        ctx,
+                        &cfg.model,
+                        &inherited_base_url,
+                        credential_source.as_ref(),
+                    )
                 },
                 supports_backend_search: ctx
                     .models_manager
