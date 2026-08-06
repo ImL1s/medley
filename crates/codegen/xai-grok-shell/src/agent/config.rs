@@ -9440,7 +9440,13 @@ reasoning_effort = "low"
     /// `Authorization` header they supplied, that message is not unhelpful, it
     /// is false.
     ///
-    /// Reverting either reader to `cfg.api_key.is_none()` fails this test.
+    /// Reverting **either of the two readers this test reaches** — the disable
+    /// reason and the notice decision — to `cfg.api_key.is_none()` fails it.
+    ///
+    /// It does **not** reach the third, `spawn.rs`'s gate, which is the one
+    /// that actually turns the tool off. That reader is guarded separately by
+    /// [`spawn_gates_web_search_on_the_shared_credential_predicate`], because
+    /// reverting it still compiles and no behavioural test reaches it.
     #[test]
     #[serial]
     fn header_authenticated_model_keeps_web_search_and_is_told_nothing() {
@@ -9506,6 +9512,50 @@ reasoning_effort = "low"
             )
             .is_none(),
             "a route with a credential must produce no disable notice"
+        );
+    }
+    /// #160: the reader that actually turns `web_search` off is `spawn.rs`'s
+    /// gate, and it must go through the shared predicate.
+    ///
+    /// Guarded by scanning source rather than by running anything, because the
+    /// regression is **type-decidable and silent**: `api_key` is now
+    /// `Option<String>`, so reverting the gate to `cfg.api_key.is_some()`
+    /// compiles cleanly, no behavioural test reaches that branch, and #160's
+    /// original symptom returns with the suite green. Same technique as
+    /// `no_user_facing_message_hardcodes_the_state_directory`, and for the same
+    /// reason — the property is not observable from the outside.
+    #[test]
+    fn spawn_gates_web_search_on_the_shared_credential_predicate() {
+        const SPAWN_SRC: &str = include_str!("../session/acp_session_impl/spawn.rs");
+        assert!(
+            SPAWN_SRC.contains("if crate::agent::config::has_usable_credential(&cfg) {"),
+            "spawn.rs must gate WebSearchConfig::Enabled on has_usable_credential. \
+             Inspecting `cfg.api_key` directly compiles and passes every other test, \
+             and re-disables web_search for header-authenticated models (#160)."
+        );
+    }
+    /// #160: the enable arm must also **forward** `env_http_headers`, not just
+    /// decide to enable.
+    ///
+    /// Sibling of [`spawn_gates_web_search_on_the_shared_credential_predicate`]
+    /// and silent for the same reason: the field has a `Default`, so dropping
+    /// it — or writing `Default::default()` — compiles cleanly. The failure it
+    /// produces is the worst shape available here: `web_search` is enabled and
+    /// then sends its request **unauthenticated**, because the credential lived
+    /// only in the env mapping. `has_usable_credential` returns true either way,
+    /// so the gate guarded above does not notice.
+    ///
+    /// The two wire tests in `web_search_e2e_tests` prove the client resolves
+    /// the map once it arrives; nothing else proves it arrives.
+    #[test]
+    fn spawn_forwards_env_http_headers_into_the_enabled_web_search_config() {
+        const SPAWN_SRC: &str = include_str!("../session/acp_session_impl/spawn.rs");
+        assert!(
+            SPAWN_SRC.contains("env_http_headers: cfg.env_http_headers,"),
+            "spawn.rs must forward `env_http_headers` into WebSearchConfig::Enabled. \
+             Dropping it compiles, leaves every behavioural test green, and enables \
+             web_search with the credential removed — the request then goes out \
+             unauthenticated (#160)."
         );
     }
     /// #160 counterweight: the fix must not become "enable everything". A route
