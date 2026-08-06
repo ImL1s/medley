@@ -9,11 +9,15 @@ use crate::leader::protocol::InternalMethod;
 /// The single model-restore edge used by `session/load` after registration and
 /// before its load guard is released. Keeping this wrapper in the load module
 /// prevents restore callers from accidentally taking the external wait path.
+/// The bypass is bound to the load's own guard, so a superseded duplicate
+/// load cannot resolve its handle through a newer load's marker.
 pub(super) async fn restore_registered_session_model(
     agent: &MvpAgent,
     request: acp::SetSessionModelRequest,
+    load_guard: &SessionLoadGuard<'_>,
 ) -> Result<acp::SetSessionModelResponse, acp::Error> {
-    crate::agent::handlers::model_switch::apply_during_session_load(agent, request).await
+    crate::agent::handlers::model_switch::apply_during_session_load(agent, request, load_guard)
+        .await
 }
 
 /// Which `x_search` sub-tools enforce the date cutoff, sent in `initialize`. `x_user_search` and
@@ -1532,7 +1536,7 @@ impl acp::Agent for MvpAgent {
         &self,
         arguments: acp::LoadSessionRequest,
     ) -> Result<acp::LoadSessionResponse, acp::Error> {
-        let _load_guard = self.begin_session_load(&arguments.session_id);
+        let load_guard = self.begin_session_load(&arguments.session_id);
         reject_chat_kind_without_feature(arguments.meta.as_ref())?;
         self.sweep_dead_sessions();
         self.drain_old_session_thread(&arguments.session_id).await;
@@ -2464,6 +2468,7 @@ impl acp::Agent for MvpAgent {
                 self,
                 acp::SetSessionModelRequest::new(session_id.to_owned(), model_id.clone())
                     .meta(restore_meta),
+                &load_guard,
             )
             .await;
             if let Err(e) = apply_result {

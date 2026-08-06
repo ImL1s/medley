@@ -2962,6 +2962,7 @@ fn load_restore_apply_bypasses_own_marker_and_preserves_request_order() {
             acp_agent::restore_registered_session_model(
                 &agent,
                 acp::SetSessionModelRequest::new(sid.clone(), acp::ModelId::new(restored_model)),
+                &guard,
             )
             .await
             .expect("session/load restore must not wait on its own marker");
@@ -3034,6 +3035,73 @@ async fn concurrent_load_guards_do_not_clobber_each_other() {
     assert!(
         agent.loading_sessions.borrow().is_empty(),
         "all markers removed once every load finished"
+    );
+}
+/// The load-restore bypass is owner-bound: with duplicate loads of the same
+/// session, the second `begin_session_load` replaces the marker, so the older
+/// load must NOT resolve a handle through the newer load's marker — only the
+/// load that owns the live marker may bypass.
+#[tokio::test]
+async fn older_load_cannot_borrow_newer_loads_marker() {
+    let agent = build_minimal_agent_for_tests();
+    let sid = acp::SessionId::new("sess-duplicate-load");
+    let guard_one = agent.begin_session_load(&sid);
+    let mut handle = make_test_handle("test-model", false, None);
+    handle.info.id = sid.clone();
+    agent.sessions.borrow_mut().insert(sid.clone(), handle);
+
+    // The only live marker is guard_one's: its own restore may bypass.
+    assert!(
+        agent.session_handle_during_load(&sid, &guard_one).is_some(),
+        "the load that owns the live marker must resolve its registered handle"
+    );
+
+    // A duplicate load begins and replaces the marker.
+    let guard_two = agent.begin_session_load(&sid);
+    assert!(
+        agent.session_handle_during_load(&sid, &guard_one).is_none(),
+        "the older load must not ride the newer load's marker"
+    );
+    assert!(
+        agent.session_handle_during_load(&sid, &guard_two).is_some(),
+        "the newer load owns the live marker and may bypass"
+    );
+
+    // Once the newer load's guard drops, its marker is gone; the older load's
+    // bypass stays refused (its own marker was replaced, never restored).
+    drop(guard_two);
+    assert!(
+        agent.session_handle_during_load(&sid, &guard_one).is_none(),
+        "no live marker owned by the older load means no bypass"
+    );
+    drop(guard_one);
+}
+/// The bounded load wait must fail closed: when it expires with the load
+/// guard still alive, the caller gets `None` — never the registered
+/// mid-restore handle, which is not ready. Driven by paused tokio time, so
+/// no real waiting occurs.
+#[tokio::test(start_paused = true)]
+async fn load_wait_timeout_fails_closed_on_mid_restore_handle() {
+    let agent = build_minimal_agent_for_tests();
+    let sid = acp::SessionId::new("sess-load-timeout");
+    let _guard = agent.begin_session_load(&sid);
+    // Registration lands before restoration finishes — the exact window the
+    // timeout must not expose.
+    let mut handle = make_test_handle("test-model", false, None);
+    handle.info.id = sid.clone();
+    agent.sessions.borrow_mut().insert(sid.clone(), handle);
+
+    // Paused time auto-advances past the 60s load-wait deadline while the
+    // guard is alive, expiring the bounded wait.
+    let resolved = agent.session_handle_waiting_for_load(&sid).await;
+    assert!(
+        resolved.is_none(),
+        "a timed-out load wait must fail closed, not hand out the mid-restore handle"
+    );
+    assert!(
+        agent.sessions.borrow().contains_key(&sid),
+        "the handle IS registered — `None` above is the fail-closed timeout, \
+         not an absent session"
     );
 }
 /// `resident_activity` returns `NeedsInput` whenever the session's

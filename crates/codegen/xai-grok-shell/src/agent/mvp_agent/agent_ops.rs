@@ -3074,21 +3074,40 @@ impl MvpAgent {
         &self,
         session_id: &acp::SessionId,
     ) -> Option<crate::session::SessionHandle> {
-        self.wait_for_in_flight_session_load(session_id).await;
-        self.sessions.borrow().get(session_id).cloned()
+        match self.wait_for_in_flight_session_load(session_id).await {
+            SessionLoadWait::Resolved => self.sessions.borrow().get(session_id).cloned(),
+            // Fail closed: the load guard is still alive, so restoration has
+            // not finished. A handle registered mid-restore is not ready, and
+            // handing it out as if it were is the still-restoring leak this
+            // branch exists to prevent.
+            SessionLoadWait::TimedOut => {
+                tracing::warn!(
+                    session_id = %session_id.0,
+                    "refusing session handle: load wait timed out with restore still in flight"
+                );
+                None
+            }
+        }
     }
     /// Resolve the registered handle from inside the active `session/load`.
     ///
     /// Unlike [`Self::session_handle_waiting_for_load`], this deliberately does
-    /// not wait for the marker owned by its caller. Requiring that marker to be
-    /// present keeps the bypass exclusive to the production restore path.
+    /// not wait for the marker owned by its caller. The bypass is bound to the
+    /// caller's own [`SessionLoadGuard`]: the marker in the map must be the one
+    /// that guard created. With duplicate loads of the same session the second
+    /// `begin_session_load` replaces the marker, so an older (or unrelated)
+    /// load can no longer ride the newer load's marker.
     pub(crate) fn session_handle_during_load(
         &self,
         session_id: &acp::SessionId,
+        load_guard: &SessionLoadGuard<'_>,
     ) -> Option<crate::session::SessionHandle> {
-        self.loading_sessions
+        let owns_marker = self
+            .loading_sessions
             .borrow()
-            .contains_key(session_id)
+            .get(session_id)
+            .is_some_and(|rx| rx.same_channel(&load_guard.rx));
+        owns_marker
             .then(|| self.sessions.borrow().get(session_id).cloned())
             .flatten()
     }
@@ -3101,24 +3120,28 @@ impl MvpAgent {
     /// The wait wakes when the load's [`SessionLoadGuard`] drops (success or
     /// failure) and re-checks; a failed load still surfaces the original error
     /// to the caller.
+    ///
+    /// The outcome distinguishes "no marker remains" from "the bounded wait
+    /// expired with the guard still alive" so callers can fail closed instead
+    /// of exposing a mid-restore handle as ready.
     pub(crate) async fn wait_for_in_flight_session_load(
         &self,
         session_id: &acp::SessionId,
-    ) {
+    ) -> SessionLoadWait {
         const LOAD_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
             60,
         );
         let deadline = tokio::time::Instant::now() + LOAD_WAIT_TIMEOUT;
         loop {
             let rx = self.loading_sessions.borrow().get(session_id).cloned();
-            let Some(mut rx) = rx else { return };
+            let Some(mut rx) = rx else { return SessionLoadWait::Resolved };
             let now = tokio::time::Instant::now();
             if now >= deadline {
                 tracing::warn!(
                     session_id = %session_id.0,
                     "timed out waiting for in-flight session/load"
                 );
-                return;
+                return SessionLoadWait::TimedOut;
             }
             let _ = tokio::time::timeout(deadline - now, rx.changed()).await;
         }

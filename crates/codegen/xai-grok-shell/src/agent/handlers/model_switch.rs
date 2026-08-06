@@ -6,8 +6,8 @@
 //! unready model (e.g. invalid `auth_scheme` fail-open → ambient Bearer).
 use crate::agent::config;
 use crate::agent::mvp_agent::{
-    MvpAgent, agent_name_after_model_switch, apply_session_cli_clamps, harnesses_are_compatible,
-    resolve_required_agent_type,
+    MvpAgent, SessionLoadGuard, agent_name_after_model_switch, apply_session_cli_clamps,
+    harnesses_are_compatible, resolve_required_agent_type,
 };
 use crate::session::SessionCommand;
 use agent_client_protocol::{self as acp};
@@ -103,26 +103,29 @@ pub(crate) async fn apply(
     agent: &MvpAgent,
     args: acp::SetSessionModelRequest,
 ) -> Result<acp::SetSessionModelResponse, acp::Error> {
-    apply_with_load_gate(agent, args, true).await
+    apply_with_load_gate(agent, args, None).await
 }
 
 /// Apply the model restored by `session/load` while that load's guard is alive.
 ///
 /// The load owns the marker that normally gates external session requests, so
-/// waiting for it here would wait on ourselves. The registered handle is still
+/// waiting for it here would wait on ourselves. The bypass is bound to the
+/// caller's own guard: an older duplicate load (or any unrelated caller)
+/// cannot ride a newer load's marker. The registered handle is still
 /// required, and the normal per-session dispatch lock continues to serialize
 /// the actor commit with every external request.
 pub(crate) async fn apply_during_session_load(
     agent: &MvpAgent,
     args: acp::SetSessionModelRequest,
+    load_guard: &SessionLoadGuard<'_>,
 ) -> Result<acp::SetSessionModelResponse, acp::Error> {
-    apply_with_load_gate(agent, args, false).await
+    apply_with_load_gate(agent, args, Some(load_guard)).await
 }
 
 async fn apply_with_load_gate(
     agent: &MvpAgent,
     args: acp::SetSessionModelRequest,
-    wait_for_session_load: bool,
+    load_guard: Option<&SessionLoadGuard<'_>>,
 ) -> Result<acp::SetSessionModelResponse, acp::Error> {
     tracing::info!("Received set session model request {args:?}");
     tracing::debug!("session_session_model::mvp_agent: {:?}", &args);
@@ -135,10 +138,9 @@ async fn apply_with_load_gate(
     // Armed until the complete actor receipt and outer mirrors have committed.
     // Every early return therefore emits exactly one sanitized failure event.
     let mut failure_telemetry = FailureTelemetry::new(&session_id, &model_id);
-    let handle = if wait_for_session_load {
-        agent.session_handle_waiting_for_load(&session_id).await
-    } else {
-        agent.session_handle_during_load(&session_id)
+    let handle = match load_guard {
+        Some(guard) => agent.session_handle_during_load(&session_id, guard),
+        None => agent.session_handle_waiting_for_load(&session_id).await,
     }
     .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))?;
     // Resolve an in-flight load before taking the per-session dispatch lock.

@@ -1422,6 +1422,68 @@ fn deferred_model_switch_blocked_by_other_agent_toasts_and_restores_display() {
     );
 }
 
+/// The dashboard / router / settings pick paths reserve the global slot at
+/// stash time, before any request id exists. When the apply-time re-check
+/// then drops the stash (the model is no longer ready at hydration), the
+/// `deferred == None` path of `begin_or_reject_deferred_model_switch` runs —
+/// it must release that request-less transaction too, or
+/// `begin_model_switch_request` refuses every later switch app-wide until
+/// the agent is closed.
+#[test]
+fn deferred_switch_dropped_at_apply_releases_stash_time_slot() {
+    let mut app = test_app_with_agent();
+    let id_a = AgentId(0);
+    let id_b = AgentId(1);
+    let session_b = make_test_agent_session(&app, id_b, "agent-b");
+    app.agents
+        .insert(id_b, AgentView::new(session_b, ScrollbackState::new()));
+    app.next_agent_id = 2;
+    {
+        let agent_b = app.agents.get_mut(&id_b).unwrap();
+        agent_b.session.session_id = None;
+        // Stashed while the model was ready; the catalog no longer has it.
+        agent_b.session.deferred_model_switch = Some(crate::app::agent::DeferredModelSwitch {
+            model_id: acp::ModelId::new(std::sync::Arc::from("gone-model")),
+            effort: None,
+            prev_model_id: None,
+        });
+    }
+    // The stash-time claim: this agent owns the slot, no request id yet.
+    app.model_switch_transaction = Some(crate::app::app_view::ModelSwitchTransaction {
+        owner_agent_id: id_b,
+        request_id: None,
+        app_models_optimistic: false,
+        app_model_id: None,
+        app_reasoning_effort: None,
+    });
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SessionCreated {
+            agent_id: id_b,
+            session_id: acp::SessionId::new("b-session"),
+            models: None,
+            scheduler_background_loops: None,
+        }),
+        &mut app,
+    );
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::SwitchModel { agent_id, .. } if *agent_id == id_b)),
+        "a stash dropped by the apply-time re-check must not emit a switch: {effects:?}"
+    );
+    assert!(
+        app.model_switch_transaction.is_none(),
+        "the stash-time slot claim must be released with the stash, not wedge every later switch"
+    );
+    assert!(
+        crate::app::dispatch::session::lifecycle::begin_deferred_model_switch(
+            &mut app, id_a, false
+        ),
+        "after release the global slot must admit the next agent's switch"
+    );
+}
+
 /// The two ways the restore step got the target wrong.
 ///
 /// `empty_snapshot`: nothing was displayed before the pick, so the rollback
