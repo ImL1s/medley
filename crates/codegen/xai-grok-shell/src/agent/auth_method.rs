@@ -560,6 +560,19 @@ pub fn auth_error_api_key() -> String {
     )
 }
 
+/// Readiness / auth-required reason when an ambient xAI credential is withheld
+/// because the model's resolved origin is not an xAI endpoint (#123 option 3).
+///
+/// `origin` must already be secret-free (use [`crate::agent::config::sanitized_origin`]).
+/// This is the same shape as [`auth_error_session_expired`] / [`auth_error_api_key`]:
+/// a single constructor for the user-facing string, never the credential bytes.
+pub fn auth_error_ambient_origin_refused(origin: &str) -> String {
+    format!(
+        "xAI credential withheld for non-xAI origin {origin}: set api_key, env_key, or auth_provider \
+         — or auth_scheme = \"none\" for a keyless local server"
+    )
+}
+
 /// Next ACP method id when `cached_token` cannot proceed (missing / expired /
 /// legacy WebLogin), or `None` when fallthrough is forbidden.
 ///
