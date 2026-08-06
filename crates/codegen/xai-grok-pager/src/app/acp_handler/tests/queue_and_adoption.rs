@@ -1043,6 +1043,7 @@
                 restore_degree: None,
                 running_prompt_id: Some("p-run".to_string()),
                 scheduler_background_loops: None,
+                web_search_disabled: None,
             }),
             &mut app,
         );
@@ -1169,6 +1170,7 @@
                 restore_degree: None,
                 running_prompt_id: Some("task-completed-abc-123".to_string()),
                 scheduler_background_loops: None,
+                web_search_disabled: None,
             }),
             &mut app,
         );
@@ -1210,6 +1212,7 @@
                 restore_degree: None,
                 running_prompt_id: Some(pid.to_string()),
                 scheduler_background_loops: None,
+                web_search_disabled: None,
             }),
             &mut app,
         );
@@ -1248,6 +1251,7 @@
                 restore_degree: None,
                 running_prompt_id: Some("p-run".to_string()),
                 scheduler_background_loops: None,
+                web_search_disabled: None,
             }),
             &mut app,
         );
@@ -1282,6 +1286,7 @@
                 restore_degree: None,
                 running_prompt_id: None,
                 scheduler_background_loops: None,
+                web_search_disabled: None,
             }),
             &mut app,
         );
@@ -2532,6 +2537,7 @@
                 restore_degree: None,
                 running_prompt_id: Some("p-run".to_string()),
                 scheduler_background_loops: None,
+                web_search_disabled: None,
             }),
             &mut app,
         );

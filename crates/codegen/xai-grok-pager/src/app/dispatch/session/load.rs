@@ -1054,7 +1054,25 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
     restore_degree: Option<xai_grok_workspace::session::git::RestoreDegree>,
     running_prompt_id: Option<String>,
     scheduler_background_loops: Option<bool>,
+    web_search_disabled: Option<xai_grok_shell::session::WebSearchDisabledNotice>,
 ) -> Vec<Effect> {
+    // #161: a resumed session must be told too. The notice was never persisted,
+    // so replayed history cannot carry it — this response is the only source.
+    let is_api_key_auth = app.is_api_key_auth;
+    if let Some(notice) = web_search_disabled
+        && let Some(agent) = app.agents.get_mut(&agent_id)
+    {
+        crate::app::acp_handler::apply_session_event(
+            &xai_grok_shell::extensions::notification::SessionUpdate::WebSearchDisabled {
+                model_id: notice.model_id,
+                reason: notice.reason,
+                message: notice.message,
+            },
+            &mut agent.session,
+            &mut agent.scrollback,
+            is_api_key_auth,
+        );
+    }
     tracing::info!(
         "Session loaded for agent {:?} session {:?}",
         agent_id,

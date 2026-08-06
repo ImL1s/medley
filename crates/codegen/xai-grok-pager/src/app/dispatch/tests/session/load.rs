@@ -45,6 +45,7 @@ fn session_loaded_with_restore_shows_summary_in_scrollback() {
             restore_degree: Some(xai_grok_workspace::session::git::RestoreDegree::Full),
             running_prompt_id: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -103,6 +104,7 @@ fn restored_session_applies_deferred_switch_before_draining_prompt_queue() {
             restore_degree: None,
             running_prompt_id: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -232,6 +234,7 @@ fn session_loaded_without_adoption_finishes_replayed_running_entries() {
             restore_degree: None,
             running_prompt_id: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -300,6 +303,7 @@ fn session_loaded_purges_replay_transient() {
             restore_degree: None,
             running_prompt_id: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -325,6 +329,7 @@ fn session_loaded_during_open_reload_window_defers_to_window() {
             restore_degree: None,
             running_prompt_id: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -435,6 +440,7 @@ fn session_loaded_with_restore_failure_shows_warning_banner() {
             restore_degree: None,
             running_prompt_id: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -477,6 +483,7 @@ fn session_loaded_without_restore_no_summary() {
             restore_degree: None,
             running_prompt_id: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -520,6 +527,7 @@ fn session_loaded_without_restore_resets_restore_degree() {
             restore_degree: Some(xai_grok_workspace::session::git::RestoreDegree::Full),
             running_prompt_id: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -537,6 +545,7 @@ fn session_loaded_without_restore_resets_restore_degree() {
             restore_degree: None,
             running_prompt_id: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -566,6 +575,7 @@ fn session_loaded_with_flag_emits_five_fetches_and_clears_flag() {
             restore_degree: None,
             running_prompt_id: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -759,6 +769,7 @@ fn session_loaded_drains_pending_first_prompt_to_front() {
             restore_degree: None,
             running_prompt_id: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -789,6 +800,7 @@ fn session_loaded_with_no_pending_first_prompt_does_not_enqueue() {
             restore_degree: None,
             running_prompt_id: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -895,6 +907,7 @@ fn session_loaded_clears_stale_running_entries() {
             restore_degree: None,
             running_prompt_id: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -935,6 +948,7 @@ fn resume_focuses_existing_agent_for_open_session() {
             session_id: "wt-sess-1".into(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -953,6 +967,7 @@ fn resume_focuses_existing_agent_for_open_session() {
             session_id: "new-sess-2".into(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -984,6 +999,7 @@ fn resume_unknown_session_still_creates_new_agent() {
             session_id: "sess-aaa".into(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1015,6 +1031,7 @@ fn resume_open_session_does_not_rearm_stale_overlay() {
             session_id: "sess-a".into(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1026,6 +1043,7 @@ fn resume_open_session_does_not_rearm_stale_overlay() {
             session_id: "sess-b".into(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1052,6 +1070,7 @@ fn resume_conversation_does_not_focus_build_id_collision() {
             session_id: "shared-id".into(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1084,6 +1103,7 @@ fn duplicate_load_unbind_invalidates_old_minimal_btw_response() {
             session_id: "shared-id".into(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1128,6 +1148,7 @@ fn resume_under_chat_mode_focuses_despite_entry_false() {
             session_id: "chat-mode-sess".into(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1140,6 +1161,7 @@ fn resume_under_chat_mode_focuses_despite_entry_false() {
             session_id: "other".into(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1166,6 +1188,7 @@ fn resume_stale_attached_target_focuses_dashboard_row() {
             session_id: "sess-a".into(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1177,6 +1200,7 @@ fn resume_stale_attached_target_focuses_dashboard_row() {
             session_id: "sess-b".into(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1251,6 +1275,7 @@ fn session_restored_clears_stale_session_id() {
             session_id: "remote-sess".into(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -2428,5 +2453,53 @@ fn plain_picker_fetch_carries_no_query_and_bumps_seq() {
             }]
         ),
         "picker fetch must be unfiltered and supersede the search, got {effects:?}"
+    );
+}
+/// #161 gating condition 3: a **resumed** session must be told too.
+///
+/// The assertion is "fires on resume", not "must not duplicate replayed
+/// history", and that direction was established rather than assumed: the
+/// removed sender went out via `gateway.ext_notification` with **no**
+/// `persistence_tx`, so the notice was never written to `updates.jsonl` and
+/// replay has nothing to duplicate. This response is the only thing that can
+/// tell a resuming user — asserting the other direction would have been
+/// asserting a fiction.
+#[test]
+fn web_search_disabled_meta_renders_once_on_resume() {
+    use crate::scrollback::block::RenderBlock;
+    const MSG: &str =
+        "web_search is unavailable: model \"grok-4-fast\" could not be used (model is not ready)";
+    let mut app = test_app();
+    dispatch(
+        Action::LoadSession("sess-resume-ws".into(), None, false),
+        &mut app,
+    );
+    let id = AgentId(0);
+    let _ = dispatch(
+        Action::TaskComplete(TaskResult::SessionLoaded {
+            agent_id: id,
+            session_id: acp::SessionId::new("sess-resume-ws"),
+            models: None,
+            code_restored: false,
+            restore_summary: None,
+            restore_degree: None,
+            running_prompt_id: None,
+            scheduler_background_loops: None,
+            web_search_disabled: Some(xai_grok_shell::session::WebSearchDisabledNotice {
+                model_id: "grok-4-fast".into(),
+                reason: "model is not ready".into(),
+                message: MSG.to_string(),
+            }),
+        }),
+        &mut app,
+    );
+    let sb = &app.agents[&id].scrollback;
+    let hits = (0..sb.len())
+        .filter_map(|i| sb.get(i))
+        .filter(|e| matches!(&e.block, RenderBlock::System(b) if b.text == MSG))
+        .count();
+    assert_eq!(
+        hits, 1,
+        "resumed session must be told exactly once, saw {hits}"
     );
 }

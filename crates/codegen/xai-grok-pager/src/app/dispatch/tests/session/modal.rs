@@ -76,6 +76,7 @@ fn session_created_with_flag_but_modal_closed_clears_flag_no_fetches() {
             session_id: acp::SessionId::new("s"),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );

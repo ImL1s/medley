@@ -1340,12 +1340,32 @@ pub(in crate::app::dispatch) fn handle_session_created(
     session_id: acp::SessionId,
     new_models: Option<acp::SessionModelState>,
     scheduler_background_loops: Option<bool>,
+    web_search_disabled: Option<xai_grok_shell::session::WebSearchDisabledNotice>,
 ) -> Vec<Effect> {
     let agent_count = app.agents.len();
     let app_chat_mode = app.chat_mode;
+    // Captured before the `agents` borrow below, like `app_chat_mode`.
+    let is_api_key_auth = app.is_api_key_auth;
     let switch_hint =
         crate::views::dashboard::session_switch_hint_command(app.screen_mode.is_minimal());
     if let Some(agent) = app.agents.get_mut(&agent_id) {
+        // #161: the notice rides this response rather than an
+        // `x.ai/session_notification`, which could not be routed before the
+        // client had bound the session id. Rendered through the same
+        // `apply_session_event` arm the notification used, so the renderer and
+        // its test stay live rather than orphaned by the sender's removal.
+        if let Some(notice) = web_search_disabled {
+            crate::app::acp_handler::apply_session_event(
+                &xai_grok_shell::extensions::notification::SessionUpdate::WebSearchDisabled {
+                    model_id: notice.model_id,
+                    reason: notice.reason,
+                    message: notice.message,
+                },
+                &mut agent.session,
+                &mut agent.scrollback,
+                is_api_key_auth,
+            );
+        }
         let session_id_clone = session_id.clone();
         if agent.session.created_via_new
             && agent_count > 1
@@ -1586,8 +1606,25 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
     session_cwd: std::path::PathBuf,
     new_models: Option<acp::SessionModelState>,
     scheduler_background_loops: Option<bool>,
+    web_search_disabled: Option<xai_grok_shell::session::WebSearchDisabledNotice>,
 ) -> Vec<Effect> {
+    // Captured before the `agents` borrow, as in `handle_session_created`.
+    let is_api_key_auth = app.is_api_key_auth;
     if let Some(agent) = app.agents.get_mut(&agent_id) {
+        // #161: same treatment as the non-worktree path — a worktree session is
+        // still a fresh session whose response carries the notice.
+        if let Some(notice) = web_search_disabled {
+            crate::app::acp_handler::apply_session_event(
+                &xai_grok_shell::extensions::notification::SessionUpdate::WebSearchDisabled {
+                    model_id: notice.model_id,
+                    reason: notice.reason,
+                    message: notice.message,
+                },
+                &mut agent.session,
+                &mut agent.scrollback,
+                is_api_key_auth,
+            );
+        }
         agent.session.finish_command();
         agent.mark_turn_finished();
         let session_id_clone = session_id.clone();

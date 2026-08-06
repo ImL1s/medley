@@ -1682,6 +1682,7 @@ fn incompatible_model_switch_hands_queue_to_replacement_until_target_switch_succ
             session_id: "replacement-session".into(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1797,6 +1798,7 @@ fn handed_queue_stays_gated_when_deferred_target_switch_fails() {
                 session_id: format!("replacement-{failure_kind}").into(),
                 models: None,
                 scheduler_background_loops: None,
+                web_search_disabled: None,
             }),
             &mut app,
         );
@@ -1930,6 +1932,7 @@ fn failed_deferred_target_preflight_aborts_transaction_and_restores_source_queue
                 session_id: format!("replacement-{target_state}").into(),
                 models: None,
                 scheduler_background_loops: None,
+                web_search_disabled: None,
             }),
             &mut app,
         );
@@ -2359,6 +2362,7 @@ fn replacement_session_persists_confirmed_default_after_creation() {
             session_id: "replacement-default".into(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -2974,6 +2978,7 @@ fn no_deferred_switch_means_no_extra_effect() {
             session_id: "new-session".into(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -4389,6 +4394,7 @@ fn adoption_persists_model(pre_session: bool) {
                 session_id: "source-session".into(),
                 models: None,
                 scheduler_background_loops: None,
+                web_search_disabled: None,
             }),
             &mut app,
         );
@@ -4440,6 +4446,7 @@ fn adoption_persists_model(pre_session: bool) {
             session_id: "replacement-session".into(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );

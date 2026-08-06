@@ -592,6 +592,24 @@ struct OpenedSession {
     models: ModelState,
     /// Directory the session is anchored to (launch cwd, resume `original_cwd`, or fork `write_cwd`).
     cwd: PathBuf,
+    /// #161: user-facing notice when `web_search` was withheld. `None` means it
+    /// is available — an absent meta key is the "nothing wrong" signal, so there
+    /// is no "disabled but the notice went missing" state to distinguish.
+    web_search_disabled: Option<String>,
+}
+
+/// Read the #161 web-search disable message out of a `session/new` /
+/// `session/load` response `_meta`.
+///
+/// This is the only channel that reaches headless at all: the shell used to
+/// announce this with an `x.ai/session_notification`, and headless has no xAI
+/// notification consumer, so `medley -p` never surfaced it under any timing.
+fn web_search_disabled_message(meta: Option<&acp::Meta>) -> Option<String> {
+    meta?
+        .get(xai_grok_shell::session::WEB_SEARCH_DISABLED_META_KEY)?
+        .get("message")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 async fn open_session(
@@ -622,6 +640,7 @@ async fn open_session(
         if let Ok(resp) = try_load {
             return Ok(OpenedSession {
                 session_id: acp::SessionId::new(sid.to_string()),
+                web_search_disabled: web_search_disabled_message(resp.meta.as_ref()),
                 models: ModelState::from(resp.models),
                 cwd: cwd.to_path_buf(),
             });
@@ -635,6 +654,8 @@ async fn open_session(
     )
     .await?;
     Ok(OpenedSession {
+        // Read before the field moves below.
+        web_search_disabled: web_search_disabled_message(new_resp.meta.as_ref()),
         session_id: new_resp.session_id,
         models: ModelState::from(new_resp.models),
         cwd: cwd.to_path_buf(),
@@ -662,6 +683,8 @@ async fn open_session_with_id(
     )
     .await?;
     Ok(OpenedSession {
+        // Read before the field moves below.
+        web_search_disabled: web_search_disabled_message(new_resp.meta.as_ref()),
         session_id: new_resp.session_id,
         models: ModelState::from(new_resp.models),
         cwd: cwd.to_path_buf(),
@@ -1028,6 +1051,7 @@ pub async fn run_single_turn(
         session_id,
         models: session_models,
         cwd: session_cwd,
+        web_search_disabled,
     } = match opened {
         Ok(v) => v,
         Err(e) => {
@@ -1036,6 +1060,13 @@ pub async fn run_single_turn(
             anyhow::bail!("{msg}");
         }
     };
+    // #161: stderr for every format, deliberately. stdout is the machine-readable
+    // contract for `--output-format json` and the streaming formats, so a human
+    // notice there would corrupt every consumer of it. `on_error` /
+    // `on_max_turns` already use stderr for the same reason.
+    if let Some(notice) = &web_search_disabled {
+        eprintln!("{notice}");
+    }
     tracing::debug!(
         elapsed_ms = t_session.elapsed().as_millis() as u64,
         session_id = %session_id.0,

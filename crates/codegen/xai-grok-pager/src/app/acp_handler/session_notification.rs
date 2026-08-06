@@ -1160,7 +1160,12 @@ pub(crate) fn apply_session_event_for_test(
 ) -> bool {
     apply_session_event(update, session, scrollback, false)
 }
-pub(super) fn apply_session_event(
+// `pub(in crate::app)` rather than `pub(super)`: #161 moved the web-search
+// disable notice off `x.ai/session_notification` and onto the session response,
+// so `dispatch::session::lifecycle` now renders it through this same arm. Kept
+// as one renderer deliberately — a second copy in dispatch would drift, and the
+// existing coverage here would go on passing while the real path rotted.
+pub(in crate::app) fn apply_session_event(
     update: &XaiSessionUpdate,
     session: &mut AgentSession,
     scrollback: &mut crate::scrollback::state::ScrollbackState,

@@ -187,6 +187,22 @@ pub(crate) fn parse_session_scheduler_background_loops(
         })
         .and_then(|v| v.as_bool())
 }
+/// #161: the web-search disable notice from a `session/new` / `session/load`
+/// response `_meta`. `None` means `web_search` is available.
+///
+/// Sibling of [`parse_session_scheduler_background_loops`] and read the same
+/// way, because it is the same kind of value: session-scoped state the shell
+/// resolves at spawn and publishes on the response rather than announcing.
+/// Returns the whole notice, not just `message`: the pager's renderer logs
+/// `model_id` and `reason` via `tracing::warn!` before pushing the block, and
+/// dropping them would leave the warning without the two fields that make it
+/// actionable.
+pub(crate) fn parse_session_web_search_disabled(
+    resp_meta: Option<&acp::Meta>,
+) -> Option<xai_grok_shell::session::WebSearchDisabledNotice> {
+    let raw = resp_meta.and_then(|m| m.get(xai_grok_shell::session::WEB_SEARCH_DISABLED_META_KEY))?;
+    serde_json::from_value(raw.clone()).ok()
+}
 /// Whether `raw` is (or wraps) a disk-full / ENOSPC failure.
 fn is_disk_full_error(raw: &str) -> bool {
     raw.contains(xai_fast_worktree::OUT_OF_DISK_CONTEXT)
