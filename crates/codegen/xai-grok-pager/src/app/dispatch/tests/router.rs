@@ -1758,6 +1758,10 @@ fn pick_over_cli_seed_keeps_display_as_rollback_target() {
     let displayed = acp::ModelId::new(std::sync::Arc::from("displayed-model"));
     let cli_model = acp::ModelId::new(std::sync::Arc::from("cli-model"));
     let picked = acp::ModelId::new(std::sync::Arc::from("picked-model"));
+    // Without this the pick is refused at the catalog-miss readiness guard and
+    // the stash is never touched, so this test asserted its expectation against
+    // code it never reached. It has been red since that guard landed.
+    insert_ready_model(&mut app, id, &picked);
     let agent = app.agents.get_mut(&id).unwrap();
     agent.session.session_id = None;
     agent.session.models.current = Some(displayed.clone());
