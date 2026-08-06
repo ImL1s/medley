@@ -247,14 +247,31 @@ fn is_campaign_driven_preference(cfg: &config::Config, source: config::ConfigSou
     cfg.models.default_is_campaign_driven && matches!(source, config::ConfigSource::Config)
 }
 
-/// A configured default that was **not found in the catalog**, so a substitute
-/// was seated in its place.
+/// `initialize` / `x.ai/models/update` `_meta` key naming a configured default
+/// that was **not seated**, so a substitute was used instead (#131).
 ///
-/// This is the one rejection a client cannot reconstruct. When the configured
-/// model is present but unready, #145 keeps it selected, so `currentModelId`
-/// names it and `availableModels` carries its `readinessReason`. When it is
-/// absent there is nothing to look up — it is not in the catalog — and the
-/// substitute occupies every field that would otherwise have named it (#131).
+/// Shape: `{"configuredModelId": "<id>", "source": "cli" | "env" | "config"}`.
+///
+/// "Not seated" covers both catalog absence and present-but-not-user-selectable
+/// preferences: both fall through to [`config::ConfigSource::Default`] in
+/// [`resolve_default_model`], and both leave the configured id out of the
+/// selectable listing a client can look up. Present-but-unready is different —
+/// #145 keeps that model selected, so this key stays omitted.
+///
+/// On `initialize`, omitted (not null) when the preference was honoured. On
+/// `x.ai/models/update`, present as the object or as JSON `null` so a prior
+/// accusation can be retracted when the catalog self-corrects.
+pub(crate) const SUBSTITUTED_DEFAULT_MODEL_META_KEY: &str = "x.ai/substitutedDefaultModel";
+
+/// A configured default that was **not seated**, so a substitute was used.
+///
+/// This is the one rejection a client cannot reconstruct from
+/// `currentModelId` + `availableModels` alone. When the configured model is
+/// present but unready, #145 keeps it selected, so `currentModelId` names it
+/// and `availableModels` carries its `readinessReason`. When it is absent from
+/// the catalog, or present but not user-selectable, there is nothing useful to
+/// look up — and the substitute occupies every field that would otherwise have
+/// named the preference (#131).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SubstitutedPreference {
     /// The model id the user configured, verbatim.
@@ -268,17 +285,35 @@ pub(crate) struct SubstitutedPreference {
 impl SubstitutedPreference {
     /// Stable wire spelling of the configuration that supplied the preference.
     ///
-    /// Written out rather than reusing `Display`: that one is the logging
-    /// format, and a client contract must not shift because someone retunes a
-    /// log line.
+    /// Exhaustive over [`config::ConfigSource`] so a new variant fails to
+    /// compile rather than being silently labelled `"config"`. Only the three
+    /// explicit arms are reachable: [`substituted_preference`] filters to
+    /// those before constructing this type.
     pub(crate) fn source_wire(&self) -> &'static str {
         match self.source {
             config::ConfigSource::Cli => "cli",
             config::ConfigSource::Env => "env",
-            // `substituted_preference` constructs this only for explicit
-            // sources, and `Config` is the only one left.
-            _ => "config",
+            config::ConfigSource::Config => "config",
+            config::ConfigSource::Requirement
+            | config::ConfigSource::SystemManagedConfig
+            | config::ConfigSource::ManagedConfig
+            | config::ConfigSource::UserConfig
+            | config::ConfigSource::Remote
+            | config::ConfigSource::Default => {
+                unreachable!(
+                    "substituted_preference only constructs Cli|Env|Config; got {}",
+                    self.source
+                )
+            }
         }
+    }
+
+    /// Wire object for [`SUBSTITUTED_DEFAULT_MODEL_META_KEY`].
+    pub(crate) fn to_meta_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "configuredModelId": self.configured,
+            "source": self.source_wire(),
+        })
     }
 }
 

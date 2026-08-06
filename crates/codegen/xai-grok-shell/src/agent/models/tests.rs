@@ -2299,19 +2299,22 @@ fn ready_entry(slug: &str) -> ModelEntry {
 }
 
 fn manager_over(cfg: &config::Config, catalog: IndexMap<String, ModelEntry>) -> ModelsManager {
-    let tmp = std::env::temp_dir().join("grok-test-models-131");
-    let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
+    let tmp = tempfile::tempdir().expect("temp home for #131 models tests");
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    // Persist the directory for AuthManager's lifetime; unique per call so
+    // parallel tests do not race on a shared `grok-test-models-131` path.
+    let _path = tmp.keep();
     ModelsManager::from_config(cfg, Some(catalog), auth_manager)
         .expect("manager construction should succeed")
 }
 
-/// #131: a configured default **absent from the catalog** is still substituted,
-/// and that substitution is now reported — the configured id and the
-/// configuration that supplied it.
+/// #131: a configured default **not seated** (absent from the catalog, or
+/// present but not user-selectable) is still substituted, and that substitution
+/// is now reported — the configured id and the configuration that supplied it.
 ///
 /// This is the case no client can reconstruct: the substitute occupies
-/// `currentModelId`, and the configured model is not in `availableModels` to be
-/// looked up because it is not in the catalog at all.
+/// `currentModelId`, and the configured model is not in the selectable
+/// `availableModels` listing to be looked up.
 ///
 /// The selection itself is asserted unchanged. This reports the decision; it
 /// does not remake it.
@@ -2496,5 +2499,105 @@ fn configured_unready_default_already_publishes_its_reason_per_model() {
             .and_then(serde_json::Value::as_str),
         Some(reason.as_str()),
         "the reason the client renders is the reason readiness computed"
+    );
+}
+
+/// #131 B2: when the current model is still present and selectable,
+/// `reselect_current_model_if_missing` must still recompute the substitution
+/// verdict. A stale `Some` taken against an emptier catalog would otherwise
+/// survive the early return forever.
+#[test]
+fn reselect_if_missing_clears_stale_substitution_on_early_return() {
+    let mut cfg = config::Config::default();
+    cfg.models.default = Some("grok-4".to_string());
+    let mut catalog = IndexMap::new();
+    catalog.insert("grok-4".to_string(), ready_entry("grok-4"));
+    let mgr = manager_over(&cfg, catalog);
+    assert_eq!(mgr.current_model_id().0.as_ref(), "grok-4");
+    assert!(
+        mgr.substituted_preference().is_none(),
+        "precondition: preference is honoured"
+    );
+
+    *mgr.inner.substituted_preference.write() = Some(SubstitutedPreference {
+        configured: "grok-4".to_string(),
+        source: config::ConfigSource::Config,
+    });
+    assert!(
+        mgr.substituted_preference().is_some(),
+        "precondition: inject a stale accusation"
+    );
+
+    mgr.reselect_current_model_if_missing(&cfg);
+    assert!(
+        mgr.substituted_preference().is_none(),
+        "early-return must still clear a stale substitution verdict"
+    );
+}
+
+/// #131 B2: `clear()` must wipe the substitution verdict so a new identity
+/// does not inherit the previous identity's accusation.
+#[test]
+fn clear_wipes_substituted_preference() {
+    let mut cfg = config::Config::default();
+    cfg.models.default = Some("typo-provider".to_string());
+    let mut catalog = IndexMap::new();
+    catalog.insert("grok-4".to_string(), ready_entry("grok-4"));
+    let mgr = manager_over(&cfg, catalog);
+    assert!(
+        mgr.substituted_preference().is_some(),
+        "precondition: absent preference is reported"
+    );
+
+    mgr.clear();
+    assert!(
+        mgr.substituted_preference().is_none(),
+        "clear() must wipe the substitution verdict with the rest of identity state"
+    );
+}
+
+/// #131 B1: after a false accusation against a thinner catalog, landing the
+/// real catalog must clear the in-memory verdict *and* the models-update
+/// `_meta` payload (JSON null), so a client holding the initialize snapshot
+/// can retract it.
+#[test]
+fn models_update_meta_clears_substitution_after_catalog_lands() {
+    let mut cfg = config::Config::default();
+    cfg.models.default = Some("my-byo".to_string());
+
+    let mut thin = IndexMap::new();
+    thin.insert("grok-4".to_string(), ready_entry("grok-4"));
+    let mgr = manager_over(&cfg, thin);
+    assert!(
+        mgr.substituted_preference().is_some(),
+        "precondition: thin catalog substitutes the preference"
+    );
+
+    let mut accused = serde_json::Map::new();
+    mgr.write_substituted_default_model_meta(&mut accused, true);
+    assert!(
+        accused
+            .get(SUBSTITUTED_DEFAULT_MODEL_META_KEY)
+            .is_some_and(|v| v.is_object()),
+        "models/update meta must carry the accusation while it stands"
+    );
+
+    let mut full = IndexMap::new();
+    full.insert("my-byo".to_string(), ready_entry("my-byo"));
+    full.insert("grok-4".to_string(), ready_entry("grok-4"));
+    mgr.apply_refresh_result(&cfg, Some(full), None);
+
+    assert!(
+        mgr.substituted_preference().is_none(),
+        "in-memory verdict must clear once the preference is in the catalog"
+    );
+
+    let mut cleared = serde_json::Map::new();
+    mgr.write_substituted_default_model_meta(&mut cleared, true);
+    assert!(
+        cleared
+            .get(SUBSTITUTED_DEFAULT_MODEL_META_KEY)
+            .is_some_and(|v| v.is_null()),
+        "models/update meta must publish JSON null so clients can retract"
     );
 }

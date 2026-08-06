@@ -354,23 +354,10 @@ fn chat_new_session_model_state(
 pub(crate) const SESSION_PLUGIN_DIRS_META_KEY: &str = "pluginDirs";
 /// `initialize` response `_meta` key advertising [`SESSION_PLUGIN_DIRS_META_KEY`] support.
 pub(crate) const SESSION_PLUGIN_DIRS_CAPABILITY_KEY: &str = "x.ai/pluginDirs";
-/// `initialize` response `_meta` key naming a configured default model that was
-/// **absent from the catalog**, so a substitute was seated instead (#131).
-///
-/// Shape: `{"configuredModelId": "<id>", "source": "cli" | "env" | "config"}`.
-/// Published by `AcpAgent::initialize`; read by clients that explain why the
-/// session is not on the model the user asked for.
-///
-/// **Absent whenever the preference was honoured** — including when it was kept
-/// despite being unready, because #145 keeps that model selected, so
-/// `modelState.currentModelId` names it and `availableModels` already carries
-/// its `readinessReason`. This key covers only the case a client cannot
-/// reconstruct: the configured model is not in `availableModels` to be looked
-/// up, because it is not in the catalog at all.
-///
-/// It describes startup configuration resolution, not session state. A session
-/// may hold a different model (`session/setModel`) without affecting it.
-pub(crate) const SUBSTITUTED_DEFAULT_MODEL_META_KEY: &str = "x.ai/substitutedDefaultModel";
+/// Re-export of the #131 wire key. Defined next to [`SubstitutedPreference`] so
+/// `models` and `initialize` share one spelling; see that constant's docs for
+/// the absent-vs-null contract on `initialize` vs `x.ai/models/update`.
+pub(crate) use crate::agent::models::SUBSTITUTED_DEFAULT_MODEL_META_KEY;
 /// Per-session plugin roots from `session/new` / `session/load` `_meta.pluginDirs`,
 /// loaded at CliOverride scope (always trusted) into this session's registry only.
 /// Paths must be absolute (the SDKs resolve before sending); anything else is

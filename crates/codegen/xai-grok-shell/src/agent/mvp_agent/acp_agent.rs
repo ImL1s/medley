@@ -519,11 +519,11 @@ impl acp::Agent for MvpAgent {
                 .auth_methods(auth_methods)
                 .meta({
                     let metadata = parse_json_object_env("GROK_AGENT_METADATA");
-                    // #131. Only set when the configured default was absent from
-                    // the catalog; a preference that was honoured — including one
-                    // kept while unready — leaves this `None`, and the key is
-                    // omitted rather than sent as null.
-                    let substituted_default = self.models_manager.substituted_preference();
+                    // #131. Only set when the configured default was not seated;
+                    // a preference that was honoured — including one kept while
+                    // unready — leaves this omitted rather than sent as null.
+                    // Republished (or cleared as null) on `x.ai/models/update`
+                    // when the catalog self-corrects.
                     let mut init_meta = serde_json::json!({
                     "grokShell": true,
                     // Re-deriving this precedence client-side has regressed OIDC
@@ -555,16 +555,9 @@ impl acp::Agent for MvpAgent {
                 })
                         .as_object()
                         .cloned();
-                    if let Some(map) = init_meta.as_mut()
-                        && let Some(substituted) = substituted_default
-                    {
-                        map.insert(
-                            SUBSTITUTED_DEFAULT_MODEL_META_KEY.to_string(),
-                            serde_json::json!({
-                                "configuredModelId": substituted.configured,
-                                "source": substituted.source_wire(),
-                            }),
-                        );
+                    if let Some(map) = init_meta.as_mut() {
+                        self.models_manager
+                            .write_substituted_default_model_meta(map, false);
                     }
                     init_meta
                 }),

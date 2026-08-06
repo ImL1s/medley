@@ -342,6 +342,40 @@ jobs:
           cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
             snapshot_never_derives_stable_ids_from_credentials -- --nocapture
 
+      - name: "Substituted default model meta (#131)"
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
+              echo "test filter matched zero tests: $*" >&2
+              rm -f "$output"
+              return 1
+            }
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib \
+            absent_configured_default_is_substituted_and_reported -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            honoured_configured_default_reports_no_substitution -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            campaign_driven_default_is_not_reported_as_the_users_choice -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            configured_unready_default_already_publishes_its_reason_per_model -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            initialize_publishes_substituted_default_model_meta -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            initialize_omits_substituted_default_model_meta_when_honoured -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            reselect_if_missing_clears_stale_substitution_on_early_return -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            clear_wipes_substituted_preference -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            models_update_meta_clears_substitution_after_catalog_lands -- --nocapture
+
       - name: Pager model picker / readiness
         env:
           PROTOC: protoc
