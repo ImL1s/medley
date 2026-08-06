@@ -898,6 +898,42 @@ impl AgentSession {
     pub(crate) fn set_auto_mode_for_test(&mut self, on: bool) {
         self.auto_mode = on;
     }
+    /// Stash a model pick made before the session id exists, keeping the
+    /// rollback target of the *first* pick in a rapid sequence.
+    ///
+    /// `prev_model_id` is where a failed switch returns to, and across rapid
+    /// picks it stays the target the first pick captured — not the model the
+    /// previous pick optimistically installed, which the user only passed
+    /// through.
+    ///
+    /// The `.or(prev_model_id)` tail is deliberate, not an oversight. A prior
+    /// whose target is `None` is a CLI seed (`--model X`), which had nothing to
+    /// roll back to when it was stashed; once its model is on screen, the
+    /// honest target for the next pick is what is displayed.
+    /// `deferred_switch_overwritten_by_second_switch` and
+    /// `pick_over_cli_seed_keeps_display_as_rollback_target` both pin that.
+    ///
+    /// Both pre-session entry points go through here (`Action::SwitchModel`'s
+    /// router arm and `set_default_model_confirmed`). They used to disagree:
+    /// only the router coalesced, so the settings path overwrote the target
+    /// with the model its own previous pick had just installed.
+    pub(crate) fn stash_deferred_model_switch(
+        &mut self,
+        model_id: acp::ModelId,
+        effort: Option<ReasoningEffort>,
+        prev_model_id: Option<acp::ModelId>,
+    ) {
+        let rollback_prev = self
+            .deferred_model_switch
+            .take()
+            .and_then(|prior| prior.prev_model_id)
+            .or(prev_model_id);
+        self.deferred_model_switch = Some(DeferredModelSwitch {
+            model_id,
+            effort,
+            prev_model_id: rollback_prev,
+        });
+    }
     /// Process an ACP session update. Returns true if scrollback was modified.
     pub fn handle_update(
         &mut self,

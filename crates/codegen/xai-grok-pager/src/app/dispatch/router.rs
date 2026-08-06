@@ -991,18 +991,9 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                 // leaves no preference behind.
                 let prev_model = agent.session.models.current.clone();
                 agent.session.models.set_current(model_id.clone(), effort);
-                let rollback_prev = agent
+                agent
                     .session
-                    .deferred_model_switch
-                    .take()
-                    .and_then(|prior| prior.prev_model_id)
-                    .or(prev_model);
-                agent.session.deferred_model_switch =
-                    Some(crate::app::agent::DeferredModelSwitch {
-                        model_id,
-                        effort,
-                        prev_model_id: rollback_prev,
-                    });
+                    .stash_deferred_model_switch(model_id, effort, prev_model);
                 return vec![];
             };
             let request_id = super::session::lifecycle::begin_model_switch_request(

@@ -1371,12 +1371,21 @@ fn rapid_no_session_model_choices_coalesce_and_keep_original_rollback() {
             .and_then(|transaction| transaction.app_model_id.as_ref()),
         Some(&model_a)
     );
+    // `prev_model_id` is the rollback target, and across rapid picks it stays
+    // the model displayed before the *first* pick — model-a, never the model-b
+    // the first pick installed on its way through.
+    //
+    // This expectation read `None` until now. That was not a decision: the
+    // stash was a two-element tuple `(model_id, effort)` when this test was
+    // written, upstream turned it into a three-field struct, and 4742a9c
+    // repaired the broken test build by filling the new field with `None`.
+    // Nothing ever asserted that value on purpose.
     assert_eq!(
         app.agents[&id].session.deferred_model_switch,
         Some(crate::app::agent::DeferredModelSwitch {
             model_id: model_c.clone(),
             effort: None,
-            prev_model_id: None,
+            prev_model_id: Some(model_a.clone()),
         }),
     );
 
@@ -1411,6 +1420,71 @@ fn rapid_no_session_model_choices_coalesce_and_keep_original_rollback() {
     assert_eq!(
         app.agents[&id].session.models.current.as_ref(),
         Some(&model_c)
+    );
+}
+
+/// The two pre-session entry points must stash identically.
+///
+/// `Action::SwitchModel`'s router arm coalesced rapid picks; the settings path
+/// assigned the field directly and so overwrote the rollback target with the
+/// model its own previous pick had just installed. Same user action, same
+/// state, two answers — and only one of them could be right.
+///
+/// Asserting the two against each other (rather than each against a literal)
+/// is what makes this hold if the shared semantics are ever revised: a change
+/// that moves one path has to move the other.
+#[test]
+fn both_pre_session_entry_points_stash_the_same_rollback_target() {
+    use super::super::super::settings::setters::set_default_model_confirmed;
+
+    let stash_after_two_picks = |use_router: bool| {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        let model_a = acp::ModelId::new(std::sync::Arc::from("model-a"));
+        let model_b = acp::ModelId::new(std::sync::Arc::from("model-b"));
+        let model_c = acp::ModelId::new(std::sync::Arc::from("model-c"));
+        for model in [&model_a, &model_b, &model_c] {
+            insert_ready_model(&mut app, id, model);
+            app.models.available.insert(
+                model.clone(),
+                acp::ModelInfo::new(model.clone(), model.0.to_string()),
+            );
+        }
+        {
+            let agent = app.agents.get_mut(&id).unwrap();
+            agent.session.session_id = None;
+            agent.session.models.set_current(model_a.clone(), None);
+        }
+        for model_id in [model_b, model_c] {
+            if use_router {
+                dispatch(
+                    Action::SwitchModel {
+                        model_id,
+                        effort: None,
+                    },
+                    &mut app,
+                );
+            } else {
+                set_default_model_confirmed(&mut app, model_id);
+            }
+        }
+        app.agents[&id].session.deferred_model_switch.clone()
+    };
+
+    let via_router = stash_after_two_picks(true);
+    let via_settings = stash_after_two_picks(false);
+    assert_eq!(
+        via_router, via_settings,
+        "the router and the settings modal are the same user action from two \
+         surfaces; they must stash the same rollback target"
+    );
+    assert_eq!(
+        via_router
+            .as_ref()
+            .and_then(|switch| switch.prev_model_id.as_ref()),
+        Some(&acp::ModelId::new(std::sync::Arc::from("model-a"))),
+        "a rejected switch returns to where the user started, not to model-b, \
+         which the first pick installed on its way through"
     );
 }
 
