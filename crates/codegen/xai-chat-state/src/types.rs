@@ -165,36 +165,217 @@ pub enum AuthType {
     ApiKey,
 }
 
+/// In-memory auth material paired with its provenance.
+///
+/// A secret is never held without a [`CredentialSource`]. The `None` arm is
+/// the empty session (no secret, no label). `Bound` may still have
+/// `api_key: None` when auth posture is known but the material was cleared
+/// (hard-expired session, keyless model) — `auth_type` and `source` stay
+/// attached so refresh paths know what to restore.
+#[derive(Clone, Default)]
+enum StoredAuth {
+    #[default]
+    None,
+    Bound {
+        api_key: Option<String>,
+        auth_type: AuthType,
+        source: xai_grok_sampling_types::CredentialSource,
+    },
+}
+
 /// Credential/secret fields that the actor stores opaquely.
 ///
 /// These are fields from the shell's full `Config` that aren't part of
 /// `xai_grok_sampling_types::SamplingConfig`. Serialized snapshots redact that
 /// type's endpoint, extra-header values, and query parameters separately.
 /// The actor just stores and returns them — it never interprets them.
-#[derive(Clone, Default, Deserialize)]
+///
+/// **Invariant:** `api_key` and credential provenance are not independently
+/// settable. Construct via [`Credentials::bound`] / [`Credentials::empty`]
+/// (or [`Credentials::rebind`] when preserving alpha/client_version).
+#[derive(Clone, Default)]
 pub struct Credentials {
-    /// API key for authentication.
-    pub api_key: Option<String>,
-    /// Whether this is a session token (refreshable) or user-provided api key.
-    #[serde(default)]
-    pub auth_type: AuthType,
+    auth: StoredAuth,
     /// Optional extra auth material forwarded with requests when present.
-    pub alpha_test_key: Option<String>,
+    alpha_test_key: Option<String>,
     /// Client version string.
-    pub client_version: Option<String>,
+    client_version: Option<String>,
 }
 
 impl Credentials {
+    /// Empty credentials: no secret, no provenance. Default for a new actor
+    /// and for serde-skipped snapshot fields.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Bind a (possibly absent) secret to its provenance and auth posture.
+    ///
+    /// Callers that genuinely have no credential should use [`Self::empty`]
+    /// rather than inventing a source. Callers that know the posture but not
+    /// the material (keyless model, cleared hard-expired token) pass
+    /// `api_key: None` with the real `auth_type` and `source`.
+    pub fn bound(
+        api_key: Option<String>,
+        auth_type: AuthType,
+        source: xai_grok_sampling_types::CredentialSource,
+    ) -> Self {
+        Self {
+            auth: StoredAuth::Bound {
+                api_key,
+                auth_type,
+                source,
+            },
+            alpha_test_key: None,
+            client_version: None,
+        }
+    }
+
+    /// Replace the bound secret/provenance, keeping alpha/client_version.
+    pub fn rebind(
+        self,
+        api_key: Option<String>,
+        auth_type: AuthType,
+        source: xai_grok_sampling_types::CredentialSource,
+    ) -> Self {
+        Self {
+            auth: StoredAuth::Bound {
+                api_key,
+                auth_type,
+                source,
+            },
+            alpha_test_key: self.alpha_test_key,
+            client_version: self.client_version,
+        }
+    }
+
+    pub fn with_alpha_test_key(mut self, alpha_test_key: Option<String>) -> Self {
+        self.alpha_test_key = alpha_test_key;
+        self
+    }
+
+    pub fn with_client_version(mut self, client_version: Option<String>) -> Self {
+        self.client_version = client_version;
+        self
+    }
+
+    pub fn api_key(&self) -> Option<&str> {
+        match &self.auth {
+            StoredAuth::None => None,
+            StoredAuth::Bound { api_key, .. } => api_key.as_deref(),
+        }
+    }
+
+    pub fn api_key_cloned(&self) -> Option<String> {
+        self.api_key().map(str::to_owned)
+    }
+
+    /// Auth posture. Empty credentials report [`AuthType::default`]
+    /// (`SessionToken`) to match the historical public-field default.
+    pub fn auth_type(&self) -> AuthType {
+        match &self.auth {
+            StoredAuth::None => AuthType::default(),
+            StoredAuth::Bound { auth_type, .. } => *auth_type,
+        }
+    }
+
+    /// Provenance of the bound secret, if any. `None` only for
+    /// [`Self::empty`] — a bound credential always carries a source, even when
+    /// the secret itself has been cleared.
+    pub fn source(&self) -> Option<&xai_grok_sampling_types::CredentialSource> {
+        match &self.auth {
+            StoredAuth::None => None,
+            StoredAuth::Bound { source, .. } => Some(source),
+        }
+    }
+
+    pub fn source_cloned(&self) -> Option<xai_grok_sampling_types::CredentialSource> {
+        self.source().cloned()
+    }
+
+    pub fn alpha_test_key(&self) -> Option<&str> {
+        self.alpha_test_key.as_deref()
+    }
+
+    pub fn alpha_test_key_cloned(&self) -> Option<String> {
+        self.alpha_test_key.clone()
+    }
+
+    pub fn client_version(&self) -> Option<&str> {
+        self.client_version.as_deref()
+    }
+
+    pub fn client_version_cloned(&self) -> Option<String> {
+        self.client_version.clone()
+    }
+
+    /// Replace the secret while keeping auth_type and source.
+    ///
+    /// If credentials were empty, binds as a session token with
+    /// [`CredentialSource::XaiSession`] — the only production path that
+    /// historically wrote a key onto empty credentials was session refresh.
+    ///
+    /// **That branch is unreachable from production today.** Every caller --
+    /// the cold mint and 401 re-mint in `set_chat_api_key`, session refresh,
+    /// and `config.toml` reload -- runs against an actor whose credentials were
+    /// already bound by `spawn_session_actor` before the state existed, and
+    /// `restore_snapshot` only ever carries in-memory credentials forward. It
+    /// exists to make the function total, not because a mint lands here.
+    ///
+    /// Were it reachable, `XaiSession` is the fail-closed choice: it is
+    /// ambient, and the Layer-3 guard refuses ambient sources on any
+    /// non-first-party origin, so the guess over-restricts. That reasoning is
+    /// why this variant and not another -- it is not a claim about current
+    /// behaviour.
+    pub fn replace_api_key(&mut self, key: String) {
+        match &mut self.auth {
+            StoredAuth::Bound { api_key, .. } => {
+                *api_key = Some(key);
+            }
+            StoredAuth::None => {
+                self.auth = StoredAuth::Bound {
+                    api_key: Some(key),
+                    auth_type: AuthType::SessionToken,
+                    source: xai_grok_sampling_types::CredentialSource::XaiSession,
+                };
+            }
+        }
+    }
+
+    /// Clear the secret without dropping provenance or auth posture.
+    /// Empty credentials stay empty.
+    pub fn clear_api_key(&mut self) {
+        if let StoredAuth::Bound { api_key, .. } = &mut self.auth {
+            *api_key = None;
+        }
+    }
+
     fn is_empty(&self) -> bool {
-        self.api_key.is_none() && self.alpha_test_key.is_none()
+        self.api_key().is_none() && self.alpha_test_key.is_none()
     }
 }
 
 impl std::fmt::Debug for Credentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured rather than read through `api_key()`. The credential
+        // observability guard proves this impl is presence-only by matching
+        // `self.api_key` followed immediately by `.is_some()`; an accessor call
+        // puts `()` in between, the match fails, and the impl is reported as
+        // exposing raw data. Going through the accessor would have blinded a
+        // gate that exists to catch exactly this kind of change -- and it did:
+        // CI caught this, review did not.
+        let (key_present, auth_type, source) = match &self.auth {
+            StoredAuth::None => (false, AuthType::default(), None),
+            StoredAuth::Bound {
+                api_key,
+                auth_type,
+                source,
+            } => (api_key.is_some(), *auth_type, Some(source)),
+        };
         f.debug_struct("Credentials")
-            .field("api_key_present", &self.api_key.is_some())
-            .field("auth_type", &self.auth_type)
+            .field("api_key_present", &key_present)
+            .field("auth_type", &auth_type)
+            .field("source", &source)
             .field("alpha_test_key_present", &self.alpha_test_key.is_some())
             .field("client_version_present", &self.client_version.is_some())
             .finish()
@@ -372,12 +553,13 @@ mod tests {
             stream_start_ms: None,
             turn_start_ms: None,
             last_compaction_prompt_index: None,
-            credentials: Credentials {
-                api_key: Some(api_key.to_owned()),
-                auth_type: AuthType::ApiKey,
-                alpha_test_key: Some(alpha_key.to_owned()),
-                client_version: Some("test-client".to_owned()),
-            },
+            credentials: Credentials::bound(
+                Some(api_key.to_owned()),
+                AuthType::ApiKey,
+                xai_grok_sampling_types::CredentialSource::ModelApiKey,
+            )
+            .with_alpha_test_key(Some(alpha_key.to_owned()))
+            .with_client_version(Some("test-client".to_owned())),
         };
 
         let rendered = format!(
@@ -397,8 +579,8 @@ mod tests {
 
         let restored: ChatStateSnapshot =
             serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
-        assert!(restored.credentials.api_key.is_none());
-        assert!(restored.credentials.alpha_test_key.is_none());
+        assert!(restored.credentials.api_key().is_none());
+        assert!(restored.credentials.alpha_test_key().is_none());
         assert_eq!(restored.sampling_config.base_url, "[configured]");
         assert!(restored.sampling_config.extra_headers.is_empty());
         assert!(restored.sampling_config.query_params.is_empty());

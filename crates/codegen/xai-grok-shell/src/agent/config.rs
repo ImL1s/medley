@@ -5304,6 +5304,38 @@ pub(crate) fn try_resolve_model_credentials(
     );
     Some(credentials)
 }
+/// As [`try_resolve_model_credentials`], but also returns the credential's
+/// provenance, classified from the model entry.
+///
+/// Callers must not infer the source from `ResolvedCredentials::auth_type`.
+/// `resolve_credentials` returns `AuthType::ApiKey` for **four** different
+/// provenances -- a model's own key, a resolved `env_key`, an `auth_provider`
+/// token, and the ambient `XAI_API_KEY` -- so collapsing them to `ModelApiKey`
+/// reports `is_ambient_xai() == false` and `is_provider_scoped() == false` for
+/// credentials that are one or the other, and both the #110 ambient-origin
+/// guard and the #135 provider-origin guard stop firing. That is the
+/// under-restricting direction.
+pub(crate) fn try_resolve_model_credentials_with_source(
+    model_id: &str,
+    session_key: Option<&str>,
+) -> Option<(ResolvedCredentials, xai_grok_sampler::CredentialSource)> {
+    let raw = crate::config::load_effective_config()
+        .map_err(|_| tracing::warn!("config load failed for credential resolution"))
+        .ok()?;
+    let cfg = Config::new_from_toml_cfg(&raw)
+        .map_err(|_| tracing::warn!("config parse failed for credential resolution"))
+        .ok()?;
+    let models = resolve_model_list(&cfg, None);
+    let entry = find_model_by_id(&models, model_id)?;
+    let mut credentials = resolve_credentials(entry, session_key);
+    enforce_disable_api_key_auth(
+        &mut credentials,
+        cfg.grok_com_config.api_key_auth_disabled(),
+        session_key,
+    );
+    let source = classify_credential_source(entry, &credentials);
+    Some((credentials, source))
+}
 /// Per-model auth facts (BYOK status + auth scheme + readiness) from one
 /// effective-config load, memoized by the session actor.
 #[derive(Clone)]

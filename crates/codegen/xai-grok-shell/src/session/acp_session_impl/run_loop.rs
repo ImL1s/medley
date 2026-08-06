@@ -720,17 +720,14 @@ pub(super) async fn run_session(
                                 // and a real session token reaches a model that
                                 // may point anywhere, with no origin strip on
                                 // this path (#136).
-                                let session_key = (existing.auth_type
+                                let session_key = (existing.auth_type()
                                     == xai_chat_state::AuthType::SessionToken)
-                                    .then_some(existing.api_key.as_deref())
+                                    .then_some(existing.api_key())
                                     .flatten();
-                                if let Some(r) = crate::agent::config::try_resolve_model_credentials(model_name.as_str(), session_key) {
-                                    session.chat_state_handle.update_credentials(xai_chat_state::Credentials {
-                                        api_key: r.api_key,
-                                        auth_type: r.auth_type,
-                                        alpha_test_key: existing.alpha_test_key,
-                                        client_version: existing.client_version,
-                                    });
+                                if let Some((r, source)) = crate::agent::config::try_resolve_model_credentials_with_source(model_name.as_str(), session_key) {
+                                    session.chat_state_handle.update_credentials(
+                                        existing.rebind(r.api_key, r.auth_type, source),
+                                    );
                                 }
                                 // Credentials changed under a possibly-unchanged model id.
                                 session.invalidate_model_auth_memo();

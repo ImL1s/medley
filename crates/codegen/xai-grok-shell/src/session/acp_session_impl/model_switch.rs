@@ -360,27 +360,33 @@ impl SessionActor {
             .auth_manager
             .as_ref()
             .and_then(|am| am.current_or_expired().map(|a| a.key));
-        let (api_key, auth_type) =
+        let (api_key, auth_type, source) =
             if sampling_config.auth_scheme == xai_grok_sampler::AuthScheme::None {
                 // Keyless models must not keep a SessionToken auth_type residue
-                // alongside a cleared api_key.
-                (None, xai_chat_state::AuthType::ApiKey)
+                // alongside a cleared api_key. Source matches prepare's
+                // AuthScheme::None arm (`CredentialSource::None`).
+                (
+                    None,
+                    xai_chat_state::AuthType::ApiKey,
+                    xai_grok_sampler::CredentialSource::None,
+                )
             } else {
                 (
                     sampling_config.api_key.clone(),
                     crate::agent::config::resolve_chat_state_auth_type(
                         catalog_model_id.0.as_ref(),
                         session_key.as_deref(),
-                        existing.auth_type,
+                        existing.auth_type(),
                     ),
+                    sampling_config
+                        .credential_source
+                        .clone()
+                        .unwrap_or(xai_grok_sampler::CredentialSource::Missing),
                 )
             };
-        committed_chat.credentials = xai_chat_state::Credentials {
-            api_key,
-            auth_type,
-            alpha_test_key: existing.alpha_test_key,
-            client_version: sampling_config.client_version.clone(),
-        };
+        committed_chat.credentials = existing
+            .rebind(api_key, auth_type, source)
+            .with_client_version(sampling_config.client_version.clone());
         if apply_prompt_override && !skip_prompt_rewrite {
             for item in &mut committed_chat.conversation {
                 if let ConversationItem::System(sys) = item {
@@ -1013,8 +1019,8 @@ mod model_switch_transaction_tests {
                 assert_eq!(sampling.base_url, previous_sampling.base_url);
                 assert_eq!(sampling.context_window, previous_sampling.context_window);
                 let credentials = actor.chat_state_handle.get_credentials().await;
-                assert_eq!(credentials.api_key, previous_credentials.api_key);
-                assert_eq!(credentials.auth_type, previous_credentials.auth_type);
+                assert_eq!(credentials.api_key(), previous_credentials.api_key());
+                assert_eq!(credentials.auth_type(), previous_credentials.auth_type());
                 assert_eq!(
                     serde_json::to_value(actor.chat_state_handle.get_conversation().await).unwrap(),
                     serde_json::to_value(previous_conversation).unwrap()
@@ -1467,12 +1473,12 @@ mod model_switch_transaction_tests {
                     serde_json::to_value(&previous_chat.conversation).unwrap()
                 );
                 assert_eq!(
-                    restored.credentials.api_key,
-                    previous_chat.credentials.api_key
+                    restored.credentials.api_key(),
+                    previous_chat.credentials.api_key()
                 );
                 assert_eq!(
-                    restored.credentials.auth_type,
-                    previous_chat.credentials.auth_type
+                    restored.credentials.auth_type(),
+                    previous_chat.credentials.auth_type()
                 );
                 let generations = persisted_generations.lock().unwrap();
                 assert_eq!(

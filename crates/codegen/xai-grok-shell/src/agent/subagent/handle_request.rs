@@ -815,12 +815,44 @@ pub(crate) async fn run_shell_child(
     );
     let model_has_own_creds = model_entry.is_some_and(|entry| entry.has_own_credentials());
     let inherited_auth_type = subagent_auth_type(model_entry, &ctx.auth_method_id);
-    let credentials = xai_chat_state::Credentials {
-        api_key: effective_sampling_config.api_key.clone(),
-        auth_type: inherited_auth_type,
-        alpha_test_key: ctx.alpha_test_key.clone(),
-        client_version: effective_sampling_config.client_version.clone(),
-    };
+    // `read_parent_sampling_config` sets `credential_source` only when the
+    // parent declared a credential header, so it is `None` for the ordinary
+    // case -- while `api_key` here is the parent's live session token. Falling
+    // back to `Missing` would label a real ambient credential with the one
+    // variant whose own doc says it never blocks a route, which is the
+    // under-restricting direction.
+    //
+    // Derive it from the posture the subagent actually inherits, preferring the
+    // more-restricted answer when unsure: a session token is ambient xAI, a
+    // model with its own credential is BYOK, and no key at all is the only
+    // honest `Missing`.
+    let source = effective_sampling_config
+        .credential_source
+        .clone()
+        .unwrap_or(
+            match (
+                effective_sampling_config.api_key.is_some(),
+                inherited_auth_type,
+                model_has_own_creds,
+            ) {
+                (false, _, _) => xai_grok_sampler::CredentialSource::Missing,
+                (true, xai_chat_state::AuthType::SessionToken, _) => {
+                    xai_grok_sampler::CredentialSource::XaiSession
+                }
+                (true, _, true) => xai_grok_sampler::CredentialSource::ModelApiKey,
+                // A key the parent carries that is neither a session token nor the
+                // model's own: ambient env is the restricted reading, and being
+                // wrong here refuses rather than permits.
+                (true, _, false) => xai_grok_sampler::CredentialSource::XaiApiKeyEnv,
+            },
+        );
+    let credentials = xai_chat_state::Credentials::bound(
+        effective_sampling_config.api_key.clone(),
+        inherited_auth_type,
+        source,
+    )
+    .with_alpha_test_key(ctx.alpha_test_key.clone())
+    .with_client_version(effective_sampling_config.client_version.clone());
     xai_grok_telemetry::unified_log::info(
         "subagent spawn credentials",
         None,

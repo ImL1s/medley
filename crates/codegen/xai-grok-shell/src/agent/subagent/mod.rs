@@ -816,7 +816,7 @@ async fn read_parent_sampling_config(
             let mut extra_headers = cfg.extra_headers;
             crate::agent::config::inject_url_derived_headers(
                 &mut extra_headers,
-                creds.alpha_test_key.as_deref(),
+                creds.alpha_test_key(),
                 &cfg.base_url,
             );
             // Prefer the spawn-time in-memory catalog (session-selected models),
@@ -833,13 +833,15 @@ async fn read_parent_sampling_config(
             })
             .unwrap_or(ctx.sampling_config.auth_scheme);
             let inherited_base_url = cfg.base_url.clone();
-            let strip_guard = ctx.would_strip_fallback_key(creds.api_key.as_deref());
+            let strip_guard = ctx.would_strip_fallback_key(creds.api_key());
             // #110: the parent config carries its headers but not
             // `credential_source`, so a parent authenticated by a header the
             // user declared arrives here with its provenance gone. Wiring the
             // parent session resolver on top would make the sampler strip that
             // header and send the child's requests under the session instead.
             // Re-derive from the headers, which do survive the rebuild.
+            // (Step 1 stores source on Credentials; this path still re-derives
+            // for SamplerConfig so wire behaviour is unchanged.)
             let declared_credential_header = crate::agent::config::explicit_credential_header_in(
                 &extra_headers,
                 &cfg.env_http_headers,
@@ -847,7 +849,7 @@ async fn read_parent_sampling_config(
             let api_key = if auth_scheme == xai_grok_sampler::AuthScheme::None {
                 None
             } else {
-                creds.api_key
+                creds.api_key_cloned()
             };
             let inherited = xai_grok_sampler::SamplerConfig {
                 api_key,
@@ -869,7 +871,7 @@ async fn read_parent_sampling_config(
                 query_params: cfg.query_params.clone(),
                 env_http_headers: cfg.env_http_headers.clone(),
                 context_window: cfg.context_window.get(),
-                client_version: creds.client_version,
+                client_version: creds.client_version_cloned(),
                 reasoning_effort: cfg.reasoning_effort,
                 force_http1: false,
                 max_retries: None,

@@ -1883,12 +1883,11 @@ async fn read_parent_sampling_config_live_never_strips_a_fallback_key() {
     );
     ctx.auth = None;
     let chat = spawn_test_parent_chat_state("grok-4.5");
-    chat.update_credentials(xai_chat_state::Credentials {
-        api_key: Some("xai-env-fallback".to_string()),
-        auth_type: xai_chat_state::AuthType::SessionToken,
-        alpha_test_key: None,
-        client_version: None,
-    });
+    chat.update_credentials(xai_chat_state::Credentials::bound(
+        Some("xai-env-fallback".to_string()),
+        xai_chat_state::AuthType::SessionToken,
+        xai_grok_sampler::CredentialSource::XaiSession,
+    ));
     ctx.parent_chat_state = Some(chat);
     let (config, _) = read_parent_sampling_config(&ctx).await;
     assert!(
@@ -2160,11 +2159,11 @@ async fn read_parent_sampling_config_strips_api_key_for_auth_scheme_none() {
     use xai_grok_sampler::AuthScheme;
     let inference_slug = "local-none-model";
     let chat_state = spawn_test_parent_chat_state(inference_slug);
-    chat_state.update_credentials(xai_chat_state::Credentials {
-        api_key: Some("stale-session-jwt".to_string()),
-        auth_type: xai_chat_state::AuthType::SessionToken,
-        ..Default::default()
-    });
+    chat_state.update_credentials(xai_chat_state::Credentials::bound(
+        Some("stale-session-jwt".to_string()),
+        xai_chat_state::AuthType::SessionToken,
+        xai_grok_sampler::CredentialSource::XaiSession,
+    ));
     let mut models = indexmap::IndexMap::new();
     let mut entry = test_model_entry(inference_slug);
     entry.info.auth_scheme = AuthScheme::None;
@@ -2193,11 +2192,11 @@ async fn read_parent_sampling_config_prefers_catalog_key_over_shared_wire_slug()
     use xai_grok_sampler::AuthScheme;
     let shared_slug = "shared-routing-slug";
     let chat_state = spawn_test_parent_chat_state(shared_slug);
-    chat_state.update_credentials(xai_chat_state::Credentials {
-        api_key: Some("stale-session-jwt".to_string()),
-        auth_type: xai_chat_state::AuthType::SessionToken,
-        ..Default::default()
-    });
+    chat_state.update_credentials(xai_chat_state::Credentials::bound(
+        Some("stale-session-jwt".to_string()),
+        xai_chat_state::AuthType::SessionToken,
+        xai_grok_sampler::CredentialSource::XaiSession,
+    ));
     let mut models = indexmap::IndexMap::new();
     let mut bearer_entry = test_model_entry(shared_slug);
     bearer_entry.info.auth_scheme = AuthScheme::Bearer;
@@ -2230,11 +2229,11 @@ async fn read_parent_sampling_config_catalog_miss_respects_parent_auth_scheme_no
     use xai_grok_sampler::AuthScheme;
     let inference_slug = "not-in-effective-catalog-xyz";
     let chat_state = spawn_test_parent_chat_state(inference_slug);
-    chat_state.update_credentials(xai_chat_state::Credentials {
-        api_key: Some("stale-session-jwt".to_string()),
-        auth_type: xai_chat_state::AuthType::SessionToken,
-        ..Default::default()
-    });
+    chat_state.update_credentials(xai_chat_state::Credentials::bound(
+        Some("stale-session-jwt".to_string()),
+        xai_chat_state::AuthType::SessionToken,
+        xai_grok_sampler::CredentialSource::XaiSession,
+    ));
     let mut ctx = ctx_with_toggle(HashMap::new());
     ctx.model_id = acp::ModelId::new("no-catalog-model");
     ctx.parent_chat_state = Some(chat_state);
@@ -2262,11 +2261,11 @@ async fn read_parent_sampling_config_available_models_none_strips_with_bearer_pa
     use xai_grok_sampler::AuthScheme;
     let inference_slug = "local-none-resolved";
     let chat_state = spawn_test_parent_chat_state(inference_slug);
-    chat_state.update_credentials(xai_chat_state::Credentials {
-        api_key: Some("stale-session-jwt".to_string()),
-        auth_type: xai_chat_state::AuthType::SessionToken,
-        ..Default::default()
-    });
+    chat_state.update_credentials(xai_chat_state::Credentials::bound(
+        Some("stale-session-jwt".to_string()),
+        xai_chat_state::AuthType::SessionToken,
+        xai_grok_sampler::CredentialSource::XaiSession,
+    ));
     let mut models = indexmap::IndexMap::new();
     let mut entry = test_model_entry(inference_slug);
     entry.info.auth_scheme = AuthScheme::None;
@@ -2301,11 +2300,11 @@ async fn read_parent_sampling_config_stale_none_baseline_keeps_bearer_from_catal
     use xai_grok_sampler::AuthScheme;
     let inference_slug = "switched-bearer-model";
     let chat_state = spawn_test_parent_chat_state(inference_slug);
-    chat_state.update_credentials(xai_chat_state::Credentials {
-        api_key: Some("live-session-bearer".to_string()),
-        auth_type: xai_chat_state::AuthType::SessionToken,
-        ..Default::default()
-    });
+    chat_state.update_credentials(xai_chat_state::Credentials::bound(
+        Some("live-session-bearer".to_string()),
+        xai_chat_state::AuthType::SessionToken,
+        xai_grok_sampler::CredentialSource::XaiSession,
+    ));
     let mut models = indexmap::IndexMap::new();
     let mut entry = test_model_entry(inference_slug);
     entry.info.auth_scheme = AuthScheme::Bearer;
@@ -2340,11 +2339,11 @@ async fn read_parent_sampling_config_stale_none_baseline_keeps_x_api_key_from_ca
     use xai_grok_sampler::AuthScheme;
     let inference_slug = "switched-x-api-key-model";
     let chat_state = spawn_test_parent_chat_state(inference_slug);
-    chat_state.update_credentials(xai_chat_state::Credentials {
-        api_key: Some("live-byok-key".to_string()),
-        auth_type: xai_chat_state::AuthType::ApiKey,
-        ..Default::default()
-    });
+    chat_state.update_credentials(xai_chat_state::Credentials::bound(
+        Some("live-byok-key".to_string()),
+        xai_chat_state::AuthType::ApiKey,
+        xai_grok_sampler::CredentialSource::ModelApiKey,
+    ));
     let mut models = indexmap::IndexMap::new();
     let mut entry = test_model_entry(inference_slug);
     entry.info.auth_scheme = AuthScheme::XApiKey;

@@ -515,7 +515,7 @@ pub(crate) async fn spawn_session_actor(
                 base_url: cfg.base_url,
                 model: cfg.model,
                 extra_headers: cfg.extra_headers,
-                alpha_test_key: credentials.alpha_test_key.clone(),
+                alpha_test_key: credentials.alpha_test_key_cloned(),
                 api_key_provider,
             }
         } else {
