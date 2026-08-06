@@ -947,6 +947,18 @@ pub struct MvpAgent {
     /// once (on the first `spawn_and_register_session`). See
     /// `ensure_session_supervisor`.
     supervisor_started: std::cell::Cell<bool>,
+    /// Idempotency guard for the web-search-disabled notice.
+    ///
+    /// `spawn_and_register_session` serves `new_session` *and* `load_session`,
+    /// so without this the notice fires on every `/resume`, every pick from the
+    /// session list, and every reconnect-driven reload. It also carries
+    /// `meta: None`, so the pager's `event_seq` dedup cannot suppress a repeat.
+    ///
+    /// Once per process, not per session: the condition is a configuration
+    /// problem identical for every session the process opens, so telling the
+    /// user once is the whole point. Re-telling them on a flaky link is the
+    /// failure this guards.
+    web_search_disabled_notified: std::cell::Cell<bool>,
     /// Dedup guard for `spawn_settings_reapply`; at most one task in flight.
     /// `Rc` so the drop-guard owns a clone without dereferencing the agent.
     settings_reapply_in_flight: std::rc::Rc<std::cell::Cell<bool>>,

@@ -6263,28 +6263,6 @@ pub(crate) fn web_search_disable_details(
     }
 }
 
-/// User-visible notice when `web_search` would be dropped for this model.
-pub(crate) fn web_search_disable_user_notice(
-    model_id: &str,
-    models: &IndexMap<String, ModelEntry>,
-    session_key: Option<&str>,
-    disable_api_key_auth: bool,
-    alpha_test_key: Option<String>,
-    client_version: Option<String>,
-    endpoints: &EndpointsConfig,
-) -> Option<String> {
-    web_search_disable_details(
-        model_id,
-        models,
-        session_key,
-        disable_api_key_auth,
-        alpha_test_key,
-        client_version,
-        endpoints,
-    )
-    .map(|d| d.user_notice())
-}
-
 pub(crate) fn resolve_web_search_sampling_config(
     model_id: &str,
     models: &IndexMap<String, ModelEntry>,
@@ -6500,7 +6478,12 @@ pub(crate) fn model_readiness(model: &ModelEntry) -> (bool, Option<String>) {
                     "OpenAI Codex credential is scoped to the Codex API origin, not {}: \
                      point base_url at {} — or set api_key / env_key without \
                      model_provider = \"openai-codex\" for a custom endpoint",
-                    provider_hint_for_url(&model.info.base_url),
+                    // `sanitized_origin`, not `provider_hint_for_url`: the
+                    // latter echoes the raw `base_url` when `Url::parse` fails,
+                    // and #57 promotes this reason from an opt-in log to the
+                    // terminal. A key pasted into `base_url` by mistake would
+                    // otherwise be printed back.
+                    sanitized_origin(&model.info.base_url),
                     crate::auth::openai_codex::CODEX_API_BASE_URL,
                 )),
             );
@@ -9363,7 +9346,11 @@ reasoning_effort = "low"
         let (_, readiness_reason) = model_readiness(catalog.get("search").unwrap());
         let readiness_reason = readiness_reason.expect("unready model must carry a reason");
 
-        let notice = web_search_disable_user_notice(
+        // `web_search_disable_details` + `user_notice()`, which is what
+        // production runs. This used to call a `web_search_disable_user_notice`
+        // wrapper that had no production caller, so the test exercised a path
+        // the binary never took.
+        let notice = web_search_disable_details(
             "search",
             &catalog,
             Some("XAI_SESSION_SENTINEL"),
@@ -9372,7 +9359,8 @@ reasoning_effort = "low"
             None,
             &EndpointsConfig::default(),
         )
-        .expect("unready web_search model must produce a user-visible notice");
+        .expect("unready web_search model must produce a user-visible notice")
+        .user_notice();
 
         assert!(
             notice.contains("search"),
