@@ -1075,6 +1075,11 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
         if let Some(placeholder_id) = agent.loading_placeholder_id.take() {
             agent.scrollback.remove_entry(placeholder_id);
         }
+        // Captured before the move: on the refusal path this decides whether
+        // restoring the display is honest. The server has just said what this
+        // session runs, so the optimistic write the restore would undo is
+        // already superseded.
+        let server_models_authoritative = new_models.is_some();
         if let Some(m) = new_models {
             app.models = Some(m).into();
             agent.session.models = app.models.clone();
@@ -1128,14 +1133,15 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
         if let Some(directive) = agent.pending_first_prompt.take() {
             agent.session.enqueue_prompt_front(directive);
         }
-        let deferred_request_id = deferred.as_ref().and_then(|_| {
-            crate::app::dispatch::session::lifecycle::begin_model_switch_request(
+        let deferred_request_id =
+            crate::app::dispatch::session::lifecycle::begin_or_reject_deferred_model_switch(
                 &mut app.model_switch_transaction,
+                &mut app.models,
                 agent_id,
-                &mut agent.session,
-                &app.models,
-            )
-        });
+                agent,
+                &deferred,
+                server_models_authoritative,
+            );
         let drain = maybe_drain_queue(agent);
         let page_flip_entry = drain.page_flip_entry;
         effects.extend(drain.effects);

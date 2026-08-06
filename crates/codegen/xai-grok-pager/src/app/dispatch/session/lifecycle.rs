@@ -137,6 +137,93 @@ pub(crate) fn abort_model_switch_transaction(app: &mut AppView, agent_id: AgentI
     }
 }
 
+/// Restore session display and toast after a deferred switch was consumed but
+/// `begin_model_switch_request` refused admission. Pair with releasing any
+/// deferred transaction this agent still owns (see
+/// [`begin_or_reject_deferred_model_switch`]).
+fn restore_rejected_deferred_switch_display(
+    agent: &mut AgentView,
+    switch: &DeferredModelSwitch,
+    server_models_authoritative: bool,
+) {
+    let rollback = agent.session.model_switch_rollback.take();
+    // The server just told us what this session is running, and that write has
+    // already superseded the optimistic one this restore exists to undo. The
+    // snapshot predates it -- it was captured at pick time -- so honouring it
+    // here would set the display to a model the session is *not* running,
+    // which is the #142 symptom this function exists to prevent.
+    if !server_models_authoritative {
+        match rollback {
+            // Assign, do not skip on `None`. A snapshot whose model is `None`
+            // means nothing was displayed before the pick, and clearing is the
+            // honest restore -- `restore_model_switch_mirrors` assigns it the
+            // same way. Testing the inner `Option` and falling through to the
+            // stash instead left the display showing a model that never
+            // started, in exactly the case the fallback looked like it covered.
+            Some(snapshot) => {
+                agent.session.models.current = snapshot.session_model_id;
+                agent.session.models.reasoning_effort = snapshot.session_reasoning_effort;
+            }
+            None => {
+                if let Some(prev) = switch.prev_model_id.clone() {
+                    agent.session.models.set_current(prev, None);
+                }
+            }
+        }
+    }
+    agent.session.model_switch_pending = false;
+    agent.session.model_switch_request_id = None;
+    // Same copy as the live `Action::SwitchModel` / router path — do not invent
+    // a new message for this gate.
+    agent.show_toast("Wait for the current model switch to finish");
+}
+
+/// Open the ACP model-switch request for a deferred stash, or reject it.
+///
+/// Call after [`apply_deferred_model_switch`] has already consumed the stash.
+/// When admission fails, this surfaces the wait toast and restores the
+/// displayed model so the UI does not claim a switch that never started.
+/// Returns `Some(request_id)` only when the caller may emit `Effect::SwitchModel`.
+///
+/// Takes field-level borrows (`transaction` / `app_models` / `agent`) so call
+/// sites that already hold `app.agents.get_mut(...)` can pass disjoint fields.
+pub(crate) fn begin_or_reject_deferred_model_switch(
+    transaction: &mut Option<ModelSwitchTransaction>,
+    app_models: &mut ModelState,
+    agent_id: AgentId,
+    agent: &mut AgentView,
+    deferred: &Option<DeferredModelSwitch>,
+    server_models_authoritative: bool,
+) -> Option<u64> {
+    let switch = deferred.as_ref()?;
+    if let Some(request_id) =
+        begin_model_switch_request(transaction, agent_id, &mut agent.session, app_models)
+    {
+        return Some(request_id);
+    }
+    restore_rejected_deferred_switch_display(agent, switch, server_models_authoritative);
+    // Release a deferred (pre-request) transaction owned by this agent and roll
+    // back optimistic app.models. Leave another agent's in-flight transaction alone.
+    //
+    // `request_id.is_none()` is half the predicate, not decoration:
+    // `begin_model_switch_request` also refuses when *this* agent owns a
+    // transaction that already has a request id. Taking that one would rewrite
+    // `app.models` from an in-flight switch's snapshot and leave
+    // `handle_switch_model_complete` to bail with "completion outside the
+    // active transaction", orphaning a switch the shell may already have
+    // applied. Unreachable today -- all three call sites run on freshly built
+    // agents -- but this is `pub(crate)` and the guard it relies on is three
+    // frames away.
+    if let Some(owned) =
+        transaction.take_if(|txn| txn.owner_agent_id == agent_id && txn.request_id.is_none())
+        && owned.app_models_optimistic
+    {
+        app_models.current = owned.app_model_id;
+        app_models.reasoning_effort = owned.app_reasoning_effort;
+    }
+    None
+}
+
 fn handoff_model_switch_transaction(app: &mut AppView, from: AgentId, to: AgentId) {
     if let Some(transaction) = app.model_switch_transaction.as_mut()
         && transaction.owner_agent_id == from
@@ -1259,6 +1346,11 @@ pub(in crate::app::dispatch) fn handle_session_created(
         }
         agent.bind_session_id(session_id);
         agent.scheduler_background_loops = scheduler_background_loops;
+        // Captured before the move: on the refusal path this decides whether
+        // restoring the display is honest. The server has just said what this
+        // session runs, so the optimistic write the restore would undo is
+        // already superseded.
+        let server_models_authoritative = new_models.is_some();
         if let Some(m) = new_models {
             app.models = Some(m).into();
             agent.session.models = app.models.clone();
@@ -1293,14 +1385,16 @@ pub(in crate::app::dispatch) fn handle_session_created(
         let deferred = apply_deferred_model_switch(agent, app.cli_effort_token.as_deref());
         let deferred_mode = agent.deferred_session_mode.take();
         let cwd = agent.session.cwd.clone();
-        let deferred_request_id = deferred.as_ref().and_then(|_| {
-            begin_model_switch_request(
-                &mut app.model_switch_transaction,
-                agent_id,
-                &mut agent.session,
-                &app.models,
-            )
-        });
+        // Consume-and-say-so: open the request, or toast + restore display.
+        // Never leave a taken stash with neither effect nor user notice.
+        let deferred_request_id = begin_or_reject_deferred_model_switch(
+            &mut app.model_switch_transaction,
+            &mut app.models,
+            agent_id,
+            agent,
+            &deferred,
+            server_models_authoritative,
+        );
         let failed_handoff = (handoff_requires_deferred_switch && deferred_request_id.is_none())
             .then(|| {
                 let source_id = agent
@@ -1309,14 +1403,24 @@ pub(in crate::app::dispatch) fn handle_session_created(
                     .take()
                     .expect("handoff gate checked above");
                 let prompts = std::mem::take(&mut agent.session.pending_prompts);
-                agent.session.model_switch_pending = false;
-                agent.session.model_switch_request_id = None;
-                agent.session.model_switch_rollback = None;
-                if let Some(transaction) = app.model_switch_transaction.take()
-                    && transaction.app_models_optimistic
-                {
-                    app.models.current = transaction.app_model_id;
-                    app.models.reasoning_effort = transaction.app_reasoning_effort;
+                // When `apply_deferred_model_switch` returned `Some` and
+                // begin was refused, `begin_or_reject_deferred_model_switch`
+                // already restored display, toasted, and released our
+                // deferred transaction. When apply returned `None` (e.g.
+                // model not ready) that path did not run — clear the
+                // handoff's residual transaction/flags here.
+                if deferred.is_none() {
+                    agent.session.model_switch_pending = false;
+                    agent.session.model_switch_request_id = None;
+                    agent.session.model_switch_rollback = None;
+                    if let Some(transaction) = app
+                        .model_switch_transaction
+                        .take_if(|transaction| transaction.owner_agent_id == agent_id)
+                        && transaction.app_models_optimistic
+                    {
+                        app.models.current = transaction.app_model_id;
+                        app.models.reasoning_effort = transaction.app_reasoning_effort;
+                    }
                 }
                 (source_id, prompts)
             });
@@ -1446,6 +1550,11 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
         agent.scheduler_background_loops = scheduler_background_loops;
         agent.session.cwd = session_cwd.clone();
         agent.session.is_worktree = true;
+        // Captured before the move: on the refusal path this decides whether
+        // restoring the display is honest. The server has just said what this
+        // session runs, so the optimistic write the restore would undo is
+        // already superseded.
+        let server_models_authoritative = new_models.is_some();
         if let Some(m) = new_models {
             app.models = Some(m).into();
             agent.session.models = app.models.clone();
@@ -1458,14 +1567,14 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
         let deferred = apply_deferred_model_switch(agent, app.cli_effort_token.as_deref());
         let deferred_mode = agent.deferred_session_mode.take();
         let cwd = agent.session.cwd.clone();
-        let deferred_request_id = deferred.as_ref().and_then(|_| {
-            begin_model_switch_request(
-                &mut app.model_switch_transaction,
-                agent_id,
-                &mut agent.session,
-                &app.models,
-            )
-        });
+        let deferred_request_id = begin_or_reject_deferred_model_switch(
+            &mut app.model_switch_transaction,
+            &mut app.models,
+            agent_id,
+            agent,
+            &deferred,
+            server_models_authoritative,
+        );
         let mut drain = if app.reconnect_pending {
             QueueDrain {
                 effects: vec![],
