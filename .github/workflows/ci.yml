@@ -608,3 +608,37 @@ jobs:
             reconstruct_full_config_ready_dual_auth_keeps_model_api_key -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             read_parent_sampling_config_dual_auth_keeps_model_api_key -- --nocapture
+
+      # #160: six of the seven tests this branch originally added matched no
+      # filter. The seventh, `web_search_resolves_an_env_backed_credential_header`,
+      # is already selected by the existing `credential_header` filter. Written
+      # out rather than looped so the #171 check can see them. Quoted name: an
+      # unquoted `#160` truncates at the comment marker.
+      - name: 'web_search env header forwarding (issue #160)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib spawn_gates_web_search -- --nocapture
+          run_nonzero -p xai-grok-shell --lib spawn_forwards_env_http_headers -- --nocapture
+          run_nonzero -p xai-grok-shell --lib web_search_env_header_overrides -- --nocapture
+          run_nonzero -p xai-grok-shell --lib env_backed_credential_header -- --nocapture
+          # Also this PR's earlier commit, whose three tests matched nothing either.
+          run_nonzero -p xai-grok-shell --lib keeps_web_search_and_is_told_nothing -- --nocapture
+          run_nonzero -p xai-grok-shell --lib credential_less_route -- --nocapture
+          run_nonzero -p xai-grok-shell --lib invents_no_bearer -- --nocapture
+          # Review follow-up: resolve→SamplerConfig map copy, and the
+          # bearer_resolver arm of has_usable_credential.
+          run_nonzero -p xai-grok-shell --lib survives_into_sampler_config -- --nocapture
+          run_nonzero -p xai-grok-shell --lib accepts_a_bearer_resolver_alone -- --nocapture
