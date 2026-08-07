@@ -302,7 +302,8 @@ pub enum ReclaimOutcome {
     Indeterminate,
 }
 
-/// Remove a leader lock file, but **only** if no live process holds its flock.
+/// Remove a stale leader lock file (and optionally its socket), but **only** if
+/// no live process holds its flock.
 ///
 /// This is the safe replacement for "the PID doesn't look like ours, so the
 /// lock must be stale" (issue #167). Occupancy, not identity, is what makes
@@ -320,11 +321,13 @@ pub enum ReclaimOutcome {
 /// the file: `try_acquire` drops the file on failure, and `acquire_reopen_timeout`
 /// explicitly `drop(file)`s before sleeping. Thus, unlinking the file while holding
 /// the flock prevents any waiter from locking the unlinked inode (since they will
-/// reopen the path and get the new inode instead).
+/// reopen the path and get the new inode instead). The optional socket cleanup is
+/// in that same lock-held window, so a new leader cannot bind and then be unlinked
+/// by stale cleanup after reclaim returns (issue #183).
 ///
 /// Opens existing-only: this must never create the very file it is deciding
 /// whether to delete.
-pub fn reclaim_lock_if_unheld(lock_path: &Path) -> ReclaimOutcome {
+pub fn reclaim_lock_if_unheld(lock_path: &Path, socket_path: Option<&Path>) -> ReclaimOutcome {
     let file = match OpenOptions::new().read(true).write(true).open(lock_path) {
         Ok(f) => f,
         Err(e) => {
@@ -339,6 +342,9 @@ pub fn reclaim_lock_if_unheld(lock_path: &Path) -> ReclaimOutcome {
         Ok(()) => {
             // Still holding the lock here: unlink before releasing.
             let removed = fs::remove_file(lock_path).is_ok();
+            if removed && let Some(sock) = socket_path {
+                let _ = fs::remove_file(sock);
+            }
             let _ = FileExt::unlock(&file);
             if removed {
                 ReclaimOutcome::Removed
@@ -395,11 +401,20 @@ mod tests {
     #[test]
     fn reclaim_removes_a_lock_no_process_holds() {
         let temp = TempDir::new().unwrap();
-        let path = temp.path().join("leader.lock");
-        fs::write(&path, "4000000000").unwrap();
+        let lock = temp.path().join("leader.lock");
+        let socket = temp.path().join("leader.sock");
+        fs::write(&lock, "4000000000").unwrap();
+        fs::write(&socket, "stale-socket").unwrap();
 
-        assert_eq!(reclaim_lock_if_unheld(&path), ReclaimOutcome::Removed);
-        assert!(!path.exists(), "an orphaned lock file must be removed");
+        assert_eq!(
+            reclaim_lock_if_unheld(&lock, Some(socket.as_path())),
+            ReclaimOutcome::Removed
+        );
+        assert!(!lock.exists(), "an orphaned lock file must be removed");
+        assert!(
+            !socket.exists(),
+            "its sibling socket must be removed in the same flock window"
+        );
     }
 
     /// Issue #167, the invariant that must not be weakened: a lock file whose
@@ -414,27 +429,33 @@ mod tests {
     #[test]
     fn reclaim_refuses_a_lock_a_live_process_holds() {
         let temp = TempDir::new().unwrap();
-        let path = temp.path().join("leader.lock");
-        fs::write(&path, "1234").unwrap();
+        let lock = temp.path().join("leader.lock");
+        let socket = temp.path().join("leader.sock");
+        fs::write(&lock, "1234").unwrap();
+        fs::write(&socket, "live-socket").unwrap();
 
         // Stand in for the live leader still holding its lock.
         let holder = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&path)
+            .open(&lock)
             .unwrap();
         holder.try_lock_exclusive().expect("holder acquires flock");
 
         assert_eq!(
-            reclaim_lock_if_unheld(&path),
+            reclaim_lock_if_unheld(&lock, Some(socket.as_path())),
             ReclaimOutcome::HeldByLiveProcess,
             "a held lock must never be reclaimed, whatever the PID or the \
              process name suggests",
         );
         assert!(
-            path.exists(),
+            lock.exists(),
             "the live holder's lock file must survive — removing it is the \
              step that produces a second leader",
+        );
+        assert!(
+            socket.exists(),
+            "socket cleanup must not run when reclaim cannot take the flock",
         );
 
         FileExt::unlock(&holder).unwrap();
@@ -445,10 +466,18 @@ mod tests {
     #[test]
     fn reclaim_returns_not_found_for_a_missing_lock_file() {
         let temp = TempDir::new().unwrap();
-        let path = temp.path().join("absent.lock");
+        let lock = temp.path().join("absent.lock");
+        let socket = temp.path().join("absent.sock");
 
-        assert_eq!(reclaim_lock_if_unheld(&path), ReclaimOutcome::NotFound,);
-        assert!(!path.exists(), "probing must not create the lock file");
+        assert_eq!(
+            reclaim_lock_if_unheld(&lock, Some(socket.as_path())),
+            ReclaimOutcome::NotFound,
+        );
+        assert!(!lock.exists(), "probing must not create the lock file");
+        assert!(
+            !socket.exists(),
+            "without an acquired flock this path must not be touched",
+        );
     }
 
     #[test]

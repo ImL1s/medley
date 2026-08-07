@@ -494,6 +494,11 @@ fn format_leader_held_guidance(lock_path: &str, pid_from_lock: Option<u32>) -> S
     out
 }
 
+fn record_reclaimed_stale_lock(lock: &std::path::Path, cleaned: &mut u32) {
+    eprintln!("  No process holds {}, removed stale lock", lock.display());
+    *cleaned += 1;
+}
+
 async fn kill_leaders() -> Result<()> {
     let leaders = xai_grok_shell::leader::discover_leaders().await;
     if leaders.is_empty() {
@@ -523,13 +528,10 @@ async fn kill_leaders() -> Result<()> {
                 let Some(ref lock) = d.lock_path else {
                     continue;
                 };
-                match xai_grok_shell::leader::reclaim_lock_if_unheld(lock) {
+                match xai_grok_shell::leader::reclaim_lock_if_unheld(lock, d.socket_path.as_deref())
+                {
                     xai_grok_shell::leader::ReclaimOutcome::Removed => {
-                        eprintln!("  No process holds {}, removed stale lock", lock.display());
-                        if let Some(ref sock) = d.socket_path {
-                            let _ = std::fs::remove_file(sock);
-                        }
-                        cleaned += 1;
+                        record_reclaimed_stale_lock(lock, &mut cleaned);
                     }
                     xai_grok_shell::leader::ReclaimOutcome::NotFound => {
                         // Deliberately touches nothing. The `Removed` arm above
@@ -3193,6 +3195,66 @@ mod tests {
             LeaderKillAction::ReclaimLockIfUnheld,
             "the fallback probes occupancy, which no rename can change",
         );
+    }
+
+    /// Issue #183: stale-lock cleanup must not unlink a socket that a new
+    /// leader bound after reclaim released the flock.
+    ///
+    /// Interleaving:
+    /// 1) process A reclaims the stale lock and returns `Removed`;
+    /// 2) process B starts, acquires a fresh lock at the same path, and binds
+    ///    a fresh socket;
+    /// 3) process A's post-reclaim cleanup runs.
+    ///
+    /// Step 3 must not remove the live socket from step 2.
+    #[test]
+    fn leaders_kill_issue183_interleaving_preserves_new_leader_socket() {
+        use std::fs::OpenOptions;
+        use std::os::fd::AsRawFd;
+
+        let temp = std::env::temp_dir().join(format!(
+            "grok-leaders-kill-issue183-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let lock = temp.join("leader.lock");
+        let socket = temp.join("leader.sock");
+        std::fs::write(&lock, "stale-lock").unwrap();
+        std::fs::write(&socket, "stale-socket").unwrap();
+
+        assert_eq!(
+            xai_grok_shell::leader::reclaim_lock_if_unheld(&lock, Some(socket.as_path())),
+            xai_grok_shell::leader::ReclaimOutcome::Removed
+        );
+
+        // New leader now owns the replacement lock and has rebound its socket.
+        let new_leader_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock)
+            .unwrap();
+        let flock_rc = unsafe { libc::flock(new_leader_lock.as_raw_fd(), libc::LOCK_EX) };
+        assert_eq!(flock_rc, 0, "new leader should hold the replacement flock");
+        std::fs::write(&socket, "live-socket").unwrap();
+
+        let mut cleaned = 0u32;
+        record_reclaimed_stale_lock(&lock, &mut cleaned);
+
+        assert_eq!(cleaned, 1);
+        assert!(
+            socket.exists(),
+            "stale cleanup must not unlink a socket that a new leader has just bound"
+        );
+
+        let _ = unsafe { libc::flock(new_leader_lock.as_raw_fd(), libc::LOCK_UN) };
+        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]
