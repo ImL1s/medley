@@ -701,6 +701,32 @@ jobs:
           }
           run_nonzero -p xai-grok-shell --lib workflow_restore -- --nocapture
 
+      # #10: catalog IDs and wire slugs are distinct identities. These filters
+      # must be unique so run_nonzero proves each guard test still executes.
+      # Quoted name: an unquoted `#10` truncates at the comment marker.
+      - name: 'Catalog ID vs wire slug restore/switch guards (issue #10)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib \
+            auto_compact_threshold_resolves_by_catalog_id_not_wire_slug -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            resolve_catalog_key_none_when_slug_is_ambiguous -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            selectable_catalog_resolution_reports_ambiguous_slug -- --nocapture
+
       # #165: abandoned sampling attempts must not enter the FTS index.
       # Unique filters so run_nonzero proves each new test is selected.
       # Quoted name: an unquoted `#165` truncates at the comment marker.
