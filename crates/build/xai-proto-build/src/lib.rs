@@ -1,8 +1,10 @@
 pub mod find_protoc;
 
 use anyhow::Context;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::time::Duration;
 use std::{fs, iter};
 
 /// Find the protoc well-known types include directory.
@@ -192,7 +194,8 @@ impl XaiProtoBuilder {
             command.stdin(Stdio::null());
             command.stderr(Stdio::inherit());
 
-            let output = command.output().context("protoc command failed")?;
+            let output =
+                output_retrying_while_busy(&mut command).context("protoc command failed")?;
             if !output.status.success() {
                 return Err(anyhow::anyhow!("protoc command failed"));
             }
@@ -382,6 +385,35 @@ fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
     bytes
 }
 
+/// Run a command, retrying while its executable is still held open for writing.
+///
+/// `execve` reports `ETXTBSY` while *any* process holds a write descriptor to the
+/// target inode, and closing the descriptor that wrote the file does not
+/// guarantee that. A `fork` on another thread duplicates every open descriptor,
+/// and the child keeps its copy until its own `exec` clears it — so a file
+/// written and closed here can still be busy because an unrelated thread spawned
+/// a process mid-write. Nothing on the writing side closes that window, and
+/// renaming does not help: the descriptor follows the inode, not the name.
+///
+/// Only `ExecutableFileBusy` is retried. A command that runs and exits non-zero
+/// has produced a result, not a transient failure, and is returned untouched.
+pub(crate) fn output_retrying_while_busy(command: &mut Command) -> std::io::Result<Output> {
+    // Roughly 100ms in total, against a window that lasts one `fork`.
+    const ATTEMPTS: u32 = 20;
+    const BACKOFF: Duration = Duration::from_millis(5);
+
+    for _ in 1..ATTEMPTS {
+        match command.output() {
+            Err(busy) if busy.kind() == ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(BACKOFF);
+            }
+            settled => return settled,
+        }
+    }
+    // Let the last attempt's error stand as the reported one.
+    command.output()
+}
+
 #[cfg(test)]
 pub(crate) fn write_executable_stub(path: impl AsRef<Path>, contents: &[u8]) -> PathBuf {
     use std::io::Write;
@@ -392,7 +424,9 @@ pub(crate) fn write_executable_stub(path: impl AsRef<Path>, contents: &[u8]) -> 
     let mut file = fs::File::create(path).expect("create executable stub");
     file.write_all(contents).expect("write executable stub");
     file.sync_all().expect("sync executable stub");
-    // Linux can return ETXTBSY if the executable is still open for write.
+    // Necessary but not sufficient against ETXTBSY: this closes our descriptor,
+    // not a copy some other thread's `fork` is holding. Exec through
+    // `output_retrying_while_busy` for the rest.
     drop(file);
     #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod executable stub");
@@ -575,8 +609,7 @@ mod tests {
         let include_dir_bytes = b"/opt/we\xffird/include";
         let include_dir = Path::new(OsStr::from_bytes(include_dir_bytes));
 
-        let output = Command::new(&protoc_script)
-            .output()
+        let output = output_retrying_while_busy(&mut Command::new(&protoc_script))
             .expect("run stub protoc for fixture verification");
         assert!(
             output
