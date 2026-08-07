@@ -3079,6 +3079,12 @@ mod command_palette_vim_input_tests {
         use ratatui::buffer::Buffer;
         use ratatui::layout::Rect;
 
+        // Local TrueColor theme for render + cursor detector. Under NO_COLOR
+        // the process-global theme quantizes text_primary to Reset and every
+        // cell matches the inverse-video check (false green / false fail).
+        let theme = crate::theme::Theme::groknight()
+            .quantized(crate::theme::color_support::ColorLevel::TrueColor);
+
         let render_palette_search_row = |search_active: bool| -> (bool, String) {
             let mut agent = make_agent();
             open_command_palette(&mut agent);
@@ -3087,9 +3093,8 @@ mod command_palette_vim_input_tests {
             }
             let area = Rect::new(0, 0, 80, 24);
             let mut buf = Buffer::empty(area);
-            agent.draw_active_modal(area, &mut buf, crate::theme::Theme::current(), false);
+            agent.draw_active_modal(area, &mut buf, theme, false);
 
-            let theme = crate::theme::Theme::current();
             let search_bar = match agent.active_modal.as_ref() {
                 Some(ActiveModal::CommandPalette { state, .. }) => {
                     state
