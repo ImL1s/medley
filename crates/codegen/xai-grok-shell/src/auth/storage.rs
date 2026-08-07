@@ -90,9 +90,10 @@ pub fn read_auth_json(auth_file: &Path) -> std::io::Result<AuthStore> {
 /// world-readable credential store must make the credential unavailable. The
 /// legacy xAI reader remains best-effort for backwards compatibility.
 pub(crate) fn read_auth_json_owner_only(auth_file: &Path) -> std::io::Result<AuthStore> {
-    ensure_auth_json_owner_only(auth_file)?;
-
-    let mut file = File::open(auth_file)?;
+    let mut file = open_auth_file_for_owner_check(auth_file)?;
+    #[cfg(test)]
+    maybe_swap_strict_read_target_after_open(auth_file)?;
+    ensure_auth_json_owner_only_for_file(auth_file, &file)?;
     let mut contents = String::new();
     file.read_to_string(&mut contents)?;
 
@@ -111,8 +112,65 @@ pub(crate) fn read_auth_json_owner_only(auth_file: &Path) -> std::io::Result<Aut
 #[cfg(test)]
 pub(super) static PERMISSION_REPAIR_FAULT_PATHS: std::sync::Mutex<Vec<PathBuf>> =
     std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+pub(super) static STRICT_READ_SWAP_AFTER_OPEN_PATHS: std::sync::Mutex<Vec<PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn maybe_swap_strict_read_target_after_open(auth_file: &Path) -> std::io::Result<()> {
+    let should_swap = STRICT_READ_SWAP_AFTER_OPEN_PATHS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .any(|path| path == auth_file);
+    if !should_swap {
+        return Ok(());
+    }
+
+    let mut attacker = AuthStore::new();
+    attacker.insert(
+        API_KEY_SCOPE.to_owned(),
+        GrokAuth {
+            key: "attacker-key".to_owned(),
+            auth_mode: AuthMode::ApiKey,
+            ..Default::default()
+        },
+    );
+    let replacement = auth_file.with_extension("json.strict-read-swap");
+    write_store_to(&replacement, &attacker)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&replacement)?.permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&replacement, perms)?;
+    }
+    std::fs::rename(&replacement, auth_file)?;
+    Ok(())
+}
 
 pub(crate) fn ensure_auth_json_owner_only(auth_file: &Path) -> std::io::Result<()> {
+    let file = match open_auth_file_for_owner_check(auth_file) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    ensure_auth_json_owner_only_for_file(auth_file, &file)
+}
+
+fn open_auth_file_for_owner_check(auth_file: &Path) -> std::io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::{FILE_GENERIC_READ, WRITE_DAC};
+        options.access_mode(FILE_GENERIC_READ.0 | WRITE_DAC.0);
+    }
+    options.open(auth_file)
+}
+
+fn ensure_auth_json_owner_only_for_file(auth_file: &Path, file: &File) -> std::io::Result<()> {
     #[cfg(all(test, unix))]
     let injected_repair_failure = {
         use std::os::unix::fs::PermissionsExt;
@@ -121,7 +179,8 @@ pub(crate) fn ensure_auth_json_owner_only(auth_file: &Path) -> std::io::Result<(
             .unwrap_or_else(|error| error.into_inner())
             .iter()
             .any(|path| path == auth_file)
-            && std::fs::metadata(auth_file)
+            && file
+                .metadata()
                 .map(|metadata| metadata.permissions().mode() & 0o777 != 0o600)
                 .unwrap_or(false)
     };
@@ -139,7 +198,7 @@ pub(crate) fn ensure_auth_json_owner_only(auth_file: &Path) -> std::io::Result<(
         ));
     }
 
-    crate::util::secure_file::ensure_owner_only_permissions(auth_file)
+    crate::util::secure_file::ensure_owner_only_permissions_for_file(file)
 }
 
 /// Strict provider counterpart to
@@ -384,9 +443,13 @@ pub(super) static WRITE_FAULT_PATH: std::sync::Mutex<Option<PathBuf>> = std::syn
 #[cfg(test)]
 pub(super) static WRITE_STORAGE_FULL_FAULT_PATH: std::sync::Mutex<Option<PathBuf>> =
     std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(super) static POST_RENAME_PERMISSION_FAULT_PATH: std::sync::Mutex<Option<PathBuf>> =
+    std::sync::Mutex::new(None);
 
-/// Atomic write: tmp + rename. Unix `rename(2)` replaces atomically;
-/// Windows `rename` requires removing the target first.
+/// Atomic write: tmp + replace in one operation.
+/// Unix uses `rename(2)` replacement semantics; Windows uses
+/// `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`.
 fn write_auth_json_atomic(auth_file: &Path, auth_store: &AuthStore) -> std::io::Result<()> {
     write_auth_json_atomic_with_permission_check(auth_file, auth_store, None)
 }
@@ -400,6 +463,7 @@ fn write_auth_json_atomic_with_permission_check(
     auth_store: &AuthStore,
     prove_owner_only: Option<fn(&File) -> std::io::Result<()>>,
 ) -> std::io::Result<()> {
+    let strict_write = prove_owner_only.is_some();
     #[cfg(test)]
     if WRITE_STORAGE_FULL_FAULT_PATH
         .lock()
@@ -446,22 +510,73 @@ fn write_auth_json_atomic_with_permission_check(
     } else {
         write_store_to(&tmp, auth_store)?;
     }
+    replace_auth_file(&tmp, auth_file)?;
+    tmp_reclaim.0 = None; // renamed into place; nothing to reclaim
+    finalize_auth_file_permissions(auth_file, strict_write)
+}
+
+fn replace_auth_file(tmp: &Path, auth_file: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        let _ = std::fs::remove_file(auth_file);
+        if !auth_file.exists() {
+            return std::fs::rename(tmp, auth_file);
+        }
+
+        use std::iter::once;
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        };
+        use windows::core::PCWSTR;
+
+        let from: Vec<u16> = tmp.as_os_str().encode_wide().chain(once(0)).collect();
+        let to: Vec<u16> = auth_file.as_os_str().encode_wide().chain(once(0)).collect();
+        unsafe {
+            MoveFileExW(
+                PCWSTR::from_raw(from.as_ptr()),
+                PCWSTR::from_raw(to.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }
+        .map_err(std::io::Error::other)?;
+        Ok(())
     }
-    std::fs::rename(&tmp, auth_file)?;
-    tmp_reclaim.0 = None; // renamed into place; nothing to reclaim
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(tmp, auth_file)
+    }
+}
+
+fn finalize_auth_file_permissions(auth_file: &Path, strict_write: bool) -> std::io::Result<()> {
+    #[cfg(test)]
+    if strict_write
+        && POST_RENAME_PERMISSION_FAULT_PATH
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_deref()
+            == Some(auth_file)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected post-rename owner-only permission failure",
+        ));
+    }
+
     // Re-assert on the final path (covers rename edge cases / FS quirks).
-    // Best-effort: rename already published the new tokens.
-    if let Err(e) = crate::util::secure_file::ensure_owner_only_permissions(auth_file) {
-        tracing::warn!(
-            error = %e,
-            path = %auth_file.display(),
-            "auth: failed to ensure owner-only permissions after rename"
-        );
+    // Strict writes fail closed here; legacy writes keep their best-effort
+    // behavior because the bytes are already durably published.
+    match crate::util::secure_file::ensure_owner_only_permissions(auth_file) {
+        Ok(()) => Ok(()),
+        Err(error) if strict_write => Err(error),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                path = %auth_file.display(),
+                "auth: failed to ensure owner-only permissions after rename"
+            );
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 fn next_auth_temp_path(auth_file: &Path) -> PathBuf {
@@ -632,6 +747,49 @@ pub fn clear_api_key(grok_home: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod write_fallback_tests {
     use super::*;
+
+    struct StrictReadSwapAfterOpenFault(PathBuf);
+
+    impl StrictReadSwapAfterOpenFault {
+        fn install(path: &Path) -> Self {
+            STRICT_READ_SWAP_AFTER_OPEN_PATHS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(path.to_owned());
+            Self(path.to_owned())
+        }
+    }
+
+    impl Drop for StrictReadSwapAfterOpenFault {
+        fn drop(&mut self) {
+            let mut swaps = STRICT_READ_SWAP_AFTER_OPEN_PATHS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            swaps.retain(|path| path != &self.0);
+        }
+    }
+
+    struct PostRenamePermissionFault(PathBuf);
+
+    impl PostRenamePermissionFault {
+        fn install(path: &Path) -> Self {
+            *POST_RENAME_PERMISSION_FAULT_PATH
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(path.to_owned());
+            Self(path.to_owned())
+        }
+    }
+
+    impl Drop for PostRenamePermissionFault {
+        fn drop(&mut self) {
+            let mut guard = POST_RENAME_PERMISSION_FAULT_PATH
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if guard.as_deref() == Some(self.0.as_path()) {
+                *guard = None;
+            }
+        }
+    }
 
     fn sample_store() -> AuthStore {
         let mut map = AuthStore::new();
@@ -845,6 +1003,46 @@ mod write_fallback_tests {
         assert!(
             orphans.is_empty(),
             "rejected strict temp file must be reclaimed: {orphans:?}"
+        );
+    }
+
+    /// A strict read must keep reading the object it already opened even if the
+    /// path is swapped before bytes are consumed.
+    #[test]
+    fn strict_read_uses_open_file_handle_when_path_is_swapped_after_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        write_auth_json_strict(&path, &sample_store()).unwrap();
+        let _swap = StrictReadSwapAfterOpenFault::install(&path);
+
+        let strict = read_auth_json_owner_only(&path).unwrap();
+        assert_eq!(
+            strict.get(API_KEY_SCOPE).map(|auth| auth.key.as_str()),
+            Some("secret-key"),
+            "strict read must stay on the inode opened before a path swap"
+        );
+
+        let swapped = read_auth_json(&path).unwrap();
+        assert_eq!(
+            swapped.get(API_KEY_SCOPE).map(|auth| auth.key.as_str()),
+            Some("attacker-key"),
+            "test precondition: path now points at the swapped attacker payload"
+        );
+    }
+
+    /// Strict writes fail closed if final-path permission re-assertion fails.
+    #[test]
+    fn strict_atomic_write_fails_when_post_rename_permission_assertion_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let _fault = PostRenamePermissionFault::install(&path);
+
+        let err = write_auth_json_strict(&path, &sample_store()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            read_key(&path).as_deref(),
+            Some("secret-key"),
+            "strict write must surface the post-rename failure without tearing bytes"
         );
     }
 

@@ -1,19 +1,28 @@
-# Contributing
+# Contributing to Medley
 
-This repository does **not** accept external pull requests or unsolicited
-patches.
+Thanks for helping improve [ImL1s/medley](https://github.com/ImL1s/medley).
+This fork accepts external issues and pull requests.
 
-SpaceXAI develops this software internally. The public tree is published for
-source transparency and local builds under the terms of the Apache License,
-Version 2.0 (see [`LICENSE`](LICENSE)).
+## Before you open a PR
 
-## Security reports
+- Read [`FORK.md`](FORK.md) for branch roles and sync rules.
+- Target **`providers`**. Do not target `main` (it is a pristine upstream mirror).
+- Keep changes focused and explain user impact in the PR body.
+- Run the checks relevant to your change (tests, lint, docs examples) before opening.
 
-Please report security issues through the process described in
-[`SECURITY.md`](SECURITY.md). Do not open a public issue for vulnerabilities.
+## What to open where
 
-## Licensing of this source
+- Bugs and feature requests: <https://github.com/ImL1s/medley/issues>
+- Code changes: pull requests to `providers`
+- Upstream sync work: follow `scripts/sync-upstream.sh` + [`FORK.md`](FORK.md)
 
-By downloading or using this source, you agree that your use is governed by
-the Apache License, Version 2.0. No contributor license agreement is offered
-because external contributions are not accepted.
+## Security-sensitive changes
+
+Do not include real credentials, API keys, or tokens in issues, commits,
+examples, or logs. For vulnerability reporting, use the process in
+[`SECURITY.md`](SECURITY.md).
+
+## License
+
+By contributing, you agree that your contributions are licensed under the
+Apache License, Version 2.0 (see [`LICENSE`](LICENSE)).

@@ -45,6 +45,11 @@ jobs:
       - name: Test the new-test filter guard
         run: python3 -B -m unittest tests.test_new_test_filter_guard -v
 
+      - name: Test the PR-head CI receipt guard
+        # This guard is a pre-merge local/orchestrator check; it does not run
+        # as part of CI itself. CI only executes its Python unit tests.
+        run: python3 -B -m unittest tests.test_pr_head_ci_run_guard -v
+
   installer:
     name: Installer
     runs-on: ubuntu-latest
@@ -261,6 +266,13 @@ jobs:
           # where a filter matching zero tests exits 0. `env_keys_` selects all
           # seven new tests and their three existing siblings.
           run_nonzero -p xai-grok-shell --lib env_keys_ -- --nocapture
+          # #73: strict-storage hardening. One guard proves strict reads stay on
+          # the already-open inode, one proves strict writes fail closed on a
+          # post-rename owner-only permission assertion failure.
+          run_nonzero -p xai-grok-shell --lib \
+            strict_read_uses_open_file_handle_when_path_is_swapped_after_open -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            strict_atomic_write_fails_when_post_rename_permission_assertion_fails -- --nocapture
           run_nonzero -p xai-grok-mcp --lib \
             callback_payload_debug_never_emits_code_state_or_issuer -- --nocapture
           run_nonzero -p xai-file-utils --lib \
@@ -911,10 +923,12 @@ jobs:
           run_nonzero -p xai-grok-shell --lib session_meta_publishes_the_web_search_disable -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             session_load_recompute_updates_web_search_notice_for_ready_unusable_and_unknown -- --nocapture
+          run_nonzero -p xai-grok-shell --lib session_meta_keeps_web_search_notices_session_scoped -- --nocapture
           run_nonzero -p xai-grok-shell --lib take_session_drops_the_web_search_notice -- --nocapture
           run_nonzero -p xai-grok-pager --lib web_search_disabled_meta -- --nocapture
           run_nonzero -p xai-grok-pager --lib no_web_search_notice -- --nocapture
           run_nonzero -p xai-grok-pager --lib parse_session_web_search_disabled -- --nocapture
+          run_nonzero -p xai-grok-pager --lib headless_web_search_notice -- --nocapture
 
       # #167: pure seams split out of `kill_leaders` so summary/exit and PID
       # guards are unit-testable. The earlier "Leader kill safety" step already
@@ -983,6 +997,28 @@ jobs:
             respawn_stdio_then_inserts_before_arming_and_has_no_post_arm_yields -- --nocapture
           run_nonzero -p xai-grok-mcp --lib \
             arm_liveness_watcher_then_has_no_scheduler_yield_after_spawning -- --nocapture
+
+      # #35: the removed local-workspace bridge surface must fail closed if a
+      # client still sends `x.ai/local_workspace`; silent ignore would read as
+      # supported and then degrade to NotAttached behavior.
+      - name: 'Removed local-workspace meta guard (issue #35)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib \
+            local_workspace_removed_meta_rejected_fail_closed_matrix -- --nocapture
 
       # #36: restore fd bundling only with a public PI caller and contract.
       # The tests are split by build mode: override-path bundle and release

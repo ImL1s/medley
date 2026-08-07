@@ -744,3 +744,104 @@ fn unsupported_effort_user_note_names_model_and_switch() {
         "soft-drop must still say the request was ignored: {note}"
     );
 }
+
+// ---- #161: headless surfaces the web_search disable notice ----
+//
+// Headless has no xAI-notification consumer, so the response-`_meta` read in
+// `open_session` is the ONLY channel the notice has to reach `medley -p`.
+// These tests drive the real `open_session` against a canned agent channel;
+// deleting the `web_search_disabled_message(...)` wiring leaves every other
+// test in the tree green.
+
+use agent_client_protocol as acp;
+
+const HEADLESS_WS_MESSAGE: &str = "web_search is unavailable: model \"grok-4-fast\" could not be used (no API key or session credential available)";
+
+fn headless_ws_notice_meta() -> acp::Meta {
+    let notice = xai_grok_shell::session::WebSearchDisabledNotice {
+        model_id: "grok-4-fast".to_owned(),
+        reason: "no API key or session credential available".to_owned(),
+        message: HEADLESS_WS_MESSAGE.to_owned(),
+    };
+    let mut meta = acp::Meta::new();
+    meta.insert(
+        xai_grok_shell::session::WEB_SEARCH_DISABLED_META_KEY.to_owned(),
+        serde_json::to_value(notice).expect("notice serializes"),
+    );
+    meta
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn headless_web_search_notice_surfaces_on_new_session() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpAgentMessage>();
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if let xai_acp_lib::AcpAgentMessage::NewSession(args) = msg {
+                let resp = acp::NewSessionResponse::new(acp::SessionId::new("headless-ws-new"))
+                    .meta(Some(headless_ws_notice_meta()));
+                let _ = args.response_tx.send(Ok(resp));
+            }
+        }
+    });
+    let cwd = tempfile::tempdir().expect("temp cwd");
+    let opened = super::open_session(&tx, cwd.path(), None, None)
+        .await
+        .expect("session opens");
+    assert_eq!(opened.session_id.0.as_ref(), "headless-ws-new");
+    assert_eq!(
+        opened.web_search_disabled.as_deref(),
+        Some(HEADLESS_WS_MESSAGE),
+        "headless must surface the notice from the session/new response meta"
+    );
+}
+
+/// The resume/reconnect path: `session/load` re-delivers the notice on its
+/// response `_meta`, so a client that missed (or never saw) the original
+/// session open is told again -- with the old notification + process-wide
+/// latch, a dropped first notice stayed dropped for the process lifetime.
+#[tokio::test(flavor = "current_thread")]
+async fn headless_web_search_notice_surfaces_on_session_load() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpAgentMessage>();
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if let xai_acp_lib::AcpAgentMessage::LoadSession(args) = msg {
+                let resp = acp::LoadSessionResponse::new().meta(Some(headless_ws_notice_meta()));
+                let _ = args.response_tx.send(Ok(resp));
+            }
+        }
+    });
+    let cwd = tempfile::tempdir().expect("temp cwd");
+    let opened = super::open_session(&tx, cwd.path(), Some("headless-ws-resume"), None)
+        .await
+        .expect("resume loads");
+    assert_eq!(opened.session_id.0.as_ref(), "headless-ws-resume");
+    assert_eq!(
+        opened.web_search_disabled.as_deref(),
+        Some(HEADLESS_WS_MESSAGE),
+        "headless must surface the notice from the session/load response meta"
+    );
+}
+
+/// Control for the two above: absent key == web_search is available. A
+/// blanket "always Some" in `web_search_disabled_message` passes the positive
+/// tests and fails here.
+#[tokio::test(flavor = "current_thread")]
+async fn headless_web_search_notice_absent_meta_means_available() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpAgentMessage>();
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if let xai_acp_lib::AcpAgentMessage::NewSession(args) = msg {
+                let resp = acp::NewSessionResponse::new(acp::SessionId::new("headless-ws-fine"));
+                let _ = args.response_tx.send(Ok(resp));
+            }
+        }
+    });
+    let cwd = tempfile::tempdir().expect("temp cwd");
+    let opened = super::open_session(&tx, cwd.path(), None, None)
+        .await
+        .expect("session opens");
+    assert_eq!(
+        opened.web_search_disabled, None,
+        "absent meta key must read as web_search available"
+    );
+}
