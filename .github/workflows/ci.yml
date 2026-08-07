@@ -379,6 +379,13 @@ jobs:
             catalog_miss -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
             toctou -- --nocapture
+          # The three tests this change fixes matched none of the filters
+          # above, so registering their models bought nothing: they ran in no
+          # job at all (#171). This selects them and the six sibling
+          # deferred-switch tests, which belong to this step by subject and
+          # were equally unrun.
+          cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
+            deferred_switch_ -- --nocapture
 
       # #166: these assert on colour, and used to inherit the ambient colour
       # level. Run them under both settings of NO_COLOR -- one pass alone would
