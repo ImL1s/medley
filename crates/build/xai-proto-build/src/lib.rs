@@ -217,15 +217,17 @@ impl XaiProtoBuilder {
                     continue;
                 }
 
-                let line_str = std::str::from_utf8(line)
-                    .context("dependency path is not valid UTF-8")?;
+                let line_str =
+                    std::str::from_utf8(line).context("dependency path is not valid UTF-8")?;
 
                 if !fs::exists(line_str)? {
                     return Err(anyhow::anyhow!("dependency file not found: {line_str}"));
                 }
 
                 if line_str.contains('\n') || line_str.contains('\r') {
-                    return Err(anyhow::anyhow!("dependency path contains newline: {line_str}"));
+                    return Err(anyhow::anyhow!(
+                        "dependency path contains newline: {line_str}"
+                    ));
                 }
 
                 println!("cargo:rerun-if-changed={line_str}");
@@ -500,9 +502,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn emit_rerun_if_changed_handles_non_utf8_well_known_types_dependency() {
-        use std::os::unix::fs::PermissionsExt;
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
 
         let dir = temp_dir_named("nonutf8-dep");
         let proto_file = dir.join("test.proto");
@@ -512,8 +514,11 @@ mod tests {
         let mut script_content = Vec::new();
         script_content.extend_from_slice(b"#!/bin/sh\n");
         script_content.extend_from_slice(b"printf '/dev/null: ");
-        script_content.extend_from_slice(proto_file.to_str().expect("temp path is utf8").as_bytes());
-        script_content.extend_from_slice(b" \\\\\\n  /opt/we\\xffird/include/google/protobuf/timestamp.proto\\n'\n");
+        script_content
+            .extend_from_slice(proto_file.to_str().expect("temp path is utf8").as_bytes());
+        script_content.extend_from_slice(
+            b" \\\\\\n  /opt/we\\xffird/include/google/protobuf/timestamp.proto\\n'\n",
+        );
         script_content.extend_from_slice(b"exit 0\n");
 
         fs::write(&protoc_script, script_content).expect("write stub protoc");
@@ -526,10 +531,14 @@ mod tests {
             Some(&protoc_script),
             Some(include_dir),
             [proto_file.as_path()],
-            [] as [&Path; 0]
+            [] as [&Path; 0],
         );
 
-        assert!(res.is_ok(), "should succeed despite non-UTF-8 paths, err: {:?}", res.err());
+        assert!(
+            res.is_ok(),
+            "should succeed despite non-UTF-8 paths, err: {:?}",
+            res.err()
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
