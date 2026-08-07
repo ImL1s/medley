@@ -494,3 +494,36 @@ jobs:
             rm -f "$output"
           }
           run_nonzero -p xai-grok-shell --lib workflow_restore -- --nocapture
+
+      # #36: restore fd bundling only with a public PI caller and contract.
+      # The tests are split by build mode: override-path bundle and release
+      # auto-download bundle. Filters are written explicitly so #171 can prove
+      # each new test runs somewhere.
+      - name: 'PI fd glob contract and bundling (issue #36)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+
+          run_nonzero -p xai-grok-tools --features pi --lib \
+            pi_glob_fd_contract_preserves_public_glob_semantics -- --nocapture
+          run_nonzero -p xai-grok-tools --features pi --lib \
+            pi_glob_fd_error_falls_back_to_ripgrep -- --nocapture
+
+          GROK_TOOLS_BUNDLE_FD_PATH="$PWD/crates/codegen/xai-grok-tools/tests/fd-override-fixture.sh" \
+            run_nonzero -p xai-grok-tools --features pi --lib \
+              bundled_fd_override_artifact_extracts_exact_and_executes -- --nocapture
+
+          run_nonzero --release -p xai-grok-tools --features pi --lib \
+            bundled_fd_release_artifact_extracts_exact_and_executes -- --nocapture
