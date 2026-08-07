@@ -390,6 +390,11 @@ jobs:
           run_nonzero -p xai-grok-pager --lib invalid_token_ranges_are_dropped -- --nocapture
           run_nonzero -p xai-grok-pager --lib token_on_second_logical_line -- --nocapture
           run_nonzero -p xai-grok-pager --lib search_bar_cursor -- --nocapture
+          # Made hermetic by this change like the others, but pre-existing, so
+          # the #171 check cannot see it: that check reads the diff for a new
+          # `#[test]`, and this test is not new -- only its contract is.
+          run_nonzero -p xai-grok-pager --lib \
+            user_prompt_band_is_semantic -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             colour_asserting_tests_do_not_use_theme_current -- --nocapture
           NO_COLOR=1 run_nonzero -p xai-grok-pager --lib keeps_teal -- --nocapture
