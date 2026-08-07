@@ -826,3 +826,32 @@ jobs:
           # mutation-proven invariant tests (`reclaim_removes_a_lock_no_process_holds`,
           # `reclaim_refuses_a_lock_a_live_process_holds`) are also selected here.
           run_nonzero -p xai-grok-shell --lib reclaim_ -- --nocapture
+
+      # #173: the arm/note_ready ordering invariant from #45 is defended by a
+      # comment spanning two crates. These are source-scanning guards: the
+      # shell test asserts respawn_stdio inserts into owned_clients BEFORE
+      # arming the watcher and never awaits between the arm and Ok(()); the
+      # mcp test asserts arm_liveness_watcher itself never awaits after
+      # spawn_transport_liveness. Full test names as filters so each selects
+      # its test uniquely. Quoted name: an unquoted `#173` truncates at the
+      # comment marker.
+      - name: 'MCP respawn arm/insert ordering guards (issue #173)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib \
+            respawn_stdio_then_inserts_before_arming_and_has_no_post_arm_yields -- --nocapture
+          run_nonzero -p xai-grok-mcp --lib \
+            arm_liveness_watcher_then_has_no_scheduler_yield_after_spawning -- --nocapture
