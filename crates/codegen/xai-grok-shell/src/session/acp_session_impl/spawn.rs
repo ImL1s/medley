@@ -509,17 +509,25 @@ pub(crate) async fn spawn_session_actor(
                 transport_profile,
             )
         });
-        if let Some(api_key) = cfg.api_key {
+        // A missing `api_key` is not the same as a missing credential: a model
+        // authenticated by an explicit `authorization` / `x-api-key` header
+        // resolves with no key and is fully authenticated. Gating on the key
+        // alone disabled web_search for those users, and #153 then told them
+        // they had no credential (#160). `env_http_headers` travels with the
+        // config so the client can resolve it at build time — dropping it here
+        // would enable the tool and then send the request unauthenticated.
+        if crate::agent::config::has_usable_credential(&cfg) {
             xai_grok_tools::implementations::WebSearchConfig::Enabled {
-                api_key,
+                api_key: cfg.api_key,
                 base_url: cfg.base_url,
                 model: cfg.model,
                 extra_headers: cfg.extra_headers,
+                env_http_headers: cfg.env_http_headers,
                 alpha_test_key: credentials.alpha_test_key_cloned(),
                 api_key_provider,
             }
         } else {
-            tracing::warn!("web_search disabled: resolved config has no API key");
+            tracing::warn!("web_search disabled: resolved config has no usable credential");
             xai_grok_tools::implementations::WebSearchConfig::Disabled
         }
     } else {

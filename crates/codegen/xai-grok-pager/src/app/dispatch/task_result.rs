@@ -246,12 +246,14 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             session_id,
             models: new_models,
             scheduler_background_loops,
+            web_search_disabled,
         } => handle_session_created(
             app,
             agent_id,
             session_id,
             new_models,
             scheduler_background_loops,
+            web_search_disabled,
         ),
         TaskResult::SessionFailed { agent_id, error } => {
             handle_session_failed(app, agent_id, error)
@@ -263,6 +265,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             session_cwd,
             models: new_models,
             scheduler_background_loops,
+            web_search_disabled,
         } => handle_worktree_session_created(
             app,
             agent_id,
@@ -271,6 +274,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             session_cwd,
             new_models,
             scheduler_background_loops,
+            web_search_disabled,
         ),
         TaskResult::WorktreeForked {
             agent_id,
@@ -337,6 +341,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             restore_degree,
             running_prompt_id,
             scheduler_background_loops,
+            web_search_disabled,
         } => handle_session_loaded(
             app,
             agent_id,
@@ -347,6 +352,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             restore_degree,
             running_prompt_id,
             scheduler_background_loops,
+            web_search_disabled,
         ),
         TaskResult::SessionTitleFromDisk { agent_id, title } => {
             if let Some(agent) = app.agents.get_mut(&agent_id)

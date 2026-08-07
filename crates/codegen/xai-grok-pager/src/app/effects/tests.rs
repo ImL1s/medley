@@ -727,6 +727,44 @@ fn parse_session_load_restore_meta_rejects_unknown_degree() {
     let (_, _, degree) = parse_session_load_restore_meta(meta.as_object());
     assert!(degree.is_none());
 }
+/// #161 write→parse bridge: the shell publishes `WebSearchDisabledNotice` under
+/// `WEB_SEARCH_DISABLED_META_KEY`; the pager must recover the same shape. This
+/// is the production parser dispatch tests skip when they inject
+/// `TaskResult::SessionLoaded { web_search_disabled: Some(...) }` directly.
+#[test]
+fn parse_session_web_search_disabled_round_trips_shared_notice() {
+    let notice = xai_grok_shell::session::WebSearchDisabledNotice {
+        model_id: "grok-4-fast".into(),
+        reason: "model is not ready".into(),
+        message: "web_search is unavailable: model \"grok-4-fast\" could not be used (model is not ready)".into(),
+    };
+    let mut meta = acp::Meta::new();
+    meta.insert(
+        xai_grok_shell::session::WEB_SEARCH_DISABLED_META_KEY.into(),
+        serde_json::to_value(&notice).expect("notice serializes"),
+    );
+    let parsed = parse_session_web_search_disabled(Some(&meta))
+        .expect("well-formed meta must parse");
+    assert_eq!(parsed, notice);
+}
+/// Absent key means available — must not invent a notice.
+#[test]
+fn parse_session_web_search_disabled_absent_key_is_none() {
+    let meta = acp::Meta::new();
+    assert!(parse_session_web_search_disabled(Some(&meta)).is_none());
+    assert!(parse_session_web_search_disabled(None).is_none());
+}
+/// Present-but-malformed collapses to None (with a warn), not a panic — and
+/// must not be mistaken for a successful disable notice.
+#[test]
+fn parse_session_web_search_disabled_malformed_is_none() {
+    let mut meta = acp::Meta::new();
+    meta.insert(
+        xai_grok_shell::session::WEB_SEARCH_DISABLED_META_KEY.into(),
+        serde_json::json!("not-an-object"),
+    );
+    assert!(parse_session_web_search_disabled(Some(&meta)).is_none());
+}
 /// Unknown keys return a descriptive error.
 #[tokio::test]
 async fn persist_setting_unknown_key_returns_err() {

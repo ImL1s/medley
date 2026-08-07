@@ -2725,6 +2725,77 @@ async fn session_meta_publishes_the_sessions_pinned_scheduler_background_loops()
         "session meta must carry the handle's pinned value"
     );
 }
+/// #161: the disable notice is published on the session responses, per session.
+///
+/// This is what makes the `insert_session_config_meta` block load-bearing —
+/// without it, deleting that block breaks nothing anywhere, and it is where the
+/// whole design lives: the notice rides the response precisely because a
+/// notification could not be routed before the client bound the session id, and
+/// because headless has no xAI-notification consumer at all.
+#[tokio::test(flavor = "current_thread")]
+async fn session_meta_publishes_the_web_search_disable_notice_per_session() {
+    let agent = build_minimal_agent_for_tests();
+    let told = acp::SessionId::new("ws-disabled-sess");
+    let untold = acp::SessionId::new("ws-fine-sess");
+    for sid in [&told, &untold] {
+        let mut handle = make_test_handle("test-model", false, None);
+        handle.info.id = (*sid).clone();
+        agent.sessions.borrow_mut().insert((*sid).clone(), handle);
+    }
+    agent.web_search_disabled.borrow_mut().insert(
+        told.clone(),
+        crate::session::WebSearchDisabledNotice {
+            model_id: "grok-4-fast".into(),
+            reason: "no API key or session credential available".into(),
+            message: "web_search is unavailable: model \"grok-4-fast\" could not be used (no API key or session credential available)".into(),
+        },
+    );
+
+    let model_state = agent.model_state(Some(&told));
+    let mut meta = serde_json::Map::new();
+    agent.insert_session_config_meta(&mut meta, &told, "/tmp".to_string(), None, &model_state);
+    let published = meta
+        .get(crate::session::WEB_SEARCH_DISABLED_META_KEY)
+        .expect("session with a notice must publish it");
+    let round_tripped: crate::session::WebSearchDisabledNotice =
+        serde_json::from_value(published.clone()).expect("published shape must be the shared type");
+    assert_eq!(round_tripped.model_id, "grok-4-fast");
+    assert!(round_tripped.message.contains("web_search is unavailable"));
+
+    // Control: absent key == available. A blanket "always publish" would pass
+    // the assertion above and fail here.
+    let mut other = serde_json::Map::new();
+    agent.insert_session_config_meta(&mut other, &untold, "/tmp".to_string(), None, &model_state);
+    assert!(
+        other.get(crate::session::WEB_SEARCH_DISABLED_META_KEY).is_none(),
+        "a session with no notice must publish no key"
+    );
+}
+/// #161: the per-session entry dies with the session, so a long-lived process
+/// cannot accumulate them. `take_session` is the single funnel for a handle
+/// leaving `self.sessions`, which is why cleaning there is sufficient.
+#[tokio::test(flavor = "current_thread")]
+async fn take_session_drops_the_web_search_notice() {
+    let agent = build_minimal_agent_for_tests();
+    let sid = acp::SessionId::new("ws-cleanup-sess");
+    let mut handle = make_test_handle("test-model", false, None);
+    handle.info.id = sid.clone();
+    agent.sessions.borrow_mut().insert(sid.clone(), handle);
+    agent.web_search_disabled.borrow_mut().insert(
+        sid.clone(),
+        crate::session::WebSearchDisabledNotice {
+            model_id: "m".into(),
+            reason: "r".into(),
+            message: "msg".into(),
+        },
+    );
+    assert!(agent.web_search_disabled.borrow().contains_key(&sid));
+    let _ = agent.take_session(&sid);
+    assert!(
+        !agent.web_search_disabled.borrow().contains_key(&sid),
+        "take_session must drop the session-scoped notice"
+    );
+}
 /// Build a minimal MvpAgent with pre-loaded auth for gate tests.
 fn build_agent_with_auth(auth: crate::auth::GrokAuth) -> MvpAgent {
     use crate::agent::config::Config as AgentConfig;
