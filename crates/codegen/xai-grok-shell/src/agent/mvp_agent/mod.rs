@@ -1006,8 +1006,9 @@ pub struct MvpAgent {
     ///
     /// Riding the response `_meta` dissolves both halves rather than trading one
     /// for the other: a response is per-session by construction, and there is no
-    /// notification left to dedup. Recorded here at spawn, read by
-    /// `insert_session_config_meta`, dropped in `take_session`.
+    /// notification left to dedup. Seeded at spawn, recomputed on warm
+    /// `session/load` (#201), read by `insert_session_config_meta`, dropped in
+    /// `take_session`.
     web_search_disabled: RefCell<HashMap<acp::SessionId, WebSearchDisabledNotice>>,
     /// Dedup guard for `spawn_settings_reapply`; at most one task in flight.
     /// `Rc` so the drop-guard owns a clone without dereferencing the agent.

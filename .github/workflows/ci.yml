@@ -950,6 +950,8 @@ jobs:
             rm -f "$output"
           }
           run_nonzero -p xai-grok-shell --lib session_meta_publishes_the_web_search_disable -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            session_load_recompute_updates_web_search_notice_for_ready_unusable_and_unknown -- --nocapture
           run_nonzero -p xai-grok-shell --lib session_meta_keeps_web_search_notices_session_scoped -- --nocapture
           run_nonzero -p xai-grok-shell --lib take_session_drops_the_web_search_notice -- --nocapture
           run_nonzero -p xai-grok-pager --lib web_search_disabled_meta -- --nocapture
