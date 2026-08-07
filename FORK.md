@@ -116,6 +116,30 @@ Scope is the fork hot path (not full workspace):
 - `clippy --lib -D warnings` on `xai-grok-sampler`, `xai-grok-shell`, `xai-grok-pager` (lib only; avoids unrelated upstream bench/test lints)
 - Targeted auth / readiness / model-picker tests (subagent None credential strip, session model-switch credential clear, pager unready hard-blocks)
 
+Pre-merge CI receipt check for PR heads (issue #202):
+
+```bash
+python3 -B scripts/check_pr_head_ci_run.py --pr <number> --repo ImL1s/medley
+```
+
+Direct branch/SHA probe (for diagnostics and no-run repros):
+
+```bash
+python3 -B scripts/check_pr_head_ci_run.py \
+  --branch <branch> --head-sha <sha> --repo ImL1s/medley
+```
+
+This guard runs from the developer/orchestrator host (outside GitHub Actions),
+so it can fail closed when the thing being watched is "no run created". For
+feature PR branches it resolves the branch head with `git ls-remote`, lists
+`pull_request` runs via `gh run list --workflow ci.yml --branch <branch>
+--event pull_request`, and matches the target commit against the run detail's
+`pull_requests[].head.sha` (not top-level `head_sha`, which is the ephemeral
+merge commit). For `providers`, where CI push runs actually exist, it keeps the
+release-gate identity shape (`event == "push"`, `head_branch`, exact
+`head_sha`, and workflow `path == ".github/workflows/ci.yml"`). It
+intentionally does **not** use `gh pr checks`.
+
 `main` has no fork workflows — it stays an upstream fast-forward mirror. Do not merge `providers` into `main`.
 
 ## Docs

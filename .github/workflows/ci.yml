@@ -45,6 +45,11 @@ jobs:
       - name: Test the new-test filter guard
         run: python3 -B -m unittest tests.test_new_test_filter_guard -v
 
+      - name: Test the PR-head CI receipt guard
+        # This guard is a pre-merge local/orchestrator check; it does not run
+        # as part of CI itself. CI only executes its Python unit tests.
+        run: python3 -B -m unittest tests.test_pr_head_ci_run_guard -v
+
   installer:
     name: Installer
     runs-on: ubuntu-latest
