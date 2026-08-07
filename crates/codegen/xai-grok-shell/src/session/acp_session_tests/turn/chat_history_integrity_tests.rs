@@ -144,6 +144,24 @@ fn mid_turn_user_injection_must_not_duplicate_tool_results_for_one_tool_use_id()
             actor.sampler_handle = sampler_handle;
             *actor.agent.borrow_mut() = test_grok_build_agent_with_todo().await;
 
+            // #159: the turn path consults ModelsManager. Without a catalog
+            // entry, a synthetic "test" model used to be misclassified as
+            // NotInCatalog (config-only miss) which stripped credentials and
+            // let this mock-only fixture limp through unauthenticated. With
+            // the fix that miss is CatalogUnavailable / a real Ready hit;
+            // bind a non-ambient key and seed the runtime catalog so the
+            // mock endpoint is not refused as ambient-on-external.
+            let mut entry = crate::agent::config::ModelEntry::fallback(
+                "test",
+                &crate::agent::config::EndpointsConfig::default(),
+            );
+            entry.info.base_url = server.url();
+            entry.info.auth_scheme = xai_grok_sampler::AuthScheme::Bearer;
+            entry.info.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+            // Own key → BYOK readiness on a non-xAI mock origin (#110).
+            entry.api_key = Some("test-key".to_string());
+            actor.models_manager.insert_test_entry("test", entry);
+
             let mut cfg = actor
                 .chat_state_handle
                 .get_sampling_config()
@@ -153,9 +171,13 @@ fn mid_turn_user_injection_must_not_duplicate_tool_results_for_one_tool_use_id()
             cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
             cfg.model = "test".to_string();
             actor.chat_state_handle.update_sampling_config(cfg);
-            let mut creds = actor.chat_state_handle.get_credentials().await;
-            creds.replace_api_key("test-key".to_string());
-            actor.chat_state_handle.update_credentials(creds);
+            actor
+                .chat_state_handle
+                .update_credentials(xai_chat_state::Credentials::bound(
+                    Some("test-key".to_string()),
+                    xai_chat_state::AuthType::ApiKey,
+                    xai_grok_sampler::CredentialSource::ModelApiKey,
+                ));
 
             actor
                 .workspace_ops

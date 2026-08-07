@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 
@@ -127,6 +127,12 @@ struct Inner {
     refresh_in_flight: AtomicBool,
     /// Model-switch signal: a generation counter bumped when the current model id changes.
     model_switch_watch: tokio::sync::watch::Sender<u64>,
+    /// Catalog-content generation: bumped whenever `cat.models` is wholesale
+    /// replaced or mutated by a publish path (`apply_catalog`, `apply_config`,
+    /// test pokes). Session auth memos key on this so a transient miss that
+    /// freezes `NotInCatalog` cannot outlive the refresh that restores the
+    /// model (#159 / F1).
+    catalog_generation: AtomicU64,
     /// Set once the user explicitly picks a model (`/model`); guards the
     /// first-catalog reselect from clobbering that choice.
     user_selected_model: AtomicBool,
@@ -224,6 +230,7 @@ impl ModelsManagerBuilder {
                 retry_in_flight: AtomicBool::new(false),
                 refresh_in_flight: AtomicBool::new(false),
                 model_switch_watch: tokio::sync::watch::channel(0u64).0,
+                catalog_generation: AtomicU64::new(0),
                 user_selected_model: AtomicBool::new(false),
             }),
         }
@@ -249,6 +256,18 @@ impl ModelsManager {
     /// Cheap snapshot of the current model-switch generation, for the laziness-check poll loop.
     pub(crate) fn model_switch_generation(&self) -> u64 {
         *self.inner.model_switch_watch.borrow()
+    }
+
+    /// Cheap snapshot of the catalog-content generation (see
+    /// [`Inner::catalog_generation`]). Auth memos compare against this.
+    pub(crate) fn catalog_generation(&self) -> u64 {
+        self.inner.catalog_generation.load(Ordering::Acquire)
+    }
+
+    fn bump_catalog_generation(&self) {
+        self.inner
+            .catalog_generation
+            .fetch_add(1, Ordering::Release);
     }
 
     /// Build from a resolved config. Falls back to bundled default if no models available.
@@ -367,6 +386,10 @@ impl ModelsManager {
             }
             cat.models = new_catalog;
         }
+        // Catalog contents changed (config-driven re-resolve); invalidate
+        // generation-keyed auth memos even when the config-watcher also
+        // broadcasts InvalidateModelAuthMemo.
+        self.bump_catalog_generation();
 
         let preferred_changed = new_preferred != old_preferred && new_preferred.is_some();
         let mut campaign_defaults = std::collections::HashSet::new();
@@ -506,10 +529,24 @@ impl ModelsManager {
             .unwrap_or_default()
     }
 
-    /// Test-only catalog poke: inserts a `ModelEntry` keyed by `id`,
+    /// Test-only catalog poke: inserts a `ModelEntry` keyed by `id`.
+    /// Bumps generation so auth memos keyed on the prior snapshot are not reused.
+    /// Prefer [`Self::apply_catalog_for_test`] when the test is about the publish
+    /// path itself (etag refresh / fetch_and_apply).
     #[cfg(test)]
     pub(crate) fn insert_test_entry(&self, id: impl Into<String>, entry: ModelEntry) {
         self.inner.catalog.write().models.insert(id.into(), entry);
+        self.bump_catalog_generation();
+    }
+
+    /// Test-only: publish a prefetched catalog through the real
+    /// [`Self::apply_catalog`] path (same as etag refresh / `fetch_and_apply` /
+    /// `reload_from_cache_manager`). Uses the manager's current config so
+    /// `resolve_model_catalog` and the generation bump match production.
+    #[cfg(test)]
+    pub(crate) fn apply_catalog_for_test(&self, models: IndexMap<String, ModelEntry>) {
+        let cfg = self.inner.cfg.read().clone();
+        self.apply_catalog(&cfg, models, None);
     }
 
     pub(crate) fn current_reasoning_effort(&self) -> Option<ReasoningEffort> {
@@ -620,7 +657,14 @@ impl ModelsManager {
     // ── Mutations ───────────────────────────────────────────────────
 
     fn rebuild(&self, cfg: &config::Config, prefetched: Option<IndexMap<String, ModelEntry>>) {
+        // Mutate, then bump — same order as apply_catalog / apply_config.
+        // `on_auth_changed` reaches this via the bundled-fallback branch when a
+        // remote fetch fails (or remote_fetch is off) and no real catalog was
+        // ever published; without the bump, a session auth memo under the prior
+        // generation would outlive a wholesale models replacement that may have
+        // dropped its subject (#159 F1).
         self.inner.catalog.write().models = resolve_model_catalog(cfg, prefetched);
+        self.bump_catalog_generation();
     }
 
     /// Refresh models when the etag changes.
@@ -908,6 +952,10 @@ impl ModelsManager {
         self.inner
             .user_selected_model
             .store(false, Ordering::Relaxed);
+        // The catalog just became empty, which is a content change like any
+        // other -- without this a memo taken under the previous identity stays
+        // valid at the same generation and is served after the wipe (#159).
+        self.bump_catalog_generation();
     }
 
     /// Build a `SamplingConfig` from the current model + auth state.
@@ -1152,6 +1200,13 @@ impl ModelsManager {
             cat.allowlist_excludes_all = allowlist_matches_nothing(cfg, &cat.models);
             (first_real_catalog, cat.allowlist_excludes_all)
         };
+        // Every publish advances the generation so session `model_auth_memo`
+        // entries that depended on the prior snapshot are not reused after a
+        // transient miss (etag refresh that drops then restores a model).
+        // Background fetch/retry paths never pass through the agent, so a
+        // generation key is required — `invalidate_model_auth_memo_all_sessions`
+        // only runs on config-watcher ext methods (#159 F1).
+        self.bump_catalog_generation();
         if excludes_all {
             tracing::error!("allowed_models excludes all fetched models; prompts will be blocked");
         }
