@@ -2213,6 +2213,11 @@ pub enum TaskResult {
         /// predates the key. See
         /// [`crate::app::effects::parse_session_scheduler_background_loops`].
         scheduler_background_loops: Option<bool>,
+        /// #161: user-facing notice when `web_search` was withheld for this
+        /// session (response `_meta["x.ai/webSearchDisabled"].message`).
+        /// `None` means it is available — or that the shell predates the key.
+        /// See [`crate::app::effects::parse_session_web_search_disabled`].
+        web_search_disabled: Option<xai_grok_shell::session::WebSearchDisabledNotice>,
     },
     /// Session creation failed.
     SessionFailed {
@@ -2230,6 +2235,8 @@ pub enum TaskResult {
         models: Option<acp::SessionModelState>,
         /// See [`TaskResult::SessionCreated::scheduler_background_loops`].
         scheduler_background_loops: Option<bool>,
+        /// See [`TaskResult::SessionCreated::web_search_disabled`].
+        web_search_disabled: Option<xai_grok_shell::session::WebSearchDisabledNotice>,
     },
     /// Worktree created and session forked, but not yet loaded.
     /// The dispatch handler sets session_id eagerly, then emits LoadSession.
@@ -2265,6 +2272,13 @@ pub enum TaskResult {
         /// resumed session re-spawns its actor, so the load response carries
         /// the value that spawn just pinned.
         scheduler_background_loops: Option<bool>,
+        /// See [`TaskResult::SessionCreated::web_search_disabled`]. Carried on
+        /// resume for the same reason as `scheduler_background_loops`:
+        /// `spawn_and_register_session` serves `load_session` too, so the load
+        /// response reports what that spawn just resolved. The notice was never
+        /// persisted to `updates.jsonl`, so replayed history cannot supply it —
+        /// this is the only thing that tells a resuming user (#161).
+        web_search_disabled: Option<xai_grok_shell::session::WebSearchDisabledNotice>,
     },
     /// Session load (resume) failed.
     SessionLoadFailed {

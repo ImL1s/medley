@@ -17,21 +17,12 @@ fn test_config() -> SamplingConfig {
 }
 
 fn test_config_with_window(context_window: u64) -> SamplingConfig {
+    // FRU from for_test (#121): fork fields live in one place; this helper only
+    // overrides the window when a test needs a non-default size.
     SamplingConfig {
-        base_url: "https://api.example.com".to_string(),
-        model: "test-model".to_string(),
-        max_completion_tokens: None,
-        temperature: None,
-        top_p: None,
-        api_backend: Default::default(),
-        endpoint_trust: None,
-        extra_headers: Default::default(),
-        query_params: Default::default(),
-        env_http_headers: Default::default(),
         context_window: NonZeroU64::new(context_window)
             .expect("test context_window must be non-zero"),
-        reasoning_effort: None,
-        stream_tool_calls: None,
+        ..SamplingConfig::for_test("https://api.example.com", "test-model")
     }
 }
 
@@ -1169,19 +1160,10 @@ async fn cache_prompt_text_appends_in_order() {
 async fn update_sampling_config_is_queryable() {
     let h = TestHarness::new();
     let new_config = SamplingConfig {
-        base_url: "https://new.example.com".to_string(),
-        model: "grok-3".to_string(),
         max_completion_tokens: Some(4096),
         temperature: Some(0.5),
-        top_p: None,
-        api_backend: Default::default(),
-        endpoint_trust: None,
-        extra_headers: Default::default(),
-        query_params: Default::default(),
-        env_http_headers: Default::default(),
         context_window: NonZeroU64::new(200_000).unwrap(),
-        reasoning_effort: None,
-        stream_tool_calls: None,
+        ..SamplingConfig::for_test("https://new.example.com", "grok-3")
     };
     h.handle.update_sampling_config(new_config.clone());
 
@@ -1557,19 +1539,10 @@ async fn build_request_with_tool_definitions() {
 #[tokio::test]
 async fn build_request_uses_sampling_config() {
     let config = SamplingConfig {
-        base_url: "https://api.example.com".to_string(),
-        model: "grok-3".to_string(),
         max_completion_tokens: Some(8192),
         temperature: Some(0.7),
         top_p: Some(0.9),
-        api_backend: Default::default(),
-        endpoint_trust: None,
-        extra_headers: Default::default(),
-        query_params: Default::default(),
-        env_http_headers: Default::default(),
-        context_window: NonZeroU64::new(128_000).unwrap(),
-        reasoning_effort: None,
-        stream_tool_calls: None,
+        ..SamplingConfig::for_test("https://api.example.com", "grok-3")
     };
     let h = TestHarness::with_config(vec![ConversationItem::user("hi")], config);
 
@@ -3701,19 +3674,11 @@ async fn sampling_config_survives_compaction_replacement() {
     use xai_grok_sampling_types::ApiBackend;
 
     let config = SamplingConfig {
-        base_url: "https://api.example.com".to_string(),
-        model: "grok-build".to_string(),
-        max_completion_tokens: None,
         temperature: Some(0.7),
         top_p: Some(0.95),
         api_backend: ApiBackend::Responses,
-        endpoint_trust: None,
-        extra_headers: Default::default(),
-        query_params: Default::default(),
-        env_http_headers: Default::default(),
         context_window: NonZeroU64::new(500_000).unwrap(),
-        reasoning_effort: None,
-        stream_tool_calls: None,
+        ..SamplingConfig::for_test("https://api.example.com", "grok-build")
     };
 
     let h = TestHarness::with_config(
@@ -3787,19 +3752,10 @@ async fn sampling_config_survives_compaction_replacement() {
 #[tokio::test]
 async fn model_metadata_lost_after_compaction_then_recovered_on_next_turn() {
     let config = SamplingConfig {
-        base_url: "https://api.example.com".to_string(),
-        model: "grok-build".to_string(),
-        max_completion_tokens: None,
         temperature: Some(0.7),
         top_p: Some(0.95),
-        api_backend: Default::default(),
-        endpoint_trust: None,
-        extra_headers: Default::default(),
-        query_params: Default::default(),
-        env_http_headers: Default::default(),
         context_window: NonZeroU64::new(500_000).unwrap(),
-        reasoning_effort: None,
-        stream_tool_calls: None,
+        ..SamplingConfig::for_test("https://api.example.com", "grok-build")
     };
 
     let h = TestHarness::with_config(
@@ -3878,19 +3834,11 @@ async fn context_window_downgrade_triggers_auto_compact() {
 
     // Initial config: 500k context, Responses backend (matches grok-4.5)
     let config = SamplingConfig {
-        base_url: "https://api.x.ai/v1".to_string(),
-        model: "grok-4.5".to_string(),
-        max_completion_tokens: None,
         temperature: Some(0.7),
         top_p: Some(0.95),
         api_backend: ApiBackend::Responses,
-        endpoint_trust: None,
-        extra_headers: Default::default(),
-        query_params: Default::default(),
-        env_http_headers: Default::default(),
         context_window: NonZeroU64::new(500_000).unwrap(),
-        reasoning_effort: None,
-        stream_tool_calls: None,
+        ..SamplingConfig::for_test("https://api.x.ai/v1", "grok-4.5")
     };
 
     let h = TestHarness::with_config(vec![], config);

@@ -84,6 +84,7 @@ On every sync PR, review upstream diffs that touch:
 - `crates/codegen/xai-grok-sampler/` — especially `AuthScheme`, `client.rs`, credential headers
 - `crates/codegen/xai-grok-shell/src/agent/` — `ConfigModelOverride`, `resolve_credentials`, `auth_method.rs`
 - `crates/codegen/xai-grok-shell/src/session/` — ACP session reconstruct / model switch
+- `crates/codegen/xai-grok-shell/src/terminal/pty_session.rs` — #132: cancellable `poll(2)` reader (no `O_NONBLOCK`), hangup-before-cancel teardown, reader/writer on `std::thread` not `spawn_blocking`; tests give the child a clean `HOME` so Fig/iTerm bashrc cannot mask the hang. Bare `spawn_blocking` `read` wedged runtime drop when descendants outlived the session; Darwin `close`/`dup2` of the reader fd mid-`read` also hangs.
 - `crates/codegen/xai-grok-pager/` — `/model` slash command, model picker (`Ctrl+M`), `available_models` rendering
 - Custom models docs: `crates/codegen/xai-grok-pager/docs/user-guide/11-custom-models.md`
 

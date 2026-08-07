@@ -1388,24 +1388,22 @@ mod model_switch_transaction_tests {
                 let receiver_generations = persisted_generations.clone();
                 tokio::task::spawn_local(async move {
                     while let Some(message) = persistence_rx.recv().await {
-                        match message {
-                            PersistenceMsg::ModelSwitchAndAck {
-                                messages,
-                                model_id,
-                                respond_to,
-                                ..
-                            } => {
-                                receiver_generations
-                                    .lock()
-                                    .unwrap()
-                                    .push((model_id.0.to_string(), messages));
-                                let _ = respond_to.send(Err(
-                                    crate::session::storage::ModelSwitchCommitError::NotCommitted(
-                                        std::io::Error::other("injected failure"),
-                                    ),
-                                ));
-                            }
-                            _ => {}
+                        if let PersistenceMsg::ModelSwitchAndAck {
+                            messages,
+                            model_id,
+                            respond_to,
+                            ..
+                        } = message
+                        {
+                            receiver_generations
+                                .lock()
+                                .unwrap()
+                                .push((model_id.0.to_string(), messages));
+                            let _ = respond_to.send(Err(
+                                crate::session::storage::ModelSwitchCommitError::NotCommitted(
+                                    std::io::Error::other("injected failure"),
+                                ),
+                            ));
                         }
                     }
                 });

@@ -38,6 +38,29 @@ pub(crate) enum SessionLiveState {
 /// `session/new` and `session/load` responses. Defined here so the shell that
 /// publishes it and the clients that read it share one spelling.
 pub const SCHEDULER_BACKGROUND_LOOPS_META_KEY: &str = "x.ai/schedulerBackgroundLoops";
+/// `_meta` key carrying [`WebSearchDisabledNotice`] on the `session/new` and
+/// `session/load` responses. Defined here for the same reason as
+/// [`SCHEDULER_BACKGROUND_LOOPS_META_KEY`]: the shell that publishes it and the
+/// clients that read it share one spelling.
+pub const WEB_SEARCH_DISABLED_META_KEY: &str = "x.ai/webSearchDisabled";
+/// Why `web_search` was withheld for a session (#57), carried on the
+/// `session/new` / `session/load` response `_meta` (#161).
+///
+/// It rides the **response** rather than an `x.ai/session_notification` because
+/// a notification cannot be delivered before the client has bound the session
+/// id, and because headless has no xAI-notification consumer at all — so a
+/// notification could never reach `medley -p`, which is where the silence this
+/// fixes is unconditional.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebSearchDisabledNotice {
+    /// Model id that was tried (config / env / baked default).
+    pub model_id: String,
+    /// Actionable rejection reason (readiness, catalog miss, missing creds, …).
+    pub reason: String,
+    /// One-line user-facing notice naming the model and the reason.
+    pub message: String,
+}
 /// Handle for interacting with a session actor.
 /// Note: Permission event receivers are returned separately from `spawn_session_actor`
 /// and should be stored/managed by the caller.

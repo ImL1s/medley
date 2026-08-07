@@ -257,6 +257,36 @@ pub(crate) fn parse_model_providers(
                         "unrecognized key; field ignored".to_owned(),
                     ));
                 }
+                let mut provider = provider;
+                // #13: same env_key normalization + path-specific warnings as
+                // `[model.*]` — do not silently keep whitespace / illegal names.
+                if let Some(raw_keys) = provider.env_key.take() {
+                    let candidates: Vec<String> =
+                        raw_keys.names().into_iter().map(str::to_owned).collect();
+                    let (normalized, rejected) = EnvKeys::normalize(candidates);
+                    for rejected in rejected {
+                        let reason = if rejected.name.is_empty() {
+                            format!(
+                                "invalid env_key entry ({}); ignored — not used as a credential source",
+                                rejected.reason
+                            )
+                        } else {
+                            format!(
+                                "invalid env_key name {:?}: {}; ignored — not used as a credential source",
+                                rejected.name, rejected.reason
+                            )
+                        };
+                        warnings.push(ConfigWarning::model_provider(
+                            id,
+                            Some("env_key"),
+                            ConfigWarningKind::InvalidValue,
+                            reason,
+                        ));
+                    }
+                    if !normalized.is_empty() {
+                        provider.env_key = Some(normalized);
+                    }
+                }
                 if let Some(auth) = &provider.auth {
                     for (field, kind, reason) in auth_config_issues(auth) {
                         warnings.push(ConfigWarning::model_provider(

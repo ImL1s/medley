@@ -563,19 +563,21 @@ impl SessionActor {
         //   when not borrowing ambient); refuse to BORROW session/provider
         //   ambient without catalog knowledge.
         let mut auth_scheme = model_facts.auth_scheme;
-        // #110 / #136 steps 2-3: a model authenticated by a header the user
-        // declared used to arrive here with its provenance gone (chat-state
-        // `SamplingConfig` keeps headers, not the label). It is still
-        // `NotByok`, so the gate would enable the session resolver and
-        // `SamplingClient::post` would strip the user's header and send under
-        // the xAI session instead.
+        // #110 / #136 / #180: provenance comes from `Credentials` alone.
+        // After #136 the chat-state secret is bound with its source; after
+        // #180 we must not re-derive `ExplicitHeader` from the header maps
+        // here. A dual-auth gateway (model `api_key` + declared credential
+        // header) is labelled `ModelApiKey` by `classify_credential_source`
+        // and keeps its key — inventing `ExplicitHeader` from the maps while
+        // leaving `api_key` in place made L3 treat a legitimate route as the
+        // post-strip mislabel and refuse it.
         //
-        // Prefer the header re-derivation when it yields something (the
-        // declared header is still in the maps and still goes out). Fall back
-        // to the provenance step 1 bound onto `Credentials` with the secret —
-        // without that, every ordinary Ready-model turn (session-token and
-        // BYOK alike) emits `credential_source: None`, which is the #151 hole
-        // on `Unknown(CatalogUnavailable)`.
+        // `declared_credential_header` still drives resolver attach and
+        // identity gating (header still ships on the wire). Only the
+        // provenance *label* stops coming from it. Without
+        // `creds.source_cloned()`, ordinary Ready-model turns would emit
+        // `credential_source: None` — the #151 hole on
+        // `Unknown(CatalogUnavailable)`.
         let declared_credential_header = crate::agent::config::explicit_credential_header_in(
             &cfg.extra_headers,
             &cfg.env_http_headers,
@@ -587,15 +589,7 @@ impl SessionActor {
             == xai_grok_sampling_types::ApiBackend::CodexResponses
             && model_auth_provider.is_some()
             && auth_scheme != xai_grok_sampler::AuthScheme::None;
-        let mut credential_source = declared_credential_header
-            .as_ref()
-            .map(
-                |(header, env)| xai_grok_sampler::CredentialSource::ExplicitHeader {
-                    header: header.clone(),
-                    env: env.clone(),
-                },
-            )
-            .or_else(|| creds.source_cloned());
+        let mut credential_source = creds.source_cloned();
         match &model_facts.readiness {
             crate::agent::auth_method::ModelReadiness::Ready => {}
             // The catalog answered and does not have this model. Before the
@@ -617,18 +611,20 @@ impl SessionActor {
                 auth_scheme = xai_grok_sampler::AuthScheme::None;
                 use_session_bearer_resolver = false;
                 use_provider_bearer_resolver = false;
-                // Credentials are gone. Label the gap `Missing`, except a
-                // declared credential header which still ships in
-                // `extra_headers` and must keep its label (same as
-                // `agent/config.rs`). Do not keep a stored ambient/BYOK
+                // Credentials are gone. Do not keep a stored ambient/BYOK
                 // source: that would claim a credential the strip just
-                // removed.
-                if !matches!(
-                    credential_source,
-                    Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
-                ) {
-                    credential_source = Some(xai_grok_sampler::CredentialSource::Missing);
-                }
+                // removed. A declared credential header still ships in
+                // `extra_headers` and must be labelled `ExplicitHeader`
+                // (post-strip meaning); otherwise `Missing`.
+                credential_source = match &declared_credential_header {
+                    Some((header, env)) => {
+                        Some(xai_grok_sampler::CredentialSource::ExplicitHeader {
+                            header: header.clone(),
+                            env: env.clone(),
+                        })
+                    }
+                    None => Some(xai_grok_sampler::CredentialSource::Missing),
+                };
             }
             // Knowledge is temporarily unobtainable, or there is no identified
             // target yet. Both were `ready = true` before the tri-state, and
@@ -663,16 +659,18 @@ impl SessionActor {
                 use_session_bearer_resolver = false;
                 use_provider_bearer_resolver = false;
                 // Label the gap on Unusable alone, never on Unknown (#133).
-                // Preserve only a declared credential header (still in
-                // `extra_headers`); overwrite any other stored source with
-                // `Missing` so the config does not claim a credential the
-                // strip just removed.
-                if !matches!(
-                    credential_source,
-                    Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
-                ) {
-                    credential_source = Some(xai_grok_sampler::CredentialSource::Missing);
-                }
+                // A declared credential header still ships in `extra_headers`
+                // and must be labelled `ExplicitHeader`; any other stored
+                // source is overwritten with `Missing`.
+                credential_source = match &declared_credential_header {
+                    Some((header, env)) => {
+                        Some(xai_grok_sampler::CredentialSource::ExplicitHeader {
+                            header: header.clone(),
+                            env: env.clone(),
+                        })
+                    }
+                    None => Some(xai_grok_sampler::CredentialSource::Missing),
+                };
             }
         }
         self.log_auth_gate_unknown("reconstruct_full_config", gate, &cfg.base_url);
