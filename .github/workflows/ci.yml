@@ -78,6 +78,22 @@ jobs:
           HOME="$home" "$home/.medley/bin/medley" --version
           test ! -e "$home/.grok"
 
+  sync-upstream:
+    name: Sync upstream script
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Lint sync-upstream shell scripts
+        run: |
+          shellcheck -s bash scripts/sync-upstream.sh
+          bash -n scripts/sync-upstream.sh
+          shellcheck -s sh tests/sync-upstream/run_cases.sh
+          dash -n tests/sync-upstream/run_cases.sh
+
+      - name: Behaviour, local bare remotes
+        run: sh tests/sync-upstream/run_cases.sh
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
