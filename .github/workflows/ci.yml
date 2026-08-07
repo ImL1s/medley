@@ -494,3 +494,35 @@ jobs:
             rm -f "$output"
           }
           run_nonzero -p xai-grok-shell --lib workflow_restore -- --nocapture
+
+      # #165: abandoned sampling attempts must not enter the FTS index.
+      # Unique filters so run_nonzero proves each new test is selected.
+      # Quoted name: an unquoted `#165` truncates at the comment marker.
+      - name: 'Abandoned attempt text omitted from search index (issue #165)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib \
+            collect_assistant_text_discards_abandoned_retry_attempt_phrase -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            collect_assistant_text_discards_attempt_discarded_retraction_phrase -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            collect_assistant_text_still_flushes_on_rewind_marker_boundary -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            collect_assistant_text_still_flushes_on_compaction_checkpoint_boundary -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            collect_assistant_text_completed_turn_still_indexes_across_hook_annotation -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            single_pass_omits_abandoned_retry_attempt_from_fts_content -- --nocapture
