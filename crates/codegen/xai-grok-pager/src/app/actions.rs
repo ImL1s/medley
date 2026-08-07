@@ -1633,6 +1633,9 @@ pub enum Effect {
     PersistPreferredModel {
         model_id: acp::ModelId,
         reasoning_effort: Option<ReasoningEffort>,
+        /// App-global default snapshot to restore if the persist fails.
+        rollback_model_id: Option<acp::ModelId>,
+        rollback_reasoning_effort: Option<ReasoningEffort>,
     },
     /// Persist the permission mode to config.toml and notify the agent
     /// via ACP. See [`PermissionModePersist`] for rollback semantics.
@@ -2420,6 +2423,10 @@ pub enum TaskResult {
         outcome: SubagentKillOutcome,
     },
     PreferredModelPersisted {
+        model_id: acp::ModelId,
+        reasoning_effort: Option<ReasoningEffort>,
+        rollback_model_id: Option<acp::ModelId>,
+        rollback_reasoning_effort: Option<ReasoningEffort>,
         result: Result<(), String>,
     },
     /// Manual `/compact` command completed.
