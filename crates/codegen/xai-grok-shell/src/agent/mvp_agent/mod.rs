@@ -847,6 +847,14 @@ pub struct MvpAgent {
     /// Serializes explicit gateway catalog refreshes across their session
     /// admission fence, cache invalidation, and fetch lifecycle.
     managed_gateway_refresh_lock: tokio::sync::Mutex<()>,
+    /// Child session command channels owned by the subagent lifecycle.
+    ///
+    /// These sessions are live and can dispatch gateway tools even though they
+    /// are not resident in `sessions`, so managed-gateway admission and refresh
+    /// broadcasts must include them.
+    pub(crate) managed_gateway_child_sessions: Rc<
+        RefCell<HashMap<acp::SessionId, tokio::sync::mpsc::UnboundedSender<SessionCommand>>>,
+    >,
     /// Agent-level MCP server state. LEADER-SAFE(shared): MCP servers are
     /// agent-scoped, not per-client.
     agent_mcp_state: std::sync::Arc<

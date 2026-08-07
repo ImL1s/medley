@@ -98,10 +98,7 @@ impl SubagentCapabilityMode {
             Mode::ReadOnly => matches!(effect, Effect::LocalRead | Effect::NetworkRead),
             Mode::ReadWrite => matches!(
                 effect,
-                Effect::LocalRead
-                    | Effect::LocalWrite
-                    | Effect::NetworkRead
-                    | Effect::ExternalMutation
+                Effect::LocalRead | Effect::LocalWrite | Effect::NetworkRead
             ),
             Mode::Execute => matches!(
                 effect,
@@ -147,7 +144,7 @@ mod tests {
             (ToolEffect::LocalWrite, false, true, false),
             (ToolEffect::Execute, false, false, true),
             (ToolEffect::NetworkRead, true, true, true),
-            (ToolEffect::ExternalMutation, false, true, false),
+            (ToolEffect::ExternalMutation, false, false, false),
             (ToolEffect::SecretAccess, false, false, false),
             (ToolEffect::SubagentSpawn, false, false, true),
         ];

@@ -294,6 +294,18 @@ pub(crate) struct SubagentSpawnContext {
     pub parent_mcp_configs: Vec<agent_client_protocol::McpServer>,
     /// Parent's managed MCP state handle (Arc-shared, no re-fetch).
     pub managed_mcp_state: crate::session::managed_mcp::ManagedMcpStateHandle,
+    /// Live child-session command channels participating in managed-gateway
+    /// admission/refresh barriers.
+    pub managed_gateway_child_sessions: Option<
+        std::rc::Rc<
+            std::cell::RefCell<
+                std::collections::HashMap<
+                    agent_client_protocol::SessionId,
+                    tokio::sync::mpsc::UnboundedSender<crate::session::commands::SessionCommand>,
+                >,
+            >,
+        >,
+    >,
     /// Snapshot of the parent session's MCP client pool at spawn time.
     pub parent_mcp_pool: Option<crate::session::mcp_servers::SharedMcpPool>,
     /// Exact parent tool schema for verbatim non-workflow forks.
@@ -2143,6 +2155,24 @@ fn fail_subagent(
     };
     persist_subagent_completion(subagent_meta_dir, &result, gcs_ctx);
     result
+}
+/// Remove a just-created worktree when spawn is rejected before promotion.
+async fn cleanup_rejected_spawn_worktree(
+    subagent_id: &str,
+    worktree_path: Option<&Path>,
+    worktree_freshly_created: bool,
+) {
+    if worktree_freshly_created
+        && let Some(wt_path) = worktree_path
+        && let Err(e) = crate::session::worktree::remove_subagent_worktree(wt_path).await
+    {
+        tracing::warn!(
+            subagent_id,
+            worktree_path = %wt_path.display(),
+            error = %e,
+            "failed to remove freshly created subagent worktree after spawn rejection"
+        );
+    }
 }
 /// Tear down a child whose pending-to-active promotion lost to cancellation.
 async fn cancel_pending_shell_child(

@@ -35,6 +35,37 @@ fn should_warn_missing_session(ctx: MissingSessionCtx) -> bool {
         None => ctx.is_session_based_auth,
     }
 }
+/// Ensures an explicit managed-gateway refresh cannot leave the shared cache
+/// permanently in `Fetching` if the task is cancelled mid-flight.
+struct ManagedGatewayRefreshAbortGuard {
+    managed_mcp_cache: crate::session::managed_mcp::ManagedMcpStateHandle,
+    armed: bool,
+}
+
+impl ManagedGatewayRefreshAbortGuard {
+    fn arm(managed_mcp_cache: crate::session::managed_mcp::ManagedMcpStateHandle) -> Self {
+        Self {
+            managed_mcp_cache,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ManagedGatewayRefreshAbortGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let cache = self.managed_mcp_cache.clone();
+        tokio::spawn(async move {
+            cache.lock().await.abort_gateway_tool_fetch();
+        });
+    }
+}
 impl MvpAgent {
     /// Announce a session's new title over ACP. ACP scopes `session/update` to
     /// sessions the client established, and a rename can name a history row it
@@ -229,6 +260,22 @@ impl MvpAgent {
         self.cfg.borrow().managed_mcp_gateway_tools_enabled
             && self.has_managed_mcp_auth()
     }
+    fn managed_gateway_session_txs_snapshot(
+        &self,
+    ) -> Vec<tokio::sync::mpsc::UnboundedSender<SessionCommand>> {
+        let mut txs: Vec<_> = self
+            .sessions
+            .borrow()
+            .values()
+            .map(|handle| handle.cmd_tx.clone())
+            .collect();
+        for child_tx in self.managed_gateway_child_sessions.borrow().values() {
+            if !txs.iter().any(|existing| existing.same_channel(child_tx)) {
+                txs.push(child_tx.clone());
+            }
+        }
+        txs
+    }
     pub(crate) async fn get_managed_mcp_configs(
         &self,
     ) -> Vec<crate::session::managed_mcp::ManagedMcpConfig> {
@@ -248,11 +295,7 @@ impl MvpAgent {
     ) -> Option<crate::session::managed_mcp::GatewayToolCatalog> {
         if !self.can_fetch_managed_mcp_gateway_tools() {
             self.disable_managed_gateway_tools_and_refresh_sessions_with_txs(
-                self.sessions
-                    .borrow()
-                    .values()
-                    .map(|handle| handle.cmd_tx.clone())
-                    .collect(),
+                self.managed_gateway_session_txs_snapshot(),
             );
             return None;
         }
@@ -272,12 +315,7 @@ impl MvpAgent {
         if cached.is_some() {
             return cached;
         }
-        let session_txs: Vec<_> = self
-            .sessions
-            .borrow()
-            .values()
-            .map(|handle| handle.cmd_tx.clone())
-            .collect();
+        let session_txs = self.managed_gateway_session_txs_snapshot();
         for barrier in Self::queue_managed_gateway_admission(&session_txs) {
             let _ = barrier.await;
         }
@@ -317,11 +355,14 @@ impl MvpAgent {
         &self,
     ) -> Option<crate::session::managed_mcp::GatewayToolCatalog> {
         let _refresh_guard = self.managed_gateway_refresh_lock.lock().await;
+        let mut refresh_abort_guard =
+            ManagedGatewayRefreshAbortGuard::arm(self.managed_mcp_cache.clone());
         self.invalidate_gateway_tool_cache_after_session_admission()
             .await;
         if !self.can_fetch_managed_mcp_gateway_tools() {
             self.managed_mcp_cache.lock().await.disable_gateway_tools();
             self.refresh_mcp_search_index_in_sessions();
+            refresh_abort_guard.disarm();
             return None;
         }
 
@@ -340,6 +381,7 @@ impl MvpAgent {
             )
             .await;
         self.refresh_mcp_search_index_in_sessions();
+        refresh_abort_guard.disarm();
         catalog
     }
     /// Wait until every currently live session has applied its admission
@@ -358,10 +400,8 @@ impl MvpAgent {
         let mut admitted: Vec<tokio::sync::mpsc::UnboundedSender<SessionCommand>> = Vec::new();
         loop {
             let pending: Vec<_> = self
-                .sessions
-                .borrow()
-                .values()
-                .map(|handle| handle.cmd_tx.clone())
+                .managed_gateway_session_txs_snapshot()
+                .into_iter()
                 .filter(|candidate| {
                     !admitted.iter().any(|seen| seen.same_channel(candidate))
                 })
@@ -386,11 +426,14 @@ impl MvpAgent {
             }
 
             let mut state = self.managed_mcp_cache.lock().await;
-            let session_added_while_waiting = self.sessions.borrow().values().any(|handle| {
-                !admitted
-                    .iter()
-                    .any(|seen| seen.same_channel(&handle.cmd_tx))
-            });
+            let session_added_while_waiting = self
+                .managed_gateway_session_txs_snapshot()
+                .iter()
+                .any(|candidate| {
+                    !admitted
+                        .iter()
+                        .any(|seen| seen.same_channel(candidate))
+                });
             if session_added_while_waiting {
                 drop(state);
                 continue;
@@ -403,7 +446,7 @@ impl MvpAgent {
     }
     pub(crate) fn disable_managed_gateway_tools_and_refresh_sessions(&self) {
         self.disable_managed_gateway_tools_and_refresh_sessions_with_txs(
-            self.sessions.borrow().values().map(|handle| handle.cmd_tx.clone()).collect(),
+            self.managed_gateway_session_txs_snapshot(),
         );
     }
     fn queue_managed_gateway_admission(
@@ -437,12 +480,7 @@ impl MvpAgent {
         });
     }
     pub(crate) fn spawn_managed_gateway_tool_catalog_fetch(&self) {
-        let session_txs: Vec<_> = self
-            .sessions
-            .borrow()
-            .values()
-            .map(|handle| handle.cmd_tx.clone())
-            .collect();
+        let session_txs = self.managed_gateway_session_txs_snapshot();
         if !self.can_fetch_managed_mcp_gateway_tools() {
             self.disable_managed_gateway_tools_and_refresh_sessions_with_txs(
                 session_txs,
@@ -552,12 +590,7 @@ impl MvpAgent {
     /// `NotFetched` in gateway mode. Callers gate on a successful refetch and
     /// skip on failure to keep the last-good index.
     pub(crate) fn refresh_mcp_search_index_in_sessions(&self) {
-        let session_txs: Vec<_> = self
-            .sessions
-            .borrow()
-            .values()
-            .map(|handle| handle.cmd_tx.clone())
-            .collect();
+        let session_txs = self.managed_gateway_session_txs_snapshot();
         for tx in session_txs {
             let _ = tx.send(SessionCommand::RefreshMcpSearchIndex);
         }
@@ -2847,6 +2880,7 @@ impl MvpAgent {
             session_registry_local,
             managed_mcp_cache: Default::default(),
             managed_gateway_refresh_lock: tokio::sync::Mutex::new(()),
+            managed_gateway_child_sessions: Rc::new(RefCell::new(HashMap::new())),
             agent_mcp_state: std::sync::Arc::new(
                 tokio::sync::Mutex::new(
                     crate::session::mcp_servers::McpState::new(vec![]),

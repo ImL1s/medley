@@ -509,6 +509,24 @@ mod tests {
     }
 
     #[test]
+    fn issue39_deploy_app_requires_all_capability_mode() {
+        let deploy = descriptor_for_kind(ToolKind::DeployApp);
+        assert_eq!(
+            deploy,
+            ToolCapabilityDescriptor::classified([ToolEffect::ExternalMutation])
+        );
+        assert!(
+            !SubagentCapabilityMode::ReadWrite.allows_tool_capability(&deploy),
+            "ReadWrite must not include external mutation tools like deploy_app"
+        );
+        assert!(
+            !SubagentCapabilityMode::Execute.allows_tool_capability(&deploy),
+            "Execute must not include external mutation tools like deploy_app"
+        );
+        assert!(SubagentCapabilityMode::All.allows_tool_capability(&deploy));
+    }
+
+    #[test]
     fn wrapper_capabilities_separate_discovery_from_forwarded_target_effects() {
         assert_eq!(
             descriptor_for_kind(ToolKind::SearchTool),

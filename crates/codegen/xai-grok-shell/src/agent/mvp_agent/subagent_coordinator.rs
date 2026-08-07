@@ -528,6 +528,7 @@ impl MvpAgent {
                     .unwrap_or_default()
             },
             managed_mcp_state: self.managed_mcp_cache.clone(),
+            managed_gateway_child_sessions: Some(self.managed_gateway_child_sessions.clone()),
             parent_mcp_pool: None,
             parent_tool_definitions: None,
             parent_skills: None,

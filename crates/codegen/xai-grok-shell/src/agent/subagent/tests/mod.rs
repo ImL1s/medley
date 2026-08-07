@@ -1905,6 +1905,47 @@ async fn cancel_pending_at_promote_removes_fresh_worktree_preserves_resumed() {
             "the source's working state must be left untouched"
         );
 }
+#[tokio::test]
+async fn issue39_cleanup_rejected_spawn_worktree_removes_only_fresh_worktrees() {
+    xai_test_utils::require_git!();
+    use xai_test_utils::git::{git_commit_all, init_git_repo};
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_git_repo(&repo);
+    std::fs::write(repo.join("tracked.txt"), "original").unwrap();
+    git_commit_all(&repo, "initial");
+
+    let fresh = temp.path().join("subagent-fresh");
+    xai_fast_worktree::WorktreeBuilder::new(&repo, &fresh)
+        .standalone(true)
+        .create()
+        .unwrap();
+    assert!(fresh.exists());
+    super::cleanup_rejected_spawn_worktree("issue39-fresh", Some(&fresh), true).await;
+    assert!(
+        !fresh.exists(),
+        "spawn rejection must clean up a just-created worktree"
+    );
+
+    let resumed = temp.path().join("subagent-resumed");
+    xai_fast_worktree::WorktreeBuilder::new(&repo, &resumed)
+        .standalone(true)
+        .create()
+        .unwrap();
+    std::fs::write(resumed.join("tracked.txt"), "source edit").unwrap();
+    super::cleanup_rejected_spawn_worktree("issue39-resumed", Some(&resumed), false).await;
+    assert!(
+        resumed.exists(),
+        "spawn rejection must not remove a resumed source-owned worktree"
+    );
+    assert_eq!(
+        std::fs::read_to_string(resumed.join("tracked.txt")).unwrap(),
+        "source edit",
+        "source-owned resumed worktree content must remain untouched"
+    );
+}
 fn test_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
     crate::agent::config::ModelEntry {
         info: crate::agent::config::ModelInfo {

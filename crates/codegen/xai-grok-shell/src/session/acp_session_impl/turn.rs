@@ -37,6 +37,28 @@ fn validate_structured_output(
         Err(e) => Err(format!("output does not match the required schema: {e}")),
     }
 }
+/// Resolve the exact tool schema exposed for this turn.
+///
+/// For verbatim forks, preserve parent ordering and docs but intersect with the
+/// current session's admitted tool set so restricted children cannot dispatch a
+/// parent-only exact ID.
+fn resolve_turn_tool_specs(
+    turn_base_tool_specs: &[xai_grok_sampling_types::ToolSpec],
+    forked_tool_override: Option<&[xai_grok_sampling_types::ToolSpec]>,
+) -> Vec<xai_grok_sampling_types::ToolSpec> {
+    let Some(override_tools) = forked_tool_override else {
+        return turn_base_tool_specs.to_vec();
+    };
+    let admitted_names: std::collections::HashSet<&str> = turn_base_tool_specs
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
+    override_tools
+        .iter()
+        .filter(|tool| admitted_names.contains(tool.name.as_str()))
+        .cloned()
+        .collect()
+}
 /// Result of the turn-end usage drain (and cancel's no-drain snapshot).
 ///
 /// **Ledger marks** only when [`Self::fail_closed`]. Sticky and background
@@ -2115,12 +2137,11 @@ impl SessionActor {
                 backend_search_active,
                 "backend_search: turn tool resolution"
             );
-            let mut effective_tools: Vec<ToolSpec> =
-                if let Some(ref override_tools) = self.forked_tool_override {
-                    override_tools.clone()
-                } else {
-                    self.turn_base_tool_specs(&tool_definitions)
-                };
+            let turn_base_tool_specs = self.turn_base_tool_specs(&tool_definitions);
+            let mut effective_tools: Vec<ToolSpec> = resolve_turn_tool_specs(
+                &turn_base_tool_specs,
+                self.forked_tool_override.as_deref(),
+            );
             if structured_output_tool && let Some(schema) = json_schema.clone() {
                 effective_tools.push(ToolSpec {
                     name: STRUCTURED_OUTPUT_TOOL.to_string(),
@@ -2949,5 +2970,32 @@ mod structured_output_validation_tests {
         let bad: Result<jsonschema::Validator, String> = Err("invalid output schema: boom".into());
         let err = validate_structured_output(&bad, r#"{"name":"alice","age":1}"#).unwrap_err();
         assert_eq!(err, "invalid output schema: boom");
+    }
+}
+#[cfg(test)]
+mod issue39_turn_tool_resolution_tests {
+    use super::resolve_turn_tool_specs;
+
+    fn tool(name: &str) -> xai_grok_sampling_types::ToolSpec {
+        xai_grok_sampling_types::ToolSpec {
+            name: name.to_string(),
+            description: Some(format!("{name} description")),
+            parameters: serde_json::json!({"type":"object"}),
+        }
+    }
+
+    #[test]
+    fn issue39_verbatim_fork_tools_intersect_session_admission() {
+        let admitted = vec![tool("read_file"), tool("search")];
+        let parent_override = vec![tool("read_file"), tool("deploy_app")];
+
+        let resolved = resolve_turn_tool_specs(&admitted, Some(&parent_override));
+        let names: Vec<_> = resolved.iter().map(|tool| tool.name.as_str()).collect();
+
+        assert_eq!(
+            names,
+            vec!["read_file"],
+            "verbatim forks must not expose parent-only exact IDs to restricted children"
+        );
     }
 }
