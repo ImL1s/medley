@@ -56,7 +56,7 @@ use sha2::{Digest as _, Sha256};
 /// connected, the value is `None` and outbound messages are silently dropped
 /// (matching the old behaviour where the gateway channel's receiver was simply
 /// gone).
-type RelayDest = Rc<RefCell<Option<mpsc::UnboundedSender<AcpClientMessage>>>>;
+type RelayDest = Rc<RefCell<Option<mpsc::Sender<AcpClientMessage>>>>;
 
 const MAX_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const KEEPALIVE_INTERVAL_SECS: u64 = 15;
@@ -66,11 +66,12 @@ type SecretDigest = [u8; 32];
 
 /// Maximum accepted inbound WebSocket text/binary payload size (bytes).
 ///
-/// Chosen to match this workspace's tool-protocol `max_frame_bytes` default
-/// (1 MiB): large enough for substantial ACP JSON-RPC payloads, small enough
-/// that a saturated per-connection queue cannot retain unbounded multi-MiB
-/// frames. Tungstenite's hard ceiling stays at [`MAX_BUFFER_SIZE`] so the
-/// application check (close 1009) is what enforces this limit.
+/// Chosen as an explicit transport hardening bound for remote ACP-over-WS:
+/// large enough for substantial ACP JSON-RPC payloads, small enough that the
+/// bounded bridge queues cap worst-case queued bytes per connection. This is
+/// independent of tool-protocol `max_frame_bytes` (which is optional there).
+/// Tungstenite's hard ceiling stays at [`MAX_BUFFER_SIZE`], so this
+/// application-level check (close 1009) is what enforces the 1 MiB cap.
 pub const MAX_INBOUND_WS_MESSAGE_BYTES: usize = 1_048_576;
 
 /// Per-connection depth for the authenticated WS↔agent bridge queues.
@@ -80,6 +81,11 @@ pub const MAX_INBOUND_WS_MESSAGE_BYTES: usize = 1_048_576;
 /// Bounds are **per connection** — not a global queue — so one saturated
 /// client cannot starve unrelated sessions.
 pub const WS_BRIDGE_QUEUE_CAPACITY: usize = 32;
+
+/// Shared relay depth from persistent session actors into the currently active
+/// ACP connection. Bounds apply across reconnects and cap burst retention when
+/// the active WebSocket consumer slows down.
+pub const WS_GATEWAY_QUEUE_CAPACITY: usize = 128;
 
 fn close_reason_diagnostic(reason: &str) -> (bool, usize) {
     (!reason.is_empty(), reason.len())
@@ -112,18 +118,31 @@ fn admit_inbound_ws_payload(
     to_agent: &mpsc::Sender<String>,
     payload: &str,
 ) -> Result<bool, Option<CloseFrame>> {
+    if payload.len() > MAX_INBOUND_WS_MESSAGE_BYTES {
+        return Err(Some(oversized_close_frame()));
+    }
     let trimmed = payload.trim_end_matches(['\r', '\n']);
     if trimmed == "ping" || trimmed.is_empty() {
         return Ok(false);
-    }
-    if trimmed.len() > MAX_INBOUND_WS_MESSAGE_BYTES {
-        return Err(Some(oversized_close_frame()));
     }
     match to_agent.try_send(trimmed.to_string()) {
         Ok(()) => Ok(true),
         Err(mpsc::error::TrySendError::Full(_)) => Err(Some(overload_close_frame())),
         Err(mpsc::error::TrySendError::Closed(_)) => Err(None),
     }
+}
+
+fn admit_inbound_ws_binary_payload(
+    to_agent: &mpsc::Sender<String>,
+    payload: &[u8],
+) -> Result<bool, Option<CloseFrame>> {
+    if payload.len() > MAX_INBOUND_WS_MESSAGE_BYTES {
+        return Err(Some(oversized_close_frame()));
+    }
+    let Ok(text) = std::str::from_utf8(payload) else {
+        return Ok(false);
+    };
+    admit_inbound_ws_payload(to_agent, text)
 }
 
 /// Forward one outbound agent message with backpressure.
@@ -413,10 +432,7 @@ async fn handle_connection(ws: WebSocket, state: Arc<ServerState>, peer_addr: So
                     }
                 }
                 Ok(Message::Binary(bin)) => {
-                    let Ok(s) = std::str::from_utf8(&bin) else {
-                        continue;
-                    };
-                    match admit_inbound_ws_payload(&to_agent_tx, s) {
+                    match admit_inbound_ws_binary_payload(&to_agent_tx, &bin) {
                         Ok(_) => {}
                         Err(Some(frame)) => {
                             let _ = policy_close_tx.try_send(frame);
@@ -493,10 +509,12 @@ async fn run_persistent_agent(
     mut connection_rx: mpsc::UnboundedReceiver<NewConnectionChannels>,
     prefetched_models: Option<IndexMap<String, ModelEntry>>,
 ) {
-    // Persistent gateway channel — the MvpAgent and all session actors hold
-    // clones of `gw_tx`. This channel survives across reconnections.
-    let (gw_tx, mut gw_rx) = tokio::sync::mpsc::unbounded_channel::<AcpClientMessage>();
-    let gateway = GatewaySender::new(gw_tx);
+    // Persistent bounded gateway channel — the MvpAgent and all session actors
+    // hold clones of `gw_tx`. This survives across reconnections while capping
+    // how many outbound ACP messages can queue behind a slow WS consumer.
+    let (gw_tx, mut gw_rx) =
+        tokio::sync::mpsc::channel::<AcpClientMessage>(WS_GATEWAY_QUEUE_CAPACITY);
+    let gateway = GatewaySender::new_bounded(gw_tx);
 
     // Create MvpAgent ONCE -- it persists for the lifetime of the server.
     let auth_manager = Arc::new(agent_config.create_auth_manager());
@@ -519,11 +537,11 @@ async fn run_persistent_agent(
     tokio::task::spawn_local(async move {
         while let Some(msg) = gw_rx.recv().await {
             let maybe_tx = relay_dest_for_task.borrow().clone();
-            if let Some(tx) = maybe_tx
-                && tx.send(msg).is_err()
-            {
-                // Connection's gateway receiver was dropped — clear it.
-                *relay_dest_for_task.borrow_mut() = None;
+            if let Some(tx) = maybe_tx {
+                if tx.send(msg).await.is_err() {
+                    // Connection's gateway receiver was dropped — clear it.
+                    *relay_dest_for_task.borrow_mut() = None;
+                }
             }
             // If no connection, the message (and its response_tx) is dropped.
             // The caller (session actor) gets a send error which is already
@@ -562,7 +580,8 @@ fn setup_acp_connection(
 
     // Create a per-connection gateway channel for the GatewayReceiver.
     // The relay task will forward persistent-channel messages here.
-    let (conn_gw_tx, conn_gw_rx) = tokio::sync::mpsc::unbounded_channel::<AcpClientMessage>();
+    let (conn_gw_tx, conn_gw_rx) =
+        tokio::sync::mpsc::channel::<AcpClientMessage>(WS_GATEWAY_QUEUE_CAPACITY);
 
     // Point the relay at this new connection's channel
     *relay_dest.borrow_mut() = Some(conn_gw_tx);
@@ -574,7 +593,7 @@ fn setup_acp_connection(
         tokio::task::spawn_local(fut);
     });
     tokio::task::spawn_local(
-        GatewayReceiver::new(conn_gw_rx, conn)
+        GatewayReceiver::new_bounded(conn_gw_rx, conn)
             .with_on_meta(xai_file_utils::trace_context::span_from_meta_traceparent)
             .run(),
     );
@@ -1123,6 +1142,72 @@ mod tests {
         }
     }
 
+    fn test_session_notification(marker: &str) -> acp::SessionNotification {
+        acp::SessionNotification::new(
+            acp::SessionId::new("issue41-session"),
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(acp::ContentBlock::Text(
+                acp::TextContent::new(marker),
+            ))),
+        )
+    }
+
+    async fn assert_oversized_text_payload_closes_with_1009(payload: String) {
+        use futures::SinkExt as _;
+        use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
+
+        let (tx, _rx) = mpsc::channel::<String>(WS_BRIDGE_QUEUE_CAPACITY);
+        let rejected = admit_inbound_ws_payload(&tx, &payload).expect_err("oversize must reject");
+        assert_eq!(rejected.expect("oversize close").code, close_code::SIZE);
+
+        let (addr, server) = spawn_loopback_agent_server().await;
+        let mut ws = connect_authorized_ws(addr).await;
+
+        assert!(payload.len() > MAX_INBOUND_WS_MESSAGE_BYTES);
+        assert!(
+            payload.len() < MAX_BUFFER_SIZE,
+            "fixture must pass tungstenite's hard ceiling so only the app gate fires"
+        );
+
+        ws.send(TungsteniteMessage::Text(payload.into()))
+            .await
+            .expect("send oversized frame");
+
+        let code = next_ws_close_code(&mut ws).await;
+        assert_eq!(code, close_code::SIZE);
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    async fn assert_oversized_binary_payload_closes_with_1009(payload: Vec<u8>) {
+        use futures::SinkExt as _;
+        use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
+
+        let (tx, _rx) = mpsc::channel::<String>(WS_BRIDGE_QUEUE_CAPACITY);
+        let rejected =
+            admit_inbound_ws_binary_payload(&tx, &payload).expect_err("oversize must reject");
+        assert_eq!(rejected.expect("oversize close").code, close_code::SIZE);
+
+        let (addr, server) = spawn_loopback_agent_server().await;
+        let mut ws = connect_authorized_ws(addr).await;
+
+        assert!(payload.len() > MAX_INBOUND_WS_MESSAGE_BYTES);
+        assert!(
+            payload.len() < MAX_BUFFER_SIZE,
+            "fixture must pass tungstenite's hard ceiling so only the app gate fires"
+        );
+
+        ws.send(TungsteniteMessage::Binary(payload.into()))
+            .await
+            .expect("send oversized binary frame");
+
+        let code = next_ws_close_code(&mut ws).await;
+        assert_eq!(code, close_code::SIZE);
+
+        server.abort();
+        let _ = server.await;
+    }
+
     /// Drives [`admit_inbound_ws_payload`]: fills the per-connection queue to
     /// capacity, then proves the next admit returns close 1013.
     ///
@@ -1146,11 +1231,59 @@ mod tests {
         assert!(frame.reason.is_empty());
     }
 
+    /// Drives bounded persistent gateway admission: once the relay queue is
+    /// full, fire-and-forget notifications are rejected instead of enqueuing
+    /// without bound.
+    ///
+    /// Mutation that must fail this test: build the gateway sender with
+    /// `GatewaySender::new` (unbounded) instead of `GatewaySender::new_bounded`.
+    #[test]
+    fn issue41_bound_ws_queues_gateway_queue_rejects_when_full() {
+        let (gw_tx, _gw_rx) = mpsc::channel::<AcpClientMessage>(2);
+        let gateway = GatewaySender::new_bounded(gw_tx);
+
+        assert!(gateway.forward_fire_and_forget(test_session_notification("delta-0")));
+        assert!(gateway.forward_fire_and_forget(test_session_notification("delta-1")));
+        assert!(!gateway.forward_fire_and_forget(test_session_notification("delta-2")));
+    }
+
+    /// Drives the raw-length gate for text frames that become `"ping"` only
+    /// after trimming CR/LF.
+    ///
+    /// Mutation that must fail this test: move the size check below
+    /// `trim_end_matches` in `admit_inbound_ws_payload`.
+    #[tokio::test]
+    async fn issue41_bound_ws_queues_oversized_trailing_ping_closes_with_1009() {
+        let payload = format!("ping{}", "\n".repeat(MAX_INBOUND_WS_MESSAGE_BYTES));
+        assert_oversized_text_payload_closes_with_1009(payload).await;
+    }
+
+    /// Drives the raw-length gate for text frames that become empty after
+    /// trimming CR/LF.
+    ///
+    /// Mutation that must fail this test: move the size check below
+    /// `trim_end_matches` in `admit_inbound_ws_payload`.
+    #[tokio::test]
+    async fn issue41_bound_ws_queues_oversized_empty_after_trim_closes_with_1009() {
+        let payload = "\n".repeat(MAX_INBOUND_WS_MESSAGE_BYTES + 1);
+        assert_oversized_text_payload_closes_with_1009(payload).await;
+    }
+
+    /// Drives the raw-length gate for oversized non-UTF-8 binary frames.
+    ///
+    /// Mutation that must fail this test: in `handle_connection`, restore the
+    /// early `from_utf8` `continue` before `admit_inbound_ws_binary_payload`.
+    #[tokio::test]
+    async fn issue41_bound_ws_queues_oversized_non_utf8_binary_closes_with_1009() {
+        let payload = vec![0xFF; MAX_INBOUND_WS_MESSAGE_BYTES + 1];
+        assert_oversized_binary_payload_closes_with_1009(payload).await;
+    }
+
     /// Drives [`admit_inbound_ws_payload`] size gate and the live WS close path
     /// in `handle_connection` (policy_close → write task).
     ///
     /// Mutation that must fail this test: delete the
-    /// `trimmed.len() > MAX_INBOUND_WS_MESSAGE_BYTES` check in
+    /// `payload.len() > MAX_INBOUND_WS_MESSAGE_BYTES` check in
     /// `admit_inbound_ws_payload`.
     #[tokio::test]
     async fn issue41_bound_ws_queues_oversized_frame_closes_with_1009() {
