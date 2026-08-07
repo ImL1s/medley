@@ -8062,4 +8062,58 @@ mod tests {
         };
         assert_eq!(ev.server_name(), Some("srv"));
     }
+
+    /// Source-scanning half of the #173 ordering guard, covering the
+    /// cross-crate fact the `respawn_stdio` comment in `xai-grok-shell`
+    /// depends on: `arm_liveness_watcher` must spawn the poller and return
+    /// without awaiting again. Its caller arms the watcher as the LAST step
+    /// of a restart and then runs synchronously through `Ok(())` →
+    /// `record_succeeded` → `note_ready`; that is only safe because the
+    /// dispatcher (same LocalSet thread) cannot interleave. An `.await`
+    /// added after `spawn_transport_liveness` here would reintroduce the
+    /// #45 budget-refund race from the OTHER side of the crate boundary,
+    /// and nobody editing this crate would see the comment that depends on
+    /// it. Scanning source text rather than behaviour for the same reason
+    /// as `no_clap_doc_comment_hardcodes_the_state_directory`: the failure
+    /// is a timing interleaving, not an input→output mapping.
+    #[test]
+    fn arm_liveness_watcher_never_awaits_after_spawning_the_poller() {
+        let src = include_str!("servers.rs");
+        let start = src
+            .find("pub async fn arm_liveness_watcher")
+            .expect("arm_liveness_watcher definition not found");
+        let after_sig = &src[start..];
+        let open = after_sig.find('{').expect("body opening brace");
+        let mut depth = 0usize;
+        let mut end = None;
+        for (offset, ch) in after_sig.char_indices().skip(open) {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &after_sig[open..=end.expect("unbalanced braces in arm_liveness_watcher")];
+        let spawn = body
+            .find("spawn_transport_liveness")
+            .expect("spawn_transport_liveness call not found in arm_liveness_watcher");
+        let after_spawn = &body[spawn..];
+        assert!(
+            !after_spawn.contains(".await"),
+            "arm_liveness_watcher awaits after spawn_transport_liveness. \
+             xai-grok-shell's respawn_stdio relies on this function spawning \
+             and returning without awaiting again: it arms the watcher as the \
+             last step of a restart and runs synchronously into the caller's \
+             note_ready. A yield point here lets the dispatcher classify a new \
+             client's death against the previous client's last_ready_at and \
+             reset the early-death counter — issue #45 returning through the \
+             other crate. See issue #173."
+        );
+    }
 }
