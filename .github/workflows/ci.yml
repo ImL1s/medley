@@ -963,3 +963,28 @@ jobs:
 
           run_nonzero --release -p xai-grok-tools --features pi --lib \
             bundled_fd_release_artifact_extracts_exact_and_executes -- --nocapture
+
+      # #88: `xai-proto-build` is run by every build script in this workspace and
+      # was in no test job at all -- so the code that decides whether protoc is
+      # findable, and what gets emitted to cargo's stdout, was never exercised by
+      # CI. That stdout is parsed one directive per line, so a value carrying a
+      # newline injects further directives; a non-UTF-8 path is exactly the input
+      # that reaches it. Quoted name: an unquoted `#88` truncates at the comment
+      # marker.
+      - name: 'Build-script protoc discovery and rerun-if-changed emission (issue #88)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-proto-build --lib -- --nocapture
