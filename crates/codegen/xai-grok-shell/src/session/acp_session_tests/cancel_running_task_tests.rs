@@ -45,7 +45,8 @@ fn persist_ack_waits_for_disk_flush_before_success() {
                 temperature: None,
                 top_p: None,
                 endpoint_trust: None,
-                credential_source: None,
+                // Bound test key needs a non-ambient source (#136 step 4).
+                credential_source: Some(xai_grok_sampler::CredentialSource::ModelApiKey),
                 api_backend: Default::default(),
                 auth_scheme: Default::default(),
                 extra_headers: Default::default(),
@@ -370,7 +371,8 @@ async fn first_turn_memory_injection_persists_to_chat_history() {
                     temperature: None,
                     top_p: None,
                     endpoint_trust: None,
-                    credential_source: None,
+                    // Bound test key needs a non-ambient source (#136 step 4).
+                    credential_source: Some(xai_grok_sampler::CredentialSource::ModelApiKey),
                     api_backend: Default::default(),
                     auth_scheme: Default::default(),
                     context_window: 100_000,
@@ -506,7 +508,8 @@ fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history() {
                 temperature: None,
                 top_p: None,
                 endpoint_trust: None,
-                credential_source: None,
+                // Bound test key needs a non-ambient source (#136 step 4).
+                credential_source: Some(xai_grok_sampler::CredentialSource::ModelApiKey),
                 api_backend: Default::default(),
                 auth_scheme: Default::default(),
                 context_window: 100_000,
@@ -2236,7 +2239,8 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 temperature: None,
                 top_p: None,
                 endpoint_trust: None,
-                credential_source: None,
+                // Bound test key needs a non-ambient source (#136 step 4).
+                credential_source: Some(xai_grok_sampler::CredentialSource::ModelApiKey),
                 api_backend: xai_grok_sampler::ApiBackend::Responses,
                 auth_scheme: Default::default(),
                 extra_headers: Default::default(),

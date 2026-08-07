@@ -332,7 +332,8 @@ pub fn test_sampler_config(
         api_backend,
         auth_scheme: Default::default(),
         endpoint_trust: None,
-        credential_source: None,
+        // Bound test key needs a non-ambient source (#136 step 4).
+        credential_source: Some(xai_grok_sampler::CredentialSource::ModelApiKey),
         extra_headers: extra_headers
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))

@@ -2674,6 +2674,11 @@ impl acp::Agent for MvpAgent {
                     serde_json::json!(running_prompt_id),
                 );
         }
+        if session_exists {
+            self
+                .recompute_web_search_disable_notice_for_session(&session_id)
+                .await;
+        }
         let model_state = self.model_state(Some(&session_id));
         self.insert_session_config_meta(
             &mut response_meta_map,

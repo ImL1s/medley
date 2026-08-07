@@ -254,6 +254,7 @@ jobs:
           # property still holds" must not look the same, and only `run_nonzero`
           # tells them apart.
           run_nonzero -p xai-grok-shell --lib catalog_unavailable -- --nocapture
+          run_nonzero -p xai-grok-shell --lib test_catalog_auth_schemes_and_override -- --nocapture
           # #132: the reader's dup must not be inherited by children. Named
           # explicitly rather than by a `pty_session` prefix: the rest of that
           # module is the hang this change fixes, and this one is the fd leak
@@ -804,6 +805,36 @@ jobs:
           cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
             preferred_model_persist_failure -- --nocapture
 
+      # #170: the dashboard's mirror obligations. A refused pre-session pick
+      # completes with a toast on the new agent; whenever the view stays on
+      # the dashboard the caller must mirror it onto the dashboard's error
+      # slot. The two mirror guards landed with this subsystem's fix but
+      # matched no filter, so the obligation's tests ran nowhere (#171); the
+      # new button-path test pins why THAT path may discard the refusal
+      # signal. Full unique names so run_nonzero proves each one still runs.
+      - name: 'Dashboard refused-pick mirror obligations (issue #170)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-pager --lib \
+            dashboard_dispatch_refused_pick_mirrors_error_and_drops_cli_stash -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            dashboard_confirm_worktree_refused_pick_mirrors_error_toast -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            dashboard_new_agent_button_refused_pick_toast_follows_the_view -- --nocapture
+
       # #159: a runtime-only model was judged absent by a config-only lookup,
       # and the turn stripped its credentials. Filters written out rather than
       # looped, so the #171 check can see them. Quoted name: an unquoted `#159`
@@ -1042,6 +1073,34 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             read_parent_sampling_config_dual_auth_keeps_model_api_key -- --nocapture
 
+      # #136 step 4: L3 refuses unlabelled / inconsistent bound auth from the
+      # material itself, not from a self-reported ambient label alone. Unique
+      # filters so run_nonzero proves each new test is selected (#171).
+      - name: 'L3 provenance-required and inconsistency (issue #136 step 4)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-sampler --lib \
+            unlabelled_bound_auth_on_external_origin_requires_provenance -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            unlabelled_bound_auth_on_https_first_party_xai_still_constructs -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            missing_or_none_label_with_bound_material_is_inconsistent -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            explicit_header_label_with_separate_api_key_is_inconsistent -- --nocapture
+
       # #160: six of the seven tests this branch originally added matched no
       # filter. The seventh, `web_search_resolves_an_env_backed_credential_header`,
       # is already selected by the existing `credential_header` filter. Written
@@ -1101,6 +1160,8 @@ jobs:
             rm -f "$output"
           }
           run_nonzero -p xai-grok-shell --lib session_meta_publishes_the_web_search_disable -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            session_load_recompute_updates_web_search_notice_for_ready_unusable_and_unknown -- --nocapture
           run_nonzero -p xai-grok-shell --lib session_meta_keeps_web_search_notices_session_scoped -- --nocapture
           run_nonzero -p xai-grok-shell --lib take_session_drops_the_web_search_notice -- --nocapture
           run_nonzero -p xai-grok-pager --lib web_search_disabled_meta -- --nocapture

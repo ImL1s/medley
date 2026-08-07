@@ -12,6 +12,10 @@ pub fn test_config(base_url: &str, api_key: &str) -> SamplerConfig {
         api_key: Some(api_key.to_string()),
         base_url: base_url.to_string(),
         model: "test-model".to_string(),
+        // Bound test key needs a non-ambient source (#136 step 4); loopback
+        // mocks are not actual https first-party xAI, so unlabelled material
+        // is refused.
+        credential_source: Some(xai_grok_sampler::CredentialSource::ModelApiKey),
         ..SamplerConfig::default()
     }
 }

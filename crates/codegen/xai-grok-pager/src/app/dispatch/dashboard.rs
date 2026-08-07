@@ -702,7 +702,12 @@ pub(super) fn dispatch_dashboard_create_new_agent_with_detail(app: &mut AppView)
     let (new_id, effects) = dispatch_new_session_inner_with_id(app, model_id);
     let policy_block = app.yolo_policy_block;
     if app.agents.contains_key(&new_id) {
-        apply_pending_dispatch_config(
+        // The one legitimate discard (#170 N1): this path walks into the new
+        // agent's detail view below, where the refusal toast is visible —
+        // there is no dashboard left to mirror it onto. The `#[must_use]` on
+        // `apply_pending_dispatch_config` exists so every OTHER discard is a
+        // compile error.
+        let _ = apply_pending_dispatch_config(
             app,
             new_id,
             pending_model.as_ref(),
@@ -1264,6 +1269,13 @@ pub(super) fn dispatch_dashboard_dispatch(
     // would have already returned without effects.
     if let Some(d) = app.dashboard.as_mut() {
         d.dispatch.set_text("");
+        // Ordering obligation (#170 N1): this clear runs BEFORE the
+        // stay-on-dashboard mirrors in the `else` branch below (yolo warning,
+        // refused pick). It wipes whatever a previous dispatch left in the
+        // slot; the mirrors then write this dispatch's outcome. Moving the
+        // clear below them erases both mirrors without touching the mirror
+        // code itself. The mirror tests assert the final value, but the
+        // dependency is invisible in the source, so it is recorded here.
         d.error_toast = None;
         d.filter = crate::views::dashboard::Filter::None;
     }
@@ -1305,6 +1317,14 @@ pub(super) fn dispatch_dashboard_dispatch(
         if model_switch_refused && let Some(d) = app.dashboard.as_mut() {
             d.set_error_toast("Wait for the current model switch to finish");
         }
+        // Recorded collision, not a designed one (#170 N2): with a pinned-yolo
+        // warning AND a refused pick at once, the mirrors above run in this
+        // order, so the refusal overwrites the warning on the dashboard slot —
+        // the opposite of the agent toast, where the warning overwrites the
+        // refusal (see the AlwaysApprove arm of `apply_pending_dispatch_config`).
+        // Each message still survives on exactly one surface, so nothing is
+        // lost; which lands where is accidental. Do not reorder one surface
+        // without deciding the collision policy for both.
     }
     effects
 }
@@ -1670,7 +1690,12 @@ fn block_dashboard_spawn_on_pending_model(
 /// refusal toast lands on the new agent, which is invisible while the view
 /// stays on the dashboard — callers whose dispatch keeps the dashboard
 /// visible must mirror it via `set_error_toast` (the
-/// `block_dashboard_spawn_on_pending_model` convention).
+/// `block_dashboard_spawn_on_pending_model` convention). The return is
+/// `#[must_use]` (#170 N1): dropping it is how this file twice shipped a
+/// refusal the user never sees, so a caller that discards it on purpose must
+/// say so with `let _ =` and a comment naming the surface that shows the
+/// toast instead.
+#[must_use = "a refused pick must be mirrored when the dashboard stays visible"]
 pub(super) fn apply_pending_dispatch_config(
     app: &mut AppView,
     agent_id: AgentId,
@@ -1737,6 +1762,11 @@ pub(super) fn apply_pending_dispatch_config(
         // `set_yolo_mode_inner`, so re-check the pin here.
         DashboardDispatchMode::AlwaysApprove => {
             if let Some(warning) = policy_block {
+                // Recorded collision (#170 N2): when the staged pick was ALSO
+                // refused above, this warning overwrites the refusal toast on
+                // the agent surface. The dashboard mirrors run in the opposite
+                // order (refusal wins there), so each message survives on
+                // exactly one surface — accidental, not designed.
                 agent.session.yolo_mode = false;
                 agent.show_toast(warning);
             } else {

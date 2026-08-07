@@ -2950,6 +2950,135 @@ async fn session_meta_publishes_the_web_search_disable_notice_per_session() {
         "a session with no notice must publish no key"
     );
 }
+/// #201 warm-load seam: a resident session must recompute from current
+/// auth/catalog state, not keep spawn's one-time snapshot.
+///
+/// Covers the three user-visible states:
+/// - Ready: key absent (web_search available)
+/// - Unusable: key present with reason
+/// - Unknown(CatalogUnavailable): key absent (silent, "not enough information")
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn session_load_recompute_updates_web_search_notice_for_ready_unusable_and_unknown() {
+    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    use crate::agent::config::{Config as AgentConfig, ModelEntry, ModelInfo};
+    use crate::auth::{AuthManager, GrokComConfig};
+    use indexmap::IndexMap;
+    use xai_grok_test_support::EnvGuard;
+
+    const WS_MODEL: &str = "ws-runtime-only-201";
+    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+    let temp_dir = tempfile::tempdir().expect("temporary auth root");
+    let auth_manager =
+        std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let gateway = GatewaySender::new(tx);
+    let cfg = AgentConfig {
+        web_search_model: WS_MODEL.to_owned(),
+        ..AgentConfig::default()
+    };
+
+    let mut info = ModelInfo::fallback(WS_MODEL);
+    info.base_url = "https://vendor.example/v1".to_owned();
+    let mut runtime_catalog = IndexMap::new();
+    runtime_catalog.insert(
+        WS_MODEL.to_owned(),
+        ModelEntry {
+            info,
+            api_key: Some("runtime-only-test-key".to_owned()),
+            env_key: None,
+            auth_provider: None,
+            api_base_url: None,
+            config_validation_errors: Vec::new(),
+        },
+    );
+    let agent =
+        MvpAgent::new(gateway, &cfg, auth_manager, Some(runtime_catalog)).expect("valid test config");
+
+    let sid = acp::SessionId::new("ws-warm-201");
+    let mut handle = make_test_handle("test-model", false, None);
+    handle.info.id = sid.clone();
+    agent.sessions.borrow_mut().insert(sid.clone(), handle);
+
+    // Ready route: web_search remains available, so `_meta` must stay silent.
+    agent
+        .recompute_web_search_disable_notice_for_session(&sid)
+        .await;
+    let ready_state = agent.model_state(Some(&sid));
+    let mut ready_meta = serde_json::Map::new();
+    agent.insert_session_config_meta(
+        &mut ready_meta,
+        &sid,
+        "/tmp".to_string(),
+        None,
+        &ready_state,
+    );
+    assert!(
+        ready_meta
+            .get(crate::session::WEB_SEARCH_DISABLED_META_KEY)
+            .is_none(),
+        "ready web_search route must publish no disable key"
+    );
+
+    // Becomes unusable while resident: the next warm load must publish notice.
+    let mut unusable = agent
+        .models_manager
+        .models()
+        .get(WS_MODEL)
+        .cloned()
+        .expect("runtime model exists");
+    unusable.api_key = None;
+    unusable
+        .config_validation_errors
+        .push("injected readiness failure".to_owned());
+    agent.models_manager.insert_test_entry(WS_MODEL, unusable);
+
+    agent
+        .recompute_web_search_disable_notice_for_session(&sid)
+        .await;
+    let unusable_state = agent.model_state(Some(&sid));
+    let mut unusable_meta = serde_json::Map::new();
+    agent.insert_session_config_meta(
+        &mut unusable_meta,
+        &sid,
+        "/tmp".to_string(),
+        None,
+        &unusable_state,
+    );
+    let published = unusable_meta
+        .get(crate::session::WEB_SEARCH_DISABLED_META_KEY)
+        .expect("resident session that became unusable must publish a disable notice");
+    let notice: crate::session::WebSearchDisabledNotice =
+        serde_json::from_value(published.clone()).expect("shared notice schema");
+    assert_eq!(notice.model_id, WS_MODEL);
+    assert!(
+        notice.reason.contains("injected readiness failure"),
+        "notice reason must come from readiness failure"
+    );
+
+    // Catalog unavailable (unknown): stay silent instead of reporting disabled.
+    agent.models_manager.apply_catalog_for_test(IndexMap::new());
+    agent
+        .recompute_web_search_disable_notice_for_session(&sid)
+        .await;
+    let unknown_state = agent.model_state(Some(&sid));
+    let mut unknown_meta = serde_json::Map::new();
+    agent.insert_session_config_meta(
+        &mut unknown_meta,
+        &sid,
+        "/tmp".to_string(),
+        None,
+        &unknown_state,
+    );
+    assert!(
+        unknown_meta
+            .get(crate::session::WEB_SEARCH_DISABLED_META_KEY)
+            .is_none(),
+        "Unknown(CatalogUnavailable) must stay silent on warm load"
+    );
+}
 /// #161: the per-session entry dies with the session, so a long-lived process
 /// cannot accumulate them. `take_session` is the single funnel for a handle
 /// leaving `self.sessions`, which is why cleaning there is sufficient.
