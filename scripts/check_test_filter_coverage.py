@@ -43,6 +43,10 @@ _VALUED_FLAGS = {"-p", "--package", "--manifest-path", "--features", "--test", "
 # Valueless flags.
 _BARE_FLAGS = {"--lib", "--all-targets", "--no-run", "--release", "--all-features", "--no-default-features"}
 
+# Seen (token, line) pairs, so the shell-variable warning is emitted once per distinct
+# workflow line rather than once per occurrence.
+_warned_shell_tokens: set[tuple[str, str]] = set()
+
 
 def _crate_from_manifest(path: str) -> str:
     """`crates/codegen/xai-grok-sampler/Cargo.toml` -> `xai-grok-sampler`."""
@@ -105,7 +109,19 @@ def parse_workflow(text: str) -> dict[str, dict[str, set[str]]]:
                 continue
             has_original_filters = True
             if "$" in a:
-                print(f"warning: ignoring filter token '{a}' containing shell variable in workflow line: {line.strip()}", file=sys.stderr)
+                # Deduplicated: `run_nonzero()` is redefined in every step that uses
+                # it, so `cargo test "$@"` appears a dozen-odd times and an
+                # unconditional warning buried the actual failure under thirty
+                # identical lines in the CI log. A warning nobody reads is the same
+                # silence it was added to break.
+                key = (a, line.strip())
+                if key not in _warned_shell_tokens:
+                    _warned_shell_tokens.add(key)
+                    print(
+                        f"warning: ignoring filter token '{a}' containing shell "
+                        f"variable in workflow line: {line.strip()}",
+                        file=sys.stderr,
+                    )
                 i += 1
                 continue
             filters.append(a)
