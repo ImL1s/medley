@@ -512,7 +512,13 @@ impl SessionActor {
                 Ok(())
             }
             Ok(Err(_)) => Err("persistence_write_failed"),
-            Err(_) => Err("persistence_ack_dropped"),
+            Err(_) => {
+                tracing::warn!(
+                    model_id = %model_id.0,
+                    "model-switch persistence acknowledgement dropped; preserving candidate generation"
+                );
+                Ok(())
+            }
         }
     }
 
@@ -1334,6 +1340,61 @@ mod model_switch_transaction_tests {
                         .model,
                     previous_chat.sampling_config.model
                 );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_model_switch_ack_preserves_live_candidate_generation() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (persistence_tx, mut persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+                tokio::task::spawn_local(async move {
+                    while let Some(message) = persistence_rx.recv().await {
+                        if let PersistenceMsg::ModelSwitchAndAck { respond_to, .. } = message {
+                            drop(respond_to);
+                            break;
+                        }
+                    }
+                });
+                let (actor, _event_rx) =
+                    create_test_actor_ex(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                *actor.active_agent_type.lock() = Some("grok-build".to_owned());
+                let previous_model = actor
+                    .chat_state_handle
+                    .get_sampling_config()
+                    .await
+                    .expect("sampling state")
+                    .model;
+
+                let receipt = actor
+                    .handle_apply_model_switch(prepared_switch("grok-build", None))
+                    .await
+                    .expect("dropped acknowledgement must not roll back the candidate generation");
+                assert!(!receipt.did_rebuild);
+                assert_eq!(receipt.catalog_model_id.0.as_ref(), "target-model");
+                assert_eq!(catalog_model_id(&actor), "target-model");
+                assert_eq!(
+                    actor
+                        .chat_state_handle
+                        .get_sampling_config()
+                        .await
+                        .expect("sampling state")
+                        .model,
+                    "target-wire-model"
+                );
+                assert_ne!(
+                    actor
+                        .chat_state_handle
+                        .get_sampling_config()
+                        .await
+                        .expect("sampling state")
+                        .model,
+                    previous_model
+                );
+                assert_eq!(actor.compaction.threshold_percent.get(), 73);
             })
             .await;
     }

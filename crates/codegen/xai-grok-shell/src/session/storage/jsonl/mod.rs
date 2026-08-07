@@ -194,16 +194,8 @@ impl JsonlStorageAdapter {
         let session_dirs = self.scan_session_dirs(cwd)?;
         let mut summaries = Vec::new();
         for session_dir in session_dirs {
-            let summary_path = session_dir.join(super::SUMMARY_FILE);
-            match std::fs::read(&summary_path) {
-                Ok(bytes) => {
-                    if let Ok(summary) = serde_json::from_slice::<Summary>(&bytes)
-                        && !summary.is_hidden()
-                    {
-                        summaries.push(summary);
-                    }
-                }
-                Err(_) => continue,
+            if let Some(summary) = self.read_summary_for_listing(&session_dir) {
+                summaries.push(summary);
             }
         }
         summaries.sort_by_cached_key(|s| {
@@ -213,6 +205,21 @@ impl JsonlStorageAdapter {
             )
         });
         Ok(summaries)
+    }
+
+    fn read_summary_for_listing(&self, session_dir: &Path) -> Option<Summary> {
+        if let Err(error) = self.recover_model_switch_in_dir_sync(session_dir) {
+            tracing::warn!(
+                session_dir = %session_dir.display(),
+                ?error,
+                "failed recovering pending model-switch intent before listing session summary"
+            );
+            return None;
+        }
+        let summary_path = session_dir.join(super::SUMMARY_FILE);
+        let bytes = std::fs::read(&summary_path).ok()?;
+        let summary = serde_json::from_slice::<Summary>(&bytes).ok()?;
+        (!summary.is_hidden()).then_some(summary)
     }
     /// List the N most recently modified session summaries across all
     /// workspaces.
@@ -227,6 +234,14 @@ impl JsonlStorageAdapter {
         let mut candidates: Vec<(PathBuf, std::time::SystemTime)> =
             Vec::with_capacity(session_dirs.len());
         for session_dir in session_dirs {
+            if let Err(error) = self.recover_model_switch_in_dir_sync(&session_dir) {
+                tracing::warn!(
+                    session_dir = %session_dir.display(),
+                    ?error,
+                    "failed recovering pending model-switch intent before recent-session scan"
+                );
+                continue;
+            }
             let summary_path = session_dir.join(super::SUMMARY_FILE);
             if let Ok(meta) = std::fs::metadata(&summary_path)
                 && let Ok(mtime) = meta.modified()
