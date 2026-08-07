@@ -37,6 +37,9 @@ from pathlib import Path
 # `run_nonzero -p <crate> ... <filter> -- --nocapture`
 # and bare `cargo test --manifest-path <path> ... <filter> -- ...`
 _RUNNER = re.compile(r"^\s*(?:run_nonzero|cargo test)\s+(.*)$")
+_ENV_ASSIGNMENT_PREFIX = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*=(?:\"[^\"]*\"|'[^']*'|\S+)\s+(.*)$"
+)
 
 # Flags that take a value, so the following token is not a filter.
 _VALUED_FLAGS = {"-p", "--package", "--manifest-path", "--features", "--test", "--bin", "--example"}
@@ -53,6 +56,16 @@ def _crate_from_manifest(path: str) -> str:
     return Path(path).parent.name
 
 
+def _strip_env_assignments_prefix(line: str) -> str:
+    """Drop leading `KEY=VALUE` assignments from a shell command line."""
+    stripped = line.strip()
+    while True:
+        m = _ENV_ASSIGNMENT_PREFIX.match(stripped)
+        if not m:
+            return stripped
+        stripped = m.group(1).lstrip()
+
+
 def parse_workflow(text: str) -> dict[str, dict[str, set[str]]]:
     """Map crate -> target -> set of filter strings used against it.
 
@@ -63,7 +76,7 @@ def parse_workflow(text: str) -> dict[str, dict[str, set[str]]]:
     per_crate: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
 
     for line in joined.splitlines():
-        m = _RUNNER.match(line)
+        m = _RUNNER.match(_strip_env_assignments_prefix(line))
         if not m:
             continue
         # Drop anything after the `--` separator: those are libtest args
