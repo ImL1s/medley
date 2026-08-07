@@ -382,3 +382,10 @@ jobs:
             dual_auth_gateway_model_key_plus_declared_header -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             seeded_ambient_key_must_not_keep_a_post_strip -- --nocapture
+          # Seam half of #180: reconstruct / parent-inherit must not invent
+          # ExplicitHeader from the maps while keeping api_key. The sampler
+          # dual_auth_gateway_… test never reaches these functions.
+          run_nonzero -p xai-grok-shell --lib \
+            reconstruct_full_config_ready_dual_auth_keeps_model_api_key -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            read_parent_sampling_config_dual_auth_keeps_model_api_key -- --nocapture

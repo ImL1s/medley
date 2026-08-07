@@ -1039,6 +1039,102 @@ async fn reconstruct_full_config_ready_byok_carries_stored_source() {
         .await;
 }
 
+/// #180 seam: Ready dual-auth gateway — model owns an `api_key` *and* a
+/// declared credential header still sits in the maps. Reconstruction must
+/// keep the stored `ModelApiKey` label (bound with the secret), not invent
+/// `ExplicitHeader` from the maps while leaving `api_key` set.
+///
+/// That invented pair is what L3 treats as ambient and refuses on External;
+/// inventing it at this seam is how a legitimate gateway route died for
+/// users. The sampler-side `dual_auth_gateway_…` constructs
+/// `SamplingClient::new` directly and never reaches this function, so it
+/// stays green under the header-preference mutation at
+/// `sampler_turn.rs` Ready-path provenance.
+///
+/// Also asserts the reconstructed `SamplingConfig` is one
+/// `SamplingClient::new` accepts — coverage through the crate boundary.
+#[tokio::test(flavor = "current_thread")]
+async fn reconstruct_full_config_ready_dual_auth_keeps_model_api_key_not_explicit_header() {
+    use crate::agent::auth_method::ModelByok;
+    use crate::agent::config::ModelAuthFacts;
+    const MODEL_KEY: &str = "sk-upstream-byok";
+    const EDGE_HEADER: &str = "x-api-key";
+    const EDGE_VALUE: &str = "sk-gateway-edge";
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                None,
+                "xai.api_key",
+                xai_chat_state::AuthType::ApiKey,
+                MODEL_KEY.to_string(),
+            )
+            .await;
+            let mut cfg = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("test actor sampling config");
+            cfg.base_url = "https://gateway.example/v1".to_string();
+            cfg.endpoint_trust = Some(xai_grok_sampler::EndpointTrustClass::External);
+            cfg.extra_headers
+                .insert(EDGE_HEADER.to_string(), EDGE_VALUE.to_string());
+            let model = cfg.model.clone();
+            actor.chat_state_handle.update_sampling_config(cfg);
+            actor
+                .model_auth_memo
+                .replace(Some(crate::session::acp_session::ModelAuthMemo {
+                    model_id: model,
+                    facts: ModelAuthFacts {
+                        byok: ModelByok::Byok,
+                        auth_scheme: xai_grok_sampler::AuthScheme::Bearer,
+                        readiness: crate::agent::auth_method::ModelReadiness::Ready,
+                    },
+                    provider: None,
+                }));
+
+            let cfg = actor.reconstruct_full_config().await;
+
+            assert!(
+                matches!(
+                    cfg.credential_source,
+                    Some(xai_grok_sampler::CredentialSource::ModelApiKey)
+                ),
+                "Ready dual-auth reconstruct must keep stored ModelApiKey; \
+                 inventing ExplicitHeader from the maps while api_key remains \
+                 is the #180 L3 false-refuse. got={:?}",
+                cfg.credential_source
+            );
+            assert!(
+                !matches!(
+                    cfg.credential_source,
+                    Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
+                ),
+                "Ready dual-auth reconstruct must not invent ExplicitHeader \
+                 from the header maps. (Value withheld.)"
+            );
+            assert!(
+                cfg.api_key.as_deref() == Some(MODEL_KEY),
+                "Ready dual-auth reconstruct must keep the model-owned api_key. \
+                 (Value withheld.)"
+            );
+            assert!(
+                cfg.extra_headers
+                    .get(EDGE_HEADER)
+                    .is_some_and(|v| v.as_str() == EDGE_VALUE),
+                "declared gateway edge header must still ship in extra_headers. \
+                 (Value withheld.)"
+            );
+
+            xai_grok_sampler::SamplingClient::new(cfg).expect(
+                "dual-auth gateway with stored ModelApiKey must construct on \
+                 an external origin; re-labelling ExplicitHeader while keeping \
+                 api_key is the #180 L3 false-refuse",
+            );
+        })
+        .await;
+}
+
 /// Without the live bearer resolver here the sampler would sign requests with
 /// the stale buffered token.
 #[tokio::test(flavor = "current_thread")]
