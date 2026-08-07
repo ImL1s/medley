@@ -2984,6 +2984,65 @@ async fn take_session_drops_the_web_search_notice() {
         "take_session must drop the session-scoped notice"
     );
 }
+/// #161: the latch is per-session, not process-wide. Two sessions disabled for
+/// *different* reasons must each publish their own notice on their own
+/// response `_meta`. The pre-#185 `Cell<bool>` latch swallowed every notice
+/// after the first, and a "first wins" / "last wins" read of the map would
+/// still pass the told/untold pair above while collapsing these two. Reading
+/// the entry for a second response (a reconnect-driven reload) must not
+/// consume it either -- the notice is not a one-shot.
+#[tokio::test(flavor = "current_thread")]
+async fn session_meta_keeps_web_search_notices_session_scoped() {
+    let agent = build_minimal_agent_for_tests();
+    let first = acp::SessionId::new("ws-first-sess");
+    let second = acp::SessionId::new("ws-second-sess");
+    for sid in [&first, &second] {
+        let mut handle = make_test_handle("test-model", false, None);
+        handle.info.id = (*sid).clone();
+        agent.sessions.borrow_mut().insert((*sid).clone(), handle);
+    }
+    let notice_for = |model: &str, reason: &str| crate::session::WebSearchDisabledNotice {
+        model_id: model.into(),
+        reason: reason.into(),
+        message: format!(
+            "web_search is unavailable: model \"{model}\" could not be used ({reason})"
+        ),
+    };
+    agent.web_search_disabled.borrow_mut().insert(
+        first.clone(),
+        notice_for("grok-4-fast", "no API key or session credential available"),
+    );
+    agent
+        .web_search_disabled
+        .borrow_mut()
+        .insert(second.clone(), notice_for("vendor-large", "model is not ready"));
+
+    let published_for = |sid: &acp::SessionId| {
+        let model_state = agent.model_state(Some(sid));
+        let mut meta = serde_json::Map::new();
+        agent.insert_session_config_meta(&mut meta, sid, "/tmp".to_string(), None, &model_state);
+        let raw = meta
+            .get(crate::session::WEB_SEARCH_DISABLED_META_KEY)
+            .expect("each disabled session must publish its own notice");
+        serde_json::from_value::<crate::session::WebSearchDisabledNotice>(raw.clone())
+            .expect("shared notice schema")
+    };
+    let first_notice = published_for(&first);
+    assert_eq!(first_notice.model_id, "grok-4-fast");
+    assert!(first_notice.reason.contains("no API key"));
+    let second_notice = published_for(&second);
+    assert_eq!(second_notice.model_id, "vendor-large");
+    assert!(second_notice.reason.contains("model is not ready"));
+
+    // A reconnect-driven reload rebuilds the response `_meta`; the entry must
+    // survive being read, or the reload silently re-latches like the old
+    // process-wide flag did.
+    let republished = published_for(&first);
+    assert_eq!(
+        republished, first_notice,
+        "re-reading the response meta must not consume the notice"
+    );
+}
 /// Build a minimal MvpAgent with pre-loaded auth for gate tests.
 fn build_agent_with_auth(auth: crate::auth::GrokAuth) -> MvpAgent {
     use crate::agent::config::Config as AgentConfig;
