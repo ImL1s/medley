@@ -786,6 +786,9 @@ jobs:
           # (substring shared with `leaders_kill` alone would not).
           run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
             leaders_kill_failed_kill_counts -- --nocapture
+          # Unique filter: proves startup kill PID plausibility bounds run.
+          run_nonzero -p xai-grok-shell --lib \
+            startup_kill_socket_pid_plausibility_bounds -- --nocapture
           # `reclaim_` rather than the NotFound test alone: this branch's two
           # mutation-proven invariant tests (`reclaim_removes_a_lock_no_process_holds`,
           # `reclaim_refuses_a_lock_a_live_process_holds`) are also selected here.
