@@ -3759,6 +3759,23 @@ impl McpClient {
         self: &Arc<Self>,
         poll_interval: std::time::Duration,
     ) -> bool {
+        self.arm_liveness_watcher_then(poll_interval, || {}).await
+    }
+
+    /// Arm the watcher and run `on_armed` synchronously once installed.
+    ///
+    /// `on_armed` runs in the same turn that installs the watcher handle:
+    /// callers can perform "watcher armed" bookkeeping (for example
+    /// restart-budget `note_ready`) without exposing a cross-crate gap
+    /// between arming and that bookkeeping.
+    pub async fn arm_liveness_watcher_then<F>(
+        self: &Arc<Self>,
+        poll_interval: std::time::Duration,
+        on_armed: F,
+    ) -> bool
+    where
+        F: FnOnce(),
+    {
         if self.is_acp() {
             return false;
         }
@@ -3768,18 +3785,21 @@ impl McpClient {
         if !matches!(self.state_kind().await, ClientStateKind::Ready) {
             return false;
         }
-        let mut slot = self.liveness_handle.lock();
-        if slot.is_some() {
-            return false;
+        {
+            let mut slot = self.liveness_handle.lock();
+            if slot.is_some() {
+                return false;
+            }
+            let handle = crate::liveness::spawn_transport_liveness(
+                self.server_name.clone(),
+                Arc::clone(self),
+                poll_interval,
+                event_tx,
+                Arc::clone(&self.liveness_handle),
+            );
+            *slot = Some(handle);
         }
-        let handle = crate::liveness::spawn_transport_liveness(
-            self.server_name.clone(),
-            Arc::clone(self),
-            poll_interval,
-            event_tx,
-            Arc::clone(&self.liveness_handle),
-        );
-        *slot = Some(handle);
+        on_armed();
         true
     }
 
@@ -8064,24 +8084,19 @@ mod tests {
     }
 
     /// Source-scanning half of the #173 ordering guard, covering the
-    /// cross-crate fact the `respawn_stdio` comment in `xai-grok-shell`
-    /// depends on: `arm_liveness_watcher` must spawn the poller and return
-    /// without awaiting again. Its caller arms the watcher as the LAST step
-    /// of a restart and then runs synchronously through `Ok(())` →
-    /// `record_succeeded` → `note_ready`; that is only safe because the
-    /// dispatcher (same LocalSet thread) cannot interleave. An `.await`
-    /// added after `spawn_transport_liveness` here would reintroduce the
-    /// #45 budget-refund race from the OTHER side of the crate boundary,
-    /// and nobody editing this crate would see the comment that depends on
-    /// it. Scanning source text rather than behaviour for the same reason
-    /// as `no_clap_doc_comment_hardcodes_the_state_directory`: the failure
-    /// is a timing interleaving, not an input→output mapping.
+    /// cross-crate fact that `respawn_stdio` in `xai-grok-shell` now
+    /// depends on: `arm_liveness_watcher_then` must not introduce a
+    /// scheduler yield between `spawn_transport_liveness` and the
+    /// `on_armed` callback. The restart path records `note_ready`
+    /// through that callback to avoid a cross-crate interleave window.
+    /// Any yield shape in the tail after spawn reopens the #45
+    /// budget-refund race from this crate side.
     #[test]
-    fn arm_liveness_watcher_never_awaits_after_spawning_the_poller() {
+    fn arm_liveness_watcher_then_has_no_scheduler_yield_after_spawning() {
         let src = include_str!("servers.rs");
         let start = src
-            .find("pub async fn arm_liveness_watcher")
-            .expect("arm_liveness_watcher definition not found");
+            .find("pub async fn arm_liveness_watcher_then")
+            .expect("arm_liveness_watcher_then definition not found");
         let after_sig = &src[start..];
         let open = after_sig.find('{').expect("body opening brace");
         let mut depth = 0usize;
@@ -8102,18 +8117,31 @@ mod tests {
         let body = &after_sig[open..=end.expect("unbalanced braces in arm_liveness_watcher")];
         let spawn = body
             .find("spawn_transport_liveness")
-            .expect("spawn_transport_liveness call not found in arm_liveness_watcher");
+            .expect("spawn_transport_liveness call not found in arm_liveness_watcher_then");
         let after_spawn = &body[spawn..];
         assert!(
-            !after_spawn.contains(".await"),
-            "arm_liveness_watcher awaits after spawn_transport_liveness. \
-             xai-grok-shell's respawn_stdio relies on this function spawning \
-             and returning without awaiting again: it arms the watcher as the \
-             last step of a restart and runs synchronously into the caller's \
-             note_ready. A yield point here lets the dispatcher classify a new \
-             client's death against the previous client's last_ready_at and \
-             reset the early-death counter — issue #45 returning through the \
-             other crate. See issue #173."
+            after_spawn.contains("on_armed();"),
+            "arm_liveness_watcher_then must invoke on_armed() in its \
+             post-spawn tail so restart bookkeeping can happen in the same \
+             call chain."
         );
+        for forbidden in [
+            ".await",
+            "select!",
+            "join!",
+            "try_join!",
+            "yield_now",
+            "block_in_place",
+            "tokio::spawn(",
+            "spawn_local(",
+        ] {
+            assert!(
+                !after_spawn.contains(forbidden),
+                "arm_liveness_watcher_then contains `{forbidden}` after \
+                 spawn_transport_liveness. Restart ordering depends on this \
+                 tail running straight through to on_armed() and return \
+                 without yielding (#45/#173). Tail: `{after_spawn}`"
+            );
+        }
     }
 }

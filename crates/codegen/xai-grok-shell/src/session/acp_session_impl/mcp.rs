@@ -957,6 +957,17 @@ impl SessionActor {
     /// SIGKILLs the spawned child — and returns an explicit error so
     /// the auto-restart loop can emit `Reason::Disabled`.
     pub(crate) async fn respawn_stdio(&self, server: &str) -> Result<(), String> {
+        self.respawn_stdio_then(server, || {}).await
+    }
+
+    pub(crate) async fn respawn_stdio_then<F>(
+        &self,
+        server: &str,
+        note_ready: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(),
+    {
         let (server_config, meta_config, event_tx) = {
             let mcp_state = self.mcp_state.lock().await;
             let server_config = mcp_state
@@ -1053,10 +1064,10 @@ impl SessionActor {
         // be cleaned up at all. That asymmetry is why the swap goes this way
         // round rather than the other.
         //
-        // Nothing may `.await` between the arm below and the caller's
-        // `note_ready` (`auto_restart_stdio`'s `Ok` arm records it
-        // synchronously); `arm_liveness_watcher` spawns and returns without
-        // awaiting again, so returning straight into `Ok(())` preserves that.
+        // `note_ready` is passed as a callback into
+        // `arm_liveness_watcher_then` so readiness bookkeeping is wired into
+        // the same call chain that installs the watcher. Keep this tail
+        // yield-free: a scheduler handoff before that callback reopens #45.
         {
             let mut mcp_state = self.mcp_state.lock().await;
             mcp_state
@@ -1064,7 +1075,7 @@ impl SessionActor {
                 .insert(server.to_string(), std::sync::Arc::clone(&arc_client));
         }
         let _ = arc_client
-            .arm_liveness_watcher(xai_grok_mcp::liveness::DEFAULT_POLL_INTERVAL)
+            .arm_liveness_watcher_then(xai_grok_mcp::liveness::DEFAULT_POLL_INTERVAL, note_ready)
             .await;
         Ok(())
     }
@@ -1930,20 +1941,20 @@ pub(super) struct McpAnnouncementSnapshot {
     pub(super) server_count: usize,
 }
 
-/// Source-scanning guards for the `respawn_stdio` arm/insert ordering
+/// Source-scanning guards for the `respawn_stdio_then` arm/insert ordering
 /// invariant (issue #173). The invariant exists to keep the #45
 /// early-death budget refund closed: once the liveness watcher is armed,
-/// no `.await` may sit between the arm and the caller's `note_ready`, and
-/// the new client must already be in `owned_clients` so a same-window
+/// the post-arm tail must contain no scheduler-yield shapes before
+/// returning, and the new client must already be in `owned_clients` so a
+/// same-window
 /// `TransportClosed` is classified against the NEW client's
 /// `last_ready_at`, not the previous one's. A runtime test for this is a
 /// timing race this crate has no harness for, so — like
 /// `no_clap_doc_comment_hardcodes_the_state_directory` in the pager —
 /// the shape is asserted against the source text instead. The comment
-/// above the insert in `respawn_stdio` explains WHY the shape matters;
-/// these tests prove the shape itself. `arm_liveness_watcher`'s own
-/// "no `.await` after the spawn" half lives in `xai-grok-mcp`'s
-/// `servers.rs` tests, next to the function it scans.
+/// above the insert in `respawn_stdio_then` explains WHY the shape matters;
+/// these tests prove the shape itself. `arm_liveness_watcher_then`'s
+/// post-spawn tail guard lives in `xai-grok-mcp`'s `servers.rs` tests.
 #[cfg(test)]
 mod respawn_ordering_guard_tests {
     /// Returns the body (outermost braces included) of the first function
@@ -1973,52 +1984,68 @@ mod respawn_ordering_guard_tests {
     }
 
     #[test]
-    fn respawn_stdio_inserts_before_arming_watcher_and_never_awaits_before_ok() {
-        let body = fn_body(include_str!("mcp.rs"), "async fn respawn_stdio");
+    fn respawn_stdio_then_inserts_before_arming_and_has_no_post_arm_yields() {
+        let body = fn_body(include_str!("mcp.rs"), "async fn respawn_stdio_then");
         let insert = body
             .find(".insert(server.to_string()")
-            .expect("owned_clients insert not found in respawn_stdio");
+            .expect("owned_clients insert not found in respawn_stdio_then");
         // The call, not the comment above it (the comment says
-        // `arm_liveness_watcher` without the `.` receiver).
+        // `arm_liveness_watcher_then` without the `.` receiver).
         let arm = body
-            .find(".arm_liveness_watcher(")
-            .expect("arm_liveness_watcher call not found in respawn_stdio");
+            .find(".arm_liveness_watcher_then(")
+            .expect("arm_liveness_watcher_then call not found in respawn_stdio_then");
         assert!(
             insert < arm,
-            "respawn_stdio arms the liveness watcher BEFORE the owned_clients \
+            "respawn_stdio_then arms the liveness watcher BEFORE the owned_clients \
              insert. That reopens the #45 budget-refund race the insert-first \
              order was chosen to close (#168): a TransportClosed emitted in the \
              same dispatcher window would be classified against the PREVIOUS \
              client's last_ready_at, and once that is older than \
              STABILITY_WINDOW the not-early branch resets the early-death \
              counter. Insert first, arm last; see the comment above the insert \
-             in respawn_stdio and issue #173."
+             in respawn_stdio_then and issue #173."
         );
-        // The arm's own `.await` is the awaited spawn-and-return; nothing may
-        // await after it, or the dispatcher can interleave before the caller's
-        // synchronous `note_ready` and take the not-early branch (#45 again).
+        let arm_tail = &body[arm..];
+        assert!(
+            arm_tail.contains("note_ready"),
+            "respawn_stdio_then must pass note_ready into \
+             arm_liveness_watcher_then so readiness bookkeeping happens in the \
+             same call chain that arms the watcher."
+        );
+        // The arm's own `.await` is the awaited spawn-and-callback return;
+        // everything after it must run straight through.
         let arm_await_end = body[arm..]
             .find(".await;")
             .map(|i| arm + i + ".await;".len())
-            .expect("arm_liveness_watcher call is not awaited in respawn_stdio");
+            .expect("arm_liveness_watcher_then call is not awaited in respawn_stdio_then");
         let ok = body
             .rfind("Ok(())")
-            .expect("closing Ok(()) not found in respawn_stdio");
+            .expect("closing Ok(()) not found in respawn_stdio_then");
         assert!(
             arm_await_end <= ok,
-            "respawn_stdio's closing Ok(()) moved above the arm_liveness_watcher \
-             call; the watcher must be armed as the LAST thing the function \
-             does, so the run to the caller's note_ready carries no yield \
-             point (#45 / #173)."
+            "respawn_stdio_then's closing Ok(()) moved above \
+             arm_liveness_watcher_then; the watcher must be armed as the LAST \
+             thing this function does (#45 / #173)."
         );
         let between = &body[arm_await_end..ok];
-        assert!(
-            !between.contains(".await"),
-            "respawn_stdio awaits between arming the liveness watcher and its \
-             closing Ok(()): `{between}`. That yield point lets the dispatcher \
-             (same LocalSet thread) classify a new client's death against the \
-             previous client's last_ready_at and reset the early-death counter \
-             — issue #45 returning. Nothing may await here; see issue #173."
-        );
+        for forbidden in [
+            ".await",
+            "select!",
+            "join!",
+            "try_join!",
+            "yield_now",
+            "block_in_place",
+            "tokio::spawn(",
+            "spawn_local(",
+        ] {
+            assert!(
+                !between.contains(forbidden),
+                "respawn_stdio_then contains `{forbidden}` between \
+                 arm_liveness_watcher_then and Ok(()): `{between}`. That \
+                 scheduling point can let the dispatcher classify a new \
+                 client's death against the previous client's last_ready_at and \
+                 refund the early-death budget (#45/#173)."
+            );
+        }
     }
 }
