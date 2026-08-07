@@ -422,6 +422,22 @@ fn leader_kill_action(live_pid: Option<u32>, has_lock_path: bool) -> LeaderKillA
     }
 }
 
+/// Apply a `kill_process_by_pid` outcome to the `kill_leaders` counters.
+///
+/// A failed signal must count as `left_alone` so the summary/exit match reality
+/// (issue #167: either kill it or report that it could not). The empty-success
+/// summary is `(killed=0, cleaned=0, left_alone=0)`.
+fn record_leader_kill_signal_result(
+    result: std::io::Result<()>,
+    killed: &mut u32,
+    left_alone: &mut u32,
+) {
+    match result {
+        Ok(()) => *killed += 1,
+        Err(_) => *left_alone += 1,
+    }
+}
+
 /// Formats the final summary message and returns the success verdict.
 fn format_kill_leaders_summary(killed: u32, cleaned: u32, left_alone: u32) -> (String, bool) {
     let success = left_alone == 0;
@@ -455,16 +471,25 @@ fn format_leader_held_guidance(lock_path: &str, pid_from_lock: Option<u32>) -> S
     let mut out = format!(
         "  A live process still holds {lock_path} but is not answering its control socket; left alone (lock file NOT removed)."
     );
-    if let Some(pid) = pid_from_lock {
-        out.push_str(&format!(
-            "\n    The lock file records PID {pid}. Note that this PID may be recycled. \
-             If you are sure it is the wedged leader, signal it directly: kill {pid}"
-        ));
-    } else {
-        out.push_str(&format!(
-            "\n    No PID is recorded in the lock file. Find the process holding the lock \
-             (e.g., using `lsof {lock_path}`) and terminate it manually."
-        ));
+    match pid_from_lock {
+        Some(pid) if pid != 0 && pid <= i32::MAX as u32 => {
+            out.push_str(&format!(
+                "\n    The lock file records PID {pid}. Note that this PID may be recycled. \
+                 If you are sure it is the wedged leader, signal it directly: kill {pid}"
+            ));
+        }
+        Some(pid) => {
+            out.push_str(&format!(
+                "\n    The lock file records PID {pid}, which is not a plausible process id. \
+                 Find the process holding the lock (e.g., using `lsof {lock_path}`) and terminate it manually."
+            ));
+        }
+        None => {
+            out.push_str(&format!(
+                "\n    No PID is recorded in the lock file. Find the process holding the lock \
+                 (e.g., using `lsof {lock_path}`) and terminate it manually."
+            ));
+        }
     }
     out
 }
@@ -484,11 +509,11 @@ async fn kill_leaders() -> Result<()> {
             LeaderKillAction::Skip => continue,
             LeaderKillAction::Signal(pid) => {
                 eprintln!("  Killing leader PID {pid}");
-                if let Err(e) = xai_grok_shell::util::kill_process_by_pid(pid) {
-                    eprintln!("  warning: failed to terminate PID {pid}: {e}");
-                    continue;
+                let result = xai_grok_shell::util::kill_process_by_pid(pid);
+                if let Err(ref e) = result {
+                    eprintln!("  warning: failed to terminate PID {pid}: {e}; leaving alone");
                 }
-                killed += 1;
+                record_leader_kill_signal_result(result, &mut killed, &mut left_alone);
             }
             LeaderKillAction::ImplausiblePid(pid) => {
                 eprintln!("  Leader reported implausible PID {pid}; not signalling.");
@@ -3266,6 +3291,56 @@ mod tests {
         let g_unknown = format_leader_held_guidance("leader.lock", None);
         assert!(g_unknown.contains("No PID is recorded"));
         assert!(!g_unknown.contains("kill "));
+
+        // Implausible lock PID: do not suggest `kill <pid>` (same bound as
+        // leader_kill_action — nix/Win32 cannot take u32::MAX as a process id).
+        let g_implausible = format_leader_held_guidance("leader.lock", Some(u32::MAX));
+        assert!(g_implausible.contains(&format!("records PID {}", u32::MAX)));
+        assert!(
+            !g_implausible.contains(&format!("kill {}", u32::MAX)),
+            "must not suggest signalling an implausible PID"
+        );
+        assert!(g_implausible.contains("not a plausible process id"));
+    }
+
+    /// Failed `kill(2)` on a socket-verified live leader must count as
+    /// `left_alone`, not as the empty success summary. Otherwise operators see
+    /// a warning then "No live leader processes found." and exit 0 while the
+    /// leader is still running — the F1 class of defect on the Signal Err arm
+    /// that F1 itself did not cover (issue #167 AC).
+    ///
+    /// Reaches the real `kill_process_by_pid` Err path: PID 1 is alive and
+    /// unkillable for a non-root process (EPERM). ESRCH is mapped to Ok in
+    /// shell-base, so a dead PID cannot exercise this arm.
+    #[cfg(unix)]
+    #[test]
+    fn leaders_kill_failed_kill_counts_as_left_alone_not_empty_success() {
+        let result = xai_grok_shell::util::kill_process_by_pid(1);
+        assert!(
+            result.is_err(),
+            "expected kill of pid 1 to fail for a non-root test process \
+             (got Ok — are we running as root?)"
+        );
+
+        let mut killed = 0u32;
+        let mut left_alone = 0u32;
+        record_leader_kill_signal_result(result, &mut killed, &mut left_alone);
+
+        assert_eq!(killed, 0, "a failed signal must not increment killed");
+        assert_eq!(
+            left_alone, 1,
+            "a failed signal must count as left_alone so summary/exit match reality"
+        );
+        let (summary, success) = format_kill_leaders_summary(killed, 0, left_alone);
+        assert!(
+            !success,
+            "failed kill must make the kill_leaders summary a failure"
+        );
+        assert_eq!(summary, "No leader processes killed. Left 1 lock(s) alone.");
+        assert_ne!(
+            summary, "No live leader processes found.",
+            "empty-success wording must not appear when a live leader could not be killed"
+        );
     }
 
     #[tokio::test]

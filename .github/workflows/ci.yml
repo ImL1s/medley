@@ -392,10 +392,11 @@ jobs:
           cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
             toctou -- --nocapture
 
-      # #167: `kill_leaders` had zero coverage, which is why the summary could
-      # contradict itself. These three cover the pure seams it was split into.
-      # Quoted name: an unquoted `#167` truncates the YAML value at the comment
-      # marker.
+      # #167: pure seams split out of `kill_leaders` so summary/exit and PID
+      # guards are unit-testable. The earlier "Leader kill safety" step already
+      # selects `leaders_kill` + `reclaim_*` invariants; this step covers the
+      # three helpers plus the failed-signal counter contract. Quoted name: an
+      # unquoted `#167` truncates the YAML value at the comment marker.
       - name: 'leaders kill summary and PID guard (issue #167)'
         env:
           PROTOC: protoc
@@ -418,7 +419,11 @@ jobs:
             leader_kill_action -- --nocapture
           run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
             format_leader_held_guidance -- --nocapture
+          # Unique filter: proves the failed-kill → left_alone contract runs
+          # (substring shared with `leaders_kill` alone would not).
+          run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
+            leaders_kill_failed_kill_counts -- --nocapture
           # `reclaim_` rather than the NotFound test alone: this branch's two
           # mutation-proven invariant tests (`reclaim_removes_a_lock_no_process_holds`,
-          # `reclaim_refuses_a_lock_a_live_process_holds`) matched no filter either.
+          # `reclaim_refuses_a_lock_a_live_process_holds`) are also selected here.
           run_nonzero -p xai-grok-shell --lib reclaim_ -- --nocapture
