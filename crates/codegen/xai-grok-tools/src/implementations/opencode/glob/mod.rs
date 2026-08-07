@@ -923,6 +923,71 @@ mod tests {
     }
 
     #[cfg(all(feature = "pi", unix))]
+    fn write_rg_glob_stub(path: &std::path::Path) {
+        write_executable_script(
+            path,
+            r#"#!/bin/sh
+set -eu
+
+pattern=""
+search_path=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --glob)
+      shift
+      next="${1-}"
+      if [ "$next" != "!.git/*" ]; then
+        pattern="$next"
+      fi
+      ;;
+    --glob=*)
+      next="${1#--glob=}"
+      if [ "$next" != "!.git/*" ]; then
+        pattern="$next"
+      fi
+      ;;
+    --hidden|--files)
+      ;;
+    *)
+      search_path="$1"
+      ;;
+  esac
+  shift || true
+done
+
+if [ -z "$pattern" ] || [ -z "$search_path" ]; then
+  echo "missing --glob/search path" >&2
+  exit 64
+fi
+
+if [ -f "$search_path/new.txt" ] && [ -f "$search_path/old.txt" ] && [ -f "$search_path/.hidden.txt" ]; then
+  printf './new.txt\n./old.txt\n./.hidden.txt\n'
+  exit 0
+fi
+
+if [ -f "$search_path/fallback.txt" ]; then
+  printf './fallback.txt\n'
+  exit 0
+fi
+
+exit 0
+"#,
+        );
+    }
+
+    #[cfg(all(feature = "pi", unix))]
+    fn prepend_path(path: &std::path::Path) -> OsString {
+        let mut combined = OsString::from(path.as_os_str());
+        if let Some(existing) = std::env::var_os("PATH")
+            && !existing.is_empty()
+        {
+            combined.push(":");
+            combined.push(existing);
+        }
+        combined
+    }
+
+    #[cfg(all(feature = "pi", unix))]
     #[tokio::test]
     async fn pi_glob_fd_contract_preserves_public_glob_semantics() {
         let _env_lock = fd_test_env_lock().lock().unwrap();
@@ -946,6 +1011,11 @@ mod tests {
         std::fs::write(tmp.path().join("old.txt"), "old\n").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(40));
         std::fs::write(tmp.path().join("new.txt"), "new\n").unwrap();
+
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        let rg_stub = bin_dir.join("rg");
+        write_rg_glob_stub(&rg_stub);
 
         let fd_script = tmp.path().join("fd-glob-proxy.sh");
         let log = tmp.path().join("fd-glob-invocation.log");
@@ -983,6 +1053,8 @@ rg --files --glob='!.git/*' --hidden --glob "$pattern" "$search_path"
 "#,
         );
 
+        let path_value = prepend_path(&bin_dir);
+        let _path = ScopedEnvVar::set("PATH", path_value.as_os_str());
         let _fd_path = ScopedEnvVar::set("GROK_TOOLS_FD_PATH", fd_script.as_os_str());
         let _fd_log = ScopedEnvVar::set("FD_TEST_INVOCATION_LOG", log.as_os_str());
 
@@ -1045,11 +1117,19 @@ rg --files --glob='!.git/*' --hidden --glob "$pattern" "$search_path"
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("fallback.txt"), "ok\n").unwrap();
 
-        let fd_script = tmp.path().join("fd-fail.sh");
-        let log = tmp.path().join("fd-fail.log");
-        write_executable_script(
-            &fd_script,
-            r#"#!/bin/sh
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        let rg_stub = bin_dir.join("rg");
+        write_rg_glob_stub(&rg_stub);
+        let path_value = prepend_path(&bin_dir);
+        let _path = ScopedEnvVar::set("PATH", path_value.as_os_str());
+
+        {
+            let fd_script = tmp.path().join("fd-fail.sh");
+            let log = tmp.path().join("fd-fail.log");
+            write_executable_script(
+                &fd_script,
+                r#"#!/bin/sh
 set -eu
 if [ -n "${FD_TEST_INVOCATION_LOG-}" ]; then
   printf 'failed=1\n' > "$FD_TEST_INVOCATION_LOG"
@@ -1057,10 +1137,50 @@ fi
 echo "intentional fd failure" >&2
 exit 70
 "#,
-        );
+            );
 
-        let _fd_path = ScopedEnvVar::set("GROK_TOOLS_FD_PATH", fd_script.as_os_str());
-        let _fd_log = ScopedEnvVar::set("FD_TEST_INVOCATION_LOG", log.as_os_str());
+            let _fd_path = ScopedEnvVar::set("GROK_TOOLS_FD_PATH", fd_script.as_os_str());
+            let _fd_log = ScopedEnvVar::set("FD_TEST_INVOCATION_LOG", log.as_os_str());
+
+            let tool = GlobTool;
+            let resources = test_resources(tmp.path());
+            let output = xai_tool_runtime::Tool::run(
+                &tool,
+                test_ctx(resources.into_shared()),
+                GlobInput {
+                    pattern: "*.txt".to_string(),
+                    path: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                output.tool_output_for_prompt.contains("fallback.txt"),
+                "rg fallback should still return matches: {}",
+                output.tool_output_for_prompt
+            );
+            assert!(
+                !output.tool_output_for_prompt.contains("Error running glob"),
+                "fd failure should not leak as a hard glob error: {}",
+                output.tool_output_for_prompt
+            );
+            let invocation =
+                std::fs::read_to_string(&log).expect("fd failure path should be attempted");
+            assert!(
+                invocation.contains("failed=1"),
+                "fd fallback test should prove the fd backend was attempted: {invocation}"
+            );
+        }
+
+        let fd_missing = tmp.path().join("fd-missing-interpreter.sh");
+        write_executable_script(
+            &fd_missing,
+            r#"#!/definitely-missing-fd-interpreter
+echo "unreachable"
+"#,
+        );
+        let _fd_missing = ScopedEnvVar::set("GROK_TOOLS_FD_PATH", fd_missing.as_os_str());
 
         let tool = GlobTool;
         let resources = test_resources(tmp.path());
@@ -1074,22 +1194,15 @@ exit 70
         )
         .await
         .unwrap();
-
         assert!(
             output.tool_output_for_prompt.contains("fallback.txt"),
-            "rg fallback should still return matches: {}",
+            "missing fd start should still fall back to rg: {}",
             output.tool_output_for_prompt
         );
         assert!(
             !output.tool_output_for_prompt.contains("Error running glob"),
-            "fd failure should not leak as a hard glob error: {}",
+            "missing fd start should not leak as a hard glob error: {}",
             output.tool_output_for_prompt
-        );
-        let invocation =
-            std::fs::read_to_string(&log).expect("fd failure path should be attempted");
-        assert!(
-            invocation.contains("failed=1"),
-            "fd fallback test should prove the fd backend was attempted: {invocation}"
         );
     }
 }
