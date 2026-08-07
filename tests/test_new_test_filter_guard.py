@@ -34,6 +34,21 @@ class ParseWorkflow(unittest.TestCase):
         )
         self.assertEqual(parse_workflow(wf), {"xai-grok-sampler": {"lib": {"hostile_injector"}}})
 
+    def test_parses_env_prefixed_run_nonzero_invocations(self):
+        wf = (
+            '          GROK_TOOLS_BUNDLE_FD_PATH="$PWD/crates/codegen/xai-grok-tools/tests/fd-override-fixture.sh" \\\n'
+            "            run_nonzero -p xai-grok-tools --features pi --lib \\\n"
+            "              bundled_fd_override_artifact_extracts_exact_and_executes -- --nocapture\n"
+        )
+        self.assertEqual(
+            parse_workflow(wf),
+            {
+                "xai-grok-tools": {
+                    "lib": {"bundled_fd_override_artifact_extracts_exact_and_executes"}
+                }
+            },
+        )
+
     def test_libtest_args_after_the_separator_are_not_filters(self):
         wf = "          run_nonzero -p xai-grok-shell --lib foo -- --skip bar --nocapture\n"
         self.assertEqual(parse_workflow(wf), {"xai-grok-shell": {"lib": {"foo"}}})

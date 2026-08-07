@@ -4,7 +4,7 @@
 //! Returns matching file paths sorted by modification time (most recent first),
 //! capped at 100 results.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use tokio::io::AsyncReadExt;
@@ -18,6 +18,8 @@ use crate::types::resources::{
 };
 use crate::types::tool::{ToolKind, ToolNamespace};
 use crate::types::tool_io::ToolInput;
+#[cfg(feature = "pi")]
+use crate::util::fd_path;
 
 // ─── Constants ──────────────────────────────────────────────────────
 
@@ -25,6 +27,13 @@ const RESULT_LIMIT: usize = 100;
 
 /// Hard cap on bytes read from ripgrep's stdout (5 MB).
 const MAX_STDOUT_BYTES: usize = 5_000_000;
+
+struct BackendRun {
+    stdout_buf: Vec<u8>,
+    truncated_by_bytes: bool,
+    #[cfg(feature = "pi")]
+    status_success: bool,
+}
 
 // ─── Description ────────────────────────────────────────────────────
 
@@ -34,6 +43,7 @@ const DESCRIPTION: &str = r#"Fast file pattern matching tool that works with any
 - Optionally set ${{ params.list.path }} to pick the directory to search in (defaults to the current working directory)
 - Returns matching file paths sorted by modification time (most recent first), capped at 100 results
 - Hidden (dot) files are included; .gitignore patterns are respected for paths the pattern does not explicitly match
+- PI builds (`--features pi`) use `fd` first and automatically fall back to ripgrep on backend errors
 - Use this tool when you need to find files by name patterns
 - You can call multiple tools in a single response. It is always better to speculatively perform multiple searches as a batch that are potentially useful."#;
 
@@ -120,6 +130,115 @@ impl crate::types::tool_metadata::ToolMetadata for GlobTool {
     }
 }
 
+fn build_rg_command(search_dir: &Path, pattern: &str) -> Command {
+    let rg_exec = rg_path();
+    let mut cmd = Command::new(rg_exec);
+    cmd.arg("--files")
+        .arg("--glob=!.git/*")
+        .arg("--hidden")
+        .arg("--glob")
+        .arg(pattern)
+        .arg(search_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::util::detach_command(&mut cmd);
+    cmd.stdin(Stdio::null());
+    cmd
+}
+
+#[cfg(feature = "pi")]
+fn build_fd_command(fd_exec: &Path, search_dir: &Path, pattern: &str) -> Command {
+    let mut cmd = Command::new(fd_exec);
+    cmd.arg("--type")
+        .arg("f")
+        .arg("--hidden")
+        .arg("--exclude")
+        .arg(".git")
+        .arg("--strip-cwd-prefix")
+        .arg("--glob")
+        .arg(pattern)
+        .arg("--search-path")
+        .arg(search_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::util::detach_command(&mut cmd);
+    cmd.stdin(Stdio::null());
+    cmd
+}
+
+async fn run_files_command(mut cmd: Command) -> Result<BackendRun, std::io::Error> {
+    #[allow(clippy::disallowed_methods)] // search helper, waited on below
+    let mut child = cmd.spawn()?;
+
+    let mut stdout_buf = Vec::with_capacity(MAX_STDOUT_BYTES.min(65_536));
+    let mut truncated_by_bytes = false;
+    if let Some(mut stdout_pipe) = child.stdout.take() {
+        let mut tmp = [0u8; 8192];
+        loop {
+            match stdout_pipe.read(&mut tmp).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if stdout_buf.len() + n <= MAX_STDOUT_BYTES {
+                        stdout_buf.extend_from_slice(&tmp[..n]);
+                    } else {
+                        let remaining = MAX_STDOUT_BYTES.saturating_sub(stdout_buf.len());
+                        if remaining > 0 {
+                            stdout_buf.extend_from_slice(&tmp[..remaining]);
+                        }
+                        truncated_by_bytes = true;
+                        let _ = child.start_kill();
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    // Consume stderr to avoid deadlocks.
+    if let Some(stderr_pipe) = child.stderr.take() {
+        let _ = stderr_pipe
+            .take(1_000_000)
+            .read_to_end(&mut Vec::new())
+            .await;
+    }
+
+    #[cfg(feature = "pi")]
+    let status_success = child.wait().await?.success();
+    #[cfg(not(feature = "pi"))]
+    let _ = child.wait().await?;
+    Ok(BackendRun {
+        stdout_buf,
+        truncated_by_bytes,
+        #[cfg(feature = "pi")]
+        status_success,
+    })
+}
+
+async fn run_glob_backend(search_dir: &Path, pattern: &str) -> Result<BackendRun, std::io::Error> {
+    #[cfg(feature = "pi")]
+    {
+        let fd_exec = fd_path();
+        match run_files_command(build_fd_command(&fd_exec, search_dir, pattern)).await {
+            Ok(out) if out.status_success || out.truncated_by_bytes => return Ok(out),
+            Ok(_) => {
+                tracing::debug!(
+                    fd_path = %fd_exec.display(),
+                    "fd glob backend exited non-zero; falling back to ripgrep"
+                );
+            }
+            Err(err) => {
+                tracing::debug!(
+                    fd_path = %fd_exec.display(),
+                    error = %err,
+                    "fd glob backend failed to start; falling back to ripgrep"
+                );
+            }
+        }
+    }
+    run_files_command(build_rg_command(search_dir, pattern)).await
+}
+
 impl xai_tool_runtime::Tool for GlobTool {
     type Args = GlobInput;
     type Output = GlobOutput;
@@ -169,24 +288,9 @@ impl xai_tool_runtime::Tool for GlobTool {
             &input.path.clone().unwrap_or_default(),
         );
 
-        // ── Build ripgrep command ───────────────────────────────
-        //   rg --files --glob='!.git/*' --hidden --glob=<pattern> <search_dir>
-        let rg_exec = rg_path();
-        let mut cmd = Command::new(rg_exec);
-        cmd.arg("--files")
-            .arg("--glob=!.git/*")
-            .arg("--hidden")
-            .arg("--glob")
-            .arg(&input.pattern)
-            .arg(&search_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        crate::util::detach_command(&mut cmd);
-        cmd.stdin(Stdio::null());
-
-        #[allow(clippy::disallowed_methods)] // search helper, waited on below
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
+        // ── Run backend (PI fd with rg fallback, or rg-only) ────
+        let backend = match run_glob_backend(&search_dir, &input.pattern).await {
+            Ok(out) => out,
             Err(e) => {
                 return Ok(GlobOutput {
                     tool_output_for_prompt: format!("Error running glob: {e}"),
@@ -201,45 +305,9 @@ impl xai_tool_runtime::Tool for GlobTool {
             }
         };
 
-        // ── Read stdout with byte cap ───────────────────────────
-        let mut stdout_buf = Vec::with_capacity(MAX_STDOUT_BYTES.min(65_536));
-        let mut truncated_by_bytes = false;
-        if let Some(mut stdout_pipe) = child.stdout.take() {
-            let mut tmp = [0u8; 8192];
-            loop {
-                match stdout_pipe.read(&mut tmp).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if stdout_buf.len() + n <= MAX_STDOUT_BYTES {
-                            stdout_buf.extend_from_slice(&tmp[..n]);
-                        } else {
-                            let remaining = MAX_STDOUT_BYTES.saturating_sub(stdout_buf.len());
-                            if remaining > 0 {
-                                stdout_buf.extend_from_slice(&tmp[..remaining]);
-                            }
-                            truncated_by_bytes = true;
-                            let _ = child.start_kill();
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-
-        // Consume stderr to avoid deadlocks.
-        if let Some(stderr_pipe) = child.stderr.take() {
-            let _ = stderr_pipe
-                .take(1_000_000)
-                .read_to_end(&mut Vec::new())
-                .await;
-        }
-
-        let _ = child.wait().await;
-
         // ── Parse file paths from stdout ────────────────────────
-        let stdout = String::from_utf8_lossy(&stdout_buf);
-        let mut truncated = truncated_by_bytes;
+        let stdout = String::from_utf8_lossy(&backend.stdout_buf);
+        let mut truncated = backend.truncated_by_bytes;
 
         struct FileEntry {
             path: PathBuf,
@@ -264,7 +332,13 @@ impl xai_tool_runtime::Tool for GlobTool {
                 continue;
             }
 
-            let full_path = search_dir.join(line);
+            let relative = line.strip_prefix("./").unwrap_or(line);
+            let path = PathBuf::from(relative);
+            let full_path = if path.is_absolute() {
+                path
+            } else {
+                search_dir.join(path)
+            };
             let mtime_ms = std::fs::metadata(&full_path)
                 .ok()
                 .and_then(|m| m.modified().ok())
@@ -331,6 +405,12 @@ mod tests {
     use crate::types::tool_metadata::test_ctx;
 
     use crate::types::resources::Resources;
+    #[cfg(all(feature = "pi", unix))]
+    use std::ffi::OsString;
+    #[cfg(all(feature = "pi", unix))]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(all(feature = "pi", unix))]
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
 
     fn test_resources(cwd: &std::path::Path) -> Resources {
@@ -792,6 +872,336 @@ mod tests {
         assert!(
             output.tool_output_for_prompt.contains("workspace_path="),
             "output should contain workspace_path attribute, got: {}",
+            output.tool_output_for_prompt
+        );
+    }
+
+    #[cfg(all(feature = "pi", unix))]
+    fn fd_test_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(all(feature = "pi", unix))]
+    struct ScopedEnvVar {
+        key: &'static str,
+        old: Option<OsString>,
+    }
+
+    #[cfg(all(feature = "pi", unix))]
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+            let old = std::env::var_os(key);
+            // SAFETY: tests mutate process env only while holding `fd_test_env_lock`.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, old }
+        }
+    }
+
+    #[cfg(all(feature = "pi", unix))]
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(value) => {
+                    // SAFETY: tests mutate process env only while holding `fd_test_env_lock`.
+                    unsafe { std::env::set_var(self.key, value) };
+                }
+                None => {
+                    // SAFETY: tests mutate process env only while holding `fd_test_env_lock`.
+                    unsafe { std::env::remove_var(self.key) };
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "pi", unix))]
+    fn write_executable_script(path: &std::path::Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    #[cfg(all(feature = "pi", unix))]
+    fn write_rg_glob_stub(path: &std::path::Path) {
+        write_executable_script(
+            path,
+            r#"#!/bin/sh
+set -eu
+
+pattern=""
+search_path=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --glob)
+      shift
+      next="${1-}"
+      if [ "$next" != "!.git/*" ]; then
+        pattern="$next"
+      fi
+      ;;
+    --glob=*)
+      next="${1#--glob=}"
+      if [ "$next" != "!.git/*" ]; then
+        pattern="$next"
+      fi
+      ;;
+    --hidden|--files)
+      ;;
+    *)
+      search_path="$1"
+      ;;
+  esac
+  shift || true
+done
+
+if [ -z "$pattern" ] || [ -z "$search_path" ]; then
+  echo "missing --glob/search path" >&2
+  exit 64
+fi
+
+if [ -f "$search_path/new.txt" ] && [ -f "$search_path/old.txt" ] && [ -f "$search_path/.hidden.txt" ]; then
+  printf './new.txt\n./old.txt\n./.hidden.txt\n'
+  exit 0
+fi
+
+if [ -f "$search_path/fallback.txt" ]; then
+  printf './fallback.txt\n'
+  exit 0
+fi
+
+exit 0
+"#,
+        );
+    }
+
+    #[cfg(all(feature = "pi", unix))]
+    fn prepend_path(path: &std::path::Path) -> OsString {
+        let mut combined = OsString::from(path.as_os_str());
+        if let Some(existing) = std::env::var_os("PATH")
+            && !existing.is_empty()
+        {
+            combined.push(":");
+            combined.push(existing);
+        }
+        combined
+    }
+
+    #[cfg(all(feature = "pi", unix))]
+    #[tokio::test]
+    async fn pi_glob_fd_contract_preserves_public_glob_semantics() {
+        let _env_lock = fd_test_env_lock().lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+
+        xai_test_utils::git::ensure_hermetic_git_on_path();
+        let status = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(tmp.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("git must be available");
+        assert!(status.success(), "git init failed");
+
+        std::fs::write(tmp.path().join(".gitignore"), "ignored_dir/\n").unwrap();
+        let ignored = tmp.path().join("ignored_dir");
+        std::fs::create_dir(&ignored).unwrap();
+        std::fs::write(ignored.join("secret.txt"), "ignored\n").unwrap();
+        std::fs::write(tmp.path().join(".hidden.txt"), "hidden\n").unwrap();
+        std::fs::write(tmp.path().join("old.txt"), "old\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        std::fs::write(tmp.path().join("new.txt"), "new\n").unwrap();
+
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        let rg_stub = bin_dir.join("rg");
+        write_rg_glob_stub(&rg_stub);
+
+        let fd_script = tmp.path().join("fd-glob-proxy.sh");
+        let log = tmp.path().join("fd-glob-invocation.log");
+        write_executable_script(
+            &fd_script,
+            r#"#!/bin/sh
+set -eu
+
+pattern=""
+search_path=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --glob)
+      shift
+      pattern="${1-}"
+      ;;
+    --search-path)
+      shift
+      search_path="${1-}"
+      ;;
+  esac
+  shift || true
+done
+
+if [ -n "${FD_TEST_INVOCATION_LOG-}" ]; then
+  printf 'pattern=%s\nsearch_path=%s\n' "$pattern" "$search_path" > "$FD_TEST_INVOCATION_LOG"
+fi
+
+if [ -z "$pattern" ] || [ -z "$search_path" ]; then
+  echo "missing --glob/--search-path" >&2
+  exit 64
+fi
+
+rg --files --glob='!.git/*' --hidden --glob "$pattern" "$search_path"
+"#,
+        );
+
+        let path_value = prepend_path(&bin_dir);
+        let _path = ScopedEnvVar::set("PATH", path_value.as_os_str());
+        let _fd_path = ScopedEnvVar::set("GROK_TOOLS_FD_PATH", fd_script.as_os_str());
+        let _fd_log = ScopedEnvVar::set("FD_TEST_INVOCATION_LOG", log.as_os_str());
+
+        let tool = GlobTool;
+        let resources = test_resources(tmp.path());
+        let output = xai_tool_runtime::Tool::run(
+            &tool,
+            test_ctx(resources.into_shared()),
+            GlobInput {
+                pattern: "**/*.txt".to_string(),
+                path: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            output.tool_output_for_prompt.contains("new.txt"),
+            "new file should be present: {}",
+            output.tool_output_for_prompt
+        );
+        assert!(
+            output.tool_output_for_prompt.contains("old.txt"),
+            "old file should be present: {}",
+            output.tool_output_for_prompt
+        );
+        assert!(
+            output.tool_output_for_prompt.contains(".hidden.txt"),
+            "hidden file should be present: {}",
+            output.tool_output_for_prompt
+        );
+        assert!(
+            !output.tool_output_for_prompt.contains("secret.txt"),
+            "gitignored file should stay excluded: {}",
+            output.tool_output_for_prompt
+        );
+
+        let new_pos = output.tool_output_for_prompt.find("new.txt").unwrap();
+        let old_pos = output.tool_output_for_prompt.find("old.txt").unwrap();
+        assert!(
+            new_pos < old_pos,
+            "mtime ordering should keep new before old (new@{new_pos}, old@{old_pos})"
+        );
+
+        let invocation = std::fs::read_to_string(&log).expect("fd proxy should log invocation");
+        assert!(
+            invocation.contains("pattern=**/*.txt"),
+            "fd glob backend should receive the requested pattern: {invocation}"
+        );
+        assert!(
+            invocation.contains("search_path="),
+            "fd glob backend should receive a search path: {invocation}"
+        );
+    }
+
+    #[cfg(all(feature = "pi", unix))]
+    #[tokio::test]
+    async fn pi_glob_fd_error_falls_back_to_ripgrep() {
+        let _env_lock = fd_test_env_lock().lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("fallback.txt"), "ok\n").unwrap();
+
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        let rg_stub = bin_dir.join("rg");
+        write_rg_glob_stub(&rg_stub);
+        let path_value = prepend_path(&bin_dir);
+        let _path = ScopedEnvVar::set("PATH", path_value.as_os_str());
+
+        {
+            let fd_script = tmp.path().join("fd-fail.sh");
+            let log = tmp.path().join("fd-fail.log");
+            write_executable_script(
+                &fd_script,
+                r#"#!/bin/sh
+set -eu
+if [ -n "${FD_TEST_INVOCATION_LOG-}" ]; then
+  printf 'failed=1\n' > "$FD_TEST_INVOCATION_LOG"
+fi
+echo "intentional fd failure" >&2
+exit 70
+"#,
+            );
+
+            let _fd_path = ScopedEnvVar::set("GROK_TOOLS_FD_PATH", fd_script.as_os_str());
+            let _fd_log = ScopedEnvVar::set("FD_TEST_INVOCATION_LOG", log.as_os_str());
+
+            let tool = GlobTool;
+            let resources = test_resources(tmp.path());
+            let output = xai_tool_runtime::Tool::run(
+                &tool,
+                test_ctx(resources.into_shared()),
+                GlobInput {
+                    pattern: "*.txt".to_string(),
+                    path: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                output.tool_output_for_prompt.contains("fallback.txt"),
+                "rg fallback should still return matches: {}",
+                output.tool_output_for_prompt
+            );
+            assert!(
+                !output.tool_output_for_prompt.contains("Error running glob"),
+                "fd failure should not leak as a hard glob error: {}",
+                output.tool_output_for_prompt
+            );
+            let invocation =
+                std::fs::read_to_string(&log).expect("fd failure path should be attempted");
+            assert!(
+                invocation.contains("failed=1"),
+                "fd fallback test should prove the fd backend was attempted: {invocation}"
+            );
+        }
+
+        let fd_missing = tmp.path().join("fd-missing-interpreter.sh");
+        write_executable_script(
+            &fd_missing,
+            r#"#!/definitely-missing-fd-interpreter
+echo "unreachable"
+"#,
+        );
+        let _fd_missing = ScopedEnvVar::set("GROK_TOOLS_FD_PATH", fd_missing.as_os_str());
+
+        let tool = GlobTool;
+        let resources = test_resources(tmp.path());
+        let output = xai_tool_runtime::Tool::run(
+            &tool,
+            test_ctx(resources.into_shared()),
+            GlobInput {
+                pattern: "*.txt".to_string(),
+                path: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            output.tool_output_for_prompt.contains("fallback.txt"),
+            "missing fd start should still fall back to rg: {}",
+            output.tool_output_for_prompt
+        );
+        assert!(
+            !output.tool_output_for_prompt.contains("Error running glob"),
+            "missing fd start should not leak as a hard glob error: {}",
             output.tool_output_for_prompt
         );
     }

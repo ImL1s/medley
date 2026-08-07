@@ -47,6 +47,13 @@ use xai_grok_workspace::file_system::AsyncFileSystem;
 use xai_hunk_tracker::HunkTrackerHandle;
 mod handle_request;
 pub(crate) use handle_request::run_shell_child;
+/// Command channels for live child sessions that participate in managed-gateway
+/// admission and refresh barriers.
+type ManagedGatewayChildSessionCommandMap =
+    std::collections::HashMap<acp::SessionId, mpsc::UnboundedSender<SessionCommand>>;
+/// Shared registry of live managed-gateway child sessions.
+type ManagedGatewayChildSessionRegistry =
+    std::rc::Rc<std::cell::RefCell<ManagedGatewayChildSessionCommandMap>>;
 /// How the child session's initial context was bootstrapped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InitialContextSource {
@@ -294,6 +301,9 @@ pub(crate) struct SubagentSpawnContext {
     pub parent_mcp_configs: Vec<agent_client_protocol::McpServer>,
     /// Parent's managed MCP state handle (Arc-shared, no re-fetch).
     pub managed_mcp_state: crate::session::managed_mcp::ManagedMcpStateHandle,
+    /// Live child-session command channels participating in managed-gateway
+    /// admission/refresh barriers.
+    pub managed_gateway_child_sessions: Option<ManagedGatewayChildSessionRegistry>,
     /// Snapshot of the parent session's MCP client pool at spawn time.
     pub parent_mcp_pool: Option<crate::session::mcp_servers::SharedMcpPool>,
     /// Exact parent tool schema for verbatim non-workflow forks.
@@ -2143,6 +2153,25 @@ fn fail_subagent(
     };
     persist_subagent_completion(subagent_meta_dir, &result, gcs_ctx);
     result
+}
+/// Remove a just-created worktree when spawn is rejected before promotion.
+#[cfg(test)]
+async fn cleanup_rejected_spawn_worktree(
+    subagent_id: &str,
+    worktree_path: Option<&Path>,
+    worktree_freshly_created: bool,
+) {
+    if worktree_freshly_created
+        && let Some(wt_path) = worktree_path
+        && let Err(e) = crate::session::worktree::remove_subagent_worktree(wt_path).await
+    {
+        tracing::warn!(
+            subagent_id,
+            worktree_path = %wt_path.display(),
+            error = %e,
+            "failed to remove freshly created subagent worktree after spawn rejection"
+        );
+    }
 }
 /// Tear down a child whose pending-to-active promotion lost to cancellation.
 async fn cancel_pending_shell_child(

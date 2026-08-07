@@ -1577,6 +1577,10 @@ mod tests {
         }
         async fn respawn_stdio(&self, server: &str) -> Result<(), String> {
             self.respawn_calls.borrow_mut().push(server.to_string());
+            self.shutdown
+                .lock()
+                .expect("ShutdownState mutex poisoned")
+                .note_ready(server);
             Ok(())
         }
         fn push_status(&self, _payload: &crate::session::mcp_dispatcher::McpServerStatusPayload) {}

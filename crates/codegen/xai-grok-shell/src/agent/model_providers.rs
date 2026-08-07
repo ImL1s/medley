@@ -1542,10 +1542,8 @@ mod tests {
         .unwrap();
 
         let cfg = Config::new_from_toml_cfg(&toml_cfg).expect("config should parse");
-        let resolved = resolve_model_list(&cfg, None);
-        let model = resolved
-            .get(OPENAI_CODEX_PRESET_MODEL_ID)
-            .expect("the preset key should resolve");
+        let auth_home = tempfile::tempdir().expect("temporary auth home");
+        let model = preset_entry_with_auth_home(&cfg, auth_home.path());
 
         assert_eq!(model.info.name.as_deref(), Some("Codex"));
         assert_eq!(model.info.context_window.get(), 400_000);
@@ -1563,7 +1561,7 @@ mod tests {
             Some(OPENAI_CODEX_PROVIDER_ID)
         );
         assert!(
-            resolve_credentials(model, Some("xai-session-token"))
+            resolve_credentials(&model, Some("xai-session-token"))
                 .api_key
                 .is_none(),
             "the xAI session token must never authenticate a Codex-keyed model"

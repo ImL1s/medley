@@ -12,6 +12,8 @@ dhat-heap = ["dep:dhat"]
 # it via `required-features`.
 test-support = []
 default-bazel = ["test-support"]
+# Public PI toolset wiring (fd-backed glob backend in xai-grok-tools).
+pi = ["xai-grok-tools/pi"]
 
 [dependencies]
 dunce = { workspace = true }

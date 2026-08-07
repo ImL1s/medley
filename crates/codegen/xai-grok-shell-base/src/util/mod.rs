@@ -217,58 +217,6 @@ pub fn kill_process_with_signal(pid: u32, signal: KillSignal) -> std::io::Result
         terminate.map_err(|e| std::io::Error::other(format!("TerminateProcess({pid}): {e}")))
     }
 }
-/// True if `pid` is a grok process; pairs with [`kill_process_by_pid`] to avoid killing a recycled PID.
-/// Best-effort on macOS/BSD (liveness-only via `kill -0`), exact on Linux (/proc cmdline) and Windows (image path).
-pub fn is_grok_process(pid: u32) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        let cmdline_path = format!("/proc/{pid}/cmdline");
-        match std::fs::read(&cmdline_path) {
-            Ok(data) => String::from_utf8_lossy(&data).contains("grok"),
-            Err(_) => false,
-        }
-    }
-    #[cfg(windows)]
-    {
-        use windows::Win32::Foundation::CloseHandle;
-        use windows::Win32::System::Threading::{
-            OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-            QueryFullProcessImageNameW,
-        };
-        use windows::core::PWSTR;
-        let Ok(handle) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) })
-        else {
-            return false;
-        };
-        let mut buf: Vec<u16> = vec![0; 1024];
-        let mut size: u32 = buf.len() as u32;
-        let result = unsafe {
-            QueryFullProcessImageNameW(
-                handle,
-                PROCESS_NAME_WIN32,
-                PWSTR(buf.as_mut_ptr()),
-                &mut size,
-            )
-        };
-        let _ = unsafe { CloseHandle(handle) };
-        if result.is_err() {
-            return false;
-        }
-        String::from_utf16_lossy(&buf[..size as usize])
-            .to_ascii_lowercase()
-            .contains("grok")
-    }
-    #[cfg(all(not(target_os = "linux"), not(windows)))]
-    {
-        let mut cmd = std::process::Command::new("kill");
-        cmd.args(["-0", &pid.to_string()])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        xai_tty_utils::detach_std_command(&mut cmd);
-        cmd.status().is_ok_and(|s| s.success())
-    }
-}
 // `is_grok_process_strict` lived here: a name-matching gate for the leader
 // auto-kill zombie path. Removed with its only caller in issue #158 — the
 // shipped command is `medley`, so "is this named grok" was permanently false
@@ -374,11 +322,6 @@ mod tests {
             !status.success(),
             "sleep was terminated, not exited cleanly"
         );
-    }
-    #[test]
-    fn is_grok_process_self_true_impossible_pid_false() {
-        assert!(is_grok_process(std::process::id()));
-        assert!(!is_grok_process(u32::MAX));
     }
     #[cfg(unix)]
     #[test]

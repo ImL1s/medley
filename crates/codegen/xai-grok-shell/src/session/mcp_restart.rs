@@ -377,7 +377,7 @@ impl RestartBudget {
             // that gets this far: reaching `Ready` is exactly what
             // records the timestamp, on both the startup path
             // (dispatcher `Ready` → `note_recovery_ready`) and the
-            // restart path (`auto_restart_stdio` → `note_ready`).
+            // restart path (`respawn_stdio` success path → `note_ready`).
             //
             // The boundary that keeps the restart path honest is
             // **watcher-arm → `note_ready`**, NOT respawn-return →
@@ -485,8 +485,9 @@ pub(crate) trait RestartActions {
 
     /// Re-run `start_mcp_server` for `server` against its current
     /// `McpState::configs` entry, drive the handshake to completion, arm
-    /// the liveness watcher, and atomically swap the new
-    /// `Arc<McpClient>` into `McpState::owned_clients`.
+    /// the liveness watcher, atomically swap the new `Arc<McpClient>` into
+    /// `McpState::owned_clients`, and record `note_ready` before returning
+    /// `Ok(())`.
     ///
     /// **Stdio-only.** Callers gate on
     /// [`Self::is_stdio_server_configured`]; HTTP / HttpAuth never
@@ -822,9 +823,6 @@ pub(crate) async fn auto_restart_stdio(
                     "auto-restart succeeded",
                 );
                 record_succeeded(&server, attempt);
-                // Start/refresh the stability window so a transport
-                // close within STABILITY_WINDOW counts as an early death.
-                actions.note_ready(&server);
                 push(
                     &*actions,
                     &session_id,
@@ -1192,10 +1190,15 @@ mod tests {
         }
         async fn respawn_stdio(&self, server: &str) -> Result<(), String> {
             self.respawn_calls.borrow_mut().push(server.to_string());
-            self.respawn_outcomes
+            let outcome = self
+                .respawn_outcomes
                 .borrow_mut()
                 .pop_front()
-                .unwrap_or_else(|| Err("not scripted".to_string()))
+                .unwrap_or_else(|| Err("not scripted".to_string()));
+            if outcome.is_ok() {
+                self.note_ready(server);
+            }
+            outcome
         }
         fn push_status(&self, payload: &McpServerStatusPayload) {
             self.pushes.borrow_mut().push(payload.clone());
@@ -2596,7 +2599,7 @@ mod tests {
             .await;
             assert!(
                 !still_parked,
-                "auto_restart_stdio's own note_ready must not clear a park",
+                "respawn-success note_ready must not clear a park",
             );
 
             // The dispatcher observing `Ready` does.

@@ -3759,6 +3759,23 @@ impl McpClient {
         self: &Arc<Self>,
         poll_interval: std::time::Duration,
     ) -> bool {
+        self.arm_liveness_watcher_then(poll_interval, || {}).await
+    }
+
+    /// Arm the watcher and run `on_armed` synchronously once installed.
+    ///
+    /// `on_armed` runs in the same turn that installs the watcher handle:
+    /// callers can perform "watcher armed" bookkeeping (for example
+    /// restart-budget `note_ready`) without exposing a cross-crate gap
+    /// between arming and that bookkeeping.
+    pub async fn arm_liveness_watcher_then<F>(
+        self: &Arc<Self>,
+        poll_interval: std::time::Duration,
+        on_armed: F,
+    ) -> bool
+    where
+        F: FnOnce(),
+    {
         if self.is_acp() {
             return false;
         }
@@ -3768,18 +3785,21 @@ impl McpClient {
         if !matches!(self.state_kind().await, ClientStateKind::Ready) {
             return false;
         }
-        let mut slot = self.liveness_handle.lock();
-        if slot.is_some() {
-            return false;
+        {
+            let mut slot = self.liveness_handle.lock();
+            if slot.is_some() {
+                return false;
+            }
+            let handle = crate::liveness::spawn_transport_liveness(
+                self.server_name.clone(),
+                Arc::clone(self),
+                poll_interval,
+                event_tx,
+                Arc::clone(&self.liveness_handle),
+            );
+            *slot = Some(handle);
         }
-        let handle = crate::liveness::spawn_transport_liveness(
-            self.server_name.clone(),
-            Arc::clone(self),
-            poll_interval,
-            event_tx,
-            Arc::clone(&self.liveness_handle),
-        );
-        *slot = Some(handle);
+        on_armed();
         true
     }
 
@@ -8061,5 +8081,67 @@ mod tests {
             server: "srv".to_string(),
         };
         assert_eq!(ev.server_name(), Some("srv"));
+    }
+
+    /// Source-scanning half of the #173 ordering guard, covering the
+    /// cross-crate fact that `respawn_stdio` in `xai-grok-shell` now
+    /// depends on: `arm_liveness_watcher_then` must not introduce a
+    /// scheduler yield between `spawn_transport_liveness` and the
+    /// `on_armed` callback. The restart path records `note_ready`
+    /// through that callback to avoid a cross-crate interleave window.
+    /// Any yield shape in the tail after spawn reopens the #45
+    /// budget-refund race from this crate side.
+    #[test]
+    fn arm_liveness_watcher_then_has_no_scheduler_yield_after_spawning() {
+        let src = include_str!("servers.rs");
+        let start = src
+            .find("pub async fn arm_liveness_watcher_then")
+            .expect("arm_liveness_watcher_then definition not found");
+        let after_sig = &src[start..];
+        let open = after_sig.find('{').expect("body opening brace");
+        let mut depth = 0usize;
+        let mut end = None;
+        for (offset, ch) in after_sig.char_indices().skip(open) {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &after_sig[open..=end.expect("unbalanced braces in arm_liveness_watcher")];
+        let spawn = body
+            .find("spawn_transport_liveness")
+            .expect("spawn_transport_liveness call not found in arm_liveness_watcher_then");
+        let after_spawn = &body[spawn..];
+        assert!(
+            after_spawn.contains("on_armed();"),
+            "arm_liveness_watcher_then must invoke on_armed() in its \
+             post-spawn tail so restart bookkeeping can happen in the same \
+             call chain."
+        );
+        for forbidden in [
+            ".await",
+            "select!",
+            "join!",
+            "try_join!",
+            "yield_now",
+            "block_in_place",
+            "tokio::spawn(",
+            "spawn_local(",
+        ] {
+            assert!(
+                !after_spawn.contains(forbidden),
+                "arm_liveness_watcher_then contains `{forbidden}` after \
+                 spawn_transport_liveness. Restart ordering depends on this \
+                 tail running straight through to on_armed() and return \
+                 without yielding (#45/#173). Tail: `{after_spawn}`"
+            );
+        }
     }
 }

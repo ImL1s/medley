@@ -3328,9 +3328,13 @@ fn validate_hooks_path_rejects_outside_grok_home() {
     let result = validate_hooks_path("/tmp/evil-hooks");
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
+    let expected_prefix = format!(
+        "must be under {}/",
+        xai_grok_config::display_grok_home_prefix()
+    );
     assert!(
-            msg.contains("must be under ~/.grok/"),
-            "should mention ~/.grok/ restriction, got: {msg}"
+            msg.contains(&expected_prefix),
+            "should mention resolved grok-home restriction ({expected_prefix}), got: {msg}"
         );
 }
 #[test]
@@ -3340,9 +3344,13 @@ fn validate_hooks_path_rejects_traversal_attack() {
     let result = validate_hooks_path(&traversal);
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
+    let expected_prefix = format!(
+        "must be under {}/",
+        xai_grok_config::display_grok_home_prefix()
+    );
     assert!(
-            msg.contains("must be under ~/.grok/"),
-            "traversal should be rejected, got: {msg}"
+            msg.contains(&expected_prefix),
+            "traversal should mention resolved grok-home restriction ({expected_prefix}), got: {msg}"
         );
 }
 #[test]

@@ -78,6 +78,22 @@ jobs:
           HOME="$home" "$home/.medley/bin/medley" --version
           test ! -e "$home/.grok"
 
+  sync-upstream:
+    name: Sync upstream script
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Lint sync-upstream shell scripts
+        run: |
+          shellcheck -s bash scripts/sync-upstream.sh
+          bash -n scripts/sync-upstream.sh
+          shellcheck -s sh tests/sync-upstream/run_cases.sh
+          dash -n tests/sync-upstream/run_cases.sh
+
+      - name: Behaviour, local bare remotes
+        run: sh tests/sync-upstream/run_cases.sh
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
@@ -229,6 +245,12 @@ jobs:
           # property still holds" must not look the same, and only `run_nonzero`
           # tells them apart.
           run_nonzero -p xai-grok-shell --lib catalog_unavailable -- --nocapture
+          # #132: the reader's dup must not be inherited by children. Named
+          # explicitly rather than by a `pty_session` prefix: the rest of that
+          # module is the hang this change fixes, and this one is the fd leak
+          # the fix introduced.
+          run_nonzero -p xai-grok-shell --lib \
+            dup_fd_is_not_inherited_by_exec_child -- --nocapture
           # #13: env-key normalization. In this step rather than the auth one
           # above because one of these asserts diagnostics carry the normalized
           # *name* and never a value -- and that step uses bare `cargo test`,
@@ -241,6 +263,32 @@ jobs:
             final_401_relation_uses_final_wire_credential_and_post_response_snapshot -- --nocapture
           run_nonzero -p xai-file-utils --lib \
             upload_config_debug_redacts_all_secret_carriers -- --nocapture
+
+      - name: Provider docs examples and fixtures
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
+              echo "test filter matched zero tests: $*" >&2
+              rm -f "$output"
+              return 1
+            }
+            rm -f "$output"
+          }
+          # #31: validate executable provider docs. Unique filters so
+          # run_nonzero proves each docs guard still runs after refactors.
+          run_nonzero -p xai-grok-shell --lib \
+            docs_examples_extractor_handles_markers_ignores_unmarked_and_rejects_malformed -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            docs_examples_parse_and_resolve_provider_toml_examples -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            docs_examples_enforce_readiness_and_secret_policy -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            docs_examples_validate_offline_commands_and_links -- --nocapture
 
       - name: Update channel isolation guards
         # The fork's worst failure mode is a medley binary self-updating into
@@ -314,18 +362,36 @@ jobs:
             restricted_capability_matrix_finalizes_and_dispatches_with_one_policy -- --nocapture
           run_nonzero -p xai-grok-tools --lib \
             readonly_gateway_target_rejects_unclassified_and_external_mutation -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            issue39_deploy_app_requires_all_capability_mode -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             restricted_gateway_snapshot_exposes_only_trusted_permitted_tools_per_session -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             restricted_children_reject_agent_owned_mcp_servers_before_session_spawn -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
+            issue39_cleanup_rejected_spawn_worktree_removes_only_fresh_worktrees -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue39_harness_rejection_cleans_fresh_worktree_before_handoff -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue39_pre_handoff_guard_cleans_worktree_on_panic -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue39_verbatim_fork_tools_intersect_session_admission -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue39_rebuild_respects_capability_mode_ceiling -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
             explicit_gateway_cache_invalidation_waits_for_all_session_admissions -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue39_gateway_invalidation_includes_registered_child_sessions -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue39_aborted_explicit_gateway_refresh_recovers_waiters -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             gateway_refresh_fence_prevents_stale_snapshot_reconciliation -- --nocapture
           run_nonzero -p xai-grok-shell-session-support --lib \
             explicit_gateway_refresh_fence_clears_only_on_fresh_commit -- --nocapture
           run_nonzero -p xai-grok-shell-session-support --lib \
             legacy_config_invalidation_preserves_gateway_catalog -- --nocapture
+          run_nonzero -p xai-grok-shell-session-support --lib \
+            issue39_abort_gateway_tool_fetch_recovers_waiters -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             subagent_trusted_tool_capabilities_render_in_human_and_json_views -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
@@ -359,6 +425,16 @@ jobs:
           }
           run_nonzero -p xai-grok-shell --lib \
             issue8_agent_serve_security_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue41_bound_ws_queues_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue41_bound_ws_queues_gateway_queue_rejects_when_full -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue41_bound_ws_queues_oversized_trailing_ping_closes_with_1009 -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue41_bound_ws_queues_oversized_empty_after_trim_closes_with_1009 -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue41_bound_ws_queues_oversized_non_utf8_binary_closes_with_1009 -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             issue8_agent_serve_security_ -- --nocapture
           run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
@@ -398,6 +474,10 @@ jobs:
           }
           run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
             leaders_kill -- --nocapture
+          # Unique selector for #183: proves the race-repro test itself runs
+          # (shared `leaders_kill` prefixes would stay green if it were deleted).
+          run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
+            leaders_kill_issue183_interleaving_preserves_new_leader_socket -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             leader::lock::tests::reclaim -- --nocapture
 
@@ -450,6 +530,10 @@ jobs:
             callback_errors_never_echo_provider_controlled_values -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
             snapshot_never_derives_stable_ids_from_credentials -- --nocapture
+          # #132: CLOEXEC regression guard; full test path keeps the filter
+          # unique so #171 can prove this exact test is selected.
+          cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
+            terminal::pty_session::tests::dup_fd_is_not_inherited_by_exec_child -- --nocapture
 
       - name: "Substituted default model meta (#131)"
         env:
@@ -717,6 +801,9 @@ jobs:
           # bearer_resolver arm of has_usable_credential.
           run_nonzero -p xai-grok-shell --lib survives_into_sampler_config -- --nocapture
           run_nonzero -p xai-grok-shell --lib accepts_a_bearer_resolver_alone -- --nocapture
+          # #57 follow-up: web_search must fall back to [models].default and keep
+          # model-scoped credential provenance when xAI ambient auth is absent.
+          run_nonzero -p xai-grok-shell --lib falls_back_to_models_default_and_keeps_model_scoped_credential -- --nocapture
 
       # #161: the web_search disable notice now rides the session response
       # `_meta` instead of a notification. Two filters because the tests split
@@ -776,10 +863,75 @@ jobs:
           # (substring shared with `leaders_kill` alone would not).
           run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
             leaders_kill_failed_kill_counts -- --nocapture
+          # Unique filter: proves startup kill PID plausibility bounds run.
+          run_nonzero -p xai-grok-shell --lib \
+            startup_kill_socket_pid_plausibility_bounds -- --nocapture
           # `reclaim_` rather than the NotFound test alone: this branch's two
           # mutation-proven invariant tests (`reclaim_removes_a_lock_no_process_holds`,
           # `reclaim_refuses_a_lock_a_live_process_holds`) are also selected here.
           run_nonzero -p xai-grok-shell --lib reclaim_ -- --nocapture
+
+      # #173: the arm/note_ready ordering invariant from #45 is defended by a
+      # comment spanning two crates. These are source-scanning guards: the
+      # shell test asserts respawn_stdio inserts into owned_clients BEFORE
+      # arming the watcher and never awaits between the arm and Ok(()); the
+      # mcp test asserts arm_liveness_watcher itself never awaits after
+      # spawn_transport_liveness. Full test names as filters so each selects
+      # its test uniquely. Quoted name: an unquoted `#173` truncates at the
+      # comment marker.
+      - name: 'MCP respawn arm/insert ordering guards (issue #173)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib \
+            respawn_stdio_then_inserts_before_arming_and_has_no_post_arm_yields -- --nocapture
+          run_nonzero -p xai-grok-mcp --lib \
+            arm_liveness_watcher_then_has_no_scheduler_yield_after_spawning -- --nocapture
+
+      # #36: restore fd bundling only with a public PI caller and contract.
+      # The tests are split by build mode: override-path bundle and release
+      # auto-download bundle. Filters are written explicitly so #171 can prove
+      # each new test runs somewhere.
+      - name: 'PI fd glob contract and bundling (issue #36)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+
+          run_nonzero -p xai-grok-tools --features pi --lib \
+            pi_glob_fd_contract_preserves_public_glob_semantics -- --nocapture
+          run_nonzero -p xai-grok-tools --features pi --lib \
+            pi_glob_fd_error_falls_back_to_ripgrep -- --nocapture
+
+          GROK_TOOLS_BUNDLE_FD_PATH="$PWD/crates/codegen/xai-grok-tools/tests/fd-override-fixture.sh" \
+            run_nonzero -p xai-grok-tools --features pi --lib \
+              bundled_fd_override_artifact_extracts_exact_and_executes -- --nocapture
+
+          run_nonzero --release -p xai-grok-tools --features pi --lib \
+            bundled_fd_release_artifact_extracts_exact_and_executes -- --nocapture
 
       # #88: `xai-proto-build` is run by every build script in this workspace and
       # was in no test job at all -- so the code that decides whether protoc is
