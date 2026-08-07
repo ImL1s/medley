@@ -1093,6 +1093,7 @@ async fn reconstruct_full_config_ready_dual_auth_keeps_model_api_key_not_explici
                         readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
+                    catalog_generation: 0,
                 }));
 
             let cfg = actor.reconstruct_full_config().await;
