@@ -374,6 +374,29 @@ impl SessionHandle {
             .ok()?;
         rx.await.ok().flatten()
     }
+    /// Snapshot all parent capabilities needed for subagent spawn in one RPC.
+    ///
+    /// Returns an error when the parent actor cannot produce a stable snapshot.
+    /// Spawn callers must surface that error and abort, never fall back to
+    /// stale bootstrap snapshots.
+    pub(crate) async fn snapshot_subagent_capabilities(
+        &self,
+    ) -> Result<crate::session::commands::SubagentCapabilitySnapshot, String> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(SessionCommand::SnapshotSubagentCapabilities { respond_to: tx })
+            .is_err()
+        {
+            return Err(
+                "parent session actor unavailable while refreshing subagent capabilities"
+                    .to_string(),
+            );
+        }
+        rx.await.map_err(|_| {
+            "parent session actor dropped subagent capability refresh reply".to_string()
+        })?
+    }
     /// Snapshot the session's client-registered hooks for subagent inheritance. A dead actor
     /// or dropped reply fails open to no hooks, warned since it drops the inherited deny gate.
     pub(crate) async fn snapshot_client_hooks(&self) -> crate::extensions::hooks::ClientHooks {

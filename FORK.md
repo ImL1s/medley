@@ -102,7 +102,7 @@ Examples: `v0.0.0+providers.1`, or `v1.2.3+providers.1` when upstream publishes 
 
 ## CI / CD
 
-GitHub Actions live only on **`providers`** (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)). Style matches our other repos: named `CI`, concurrency cancel-in-progress, separate **Format / Clippy / Tests** jobs.
+GitHub Actions live only on **`providers`** (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)). Style matches our other repos: named `CI`, `pull_request`/`workflow_dispatch` runs cancel superseded attempts, `push` runs are SHA-scoped and uncancelled so every merged commit can satisfy the release gate, and jobs stay split into **Format / Clippy / Tests** lanes.
 
 Triggers:
 

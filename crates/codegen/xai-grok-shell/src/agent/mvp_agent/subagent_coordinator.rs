@@ -6,6 +6,15 @@ use crate::session::repo_changes::UploadMethod;
 struct ShellChildRunner {
     agent_ref: LocalRef<MvpAgent>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RefreshedSubagentCapabilities {
+    pub mcp_generation: u64,
+    pub mcp_server_count: usize,
+    pub inherited_mcp_client_count: usize,
+    pub tool_definition_count: usize,
+    pub skill_count: usize,
+}
 impl xai_grok_tools::implementations::grok_build::task::coordinator::ChildRunner
     for ShellChildRunner
 {
@@ -72,10 +81,43 @@ impl xai_grok_tools::implementations::grok_build::task::coordinator::ChildRunner
             ctx.web_search_sampling_config = this
                 .prepare_web_search_sampling_config_preflight(&mut ignored_disable_reason)
                 .await;
-            ctx.parent_mcp_pool = handle.snapshot_mcp_pool().await;
-            ctx.client_hooks = handle.snapshot_client_hooks().await;
-            let definitions = handle.snapshot_tool_definitions().await;
-            ctx.parent_tool_definitions = (!definitions.is_empty()).then_some(definitions);
+            let refreshed = match this
+                .refresh_subagent_capabilities_for_spawn(&mut ctx, &handle)
+                .await
+            {
+                Ok(refreshed) => refreshed,
+                Err(error) => {
+                    tracing::warn!(
+                        lifecycle_parent_session_id = %lifecycle_parent_sid,
+                        spawn_parent_session_id = %spawn_parent_session_id,
+                        subagent_id = %request.id,
+                        error = %error,
+                        "Failed to refresh parent capabilities at subagent spawn"
+                    );
+                    return xai_grok_tools::implementations::grok_build::task::coordinator::ChildRunOutput {
+                        result: xai_grok_tools::implementations::grok_build::task::types::SubagentResult {
+                            success: false,
+                            error: Some(format!(
+                                "Failed to refresh parent capabilities for subagent spawn: {error}"
+                            )),
+                            subagent_id: request.id.clone(),
+                            child_session_id: request.id,
+                            ..Default::default()
+                        },
+                        completion_data: Default::default(),
+                        snapshot_ref: None,
+                    };
+                }
+            };
+            tracing::info!(
+                subagent_id = %request.id,
+                mcp_generation = refreshed.mcp_generation,
+                mcp_server_count = refreshed.mcp_server_count,
+                inherited_mcp_client_count = refreshed.inherited_mcp_client_count,
+                tool_definition_count = refreshed.tool_definition_count,
+                skill_count = refreshed.skill_count,
+                "Refreshed parent capabilities for subagent spawn"
+            );
             crate::agent::subagent::run_shell_child(
                 request,
                 ctx,
@@ -205,6 +247,33 @@ impl MvpAgent {
                 }
             }
         });
+    }
+    /// Refresh parent capabilities for one child spawn.
+    ///
+    /// This must succeed atomically before spawn continues; callers surface the
+    /// error and abort rather than falling back to stale bootstrap snapshots.
+    pub(super) async fn refresh_subagent_capabilities_for_spawn(
+        &self,
+        ctx: &mut crate::agent::subagent::SubagentSpawnContext,
+        handle: &crate::session::SessionHandle,
+    ) -> Result<RefreshedSubagentCapabilities, String> {
+        let snapshot = handle.snapshot_subagent_capabilities().await?;
+        let refreshed = RefreshedSubagentCapabilities {
+            mcp_generation: snapshot.mcp_generation,
+            mcp_server_count: snapshot.mcp_configs.len(),
+            inherited_mcp_client_count: snapshot.mcp_pool.as_ref().map_or(0, |pool| pool.len()),
+            tool_definition_count: snapshot.tool_definitions.len(),
+            skill_count: snapshot.skills.len(),
+        };
+        ctx.parent_mcp_configs = snapshot.mcp_configs;
+        ctx.parent_mcp_pool = snapshot.mcp_pool;
+        ctx.client_hooks = snapshot.client_hooks;
+        ctx.parent_tool_definitions = (!snapshot.tool_definitions.is_empty())
+            .then_some(snapshot.tool_definitions);
+        // `Some(empty)` means "refresh succeeded and parent currently has none";
+        // keeping `None` would trigger a stale disk/plugin rediscovery fallback.
+        ctx.parent_skills = Some(snapshot.skills);
+        Ok(refreshed)
     }
     /// Lightweight context for the `SubagentEvent::ValidateType` drain arm;
     /// tolerates evicted parent sessions (returns built-in defaults + warns).
