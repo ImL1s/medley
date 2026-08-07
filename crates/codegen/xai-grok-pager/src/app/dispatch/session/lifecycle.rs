@@ -1539,6 +1539,22 @@ pub(in crate::app::dispatch) fn handle_session_created(
                 .as_ref()
                 .is_some_and(|transaction| transaction.owner_agent_id == agent_id)
             {
+                // Vestigial since the release moved into
+                // `begin_or_reject_deferred_model_switch` (#170 N3): this
+                // block only runs when the stash was `None` at computation,
+                // and that `deferred == None` arm above has already released
+                // any transaction this agent owned. Read it as a backstop,
+                // not load-bearing.
+                //
+                // Record from the same review: that move also made the
+                // release roll back `app_models_optimistic` where the old
+                // on-site release did not — in the narrow
+                // `dispatch_agent_type_mismatch_answered` handoff (optimistic
+                // transaction, target model absent from
+                // `app.models.available`) `app.models` now ends rolled back
+                // instead of left as-is. That is what the flag is for; it
+                // arrived as a side effect of the move and should not be
+                // rediscovered later as a surprise.
                 app.model_switch_transaction = None;
             }
             effects.push(Effect::PersistPreferredModel {
