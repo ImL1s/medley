@@ -3000,7 +3000,7 @@ async fn session_load_recompute_updates_web_search_notice_for_ready_unusable_and
     let sid = acp::SessionId::new("ws-warm-201");
     let mut handle = make_test_handle("test-model", false, None);
     handle.info.id = sid.clone();
-    agent.sessions.borrow_mut().insert(sid.clone(), handle);
+    agent.session_registry.put_resident(&sid, handle);
 
     // Ready route: web_search remains available, so `_meta` must stay silent.
     agent
