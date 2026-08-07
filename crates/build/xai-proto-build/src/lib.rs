@@ -23,21 +23,11 @@ fn find_protoc_include_dir(protoc: Option<&Path>) -> Option<PathBuf> {
     let grandparent = parent.parent()?; // .../
     let include_dir = grandparent.join("include");
 
-    // Everything downstream needs this decoded — the `-I` flag is built with
-    // `format!`, and protoc's dependency output is read back as UTF-8 — so an
-    // undecodable include directory fails the build rather than being used.
-    //
-    // Discovering it at all is new. This is reached from a `protoc` resolved
-    // off `PATH`, which used to be the bare name: `parent()` of that is `""`
-    // and `parent()` of `""` is `None`, so the walk stopped here and no
-    // include directory was ever derived. Resolving the real path is what
-    // exposed the sibling `include`, so declining an undecodable one restores
-    // exactly what those builds had before, rather than trading a slow build
-    // for a broken one. Handling such a path end to end is worth doing, but it
-    // is a different change than this one: tracked in #88.
-    //
-    // Ahead of `is_dir` only because it answers without a syscall; the two
-    // gates are independent and either order gives the same result.
+    // Keep this in `OsStr` terms. A valid include directory can carry
+    // non-UTF-8 bytes, and we pass it to protoc as an `OsString` `-I` arg.
+    // Build-script dependency parsing still validates UTF-8 before emission
+    // where needed; this lookup should only answer whether the sibling
+    // directory exists.
 
     include_dir.is_dir().then_some(include_dir)
 }
@@ -353,6 +343,24 @@ pub fn configure() -> XaiProtoBuilder {
     }
 }
 
+fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
+    while let Some((first, rest)) = bytes.split_first() {
+        if first.is_ascii_whitespace() {
+            bytes = rest;
+        } else {
+            break;
+        }
+    }
+    while let Some((last, rest)) = bytes.split_last() {
+        if last.is_ascii_whitespace() {
+            bytes = rest;
+        } else {
+            break;
+        }
+    }
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,16 +476,15 @@ mod tests {
         assert_eq!(find_protoc_include_dir(Some(protoc)), None);
     }
 
-    /// The half that actually pins the decode gate, and it can only run where
-    /// the filesystem accepts the name: APFS and HFS+ reject non-UTF-8
-    /// filenames with `Illegal byte sequence`, so this is unconstructible on
-    /// macOS. Without the gate the directory exists, `is_dir` accepts it, and
-    /// the build fails later in `emit_rerun_if_changed` — for a protoc that
-    /// runs perfectly well and that, before #87, derived no include directory
-    /// at all.
+    /// This can only run where the filesystem accepts non-UTF-8 names: APFS
+    /// and HFS+ reject these with `Illegal byte sequence`, so this shape is
+    /// unconstructible on macOS.
+    ///
+    /// The point is to pin the new contract: once a sibling include directory
+    /// exists, `find_protoc_include_dir` returns it without requiring UTF-8.
     #[cfg(target_os = "linux")]
     #[test]
-    fn an_existing_non_utf8_include_dir_is_declined() {
+    fn an_existing_non_utf8_include_dir_is_accepted() {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
 
@@ -494,7 +501,10 @@ mod tests {
              cannot be decoded; without the first half `is_dir` would reject \
              it and the decode gate would go unexercised"
         );
-        assert_eq!(find_protoc_include_dir(Some(&protoc)), None);
+        assert_eq!(
+            find_protoc_include_dir(Some(&protoc)),
+            Some(root.join("include"))
+        );
 
         fs::remove_dir_all(&parent).ok();
     }
@@ -503,6 +513,7 @@ mod tests {
     #[test]
     fn emit_rerun_if_changed_handles_non_utf8_well_known_types_dependency() {
         use std::ffi::OsStr;
+        use std::io::Write;
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::PermissionsExt;
 
@@ -521,7 +532,13 @@ mod tests {
         );
         script_content.extend_from_slice(b"exit 0\n");
 
-        fs::write(&protoc_script, script_content).expect("write stub protoc");
+        // Linux can return ETXTBSY when executing a file still open for write.
+        // Keep ownership explicit: write, flush, and close before exec.
+        {
+            let mut file = fs::File::create(&protoc_script).expect("create stub protoc");
+            file.write_all(&script_content).expect("write stub protoc");
+            file.sync_all().expect("sync stub protoc");
+        }
         fs::set_permissions(&protoc_script, fs::Permissions::from_mode(0o755)).expect("chmod");
 
         let include_dir_bytes = b"/opt/we\xffird/include";
@@ -542,22 +559,4 @@ mod tests {
 
         fs::remove_dir_all(&dir).ok();
     }
-}
-
-fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
-    while let Some((first, rest)) = bytes.split_first() {
-        if first.is_ascii_whitespace() {
-            bytes = rest;
-        } else {
-            break;
-        }
-    }
-    while let Some((last, rest)) = bytes.split_last() {
-        if last.is_ascii_whitespace() {
-            bytes = rest;
-        } else {
-            break;
-        }
-    }
-    bytes
 }
