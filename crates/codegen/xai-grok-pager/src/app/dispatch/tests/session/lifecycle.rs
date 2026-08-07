@@ -1235,6 +1235,11 @@ fn deferred_switch_threads_stash_prev_into_effect() {
     let id = AgentId(0);
     let model_a = acp::ModelId::new(std::sync::Arc::from("model-a"));
     let model_b = acp::ModelId::new(std::sync::Arc::from("model-b"));
+    // Both, and for different reasons: `model_b` because #145's hard-block
+    // checks the switch target, `model_a` because it is the `current` this
+    // test wants threaded through as `prev_model_id` (#163).
+    insert_ready_model(&mut app, id, &model_a);
+    insert_ready_model(&mut app, id, &model_b);
     let agent = app.agents.get_mut(&id).unwrap();
     agent.session.session_id = None;
     agent.session.models.current = Some(model_a.clone());
@@ -1266,6 +1271,15 @@ fn deferred_switch_prefers_authoritative_current_as_prev() {
     let id = AgentId(0);
     let model_b = acp::ModelId::new(std::sync::Arc::from("model-b"));
     let server_model = acp::ModelId::new(std::sync::Arc::from("server-model"));
+    // `model_b` is required — the apply-time re-check at `lifecycle.rs:339-345`
+    // refuses a catalog miss before the authoritative-current preference can
+    // run. `server_model` is not read by the assertion, only by `models.current`,
+    // but a hydrated session that reports a current model does have it in its
+    // catalog, so registering it keeps the fixture honest (#163). The two ids
+    // must stay different, or the `!=` branch never fires and the test stops
+    // testing what its name claims.
+    insert_ready_model(&mut app, id, &model_b);
+    insert_ready_model(&mut app, id, &server_model);
     let agent = app.agents.get_mut(&id).unwrap();
     agent.session.session_id = None;
     agent.session.deferred_model_switch = Some(crate::app::agent::DeferredModelSwitch {
