@@ -412,6 +412,136 @@ jobs:
             unrestricted_generation_guard_rejects_reused_session_id -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
             drop_cleanup_clears_old_generation_resources_written_in_flight -- --nocapture
+          run_nonzero -p xai-circuit-breaker --lib \
+            edge_client_retries_transient_edge_codes_but_not_origin_tls -- --nocapture
+          run_nonzero -p xai-sqlite-journal --lib \
+            apply_with_retry -- --nocapture
+          run_nonzero -p xai-tty-utils --lib \
+            git_command_locking -- --nocapture
+          run_nonzero -p xai-tool-types --lib \
+            background_spawn_notice_keeps_poll_hint_and_open_parent_work -- --nocapture
+          run_nonzero -p xai-tool-types --lib \
+            continue_parent_work_detects_prior_exec_and_skips_review_only -- --nocapture
+          run_nonzero -p xai-computer-hub-sdk --lib \
+            connection:: -- --nocapture
+          run_nonzero -p xai-computer-hub-sdk --lib \
+            server:: -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            permission::auto_mode:: -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            permission::manager:: -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            permission::prompter:: -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            permission::types:: -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            restore_fetch_tests:: -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            session::git:: -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            workspace_ops:: -- --nocapture
+          run_nonzero -p xai-fast-worktree --lib \
+            db::tests:: -- --nocapture
+          run_nonzero -p xai-file-utils --lib \
+            storage_client:: -- --nocapture
+          run_nonzero -p xai-grok-auth --lib \
+            bearer_fragment:: -- --nocapture
+          run_nonzero -p xai-grok-markdown --lib \
+            render:: -- --nocapture
+          run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
+            cache_ -- --nocapture
+          run_nonzero -p xai-grok-pager-render --lib \
+            terminal::tmux:: -- --nocapture
+          run_nonzero -p xai-grok-pager-render --lib \
+            theme:: -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            retry:: -- --nocapture
+          run_nonzero -p xai-grok-sampler --test cf_edge_error_message \
+            cf_edge_error_message:: -- --nocapture
+          run_nonzero -p xai-grok-sampling-types --lib \
+            error:: -- --nocapture
+          run_nonzero -p xai-grok-sandbox --lib \
+            deny::glob:: -- --nocapture
+          run_nonzero -p xai-grok-shared --lib \
+            ui_config:: -- --nocapture
+          run_nonzero -p xai-grok-telemetry --lib \
+            events:: -- --nocapture
+          run_nonzero -p xai-grok-telemetry --lib \
+            external:: -- --nocapture
+          run_nonzero -p xai-grok-telemetry --lib \
+            startup:: -- --nocapture
+          run_nonzero -p xai-grok-test-support --lib \
+            resources:: -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            implementations:: -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            registry:: -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            types:: -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            util:: -- --nocapture
+          run_nonzero -p xai-grok-workspace-types --lib \
+            rpc::repos:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            auth:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            config:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            inspect:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            leader:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            managed_config:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            sampling:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            session:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            util:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            app:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            disk_usage_cmd:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            fs_size_tests:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            headless:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            input:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            notifications:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            pty_wrap:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            scrollback:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            settings:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            slash:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            views:: -- --nocapture
+          run_nonzero -p xai-grok-pager --test grok_home_paths \
+            grok_home_paths:: -- --nocapture
+          run_nonzero -p xai-grok-pager --test signal_errno_preservation \
+            signal_errno_preservation:: -- --nocapture
+          run_nonzero -p xai-grok-pager --test settings_e2e \
+            settings_e2e:: -- --nocapture
+          run_nonzero -p xai-grok-shell --test acp_session_setup_wire \
+            acp_session_setup_conformance -- --nocapture
+          run_nonzero -p xai-grok-sandbox --lib \
+            resolve_failure_refuses_for_deny_carrying_devbox_extends -- --nocapture
+          run_nonzero -p xai-grok-sandbox --lib \
+            bwrap_reexec_for_profile_skips_plan_inside_bwrap -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            terminal::local_terminal:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            acp:: -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            actions:: -- --nocapture
+          run_nonzero -p xai-grok-pager --test pty_e2e_minimal --test pty_e2e \
+            pty_e2e:: -- --nocapture
 
       - name: Agent serve exposure and authentication
         env:

@@ -254,7 +254,8 @@ mod tests {
         }
 
         let temp_home = tempfile::tempdir().expect("temporary HOME for shell startup");
-        let mut request = make_request("(exec 3>/dev/tty && echo ATTACHED || echo DETACHED) 2>/dev/null");
+        let mut request =
+            make_request("(exec 3>/dev/tty && echo ATTACHED || echo DETACHED) 2>/dev/null");
         request.env.insert(
             "HOME".to_owned(),
             temp_home.path().to_string_lossy().into_owned(),
