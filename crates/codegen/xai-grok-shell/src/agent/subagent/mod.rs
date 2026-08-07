@@ -47,6 +47,13 @@ use xai_grok_workspace::file_system::AsyncFileSystem;
 use xai_hunk_tracker::HunkTrackerHandle;
 mod handle_request;
 pub(crate) use handle_request::run_shell_child;
+/// Command channels for live child sessions that participate in managed-gateway
+/// admission and refresh barriers.
+type ManagedGatewayChildSessionCommandMap =
+    std::collections::HashMap<acp::SessionId, mpsc::UnboundedSender<SessionCommand>>;
+/// Shared registry of live managed-gateway child sessions.
+type ManagedGatewayChildSessionRegistry =
+    std::rc::Rc<std::cell::RefCell<ManagedGatewayChildSessionCommandMap>>;
 /// How the child session's initial context was bootstrapped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InitialContextSource {
@@ -296,16 +303,7 @@ pub(crate) struct SubagentSpawnContext {
     pub managed_mcp_state: crate::session::managed_mcp::ManagedMcpStateHandle,
     /// Live child-session command channels participating in managed-gateway
     /// admission/refresh barriers.
-    pub managed_gateway_child_sessions: Option<
-        std::rc::Rc<
-            std::cell::RefCell<
-                std::collections::HashMap<
-                    agent_client_protocol::SessionId,
-                    tokio::sync::mpsc::UnboundedSender<crate::session::commands::SessionCommand>,
-                >,
-            >,
-        >,
-    >,
+    pub managed_gateway_child_sessions: Option<ManagedGatewayChildSessionRegistry>,
     /// Snapshot of the parent session's MCP client pool at spawn time.
     pub parent_mcp_pool: Option<crate::session::mcp_servers::SharedMcpPool>,
     /// Exact parent tool schema for verbatim non-workflow forks.
@@ -2157,6 +2155,7 @@ fn fail_subagent(
     result
 }
 /// Remove a just-created worktree when spawn is rejected before promotion.
+#[cfg(test)]
 async fn cleanup_rejected_spawn_worktree(
     subagent_id: &str,
     worktree_path: Option<&Path>,

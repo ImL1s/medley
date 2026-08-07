@@ -57,31 +57,13 @@ pub(super) fn task_model_override_error(
 /// Lifecycle guard that keeps managed-gateway refresh barriers aware of live
 /// child sessions until this spawn path exits.
 struct ManagedGatewayChildSessionRegistration {
-    registry: Option<
-        std::rc::Rc<
-            std::cell::RefCell<
-                std::collections::HashMap<
-                    acp::SessionId,
-                    tokio::sync::mpsc::UnboundedSender<SessionCommand>,
-                >,
-            >,
-        >,
-    >,
+    registry: Option<ManagedGatewayChildSessionRegistry>,
     session_id: acp::SessionId,
 }
 
 impl ManagedGatewayChildSessionRegistration {
     fn register(
-        registry: Option<
-            std::rc::Rc<
-                std::cell::RefCell<
-                    std::collections::HashMap<
-                        acp::SessionId,
-                        tokio::sync::mpsc::UnboundedSender<SessionCommand>,
-                    >,
-                >,
-            >,
-        >,
+        registry: Option<ManagedGatewayChildSessionRegistry>,
         session_id: &acp::SessionId,
         cmd_tx: tokio::sync::mpsc::UnboundedSender<SessionCommand>,
     ) -> Self {
@@ -99,6 +81,53 @@ impl Drop for ManagedGatewayChildSessionRegistration {
     fn drop(&mut self) {
         if let Some(registry) = self.registry.as_ref() {
             registry.borrow_mut().remove(&self.session_id);
+        }
+    }
+}
+/// Removes a freshly-created worktree if subagent spawn exits before the child
+/// session is handed off to the coordinator.
+pub(super) struct PreHandoffWorktreeCleanupGuard {
+    subagent_id: String,
+    worktree_path: Option<PathBuf>,
+    armed: bool,
+}
+
+impl PreHandoffWorktreeCleanupGuard {
+    pub(super) fn new(
+        subagent_id: &str,
+        worktree_path: Option<&Path>,
+        worktree_freshly_created: bool,
+    ) -> Self {
+        Self {
+            subagent_id: subagent_id.to_owned(),
+            worktree_path: worktree_path.map(Path::to_path_buf),
+            armed: worktree_freshly_created && worktree_path.is_some(),
+        }
+    }
+
+    pub(super) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PreHandoffWorktreeCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(worktree_path) = self.worktree_path.take() else {
+            return;
+        };
+        if let Err(e) = xai_fast_worktree::remove_worktree_with_delegate(
+            &worktree_path,
+            crate::session::worktree::btrfs_delegate_from_env(),
+        ) {
+            tracing::warn!(
+                subagent_id = %self.subagent_id,
+                worktree_path = %worktree_path.display(),
+                error = %e,
+                "failed to remove freshly created subagent worktree after pre-handoff exit"
+            );
         }
     }
 }
@@ -422,6 +451,11 @@ pub(crate) async fn run_shell_child(
         None
     };
     let worktree_freshly_created = resume_source.is_none() && worktree_path.is_some();
+    let mut pre_handoff_worktree_cleanup = PreHandoffWorktreeCleanupGuard::new(
+        &request.id,
+        worktree_path.as_deref(),
+        worktree_freshly_created,
+    );
     if let Some(raw_cwd) = request.cwd.as_deref() {
         match sanitize_cwd_value(raw_cwd) {
             Some(cwd_path) => {
@@ -1304,14 +1338,11 @@ pub(crate) async fn run_shell_child(
     )
     .await;
     let (child_handle, mut permission_rx, _system_prompt, child_thread) = match spawn_result {
-        Ok(r) => r,
+        Ok(r) => {
+            pre_handoff_worktree_cleanup.disarm();
+            r
+        }
         Err(e) => {
-            cleanup_rejected_spawn_worktree(
-                &request.id,
-                worktree_path.as_deref(),
-                worktree_freshly_created,
-            )
-            .await;
             let msg = format!("Failed to spawn child session: {e}");
             let result = fail_subagent(
                 &msg,

@@ -355,6 +355,10 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             issue39_cleanup_rejected_spawn_worktree_removes_only_fresh_worktrees -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
+            issue39_harness_rejection_cleans_fresh_worktree_before_handoff -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue39_pre_handoff_guard_cleans_worktree_on_panic -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
             issue39_verbatim_fork_tools_intersect_session_admission -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             issue39_rebuild_respects_capability_mode_ceiling -- --nocapture
