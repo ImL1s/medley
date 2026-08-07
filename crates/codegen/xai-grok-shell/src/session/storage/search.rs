@@ -28,7 +28,7 @@ use super::search_recovery;
 use super::search_remote_sync;
 use super::{
     ContentPeek, PromptExtractEvent, RawLinePeek, RawParamsPeek, StorageAdapter,
-    XAI_SESSION_UPDATE_METHOD, collect_prompts_from_events,
+    XAI_SESSION_UPDATE_METHOD, apply_assistant_text_xai_boundary, collect_prompts_from_events,
 };
 use crate::session::info::Info;
 use crate::session::persistence::Summary;
@@ -930,8 +930,9 @@ fn collect_all_indexable_content_single_pass(updates_path: &Path) -> io::Result<
     const TOOL_MAX_CHARS: usize = 100_000;
 
     // Helper: flush in-progress assistant text buffer on turn boundary.
-    // Must be called in every non-agent_message_chunk branch, matching
-    // the existing `collect_assistant_text` flush semantics (mod.rs:883).
+    // Must be called in every non-agent_message_chunk ACP branch. xAI
+    // boundaries go through `apply_assistant_text_xai_boundary` so RetryState /
+    // AttemptDiscarded discard instead of flushing (#165).
     let flush_assistant = |current: &mut String, texts: &mut Vec<String>| {
         if !current.is_empty() {
             let t = current.trim().to_string();
@@ -1100,9 +1101,24 @@ fn collect_all_indexable_content_single_pass(updates_path: &Path) -> io::Result<
             }
         } else {
             // ── xAI control events ──────────────────────────────────
+            // Assistant-text boundary must match `collect_assistant_text`
+            // (#165): RetryState / AttemptDiscarded discard; rewind /
+            // compaction flush; other xAI records keep today's flush.
+            if let Ok(notif) = serde_json::from_str::<
+                crate::extensions::notification::SessionNotification,
+            >(raw_params)
+            {
+                apply_assistant_text_xai_boundary(
+                    &notif.update,
+                    &mut current_assistant,
+                    &mut assistant_texts,
+                );
+            } else {
+                // Unparseable xAI line: preserve prior flush behaviour.
+                flush_assistant(&mut current_assistant, &mut assistant_texts);
+            }
             match tag {
                 Some(t) if t == *REWIND_MARKER => {
-                    flush_assistant(&mut current_assistant, &mut assistant_texts);
                     if let Some(ref u) = update_peek
                         && let Some(idx) = u.target_prompt_index
                     {
@@ -1112,7 +1128,6 @@ fn collect_all_indexable_content_single_pass(updates_path: &Path) -> io::Result<
                     }
                 }
                 _ => {
-                    flush_assistant(&mut current_assistant, &mut assistant_texts);
                     prompt_events.push(PromptExtractEvent::NotUserMessage);
                 }
             }
@@ -1316,6 +1331,41 @@ mod tests {
         assert!(
             content.contains("assistant reply"),
             "should contain assistant text"
+        );
+    }
+
+    /// #165 acceptance: abandoned-then-retried attempt must not put the
+    /// abandoned phrase into the single-pass FTS content (the search index
+    /// path), while the retry's phrase remains findable.
+    #[test]
+    fn single_pass_omits_abandoned_retry_attempt_from_fts_content() {
+        let lines = vec![
+            acp_update(
+                r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"please plan the migration"}}"#,
+            ),
+            acp_update(
+                r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"here is the migration plan abandoned-fts-xyzzy-165"}}"#,
+            ),
+            xai_update(
+                r#"{"sessionUpdate":"retry_state","type":"retrying","attempt":1,"max_retries":3,"reason":"transport reset"}"#,
+            ),
+            acp_update(
+                r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"retry succeeded with different wording kept-fts-plugh-165"}}"#,
+            ),
+        ];
+        let f = write_updates_jsonl(&lines);
+        let (content, _bytes) = collect_all_indexable_content_single_pass(f.path()).unwrap();
+        assert!(
+            !content.contains("abandoned-fts-xyzzy-165"),
+            "abandoned attempt must not appear in FTS content: {content:?}"
+        );
+        assert!(
+            content.contains("kept-fts-plugh-165"),
+            "retry phrase must remain findable in FTS content: {content:?}"
+        );
+        assert!(
+            content.contains("please plan the migration"),
+            "user prompt must still be indexed: {content:?}"
         );
     }
 

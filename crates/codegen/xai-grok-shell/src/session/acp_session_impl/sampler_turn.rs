@@ -2,6 +2,23 @@
 //! facts/gates and retry, sampler config reconstruction, sampling-failure
 //! recovery, and per-response usage recording.
 use super::*;
+
+/// Whether a resolved [`ModelAuthFacts`] may be frozen in
+/// [`SessionActor::model_auth_memo`].
+///
+/// Only `byok = Unknown` is non-cacheable. Production resolution binds
+/// incomplete knowledge (`CatalogUnavailable` / empty id → `UnidentifiedModel`)
+/// to `byok = Unknown` already, so a readiness-side clause would be redundant
+/// for live resolves and would only disarm hand-seeded memos that deliberately
+/// pair a definite `NotByok` with a transient readiness for regression coverage
+/// (#159 F2). A genuine authoritative `NotInCatalog` stays `NotByok` and may
+/// cache; catalog-generation invalidation (F1) prevents that freeze from
+/// outliving a refresh that restores the model.
+fn model_auth_facts_are_cacheable(facts: &crate::agent::config::ModelAuthFacts) -> bool {
+    use crate::agent::auth_method::ModelByok;
+    facts.byok != ModelByok::Unknown
+}
+
 /// Auth-failure detector for tool errors. Matches strictly on HTTP 401
 /// when the error carries a structured status code, mirroring
 /// `SamplingError::is_auth_error` in xai-grok-sampling-types: 403 is
@@ -268,8 +285,14 @@ impl SessionActor {
     pub(crate) fn invalidate_model_auth_memo(&self) {
         self.model_auth_memo.replace(None);
     }
-    /// Reads and populates [`Self::model_auth_memo`]; a fresh `Unknown`
-    /// falls back to the last definite entry (see the field's contract).
+    /// Reads and populates [`Self::model_auth_memo`].
+    ///
+    /// A definite memo for the same model id at the current catalog generation
+    /// is returned without re-resolve. Incomplete lookups (`byok = Unknown`)
+    /// are never written; they return live so a later complete catalog can
+    /// re-classify the model. (There is no "fresh Unknown falls back to last
+    /// definite" arm: a same-id definite memo at the current generation would
+    /// already have been served above.)
     fn model_auth_state(
         &self,
         model_id: &str,
@@ -277,28 +300,35 @@ impl SessionActor {
         crate::agent::config::ModelAuthFacts,
         Option<crate::auth::AuthProviderRef>,
     ) {
-        use crate::agent::auth_method::ModelByok;
         use crate::session::acp_session::ModelAuthMemo;
+        let catalog_generation = self.models_manager.catalog_generation();
         if let Some(memo) = self.model_auth_memo.borrow().as_ref()
             && memo.model_id == model_id
-            && memo.facts.byok != ModelByok::Unknown
+            && memo.catalog_generation == catalog_generation
+            && model_auth_facts_are_cacheable(&memo.facts)
         {
             return (memo.facts.clone(), memo.provider.clone());
         }
-        let (fresh, provider) =
-            crate::agent::config::resolve_model_auth_facts_and_provider(model_id);
-        if fresh.byok == ModelByok::Unknown {
-            if let Some(memo) = self.model_auth_memo.borrow().as_ref()
-                && memo.model_id == model_id
-            {
-                return (memo.facts.clone(), memo.provider.clone());
-            }
+        // Authoritative session catalog (defaults + prefetched + overrides).
+        // Passing this is what keeps a remote-only model from being judged
+        // NotInCatalog by a config-only re-resolve (#159).
+        // Note: ModelsManager may retain-out `disabled_models` while a bare
+        // config-only `resolve_model_list` does not — disabled entries can
+        // therefore affect the auth verdict when the runtime catalog is used.
+        let runtime_catalog = self.models_manager.models();
+        let (fresh, provider) = crate::agent::config::resolve_model_auth_facts_and_provider(
+            model_id,
+            Some(&runtime_catalog),
+        );
+        if !model_auth_facts_are_cacheable(&fresh) {
+            // Incomplete: do not freeze as a definite memo entry.
             return (fresh, provider);
         }
         *self.model_auth_memo.borrow_mut() = Some(ModelAuthMemo {
             model_id: model_id.to_string(),
             facts: fresh.clone(),
             provider: provider.clone(),
+            catalog_generation,
         });
         (fresh, provider)
     }

@@ -5347,15 +5347,26 @@ pub(crate) struct ModelAuthFacts {
     /// must not be treated as unusable (#133).
     pub readiness: ModelReadiness,
 }
-/// Resolve `model_id` to its auth facts and auth-provider reference from one
-/// effective-config load; both ride the same memo (see
-/// `SessionActor::model_auth_memo`). Load/parse failure → `byok = Unknown` and
-/// `readiness = Unknown(CatalogUnavailable)`; model absent from the catalog →
+/// Resolve `model_id` to its auth facts and auth-provider reference.
+///
+/// Prefer `runtime_catalog` from the session's [`crate::agent::models::ModelsManager`]
+/// (or an equivalent authoritative snapshot). That catalog already folds
+/// defaults + prefetched remote entries + config overrides, so a miss is a
+/// genuine [`UnknownReason::NotInCatalog`].
+///
+/// When `runtime_catalog` is `None` or empty, this falls back to a config-only
+/// re-resolve. That universe is incomplete (no remote/prefetched models), so a
+/// miss there is [`UnknownReason::CatalogUnavailable`] — **not** `NotInCatalog`
+/// (#159). A config-only hit is still trustworthy.
+///
+/// Load/parse failure → `byok = Unknown` and
+/// `readiness = Unknown(CatalogUnavailable)`; genuine catalog absence →
 /// `NotByok` + `Unknown(NotInCatalog)` (not `Unusable`). An empty `model_id`
 /// (no sampling config yet) → `Unknown` on both, so the gate isn't activated
-/// for an unidentified model.
+/// for an unidentified model. Results ride `SessionActor::model_auth_memo`.
 pub(crate) fn resolve_model_auth_facts_and_provider(
     model_id: &str,
+    runtime_catalog: Option<&IndexMap<String, ModelEntry>>,
 ) -> (ModelAuthFacts, Option<crate::auth::AuthProviderRef>) {
     if model_id.is_empty() {
         return (
@@ -5367,7 +5378,7 @@ pub(crate) fn resolve_model_auth_facts_and_provider(
             None,
         );
     }
-    with_resolved_model(model_id, |lookup| {
+    with_resolved_model(model_id, runtime_catalog, |lookup| {
         let facts = ModelAuthFacts {
             byok: byok_from_lookup(&lookup),
             auth_scheme: match lookup {
@@ -5413,14 +5424,31 @@ fn byok_from_lookup(lookup: &ModelLookup) -> ModelByok {
     }
 }
 enum ModelLookup<'a> {
-    /// `None` if `model_id` is absent from the catalog.
+    /// `None` if `model_id` is absent from an authoritative loaded catalog.
     Loaded(Option<&'a ModelEntry>),
+    /// Config load/parse failed, or the only available lookup was config-only
+    /// (incomplete: no runtime/prefetched catalog consulted) and the id was
+    /// not there. Callers must not treat this as a definite catalog miss.
     ConfigUnavailable,
 }
-/// Load + parse the effective config and hand the `model_id` lookup to `f`,
-/// keeping "config unavailable" distinct from "model absent" so callers can
-/// stay conservative on a transient config failure.
-fn with_resolved_model<T>(model_id: &str, f: impl FnOnce(ModelLookup) -> T) -> T {
+/// Hand the `model_id` lookup to `f`, preferring an authoritative runtime
+/// catalog snapshot. Keeps "knowledge unobtainable / incomplete" distinct from
+/// "model absent from a complete catalog" so callers stay conservative (#159).
+fn with_resolved_model<T>(
+    model_id: &str,
+    runtime_catalog: Option<&IndexMap<String, ModelEntry>>,
+    f: impl FnOnce(ModelLookup) -> T,
+) -> T {
+    // Authoritative path: ModelsManager's resolved catalog (defaults + remote
+    // prefetched + config). A miss here is a real NotInCatalog.
+    // Empty is not authoritative (test fixtures / cleared manager) — fall
+    // through rather than judging every id absent.
+    if let Some(models) = runtime_catalog.filter(|m| !m.is_empty()) {
+        return f(ModelLookup::Loaded(find_model_by_id(models, model_id)));
+    }
+
+    // Incomplete path: config-only re-resolve (no prefetched). A hit is fine;
+    // a miss only proves absence from this incomplete universe (#159).
     let Some(raw) = crate::config::load_effective_config()
         .map_err(|e| tracing::warn!(error = %e, "config load failed for model auth lookup"))
         .ok()
@@ -5434,7 +5462,10 @@ fn with_resolved_model<T>(model_id: &str, f: impl FnOnce(ModelLookup) -> T) -> T
         return f(ModelLookup::ConfigUnavailable);
     };
     let models = resolve_model_list(&cfg, None);
-    f(ModelLookup::Loaded(find_model_by_id(&models, model_id)))
+    match find_model_by_id(&models, model_id) {
+        Some(entry) => f(ModelLookup::Loaded(Some(entry))),
+        None => f(ModelLookup::ConfigUnavailable),
+    }
 }
 /// Resolve a standalone `SamplerConfig` for an auxiliary model slug (image
 /// description, session summary, ...), resolved through the catalog so a
@@ -6635,11 +6666,17 @@ pub(crate) fn model_readiness(model: &ModelEntry) -> (bool, Option<String>) {
 /// Resolve the catalog entry for `model_id` and return its readiness reason
 /// when unready. Used by turn-time auth-error mapping so an origin refusal
 /// (or any other unready cause) is not rewritten as "Session expired" (#123).
-pub(crate) fn unready_reason_for_model_id(model_id: &str) -> Option<String> {
+///
+/// Pass the session's runtime catalog when available so a remote-only model
+/// is not treated as unknown (#159).
+pub(crate) fn unready_reason_for_model_id(
+    model_id: &str,
+    runtime_catalog: Option<&IndexMap<String, ModelEntry>>,
+) -> Option<String> {
     if model_id.is_empty() {
         return None;
     }
-    with_resolved_model(model_id, |lookup| match lookup {
+    with_resolved_model(model_id, runtime_catalog, |lookup| match lookup {
         ModelLookup::Loaded(Some(entry)) => {
             let (ready, reason) = model_readiness(entry);
             if ready { None } else { reason }
@@ -9979,11 +10016,57 @@ reasoning_effort = "low"
     }
     #[test]
     fn resolve_model_auth_facts_empty_model_id_is_unknown() {
-        let facts = resolve_model_auth_facts_and_provider("").0;
+        let facts = resolve_model_auth_facts_and_provider("", None).0;
         assert_eq!(facts.byok, ModelByok::Unknown);
         assert_eq!(
             facts.readiness,
             ModelReadiness::Unknown(UnknownReason::UnidentifiedModel)
+        );
+    }
+
+    /// #159: a model present only in the runtime/prefetched catalog must not
+    /// be judged `NotInCatalog` just because config-only re-resolve misses it.
+    #[test]
+    fn runtime_catalog_hit_is_ready_even_when_absent_from_config_only() {
+        let remote = test_model_entry("remote-grok-x", "https://api.x.ai/v1", None, None, None);
+        let mut catalog = IndexMap::new();
+        catalog.insert("remote-grok-x".to_string(), remote);
+        let (facts, _) = resolve_model_auth_facts_and_provider("remote-grok-x", Some(&catalog));
+        assert_eq!(facts.readiness, ModelReadiness::Ready);
+        assert_eq!(facts.byok, ModelByok::NotByok);
+    }
+
+    /// #159: a genuine miss against a non-empty runtime catalog is still
+    /// `NotInCatalog` (the strip reaction keys on this).
+    #[test]
+    fn genuine_runtime_catalog_miss_is_not_in_catalog() {
+        let present = test_model_entry("other", "https://api.x.ai/v1", None, None, None);
+        let mut catalog = IndexMap::new();
+        catalog.insert("other".to_string(), present);
+        let (facts, _) = resolve_model_auth_facts_and_provider("remote-grok-x", Some(&catalog));
+        assert_eq!(
+            facts.readiness,
+            ModelReadiness::Unknown(UnknownReason::NotInCatalog)
+        );
+        assert_eq!(facts.byok, ModelByok::NotByok);
+    }
+
+    /// #159: without a runtime catalog, a config-only miss is incomplete
+    /// knowledge — `CatalogUnavailable`, never `NotInCatalog`.
+    #[test]
+    fn config_only_miss_is_catalog_unavailable_not_not_in_catalog() {
+        // A slug that is not a bundled default and has no [model.*] entry.
+        let (facts, _) =
+            resolve_model_auth_facts_and_provider("remote-grok-x-only-in-runtime", None);
+        assert_eq!(
+            facts.readiness,
+            ModelReadiness::Unknown(UnknownReason::CatalogUnavailable),
+            "config-only miss must not claim a definite catalog absence"
+        );
+        assert_eq!(
+            facts.byok,
+            ModelByok::Unknown,
+            "incomplete lookup must not freeze as NotByok"
         );
     }
 

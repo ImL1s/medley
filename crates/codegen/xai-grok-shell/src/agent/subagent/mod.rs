@@ -796,9 +796,12 @@ fn inherited_bearer_resolver(
     base_url: &str,
     credential_source: Option<&xai_grok_sampler::CredentialSource>,
 ) -> Option<xai_grok_sampler::SharedBearerResolver> {
-    let byok = crate::agent::config::resolve_model_auth_facts_and_provider(model)
-        .0
-        .byok;
+    let byok = crate::agent::config::resolve_model_auth_facts_and_provider(
+        model,
+        Some(&ctx.available_models),
+    )
+    .0
+    .byok;
     session_bearer_resolver(ctx, byok, base_url, credential_source)
 }
 /// Read the parent session's actual current sampling config.
