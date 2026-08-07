@@ -76,14 +76,7 @@ pub(crate) fn resolve_default_model(
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
-    let model_pref = config::resolve_string_flag(
-        cfg.default_model_override.as_deref(),
-        "GROK_DEFAULT_MODEL",
-        cfg.models.default.as_deref(),
-        cfg.remote_settings
-            .as_ref()
-            .and_then(|rs| rs.default_model.as_deref()),
-    );
+    let model_pref = configured_preference(cfg);
 
     let first_or_fallback = || -> (String, ModelEntry) {
         if let Some((key, first)) = ready_visible.first() {
@@ -118,12 +111,7 @@ pub(crate) fn resolve_default_model(
             (key, first, config::ConfigSource::Default, None)
         }
         Some(pref) => {
-            let is_explicit = matches!(
-                pref.source,
-                config::ConfigSource::Cli
-                    | config::ConfigSource::Env
-                    | config::ConfigSource::Config
-            );
+            let is_explicit = is_explicit_preference(pref.source);
             // A campaign-driven default arrives over the wire into the same
             // `Config` slot a user's own choice occupies, so `pref.source`
             // alone cannot tell them apart. Keeping an unready *user* choice
@@ -131,8 +119,7 @@ pub(crate) fn resolve_default_model(
             // strands the cohort on a model it cannot authenticate until
             // someone hand-edits config -- which is the exact failure
             // `pre_campaign_default` exists to undo.
-            let campaign_driven = cfg.models.default_is_campaign_driven
-                && matches!(pref.source, config::ConfigSource::Config);
+            let campaign_driven = is_campaign_driven_preference(cfg, pref.source);
             // Honour the configured id against the full catalog first, before
             // the ready-only filter. An explicit preference that is present
             // but unusable must not be silently replaced (#131).
@@ -199,8 +186,7 @@ pub(crate) fn resolve_default_model(
                         "remote default_model not in available models, skipping"
                     );
                 }
-                let campaign_pref_missing = cfg.models.default_is_campaign_driven
-                    && matches!(pref.source, config::ConfigSource::Config);
+                let campaign_pref_missing = is_campaign_driven_preference(cfg, pref.source);
                 if campaign_pref_missing
                     && let Some(prev) = cfg
                         .models
@@ -227,6 +213,147 @@ pub(crate) fn resolve_default_model(
             }
         }
     }
+}
+
+/// The default-model preference the user configured, in precedence order
+/// (`--model` override, `GROK_DEFAULT_MODEL`, `[models] default`, remote).
+///
+/// Shared by [`resolve_default_model`] and [`substituted_preference`] so the
+/// two can never disagree about *what* was configured.
+fn configured_preference(cfg: &config::Config) -> Option<config::Resolved<String>> {
+    config::resolve_string_flag(
+        cfg.default_model_override.as_deref(),
+        "GROK_DEFAULT_MODEL",
+        cfg.models.default.as_deref(),
+        cfg.remote_settings
+            .as_ref()
+            .and_then(|rs| rs.default_model.as_deref()),
+    )
+}
+
+/// `true` when the preference is the user's own choice rather than a remote
+/// default. One definition, used by every decision that turns on it —
+/// including the warm-cache reseat in `reselect_current_model_if_missing`.
+pub(crate) fn is_explicit_preference(source: config::ConfigSource) -> bool {
+    matches!(
+        source,
+        config::ConfigSource::Cli | config::ConfigSource::Env | config::ConfigSource::Config
+    )
+}
+
+/// `true` when a `Config`-sourced preference was pushed by a campaign rather
+/// than written by the user. It arrives over the wire into the same slot a
+/// user's own choice occupies, so `source` alone cannot tell them apart.
+fn is_campaign_driven_preference(cfg: &config::Config, source: config::ConfigSource) -> bool {
+    cfg.models.default_is_campaign_driven && matches!(source, config::ConfigSource::Config)
+}
+
+/// `initialize` / `x.ai/models/update` `_meta` key naming a configured default
+/// that resolve fell through on, so a substitute was seated instead (#131).
+///
+/// Shape: `{"configuredModelId": "<id>", "source": "cli" | "env" | "config"}`.
+///
+/// Derived from [`resolve_default_model`]'s output source, not from a second
+/// seating check: an explicit preference that was seated comes back carrying
+/// `pref.source`; the only way it yields [`config::ConfigSource::Default`] is
+/// the not-found fall-through (catalog absence *or* present-but-not-user-
+/// selectable). Present-but-unready is different — #145 keeps that model
+/// selected, so this key stays omitted.
+///
+/// That proxy matches seating truth when every resolve site either seats what
+/// resolve returned or leaves a still-missing preference substituted. The
+/// warm-cache refresh path reseats when a previously missing preference
+/// becomes honourable (unless the user `/model`-picked), so a cleared verdict
+/// cannot mean "would honour if reseated" while the substitute stays current.
+///
+/// On `initialize`, omitted (not null) when the preference was honoured — and
+/// written on the *response* top-level `_meta`. On `x.ai/models/update`,
+/// present as the object or as JSON `null` on `SessionModelState._meta` (a
+/// different JSON path; same key name) so a prior accusation can be retracted
+/// when the catalog self-corrects and the preference is seated.
+pub(crate) const SUBSTITUTED_DEFAULT_MODEL_META_KEY: &str = "x.ai/substitutedDefaultModel";
+
+/// A configured default that resolve fell through on, so a substitute was seated.
+///
+/// This is the one rejection a client cannot reconstruct from
+/// `currentModelId` + `availableModels` alone. When the configured model is
+/// present but unready, #145 keeps it selected, so `currentModelId` names it
+/// and `availableModels` carries its `readinessReason`. When it is absent from
+/// the catalog, or present but not user-selectable, there is nothing useful to
+/// look up — and the substitute occupies every field that would otherwise have
+/// named the preference (#131).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SubstitutedPreference {
+    /// The model id the user configured, verbatim.
+    pub configured: String,
+    /// Which configuration supplied it. A stale `GROK_DEFAULT_MODEL` in a shell
+    /// profile and a line in `config.toml` need different remedies, and nothing
+    /// else on the wire distinguishes them.
+    pub source: config::ConfigSource,
+}
+
+impl SubstitutedPreference {
+    /// Stable wire spelling of the configuration that supplied the preference.
+    ///
+    /// Exhaustive over [`config::ConfigSource`] so a new variant fails to
+    /// compile rather than being silently labelled `"config"`. Only the three
+    /// explicit arms are reachable: [`substituted_preference`] filters to
+    /// those before constructing this type.
+    pub(crate) fn source_wire(&self) -> &'static str {
+        match self.source {
+            config::ConfigSource::Cli => "cli",
+            config::ConfigSource::Env => "env",
+            config::ConfigSource::Config => "config",
+            config::ConfigSource::Requirement
+            | config::ConfigSource::SystemManagedConfig
+            | config::ConfigSource::ManagedConfig
+            | config::ConfigSource::UserConfig
+            | config::ConfigSource::Remote
+            | config::ConfigSource::Default => {
+                unreachable!(
+                    "substituted_preference only constructs Cli|Env|Config; got {}",
+                    self.source
+                )
+            }
+        }
+    }
+
+    /// Wire object for [`SUBSTITUTED_DEFAULT_MODEL_META_KEY`].
+    pub(crate) fn to_meta_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "configuredModelId": self.configured,
+            "source": self.source_wire(),
+        })
+    }
+}
+
+/// Did [`resolve_default_model`] substitute an explicit configured preference?
+///
+/// Derived from that function's **own output** rather than re-deciding it. An
+/// explicit preference that was honoured — ready, or kept-unready under #145 —
+/// comes back carrying `pref.source`; the only way an explicit preference
+/// yields [`config::ConfigSource::Default`] is the not-found fall-back.
+/// Re-implementing the readiness and visibility rules here would be a second
+/// classifier that can drift from the first, which is exactly the failure this
+/// module already guards against elsewhere.
+///
+/// Returns `None` for a campaign-driven default: the user did not write it, and
+/// telling them their configuration was rejected would name the wrong culprit.
+pub(crate) fn substituted_preference(
+    cfg: &config::Config,
+    resolved_source: config::ConfigSource,
+) -> Option<SubstitutedPreference> {
+    if !matches!(resolved_source, config::ConfigSource::Default) {
+        return None;
+    }
+    let pref = configured_preference(cfg)?;
+    if !is_explicit_preference(pref.source) || is_campaign_driven_preference(cfg, pref.source) {
+        return None;
+    }
+    Some(SubstitutedPreference {
+        configured: pref.value,
+        source: pref.source,
+    })
 }
 
 /// Filter hidden and auth-gated entries out of `catalog` and convert to ACP wire format.
