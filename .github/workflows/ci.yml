@@ -12,8 +12,12 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Push runs are release candidates keyed by commit SHA; if a later merge lands
+  # while one is running, we still need the earlier SHA to reach a completed
+  # verdict for release.yml's SHA-exact gate.
+  group: ci-${{ github.event_name == 'push' && github.sha || github.ref }}
+  # PRs and manual runs should still drop superseded attempts.
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -381,6 +385,10 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             issue39_pre_handoff_guard_cleans_worktree_on_panic -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
+            issue14_spawn_refresh_replaces_stale_parent_capabilities -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue14_spawn_refresh_parent_actor_unavailable_is_actionable_error -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
             issue39_verbatim_fork_tools_intersect_session_admission -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             issue39_rebuild_respects_capability_mode_ceiling -- --nocapture
@@ -637,9 +645,13 @@ jobs:
           # which looks for added `#[test]` attributes.
           run_nonzero -p xai-grok-shell --lib agent::models -- --nocapture
 
-      # #50: crash-consistent model-switch persistence boundaries. Each filter
-      # is unique so run_nonzero proves the targeted test still runs.
-      - name: 'Crash-consistent model-switch boundaries (issue #50)'
+      # #50 and #54 are the same subsystem from two directions -- crash
+      # consistency across the intent write/rename boundary, and the narrow
+      # windows around owner-bound load markers and dropped acks. They added
+      # separate steps with an overlapping filter, so they are one step here
+      # and `dropped_model_switch_ack_...` appears once rather than twice.
+      # Filters are unique names, so run_nonzero proves each is selected.
+      - name: 'Model-switch persistence boundaries and narrow windows (issues #50, #54)'
         env:
           PROTOC: protoc
         run: |
@@ -656,6 +668,12 @@ jobs:
             rm -f "$output"
           }
           run_nonzero -p xai-grok-shell --lib \
+            dropping_newer_duplicate_load_keeps_older_wait_marker_alive -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            dropped_model_switch_ack_preserves_live_candidate_generation -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            model_switch_recovers_new_generation_after_summary_materialization -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
             model_switch_interruption_before_intent_rename_ -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             model_switch_interruption_after_intent_rename_ -- --nocapture
@@ -663,8 +681,6 @@ jobs:
             list_sessions_recovers_pending_model_switch_intent_before_loading_summary -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             list_sessions_recent_recovers_pending_model_switch_intent_before_loading_summary -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
-            dropped_model_switch_ack_preserves_live_candidate_generation -- --nocapture
 
       # #166: these assert on colour, and used to inherit the ambient colour
       # level. Run them under both settings of NO_COLOR -- one pass alone would

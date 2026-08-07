@@ -3418,6 +3418,30 @@ async fn concurrent_load_guards_do_not_clobber_each_other() {
         "all markers removed once every load finished"
     );
 }
+/// Dropping a newer duplicate load while an older load is still restoring must
+/// keep the older marker visible to waiters. Otherwise an external
+/// `session_handle_waiting_for_load` sees no marker and releases early while the
+/// older restore is still in flight.
+#[tokio::test(start_paused = true)]
+async fn dropping_newer_duplicate_load_keeps_older_wait_marker_alive() {
+    let agent = build_minimal_agent_for_tests();
+    let sid = acp::SessionId::new("sess-concurrent-newer-drops-first");
+    let guard_one = agent.begin_session_load(&sid);
+    let guard_two = agent.begin_session_load(&sid);
+
+    // Superseded load finishes first.
+    drop(guard_two);
+    assert!(
+        agent.loading_sessions.borrow().contains_key(&sid),
+        "dropping the newer guard must not clear the older in-flight load marker"
+    );
+    assert_eq!(
+        agent.wait_for_in_flight_session_load(&sid).await,
+        SessionLoadWait::TimedOut,
+        "with the older load still active, waiter-side lookup must fail closed"
+    );
+    drop(guard_one);
+}
 /// The load-restore bypass is owner-bound: with duplicate loads of the same
 /// session, the second `begin_session_load` replaces the marker, so the older
 /// load must NOT resolve a handle through the newer load's marker — only the
