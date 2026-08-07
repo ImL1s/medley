@@ -378,5 +378,7 @@ jobs:
           }
           run_nonzero -p xai-grok-sampler --lib \
             ambient_token_labelled_explicit_header -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            dual_auth_gateway_model_key_plus_declared_header -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             seeded_ambient_key_must_not_keep_a_post_strip -- --nocapture

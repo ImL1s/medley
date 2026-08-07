@@ -2738,21 +2738,21 @@ fn build_agent_with_auth(auth: crate::auth::GrokAuth) -> MvpAgent {
     let cfg = AgentConfig::default();
     MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config")
 }
-/// #180: `seed_client_config_auth_if_available` must not decouple the
-/// credential bytes from the credential label.
+/// #180: `seed_client_config_auth_if_available` must not reinject ambient
+/// credentials into a post-strip header-auth route.
 ///
 /// `sampling_config_for_model` treats `ExplicitHeader` as a **post-strip**
 /// label: for a model that authenticates by a header the user declared, it
 /// sets `credentials.api_key = None` and *then* writes `ExplicitHeader`, so
 /// the label means "the ambient credential has been removed". The seed's
-/// `api_key.is_none()` gate is satisfied by exactly that strip, so it puts
-/// the ambient session bytes back — while never touching
-/// `credential_source` (its only mention in `agent_ops.rs` is a read).
+/// `api_key.is_none()` gate is satisfied by exactly that strip; without the
+/// early return it would put the ambient session bytes back.
 ///
-/// The resulting pair is `{ api_key: <ambient session JWT>, credential_source:
-/// ExplicitHeader }`. `ExplicitHeader` is not `is_ambient_xai`, so L3
-/// (`SamplingClient::new`) stops refusing the route on an external origin —
-/// see the sampler-side companion
+/// The property is stronger than "do not leave the inconsistent pair": the
+/// seed must not reinject ambient bytes **at all**. Stamping `XaiSession` on
+/// reinjection would make the pair consistent and L3-refuse the route, while
+/// an assertion that only checks `!(api_key.is_some() && ExplicitHeader)`
+/// would stay green. See the sampler-side companion
 /// `ambient_token_labelled_explicit_header_must_not_reach_an_external_origin`.
 #[tokio::test(flavor = "current_thread")]
 async fn seeded_ambient_key_must_not_keep_a_post_strip_explicit_header_label() {
@@ -2837,19 +2837,27 @@ async fn seeded_ambient_key_body() {
     agent.seed_client_config_auth_if_available();
 
     let seeded = agent.sampling_config.borrow();
-    let labelled_explicit_header = matches!(
-        seeded.credential_source,
-        Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
+    // Property: the seed must not reinject ambient bytes into a post-strip
+    // header-auth route *at all* — not merely avoid leaving the inconsistent
+    // pair. Removing only the ExplicitHeader early-return while keeping the
+    // XaiSession stamp reinjects ambient under a consistent ambient label;
+    // the old `!(api_key.is_some() && ExplicitHeader)` assertion stayed green
+    // on that mutation while the route became ambient-labelled and L3-refused.
+    assert!(
+        seeded.api_key.is_none(),
+        "the seed reinjected a credential into a post-strip header-auth \
+         route. That route authenticates by the user's declared header on an \
+         external origin; ambient bytes must stay absent under every label. \
+         (Value withheld.)"
     );
     assert!(
-        !(seeded.api_key.is_some() && labelled_explicit_header),
-        "the seed re-introduced a credential while leaving the post-strip \
-         `ExplicitHeader` label in place. That label asserts the ambient \
-         credential was removed, and L3 keys its refusal on \
-         `is_ambient_xai()` — which `ExplicitHeader` is not — so this pair \
-         carries an ambient xAI session token to a third-party origin with \
-         every layer believing it is the user's own header. Bytes and label \
-         must be written together. (Value withheld.)"
+        matches!(
+            seeded.credential_source,
+            Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
+        ),
+        "post-strip header-auth label must remain ExplicitHeader after seed; \
+         got {:?}",
+        seeded.credential_source
     );
 }
 /// Regression: boot-time plugin discovery is deferred past ACP

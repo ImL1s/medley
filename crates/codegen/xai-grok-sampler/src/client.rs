@@ -53,6 +53,11 @@ const OPENAI_FEDRAMP: HeaderName = HeaderName::from_static("x-openai-fedramp");
 const ORIGINATOR: HeaderName = HeaderName::from_static("originator");
 const GROK_BUILD_ORIGINATOR: HeaderValue = HeaderValue::from_static("grok_build");
 
+/// L3 ambient-origin refusal. Shared with tests so the "exact identity" match
+/// is the same string the production gate returns (#180).
+pub(crate) const AMBIENT_XAI_NON_FIRST_PARTY_REFUSAL: &str =
+    "ambient xAI credential is not allowed for a non-first-party endpoint";
+
 fn should_send_xai_identity_headers(auth_scheme: AuthScheme, base_url: &str) -> bool {
     !matches!(auth_scheme, AuthScheme::None) && crate::util::is_xai_api_url(base_url)
 }
@@ -844,7 +849,7 @@ impl SamplingClient {
                 ));
         if !ambient_origin_allowed && ambient_credential_present {
             return Err(SamplingError::InvalidConfiguration(
-                "ambient xAI credential is not allowed for a non-first-party endpoint",
+                AMBIENT_XAI_NON_FIRST_PARTY_REFUSAL,
             ));
         }
         let is_codex = matches!(config.api_backend, ApiBackend::CodexResponses);
@@ -3223,6 +3228,33 @@ mod tests {
         })
         .expect("an ambient credential on a first-party origin is the normal flow");
     }
+
+    /// #180: dual-auth gateway — model owns an `api_key` *and* declares a
+    /// credential header (edge key). After the seam fix, provenance is
+    /// `ModelApiKey` (not re-derived `ExplicitHeader`), so L3 must construct.
+    ///
+    /// The broken intermediate was `{api_key: Some(byok), ExplicitHeader,
+    /// External}`: reconstruct preferred the header map and L3 treated that
+    /// pair as ambient. This is the route the fix exists to protect.
+    #[test]
+    fn dual_auth_gateway_model_key_plus_declared_header_constructs_on_external() {
+        use crate::config::CredentialSource;
+        let mut extra_headers = IndexMap::new();
+        extra_headers.insert("x-api-key".to_string(), "sk-gateway-edge".to_string());
+        SamplingClient::new(SamplerConfig {
+            api_key: Some("sk-upstream-byok".to_string()),
+            base_url: "https://gateway.example/v1".to_string(),
+            credential_source: Some(CredentialSource::ModelApiKey),
+            extra_headers,
+            endpoint_trust: Some(EndpointTrustClass::External),
+            ..minimal_config()
+        })
+        .expect(
+            "dual-auth gateway with a non-ambient model key must construct on \
+             an external origin; re-labelling it ExplicitHeader while keeping \
+             api_key is the #180 L3 false-refuse",
+        );
+    }
     /// A model-declared key reaches its own provider untouched, and nothing
     /// ambient rides along. Built rather than sent: the built request carries
     /// exactly the headers that would go on the wire, which is what is being
@@ -3973,16 +4005,15 @@ mod tests {
     /// `ExplicitHeader` is a **post-strip** label. `sampling_config_for_model`
     /// (shell, `agent/config.rs`) writes it only after `credentials.api_key =
     /// None`, so it means "the ambient credential has been removed and the
-    /// user's declared header is the only auth". The shell's turn seam
-    /// re-derives the same label from the header maps *before* any strip, so
-    /// the label can describe the config while `api_key` still holds ambient
-    /// bytes.
+    /// user's declared header is the only auth". Production seams take the
+    /// label from `Credentials` (#180) so this pair is only a genuine
+    /// mislabel (built here by hand, or from a seed that reinjects ambient
+    /// without updating the label). L3 still refuses it as belt-and-braces.
     ///
-    /// That mislabel disarms L3: the refusal below keys on
-    /// `CredentialSource::is_ambient_xai()`, which is false for
-    /// `ExplicitHeader`. And a declared `x-api-key` does not occupy the
-    /// `Authorization` slot that `AuthScheme::Bearer` writes, so the two do
-    /// not collide — both go out.
+    /// That mislabel would disarm a label-only gate: `is_ambient_xai()` is
+    /// false for `ExplicitHeader`. And a declared `x-api-key` does not occupy
+    /// the `Authorization` slot that `AuthScheme::Bearer` writes, so the two
+    /// would both go out.
     ///
     /// The assertion is deliberately about the wire rather than about which
     /// layer refuses: a fix may either decline to construct the route or drop
@@ -4036,11 +4067,11 @@ mod tests {
         // Either L3 refuses construction with the ambient-origin refusal, or
         // construction succeeds and the wire has no ambient token. An unexamined
         // `Err` early-return would green on unrelated construction failures.
-        const AMBIENT_ORIGIN_REFUSAL: &str =
-            "ambient xAI credential is not allowed for a non-first-party endpoint";
         let client = match built {
             Ok(client) => client,
-            Err(SamplingError::InvalidConfiguration(msg)) if msg == AMBIENT_ORIGIN_REFUSAL => {
+            Err(SamplingError::InvalidConfiguration(msg))
+                if msg == super::AMBIENT_XAI_NON_FIRST_PARTY_REFUSAL =>
+            {
                 return;
             }
             Err(other) => {

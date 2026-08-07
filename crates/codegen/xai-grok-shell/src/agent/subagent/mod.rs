@@ -834,32 +834,25 @@ async fn read_parent_sampling_config(
             .unwrap_or(ctx.sampling_config.auth_scheme);
             let inherited_base_url = cfg.base_url.clone();
             let strip_guard = ctx.would_strip_fallback_key(creds.api_key());
-            // #110 / #136 steps 2-3: the parent chat-state `SamplingConfig`
-            // carries headers but not `credential_source`. Prefer re-deriving
-            // an `ExplicitHeader` from the header maps (still the live wire
-            // proof that a declared header is present); fall back to the
-            // provenance step 1 bound onto parent `Credentials` so ordinary
-            // session-token / BYOK parents no longer arrive unlabelled.
+            // #110 / #136 / #180: provenance comes from parent `Credentials`
+            // alone. After #136 the secret is bound with its source; after
+            // #180 do not re-derive `ExplicitHeader` from the header maps —
+            // a dual-auth parent (model key + declared header) is
+            // `ModelApiKey` and inventing `ExplicitHeader` while keeping
+            // `api_key` made L3 refuse a legitimate route.
             //
-            // Passing that source into `inherited_bearer_resolver` also gates
-            // the session resolver when the stored label is `ExplicitHeader`
-            // even if the env var has since been unset (header re-derivation
-            // yields nothing). The child then has neither key nor resolver and
-            // gets a 401 — conservative, and consistent with #110 treating a
-            // declared header as terminal auth.
+            // `declared_credential_header` still gates the session resolver
+            // (header still ships on the wire). Passing the *stored* source
+            // into `inherited_bearer_resolver` also gates when the label is
+            // `ExplicitHeader` even if the env var has since been unset
+            // (header re-derivation would yield nothing). The child then has
+            // neither key nor resolver and gets a 401 — conservative, and
+            // consistent with #110 treating a declared header as terminal auth.
             let declared_credential_header = crate::agent::config::explicit_credential_header_in(
                 &extra_headers,
                 &cfg.env_http_headers,
             );
-            let credential_source = declared_credential_header
-                .clone()
-                .map(
-                    |(header, env)| xai_grok_sampler::CredentialSource::ExplicitHeader {
-                        header,
-                        env,
-                    },
-                )
-                .or_else(|| creds.source_cloned());
+            let credential_source = creds.source_cloned();
             let api_key = if auth_scheme == xai_grok_sampler::AuthScheme::None {
                 None
             } else {
