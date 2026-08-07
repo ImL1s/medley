@@ -383,6 +383,23 @@ fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
 }
 
 #[cfg(test)]
+pub(crate) fn write_executable_stub(path: impl AsRef<Path>, contents: &[u8]) -> PathBuf {
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = path.as_ref();
+    let mut file = fs::File::create(path).expect("create executable stub");
+    file.write_all(contents).expect("write executable stub");
+    file.sync_all().expect("sync executable stub");
+    // Linux can return ETXTBSY if the executable is still open for write.
+    drop(file);
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod executable stub");
+    path.to_path_buf()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -534,9 +551,7 @@ mod tests {
     #[test]
     fn emit_rerun_if_changed_handles_non_utf8_well_known_types_dependency() {
         use std::ffi::OsStr;
-        use std::io::Write;
         use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
 
         let dir = temp_dir_named("nonutf8-dep");
@@ -555,14 +570,7 @@ mod tests {
         script_content.extend_from_slice(b"\n'\n");
         script_content.extend_from_slice(b"exit 0\n");
 
-        // Linux can return ETXTBSY when executing a file still open for write.
-        // Keep ownership explicit: write, flush, and close before exec.
-        {
-            let mut file = fs::File::create(&protoc_script).expect("create stub protoc");
-            file.write_all(&script_content).expect("write stub protoc");
-            file.sync_all().expect("sync stub protoc");
-        }
-        fs::set_permissions(&protoc_script, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let protoc_script = write_executable_stub(protoc_script, &script_content);
 
         let include_dir_bytes = b"/opt/we\xffird/include";
         let include_dir = Path::new(OsStr::from_bytes(include_dir_bytes));
