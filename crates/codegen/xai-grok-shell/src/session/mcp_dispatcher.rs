@@ -201,6 +201,14 @@ pub(crate) struct ShutdownState {
     /// the spawned task's RAII guard on every exit path. Lives next to
     /// `shutting_down` so both share the one `SharedShutdownState` lock.
     in_flight_restart: HashSet<McpServerName>,
+    /// Per-server early-death budgets (issue #45). Handshake-OK then
+    /// transport-close within [`crate::session::mcp_restart::STABILITY_WINDOW`]
+    /// burns a cycle; after [`crate::session::mcp_restart::MAX_EARLY_DEATHS`]
+    /// consecutive early exits the server is parked. The park is
+    /// cleared by [`Self::note_recovery_ready`] — a `Ready` observed in
+    /// [`flush_window`] — so a user who fixes and re-adds the server
+    /// gets auto-restart back without restarting the session.
+    restart_budgets: HashMap<McpServerName, crate::session::mcp_restart::RestartBudget>,
 }
 
 impl ShutdownState {
@@ -226,6 +234,43 @@ impl ShutdownState {
     /// Release the in-flight restart claim taken by [`Self::begin_restart`].
     pub(crate) fn end_restart(&mut self, name: &str) {
         self.in_flight_restart.remove(name);
+    }
+
+    /// Record an [`crate::session::mcp_restart::auto_restart_stdio`]
+    /// handshake for the early-death budget. Starts the stability
+    /// window; does not clear a park (see `note_recovery_ready`).
+    pub(crate) fn note_ready(&mut self, name: &str) {
+        self.restart_budgets
+            .entry(name.to_string())
+            .or_default()
+            .note_ready(tokio::time::Instant::now());
+    }
+
+    /// Record a handshake the **dispatcher** observed on the client
+    /// event stream and clear any park — the documented recovery path
+    /// for a server whose early-death budget ran out. Called only from
+    /// [`flush_window`]'s `Ready` arm; see
+    /// [`crate::session::mcp_restart::RestartBudget::note_recovery_ready`]
+    /// for why a dispatcher `Ready` implies user-initiated recovery.
+    pub(crate) fn note_recovery_ready(&mut self, name: &str) {
+        self.restart_budgets
+            .entry(name.to_string())
+            .or_default()
+            .note_recovery_ready(tokio::time::Instant::now());
+    }
+
+    /// Classify a death event against the early-death budget. Only
+    /// `TransportClosed` feeds the counter — see
+    /// [`crate::session::mcp_restart::RestartBudget::classify_death`].
+    pub(crate) fn classify_death(
+        &mut self,
+        name: &str,
+        kind: McpClientEventKind,
+    ) -> crate::session::mcp_restart::DeathDisposition {
+        self.restart_budgets
+            .entry(name.to_string())
+            .or_default()
+            .classify_death(tokio::time::Instant::now(), kind)
     }
 }
 
@@ -508,6 +553,13 @@ pub(crate) fn flush_window(
             }
             McpClientEventKind::Ready => {
                 shutdown_guard.forget(server);
+                // Starts the early-death stability window so a crash
+                // right after first init counts toward the budget, and
+                // clears any park — a handshake the dispatcher sees is
+                // never one auto-restart performed, so after a park it
+                // can only be the user fixing the server (Refresh /
+                // re-add / toggle-on). Issue #45.
+                shutdown_guard.note_recovery_ready(server);
             }
             _ => {}
         }
@@ -1528,6 +1580,34 @@ mod tests {
             Ok(())
         }
         fn push_status(&self, _payload: &crate::session::mcp_dispatcher::McpServerStatusPayload) {}
+        fn begin_restart(&self, server: &str) -> bool {
+            self.shutdown
+                .lock()
+                .expect("ShutdownState mutex poisoned")
+                .begin_restart(server.to_string())
+        }
+        fn end_restart(&self, server: &str) {
+            self.shutdown
+                .lock()
+                .expect("ShutdownState mutex poisoned")
+                .end_restart(server);
+        }
+        fn note_ready(&self, server: &str) {
+            self.shutdown
+                .lock()
+                .expect("ShutdownState mutex poisoned")
+                .note_ready(server);
+        }
+        fn classify_death(
+            &self,
+            server: &str,
+            kind: McpClientEventKind,
+        ) -> crate::session::mcp_restart::DeathDisposition {
+            self.shutdown
+                .lock()
+                .expect("ShutdownState mutex poisoned")
+                .classify_death(server, kind)
+        }
     }
 
     /// End-to-end: a `TransportClosed` event flowing through
@@ -1754,6 +1834,71 @@ mod tests {
         assert!(
             !shutdown.lock().unwrap().is_shutting_down("removed"),
             "Ready must clear shutting_down",
+        );
+    }
+
+    /// Issue #45 recovery wiring: the early-death park is NOT
+    /// session-permanent. `flush_window` observing a `Ready` — the
+    /// event a Refresh / config re-add / toggle-on produces — must
+    /// clear it through `ShutdownState::note_recovery_ready`, so a user
+    /// who fixes the server's command gets auto-restart back.
+    ///
+    /// Drives the real `ShutdownState`, so it fails if `flush_window`
+    /// is ever reverted to the plain `note_ready` (which by design
+    /// cannot unpark).
+    #[tokio::test(start_paused = true)]
+    async fn flush_window_ready_clears_the_early_death_park() {
+        use crate::session::mcp_restart::{DeathDisposition, MAX_EARLY_DEATHS};
+
+        let shutdown = new_shutdown_state();
+        let gateway = discard_gateway();
+
+        // Drive "parky" to a park. The clock is paused and never
+        // advanced, so every death lands inside STABILITY_WINDOW.
+        {
+            let mut guard = shutdown.lock().unwrap();
+            guard.note_ready("parky");
+            for cycle in 0..MAX_EARLY_DEATHS {
+                assert!(
+                    matches!(
+                        guard.classify_death("parky", McpClientEventKind::TransportClosed),
+                        DeathDisposition::Proceed { .. }
+                    ),
+                    "cycle {cycle} is still within budget",
+                );
+            }
+            assert!(
+                matches!(
+                    guard.classify_death("parky", McpClientEventKind::TransportClosed),
+                    DeathDisposition::Exhausted
+                ),
+                "the death past the budget must park",
+            );
+            assert!(
+                matches!(
+                    guard.classify_death("parky", McpClientEventKind::TransportClosed),
+                    DeathDisposition::AlreadyParked
+                ),
+                "and stay parked",
+            );
+        }
+
+        let mut buf: HashMap<(McpServerName, McpClientEventKind), McpClientEvent> = HashMap::new();
+        buf.insert(
+            ("parky".to_string(), McpClientEventKind::Ready),
+            McpClientEvent::Ready {
+                server: "parky".to_string(),
+            },
+        );
+        flush_window("s", buf, &shutdown, &gateway);
+
+        let mut guard = shutdown.lock().unwrap();
+        assert!(
+            matches!(
+                guard.classify_death("parky", McpClientEventKind::TransportClosed),
+                DeathDisposition::Proceed { .. }
+            ),
+            "a dispatcher-observed Ready must clear the park",
         );
     }
 }

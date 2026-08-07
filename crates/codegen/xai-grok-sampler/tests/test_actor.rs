@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::response::sse::{Event, Sse};
 use axum::routing::post;
 use futures_util::stream::{self, StreamExt};
@@ -886,6 +887,192 @@ async fn responses_confident_doom_loop_signal_resamples_once() {
         response.doom_loop_signals.is_empty(),
         "the accepted response is the clean resample"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Attempt discard on retry after streamed output (#44)
+// ---------------------------------------------------------------------------
+
+/// Reconstruct user-visible text the way a retracting consumer must: accumulate
+/// `ChannelToken` text per attempt, drop the attempt buffer on
+/// `AttemptDiscarded`, commit only on `Completed`.
+fn visible_text_with_discard(events: &[SamplingEvent]) -> String {
+    let mut accepted = String::new();
+    let mut attempt = String::new();
+    for ev in events {
+        match ev {
+            SamplingEvent::ChannelToken {
+                channel: SamplingChannel::Text,
+                text,
+                ..
+            } => attempt.push_str(text),
+            SamplingEvent::AttemptDiscarded { .. } => attempt.clear(),
+            SamplingEvent::Completed { .. } => {
+                accepted.push_str(&attempt);
+                attempt.clear();
+            }
+            _ => {}
+        }
+    }
+    accepted
+}
+
+/// Attempt streams text, fails retryably mid-stream, retry succeeds → final
+/// visible text is the successful attempt's content exactly once (issue #44).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streamed_text_then_retryable_failure_discards_and_succeeds_once() {
+    use axum::body::Body;
+    use axum::http::header;
+
+    let counter = Arc::new(AtomicU32::new(0));
+    let counter_handler = Arc::clone(&counter);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let counter = Arc::clone(&counter_handler);
+            async move {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // Deliver one SSE text delta, pause so the client can
+                    // parse/forward it, then abort the body mid-stream. A
+                    // pure `Sse::new(Err)` fails before any chunk is delivered;
+                    // a raw body stream + gap is the established mid-stream
+                    // abort pattern (see mcp repro_sse_flood).
+                    let chunk = json!({
+                        "id": "chatcmpl-partial",
+                        "object": "chat.completion.chunk",
+                        "created": 0,
+                        "model": "test-model",
+                        "choices": [{
+                            "index": 0,
+                            "delta": { "role": "assistant", "content": "hello" },
+                            "finish_reason": null
+                        }]
+                    });
+                    let sse_frame = format!("data: {chunk}\n\n");
+                    let body = Body::from_stream(
+                        stream::iter([Ok::<_, std::io::Error>(sse_frame)]).chain(stream::once(
+                            async {
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                Err(std::io::Error::other("body aborted mid-stream"))
+                            },
+                        )),
+                    );
+                    ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
+                } else {
+                    Sse::new(stream::iter(
+                        sse::chat_completion_events("hello", "test-model")
+                            .into_iter()
+                            .map(Ok::<_, std::convert::Infallible>),
+                    ))
+                    .into_response()
+                }
+            }
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    // Default RetryPolicy has retry_only_before_output = false, so a
+    // post-output transport failure still retries (the bug scenario).
+    let cfg = test_config(server.base_url(), "test-model");
+    let handle = SamplerActor::spawn(cfg, RetryPolicy::default(), event_tx);
+
+    let rid = RequestId::from("req-discard-restream");
+    handle.submit(rid.clone(), user_request("hi"));
+
+    let events = drain_until_terminal(&mut event_rx, Duration::from_secs(15)).await;
+    server.shutdown();
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, SamplingEvent::AttemptDiscarded { .. })),
+        "expected AttemptDiscarded before the retry; events={events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, SamplingEvent::Retrying { .. })),
+        "expected Retrying after discard; events={events:?}"
+    );
+
+    // Without discard, a naive consumer that concatenates every ChannelToken
+    // would see "hellohello". With discard it must be exactly once.
+    let naive: String = events
+        .iter()
+        .filter_map(|e| match e {
+            SamplingEvent::ChannelToken {
+                channel: SamplingChannel::Text,
+                text,
+                ..
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        naive, "hellohello",
+        "fixture must stream the token on both attempts so discard is load-bearing"
+    );
+
+    let visible = visible_text_with_discard(&events);
+    assert_eq!(
+        visible, "hello",
+        "consumer that honors AttemptDiscarded must show the text exactly once"
+    );
+
+    match events.last().unwrap() {
+        SamplingEvent::Completed { response, .. } => {
+            assert_eq!(response.assistant_text(), "hello");
+        }
+        other => panic!("expected Completed after retry, got {other:?}"),
+    }
+    assert!(
+        counter.load(Ordering::SeqCst) >= 2,
+        "server must have been hit at least twice"
+    );
+}
+
+/// An accepted first attempt must not emit AttemptDiscarded and must keep
+/// every streamed token (no added latency / no dropped content).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_attempt_emits_no_discard_and_keeps_text() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            let events = sse::chat_completion_events("once only", "test-model");
+            Sse::new(stream::iter(
+                events.into_iter().map(Ok::<_, std::convert::Infallible>),
+            ))
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let cfg = test_config(server.base_url(), "test-model");
+    let handle = SamplerActor::spawn(cfg, RetryPolicy::default(), event_tx);
+
+    handle.submit(RequestId::from("req-accept"), user_request("hi"));
+    let events = drain_until_terminal(&mut event_rx, Duration::from_secs(5)).await;
+    server.shutdown();
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, SamplingEvent::AttemptDiscarded { .. })),
+        "accepted attempt must not emit AttemptDiscarded; events={events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, SamplingEvent::Retrying { .. })),
+        "accepted attempt must not retry"
+    );
+    assert_eq!(visible_text_with_discard(&events), "once only");
+    match events.last().unwrap() {
+        SamplingEvent::Completed { response, .. } => {
+            assert_eq!(response.assistant_text(), "once only");
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -696,8 +696,14 @@ pub(super) fn dispatch_dashboard_create_new_agent_with_detail(app: &mut AppView)
     log_dashboard_launched("new_agent_button");
     let (new_id, effects) = dispatch_new_session_inner_with_id(app, model_id);
     let policy_block = app.yolo_policy_block;
-    if let Some(agent) = app.agents.get_mut(&new_id) {
-        apply_pending_dispatch_config(agent, pending_model.as_ref(), pending_mode, policy_block);
+    if app.agents.contains_key(&new_id) {
+        apply_pending_dispatch_config(
+            app,
+            new_id,
+            pending_model.as_ref(),
+            pending_mode,
+            policy_block,
+        );
     }
     if let Some(d) = app.dashboard.as_mut() {
         d.restore_peek_viewport(&mut app.agents);
@@ -1006,14 +1012,20 @@ pub(super) fn dispatch_dashboard_confirm_worktree(
         // then carry any pasted images onto the replayed prompt — both mirror
         // `dispatch_dashboard_dispatch`.
         let policy_block = app.yolo_policy_block;
-        if let Some(agent) = app.agents.get_mut(&new_id) {
-            apply_pending_dispatch_config(
-                agent,
+        let mut model_switch_refused = false;
+        if app.agents.contains_key(&new_id) {
+            model_switch_refused = apply_pending_dispatch_config(
+                app,
+                new_id,
                 pending_model.as_ref(),
                 pending_mode,
                 policy_block,
             );
-            if let Some(entry) = agent.session.pending_prompts.back_mut() {
+            if let Some(entry) = app
+                .agents
+                .get_mut(&new_id)
+                .and_then(|agent| agent.session.pending_prompts.back_mut())
+            {
                 entry.images = std::mem::take(&mut images);
                 entry.chip_elements = chip_elements;
             }
@@ -1030,6 +1042,12 @@ pub(super) fn dispatch_dashboard_confirm_worktree(
             // Plain Enter: undo the view switch `dispatch_new_worktree_session`
             // made and stay on the dashboard.
             app.active_view = ActiveView::AgentDashboard;
+            // A refused model+effort pick already completed with a toast on
+            // the new agent — invisible while the view stays on the dashboard,
+            // so mirror it on the dashboard's error slot.
+            if model_switch_refused && let Some(d) = app.dashboard.as_mut() {
+                d.set_error_toast("Wait for the current model switch to finish");
+            }
         }
     }
     crate::prompt_images::drain_and_cleanup(&mut images);
@@ -1209,13 +1227,23 @@ pub(super) fn dispatch_dashboard_dispatch(
     log_dashboard_launched("prompt");
     let (new_id, effects) = dispatch_new_session_inner_with_id(app, model_id);
     let policy_block = app.yolo_policy_block;
-    if let Some(agent) = app.agents.get_mut(&new_id) {
-        agent.session.enqueue_prompt(prompt_text);
-        if let Some(entry) = agent.session.pending_prompts.back_mut() {
-            entry.images = std::mem::take(&mut pasted_images);
-            entry.chip_elements = chip_elements;
+    let mut model_switch_refused = false;
+    if app.agents.contains_key(&new_id) {
+        {
+            let agent = app.agents.get_mut(&new_id).expect("checked above");
+            agent.session.enqueue_prompt(prompt_text);
+            if let Some(entry) = agent.session.pending_prompts.back_mut() {
+                entry.images = std::mem::take(&mut pasted_images);
+                entry.chip_elements = chip_elements;
+            }
         }
-        apply_pending_dispatch_config(agent, pending_model.as_ref(), pending_mode, policy_block);
+        model_switch_refused = apply_pending_dispatch_config(
+            app,
+            new_id,
+            pending_model.as_ref(),
+            pending_mode,
+            policy_block,
+        );
     }
     crate::prompt_images::drain_and_cleanup(&mut pasted_images);
     // Only clear the input AFTER successful session
@@ -1257,6 +1285,12 @@ pub(super) fn dispatch_dashboard_dispatch(
             && let Some(d) = app.dashboard.as_mut()
         {
             d.set_error_toast(warning);
+        }
+        // Same invisibility for a refused model+effort pick: the request
+        // already completed with a toast on the new agent — mirror it here so
+        // the refusal is not silent on the surface the user is looking at.
+        if model_switch_refused && let Some(d) = app.dashboard.as_mut() {
+            d.set_error_toast("Wait for the current model switch to finish");
         }
     }
     effects
@@ -1610,26 +1644,69 @@ fn block_dashboard_spawn_on_pending_model(
 /// `model_id`; here we stash the reasoning effort (pushed to the shell once
 /// the session exists, mirroring the agent-view flow) and the deferred plan
 /// `SessionMode` (consumed in the `SessionCreated` handlers).
+///
+/// The effort stash is a pre-session switch, so it enters the same
+/// app-global admission contract as the agent-view pick paths: the slot is
+/// reserved via `begin_deferred_model_switch` BEFORE the stash is written.
+/// When another agent's switch holds the slot, the refusal completes the
+/// request immediately — same toast as the live path, nothing stashed — so
+/// hydration has nothing left to drop, silently or otherwise.
+///
+/// Returns `true` when a staged model+effort pick was refused that way. The
+/// refusal toast lands on the new agent, which is invisible while the view
+/// stays on the dashboard — callers whose dispatch keeps the dashboard
+/// visible must mirror it via `set_error_toast` (the
+/// `block_dashboard_spawn_on_pending_model` convention).
 pub(super) fn apply_pending_dispatch_config(
-    agent: &mut AgentView,
+    app: &mut AppView,
+    agent_id: AgentId,
     pending_model: Option<&crate::views::dashboard::PendingDispatchModel>,
     pending_mode: crate::views::dashboard::DashboardDispatchMode,
     policy_block: Option<&'static str>,
-) {
+) -> bool {
     use crate::views::dashboard::DashboardDispatchMode;
 
+    let mut model_switch_refused = false;
     if let Some(m) = pending_model {
         // The base model is seeded via `CreateSession.model_id`; only stash a
         // deferred switch when an explicit effort must be pushed. Setting it
         // (or clearing to `None`) also overrides any CLI `-m` default so the
         // dashboard's `/model` choice wins.
-        agent.session.deferred_model_switch = m.effort.map(|e| DeferredModelSwitch {
-            model_id: m.id.clone(),
-            effort: Some(e),
-            // Effort-only push; no display change to roll back.
-            prev_model_id: None,
-        });
+        match m.effort {
+            Some(effort) => {
+                if crate::app::dispatch::session::lifecycle::begin_deferred_model_switch(
+                    app, agent_id, false,
+                ) && let Some(agent) = app.agents.get_mut(&agent_id)
+                {
+                    agent.session.deferred_model_switch = Some(DeferredModelSwitch {
+                        model_id: m.id.clone(),
+                        effort: Some(effort),
+                        // Effort-only push; no display change to roll back.
+                        prev_model_id: None,
+                    });
+                } else if let Some(agent) = app.agents.get_mut(&agent_id) {
+                    // Refused at stash time: the request completes here, once,
+                    // with the same notice the live switch path uses. Clear
+                    // any pre-existing stash too — every fresh session is
+                    // seeded from CLI `-m`, and leaving it would let hydration
+                    // switch this session to a model the user did not pick
+                    // (once the in-flight switch frees the slot), reporting
+                    // this same sentence a second time.
+                    agent.session.deferred_model_switch = None;
+                    agent.show_toast("Wait for the current model switch to finish");
+                    model_switch_refused = true;
+                }
+            }
+            None => {
+                if let Some(agent) = app.agents.get_mut(&agent_id) {
+                    agent.session.deferred_model_switch = None;
+                }
+            }
+        }
     }
+    let Some(agent) = app.agents.get_mut(&agent_id) else {
+        return model_switch_refused;
+    };
     match pending_mode {
         DashboardDispatchMode::Normal => {
             // Explicit normal overrides any `app.default_yolo` seed.
@@ -1655,6 +1732,7 @@ pub(super) fn apply_pending_dispatch_config(
             }
         }
     }
+    model_switch_refused
 }
 
 /// Send or queue a reply typed into the peek panel's `❯ reply` input.

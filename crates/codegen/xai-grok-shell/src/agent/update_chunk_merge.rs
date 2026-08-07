@@ -1067,4 +1067,51 @@ mod tests {
         assert!(matches!(rest, Some(SessionNotification::Xai(_))));
         assert!(buf.pending.is_none());
     }
+
+    /// #44: without the run_loop special-case, AttemptDiscarded force-flushes
+    /// any pending agent text (different kinds cannot merge). The special-case
+    /// instead drops the pending slot via flush-and-discard.
+    #[test]
+    fn attempt_discarded_without_special_case_would_flush_abandoned_text() {
+        let mut buf = ReplayBuffer::new(Some(settings(100, 1_000_000)));
+        assert!(buf.consume_chunk(msg_chunk("s", 1, "hello")).is_none());
+        let discard = crate::extensions::notification::SessionNotification {
+            session_id: acp::SessionId::new("s"),
+            update: crate::extensions::notification::SessionUpdate::AttemptDiscarded,
+            meta: None,
+        };
+        let (first, second) = buf
+            .consume_chunk(discard)
+            .expect("cross-kind must force-flush");
+        assert!(
+            matches!(first, SessionNotification::Acp(_)),
+            "naive path emits abandoned agent text first"
+        );
+        assert!(
+            matches!(
+                second,
+                Some(SessionNotification::Xai(ref n))
+                    if matches!(
+                        n.update,
+                        crate::extensions::notification::SessionUpdate::AttemptDiscarded
+                    )
+            ),
+            "then the retraction"
+        );
+    }
+
+    /// #44: the run_loop special-case — drop pending without emit, then only
+    /// the retraction remains to forward.
+    #[test]
+    fn attempt_discarded_special_case_drops_pending_without_emitting_text() {
+        let mut buf = ReplayBuffer::new(Some(settings(100, 1_000_000)));
+        assert!(buf.consume_chunk(msg_chunk("s", 1, "hello")).is_none());
+        let dropped = buf.flush();
+        assert!(
+            matches!(dropped, Some(SessionNotification::Acp(_))),
+            "pending agent text is held for drop"
+        );
+        assert!(buf.flush().is_none(), "buffer empty after drop");
+        // Retraction is forwarded separately (not through consume_chunk).
+    }
 }

@@ -1212,23 +1212,332 @@ fn dashboard_second_stash_does_not_overwrite_first() {
 fn apply_pending_dispatch_config_always_approve_blocked_by_policy_pin() {
     use crate::views::dashboard::DashboardDispatchMode;
     let mut app = test_app_with_agent();
-    let agent = app.agents.get_mut(&AgentId(0)).unwrap();
     apply_pending_dispatch_config(
-        agent,
+        &mut app,
+        AgentId(0),
         None,
         DashboardDispatchMode::AlwaysApprove,
         Some(POLICY_WARNING),
     );
+    {
+        let agent = &app.agents[&AgentId(0)];
+        assert!(
+            !agent.session.is_yolo(),
+            "staged Always-Approve must not enable yolo under the pin"
+        );
+        assert_eq!(
+            agent.toast.as_ref().map(|(s, _)| s.as_str()),
+            Some(POLICY_WARNING),
+        );
+    }
+    apply_pending_dispatch_config(
+        &mut app,
+        AgentId(0),
+        None,
+        DashboardDispatchMode::AlwaysApprove,
+        None,
+    );
+    assert!(app.agents[&AgentId(0)].session.is_yolo());
+}
+/// A dashboard effort stash is a pre-session switch, so it must clear the
+/// app-global admission contract BEFORE it is stashed. When another agent's
+/// switch holds the slot, the refusal completes the request exactly once at
+/// stash time — shared wait toast, nothing stashed — leaving hydration
+/// nothing to re-report or silently drop.
+#[test]
+fn dashboard_effort_stash_refused_while_other_switch_in_flight_completes_once() {
+    use crate::views::dashboard::{DashboardDispatchMode, PendingDispatchModel};
+    let mut app = test_app_with_agent();
+    let id_a = AgentId(0);
+    let id_b = AgentId(1);
+    let session_b = make_test_agent_session(&app, id_b, "agent-b");
+    app.agents
+        .insert(id_b, AgentView::new(session_b, ScrollbackState::new()));
+    app.next_agent_id = 2;
+    // Freshly spawned by the dashboard: no ACP session id yet.
+    app.agents.get_mut(&id_b).unwrap().session.session_id = None;
+
+    // Agent A owns the global admission slot mid-switch.
+    app.model_switch_transaction = Some(crate::app::app_view::ModelSwitchTransaction {
+        owner_agent_id: id_a,
+        request_id: Some(7),
+        app_models_optimistic: false,
+        app_model_id: None,
+        app_reasoning_effort: None,
+    });
+
+    let model_id = acp::ModelId::new("dashboard-model");
+    let pending = PendingDispatchModel {
+        id: model_id.clone(),
+        effort: Some(xai_grok_shell::sampling::types::ReasoningEffort::High),
+        display: "dashboard-model".to_string(),
+    };
+    apply_pending_dispatch_config(
+        &mut app,
+        id_b,
+        Some(&pending),
+        DashboardDispatchMode::Normal,
+        None,
+    );
+
+    // Refused at stash time: nothing stashed, one structured notice, and the
+    // other agent's in-flight switch is untouched.
+    {
+        let agent_b = &app.agents[&id_b];
+        assert!(
+            agent_b.session.deferred_model_switch.is_none(),
+            "a refused pick must never reach the stash"
+        );
+        assert_eq!(
+            agent_b.toast.as_ref().map(|(msg, _)| msg.as_str()),
+            Some("Wait for the current model switch to finish"),
+            "the refusal must surface the shared wait notice"
+        );
+        assert!(!agent_b.session.model_switch_pending);
+    }
     assert!(
-        !agent.session.is_yolo(),
-        "staged Always-Approve must not enable yolo under the pin"
+        app.model_switch_transaction
+            .as_ref()
+            .is_some_and(|t| t.owner_agent_id == id_a && t.request_id == Some(7)),
+        "a refused pre-session pick must not disturb the in-flight switch"
+    );
+
+    // Hydration has nothing to drop: no SwitchModel effect, and the refusal
+    // is not reported a second time (the toast still holds the stash-time
+    // notice).
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SessionCreated {
+            agent_id: id_b,
+            session_id: acp::SessionId::new("b-session"),
+            models: None,
+            scheduler_background_loops: None,
+        }),
+        &mut app,
+    );
+    assert!(
+        !effects.iter().any(|e| matches!(
+            e,
+            Effect::SwitchModel { agent_id, .. } if *agent_id == id_b
+        )),
+        "no switch may be emitted for a request already completed as refused: {effects:?}"
+    );
+    let agent_b = &app.agents[&id_b];
+    assert_eq!(
+        agent_b.toast.as_ref().map(|(msg, _)| msg.as_str()),
+        Some("Wait for the current model switch to finish"),
+        "the refusal is reported exactly once — at stash time, not again at hydration"
+    );
+    assert!(
+        !agent_b.session.model_switch_pending,
+        "a refused request must not leave the queue gated"
+    );
+}
+/// The same gate admits when the slot is free: the effort stash is written,
+/// the slot is reserved for the new agent, and hydration emits the switch.
+#[test]
+fn dashboard_effort_stash_admitted_when_slot_free() {
+    use crate::views::dashboard::{DashboardDispatchMode, PendingDispatchModel};
+    let mut app = test_app_with_agent();
+    let id_b = AgentId(1);
+    let session_b = make_test_agent_session(&app, id_b, "agent-b");
+    app.agents
+        .insert(id_b, AgentView::new(session_b, ScrollbackState::new()));
+    app.next_agent_id = 2;
+    app.agents.get_mut(&id_b).unwrap().session.session_id = None;
+    let model_id = acp::ModelId::new("dashboard-model");
+    insert_ready_model(&mut app, id_b, &model_id);
+
+    let pending = PendingDispatchModel {
+        id: model_id.clone(),
+        effort: Some(xai_grok_shell::sampling::types::ReasoningEffort::High),
+        display: "dashboard-model".to_string(),
+    };
+    apply_pending_dispatch_config(
+        &mut app,
+        id_b,
+        Some(&pending),
+        DashboardDispatchMode::Normal,
+        None,
+    );
+
+    assert_eq!(
+        app.agents[&id_b].session.deferred_model_switch,
+        Some(crate::app::agent::DeferredModelSwitch {
+            model_id: model_id.clone(),
+            effort: Some(xai_grok_shell::sampling::types::ReasoningEffort::High),
+            prev_model_id: None,
+        }),
+        "an admitted pick is stashed for hydration"
+    );
+    assert!(
+        app.model_switch_transaction
+            .as_ref()
+            .is_some_and(|t| t.owner_agent_id == id_b && t.request_id.is_none()),
+        "the stash must hold the global slot until hydration fills in the request id"
+    );
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SessionCreated {
+            agent_id: id_b,
+            session_id: acp::SessionId::new("b-session"),
+            models: None,
+            scheduler_background_loops: None,
+        }),
+        &mut app,
+    );
+    assert!(
+        effects.iter().any(|e| matches!(
+            e,
+            Effect::SwitchModel { agent_id, model_id: m, effort, .. }
+                if *agent_id == id_b
+                    && m == &model_id
+                    && *effort == Some(xai_grok_shell::sampling::types::ReasoningEffort::High)
+        )),
+        "hydration must emit the admitted switch: {effects:?}"
+    );
+}
+/// Plain-Enter dispatch with a staged model+effort while another agent's
+/// switch holds the global slot: the refusal completes on the new agent's
+/// toast, which is invisible while the view stays on the dashboard — it must
+/// be mirrored on the dashboard's own error slot, or the session starts
+/// without the requested effort and the user is never told.
+///
+/// The same refusal must also clear the CLI `-m` stash every fresh session
+/// is seeded with (this goes through `dispatch_new_session_inner_with_id`
+/// with `cli_model_override` set, so the seeding really happens): leaving it
+/// would let hydration switch the session to a model the user did not pick
+/// once the in-flight switch frees the slot.
+#[serial_test::serial(GROK_AGENT_DASHBOARD)]
+#[test]
+fn dashboard_dispatch_refused_pick_mirrors_error_and_drops_cli_stash() {
+    let mut app = test_app_with_agent();
+    seed_model(&mut app, "grok-4.5", "Grok 4.5");
+    seed_model(&mut app, "grok-4-fast", "Grok 4 Fast");
+    open_dashboard(&mut app);
+    // `medley -m grok-4-fast`: every new session is seeded with this stash.
+    app.cli_model_override = Some(acp::ModelId::new(std::sync::Arc::from("grok-4-fast")));
+    // Agent A owns the global admission slot mid-switch.
+    app.model_switch_transaction = Some(crate::app::app_view::ModelSwitchTransaction {
+        owner_agent_id: AgentId(0),
+        request_id: Some(7),
+        app_models_optimistic: false,
+        app_model_id: None,
+        app_reasoning_effort: None,
+    });
+    let model_id = acp::ModelId::new(std::sync::Arc::from("grok-4.5"));
+    if let Some(d) = app.dashboard.as_mut() {
+        d.pending_model = Some(crate::views::dashboard::PendingDispatchModel {
+            id: model_id.clone(),
+            effort: Some(xai_grok_shell::sampling::types::ReasoningEffort::High),
+            display: "Grok 4.5".to_string(),
+        });
+    }
+    let effects = dispatch_dashboard_dispatch(&mut app, "do the thing".into(), false);
+    let new_id = AgentId(1);
+    assert!(
+        effects.iter().any(|e| matches!(
+            e,
+            Effect::CreateSession { model_id: Some(m), .. } if *m == model_id
+        )),
+        "the base model still seeds CreateSession: {effects:?}"
+    );
+    assert!(
+        matches!(app.active_view, ActiveView::AgentDashboard),
+        "plain Enter stays on the dashboard"
+    );
+    // The constructor seeded the CLI stash; the refusal must have cleared it.
+    let agent = &app.agents[&new_id];
+    assert!(
+        agent.session.deferred_model_switch.is_none(),
+        "a refused pick must clear the CLI `-m` stash, not leave it to win at hydration"
     );
     assert_eq!(
-        agent.toast.as_ref().map(|(s, _)| s.as_str()),
-        Some(POLICY_WARNING),
+        agent.toast.as_ref().map(|(msg, _)| msg.as_str()),
+        Some("Wait for the current model switch to finish"),
     );
-    apply_pending_dispatch_config(agent, None, DashboardDispatchMode::AlwaysApprove, None);
-    assert!(agent.session.is_yolo());
+    assert_eq!(
+        app.dashboard.as_ref().unwrap().error_toast.as_deref(),
+        Some("✗ Wait for the current model switch to finish"),
+        "the refusal must be visible on the dashboard the user never left"
+    );
+    // A's switch completes before B's hydration lands: had the CLI stash
+    // survived, admission would now pass and switch B to a model the user
+    // did not choose.
+    app.model_switch_transaction = None;
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SessionCreated {
+            agent_id: new_id,
+            session_id: acp::SessionId::new("b-session"),
+            models: None,
+            scheduler_background_loops: None,
+        }),
+        &mut app,
+    );
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::SwitchModel { .. })),
+        "no switch may be emitted — least of all to the CLI model: {effects:?}"
+    );
+    assert_eq!(
+        app.agents[&new_id]
+            .toast
+            .as_ref()
+            .map(|(msg, _)| msg.as_str()),
+        Some("Wait for the current model switch to finish"),
+        "one action, one report — hydration must not toast the refusal again"
+    );
+}
+/// Same refusal through the worktree-confirm path with `attach == false`:
+/// the view stays on the dashboard (and this branch has no yolo mirror at
+/// all), so the refusal must be mirrored on the dashboard's error slot.
+#[serial_test::serial(GROK_AGENT_DASHBOARD)]
+#[test]
+fn dashboard_confirm_worktree_refused_pick_mirrors_error_toast() {
+    let mut app = test_app_with_agent();
+    seed_model(&mut app, "grok-4.5", "Grok 4.5");
+    open_dashboard(&mut app);
+    app.cwd_has_git_ancestor = true;
+    // Agent A owns the global admission slot mid-switch.
+    app.model_switch_transaction = Some(crate::app::app_view::ModelSwitchTransaction {
+        owner_agent_id: AgentId(0),
+        request_id: Some(7),
+        app_models_optimistic: false,
+        app_model_id: None,
+        app_reasoning_effort: None,
+    });
+    let model_id = acp::ModelId::new(std::sync::Arc::from("grok-4.5"));
+    if let Some(d) = app.dashboard.as_mut() {
+        d.pending_model = Some(crate::views::dashboard::PendingDispatchModel {
+            id: model_id.clone(),
+            effort: Some(xai_grok_shell::sampling::types::ReasoningEffort::High),
+            display: "Grok 4.5".to_string(),
+        });
+        d.dispatch.set_text("hello wt");
+        d.pending_worktree_prompt = Some(d.dispatch.stash());
+        d.pending_worktree_attach = false;
+    }
+    let effects = dispatch_dashboard_confirm_worktree(&mut app, Some("my-wt".into()));
+    let wt_id = effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::CreateWorktreeSession { agent_id, .. } => Some(*agent_id),
+            _ => None,
+        })
+        .expect("expected a CreateWorktreeSession effect");
+    assert!(
+        matches!(app.active_view, ActiveView::AgentDashboard),
+        "attach=false stays on the dashboard"
+    );
+    assert!(
+        app.agents[&wt_id].session.deferred_model_switch.is_none(),
+        "refused: nothing stashed"
+    );
+    assert_eq!(
+        app.dashboard.as_ref().unwrap().error_toast.as_deref(),
+        Some("✗ Wait for the current model switch to finish"),
+        "the refusal must be visible on the dashboard the user never left"
+    );
 }
 /// Dashboard per-agent toggle under the pin: refused, warning lands on
 /// the dashboard's OWN error slot (the user is looking at the

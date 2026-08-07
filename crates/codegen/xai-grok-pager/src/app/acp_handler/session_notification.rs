@@ -209,6 +209,14 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             }
             changed
         }
+        XaiSessionUpdate::AttemptDiscarded => {
+            // Retract streamed agent/thought content (and any partial tool UI
+            // opened this attempt) so a retry cannot duplicate visible output.
+            agent
+                .session
+                .tracker
+                .discard_streamed_attempt(&mut agent.scrollback)
+        }
         XaiSessionUpdate::ImageCompressed {
             ref images,
             ref message,
@@ -1138,6 +1146,16 @@ pub(super) fn handle_child_session_notification(
                     &mut child_view.scrollback,
                     is_api_key_auth,
                 )
+            } else {
+                false
+            }
+        }
+        XaiSessionUpdate::AttemptDiscarded => {
+            if let Some(child_view) = agent.subagent_views.get_mut(child_sid) {
+                child_view
+                    .session
+                    .tracker
+                    .discard_streamed_attempt(&mut child_view.scrollback)
             } else {
                 false
             }

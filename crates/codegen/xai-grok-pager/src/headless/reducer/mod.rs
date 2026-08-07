@@ -72,6 +72,15 @@ pub(crate) enum StreamEvent {
         /// Provider's matched stop sequence; set only by the Messages reducer.
         stop_sequence: Option<String>,
     },
+    /// A streamed sampling attempt was abandoned for retry.
+    ///
+    /// Consumers of the streaming wire formats must drop any agent-message /
+    /// thought (and partial tool-call) content emitted since the last accepted
+    /// response boundary or turn start — there is no per-chunk attempt id on
+    /// the wire, so the contract is positional: everything after the previous
+    /// stable point and before this marker is abandoned. Mirrors
+    /// [`xai_grok_shell::extensions::notification::SessionUpdate::AttemptDiscarded`].
+    AttemptDiscarded,
 }
 
 pub(crate) struct ToolCallEvent {

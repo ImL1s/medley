@@ -3367,7 +3367,11 @@ mod tests {
 
         // A `show_search_hint: false` picker (command palette / arg-picker family):
         // the cursor must track focus (`search_active`), not render always-on.
-        let theme = Theme::current();
+        // Local TrueColor theme: under NO_COLOR the process-global theme
+        // quantizes text_primary to Reset and the inverse-video detector
+        // matches every cell (false green on focused, false fail on unfocused).
+        let theme =
+            Theme::groknight().quantized(crate::theme::color_support::ColorLevel::TrueColor);
         let config = cfg(false, false);
         let area = Rect::new(0, 0, 60, 16);
 

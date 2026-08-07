@@ -1483,6 +1483,18 @@ impl Drop for SessionLoadGuard<'_> {
         }
     }
 }
+/// Outcome of [`MvpAgent::wait_for_in_flight_session_load`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionLoadWait {
+    /// No load marker remains for the session (none was in flight, or the
+    /// in-flight load finished — success or failure). The `sessions` map is
+    /// authoritative.
+    Resolved,
+    /// The bounded wait expired while the load guard was still alive. The
+    /// session may be registered but is mid-restore; callers must fail
+    /// closed rather than hand out the still-restoring handle as ready.
+    TimedOut,
+}
 mod code_nav;
 mod folder_trust_prompt;
 mod heap_profile;

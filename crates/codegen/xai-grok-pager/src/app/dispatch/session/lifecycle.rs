@@ -195,25 +195,43 @@ pub(crate) fn begin_or_reject_deferred_model_switch(
     deferred: &Option<DeferredModelSwitch>,
     server_models_authoritative: bool,
 ) -> Option<u64> {
-    let switch = deferred.as_ref()?;
+    let Some(switch) = deferred.as_ref() else {
+        // No stash, but the slot may still be held: the dashboard / router /
+        // settings pick paths reserve the global transaction at stash time
+        // (`begin_deferred_model_switch`, before any request id exists), and
+        // the apply-time re-check in `apply_deferred_switch_outcome` can drop
+        // the stash itself (model unready, catalog replaced). Returning
+        // without releasing would leave a request-less transaction that makes
+        // `begin_model_switch_request` refuse every later switch app-wide.
+        release_deferred_transaction(transaction, app_models, agent_id);
+        return None;
+    };
     if let Some(request_id) =
         begin_model_switch_request(transaction, agent_id, &mut agent.session, app_models)
     {
         return Some(request_id);
     }
     restore_rejected_deferred_switch_display(agent, switch, server_models_authoritative);
-    // Release a deferred (pre-request) transaction owned by this agent and roll
-    // back optimistic app.models. Leave another agent's in-flight transaction alone.
-    //
-    // `request_id.is_none()` is half the predicate, not decoration:
-    // `begin_model_switch_request` also refuses when *this* agent owns a
-    // transaction that already has a request id. Taking that one would rewrite
-    // `app.models` from an in-flight switch's snapshot and leave
-    // `handle_switch_model_complete` to bail with "completion outside the
-    // active transaction", orphaning a switch the shell may already have
-    // applied. Unreachable today -- all three call sites run on freshly built
-    // agents -- but this is `pub(crate)` and the guard it relies on is three
-    // frames away.
+    release_deferred_transaction(transaction, app_models, agent_id);
+    None
+}
+
+/// Release a deferred (pre-request) transaction owned by `agent_id` and roll
+/// back optimistic `app.models`. Leave another agent's in-flight transaction
+/// alone.
+///
+/// `request_id.is_none()` is half the predicate, not decoration:
+/// `begin_model_switch_request` also refuses when *this* agent owns a
+/// transaction that already has a request id. Taking that one would rewrite
+/// `app.models` from an in-flight switch's snapshot and leave
+/// `handle_switch_model_complete` to bail with "completion outside the
+/// active transaction", orphaning a switch the shell may already have
+/// applied.
+fn release_deferred_transaction(
+    transaction: &mut Option<ModelSwitchTransaction>,
+    app_models: &mut ModelState,
+    agent_id: AgentId,
+) {
     if let Some(owned) =
         transaction.take_if(|txn| txn.owner_agent_id == agent_id && txn.request_id.is_none())
         && owned.app_models_optimistic
@@ -221,7 +239,6 @@ pub(crate) fn begin_or_reject_deferred_model_switch(
         app_models.current = owned.app_model_id;
         app_models.reasoning_effort = owned.app_reasoning_effort;
     }
-    None
 }
 
 fn handoff_model_switch_transaction(app: &mut AppView, from: AgentId, to: AgentId) {
@@ -1426,8 +1443,10 @@ pub(in crate::app::dispatch) fn handle_session_created(
                 // begin was refused, `begin_or_reject_deferred_model_switch`
                 // already restored display, toasted, and released our
                 // deferred transaction. When apply returned `None` (e.g.
-                // model not ready) that path did not run — clear the
-                // handoff's residual transaction/flags here.
+                // model not ready) the display work did not run — clear the
+                // handoff's residual flags here. The transaction release now
+                // also happens on the `None` path there, so the `take_if`
+                // below is a backstop for the handoff case only.
                 if deferred.is_none() {
                     agent.session.model_switch_pending = false;
                     agent.session.model_switch_request_id = None;
@@ -1451,7 +1470,26 @@ pub(in crate::app::dispatch) fn handle_session_created(
         if !handoff_requires_deferred_switch || failed_handoff.is_some() {
             agent.session.model_switch_queue_handoff_from = None;
         }
-        let mut drain = if app.reconnect_pending {
+        let mut effects = Vec::new();
+        // The deferred switch is decided and emitted BEFORE the queue drain —
+        // same ordering as `handle_session_loaded`: the shell must see the
+        // switch ahead of anything the drain releases.
+        // `begin_model_switch_request` (inside `begin_or_reject_...` above) has
+        // already set `model_switch_pending`, so `maybe_drain_queue` stays
+        // gated until the completion lands.
+        if let Some(switch) = deferred
+            && let Some(request_id) = deferred_request_id
+        {
+            effects.push(Effect::SwitchModel {
+                agent_id,
+                session_id: session_id_clone.clone(),
+                model_id: switch.model_id,
+                effort: switch.effort,
+                request_id,
+                prev_model_id: switch.prev_model_id,
+            });
+        }
+        let drain = if app.reconnect_pending {
             QueueDrain {
                 effects: vec![],
                 page_flip_entry: None,
@@ -1459,7 +1497,7 @@ pub(in crate::app::dispatch) fn handle_session_created(
         } else {
             maybe_drain_queue(agent)
         };
-        let mut effects = std::mem::take(&mut drain.effects);
+        effects.extend(drain.effects);
         if let Some((model_id, reasoning_effort)) = replacement_default {
             agent.session.user_model_preference = Some(model_id.clone());
             if app.models.available.contains_key(&model_id) {
@@ -1505,18 +1543,6 @@ pub(in crate::app::dispatch) fn handle_session_created(
             agent_id,
             silent: true,
         });
-        if let Some(switch) = deferred
-            && let Some(request_id) = deferred_request_id
-        {
-            effects.push(Effect::SwitchModel {
-                agent_id,
-                session_id: session_id_clone.clone(),
-                model_id: switch.model_id,
-                effort: switch.effort,
-                request_id,
-                prev_model_id: switch.prev_model_id,
-            });
-        }
         if let Some(mode) = deferred_mode {
             effects.push(Effect::SetSessionMode {
                 session_id: session_id_clone.clone(),
@@ -1594,7 +1620,26 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
             &deferred,
             server_models_authoritative,
         );
-        let mut drain = if app.reconnect_pending {
+        let mut effects = Vec::new();
+        // The deferred switch is decided and emitted BEFORE the queue drain —
+        // same ordering as `handle_session_created` / `handle_session_loaded`:
+        // the shell must see the switch ahead of anything the drain releases.
+        // `begin_model_switch_request` (inside `begin_or_reject_...` above) has
+        // already set `model_switch_pending`, so `maybe_drain_queue` stays
+        // gated until the completion lands.
+        if let Some(switch) = deferred
+            && let Some(request_id) = deferred_request_id
+        {
+            effects.push(Effect::SwitchModel {
+                agent_id,
+                session_id: session_id_clone.clone(),
+                model_id: switch.model_id,
+                effort: switch.effort,
+                request_id,
+                prev_model_id: switch.prev_model_id,
+            });
+        }
+        let drain = if app.reconnect_pending {
             QueueDrain {
                 effects: vec![],
                 page_flip_entry: None,
@@ -1602,7 +1647,7 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
         } else {
             maybe_drain_queue(agent)
         };
-        let mut effects = std::mem::take(&mut drain.effects);
+        effects.extend(drain.effects);
         agent.session.prompt_history_loading = true;
         effects.push(Effect::FetchPromptHistory {
             agent_id,
@@ -1631,18 +1676,6 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
             agent_id,
             silent: true,
         });
-        if let Some(switch) = deferred
-            && let Some(request_id) = deferred_request_id
-        {
-            effects.push(Effect::SwitchModel {
-                agent_id,
-                session_id: session_id_clone.clone(),
-                model_id: switch.model_id,
-                effort: switch.effort,
-                request_id,
-                prev_model_id: switch.prev_model_id,
-            });
-        }
         if let Some(mode) = deferred_mode {
             effects.push(Effect::SetSessionMode {
                 session_id: session_id_clone.clone(),
@@ -2069,6 +2102,19 @@ pub(in crate::app::dispatch) fn dispatch_auth_class_switch_answered(
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
     };
+    // A pre-session stash is a deferred switch: it enters the same app-global
+    // admission contract as the router/settings pick paths BEFORE the stash is
+    // written, so a busy slot refuses here (once, with the shared toast)
+    // instead of surfacing later as a hydration-time rejection.
+    if app
+        .agents
+        .get(&id)
+        .is_some_and(|agent| agent.session.session_id.is_none())
+        && !begin_deferred_model_switch(app, id, false)
+    {
+        app.show_toast("Wait for the current model switch to finish");
+        return vec![];
+    }
     let Some(agent) = app.agents.get_mut(&id) else {
         return vec![];
     };

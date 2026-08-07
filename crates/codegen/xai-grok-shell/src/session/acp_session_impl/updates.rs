@@ -205,13 +205,71 @@ impl SessionActor {
     ///   because the canonical `acp::SessionUpdate::ToolCall` (with
     ///   assembled `raw_input`) is persisted at end-of-turn and is the
     ///   source of truth for replay; (2) no hook dispatch.
+    /// - **xAI** (`AttemptDiscarded`) -> **persists** (with `eventId`)
+    ///   **and** gateway-forwards **from this buffered drain path**.
+    ///
+    ///   Why not switch to `send_xai_notification` (the direct path)? That
+    ///   also persists and stamps meta, and looks like the obvious fix.
+    ///   But it bypasses `event_tx` entirely, going straight to persistence
+    ///   plus gateway. With attempt chunks still queued and undrained, the
+    ///   retraction would reach the client **before** the text it retracts,
+    ///   apply against content that has not arrived, retract nothing, and
+    ///   the duplicate would survive -- #44 unfixed. Keeping
+    ///   the write on the buffered drain preserves delivery order relative to
+    ///   already-queued attempt chunks.
+    ///
+    ///   This is **not** about the client's dedup highwater dropping the
+    ///   retry's chunks -- it cannot. ACP and xAI keep separate highwaters
+    ///   (`agent_view/mod.rs`, `last_applied_xai_event_seq`) precisely so an
+    ///   xAI id can never make queued lower-id ACP chunks look stale. The
+    ///   hazard documented on `enqueue_current_mode_update` above does not
+    ///   transfer: `CurrentModeUpdate` is an **ACP** notification sharing the
+    ///   ACP highwater with the chunks, which is why *it* needs enqueue-time
+    ///   stamping; `AttemptDiscarded` is xAI, on the other highwater.
+    ///
+    ///   Stamping `eventId` via
+    ///   `ensure_event_id_meta` also makes a duplicate delivery dedupable
+    ///   (meta was `None` at enqueue). Without the persistence write,
+    ///   resume/rebuild would keep both attempt copies (#44).
+    ///
+    ///   Note: main-session resume already forwards xAI via
+    ///   `forward_raw_replay_line`. Subagent/export UI replay uses
+    ///   `stream_replay_updates_at` / `load_updates_for_replay`, which must
+    ///   also surface `AttemptDiscarded` (see `ReplayUpdate`).
     pub(super) async fn emit_buffered(&self, notification: SessionNotification) {
         match notification {
             SessionNotification::Acp(n) => {
                 self.emit_notification_direct(*n).await;
             }
-            SessionNotification::Xai(n) => {
+            SessionNotification::Xai(mut n) => {
                 self.log_outbound_xai_buffered(&n);
+                // AttemptDiscarded is a retraction, not a tool-delta: it must
+                // survive on disk so ChatReducer / helpers::replay can drop
+                // the abandoned attempt's text on resume. Stamp eventId so a
+                // duplicate delivery is dedupable (meta was None at enqueue).
+                // See the doc-comment above for why this lives on the
+                // "no persistence" buffered path rather than the direct path.
+                if matches!(n.update, XaiSessionUpdate::AttemptDiscarded) {
+                    let mut meta_map = n.meta.take().and_then(|v| match v {
+                        serde_json::Value::Object(m) => Some(m),
+                        _ => None,
+                    });
+                    crate::util::event_id::ensure_event_id_meta(
+                        &self.session_info.id.0,
+                        &mut meta_map,
+                    );
+                    n.meta = meta_map.map(serde_json::Value::Object);
+                    if self
+                        .notifications
+                        .persistence_tx
+                        .send(PersistenceMsg::Update(
+                            crate::session::storage::SessionUpdate::Xai(n.clone()),
+                        ))
+                        .is_err()
+                    {
+                        tracing::warn!("Failed to send AttemptDiscarded to persistence channel");
+                    }
+                }
                 if self
                     .notifications
                     .gateway_enabled

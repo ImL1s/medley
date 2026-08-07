@@ -11,6 +11,8 @@
 //!
 //! ## Backoff
 //!
+//! ### Intra-cycle (attempt ladder)
+//!
 //! Three attempts at exactly:
 //!
 //! ```text
@@ -20,6 +22,24 @@
 //! ```
 //!
 //! Encoded as [`BACKOFF`]. The full window before exhaustion is 21 s.
+//!
+//! ### Inter-cycle (early-death budget, issue #45)
+//!
+//! A handshake that succeeds but whose **transport closes** within
+//! [`STABILITY_WINDOW`] counts as a failed cycle. Up to
+//! [`MAX_EARLY_DEATHS`] such cycles each schedule a restart after
+//! [`CYCLE_BACKOFF`]; the next early exit parks the server for the
+//! session with a single `RestartFailed` diagnostic. Surviving past
+//! the stability window resets the consecutive counter.
+//!
+//! Only [`xai_grok_mcp::servers::McpClientEventKind::TransportClosed`]
+//! feeds this budget — see [`RestartBudget::classify_death`] for why
+//! `HandshakeFailed` must not.
+//!
+//! A park is **not** session-permanent: a handshake observed on the
+//! dispatcher's event stream (`Ready`) clears it, via
+//! [`RestartBudget::note_recovery_ready`]. See that method for why such
+//! a handshake can only be user-initiated recovery.
 //!
 //! ## Guard rails (skip conditions)
 //!
@@ -60,6 +80,11 @@
 //!    `Empty` is via the explicit `Refresh` button, not auto-restart.
 //!    Enforced upstream: the liveness watcher emits `TransportClosed`
 //!    only from `Ready` / `Initializing`, never from `Empty`.
+//! 6. **Early-death budget parked** — the server crash-looped past
+//!    [`MAX_EARLY_DEATHS`] (see [`RestartBudget`]). Checked last in
+//!    [`maybe_schedule_restart`], *after* the in-flight dedup claim,
+//!    because it is the only guard that mutates state: a call the
+//!    dedup guard is going to reject must not first burn a cycle.
 //!
 //! ### Check-order difference
 //!
@@ -113,6 +138,266 @@ pub const BACKOFF: [Duration; 3] = [
     Duration::from_secs(16),
 ];
 
+/// How long a post-handshake transport must stay open before the restart
+/// is treated as healthy (resets the early-death cycle budget).
+///
+/// 30s is long enough that a server doing brief post-init work (tool
+/// registration, a reconnect hop) is not misclassified, and short enough
+/// that a crash-loop parks within a few minutes once cycle backoff is
+/// applied. Classification keys only off transport close — a server that
+/// stays up while "becoming useful" is never mis-parked, regardless of
+/// how long that takes.
+pub const STABILITY_WINDOW: Duration = Duration::from_secs(30);
+
+/// Consecutive handshake-then-early-exit cycles before auto-restart parks
+/// the server (until a dispatcher-observed `Ready` recovers it — see
+/// [`RestartBudget::note_recovery_ready`]).
+///
+/// Cap shape: **cycle count**, not a wall-clock window. Acceptance wants
+/// "stays up past the window → budget resets"; a consecutive counter with
+/// a stability reset is the dual of that rule and stays deterministic
+/// under `tokio::time::pause`. A rolling wall-clock cap would still allow
+/// infinite restarts spaced just over the window.
+pub const MAX_EARLY_DEATHS: usize = 5;
+
+/// Backoff *between* early-death restart cycles (before the intra-cycle
+/// [`BACKOFF`] ladder). Indexed by `early_deaths - 1` for deaths 1..=5
+/// (the 6th early death parks). The last step is a 60s cap.
+///
+/// Strictly non-decreasing so steady-state log/spawn volume stays bounded
+/// without multi-hour waits.
+pub const CYCLE_BACKOFF: [Duration; 5] = [
+    Duration::from_secs(2),
+    Duration::from_secs(8),
+    Duration::from_secs(32),
+    Duration::from_secs(60),
+    Duration::from_secs(60),
+];
+
+/// Outcome of classifying a transport death against the early-death budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeathDisposition {
+    /// Schedule a restart cycle; sleep `cycle_backoff` before the attempt ladder.
+    Proceed { cycle_backoff: Duration },
+    /// This death exhausted the budget — emit the one park diagnostic, do not restart.
+    Exhausted,
+    /// Parked by an earlier [`Self::Exhausted`] and not yet recovered
+    /// (see [`RestartBudget::note_recovery_ready`]) — do not restart and
+    /// do not emit a second diagnostic. The caller still unregisters the
+    /// server's tools: the client was just evicted again.
+    AlreadyParked,
+}
+
+/// Per-server early-death budget (issue #45). Lives in [`ShutdownState`].
+#[derive(Debug, Default)]
+pub(crate) struct RestartBudget {
+    /// Consecutive early-death cycles observed since the last healthy stretch.
+    early_deaths: usize,
+    /// When this server was last observed `Ready`. Monotonic: written
+    /// by [`Self::note_ready`] / [`Self::note_recovery_ready`], and
+    /// **never cleared**.
+    ///
+    /// Clearing it is a tempting tidy-up and re-creates issue #45. A
+    /// restart is scheduled on *every* early death, so clearing this
+    /// "when a restart is scheduled" makes the next
+    /// [`Self::classify_death`] find `None`, take the not-early branch,
+    /// and run `early_deaths = 0` — zeroing the counter once per cycle,
+    /// forever. Clearing it inside `classify_death` is worse still: the
+    /// second death of a double-burn window would reset the counter
+    /// instead of incrementing it, turning a mild over-count into a
+    /// budget escape. The invariant is "when last seen `Ready`", not
+    /// "since the last restart".
+    last_ready_at: Option<tokio::time::Instant>,
+    /// Park after more than [`MAX_EARLY_DEATHS`] early exits. Cleared by
+    /// [`Self::note_recovery_ready`].
+    parked: bool,
+}
+
+impl RestartBudget {
+    /// Record a successful handshake performed by [`auto_restart_stdio`];
+    /// starts/refreshes the stability window.
+    ///
+    /// Deliberately does NOT touch `early_deaths` or `parked` — a restart
+    /// this module performed itself is the thing being budgeted, so
+    /// letting it clear the counter would re-create the issue #45 bug
+    /// (every successful handshake resetting the budget). Recovery
+    /// driven from outside goes through [`Self::note_recovery_ready`].
+    pub(crate) fn note_ready(&mut self, now: tokio::time::Instant) {
+        self.last_ready_at = Some(now);
+    }
+
+    /// Record a handshake observed on the **dispatcher's** client-event
+    /// stream (`McpClientEventKind::Ready`) and clear the park.
+    ///
+    /// Why this is safe to treat as user-initiated recovery: the
+    /// auto-restart success path never produces a dispatcher `Ready`.
+    /// `respawn_stdio` wires `set_event_tx` AFTER `ensure_initialized`
+    /// (see `AcpSessionImpl::respawn_stdio`), so the handshake it
+    /// performs is invisible to the dispatcher — it reports through
+    /// [`Self::note_ready`] instead.
+    ///
+    /// **That ordering is necessary but not sufficient, and the
+    /// sufficient fact lives in another crate.** Once `set_event_tx` has
+    /// run, the restarted client *does* have a sender wired: if it could
+    /// ever re-handshake in place it would emit a dispatcher `Ready` and
+    /// lift its own park. What makes that impossible for stdio is
+    /// `restorable_transport` mapping `PendingTransport::Stdio(_)` to
+    /// `None` (`xai-grok-mcp/src/servers.rs`) — `reset_transport` is a
+    /// no-op, so a dead stdio client cannot be re-initialised in place.
+    /// It can only be replaced by a fresh `start_mcp_server`.
+    ///
+    /// **If stdio is ever made restorable** — the shape of that is a
+    /// "reconnect without respawning the child" optimisation — **this
+    /// breaks**, and an auto-restart would silently unpark the server it
+    /// had just parked. The `if self.parked` gate below bounds the
+    /// damage to unparking rather than refunding the counter, but the
+    /// dependency is real and it is not visible from this file.
+    ///
+    /// So the only producers of a dispatcher `Ready` are a fresh
+    /// `start_mcp_server`: session startup, `ConfigAdded` (re-add),
+    /// `ToggleMcpServer` on, or an explicit Refresh. After a park, all
+    /// of those are the user fixing the server.
+    ///
+    /// The counter reset is deliberately gated on `parked`, and that
+    /// gate is load-bearing. Undoing a park is this method's whole job;
+    /// resetting an *un-parked* server's counter would open a refund
+    /// path that re-creates issue #45. `flush_window` runs before
+    /// `maybe_schedule_restart` (see `run_dispatcher`), so a `Ready`
+    /// and a `TransportClosed` coalescing into the same 50 ms window
+    /// would zero the counter and then immediately re-increment it from
+    /// zero — once per cycle, forever. Making that safe would require
+    /// proving no path anywhere can emit a stray `Ready` for a live
+    /// crash-looping client; gating on `parked` makes the proof
+    /// unnecessary.
+    ///
+    /// Nothing is lost by the gate: "this server is healthy again" for
+    /// an un-parked server is already handled by
+    /// [`Self::classify_death`]'s not-early branch, which resets the
+    /// counter after a stretch longer than [`STABILITY_WINDOW`]. And a
+    /// park always yields a full budget again, because the reset does
+    /// run in the case the gate admits.
+    pub(crate) fn note_recovery_ready(&mut self, now: tokio::time::Instant) {
+        self.last_ready_at = Some(now);
+        // Not removable: see this method's doc. Deleting the gate is
+        // caught by `dispatcher_ready_while_unparked_does_not_refund_the_budget`.
+        if self.parked {
+            self.parked = false;
+            self.early_deaths = 0;
+        }
+    }
+
+    /// Classify a death event and update counters.
+    ///
+    /// Up to [`MAX_EARLY_DEATHS`] early exits each schedule a restart (with
+    /// increasing cycle backoff). The next early exit parks.
+    ///
+    /// **Only [`McpClientEventKind::TransportClosed`] feeds the
+    /// early-death counter.** `HandshakeFailed` is emitted for *any*
+    /// `ensure_initialized` error — including a `startup_timeout_sec`
+    /// timeout on a server that is still alive and whose transport never
+    /// closed. Letting it burn a cycle would park a healthy-but-slow
+    /// server after a handful of startup hiccups, under a message
+    /// ("early exit within 30s of handshake") describing something that
+    /// did not happen. It also has no need for a budget of its own: a
+    /// handshake that never succeeds never reaches the `Ok` arm of
+    /// [`auto_restart_stdio`], so the intra-cycle [`BACKOFF`] ladder is
+    /// never reset and exhaustion after 3 attempts is already reachable
+    /// — which is the pre-#45 behaviour and is correct.
+    ///
+    /// The `parked` check runs *after* the kind check, so a park never
+    /// suppresses a `HandshakeFailed`. For stdio a parked server's old
+    /// client cannot re-handshake in place — `restorable_transport` maps
+    /// `PendingTransport::Stdio(_)` to `None`
+    /// (`xai-grok-mcp/src/servers.rs`) so `reset_transport` is a no-op,
+    /// `Ready(dead)` returns `Ok` without handshaking, and `Empty`
+    /// returns `Err` before the emit block. The only producer of a
+    /// `HandshakeFailed` for a parked stdio server is therefore a fresh
+    /// `start_mcp_server`: a client the user just asked for.
+    ///
+    /// Suppressing that would defeat the recovery path on its first
+    /// stumble. The user fixes the command and toggles the server back
+    /// on; the new client's first handshake overruns
+    /// `startup_timeout_sec` — the very transient this kind exclusion
+    /// exists to tolerate — and with the checks the other way round it
+    /// would get zero restart attempts instead of the three-attempt
+    /// ladder that would most likely recover it, with nothing telling
+    /// the user why. Nothing leaks in return: a restart that succeeds
+    /// reports through [`Self::note_ready`], not
+    /// [`Self::note_recovery_ready`], so `parked` stays set and the
+    /// transport-death park is untouched.
+    pub(crate) fn classify_death(
+        &mut self,
+        now: tokio::time::Instant,
+        kind: McpClientEventKind,
+    ) -> DeathDisposition {
+        // Kind first, and the order matters: a non-transport death is
+        // outside this budget entirely, so it is not subject to the park
+        // either. See the doc above for why suppressing a
+        // `HandshakeFailed` here would defeat the recovery path.
+        if !matches!(kind, McpClientEventKind::TransportClosed) {
+            // Proceed on the legacy path without touching `early_deaths`
+            // or `last_ready_at`. Resetting either here would let an
+            // interleaved `HandshakeFailed` silently refund a
+            // crash-looping server's budget.
+            return DeathDisposition::Proceed {
+                cycle_backoff: Duration::ZERO,
+            };
+        }
+        if self.parked {
+            return DeathDisposition::AlreadyParked;
+        }
+        let early = self
+            .last_ready_at
+            .is_some_and(|t| now.saturating_duration_since(t) < STABILITY_WINDOW);
+        if early {
+            self.early_deaths = self.early_deaths.saturating_add(1);
+            if self.early_deaths > MAX_EARLY_DEATHS {
+                self.parked = true;
+                return DeathDisposition::Exhausted;
+            }
+            let idx = self.early_deaths.saturating_sub(1);
+            let cycle_backoff = CYCLE_BACKOFF
+                .get(idx)
+                .copied()
+                .unwrap_or(*CYCLE_BACKOFF.last().expect("CYCLE_BACKOFF non-empty"));
+            DeathDisposition::Proceed { cycle_backoff }
+        } else {
+            // Survived past the window: correct by construction. A
+            // `TransportClosed` can only come from a liveness watcher,
+            // which `arm_liveness_watcher` refuses to spawn unless the
+            // client is already `Ready` (`xai-grok-mcp/src/servers.rs`)
+            // and which withdraws silently from every non-`Ready` state
+            // (`xai-grok-mcp/src/liveness.rs`). So this client was
+            // `Ready` at `last_ready_at` and stayed `Ready` until it
+            // closed — a healthy stretch longer than STABILITY_WINDOW,
+            // and the consecutive counter should reset.
+            //
+            // `last_ready_at == None` also lands here, as a defensive
+            // default. It is not a reachable case for the only kind
+            // that gets this far: reaching `Ready` is exactly what
+            // records the timestamp, on both the startup path
+            // (dispatcher `Ready` → `note_recovery_ready`) and the
+            // restart path (`auto_restart_stdio` → `note_ready`).
+            //
+            // The boundary that keeps the restart path honest is
+            // **watcher-arm → `note_ready`**, NOT respawn-return →
+            // `note_ready`. `interval` ticks immediately, so the watcher
+            // can emit a close the instant it is armed; any `.await`
+            // between arming and recording lets the dispatcher classify
+            // the NEW client's death against the PREVIOUS client's
+            // timestamp, and once that is stale this branch refunds the
+            // budget. `respawn_stdio` therefore arms AFTER its
+            // `owned_clients.insert` and returns straight into
+            // `note_ready` with nothing awaiting in between — see the
+            // comment there before reordering it.
+            self.early_deaths = 0;
+            DeathDisposition::Proceed {
+                cycle_backoff: Duration::ZERO,
+            }
+        }
+    }
+}
+
 /// Backoff between HTTP recovery attempts (first attempt is immediate).
 /// Longer than the stdio [`BACKOFF`] because an HTTP MCP server (e.g.
 /// `http-mcp-server`) usually drops on a rolling redeploy that takes minutes to bring
@@ -151,6 +436,11 @@ pub(crate) enum SkipReason {
     /// the first respawn is still sleeping or mid-handshake is
     /// short-circuited here so we never spawn a duplicate task.
     InProgress,
+    /// Early-death budget exhausted earlier; further deaths stay
+    /// parked until a dispatcher-observed handshake (`Ready` — from
+    /// Refresh, a config re-add, or toggle-on) clears the park via
+    /// [`RestartBudget::note_recovery_ready`].
+    Parked,
 }
 
 impl SkipReason {
@@ -160,6 +450,7 @@ impl SkipReason {
             Self::NotConfigured => "not_configured",
             Self::Disabled => "disabled",
             Self::InProgress => "in_progress",
+            Self::Parked => "parked",
         }
     }
 }
@@ -256,6 +547,25 @@ pub(crate) trait RestartActions {
     /// Drop `server`'s tools from the bridge after stdio restart exhaustion,
     /// so the model stops calling a `not found` server. Default no-op for mocks.
     fn unregister_server_tools(&self, _server: &str) {}
+
+    /// Record a successful handshake for `server` (starts/refreshes the
+    /// [`STABILITY_WINDOW`] used to classify the next transport death).
+    /// Default no-op for mocks that do not track early-death budgets.
+    ///
+    /// This is the [`auto_restart_stdio`] success path only; the
+    /// dispatcher's own `Ready` observation goes straight to
+    /// [`RestartBudget::note_recovery_ready`] (it holds the
+    /// `ShutdownState` lock already and must be able to *clear* a park,
+    /// which this method deliberately cannot).
+    fn note_ready(&self, _server: &str) {}
+
+    /// Classify a death event against the early-death budget.
+    /// Default: always proceed with no cycle backoff (legacy behaviour).
+    fn classify_death(&self, _server: &str, _kind: McpClientEventKind) -> DeathDisposition {
+        DeathDisposition::Proceed {
+            cycle_backoff: Duration::ZERO,
+        }
+    }
 }
 
 /// Decide whether to schedule an [`auto_restart_stdio`] task for the
@@ -303,20 +613,79 @@ pub(crate) async fn maybe_schedule_restart(
     // `owned_clients.insert`, orphaning a stdio child. The claim is
     // atomic: no `.await` between here and the `spawn_local` below.
     // Released by the RAII guard on every exit path.
+    //
+    // This runs BEFORE the early-death classifier below because
+    // `classify_death` MUTATES the budget: a single coalesce window can
+    // carry both a `TransportClosed` (liveness watcher) and a
+    // `HandshakeFailed` (a concurrent tool call's re-init) for the same
+    // server, and `run_dispatcher` calls us once per `(server, kind)`
+    // key. Classifying first would let the second call burn a budget
+    // slot and then be dropped here, halving the effective budget for
+    // any server whose crashes reliably produce both events.
     if !actions.begin_restart(&server) {
         record_skipped(&server, SkipReason::InProgress);
         return false;
     }
+    // RAII from here on: every `return false` below drops this and
+    // releases the claim taken above; the spawn path moves it into the
+    // task instead, so the claim outlives this function exactly when a
+    // restart is actually in flight.
+    let in_flight = RestartInFlightGuard {
+        actions: Rc::clone(&actions),
+        server: server.clone(),
+    };
+
+    // Guard 5: early-death budget (issue #45). Handshake-OK then
+    // transport-close within STABILITY_WINDOW counts as a failed
+    // cycle; after MAX_EARLY_DEATHS such cycles we park the server
+    // with a single RestartFailed diagnostic until a dispatcher
+    // `Ready` (Refresh / re-add / toggle-on) clears the park.
+    let cycle_backoff = match actions.classify_death(&server, kind) {
+        DeathDisposition::AlreadyParked => {
+            record_skipped(&server, SkipReason::Parked);
+            // No second diagnostic (the park already emitted one), but
+            // the tools MUST go. Only a `TransportClosed` can reach
+            // here — `classify_death` checks `kind` before `parked` and
+            // returns `Proceed` for everything else — and for that kind
+            // `drop_dead_clients` has just evicted the client, so
+            // leaving its tools registered lets the model call a server
+            // that no longer exists. Idempotent.
+            //
+            // That reason is specific to this kind, not a general one:
+            // `drop_dead_clients` never sees `HandshakeFailed`. If the
+            // check order above is ever reversed, this comment stops
+            // being true — which is the point of stating the dependency
+            // rather than just the conclusion.
+            actions.unregister_server_tools(&server);
+            drop(in_flight);
+            return false;
+        }
+        DeathDisposition::Exhausted => {
+            record_exhausted(&server);
+            push(
+                &*actions,
+                &session_id,
+                &server,
+                McpServerStatus::Unavailable,
+                McpServerStatusReason::RestartFailed,
+                Some(format!(
+                    "stopped auto-restart: early exit within {}s of handshake {} times",
+                    STABILITY_WINDOW.as_secs(),
+                    MAX_EARLY_DEATHS,
+                )),
+            );
+            actions.unregister_server_tools(&server);
+            drop(in_flight);
+            return false;
+        }
+        DeathDisposition::Proceed { cycle_backoff } => cycle_backoff,
+    };
 
     let task_actions = Rc::clone(&actions);
     tokio::task::spawn_local(async move {
-        // RAII: release the in-flight claim taken above when the task
-        // exits for any reason.
-        let _in_flight = RestartInFlightGuard {
-            actions: Rc::clone(&task_actions),
-            server: server.clone(),
-        };
-        auto_restart_stdio(task_actions, session_id, server, cancel).await;
+        // Release the in-flight claim when the task exits for any reason.
+        let _in_flight = in_flight;
+        auto_restart_stdio(task_actions, session_id, server, cancel, cycle_backoff).await;
     });
     true
 }
@@ -338,10 +707,14 @@ impl Drop for RestartInFlightGuard {
     }
 }
 
-/// One-shot task: sleep, re-check guard rails, respawn, repeat (≤3
-/// attempts), emitting the `mcp.auto_restart.*` metrics. Must run
-/// inside a `LocalSet` (the production `RestartActions` holds `!Send`
-/// types).
+/// One-shot task: optional inter-cycle backoff, then sleep / re-check
+/// guard rails / respawn (≤3 attempts), emitting the
+/// `mcp.auto_restart.*` metrics. Must run inside a `LocalSet` (the
+/// production `RestartActions` holds `!Send` types).
+///
+/// `cycle_backoff` is the issue #45 delay *between* early-death
+/// restart cycles; the intra-cycle [`BACKOFF`] ladder still applies
+/// after it.
 ///
 /// Each iteration re-checks the guards in the inverse order of
 /// [`maybe_schedule_restart`] (see the module doc § "Check-order
@@ -350,7 +723,8 @@ impl Drop for RestartInFlightGuard {
 /// `is_in_shutting_down` (no push; the `ConfigRemoved` flush already
 /// emitted one).
 ///
-/// On `Ok` it emits `Reason::RestartSucceeded`; this is the SOLE
+/// On `Ok` it emits `Reason::RestartSucceeded`, records `note_ready`
+/// (starts the stability window), and returns; this is the SOLE
 /// success emitter, since `respawn_stdio` wires `set_event_tx` AFTER
 /// `ensure_initialized` so the dispatcher's `Ready → Initialized`
 /// mapping does not fire. On `Err` it emits `Reason::RestartFailed`
@@ -361,7 +735,24 @@ pub(crate) async fn auto_restart_stdio(
     session_id: String,
     server: McpServerName,
     cancel: tokio_util::sync::CancellationToken,
+    cycle_backoff: Duration,
 ) {
+    if !cycle_backoff.is_zero() {
+        tokio::select! {
+            _ = tokio::time::sleep(cycle_backoff) => {}
+            _ = cancel.cancelled() => {
+                tracing::debug!(
+                    server = %server,
+                    "auto-restart cancelled during cycle backoff (session shutdown)",
+                );
+                return;
+            }
+        }
+        if cancel.is_cancelled() {
+            return;
+        }
+    }
+
     for (idx, wait) in BACKOFF.iter().enumerate() {
         let attempt = idx + 1;
 
@@ -431,6 +822,9 @@ pub(crate) async fn auto_restart_stdio(
                     "auto-restart succeeded",
                 );
                 record_succeeded(&server, attempt);
+                // Start/refresh the stability window so a transport
+                // close within STABILITY_WINDOW counts as an early death.
+                actions.note_ready(&server);
                 push(
                     &*actions,
                     &session_id,
@@ -722,6 +1116,8 @@ mod tests {
         reset_calls: RefCell<Vec<String>>,
         /// Recorded `unregister_server_tools` calls.
         unregister_calls: RefCell<Vec<String>>,
+        /// Per-server early-death budgets (issue #45).
+        budgets: RefCell<std::collections::HashMap<String, RestartBudget>>,
     }
 
     impl MockActions {
@@ -761,6 +1157,28 @@ mod tests {
         }
         fn unregister_calls(&self) -> Vec<String> {
             self.unregister_calls.borrow().clone()
+        }
+        /// Mirror of the dispatcher's `flush_window` `Ready` arm (which
+        /// calls `ShutdownState::note_recovery_ready`, not a
+        /// `RestartActions` method — the dispatcher already holds the
+        /// lock). Lets the unit tests drive the unpark path.
+        fn note_recovery_ready(&self, name: &str) {
+            self.budgets
+                .borrow_mut()
+                .entry(name.to_string())
+                .or_default()
+                .note_recovery_ready(tokio::time::Instant::now());
+        }
+        /// Consecutive early-death count for `name` (0 if never seen).
+        /// The dedup test asserts on this directly: a rejected
+        /// `maybe_schedule_restart` must leave the counter untouched,
+        /// which no push / respawn / spawn assertion can observe.
+        fn early_deaths(&self, name: &str) -> usize {
+            self.budgets
+                .borrow()
+                .get(name)
+                .map(|b| b.early_deaths)
+                .unwrap_or(0)
         }
     }
 
@@ -802,6 +1220,20 @@ mod tests {
         fn unregister_server_tools(&self, server: &str) {
             self.unregister_calls.borrow_mut().push(server.to_string());
         }
+        fn note_ready(&self, server: &str) {
+            self.budgets
+                .borrow_mut()
+                .entry(server.to_string())
+                .or_default()
+                .note_ready(tokio::time::Instant::now());
+        }
+        fn classify_death(&self, server: &str, kind: McpClientEventKind) -> DeathDisposition {
+            self.budgets
+                .borrow_mut()
+                .entry(server.to_string())
+                .or_default()
+                .classify_death(tokio::time::Instant::now(), kind)
+        }
     }
 
     fn dyn_actions(mock: Rc<MockActions>) -> Rc<dyn RestartActions> {
@@ -838,6 +1270,7 @@ mod tests {
                 "sess-1".to_string(),
                 "svr".to_string(),
                 never_cancel(),
+                StdDuration::ZERO,
             ));
 
             // t=0: nothing yet
@@ -879,6 +1312,7 @@ mod tests {
                 "sess-1".to_string(),
                 "svr".to_string(),
                 never_cancel(),
+                StdDuration::ZERO,
             ));
 
             // Remove the config BEFORE the first 1s sleep elapses.
@@ -919,6 +1353,7 @@ mod tests {
                 "sess-1".to_string(),
                 "svr".to_string(),
                 never_cancel(),
+                StdDuration::ZERO,
             ));
 
             // ToggleMcpServer(enabled=false) effectively drops the
@@ -1002,15 +1437,28 @@ mod tests {
     /// Contract (in-flight dedup): if a restart task
     /// is already in flight for a server, a second
     /// `maybe_schedule_restart` for the same server returns `false`,
-    /// does NOT spawn a duplicate task, and emits
-    /// `mcp.auto_restart.skipped{reason="in_progress"}`. Modeled by
+    /// does NOT spawn a duplicate task, emits
+    /// `mcp.auto_restart.skipped{reason="in_progress"}`, and — issue
+    /// #45 — leaves the early-death budget untouched. Modeled by
     /// pre-claiming the in-flight slot (which the production
     /// `ShutdownState` set does atomically).
+    ///
+    /// The budget assertion is the load-bearing one: `run_dispatcher`
+    /// calls us once per `(server, kind)` key, so one coalesce window
+    /// carrying both a `TransportClosed` and a `HandshakeFailed` for the
+    /// same server produces two calls. If the classifier ran before this
+    /// guard, the rejected call would still burn a cycle and quietly
+    /// halve the budget. `!spawned` / `respawn_call_count` / `pushes`
+    /// all stay true while the counter moves, so none of them catch it.
     #[tokio::test(start_paused = true)]
     async fn dedup_skips_when_restart_already_in_flight() {
         run_in_local(async {
             let mock = Rc::new(MockActions::new());
             mock.configure("svr");
+            // A handshake just landed, so a transport close now WOULD
+            // classify as an early death — without this the classifier
+            // would be a no-op and the counter assertion vacuous.
+            mock.note_ready("svr");
             // Simulate an already-running restart task by claiming the
             // in-flight slot up front.
             assert!(mock.begin_restart("svr"));
@@ -1028,6 +1476,12 @@ mod tests {
             assert!(!spawned, "must not spawn a duplicate restart task");
             assert_eq!(mock.respawn_call_count(), 0);
             assert!(mock.pushes().is_empty());
+            assert_eq!(
+                mock.early_deaths("svr"),
+                0,
+                "a call rejected by the dedup guard must not burn an \
+                 early-death cycle (classify AFTER begin_restart)",
+            );
         })
         .await;
     }
@@ -1048,6 +1502,7 @@ mod tests {
                 "sess-1".to_string(),
                 "svr".to_string(),
                 cancel.clone(),
+                StdDuration::ZERO,
             ));
 
             // Cancel during the first 1s backoff sleep.
@@ -1086,6 +1541,7 @@ mod tests {
                 "sess-1".to_string(),
                 "svr".to_string(),
                 never_cancel(),
+                StdDuration::ZERO,
             ));
 
             tokio::time::advance(StdDuration::from_secs(1)).await;
@@ -1140,6 +1596,7 @@ mod tests {
                 "sess-1".to_string(),
                 "svr".to_string(),
                 never_cancel(),
+                StdDuration::ZERO,
             ));
 
             tokio::time::advance(StdDuration::from_secs(21)).await;
@@ -1199,6 +1656,7 @@ mod tests {
                 "sess-1".to_string(),
                 "svr".to_string(),
                 never_cancel(),
+                StdDuration::ZERO,
             ));
 
             tokio::time::advance(StdDuration::from_secs(21)).await;
@@ -1229,6 +1687,7 @@ mod tests {
                 "sess-1".to_string(),
                 "svr".to_string(),
                 never_cancel(),
+                StdDuration::ZERO,
             ));
 
             tokio::time::advance(StdDuration::from_secs(1)).await;
@@ -1514,5 +1973,696 @@ mod tests {
         // const, no shadowing. If the import line at the top of
         // this file ever fans out a local copy, this test still
         // catches the wire name itself.
+    }
+
+    /// Drive one early-death restart cycle with a JoinHandle so the
+    /// paused clock reliably wakes the task (same pattern as the
+    /// existing BACKOFF unit tests).
+    async fn drive_cycle(mock: &Rc<MockActions>, cycle_backoff: StdDuration) {
+        let task = tokio::task::spawn_local(auto_restart_stdio(
+            dyn_actions(mock.clone()),
+            "sess-1".to_string(),
+            "svr".to_string(),
+            never_cancel(),
+            cycle_backoff,
+        ));
+        // Register sleeps with the paused driver before advancing.
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        if !cycle_backoff.is_zero() {
+            tokio::time::advance(cycle_backoff).await;
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+        }
+        tokio::time::advance(StdDuration::from_secs(1)).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        task.await.unwrap();
+    }
+
+    fn early_park_detail(detail: Option<&str>) -> bool {
+        detail.is_some_and(|d| d.contains("early exit") || d.contains("early-exit"))
+    }
+
+    /// Issue #45: handshake OK then immediate transport death must
+    /// burn the early-death budget. After [`MAX_EARLY_DEATHS`] such
+    /// cycles the server is parked with exactly one `RestartFailed`
+    /// diagnostic — not one per cycle forever — and both the parking
+    /// death and every subsequent already-parked death must drop the
+    /// server's tools from the bridge (the client is already evicted by
+    /// `drop_dead_clients`, so leaving them registered lets the model
+    /// call a server that no longer exists).
+    #[tokio::test(start_paused = true)]
+    async fn early_death_cycles_exhaust_with_one_diagnostic() {
+        run_in_local(async {
+            let mock = Rc::new(MockActions::new());
+            mock.configure("svr");
+            for _ in 0..(MAX_EARLY_DEATHS + 3) {
+                mock.script_outcome(Ok(()));
+            }
+            mock.note_ready("svr");
+
+            for cycle in 0..MAX_EARLY_DEATHS {
+                let disposition = mock.classify_death("svr", McpClientEventKind::TransportClosed);
+                let DeathDisposition::Proceed { cycle_backoff } = disposition else {
+                    panic!("cycle {cycle}: expected Proceed, got {disposition:?}");
+                };
+                assert_eq!(cycle_backoff, CYCLE_BACKOFF[cycle], "cycle {cycle} backoff",);
+                drive_cycle(&mock, cycle_backoff).await;
+                assert_eq!(
+                    mock.respawn_call_count(),
+                    cycle + 1,
+                    "cycle {cycle}: expected one respawn per early-death cycle",
+                );
+            }
+
+            // Next death goes through maybe_schedule_restart → Exhausted.
+            let scheduled = maybe_schedule_restart(
+                dyn_actions(mock.clone()),
+                "sess-1".to_string(),
+                "svr".to_string(),
+                McpClientEventKind::TransportClosed,
+                never_cancel(),
+            )
+            .await;
+            assert!(
+                !scheduled,
+                "after {MAX_EARLY_DEATHS} early deaths auto-restart must stop",
+            );
+            assert_eq!(
+                mock.respawn_call_count(),
+                MAX_EARLY_DEATHS,
+                "parked server must not respawn again",
+            );
+
+            let park_pushes: Vec<_> = mock
+                .pushes()
+                .into_iter()
+                .filter(|p| {
+                    p.reason == McpServerStatusReason::RestartFailed
+                        && early_park_detail(p.detail.as_deref())
+                })
+                .collect();
+            assert_eq!(
+                park_pushes.len(),
+                1,
+                "exactly one early-death park diagnostic; got {:?}",
+                mock.pushes(),
+            );
+            assert_eq!(park_pushes[0].status, McpServerStatus::Unavailable);
+            assert_eq!(
+                mock.unregister_calls(),
+                vec!["svr".to_string()],
+                "the parking death must drop the server's tools",
+            );
+
+            // Already parked → silent on the wire, but still evicts the
+            // tools: `drop_dead_clients` evicted the client again, and
+            // this branch is the only place left to notice.
+            let scheduled = maybe_schedule_restart(
+                dyn_actions(mock.clone()),
+                "sess-1".to_string(),
+                "svr".to_string(),
+                McpClientEventKind::TransportClosed,
+                never_cancel(),
+            )
+            .await;
+            assert!(!scheduled, "a parked server must not schedule a restart");
+            let park_again = mock
+                .pushes()
+                .into_iter()
+                .filter(|p| {
+                    p.reason == McpServerStatusReason::RestartFailed
+                        && early_park_detail(p.detail.as_deref())
+                })
+                .count();
+            assert_eq!(
+                park_again, 1,
+                "already-parked must not emit another diagnostic"
+            );
+            assert_eq!(
+                mock.unregister_calls(),
+                vec!["svr".to_string(), "svr".to_string()],
+                "an already-parked death must also unregister the tools",
+            );
+        })
+        .await;
+    }
+
+    /// Issue #45: successive early-death restart cycles must wait
+    /// increasing [`CYCLE_BACKOFF`] before the attempt ladder, not
+    /// only the intra-cycle [`BACKOFF`].
+    #[tokio::test(start_paused = true)]
+    async fn restart_cycles_use_increasing_backoff() {
+        run_in_local(async {
+            assert!(
+                CYCLE_BACKOFF[1] > CYCLE_BACKOFF[0]
+                    && CYCLE_BACKOFF[2] > CYCLE_BACKOFF[1]
+                    && CYCLE_BACKOFF[3] >= CYCLE_BACKOFF[2],
+                "CYCLE_BACKOFF must be increasing (last step may cap)",
+            );
+
+            let mock = Rc::new(MockActions::new());
+            mock.configure("svr");
+            mock.script_outcome(Ok(()));
+            mock.script_outcome(Ok(()));
+            mock.note_ready("svr");
+
+            let DeathDisposition::Proceed { cycle_backoff } =
+                mock.classify_death("svr", McpClientEventKind::TransportClosed)
+            else {
+                panic!("expected Proceed for first early death");
+            };
+            assert_eq!(cycle_backoff, CYCLE_BACKOFF[0]);
+
+            let task = tokio::task::spawn_local(auto_restart_stdio(
+                dyn_actions(mock.clone()),
+                "sess-1".to_string(),
+                "svr".to_string(),
+                never_cancel(),
+                cycle_backoff,
+            ));
+            // Register the cycle-backoff sleep with the paused driver
+            // before any advance (otherwise the first advance is lost).
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            // 1s into the cycle backoff — must not respawn yet.
+            tokio::time::advance(StdDuration::from_secs(1)).await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                mock.respawn_call_count(),
+                0,
+                "cycle 1 must wait cycle backoff before the attempt ladder",
+            );
+            // Finish cycle backoff, then attempt backoff (separate
+            // advances: a newly-created sleep is not covered by the
+            // advance that woke the previous one).
+            tokio::time::advance(cycle_backoff - StdDuration::from_secs(1)).await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                mock.respawn_call_count(),
+                0,
+                "cycle backoff done but attempt backoff still pending",
+            );
+            tokio::time::advance(StdDuration::from_secs(1)).await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                mock.respawn_call_count(),
+                1,
+                "cycle 1 respawn after cycle backoff + attempt backoff",
+            );
+            task.await.unwrap();
+
+            let DeathDisposition::Proceed { cycle_backoff } =
+                mock.classify_death("svr", McpClientEventKind::TransportClosed)
+            else {
+                panic!("expected Proceed for second early death");
+            };
+            assert_eq!(cycle_backoff, CYCLE_BACKOFF[1]);
+            assert!(
+                cycle_backoff > CYCLE_BACKOFF[0],
+                "second early-death cycle backoff must exceed the first",
+            );
+
+            let task = tokio::task::spawn_local(auto_restart_stdio(
+                dyn_actions(mock.clone()),
+                "sess-1".to_string(),
+                "svr".to_string(),
+                never_cancel(),
+                cycle_backoff,
+            ));
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            // Advance only as far as cycle 1's total wait — must not fire.
+            let cycle1_total = CYCLE_BACKOFF[0] + StdDuration::from_secs(1);
+            tokio::time::advance(cycle1_total).await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                mock.respawn_call_count(),
+                1,
+                "cycle 2 backoff must be strictly longer than cycle 1",
+            );
+            tokio::time::advance(cycle_backoff - cycle1_total).await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                mock.respawn_call_count(),
+                1,
+                "cycle 2 cycle-backoff done; attempt backoff still pending",
+            );
+            tokio::time::advance(StdDuration::from_secs(1)).await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                mock.respawn_call_count(),
+                2,
+                "cycle 2 respawn after its longer cycle backoff",
+            );
+            task.await.unwrap();
+        })
+        .await;
+    }
+
+    /// Issue #45 regression guard: surviving past [`STABILITY_WINDOW`]
+    /// after a handshake resets the early-death budget so occasional
+    /// healthy restarts are not mis-parked.
+    #[tokio::test(start_paused = true)]
+    async fn surviving_past_stability_window_resets_budget() {
+        run_in_local(async {
+            let mock = Rc::new(MockActions::new());
+            mock.configure("svr");
+            for _ in 0..(MAX_EARLY_DEATHS * 2 + 2) {
+                mock.script_outcome(Ok(()));
+            }
+            mock.note_ready("svr");
+
+            for cycle in 0..(MAX_EARLY_DEATHS - 1) {
+                let DeathDisposition::Proceed { cycle_backoff } =
+                    mock.classify_death("svr", McpClientEventKind::TransportClosed)
+                else {
+                    panic!("pre-reset cycle {cycle}: expected Proceed");
+                };
+                drive_cycle(&mock, cycle_backoff).await;
+            }
+            let after_partial = mock.respawn_call_count();
+            assert_eq!(after_partial, MAX_EARLY_DEATHS - 1);
+
+            // Survive past the stability window — budget resets.
+            tokio::time::advance(STABILITY_WINDOW).await;
+            tokio::task::yield_now().await;
+
+            let DeathDisposition::Proceed { cycle_backoff } =
+                mock.classify_death("svr", McpClientEventKind::TransportClosed)
+            else {
+                panic!("post-window death must be a healthy Proceed");
+            };
+            assert_eq!(
+                cycle_backoff,
+                StdDuration::ZERO,
+                "death after stability window must have zero cycle backoff",
+            );
+            drive_cycle(&mock, cycle_backoff).await;
+            assert_eq!(
+                mock.respawn_call_count(),
+                after_partial + 1,
+                "death after stability window must restart (budget reset)",
+            );
+
+            // Full early-death budget again after the reset.
+            for cycle in 0..MAX_EARLY_DEATHS {
+                let DeathDisposition::Proceed { cycle_backoff } =
+                    mock.classify_death("svr", McpClientEventKind::TransportClosed)
+                else {
+                    panic!("post-reset early cycle {cycle}: expected Proceed");
+                };
+                // This is the assertion that actually fires if the
+                // reset regresses: without `early_deaths = 0` the
+                // counter carries over from the pre-window cycles and
+                // this walk starts partway down (or past the end of)
+                // the table instead of at CYCLE_BACKOFF[0]. Read a
+                // failure here as "the stability window did not reset
+                // the budget", not as a backoff-table typo.
+                assert_eq!(
+                    cycle_backoff, CYCLE_BACKOFF[cycle],
+                    "post-reset cycle {cycle} must resume the cycle-backoff \
+                     table from the top; a later entry means surviving the \
+                     stability window failed to reset early_deaths",
+                );
+                drive_cycle(&mock, cycle_backoff).await;
+            }
+            assert_eq!(
+                mock.respawn_call_count(),
+                after_partial + 1 + MAX_EARLY_DEATHS,
+            );
+            let scheduled = maybe_schedule_restart(
+                dyn_actions(mock.clone()),
+                "sess-1".to_string(),
+                "svr".to_string(),
+                McpClientEventKind::TransportClosed,
+                never_cancel(),
+            )
+            .await;
+            assert!(
+                !scheduled,
+                "full early-death budget after a reset must still park",
+            );
+        })
+        .await;
+    }
+
+    /// Issue #45 scope guard: `HandshakeFailed` must never feed the
+    /// early-death classifier.
+    ///
+    /// `HandshakeFailed` is emitted for *any* `ensure_initialized`
+    /// error, including a `startup_timeout_sec` timeout on a server
+    /// whose child is alive and whose transport never closed. A server
+    /// that intermittently overruns its startup timeout would otherwise
+    /// burn a cycle per hiccup and be parked — under a message claiming
+    /// an "early exit within 30s of handshake" that never happened.
+    #[tokio::test(start_paused = true)]
+    async fn handshake_failed_never_burns_the_early_death_budget() {
+        let mut budget = RestartBudget::default();
+        budget.note_ready(tokio::time::Instant::now());
+
+        // Far more handshake failures than the budget, all well inside
+        // the stability window.
+        for i in 0..(MAX_EARLY_DEATHS * 3) {
+            let disposition = budget.classify_death(
+                tokio::time::Instant::now(),
+                McpClientEventKind::HandshakeFailed,
+            );
+            assert_eq!(
+                disposition,
+                DeathDisposition::Proceed {
+                    cycle_backoff: Duration::ZERO
+                },
+                "handshake failure {i} must proceed on the legacy path",
+            );
+        }
+
+        // The transport-close budget is untouched: the next real
+        // transport death is early death #1, not a park.
+        assert_eq!(
+            budget.classify_death(
+                tokio::time::Instant::now(),
+                McpClientEventKind::TransportClosed,
+            ),
+            DeathDisposition::Proceed {
+                cycle_backoff: CYCLE_BACKOFF[0]
+            },
+            "handshake failures must not have advanced the cycle counter",
+        );
+    }
+
+    /// Issue #45 recovery, the ordering half: a park must NOT suppress a
+    /// `HandshakeFailed`.
+    ///
+    /// After a park, the only producer of a `HandshakeFailed` for a stdio
+    /// server is a fresh `start_mcp_server` — the client the user just
+    /// asked for by fixing the command and toggling the server back on
+    /// (a parked server's old client cannot re-handshake in place; see
+    /// `classify_death`'s doc). If that first handshake overruns
+    /// `startup_timeout_sec`, it must still get the full attempt ladder
+    /// rather than zero attempts, or recovery dies on its first stumble
+    /// with nothing telling the user why.
+    ///
+    /// Swapping the `kind` and `parked` checks back fails this test.
+    #[tokio::test(start_paused = true)]
+    async fn a_park_does_not_suppress_a_handshake_failure() {
+        let mut budget = RestartBudget::default();
+        budget.note_ready(tokio::time::Instant::now());
+        for _ in 0..MAX_EARLY_DEATHS {
+            budget.classify_death(
+                tokio::time::Instant::now(),
+                McpClientEventKind::TransportClosed,
+            );
+        }
+        assert_eq!(
+            budget.classify_death(
+                tokio::time::Instant::now(),
+                McpClientEventKind::TransportClosed,
+            ),
+            DeathDisposition::Exhausted,
+            "budget exhaustion parks",
+        );
+        assert_eq!(
+            budget.classify_death(
+                tokio::time::Instant::now(),
+                McpClientEventKind::TransportClosed,
+            ),
+            DeathDisposition::AlreadyParked,
+            "further transport deaths stay parked",
+        );
+
+        assert_eq!(
+            budget.classify_death(
+                tokio::time::Instant::now(),
+                McpClientEventKind::HandshakeFailed,
+            ),
+            DeathDisposition::Proceed {
+                cycle_backoff: Duration::ZERO
+            },
+            "a handshake failure is outside this budget, so the park must \
+             not swallow it — that is the user's re-added server failing \
+             its first handshake, and it deserves the attempt ladder",
+        );
+
+        assert_eq!(
+            budget.classify_death(
+                tokio::time::Instant::now(),
+                McpClientEventKind::TransportClosed,
+            ),
+            DeathDisposition::AlreadyParked,
+            "and letting it through must not have disturbed the park",
+        );
+    }
+
+    /// Companion to the above through the real scheduling path: a
+    /// `HandshakeFailed` restart is scheduled with NO cycle backoff, so
+    /// it respawns on the plain `BACKOFF[0]` ladder.
+    #[tokio::test(start_paused = true)]
+    async fn handshake_failed_schedules_without_cycle_backoff() {
+        run_in_local(async {
+            let mock = Rc::new(MockActions::new());
+            mock.configure("svr");
+            mock.script_outcome(Ok(()));
+            // A handshake just landed: a TransportClosed now would be
+            // early death #1 with a non-zero CYCLE_BACKOFF[0].
+            mock.note_ready("svr");
+
+            let spawned = maybe_schedule_restart(
+                dyn_actions(mock.clone()),
+                "sess-1".to_string(),
+                "svr".to_string(),
+                McpClientEventKind::HandshakeFailed,
+                never_cancel(),
+            )
+            .await;
+            assert!(spawned, "HandshakeFailed must still schedule a restart");
+            assert_eq!(
+                mock.early_deaths("svr"),
+                0,
+                "HandshakeFailed must not burn an early-death cycle",
+            );
+
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(BACKOFF[0]).await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                mock.respawn_call_count(),
+                1,
+                "HandshakeFailed restart must fire on BACKOFF[0] alone, \
+                 with no inter-cycle delay in front of it",
+            );
+        })
+        .await;
+    }
+
+    /// Issue #45 regression guard, the other side of
+    /// `dispatcher_ready_unparks_and_restores_the_budget`: a dispatcher
+    /// `Ready` for a server that is **not** parked must NOT refund the
+    /// early-death budget.
+    ///
+    /// `flush_window` runs before `maybe_schedule_restart`, so if this
+    /// reset were ungated, a `Ready` coalescing into the same window as
+    /// a `TransportClosed` would zero the counter and re-increment from
+    /// zero every cycle — the original bug, reintroduced through the
+    /// recovery path. Deleting the `if self.parked` gate in
+    /// `note_recovery_ready` fails this test.
+    #[tokio::test(start_paused = true)]
+    async fn dispatcher_ready_while_unparked_does_not_refund_the_budget() {
+        let mut budget = RestartBudget::default();
+        budget.note_ready(tokio::time::Instant::now());
+
+        // Burn part of the budget without reaching a park.
+        for cycle in 0..3 {
+            let disposition = budget.classify_death(
+                tokio::time::Instant::now(),
+                McpClientEventKind::TransportClosed,
+            );
+            assert_eq!(
+                disposition,
+                DeathDisposition::Proceed {
+                    cycle_backoff: CYCLE_BACKOFF[cycle]
+                },
+                "cycle {cycle} walks the table",
+            );
+        }
+
+        // A dispatcher-observed handshake lands mid-loop. It refreshes
+        // the stability window, but must not hand back the budget.
+        budget.note_recovery_ready(tokio::time::Instant::now());
+
+        assert_eq!(
+            budget.classify_death(
+                tokio::time::Instant::now(),
+                McpClientEventKind::TransportClosed,
+            ),
+            DeathDisposition::Proceed {
+                cycle_backoff: CYCLE_BACKOFF[3]
+            },
+            "an un-parked Ready must not rewind the cycle counter",
+        );
+
+        // And the park still arrives on schedule rather than never.
+        assert_eq!(
+            budget.classify_death(
+                tokio::time::Instant::now(),
+                McpClientEventKind::TransportClosed,
+            ),
+            DeathDisposition::Proceed {
+                cycle_backoff: CYCLE_BACKOFF[4]
+            },
+        );
+        assert_eq!(
+            budget.classify_death(
+                tokio::time::Instant::now(),
+                McpClientEventKind::TransportClosed,
+            ),
+            DeathDisposition::Exhausted,
+            "the budget must still be exhaustible after an un-parked Ready",
+        );
+    }
+
+    /// Issue #45: a park must be recoverable. A handshake observed by
+    /// the *dispatcher* (`flush_window`'s `Ready` arm → the production
+    /// `ShutdownState::note_recovery_ready`) clears the park and
+    /// restores the full budget, so a user who fixes the server's
+    /// command and toggles it off/on gets auto-restart back without
+    /// restarting the session.
+    ///
+    /// The distinction matters: [`auto_restart_stdio`]'s own success
+    /// path reports via `note_ready`, which deliberately does NOT clear
+    /// the park — if it did, every successful restart would refund the
+    /// budget and re-create the original bug.
+    #[tokio::test(start_paused = true)]
+    async fn dispatcher_ready_unparks_and_restores_the_budget() {
+        run_in_local(async {
+            let mock = Rc::new(MockActions::new());
+            mock.configure("svr");
+            for _ in 0..(MAX_EARLY_DEATHS * 2 + 2) {
+                mock.script_outcome(Ok(()));
+            }
+            mock.note_ready("svr");
+
+            // Burn the whole budget, then park on the next death.
+            for cycle in 0..MAX_EARLY_DEATHS {
+                let DeathDisposition::Proceed { cycle_backoff } =
+                    mock.classify_death("svr", McpClientEventKind::TransportClosed)
+                else {
+                    panic!("cycle {cycle}: expected Proceed");
+                };
+                drive_cycle(&mock, cycle_backoff).await;
+            }
+            let parking = maybe_schedule_restart(
+                dyn_actions(mock.clone()),
+                "sess-1".to_string(),
+                "svr".to_string(),
+                McpClientEventKind::TransportClosed,
+                never_cancel(),
+            )
+            .await;
+            assert!(!parking, "budget exhaustion must park");
+            let respawns_at_park = mock.respawn_call_count();
+
+            // A restart-path handshake must NOT lift the park.
+            mock.note_ready("svr");
+            let still_parked = maybe_schedule_restart(
+                dyn_actions(mock.clone()),
+                "sess-1".to_string(),
+                "svr".to_string(),
+                McpClientEventKind::TransportClosed,
+                never_cancel(),
+            )
+            .await;
+            assert!(
+                !still_parked,
+                "auto_restart_stdio's own note_ready must not clear a park",
+            );
+
+            // The dispatcher observing `Ready` does.
+            mock.note_recovery_ready("svr");
+            let recovered = maybe_schedule_restart(
+                dyn_actions(mock.clone()),
+                "sess-1".to_string(),
+                "svr".to_string(),
+                McpClientEventKind::TransportClosed,
+                never_cancel(),
+            )
+            .await;
+            assert!(
+                recovered,
+                "a dispatcher-observed Ready must restore auto-restart",
+            );
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            // Back at the top of the table: CYCLE_BACKOFF[0] then
+            // BACKOFF[0], in separate advances (a sleep created after an
+            // advance is not covered by the advance that woke its
+            // predecessor).
+            tokio::time::advance(CYCLE_BACKOFF[0]).await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(BACKOFF[0]).await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                mock.respawn_call_count(),
+                respawns_at_park + 1,
+                "the unparked server must actually respawn again",
+            );
+
+            // ... and the budget is full again, not one death from a
+            // re-park: MAX_EARLY_DEATHS - 1 further cycles all proceed.
+            for cycle in 1..MAX_EARLY_DEATHS {
+                let DeathDisposition::Proceed { cycle_backoff } =
+                    mock.classify_death("svr", McpClientEventKind::TransportClosed)
+                else {
+                    panic!("post-unpark cycle {cycle}: expected Proceed");
+                };
+                assert_eq!(
+                    cycle_backoff, CYCLE_BACKOFF[cycle],
+                    "post-unpark cycle {cycle} must walk the table from \
+                     the top; an unpark that left early_deaths set would \
+                     land further down it",
+                );
+                drive_cycle(&mock, cycle_backoff).await;
+            }
+            let re_parked = maybe_schedule_restart(
+                dyn_actions(mock.clone()),
+                "sess-1".to_string(),
+                "svr".to_string(),
+                McpClientEventKind::TransportClosed,
+                never_cancel(),
+            )
+            .await;
+            assert!(
+                !re_parked,
+                "an unparked server must still be parkable a second time",
+            );
+        })
+        .await;
     }
 }

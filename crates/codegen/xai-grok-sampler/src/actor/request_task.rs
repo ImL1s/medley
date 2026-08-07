@@ -792,6 +792,12 @@ fn emit_failed(
     });
 }
 
+fn emit_attempt_discarded(event_tx: &mpsc::UnboundedSender<SamplingEvent>, request_id: &RequestId) {
+    let _ = event_tx.send(SamplingEvent::AttemptDiscarded {
+        request_id: request_id.clone(),
+    });
+}
+
 fn emit_retrying(
     event_tx: &mpsc::UnboundedSender<SamplingEvent>,
     request_id: &RequestId,
@@ -799,6 +805,9 @@ fn emit_retrying(
     max_retries: u32,
     err: &SamplingError,
 ) {
+    // Retraction first so consumers drop any already-streamed chunks for this
+    // attempt before they render the retry indicator / next attempt's text.
+    emit_attempt_discarded(event_tx, request_id);
     let info = SamplingErrorInfo::from(err);
     let _ = event_tx.send(SamplingEvent::Retrying {
         request_id: request_id.clone(),
@@ -1002,6 +1011,10 @@ mod tests {
         .await;
 
         assert!(!should_continue);
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(SamplingEvent::AttemptDiscarded { .. })
+        ));
         assert!(matches!(
             event_rx.recv().await,
             Some(SamplingEvent::Retrying { .. })

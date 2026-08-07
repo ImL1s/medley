@@ -71,6 +71,45 @@ fn acp_response_completed_emits_usage_line() {
     assert_eq!(out[0]["signature"], "sig");
 }
 
+/// #44: abandoned attempt emits one `attempt_discarded` line between the
+/// abandoned deltas and the retry's, so a streaming consumer can drop the first set.
+#[test]
+fn acp_attempt_discarded_sits_between_abandoned_and_retry_text() {
+    let mut r = AcpReducer;
+    let mut lines = Vec::new();
+    lines.extend(r.reduce(StreamEvent::AgentMessage("hello".into())));
+    lines.extend(r.reduce(StreamEvent::AttemptDiscarded));
+    lines.extend(r.reduce(StreamEvent::AgentMessage("hello".into())));
+    assert_eq!(
+        lines,
+        vec![
+            json!({"type": "text", "data": "hello"}),
+            json!({"type": "attempt_discarded"}),
+            json!({"type": "text", "data": "hello"}),
+        ]
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l["type"] == "attempt_discarded")
+            .count(),
+        1,
+        "exactly one retraction line"
+    );
+}
+
+/// Accepted attempt (no discard event) emits no retraction line.
+#[test]
+fn acp_accepted_attempt_emits_no_attempt_discarded() {
+    let mut r = AcpReducer;
+    let lines = r.reduce(StreamEvent::AgentMessage("once only".into()));
+    assert_eq!(lines, vec![json!({"type": "text", "data": "once only"})]);
+    assert!(
+        lines.iter().all(|l| l["type"] != "attempt_discarded"),
+        "accepted stream must not contain attempt_discarded"
+    );
+}
+
 #[test]
 fn acp_finish_emits_end_line_with_usage_and_structured_output() {
     let mut r = AcpReducer;

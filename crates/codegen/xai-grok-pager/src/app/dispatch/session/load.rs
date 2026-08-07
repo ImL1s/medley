@@ -1142,6 +1142,23 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
                 &deferred,
                 server_models_authoritative,
             );
+        // The deferred switch is decided and emitted BEFORE the queue drain:
+        // the shell must see the switch ahead of anything the drain releases.
+        // `begin_model_switch_request` (inside `begin_or_reject_...` above) has
+        // already set `model_switch_pending`, so `maybe_drain_queue` stays
+        // gated until the completion lands.
+        if let Some(switch) = deferred
+            && let Some(request_id) = deferred_request_id
+        {
+            effects.push(Effect::SwitchModel {
+                agent_id,
+                session_id: hydrate_sid.clone(),
+                model_id: switch.model_id,
+                effort: switch.effort,
+                request_id,
+                prev_model_id: switch.prev_model_id,
+            });
+        }
         let drain = maybe_drain_queue(agent);
         let page_flip_entry = drain.page_flip_entry;
         effects.extend(drain.effects);
@@ -1171,23 +1188,6 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
             agent_id,
             silent: true,
         });
-        // One block, not two: upstream added this one while the fork already had
-        // an equivalent earlier in the same scope, and keeping both pushed the
-        // effect twice. `request_id` is the fork's -- `Effect::SwitchModel`
-        // still carries it.
-        if let Some(switch) = deferred
-            && let Some(request_id) = deferred_request_id
-        {
-            agent.session.model_switch_pending = true;
-            effects.push(Effect::SwitchModel {
-                agent_id,
-                session_id: hydrate_sid.clone(),
-                model_id: switch.model_id,
-                effort: switch.effort,
-                request_id,
-                prev_model_id: switch.prev_model_id,
-            });
-        }
         if std::mem::take(&mut agent.pending_extensions_fetch)
             && let Some(modal) = agent.extensions_modal.as_mut()
         {
