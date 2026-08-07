@@ -2346,6 +2346,37 @@ fn absent_configured_default_is_substituted_and_reported() {
     );
 }
 
+/// #131: present in the catalog but `user_selectable = false` is the other
+/// half of "not seated". Resolve falls through to `Default` the same way as
+/// absence; the preference must still be reported.
+///
+/// Asserted at the resolve layer: `from_config` rebuilds selectable flags from
+/// `allowed_models` (and rejects a config default the allowlist excludes), so
+/// a hand-flipped `user_selectable` does not survive construction. The docs
+/// claim is about [`resolve_default_model`]'s fall-through.
+#[test]
+fn present_but_not_selectable_configured_default_is_substituted_and_reported() {
+    let mut cfg = config::Config::default();
+    cfg.models.default = Some("hidden-byo".to_string());
+
+    let mut catalog = IndexMap::new();
+    let mut blocked = ready_entry("hidden-byo");
+    blocked.info.user_selectable = false;
+    catalog.insert("hidden-byo".to_string(), blocked);
+    catalog.insert("grok-4".to_string(), ready_entry("grok-4"));
+
+    let (key, _, source, _) = resolve_default_model(&cfg, &catalog, false);
+    assert_ne!(
+        key.as_str(),
+        "hidden-byo",
+        "a not-user-selectable preference must not be seated"
+    );
+    let reported = substituted_preference(&cfg, source)
+        .expect("present-but-not-selectable must be reported as substituted");
+    assert_eq!(reported.configured, "hidden-byo");
+    assert_eq!(reported.source_wire(), "config");
+}
+
 /// #131 counterweight: a configured default that is **honoured** must produce
 /// no substitution field — including the kept-but-unready case, which #145
 /// already covers through `readinessReason`. A field that appeared for a
@@ -2556,10 +2587,16 @@ fn clear_wipes_substituted_preference() {
     );
 }
 
-/// #131 B1: after a false accusation against a thinner catalog, landing the
-/// real catalog must clear the in-memory verdict *and* the models-update
-/// `_meta` payload (JSON null), so a client holding the initialize snapshot
-/// can retract it.
+/// #131 B1+B4+B5: after a false accusation against a thinner (warm-cache)
+/// catalog, landing the real catalog must (1) *reseat* the configured
+/// preference, (2) clear the in-memory verdict, and (3) publish JSON `null` on
+/// a real `x.ai/models/update` ExtNotification — not via a hand-rolled
+/// `write_substituted_default_model_meta` call that bypasses the wire.
+///
+/// Deleting the `model_state.meta(...)` block in `notify_models_updated` must
+/// fail this test; asserting only on `substituted_preference()` would not
+/// (same bar as initialize B3). Asserting seating stops the warm-cache path
+/// from retracting while the substitute stays current.
 #[test]
 fn models_update_meta_clears_substitution_after_catalog_lands() {
     let mut cfg = config::Config::default();
@@ -2568,36 +2605,120 @@ fn models_update_meta_clears_substitution_after_catalog_lands() {
     let mut thin = IndexMap::new();
     thin.insert("grok-4".to_string(), ready_entry("grok-4"));
     let mgr = manager_over(&cfg, thin);
+    assert_eq!(
+        mgr.current_model_id().0.as_ref(),
+        "grok-4",
+        "precondition: thin catalog seats the substitute"
+    );
     assert!(
         mgr.substituted_preference().is_some(),
         "precondition: thin catalog substitutes the preference"
     );
 
-    let mut accused = serde_json::Map::new();
-    mgr.write_substituted_default_model_meta(&mut accused, true);
+    let (gateway, mut rx) = crate::test_support::lsp_runtime::test_gateway_with_receiver();
+    mgr.set_gateway(gateway);
+
+    // Accusation while it stands — through the notify wire, not a hand write.
+    mgr.notify_models_updated();
+    let accused = recv_models_update_meta(&mut rx);
     assert!(
         accused
             .get(SUBSTITUTED_DEFAULT_MODEL_META_KEY)
             .is_some_and(|v| v.is_object()),
-        "models/update meta must carry the accusation while it stands"
+        "x.ai/models/update SessionModelState._meta must carry the accusation while it stands"
     );
+
+    let mut full = IndexMap::new();
+    full.insert("my-byo".to_string(), ready_entry("my-byo"));
+    full.insert("grok-4".to_string(), ready_entry("grok-4"));
+    // Prefetch already set has_fetched_real_catalog — this is the warm-cache
+    // path that takes reselect_current_model_if_missing, not reselect_default.
+    assert!(
+        mgr.inner.catalog.read().has_fetched_real_catalog,
+        "precondition: warm-cache path (prefetch marked the catalog real)"
+    );
+    mgr.apply_refresh_result(&cfg, Some(full), None);
+    mgr.notify_models_updated();
+
+    assert_eq!(
+        mgr.current_model_id().0.as_ref(),
+        "my-byo",
+        "warm-cache refresh must reseat the now-honourable preference — \
+         retracting while the substitute stays seated is the B4 lie"
+    );
+    assert!(
+        mgr.substituted_preference().is_none(),
+        "in-memory verdict must clear once the preference is seated"
+    );
+
+    let cleared = recv_models_update_meta(&mut rx);
+    assert!(
+        cleared
+            .get(SUBSTITUTED_DEFAULT_MODEL_META_KEY)
+            .is_some_and(|v| v.is_null()),
+        "x.ai/models/update SessionModelState._meta must publish JSON null so clients can retract"
+    );
+    assert_eq!(
+        cleared.get("currentModelId").and_then(|v| v.as_str()),
+        Some("my-byo"),
+        "wire currentModelId must name the reseated preference"
+    );
+}
+
+/// Drain one `x.ai/models/update` ExtNotification and return its params as JSON
+/// (the `SessionModelState` body, including `_meta`).
+fn recv_models_update_meta(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<xai_acp_lib::AcpClientMessage>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let msg = rx
+        .try_recv()
+        .expect("expected an x.ai/models/update ExtNotification");
+    let xai_acp_lib::AcpClientMessage::ExtNotification(args) = msg else {
+        panic!("expected ExtNotification, got another message kind");
+    };
+    assert_eq!(
+        args.request.method.as_ref(),
+        "x.ai/models/update",
+        "notify_models_updated must publish x.ai/models/update"
+    );
+    let params: serde_json::Value =
+        serde_json::from_str(args.request.params.get()).expect("models/update params are JSON");
+    let obj = params
+        .as_object()
+        .cloned()
+        .expect("SessionModelState serializes as a JSON object");
+    // Flatten: assertions look at both top-level currentModelId and _meta keys.
+    let mut flat = obj.clone();
+    if let Some(serde_json::Value::Object(meta)) = obj.get("_meta") {
+        for (k, v) in meta {
+            flat.insert(k.clone(), v.clone());
+        }
+    }
+    flat
+}
+
+/// #131 B4 counterweight: an explicit `/model` pick must not be clobbered when
+/// a previously missing configured preference later appears in the catalog.
+#[test]
+fn warm_cache_refresh_does_not_reseat_over_user_model_pick() {
+    let mut cfg = config::Config::default();
+    cfg.models.default = Some("my-byo".to_string());
+
+    let mut thin = IndexMap::new();
+    thin.insert("grok-4".to_string(), ready_entry("grok-4"));
+    let mgr = manager_over(&cfg, thin);
+    assert_eq!(mgr.current_model_id().0.as_ref(), "grok-4");
+    // User explicitly keeps the substitute.
+    mgr.set_current_model_id(acp::ModelId::new(std::sync::Arc::from("grok-4")));
 
     let mut full = IndexMap::new();
     full.insert("my-byo".to_string(), ready_entry("my-byo"));
     full.insert("grok-4".to_string(), ready_entry("grok-4"));
     mgr.apply_refresh_result(&cfg, Some(full), None);
 
-    assert!(
-        mgr.substituted_preference().is_none(),
-        "in-memory verdict must clear once the preference is in the catalog"
-    );
-
-    let mut cleared = serde_json::Map::new();
-    mgr.write_substituted_default_model_meta(&mut cleared, true);
-    assert!(
-        cleared
-            .get(SUBSTITUTED_DEFAULT_MODEL_META_KEY)
-            .is_some_and(|v| v.is_null()),
-        "models/update meta must publish JSON null so clients can retract"
+    assert_eq!(
+        mgr.current_model_id().0.as_ref(),
+        "grok-4",
+        "a /model pick must survive the preference becoming available"
     );
 }

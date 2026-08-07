@@ -360,6 +360,8 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             absent_configured_default_is_substituted_and_reported -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
+            present_but_not_selectable_configured_default_is_substituted_and_reported -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
             honoured_configured_default_reports_no_substitution -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             campaign_driven_default_is_not_reported_as_the_users_choice -- --nocapture
@@ -375,6 +377,8 @@ jobs:
             clear_wipes_substituted_preference -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             models_update_meta_clears_substitution_after_catalog_lands -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            warm_cache_refresh_does_not_reseat_over_user_model_pick -- --nocapture
 
       - name: Pager model picker / readiness
         env:

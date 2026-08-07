@@ -118,8 +118,11 @@ struct Inner {
     /// was used (#131). Refreshed at every `resolve_default_model` call site —
     /// including the early-return of `reselect_current_model_if_missing` — so a
     /// catalog that arrives late corrects a verdict taken against an emptier
-    /// one rather than leaving it stale. Republished on `x.ai/models/update`
-    /// via [`Self::notify_models_updated`].
+    /// one rather than leaving it stale. On the warm-cache path that correction
+    /// also reseats the preference when it becomes honourable (unless the user
+    /// already picked via `/model`), so clearing the verdict cannot disagree
+    /// with `current_model_id`. Republished on `x.ai/models/update` via
+    /// [`Self::notify_models_updated`].
     substituted_preference: RwLock<Option<resolution::SubstitutedPreference>>,
     // ── Owned context for self-contained refresh ────────────────
     auth_manager: Arc<AuthManager>,
@@ -480,10 +483,18 @@ impl ModelsManager {
         self.inner.current_model_id.read().clone()
     }
 
-    /// The configured default that was not seated (absent from the catalog, or
-    /// present but not user-selectable), if that happened (#131). `None` covers
-    /// every other outcome, including a preference kept-but-unready — that one
-    /// is already reported per-model as `readinessReason` in `availableModels`.
+    /// The configured default that resolve fell through on (absent from the
+    /// catalog, or present but not user-selectable), so a substitute is what
+    /// `current_model_id` names (#131). Derived from
+    /// [`resolve_default_model`]'s source: an explicit preference that was
+    /// seated — ready, or kept-unready under #145 — comes back carrying its
+    /// own source, not `Default`. `None` covers every other outcome, including
+    /// kept-but-unready (already reported per-model as `readinessReason`).
+    ///
+    /// After a later catalog makes the preference honourable, the warm-cache
+    /// path reseats it (when the user has not `/model`-picked), so a cleared
+    /// verdict means the preference is seated — not merely "would be seated if
+    /// we reselected".
     pub(crate) fn substituted_preference(&self) -> Option<resolution::SubstitutedPreference> {
         self.inner.substituted_preference.read().clone()
     }
@@ -764,8 +775,13 @@ impl ModelsManager {
             // catalog push. `initialize` is one-shot; without this, a verdict
             // taken against a bundled/empty catalog survives on the only
             // surface a client can see after the remote catalog corrects it.
-            // Carried on `SessionModelState._meta` under the same key as
-            // initialize — JSON `null` means "no longer substituted".
+            //
+            // Path asymmetry (intentional until a consumer unifies them):
+            // `initialize` writes the key on the *response* top-level `_meta`
+            // (sibling of `modelState`); this notification writes it on
+            // `SessionModelState._meta` (inside the update params). Same key
+            // name, different JSON path — first consumers must branch.
+            // JSON `null` means "no longer substituted".
             let mut model_state =
                 acp::SessionModelState::new(current, available.values().cloned().collect());
             let mut meta = serde_json::Map::new();
@@ -1267,6 +1283,15 @@ impl ModelsManager {
     /// no longer user-selectable. Always refreshes the #131 verdict: the
     /// early-return path is exactly when a stale `Some` taken against an
     /// emptier catalog would otherwise survive.
+    ///
+    /// Warm-cache path: a prefetched disk catalog already set
+    /// `has_fetched_real_catalog`, so later remote catalogs take this method
+    /// rather than [`Self::reselect_default_model`]. When a prior substitution
+    /// verdict exists and resolve now honours an explicit preference that is
+    /// not the seated id (and the user has not `/model`-picked), reseat —
+    /// otherwise clearing the verdict would retract the accusation while the
+    /// substitute stayed seated. Gating on a prior verdict also keeps
+    /// campaign-only preferred flips from yanking a live session.
     fn reselect_current_model_if_missing(&self, config: &config::Config) {
         let current = self.inner.current_model_id.read().clone();
         let needs_reselection = {
@@ -1282,15 +1307,33 @@ impl ModelsManager {
             let models = &cat.models;
             resolve_default_model(config, models, self.is_session_auth())
         };
+        let user_picked = self.inner.user_selected_model.load(Ordering::Relaxed);
+        // Only reseat when we previously recorded a substitution: that is the
+        // warm-cache "preference was missing, now honourable" path. Without
+        // this gate, a campaign-only preferred flip (which deliberately takes
+        // this method rather than reselect_default_model) would yank a live
+        // session onto the pushed default.
+        let had_substitution = self.substituted_preference().is_some();
+        let honour_explicit_preference = had_substitution
+            && !user_picked
+            && key.as_str() != current.0.as_ref()
+            && resolution::is_explicit_preference(source);
         self.record_substituted_preference(config, source);
-        if !needs_reselection {
+        if !needs_reselection && !honour_explicit_preference {
             return;
         }
         let new_id = acp::ModelId::new(Arc::from(key));
-        tracing::info!(
-            old = %current.0, new = %new_id.0, source = %source,
-            "current model not in new catalog, reselecting default"
-        );
+        if honour_explicit_preference && !needs_reselection {
+            tracing::info!(
+                old = %current.0, new = %new_id.0, source = %source,
+                "configured preference now honourable, reseating"
+            );
+        } else {
+            tracing::info!(
+                old = %current.0, new = %new_id.0, source = %source,
+                "current model not in new catalog, reselecting default"
+            );
+        }
         self.set_current_model_id_internal(new_id);
     }
 

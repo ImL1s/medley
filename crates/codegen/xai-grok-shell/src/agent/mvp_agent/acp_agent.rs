@@ -556,6 +556,10 @@ impl acp::Agent for MvpAgent {
                         .as_object()
                         .cloned();
                     if let Some(map) = init_meta.as_mut() {
+                        // #131: top-level response `_meta` (sibling of
+                        // `modelState`). `x.ai/models/update` carries the same
+                        // key on `SessionModelState._meta` instead — see
+                        // `ModelsManager::notify_models_updated`.
                         self.models_manager
                             .write_substituted_default_model_meta(map, false);
                     }

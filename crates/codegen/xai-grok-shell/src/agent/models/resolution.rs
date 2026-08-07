@@ -232,8 +232,9 @@ fn configured_preference(cfg: &config::Config) -> Option<config::Resolved<String
 }
 
 /// `true` when the preference is the user's own choice rather than a remote
-/// default. One definition, used by every decision that turns on it.
-fn is_explicit_preference(source: config::ConfigSource) -> bool {
+/// default. One definition, used by every decision that turns on it —
+/// including the warm-cache reseat in `reselect_current_model_if_missing`.
+pub(crate) fn is_explicit_preference(source: config::ConfigSource) -> bool {
     matches!(
         source,
         config::ConfigSource::Cli | config::ConfigSource::Env | config::ConfigSource::Config
@@ -248,22 +249,31 @@ fn is_campaign_driven_preference(cfg: &config::Config, source: config::ConfigSou
 }
 
 /// `initialize` / `x.ai/models/update` `_meta` key naming a configured default
-/// that was **not seated**, so a substitute was used instead (#131).
+/// that resolve fell through on, so a substitute was seated instead (#131).
 ///
 /// Shape: `{"configuredModelId": "<id>", "source": "cli" | "env" | "config"}`.
 ///
-/// "Not seated" covers both catalog absence and present-but-not-user-selectable
-/// preferences: both fall through to [`config::ConfigSource::Default`] in
-/// [`resolve_default_model`], and both leave the configured id out of the
-/// selectable listing a client can look up. Present-but-unready is different —
-/// #145 keeps that model selected, so this key stays omitted.
+/// Derived from [`resolve_default_model`]'s output source, not from a second
+/// seating check: an explicit preference that was seated comes back carrying
+/// `pref.source`; the only way it yields [`config::ConfigSource::Default`] is
+/// the not-found fall-through (catalog absence *or* present-but-not-user-
+/// selectable). Present-but-unready is different — #145 keeps that model
+/// selected, so this key stays omitted.
 ///
-/// On `initialize`, omitted (not null) when the preference was honoured. On
-/// `x.ai/models/update`, present as the object or as JSON `null` so a prior
-/// accusation can be retracted when the catalog self-corrects.
+/// That proxy matches seating truth when every resolve site either seats what
+/// resolve returned or leaves a still-missing preference substituted. The
+/// warm-cache refresh path reseats when a previously missing preference
+/// becomes honourable (unless the user `/model`-picked), so a cleared verdict
+/// cannot mean "would honour if reseated" while the substitute stays current.
+///
+/// On `initialize`, omitted (not null) when the preference was honoured — and
+/// written on the *response* top-level `_meta`. On `x.ai/models/update`,
+/// present as the object or as JSON `null` on `SessionModelState._meta` (a
+/// different JSON path; same key name) so a prior accusation can be retracted
+/// when the catalog self-corrects and the preference is seated.
 pub(crate) const SUBSTITUTED_DEFAULT_MODEL_META_KEY: &str = "x.ai/substitutedDefaultModel";
 
-/// A configured default that was **not seated**, so a substitute was used.
+/// A configured default that resolve fell through on, so a substitute was seated.
 ///
 /// This is the one rejection a client cannot reconstruct from
 /// `currentModelId` + `availableModels` alone. When the configured model is
