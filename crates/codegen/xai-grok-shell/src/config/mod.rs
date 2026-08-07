@@ -697,9 +697,10 @@ impl ModelOverrideConfig {
         let parsed_models: crate::agent::config::ModelsConfig = models_table
             .and_then(|v| v.clone().try_into().ok())
             .unwrap_or_default();
+        let local_default = non_empty_model_override(parsed_models.default.as_deref());
         let mut result = Self {
-            web_search: parsed_models
-                .web_search
+            web_search: non_empty_model_override(parsed_models.web_search.as_deref())
+                .or_else(|| local_default.clone())
                 .unwrap_or_else(|| crate::models::default_web_search_model().to_owned()),
             session_summary: non_empty_model_override(parsed_models.session_summary.as_deref()),
             image_description: non_empty_model_override(parsed_models.image_description.as_deref()),
@@ -708,6 +709,7 @@ impl ModelOverrideConfig {
                 .unwrap_or_default(),
         };
         let has_local_ws = models_table.and_then(|m| m.get("web_search")).is_some();
+        let has_local_default = models_table.and_then(|m| m.get("default")).is_some();
         let has_local_ss = models_table
             .and_then(|m| m.get("session_summary"))
             .is_some();
@@ -715,8 +717,14 @@ impl ModelOverrideConfig {
             .and_then(|m| m.get("image_description"))
             .is_some();
         if let Some(remote) = remote {
-            if !has_local_ws && let Some(ref v) = remote.web_search_model {
-                result.web_search = v.clone();
+            if !has_local_ws {
+                if let Some(v) = non_empty_model_override(remote.web_search_model.as_deref()) {
+                    result.web_search = v;
+                } else if !has_local_default
+                    && let Some(v) = non_empty_model_override(remote.default_model.as_deref())
+                {
+                    result.web_search = v;
+                }
             }
             if !has_local_ss {
                 result.session_summary =

@@ -767,6 +767,9 @@ jobs:
           # bearer_resolver arm of has_usable_credential.
           run_nonzero -p xai-grok-shell --lib survives_into_sampler_config -- --nocapture
           run_nonzero -p xai-grok-shell --lib accepts_a_bearer_resolver_alone -- --nocapture
+          # #57 follow-up: web_search must fall back to [models].default and keep
+          # model-scoped credential provenance when xAI ambient auth is absent.
+          run_nonzero -p xai-grok-shell --lib falls_back_to_models_default_and_keeps_model_scoped_credential -- --nocapture
 
       # #161: the web_search disable notice now rides the session response
       # `_meta` instead of a notification. Two filters because the tests split
