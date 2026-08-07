@@ -238,16 +238,18 @@ impl HeadlessEmitter {
 
     fn on_text_chunk(&mut self, text: &str) {
         match self.format {
-            OutputFormat::Plain => {
-                let _ = self.write_out(text.as_bytes(), true);
-            }
-            OutputFormat::Json => {
+            // Buffer only: plain must support AttemptDiscarded retraction, which
+            // cannot un-write bytes already flushed to stdout. Final text is
+            // emitted once on `on_end` with exactly one trailing newline.
+            OutputFormat::Plain | OutputFormat::Json => {
                 self.text_buffer.push_str(text);
             }
             OutputFormat::StreamingMessagesJson => {
                 self.text_buffer.push_str(text);
                 self.reduce_and_emit(StreamEvent::AgentMessage(text.to_string()));
             }
+            // Live NDJSON deltas only; structured/result text comes from meta /
+            // other paths. Discard still clears `text_buffer` (no-op when empty).
             OutputFormat::StreamingJson => {
                 self.reduce_and_emit(StreamEvent::AgentMessage(text.to_string()));
             }
@@ -263,6 +265,22 @@ impl HeadlessEmitter {
             OutputFormat::StreamingJson | OutputFormat::StreamingMessagesJson => {
                 self.reduce_and_emit(StreamEvent::AgentThought(text.to_string()));
             }
+        }
+    }
+
+    /// Drop text/thought buffered for a sampling attempt that is being
+    /// abandoned for retry. Streaming formats may already have emitted
+    /// partial NDJSON deltas — emit a single `attempt_discarded` line so
+    /// consumers can drop that attempt's content. Plain/Json never flush
+    /// mid-attempt, so they only need the buffer clear (no wire line).
+    fn on_attempt_discarded(&mut self) {
+        self.text_buffer.clear();
+        self.thought_buffer.clear();
+        match self.format {
+            OutputFormat::StreamingJson | OutputFormat::StreamingMessagesJson => {
+                self.reduce_and_emit(StreamEvent::AttemptDiscarded);
+            }
+            OutputFormat::Plain | OutputFormat::Json => {}
         }
     }
 
@@ -304,7 +322,10 @@ impl HeadlessEmitter {
     fn on_end(&mut self, stop_reason: &str, session_id: &str, request_id: &str) {
         match self.format {
             OutputFormat::Plain => {
-                let _ = self.write_out(b"\n", false);
+                // Always emit: empty turn → lone `\n` (legacy); non-empty →
+                // buffer with exactly one trailing newline.
+                let out = normalize_plain_trailing_newline(std::mem::take(&mut self.text_buffer));
+                let _ = self.write_out(out.as_bytes(), false);
             }
             OutputFormat::Json => {
                 let result = self.build_json_result(stop_reason, session_id, request_id);
@@ -355,7 +376,14 @@ impl HeadlessEmitter {
     /// Emit the terminal error; `stop_reason_override` stamps a Messages stop reason (e.g. `max_tokens`).
     fn on_error(&mut self, message: &str, stop_reason_override: Option<&str>) {
         match self.format {
-            OutputFormat::Plain => eprintln!("{message}"),
+            OutputFormat::Plain => {
+                // Buffering for AttemptDiscarded means plain no longer
+                // live-streams; a turn that errors after partial output must
+                // still flush what was accepted so far (otherwise a rate-limit
+                // at the end erases all text — a regression vs pre-#44).
+                self.flush_plain_buffer_if_nonempty();
+                eprintln!("{message}");
+            }
             OutputFormat::Json => {
                 let mut err = serde_json::json!({"type":"error","message": message});
                 if let Some(usage) = &self.usage {
@@ -375,6 +403,29 @@ impl HeadlessEmitter {
             }
         }
     }
+
+    /// Flush any non-empty plain buffer (error path). Empty is a no-op so a
+    /// failure before any text does not invent a blank line before stderr.
+    fn flush_plain_buffer_if_nonempty(&mut self) {
+        if !matches!(self.format, OutputFormat::Plain) || self.text_buffer.is_empty() {
+            return;
+        }
+        let out = normalize_plain_trailing_newline(std::mem::take(&mut self.text_buffer));
+        let _ = self.write_out(out.as_bytes(), false);
+    }
+}
+
+/// Normalize plain headless output to exactly one trailing newline.
+///
+/// Strips any trailing newlines the model already produced, then appends a
+/// single `\n`. Pure so unit tests cover the contract without intercepting
+/// stdout.
+pub(crate) fn normalize_plain_trailing_newline(mut text: String) -> String {
+    while text.ends_with('\n') {
+        text.pop();
+    }
+    text.push('\n');
+    text
 }
 
 pub(crate) fn attach_result_usage(result: &mut serde_json::Value, usage: &serde_json::Value) {
@@ -1486,8 +1537,12 @@ fn track_background_lifecycle(
                 );
             }
         }
-        // Routed to the emitter by the caller, never tracked.
-        ExtEvent::MonitorEvent | ExtEvent::None | ExtEvent::Lifecycle(_) | ExtEvent::Stream(_) => {}
+        // Routed to the emitter by the caller, never tracked as background work.
+        ExtEvent::MonitorEvent
+        | ExtEvent::None
+        | ExtEvent::Lifecycle(_)
+        | ExtEvent::Stream(_)
+        | ExtEvent::AttemptDiscarded => {}
     }
 }
 
@@ -1646,6 +1701,7 @@ fn handle_headless_acp_message(
             match event {
                 ExtEvent::Lifecycle(l) => emitter.on_lifecycle(l),
                 ExtEvent::Stream(event) => emitter.reduce_and_emit(*event),
+                ExtEvent::AttemptDiscarded => emitter.on_attempt_discarded(),
                 other => track_background_lifecycle(other, pending_bg, completed_bg),
             }
         }

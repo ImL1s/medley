@@ -12,7 +12,7 @@ use agent_client_protocol as acp;
 use tempfile::TempDir;
 
 use xai_grok_shell::session::storage::{
-    ReplayEmission, SessionUpdate, UpdatesIterator, filter_rewind_updates,
+    ReplayEmission, ReplayUpdate, SessionUpdate, UpdatesIterator, filter_rewind_updates,
     stream_replay_updates_at, strip_context_wrappers,
 };
 use xai_grok_shell::session::testkit::synth::{self, SessionSpec};
@@ -70,7 +70,7 @@ fn fork_replay_spec() -> SessionSpec {
     )
 }
 
-fn reference_load_all(updates_path: &Path) -> Vec<acp::SessionUpdate> {
+fn reference_load_all(updates_path: &Path) -> Vec<ReplayUpdate> {
     let iter = UpdatesIterator::open(updates_path)
         .expect("open updates")
         .expect("updates file exists");
@@ -79,14 +79,27 @@ fn reference_load_all(updates_path: &Path) -> Vec<acp::SessionUpdate> {
     filtered
         .into_iter()
         .filter_map(|u| match u {
-            SessionUpdate::Acp(notif) => Some(strip_context_wrappers(notif.update)),
+            SessionUpdate::Acp(notif) => {
+                Some(ReplayUpdate::Acp(strip_context_wrappers(notif.update)))
+            }
+            SessionUpdate::Xai(n)
+                if matches!(
+                    n.update,
+                    xai_grok_shell::extensions::notification::SessionUpdate::AttemptDiscarded
+                ) =>
+            {
+                Some(ReplayUpdate::AttemptDiscarded)
+            }
             SessionUpdate::Xai(_) => None,
         })
         .collect()
 }
 
-fn serialize(u: &acp::SessionUpdate) -> String {
-    serde_json::to_string(u).expect("serialize replayed update")
+fn serialize(u: &ReplayUpdate) -> String {
+    match u {
+        ReplayUpdate::Acp(a) => serde_json::to_string(a).expect("serialize replayed ACP update"),
+        ReplayUpdate::AttemptDiscarded => "attempt_discarded".into(),
+    }
 }
 
 /// Streaming holds one `read_to_string` copy (~1x) plus transient per-update

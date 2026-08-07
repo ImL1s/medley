@@ -833,6 +833,13 @@ pub enum SessionUpdate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         arguments_delta: Option<String>,
     },
+    /// A streamed sampling attempt was abandoned for retry.
+    ///
+    /// Clients must drop any agent-message / thought / partial tool-call
+    /// UI produced for the abandoned attempt so a successful retry does
+    /// not show duplicated output. Mirrors
+    /// [`xai_grok_sampler::SamplingEvent::AttemptDiscarded`].
+    AttemptDiscarded,
     /// One or more prompt images were resized to fit within API limits.
     ImageCompressed {
         images: Vec<ImageCompressedEntry>,
@@ -1700,6 +1707,27 @@ mod tests {
 
         let json = serde_json::to_value(&update).unwrap();
         assert_eq!(json["tokens_used"], 75_000);
+    }
+
+    /// #44: wire shape for the sampling-attempt retraction.
+    #[test]
+    fn attempt_discarded_round_trips_on_wire() {
+        let update = SessionUpdate::AttemptDiscarded;
+        let json = serde_json::to_value(&update).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"sessionUpdate": "attempt_discarded"})
+        );
+        let parsed: SessionUpdate = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, SessionUpdate::AttemptDiscarded);
+
+        let envelope = r#"{
+            "sessionId": "sess-1",
+            "update": {"sessionUpdate": "attempt_discarded"}
+        }"#;
+        let notification: SessionNotification = serde_json::from_str(envelope).unwrap();
+        assert_eq!(notification.session_id.0.as_ref(), "sess-1");
+        assert_eq!(notification.update, SessionUpdate::AttemptDiscarded);
     }
 
     #[test]

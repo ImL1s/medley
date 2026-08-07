@@ -832,6 +832,47 @@ impl AcpUpdateTracker {
         }
         changed
     }
+    /// Retract content streamed for a sampling attempt that is being abandoned
+    /// for retry ([`xai_grok_shell::extensions::notification::SessionUpdate::AttemptDiscarded`]).
+    ///
+    /// Removes the in-progress agent-message and thinking entries so a successful
+    /// retry can stream into fresh blocks. Also removes mid-attempt ACP
+    /// `ToolCall` blocks (e.g. `BackendToolCallStarted` emits a full in-progress
+    /// `ToolCall` before the attempt is accepted) and clears orphan tool-update
+    /// state so a retry cannot leave a stuck incomplete tool block in scrollback.
+    pub fn discard_streamed_attempt(&mut self, scrollback: &mut ScrollbackState) -> bool {
+        let mut changed = false;
+        if let Some(id) = self.current_agent_msg.take() {
+            scrollback.remove_entry(id);
+            changed = true;
+        }
+        if let Some(id) = self.current_thinking.take() {
+            scrollback.remove_entry(id);
+            changed = true;
+        }
+        self.last_thinking_elapsed_ms = None;
+        // Phantom / incomplete tool calls registered this attempt (backend
+        // web_search start, client tools mid-stream, …) must leave scrollback.
+        if !self.pending_tools.is_empty() {
+            for (_, pending) in self.pending_tools.drain() {
+                if let Some(id) = pending.entry_id {
+                    scrollback.remove_entry(id);
+                }
+            }
+            changed = true;
+        }
+        // Orphan tool updates are only meaningful against a live attempt; drop
+        // them so a retry cannot merge into a discarded tool-call skeleton.
+        if !self.orphan_updates.is_empty() {
+            self.orphan_updates.clear();
+            changed = true;
+        }
+        if changed {
+            self.bump_agent_output_epoch();
+        }
+        changed
+    }
+
     /// Called when PromptResponse is received (turn complete).
     pub fn finish_turn(&mut self, scrollback: &mut ScrollbackState) {
         self.epoch_at_last_finish = self.agent_output_epoch;
@@ -2976,6 +3017,86 @@ mod tests {
         assert!(tracker.current_agent_msg.is_none());
         tracker.handle_update(agent_chunk("After tool"), &meta(), &mut sb);
         assert_eq!(sb.len(), 3);
+    }
+
+    /// #44: discarded attempt removes streamed agent/thought blocks so the
+    /// retry can re-stream into a fresh entry without duplicating scrollback.
+    #[test]
+    fn discard_streamed_attempt_removes_agent_and_thought_once() {
+        let mut sb = ScrollbackState::new();
+        let mut tracker = AcpUpdateTracker::new();
+        // Thinking alone (agent_chunk would finish_thinking first).
+        tracker.handle_update(thought_chunk("thinking"), &meta(), &mut sb);
+        assert_eq!(sb.len(), 1);
+        assert!(tracker.current_thinking.is_some());
+        assert!(tracker.discard_streamed_attempt(&mut sb));
+        assert!(tracker.current_thinking.is_none());
+        assert_eq!(sb.len(), 0, "discarded thought must leave scrollback empty");
+
+        // Agent text attempt.
+        tracker.handle_update(agent_chunk("hello"), &meta(), &mut sb);
+        assert_eq!(sb.len(), 1);
+        assert!(tracker.current_agent_msg.is_some());
+        assert!(tracker.discard_streamed_attempt(&mut sb));
+        assert!(tracker.current_agent_msg.is_none());
+        assert_eq!(
+            sb.len(),
+            0,
+            "discarded agent text must leave scrollback empty"
+        );
+
+        // Retry streams the same text once into a fresh block.
+        tracker.handle_update(agent_chunk("hello"), &meta(), &mut sb);
+        assert_eq!(sb.len(), 1);
+        assert!(tracker.current_agent_msg.is_some());
+    }
+
+    /// Accepted (non-discarded) stream is unaffected: content stays, no drop.
+    #[test]
+    fn discard_not_called_keeps_accepted_agent_text() {
+        let mut sb = ScrollbackState::new();
+        let mut tracker = AcpUpdateTracker::new();
+        tracker.handle_update(agent_chunk("once only"), &meta(), &mut sb);
+        assert_eq!(sb.len(), 1);
+        assert!(tracker.current_agent_msg.is_some());
+        // finish_turn keeps the block (does not remove it).
+        tracker.finish_turn(&mut sb);
+        assert_eq!(sb.len(), 1);
+        assert!(tracker.current_agent_msg.is_none());
+    }
+
+    /// F4: mid-attempt ACP ToolCall (e.g. BackendToolCallStarted) must leave
+    /// scrollback on discard — otherwise a retry leaves a stuck incomplete block.
+    #[test]
+    fn discard_streamed_attempt_removes_pending_tool_blocks() {
+        let mut sb = ScrollbackState::new();
+        let mut tracker = AcpUpdateTracker::new();
+        tracker.handle_update(
+            tool_call("tc-web", acp::ToolKind::Fetch, "web_search"),
+            &meta(),
+            &mut sb,
+        );
+        assert_eq!(sb.len(), 1);
+        assert_eq!(tracker.pending_tools.len(), 1);
+        assert!(tracker.discard_streamed_attempt(&mut sb));
+        assert!(
+            tracker.pending_tools.is_empty(),
+            "discard must drain pending_tools"
+        );
+        assert_eq!(
+            sb.len(),
+            0,
+            "phantom in-progress tool block must leave scrollback"
+        );
+
+        // Retry can open a fresh tool block without colliding with the discarded one.
+        tracker.handle_update(
+            tool_call("tc-web", acp::ToolKind::Fetch, "web_search"),
+            &meta(),
+            &mut sb,
+        );
+        assert_eq!(sb.len(), 1);
+        assert_eq!(tracker.pending_tools.len(), 1);
     }
     #[test]
     fn finish_turn_clears_state() {

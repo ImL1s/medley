@@ -453,6 +453,94 @@ async fn load_rebuilds_chat_history_from_updates() {
             "rebuilt cache carries the transcript text"
         );
 }
+
+/// #44 F1: persisted AttemptDiscarded must make rebuild_chat_history keep
+/// the retry text once (not hellohello) when both attempts are on disk.
+///
+/// Path covered: **chat_history rebuild** (`ChatReducer` via `load_session`),
+/// not subagent `stream_replay_updates_at` (see
+/// `attempt_discarded_persist_then_stream_replay_subagent_path` for that).
+/// Writer is the real `JsonlStorageAdapter::append_update`.
+#[tokio::test]
+async fn rebuild_chat_history_honors_attempt_discarded() {
+    use agent_client_protocol::{
+        ContentBlock, ContentChunk, SessionUpdate as Acp, TextContent,
+    };
+    use crate::extensions::notification::{
+        SessionNotification as XaiNotif, SessionUpdate as XaiUpdate,
+    };
+    let temp_dir = TempDir::new().unwrap();
+    let info = create_test_info();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    adapter.init_session(&info, default_model_id()).await.unwrap();
+    let text = |s: &str| {
+        ContentChunk::new(ContentBlock::Text(TextContent::new(s.to_string())))
+    };
+    let notify = |u| {
+        SessionUpdate::Acp(Box::new(acp::SessionNotification::new(
+            info.id.clone(),
+            u,
+        )))
+    };
+    adapter
+        .append_update(&info, &notify(Acp::UserMessageChunk(text("hi"))))
+        .await
+        .unwrap();
+    adapter
+        .append_update(&info, &notify(Acp::AgentMessageChunk(text("hello"))))
+        .await
+        .unwrap();
+    adapter
+        .append_update(
+            &info,
+            &SessionUpdate::Xai(Box::new(XaiNotif {
+                session_id: info.id.clone(),
+                update: XaiUpdate::AttemptDiscarded,
+                meta: None,
+            })),
+        )
+        .await
+        .unwrap();
+    adapter
+        .append_update(&info, &notify(Acp::AgentMessageChunk(text("hello"))))
+        .await
+        .unwrap();
+
+    // (a) raw file must double-stream the attempt text (fixture is load-bearing).
+    let updates_path = adapter.session_dir(&info).join("updates.jsonl");
+    let raw = std::fs::read_to_string(&updates_path).unwrap();
+    assert!(
+        raw.matches("hello").count() >= 2,
+        "updates.jsonl must contain both attempts; raw:\n{raw}"
+    );
+    assert!(
+        raw.contains("attempt_discarded"),
+        "updates.jsonl must contain the retraction; raw:\n{raw}"
+    );
+
+    // Force rebuild from updates alone.
+    let chat_path = adapter.session_dir(&info).join("chat_history.jsonl");
+    let _ = std::fs::remove_file(&chat_path);
+    let loaded = adapter.load_session(&info).await.unwrap();
+    let assistant_texts: Vec<String> = loaded
+        .chat_history
+        .iter()
+        .filter_map(|item| match item {
+            ConversationItem::Assistant(a) => Some(a.content.to_string()),
+            _ => None,
+        })
+        .collect();
+    // (b) rebuilt ConversationItem list keeps the text once.
+    assert_eq!(
+        assistant_texts,
+        vec!["hello".to_string()],
+        "ChatReducer must retract the abandoned attempt; got {assistant_texts:?}"
+    );
+    assert!(
+        !assistant_texts.iter().any(|t| t == "hellohello"),
+        "concatenated attempts must not appear in rebuilt history"
+    );
+}
 #[tokio::test]
 async fn workflow_run_manifest_round_trips_and_clear_tombstone_wins() {
     use crate::session::workflow::store::{
@@ -560,6 +648,130 @@ async fn workflow_restore_rejects_symlinks_and_caps_run_count() {
                 .iter()
                 .all(|run| run.manifest.state.run_id != "wf_symlink")
         );
+}
+/// Write a minimal valid workflow run directory. Returns the run id.
+#[cfg(test)]
+fn write_workflow_run(workflows: &std::path::Path, run_id: &str) -> String {
+    use crate::session::workflow::store::{
+        WORKFLOW_RUN_MANIFEST_VERSION, WorkflowRunManifest, script_revision_path,
+    };
+    use crate::session::workflow::tracker::WorkflowTracker;
+    let run_dir = workflows.join(run_id);
+    std::fs::create_dir_all(run_dir.join("scripts")).unwrap();
+    let mut tracker = WorkflowTracker::default();
+    let state = tracker.start_run(
+        run_id.to_string(),
+        "demo".into(),
+        "ship".into(),
+        Vec::new(),
+        None,
+        Some(format!("workflows/{run_id}/journal.jsonl")),
+    );
+    let manifest = WorkflowRunManifest {
+        version: WORKFLOW_RUN_MANIFEST_VERSION,
+        state,
+        script_revision: 0,
+    };
+    std::fs::write(
+        run_dir.join("state.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(script_revision_path(&run_dir, 0), "complete(\"ok\");").unwrap();
+    std::fs::write(run_dir.join("args.json"), "{}").unwrap();
+    run_id.to_string()
+}
+/// Write a cleared tombstone: `remove()` deletes `state.json` and leaves the
+/// directory with a `cleared` marker, so these accumulate forever.
+#[cfg(test)]
+fn write_workflow_tombstone(workflows: &std::path::Path, run_id: &str) {
+    let run_dir = workflows.join(run_id);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("cleared"), "").unwrap();
+}
+/// #162: the restore cap must keep the **newest** runs.
+///
+/// The pre-existing cap test asserts only the *count*, so deleting `.rev()`
+/// from production leaves it green -- even though `.rev()` is the entire fix
+/// for #154's "the cap kept the oldest runs" defect. Run ids are `wf_` + a
+/// UUIDv7 `simple()`, whose leading 48 bits are a big-endian millisecond
+/// timestamp in fixed-width hex, so lexicographic order is chronological; the
+/// zero-padded ids below stand in for that ordering.
+///
+/// Asserting the surviving ids **by name** is what makes the direction
+/// load-bearing.
+#[tokio::test]
+async fn workflow_restore_keeps_the_newest_runs_not_the_oldest() {
+    use crate::session::workflow::store::MAX_RESTORED_WORKFLOW_RUNS;
+    let temp_dir = TempDir::new().unwrap();
+    let info = create_test_info();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    adapter.init_session(&info, default_model_id()).await.unwrap();
+    let workflows = adapter.session_dir(&info).join("workflows");
+    std::fs::create_dir_all(&workflows).unwrap();
+
+    let total = MAX_RESTORED_WORKFLOW_RUNS + 3;
+    for index in 0..total {
+        write_workflow_run(&workflows, &format!("wf_{index:04}"));
+    }
+
+    let loaded = adapter.load_session_without_updates(&info).await.unwrap();
+    let mut got: Vec<String> = loaded
+        .workflow_runs
+        .iter()
+        .map(|run| run.manifest.state.run_id.clone())
+        .collect();
+    got.sort();
+    let expected: Vec<String> = (total - MAX_RESTORED_WORKFLOW_RUNS..total)
+        .map(|index| format!("wf_{index:04}"))
+        .collect();
+    assert_eq!(
+        got, expected,
+        "the cap must keep the newest runs; keeping the oldest is #154's defect \
+         and a count-only assertion cannot tell the two apart"
+    );
+}
+/// #162: a wall of tombstones must not hide the valid runs behind it.
+///
+/// `remove()` leaves the directory, so a long-lived session accumulates
+/// tombstones at the newest end. The scan bound used to be a `.take()` on raw
+/// dirents, so those tombstones consumed the whole budget and the older valid
+/// runs were never reached -- with no warning, because the only one fired on
+/// the *restore* cap, which this path never reaches. A silent truncation then
+/// reads as "nothing to restore".
+///
+/// Cheap rejections now cost nothing against the manifest-read budget.
+#[tokio::test]
+async fn workflow_restore_sees_past_a_wall_of_tombstones() {
+    use crate::session::workflow::store::MAX_RESTORED_WORKFLOW_RUNS;
+    let temp_dir = TempDir::new().unwrap();
+    let info = create_test_info();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    adapter.init_session(&info, default_model_id()).await.unwrap();
+    let workflows = adapter.session_dir(&info).join("workflows");
+    std::fs::create_dir_all(&workflows).unwrap();
+
+    // Sorts first, so it is reached last walking newest-first.
+    write_workflow_run(&workflows, "wf_0000_survivor");
+    // More tombstones than the old raw-dirent budget of
+    // `MAX_RESTORED_WORKFLOW_RUNS * 8`, all sorting after the survivor.
+    let wall = MAX_RESTORED_WORKFLOW_RUNS * 8 + 1;
+    for index in 0..wall {
+        write_workflow_tombstone(&workflows, &format!("wf_9{index:06}"));
+    }
+
+    let loaded = adapter.load_session_without_updates(&info).await.unwrap();
+    let ids: Vec<String> = loaded
+        .workflow_runs
+        .iter()
+        .map(|run| run.manifest.state.run_id.clone())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["wf_0000_survivor".to_string()],
+        "a valid run behind {wall} tombstones must still be restored; restoring \
+         nothing here is the silent truncation #162 describes"
+    );
 }
 /// `load_session_without_updates` always defers rewind points while the full
 /// `load_session` / `load_rewind_points` still return them.

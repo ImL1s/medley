@@ -2770,6 +2770,15 @@ impl SessionActor {
             SamplingEvent::ModelMetadata { metadata, .. } => {
                 self.handle_model_metadata_update(metadata).await;
             }
+            SamplingEvent::AttemptDiscarded { .. } => {
+                // Ordered through the high-frequency event pipeline so any
+                // already-queued ChannelToken / ToolCallDelta notifications
+                // for this attempt drain first; the run loop then drops the
+                // ReplayBuffer pending slot without flushing those chunks to
+                // clients, and finally forwards this retraction.
+                self.send_buffered_xai_update(XaiSessionUpdate::AttemptDiscarded)
+                    .await;
+            }
             SamplingEvent::Retrying {
                 request_id,
                 attempt,

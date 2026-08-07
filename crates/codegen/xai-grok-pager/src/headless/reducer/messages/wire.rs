@@ -193,6 +193,11 @@ pub(super) enum MessagesLine {
     User(ToolResultLine),
     StreamEvent(PartialEventLine),
     Result(Box<ResultLine>),
+    /// Sampling attempt abandoned; drop stream content since the last accepted
+    /// response boundary or turn start. Grok extension (not a Messages SDK type);
+    /// same `type` token as `streaming-json` so a dual-format consumer can key
+    /// off one string.
+    AttemptDiscarded,
 }
 
 /// The two `system` line subtypes, discriminated by `subtype`.

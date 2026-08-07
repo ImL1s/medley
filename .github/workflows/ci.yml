@@ -35,6 +35,12 @@ jobs:
       - name: Enforce credential-safe observability
         run: python3 -B -m unittest tests.test_credential_observability_guard -v
 
+      # The `new-test-filters` job below is the thing that notices a Rust test
+      # no filter selects. These are its own tests -- without them it would be
+      # an unverified checker guarding against unverified tests (#171).
+      - name: Test the new-test filter guard
+        run: python3 -B -m unittest tests.test_new_test_filter_guard -v
+
   installer:
     name: Installer
     runs-on: ubuntu-latest
@@ -86,6 +92,25 @@ jobs:
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
+
+  new-test-filters:
+    name: New tests run somewhere
+    runs-on: ubuntu-latest
+    steps:
+      # Full history: the check needs a merge base to find what this branch added.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # No Rust toolchain and no build: this reads the diff, not a test listing.
+      # That is what makes it cheap, and it is also what makes it correct for
+      # `#[cfg(target_os = ...)]` tests -- they are in the diff on every
+      # platform, whereas `cargo test -- --list` omits them off their target.
+      - name: Every new test matches a CI filter
+        run: |
+          python3 scripts/check_new_tests_are_filtered.py \
+            --workflow .github/workflows/ci.yml \
+            --base "origin/${{ github.base_ref || 'providers' }}"
 
   lint:
     name: Clippy (hot path)
@@ -354,6 +379,88 @@ jobs:
             catalog_miss -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
             toctou -- --nocapture
+          # The three tests this change fixes matched none of the filters
+          # above, so registering their models bought nothing: they ran in no
+          # job at all (#171). This selects them and the six sibling
+          # deferred-switch tests, which belong to this step by subject and
+          # were equally unrun.
+          cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
+            deferred_switch_ -- --nocapture
+
+      # #166: these assert on colour, and used to inherit the ambient colour
+      # level. Run them under both settings of NO_COLOR -- one pass alone would
+      # not have caught the original bug, because it only showed up on the axis
+      # CI never varied. Quoted name: an unquoted `#166` truncates at the
+      # comment marker.
+      - name: 'Colour-asserting pager tests, both NO_COLOR settings (issue #166)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          # Filters written out rather than looped over a shell variable, so
+          # they stay greppable in this file -- the #171 check parses these
+          # lines, and a filter built at runtime is invisible to it.
+          #
+          # Do not use bare `teal`: Cargo substring-matches, and `steal` /
+          # `steals` / `resteal` contain `teal`, as does
+          # `teal_highlighting_on_second_line` (which skips its colour assert
+          # under NO_COLOR). `keeps_teal` + `each_teal` select only the four
+          # fixed skill-accent tests that filter on accent_skill spans.
+          run_nonzero -p xai-grok-pager --lib keeps_teal -- --nocapture
+          run_nonzero -p xai-grok-pager --lib each_teal -- --nocapture
+          run_nonzero -p xai-grok-pager --lib invalid_token_ranges_are_dropped -- --nocapture
+          run_nonzero -p xai-grok-pager --lib token_on_second_logical_line -- --nocapture
+          run_nonzero -p xai-grok-pager --lib search_bar_cursor -- --nocapture
+          # Made hermetic by this change like the others, but pre-existing, so
+          # the #171 check cannot see it: that check reads the diff for a new
+          # `#[test]`, and this test is not new -- only its contract is.
+          run_nonzero -p xai-grok-pager --lib \
+            user_prompt_band_is_semantic -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            colour_asserting_tests_do_not_use_theme_current -- --nocapture
+          NO_COLOR=1 run_nonzero -p xai-grok-pager --lib keeps_teal -- --nocapture
+          NO_COLOR=1 run_nonzero -p xai-grok-pager --lib each_teal -- --nocapture
+          NO_COLOR=1 run_nonzero -p xai-grok-pager --lib invalid_token_ranges_are_dropped -- --nocapture
+          NO_COLOR=1 run_nonzero -p xai-grok-pager --lib token_on_second_logical_line -- --nocapture
+          NO_COLOR=1 run_nonzero -p xai-grok-pager --lib search_bar_cursor -- --nocapture
+          NO_COLOR=1 run_nonzero -p xai-grok-pager --lib \
+            user_prompt_band_is_semantic -- --nocapture
+          NO_COLOR=1 run_nonzero -p xai-grok-pager --lib \
+            colour_asserting_tests_do_not_use_theme_current -- --nocapture
+
+      # #162: the restore-direction and the tombstone-wall cases. The
+      # pre-existing `workflow_restore_rejects_symlinks_and_caps_run_count`
+      # stays green under both defects, so `workflow_restore` as one filter
+      # covers all three and the two new ones carry the protection. Quoted
+      # name: an unquoted `#162` truncates at the comment marker.
+      - name: 'Workflow restore ordering and scan budget (issue #162)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib workflow_restore -- --nocapture
 
       # #161: the web_search disable notice now rides the session response
       # `_meta` instead of a notification. Two filters because the tests split
