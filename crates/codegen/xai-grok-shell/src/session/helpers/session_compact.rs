@@ -1720,7 +1720,8 @@ mod reasoning_compaction_regression_tests {
             temperature: Some(0.7),
             top_p: None,
             endpoint_trust: None,
-            credential_source: None,
+            // Bound test key needs a non-ambient source (#136 step 4).
+            credential_source: Some(xai_grok_sampler::CredentialSource::ModelApiKey),
             api_backend: ApiBackend::ChatCompletions,
             auth_scheme: Default::default(),
             extra_headers: Default::default(),

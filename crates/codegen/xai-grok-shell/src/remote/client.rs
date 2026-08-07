@@ -806,7 +806,11 @@ pub(crate) fn models_list_url(
     endpoints: &crate::agent::config::EndpointsConfig,
     fetch_auth: crate::agent::models::ModelFetchAuth,
 ) -> String {
-    ListModelsEndpoint::from_endpoints(endpoints, fetch_auth).url
+    if let Some(ref ep) = endpoints.catalog_auth.endpoint {
+        ep.clone()
+    } else {
+        ListModelsEndpoint::from_endpoints(endpoints, fetch_auth).url
+    }
 }
 impl ListModelsEndpoint {
     fn from_endpoints(
@@ -849,14 +853,58 @@ pub(crate) fn validate_models_catalog_auth(
         return Ok(());
     }
 
-    let source = ListModelsEndpoint::from_endpoints(endpoints, fetch_auth);
-    let missing_api_key = crate::agent::auth_method::read_xai_api_key_env().is_err();
-    match source.auth {
-        EndpointAuth::ApiKey if missing_api_key => Err(XAI_MODELS_API_KEY_REQUIRED.to_owned()),
-        EndpointAuth::CustomApiKey if missing_api_key => {
-            Err(CUSTOM_MODELS_API_KEY_REQUIRED.to_owned())
+    let catalog_auth = &endpoints.catalog_auth;
+
+    if let Some(ref scheme) = catalog_auth.auth_scheme {
+        for key in catalog_auth.headers.keys() {
+            let lower = key.to_lowercase();
+            if PROTECTED_HEADERS.contains(&lower.as_str()) {
+                return Err(format!(
+                    "header {:?} is protected and cannot be overridden",
+                    key
+                ));
+            }
+            if reqwest::header::HeaderName::from_bytes(key.as_bytes()).is_err() {
+                return Err(format!("invalid header name {:?}", key));
+            }
+            if let Some(val) = catalog_auth.headers.get(key)
+                && reqwest::header::HeaderValue::from_str(val).is_err()
+            {
+                return Err(format!("invalid header value for {:?}", key));
+            }
         }
-        EndpointAuth::ApiKey | EndpointAuth::CustomApiKey | EndpointAuth::Session => Ok(()),
+        match scheme {
+            xai_grok_sampler::AuthScheme::None => Ok(()),
+            xai_grok_sampler::AuthScheme::Bearer | xai_grok_sampler::AuthScheme::XApiKey => {
+                let env_keys = catalog_auth.env_key.as_ref().ok_or_else(|| {
+                    format!(
+                        "catalog_auth_scheme is configured as {:?}, but catalog_env_key is missing",
+                        scheme
+                    )
+                })?;
+                let val = env_keys.resolve_value().ok_or_else(|| {
+                    let names = env_keys.names().join(", ");
+                    format!("catalog_env_key is configured ({}), but none of the environment variables are set or non-empty", names)
+                })?;
+                if val.trim().is_empty() {
+                    return Err(
+                        "catalog_env_key resolved to an empty or whitespace-only value".to_owned(),
+                    );
+                }
+                Ok(())
+            }
+        }
+    } else {
+        // Fallback to legacy validation
+        let source = ListModelsEndpoint::from_endpoints(endpoints, fetch_auth);
+        let missing_api_key = crate::agent::auth_method::read_xai_api_key_env().is_err();
+        match source.auth {
+            EndpointAuth::ApiKey if missing_api_key => Err(XAI_MODELS_API_KEY_REQUIRED.to_owned()),
+            EndpointAuth::CustomApiKey if missing_api_key => {
+                Err(CUSTOM_MODELS_API_KEY_REQUIRED.to_owned())
+            }
+            EndpointAuth::ApiKey | EndpointAuth::CustomApiKey | EndpointAuth::Session => Ok(()),
+        }
     }
 }
 /// Fetch models from an OpenAI-compatible `/v1/models` endpoint.
@@ -866,32 +914,90 @@ pub struct FetchModelsResult {
     pub models: Vec<crate::agent::config::ModelEntryConfig>,
     pub etag: Option<String>,
 }
+const PROTECTED_HEADERS: &[&str] = &[
+    "authorization",
+    "x-xai-token-auth",
+    "x-userid",
+    "x-grok-client-version",
+    "x-email",
+    "client-mode",
+    "x-api-key",
+    "host",
+];
+
 pub(crate) fn fetch_models_blocking(
     endpoints: &crate::agent::config::EndpointsConfig,
     auth: Option<&GrokAuth>,
     fetch_auth: crate::agent::models::ModelFetchAuth,
 ) -> Result<FetchModelsResult, BackendError> {
+    let catalog_auth = &endpoints.catalog_auth;
     let client = models_catalog_blocking_client();
-    let source = ListModelsEndpoint::from_endpoints(endpoints, fetch_auth);
+    let url = if let Some(ref ep) = catalog_auth.endpoint {
+        ep.clone()
+    } else if endpoints.has_custom_endpoint() {
+        endpoints.resolve_models_list_url()
+    } else if fetch_auth == crate::agent::models::ModelFetchAuth::ApiKey {
+        format!("{}/models", endpoints.xai_api_base_url)
+    } else {
+        endpoints.resolve_models_list_url()
+    };
     let inference_base_url = endpoints.resolve_inference_base_url();
     tracing::info!("Fetching models from configured catalog endpoint");
-    let mut request = client.get(&source.url);
-    match source.auth {
-        EndpointAuth::ApiKey => {
-            let api_key = crate::agent::auth_method::read_xai_api_key_env()
-                .map_err(|_| BackendError::Auth(XAI_MODELS_API_KEY_REQUIRED.to_owned()))?;
-            request = request.header("Authorization", format!("Bearer {}", api_key));
+    let mut request = client.get(&url);
+    if let Some(timeout_secs) = catalog_auth.timeout_secs {
+        request = request.timeout(Duration::from_secs(timeout_secs));
+    }
+    if let Some(ref scheme) = catalog_auth.auth_scheme {
+        match scheme {
+            xai_grok_sampler::AuthScheme::None => {}
+            xai_grok_sampler::AuthScheme::Bearer => {
+                let env_keys = catalog_auth.env_key.as_ref().ok_or_else(|| {
+                    BackendError::Auth(
+                        "catalog_auth_scheme is Bearer, but catalog_env_key is missing".to_owned(),
+                    )
+                })?;
+                let api_key = env_keys.resolve_value().ok_or_else(|| {
+                    BackendError::Auth("catalog_env_key is configured but empty".to_owned())
+                })?;
+                request = request.header("Authorization", format!("Bearer {}", api_key));
+            }
+            xai_grok_sampler::AuthScheme::XApiKey => {
+                let env_keys = catalog_auth.env_key.as_ref().ok_or_else(|| {
+                    BackendError::Auth(
+                        "catalog_auth_scheme is XApiKey, but catalog_env_key is missing".to_owned(),
+                    )
+                })?;
+                let api_key = env_keys.resolve_value().ok_or_else(|| {
+                    BackendError::Auth("catalog_env_key is configured but empty".to_owned())
+                })?;
+                request = request.header("x-api-key", api_key);
+            }
         }
-        EndpointAuth::CustomApiKey => {
-            let api_key = crate::agent::auth_method::read_xai_api_key_env()
-                .map_err(|_| BackendError::Auth(CUSTOM_MODELS_API_KEY_REQUIRED.to_owned()))?;
-            request = request.header("Authorization", format!("Bearer {}", api_key));
+    } else {
+        let source = ListModelsEndpoint::from_endpoints(endpoints, fetch_auth);
+        match source.auth {
+            EndpointAuth::ApiKey => {
+                let api_key = crate::agent::auth_method::read_xai_api_key_env()
+                    .map_err(|_| BackendError::Auth(XAI_MODELS_API_KEY_REQUIRED.to_owned()))?;
+                request = request.header("Authorization", format!("Bearer {}", api_key));
+            }
+            EndpointAuth::CustomApiKey => {
+                let api_key = crate::agent::auth_method::read_xai_api_key_env()
+                    .map_err(|_| BackendError::Auth(CUSTOM_MODELS_API_KEY_REQUIRED.to_owned()))?;
+                request = request.header("Authorization", format!("Bearer {}", api_key));
+            }
+            EndpointAuth::Session => {
+                let auth = auth.ok_or_else(|| {
+                    BackendError::Auth("No auth credentials for cli-chat-proxy".into())
+                })?;
+                request = add_models_session_headers_blocking(request, auth);
+            }
         }
-        EndpointAuth::Session => {
-            let auth = auth.ok_or_else(|| {
-                BackendError::Auth("No auth credentials for cli-chat-proxy".into())
-            })?;
-            request = add_models_session_headers_blocking(request, auth);
+    }
+    for (k, v) in &catalog_auth.headers {
+        let lower = k.to_lowercase();
+        if !PROTECTED_HEADERS.contains(&lower.as_str()) {
+            request = request.header(k, v);
         }
     }
     let response = request.send().map_err(BackendError::from)?;
@@ -1007,7 +1113,16 @@ pub(crate) fn parse_remote_model_value(
             .or_else(|| meta.and_then(|m| m.get("supportedInApi")))
             .and_then(|v| v.as_bool())
             .unwrap_or(true),
-        auth_scheme: None,
+        auth_scheme: get_string(obj, "authScheme")
+            .or_else(|| get_string(obj, "auth_scheme"))
+            .or_else(|| meta.and_then(|m| get_string(m, "authScheme")))
+            .or_else(|| meta.and_then(|m| get_string(m, "auth_scheme")))
+            .and_then(|s| match s.as_str() {
+                "bearer" => Some(xai_grok_sampler::AuthScheme::Bearer),
+                "x_api_key" => Some(xai_grok_sampler::AuthScheme::XApiKey),
+                "none" => Some(xai_grok_sampler::AuthScheme::None),
+                _ => None,
+            }),
         reasoning_effort: get_string(obj, "reasoningEffort")
             .or_else(|| get_string(obj, "reasoning_effort"))
             .or_else(|| meta.and_then(|m| get_string(m, "reasoningEffort")))

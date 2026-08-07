@@ -1212,13 +1212,14 @@ fn dashboard_second_stash_does_not_overwrite_first() {
 fn apply_pending_dispatch_config_always_approve_blocked_by_policy_pin() {
     use crate::views::dashboard::DashboardDispatchMode;
     let mut app = test_app_with_agent();
-    apply_pending_dispatch_config(
+    let refused = apply_pending_dispatch_config(
         &mut app,
         AgentId(0),
         None,
         DashboardDispatchMode::AlwaysApprove,
         Some(POLICY_WARNING),
     );
+    assert!(!refused, "the yolo clamp is not a model-switch refusal");
     {
         let agent = &app.agents[&AgentId(0)];
         assert!(
@@ -1230,13 +1231,14 @@ fn apply_pending_dispatch_config_always_approve_blocked_by_policy_pin() {
             Some(POLICY_WARNING),
         );
     }
-    apply_pending_dispatch_config(
+    let refused = apply_pending_dispatch_config(
         &mut app,
         AgentId(0),
         None,
         DashboardDispatchMode::AlwaysApprove,
         None,
     );
+    assert!(!refused, "no staged model here, so no refusal to report");
     assert!(app.agents[&AgentId(0)].session.is_yolo());
 }
 /// A dashboard effort stash is a pre-session switch, so it must clear the
@@ -1272,12 +1274,16 @@ fn dashboard_effort_stash_refused_while_other_switch_in_flight_completes_once() 
         effort: Some(xai_grok_shell::sampling::types::ReasoningEffort::High),
         display: "dashboard-model".to_string(),
     };
-    apply_pending_dispatch_config(
+    let refused = apply_pending_dispatch_config(
         &mut app,
         id_b,
         Some(&pending),
         DashboardDispatchMode::Normal,
         None,
+    );
+    assert!(
+        refused,
+        "the return is the caller-visible signal that stay-on-dashboard paths mirror"
     );
 
     // Refused at stash time: nothing stashed, one structured notice, and the
@@ -1353,13 +1359,14 @@ fn dashboard_effort_stash_admitted_when_slot_free() {
         effort: Some(xai_grok_shell::sampling::types::ReasoningEffort::High),
         display: "dashboard-model".to_string(),
     };
-    apply_pending_dispatch_config(
+    let refused = apply_pending_dispatch_config(
         &mut app,
         id_b,
         Some(&pending),
         DashboardDispatchMode::Normal,
         None,
     );
+    assert!(!refused, "an admitted pick is not a refusal");
 
     assert_eq!(
         app.agents[&id_b].session.deferred_model_switch,
@@ -1540,6 +1547,65 @@ fn dashboard_confirm_worktree_refused_pick_mirrors_error_toast() {
         app.dashboard.as_ref().unwrap().error_toast.as_deref(),
         Some("✗ Wait for the current model switch to finish"),
         "the refusal must be visible on the dashboard the user never left"
+    );
+}
+/// `[+ New Agent]` with a staged model+effort while another agent's switch
+/// holds the global slot: the refusal toast lands on the NEW agent and the
+/// view walks into that agent — exactly what makes the `let _ =` discard of
+/// `apply_pending_dispatch_config`'s return legitimate on this path (#170
+/// N1). No dashboard mirror here: the user is no longer looking at the
+/// dashboard. If this path ever stops moving the view, the refusal becomes
+/// invisible and this test fails.
+#[serial_test::serial(GROK_AGENT_DASHBOARD)]
+#[test]
+fn dashboard_new_agent_button_refused_pick_toast_follows_the_view() {
+    let mut app = test_app();
+    seed_model(&mut app, "grok-4.5", "Grok 4.5");
+    open_dashboard(&mut app);
+    // Another agent's switch holds the global admission slot.
+    app.model_switch_transaction = Some(crate::app::app_view::ModelSwitchTransaction {
+        owner_agent_id: AgentId(99),
+        request_id: Some(7),
+        app_models_optimistic: false,
+        app_model_id: None,
+        app_reasoning_effort: None,
+    });
+    let model_id = acp::ModelId::new(std::sync::Arc::from("grok-4.5"));
+    if let Some(d) = app.dashboard.as_mut() {
+        d.pending_model = Some(crate::views::dashboard::PendingDispatchModel {
+            id: model_id.clone(),
+            effort: Some(xai_grok_shell::sampling::types::ReasoningEffort::High),
+            display: "Grok 4.5".to_string(),
+        });
+    }
+    let effects = dispatch(Action::DashboardCreateNewAgentWithDetail, &mut app);
+    assert!(
+        effects.iter().any(|e| matches!(
+            e,
+            Effect::CreateSession { model_id: Some(m), .. } if *m == model_id
+        )),
+        "the base model still seeds CreateSession: {effects:?}"
+    );
+    let new_id = AgentId(0);
+    assert!(
+        matches!(app.active_view, ActiveView::Agent(a) if a == new_id),
+        "the view must follow the new agent — that is what makes the discarded refusal visible, got {:?}",
+        app.active_view
+    );
+    let agent = &app.agents[&new_id];
+    assert!(
+        agent.session.deferred_model_switch.is_none(),
+        "a refused pick must never reach the stash"
+    );
+    assert_eq!(
+        agent.toast.as_ref().map(|(msg, _)| msg.as_str()),
+        Some("Wait for the current model switch to finish"),
+        "the refusal is visible because the user is now looking at this agent"
+    );
+    assert_eq!(
+        app.dashboard.as_ref().unwrap().error_toast.as_deref(),
+        None,
+        "no dashboard mirror on this path: the view left the dashboard"
     );
 }
 /// Dashboard per-agent toggle under the pin: refused, warning lands on
