@@ -682,30 +682,61 @@ impl JsonlStorageAdapter {
             }
             Err(error) => return Err(error),
         };
-        // Cap applies to successfully restored runs, not raw dirents: a
-        // symlink / invalid sibling must not steal a slot from a valid run
-        // (see workflow_restore_rejects_symlinks_and_caps_run_count).
+        // Three bounds, in three different domains. Conflating them is #162:
+        // the scan bound used to be a `.take()` on raw dirents, so a run of
+        // cleared tombstones at the newest end consumed the whole budget and
+        // the older valid runs behind them were never reached -- silently,
+        // because the only warning fired on the *restore* cap, which that
+        // path never reaches.
         //
-        // Bound the scan too. `remove()` writes a `cleared` marker and deletes
-        // `state.json` but leaves the directory, so a long-lived session
-        // accumulates tombstones forever and an unbounded walk pays two
-        // `symlink_metadata` calls for each of them on every load.
+        // 1. `MAX_RESTORED_WORKFLOW_RUNS` bounds successfully restored runs.
+        //    A symlink or invalid sibling must not steal a slot from a valid
+        //    run (see workflow_restore_rejects_symlinks_and_caps_run_count).
+        //
+        // 2. `MAX_SCANNED_WORKFLOW_ENTRIES` bounds entries that cost a
+        //    *manifest read*. Cheap rejections -- symlink, non-directory,
+        //    tombstone -- are one `symlink_metadata` each and deliberately do
+        //    not consume it. `remove()` writes a `cleared` marker and deletes
+        //    `state.json` but leaves the directory, so tombstones accumulate
+        //    forever and are the expected bulk of a long-lived session.
+        //
+        // 3. `MAX_EXAMINED_WORKFLOW_ENTRIES` is the absolute stop, so the walk
+        //    still terminates on a pathological directory. It is generous
+        //    because the per-entry cost below it is one stat.
+        //
+        // Each bound warns distinctly when it is what stopped us short, so a
+        // truncated restore is never indistinguishable from an empty one.
         const MAX_SCANNED_WORKFLOW_ENTRIES: usize = MAX_RESTORED_WORKFLOW_RUNS * 8;
+        const MAX_EXAMINED_WORKFLOW_ENTRIES: usize = MAX_RESTORED_WORKFLOW_RUNS * 64;
         let mut entries: Vec<_> = std::fs::read_dir(&workflows_dir)?
             .filter_map(Result::ok)
             .collect();
         entries.sort_by_key(|entry| entry.file_name());
         let mut restored = Vec::new();
         let mut skipped_after_cap = false;
+        let mut hit_scan_cap = false;
+        let mut hit_examined_cap = false;
+        // `scanned` stays an explicit counter because it only advances past the
+        // cheap rejections; `examined` is every iteration, so it comes from
+        // `enumerate()` -- it is read before the increment point either way.
+        let mut scanned = 0usize;
         // Newest first. Run ids are `wf_` + a UUIDv7 `simple()`, whose leading
         // 48 bits are a big-endian millisecond timestamp rendered as
         // fixed-width hex -- so lexicographic order *is* chronological order,
         // and walking ascending would keep the oldest runs and silently drop
         // everything recent. For a resume feature that is exactly backwards.
         // Display order is unaffected: the consumer re-sorts by `history.first().at`.
-        for entry in entries.into_iter().rev().take(MAX_SCANNED_WORKFLOW_ENTRIES) {
+        for (examined, entry) in entries.into_iter().rev().enumerate() {
             if restored.len() >= MAX_RESTORED_WORKFLOW_RUNS {
                 skipped_after_cap = true;
+                break;
+            }
+            if examined >= MAX_EXAMINED_WORKFLOW_ENTRIES {
+                hit_examined_cap = true;
+                break;
+            }
+            if scanned >= MAX_SCANNED_WORKFLOW_ENTRIES {
+                hit_scan_cap = true;
                 break;
             }
             let run_dir = entry.path();
@@ -720,6 +751,9 @@ impl JsonlStorageAdapter {
             {
                 continue;
             }
+            // Past the cheap rejections: everything below costs a file read,
+            // so this is what `MAX_SCANNED_WORKFLOW_ENTRIES` bounds.
+            scanned += 1;
             let manifest_path = run_dir.join("state.json");
             let manifest = match read_bounded_nofollow(&manifest_path, MAX_WORKFLOW_MANIFEST_BYTES)
                 .and_then(|bytes| {
@@ -788,6 +822,28 @@ impl JsonlStorageAdapter {
                 path = %workflows_dir.display(),
                 limit = MAX_RESTORED_WORKFLOW_RUNS,
                 "workflow restore run-count cap reached; ignoring remaining entries"
+            );
+        }
+        // These two say something different from the one above: there was room
+        // to restore more and we stopped looking anyway, so whatever is behind
+        // the cut is hidden rather than merely surplus. Reported separately for
+        // that reason -- #162 is exactly this case going unreported.
+        if hit_scan_cap {
+            tracing::warn!(
+                path = %workflows_dir.display(),
+                limit = MAX_SCANNED_WORKFLOW_ENTRIES,
+                restored = restored.len(),
+                "workflow restore stopped at the manifest-read budget with room left; \
+                 older runs behind the cut were not restored"
+            );
+        }
+        if hit_examined_cap {
+            tracing::warn!(
+                path = %workflows_dir.display(),
+                limit = MAX_EXAMINED_WORKFLOW_ENTRIES,
+                restored = restored.len(),
+                "workflow restore stopped at the absolute directory-scan bound with room \
+                 left; older runs behind the cut were not restored"
             );
         }
         Ok(restored)
