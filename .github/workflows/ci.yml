@@ -346,6 +346,23 @@ jobs:
             agent::auth_method -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
             config_model_override_parse -- --nocapture
+          # #13: env_key trim/validate/dedupe + path-specific invalid-name warnings.
+          # Unique prefixes so run_nonzero proves the new tests are selected.
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero --lib env_keys_normalize_ -- --nocapture
+          run_nonzero --lib env_keys_diagnostics_show_normalized_names_only -- --nocapture
+          run_nonzero --lib env_keys_invalid_entry_emits_path_specific_config_warning -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
             read_parent_sampling_config_ -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
