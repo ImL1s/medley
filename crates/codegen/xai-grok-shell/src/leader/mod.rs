@@ -62,9 +62,9 @@ mod transport;
 use crate::env::GrokBuildEnvironment;
 pub use client::{ClientError, DisconnectReason, LeaderClient, LeaderRegistration};
 pub use lock::{
-    LEADER_SOCKET_ENV, LeaderLock, LockError, compute_ws_url_suffix, lock_path_for_ws_url,
-    lock_path_for_ws_url_in, socket_path_for_ws_url, socket_path_for_ws_url_in,
-    ws_url_suffix_from_paths,
+    LEADER_SOCKET_ENV, LeaderLock, LockError, ReclaimOutcome, compute_ws_url_suffix,
+    lock_path_for_ws_url, lock_path_for_ws_url_in, reclaim_lock_if_unheld, socket_path_for_ws_url,
+    socket_path_for_ws_url_in, ws_url_suffix_from_paths,
 };
 pub use protocol::{
     ClientCapabilities, ClientId, ClientMode, ControlCommand, ControlPayload,

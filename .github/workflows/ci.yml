@@ -364,6 +364,43 @@ jobs:
           run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
             issue8_agent_serve_security_ -- --nocapture
 
+      - name: "Leader kill safety (issue #167)"
+        # `leaders kill` used to ask "is this process named grok?", which is
+        # false for the shipped `medley` binary — so it deleted a LIVE leader's
+        # lock and socket without signalling it, and the next client acquired
+        # the flock on a fresh inode: two live leaders from a command whose
+        # purpose is to leave none.
+        #
+        # These pin the two invariants that replaced it: a socket-verified live
+        # leader is signalled and its files are never touched, and a lock file
+        # is reclaimed only when no live process holds its flock. Neither
+        # consults a process name, so neither can rot on the next rename.
+        #
+        # Needed because ci.yml has no unfiltered job (#171): the only other
+        # xai-grok-pager-bin invocation filters on `issue8_agent_serve_security_`,
+        # so without this step these tests would run nowhere. `run_nonzero`
+        # fails on a zero-match filter, so renaming them breaks CI loudly
+        # instead of silently dropping the coverage.
+        env:
+          PROTOC: protoc
+        run: |
+          set -o pipefail
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
+              echo "test filter matched zero tests: $*" >&2
+              rm -f "$output"
+              return 1
+            }
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
+            leaders_kill -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            leader::lock::tests::reclaim -- --nocapture
+
       - name: Shell auth + readiness meta
         env:
           PROTOC: protoc
@@ -669,3 +706,39 @@ jobs:
           run_nonzero -p xai-grok-pager --lib web_search_disabled_meta -- --nocapture
           run_nonzero -p xai-grok-pager --lib no_web_search_notice -- --nocapture
           run_nonzero -p xai-grok-pager --lib parse_session_web_search_disabled -- --nocapture
+
+      # #167: pure seams split out of `kill_leaders` so summary/exit and PID
+      # guards are unit-testable. The earlier "Leader kill safety" step already
+      # selects `leaders_kill` + `reclaim_*` invariants; this step covers the
+      # three helpers plus the failed-signal counter contract. Quoted name: an
+      # unquoted `#167` truncates the YAML value at the comment marker.
+      - name: 'leaders kill summary and PID guard (issue #167)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
+            format_kill_leaders_summary -- --nocapture
+          run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
+            leader_kill_action -- --nocapture
+          run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
+            format_leader_held_guidance -- --nocapture
+          # Unique filter: proves the failed-kill → left_alone contract runs
+          # (substring shared with `leaders_kill` alone would not).
+          run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
+            leaders_kill_failed_kill_counts -- --nocapture
+          # `reclaim_` rather than the NotFound test alone: this branch's two
+          # mutation-proven invariant tests (`reclaim_removes_a_lock_no_process_holds`,
+          # `reclaim_refuses_a_lock_a_live_process_holds`) are also selected here.
+          run_nonzero -p xai-grok-shell --lib reclaim_ -- --nocapture
