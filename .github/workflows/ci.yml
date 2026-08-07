@@ -200,6 +200,12 @@ jobs:
           }
           run_nonzero -p xai-grok-auth --features middleware --lib credential -- --nocapture
           run_nonzero -p xai-grok-telemetry --lib unified_log -- --nocapture
+          # #121: for_test is the single place that names SamplingConfig fork
+          # fields. Unique substrings — run_nonzero only fails on *zero* matches.
+          run_nonzero -p xai-grok-sampling-types --lib \
+            sampling_config_for_test_sets_fork_endpoint_trust_to_none -- --nocapture
+          run_nonzero -p xai-grok-sampling-types --lib \
+            sampling_config_for_test_fru_inherits_fork_endpoint_trust_without_naming_it -- --nocapture
           run_nonzero -p xai-grok-sampler --lib \
             final_relation_observes_hostile_injector_replacement_and_removal -- --nocapture
           run_nonzero -p xai-grok-sampler --lib \
