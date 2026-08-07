@@ -133,6 +133,7 @@ fn session_created_sets_session_id() {
             session_id: "new-session-123".into(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -177,6 +178,7 @@ fn session_created_omits_cta_catalog_when_disabled() {
             session_id: "new-session-123".into(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -222,6 +224,7 @@ fn session_created_banner_advertises_resume_in_minimal_mode() {
             session_id: "new-session-123".into(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -304,6 +307,7 @@ fn worktree_session_created_sets_session_and_cwd() {
             session_cwd: session_cwd.clone(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -363,6 +367,7 @@ fn worktree_session_preserves_subdirectory_offset() {
             session_cwd: session_cwd.clone(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -492,6 +497,7 @@ fn worktree_session_created_drains_queued_prompts() {
             session_cwd: PathBuf::from("/tmp/grok-worktrees/pager-abc"),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -526,6 +532,7 @@ fn session_created_drains_queued_prompts() {
             session_id: acp::SessionId::new("sess-drain-1"),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -563,6 +570,7 @@ fn session_created_with_flag_emits_five_fetches_and_clears_flag() {
             session_id: acp::SessionId::new("s"),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -586,6 +594,7 @@ fn session_created_without_flag_emits_no_extension_fetches() {
             session_id: acp::SessionId::new("s"),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -987,6 +996,7 @@ fn deferred_pre_session_pick_does_not_persist_when_switch_fails() {
             session_id: "deferred-fail-session".into(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1068,6 +1078,7 @@ fn pre_session_pick_with_no_prior_model_still_persists() {
             session_id: "no-prior-model-session".into(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1132,6 +1143,7 @@ fn pre_session_effort_only_change_still_persists() {
             session_id: "effort-only-session".into(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1197,6 +1209,7 @@ fn deferred_pre_session_pick_persists_after_switch_succeeds() {
             session_id: "deferred-ok-session".into(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1256,6 +1269,7 @@ fn deferred_switch_threads_stash_prev_into_effect() {
             session_id: "prev-session".into(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1294,6 +1308,7 @@ fn deferred_switch_prefers_authoritative_current_as_prev() {
             session_id: "auth-session".into(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1326,6 +1341,7 @@ fn deferred_model_switch_applied_on_session_created() {
             session_id: session_id.clone(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1394,6 +1410,7 @@ fn deferred_model_switch_blocked_by_other_agent_toasts_and_restores_display() {
             session_id: acp::SessionId::new("b-session"),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1477,6 +1494,7 @@ fn deferred_switch_dropped_at_apply_releases_stash_time_slot() {
             session_id: acp::SessionId::new("b-session"),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1574,6 +1592,7 @@ fn a_refused_deferred_switch_restores_the_truth_not_a_stale_snapshot() {
                 session_id: acp::SessionId::new("b-session"),
                 models,
                 scheduler_background_loops: None,
+                web_search_disabled: None,
             }),
             &mut app,
         );
@@ -1674,6 +1693,7 @@ fn rapid_no_session_model_choices_coalesce_and_keep_original_rollback() {
             session_id: acp::SessionId::new("new-session"),
             models: Some(acp::SessionModelState::new(model_a.clone(), infos)),
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1805,6 +1825,7 @@ fn rapid_no_session_model_choice_failure_restores_original_model() {
             session_id: acp::SessionId::new("failed-session"),
             models: Some(acp::SessionModelState::new(model_a.clone(), infos)),
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1858,6 +1879,7 @@ fn deferred_model_switch_applied_on_worktree_session_created() {
             session_cwd: PathBuf::from("/tmp/worktree"),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -4023,4 +4045,63 @@ mod welcome_workspace_mode {
         );
         set_active_local_workspace(None).unwrap();
     }
+}
+/// #161: the notice rides the session response, so the pager must render it
+/// **exactly once** — not zero (what headless got under every timing, and what
+/// the interactive path got whenever Pass 3's race-window fallback could not
+/// fire) and not twice (what a second delivery path alongside this one would
+/// produce, which is how #44's duplicate-render bugs started).
+#[test]
+fn web_search_disabled_meta_renders_exactly_one_system_block() {
+    use crate::scrollback::block::RenderBlock;
+    const MSG: &str = "web_search is unavailable: model \"grok-4-fast\" could not be used (no API key or session credential available)";
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.agents.get_mut(&id).unwrap().session.session_id = None;
+    let _ = dispatch(
+        Action::TaskComplete(TaskResult::SessionCreated {
+            agent_id: id,
+            session_id: "sess-ws-161".into(),
+            models: None,
+            scheduler_background_loops: None,
+            web_search_disabled: Some(xai_grok_shell::session::WebSearchDisabledNotice {
+                model_id: "grok-4-fast".into(),
+                reason: "no API key or session credential available".into(),
+                message: MSG.to_string(),
+            }),
+        }),
+        &mut app,
+    );
+    let sb = &app.agents[&id].scrollback;
+    let hits = (0..sb.len())
+        .filter_map(|i| sb.get(i))
+        .filter(|e| matches!(&e.block, RenderBlock::System(b) if b.text == MSG))
+        .count();
+    assert_eq!(hits, 1, "notice must render exactly once, saw {hits}");
+}
+/// Absent key == available. A session with no notice must not invent a block —
+/// this is the control that keeps the assertion above from passing on a stub
+/// that pushes unconditionally.
+#[test]
+fn no_web_search_notice_pushes_no_block() {
+    use crate::scrollback::block::RenderBlock;
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.agents.get_mut(&id).unwrap().session.session_id = None;
+    let _ = dispatch(
+        Action::TaskComplete(TaskResult::SessionCreated {
+            agent_id: id,
+            session_id: "sess-ws-none".into(),
+            models: None,
+            scheduler_background_loops: None,
+            web_search_disabled: None,
+        }),
+        &mut app,
+    );
+    let sb = &app.agents[&id].scrollback;
+    let hits = (0..sb.len())
+        .filter_map(|i| sb.get(i))
+        .filter(|e| matches!(&e.block, RenderBlock::System(b) if b.text.contains("web_search is unavailable")))
+        .count();
+    assert_eq!(hits, 0, "no notice must mean no block");
 }

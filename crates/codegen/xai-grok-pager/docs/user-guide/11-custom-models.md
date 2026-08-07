@@ -19,6 +19,7 @@ By default, Grok uses models hosted by SpaceXAI, and new sessions start with `gr
 
 List all available models:
 
+<!-- medley-doc-test:shell-offline:offline-list-models -->
 ```bash
 grok models
 ```
@@ -57,6 +58,7 @@ Each row shows a short provider hint and a readiness badge (`ready`, `missing`, 
 
 Set a persistent default in `~/.medley/config.toml`:
 
+<!-- medley-doc-test:toml:models-default -->
 ```toml
 [models]
 default = "grok-4.5"
@@ -126,6 +128,27 @@ A **first-party xAI origin** is `https://x.ai` or any `https://*.x.ai` host, plu
 **Invalid values fail closed.** If `auth_scheme` is misspelled or unsupported (for example `"bearer "` or `"noauth"`), Grok keeps the model entry but marks it **unready** with a validation error. The model picker and `/model` refuse to select it. New sessions, session restore, and ACP model switches also refuse to attach an unready model (they fall back or block prompts instead of silently using ambient Bearer credentials). No sampling request is sent for an unready selection. Grok does **not** silently fall back to `"bearer"` or `"none"` for bad values.
 
 **Duplicate routing slugs.** The catalog is keyed by each entry's config key (`[model.<key>]`). Two entries may share the same wire `model` slug but must use distinct catalog keys. Always pick models by their catalog key in config and `/model`; slug-only lookups can bind to the wrong entry when duplicates exist.
+
+When you need two routes for the same upstream slug, keep distinct catalog keys
+and point defaults at those keys (not the wire slug):
+
+<!-- medley-doc-test:toml:catalog-key-wire-slug-default-refs -->
+```toml
+[model.prod-grok-build]
+model = "grok-4.5"
+base_url = "https://api.x.ai/v1"
+context_window = 256000
+
+[model.canary-grok-build]
+model = "grok-4.5"
+base_url = "https://api.x.ai/v1"
+context_window = 256000
+
+[models]
+default = "canary-grok-build"
+web_search = "prod-grok-build"
+session_summary = "canary-grok-build"
+```
 
 **xAI identity headers.** On third-party endpoints or when `auth_scheme = "none"`, Grok omits `x-grok-user-id` and `x-grok-deployment-id` so account metadata is not sent to external hosts.
 
@@ -346,6 +369,7 @@ When you override a built-in model, Grok starts with the default configuration (
 
 Use Claude models directly via the Anthropic Messages API:
 
+<!-- medley-doc-test:toml:provider-anthropic-claude -->
 ```toml
 [model.claude-opus]
 model = "claude-opus-4-6"
@@ -362,6 +386,7 @@ The `messages` backend uses the Anthropic Messages protocol. Set `auth_scheme = 
 
 ### OpenAI (Chat Completions)
 
+<!-- medley-doc-test:toml:provider-openai-chat -->
 ```toml
 [model.gpt-4o]
 model = "gpt-4o"
@@ -376,6 +401,7 @@ env_key = "OPENAI_API_KEY"
 
 If your provider supports the newer Responses API:
 
+<!-- medley-doc-test:toml:provider-openai-responses -->
 ```toml
 [model.gpt-4o-responses]
 model = "gpt-4o"
@@ -428,6 +454,7 @@ not apply to it.
 
 To add a *different* Codex model, give it its own key and name the provider:
 
+<!-- medley-doc-test:toml:provider-openai-codex-secondary -->
 ```toml
 [model.my-other-codex-model]
 model = "<the wire id>"
@@ -458,6 +485,7 @@ OpenAI examples above for the separate OpenAI Platform API transport.
 
 Google's OpenAI-compatible endpoint uses Bearer auth:
 
+<!-- medley-doc-test:toml:provider-gemini -->
 ```toml
 [model.gemini-flash]
 model = "gemini-2.0-flash"
@@ -468,6 +496,7 @@ env_key = "GEMINI_API_KEY"
 
 ### OpenRouter
 
+<!-- medley-doc-test:toml:provider-openrouter -->
 ```toml
 [model.openrouter-llama]
 model = "meta-llama/llama-3.3-70b-instruct"
@@ -481,6 +510,7 @@ Optional attribution headers (`HTTP-Referer`, `X-Title`) are non-secret; put the
 
 ### Together AI
 
+<!-- medley-doc-test:toml:provider-together -->
 ```toml
 [model.together-mixtral]
 model = "mistralai/Mixtral-8x7B-Instruct-v0.1"
@@ -493,6 +523,7 @@ env_key = "TOGETHER_API_KEY"
 
 Any hosted OpenAI-compatible Chat Completions endpoint:
 
+<!-- medley-doc-test:toml:provider-hosted-generic -->
 ```toml
 [model.hosted-custom]
 model = "provider-model-id"
@@ -509,6 +540,7 @@ Tools, reasoning, images, and structured output depend on what the local server 
 
 #### Ollama
 
+<!-- medley-doc-test:toml:provider-local-ollama -->
 ```toml
 [model.ollama-codellama]
 model = "codellama"
@@ -522,6 +554,7 @@ Make sure Ollama is running (`ollama serve`) and the model is pulled (`ollama pu
 
 #### LM Studio
 
+<!-- medley-doc-test:toml:provider-local-lmstudio -->
 ```toml
 [model.lmstudio-local]
 model = "local-model"
@@ -533,6 +566,7 @@ context_window = 32768
 
 #### llama.cpp
 
+<!-- medley-doc-test:toml:provider-local-llamacpp -->
 ```toml
 [model.llamacpp]
 model = "local-model"
@@ -544,6 +578,7 @@ context_window = 8192
 
 #### vLLM
 
+<!-- medley-doc-test:toml:provider-local-vllm -->
 ```toml
 [model.vllm-local]
 model = "meta-llama/Llama-3.1-8B-Instruct"

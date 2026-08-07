@@ -2913,6 +2913,77 @@ async fn session_meta_publishes_the_sessions_pinned_scheduler_background_loops()
         "session meta must carry the handle's pinned value"
     );
 }
+/// #161: the disable notice is published on the session responses, per session.
+///
+/// This is what makes the `insert_session_config_meta` block load-bearing —
+/// without it, deleting that block breaks nothing anywhere, and it is where the
+/// whole design lives: the notice rides the response precisely because a
+/// notification could not be routed before the client bound the session id, and
+/// because headless has no xAI-notification consumer at all.
+#[tokio::test(flavor = "current_thread")]
+async fn session_meta_publishes_the_web_search_disable_notice_per_session() {
+    let agent = build_minimal_agent_for_tests();
+    let told = acp::SessionId::new("ws-disabled-sess");
+    let untold = acp::SessionId::new("ws-fine-sess");
+    for sid in [&told, &untold] {
+        let mut handle = make_test_handle("test-model", false, None);
+        handle.info.id = (*sid).clone();
+        agent.sessions.borrow_mut().insert((*sid).clone(), handle);
+    }
+    agent.web_search_disabled.borrow_mut().insert(
+        told.clone(),
+        crate::session::WebSearchDisabledNotice {
+            model_id: "grok-4-fast".into(),
+            reason: "no API key or session credential available".into(),
+            message: "web_search is unavailable: model \"grok-4-fast\" could not be used (no API key or session credential available)".into(),
+        },
+    );
+
+    let model_state = agent.model_state(Some(&told));
+    let mut meta = serde_json::Map::new();
+    agent.insert_session_config_meta(&mut meta, &told, "/tmp".to_string(), None, &model_state);
+    let published = meta
+        .get(crate::session::WEB_SEARCH_DISABLED_META_KEY)
+        .expect("session with a notice must publish it");
+    let round_tripped: crate::session::WebSearchDisabledNotice =
+        serde_json::from_value(published.clone()).expect("published shape must be the shared type");
+    assert_eq!(round_tripped.model_id, "grok-4-fast");
+    assert!(round_tripped.message.contains("web_search is unavailable"));
+
+    // Control: absent key == available. A blanket "always publish" would pass
+    // the assertion above and fail here.
+    let mut other = serde_json::Map::new();
+    agent.insert_session_config_meta(&mut other, &untold, "/tmp".to_string(), None, &model_state);
+    assert!(
+        other.get(crate::session::WEB_SEARCH_DISABLED_META_KEY).is_none(),
+        "a session with no notice must publish no key"
+    );
+}
+/// #161: the per-session entry dies with the session, so a long-lived process
+/// cannot accumulate them. `take_session` is the single funnel for a handle
+/// leaving `self.sessions`, which is why cleaning there is sufficient.
+#[tokio::test(flavor = "current_thread")]
+async fn take_session_drops_the_web_search_notice() {
+    let agent = build_minimal_agent_for_tests();
+    let sid = acp::SessionId::new("ws-cleanup-sess");
+    let mut handle = make_test_handle("test-model", false, None);
+    handle.info.id = sid.clone();
+    agent.sessions.borrow_mut().insert(sid.clone(), handle);
+    agent.web_search_disabled.borrow_mut().insert(
+        sid.clone(),
+        crate::session::WebSearchDisabledNotice {
+            model_id: "m".into(),
+            reason: "r".into(),
+            message: "msg".into(),
+        },
+    );
+    assert!(agent.web_search_disabled.borrow().contains_key(&sid));
+    let _ = agent.take_session(&sid);
+    assert!(
+        !agent.web_search_disabled.borrow().contains_key(&sid),
+        "take_session must drop the session-scoped notice"
+    );
+}
 /// Build a minimal MvpAgent with pre-loaded auth for gate tests.
 fn build_agent_with_auth(auth: crate::auth::GrokAuth) -> MvpAgent {
     use crate::agent::config::Config as AgentConfig;
@@ -7188,5 +7259,131 @@ mod soft_default_settings_emit {
             .await;
     }
 }
+
+/// #131 B3: the deliverable is the `initialize` response `_meta` key, not the
+/// in-memory lock. Deleting the insert in `AcpAgent::initialize` must fail
+/// this test; asserting only on `substituted_preference()` would not.
+#[test]
+fn initialize_publishes_substituted_default_model_meta() {
+    run_local_for_bridge_test(|| async {
+        use crate::agent::config::{Config as AgentConfig, ModelEntry, ModelInfo};
+        use crate::auth::{AuthManager, GrokComConfig};
+        use indexmap::IndexMap;
+
+        // CLI override beats disk/campaign `models.default` so this assertion
+        // is about the wire path, not about whoever last wrote ~/.medley.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let auth_manager =
+            std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let gateway = GatewaySender::new(tx);
+        let cfg = AgentConfig {
+            default_model_override: Some("typo-provider-131".to_owned()),
+            ..AgentConfig::default()
+        };
+
+        let mut catalog = IndexMap::new();
+        let mut info = ModelInfo::fallback("grok-4");
+        info.base_url = "https://api.x.ai/v1".to_string();
+        catalog.insert(
+            "grok-4".to_string(),
+            ModelEntry {
+                info,
+                api_key: None,
+                env_key: None,
+                auth_provider: None,
+                api_base_url: None,
+                config_validation_errors: Vec::new(),
+            },
+        );
+
+        let agent =
+            MvpAgent::new(gateway, &cfg, auth_manager, Some(catalog)).expect("valid test config");
+
+        let reported_pref = agent
+            .models_manager
+            .substituted_preference()
+            .expect("precondition: in-memory verdict is set — this test still asserts the wire");
+        assert_eq!(reported_pref.configured, "typo-provider-131");
+
+        let resp = <MvpAgent as acp::Agent>::initialize(
+            &agent,
+            acp::InitializeRequest::new(acp::ProtocolVersion::V1),
+        )
+        .await
+        .expect("initialize must succeed");
+
+        let meta = resp.meta.as_ref().expect("initialize must carry _meta");
+        let reported = meta
+            .get(SUBSTITUTED_DEFAULT_MODEL_META_KEY)
+            .unwrap_or_else(|| {
+                panic!(
+                    "initialize _meta must publish {SUBSTITUTED_DEFAULT_MODEL_META_KEY} when the configured default was substituted"
+                )
+            });
+        assert_eq!(
+            reported.get("configuredModelId").and_then(|v| v.as_str()),
+            Some("typo-provider-131"),
+        );
+        assert_eq!(reported.get("source").and_then(|v| v.as_str()), Some("cli"),);
+    });
+}
+
+/// #131 B3 counterweight: when the preference was honoured, initialize `_meta`
+/// must omit the key — absent-vs-present is the whole contract.
+#[test]
+fn initialize_omits_substituted_default_model_meta_when_honoured() {
+    run_local_for_bridge_test(|| async {
+        use crate::agent::config::{Config as AgentConfig, ModelEntry, ModelInfo};
+        use crate::auth::{AuthManager, GrokComConfig};
+        use indexmap::IndexMap;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let auth_manager =
+            std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let gateway = GatewaySender::new(tx);
+        let cfg = AgentConfig {
+            default_model_override: Some("honoured-131".to_owned()),
+            ..AgentConfig::default()
+        };
+
+        let mut catalog = IndexMap::new();
+        let mut info = ModelInfo::fallback("honoured-131");
+        info.base_url = "https://api.x.ai/v1".to_string();
+        catalog.insert(
+            "honoured-131".to_string(),
+            ModelEntry {
+                info,
+                api_key: None,
+                env_key: None,
+                auth_provider: None,
+                api_base_url: None,
+                config_validation_errors: Vec::new(),
+            },
+        );
+
+        let agent =
+            MvpAgent::new(gateway, &cfg, auth_manager, Some(catalog)).expect("valid test config");
+        assert!(
+            agent.models_manager.substituted_preference().is_none(),
+            "precondition: preference is honoured"
+        );
+
+        let resp = <MvpAgent as acp::Agent>::initialize(
+            &agent,
+            acp::InitializeRequest::new(acp::ProtocolVersion::V1),
+        )
+        .await
+        .expect("initialize must succeed");
+
+        let meta = resp.meta.as_ref().expect("initialize must carry _meta");
+        assert!(
+            meta.get(SUBSTITUTED_DEFAULT_MODEL_META_KEY).is_none(),
+            "honoured preference must omit {SUBSTITUTED_DEFAULT_MODEL_META_KEY}, not send null"
+        );
+    });
+}
+
 #[cfg(feature = "dhat-heap")]
 mod dhat_soak;

@@ -1369,6 +1369,7 @@
                 restore_degree: None,
                 running_prompt_id: Some("p-run".to_string()),
                 scheduler_background_loops: None,
+                web_search_disabled: None,
             }),
             &mut app,
         );

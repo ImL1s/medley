@@ -62,9 +62,9 @@ mod transport;
 use crate::env::GrokBuildEnvironment;
 pub use client::{ClientError, DisconnectReason, LeaderClient, LeaderRegistration};
 pub use lock::{
-    LEADER_SOCKET_ENV, LeaderLock, LockError, compute_ws_url_suffix, lock_path_for_ws_url,
-    lock_path_for_ws_url_in, socket_path_for_ws_url, socket_path_for_ws_url_in,
-    ws_url_suffix_from_paths,
+    LEADER_SOCKET_ENV, LeaderLock, LockError, ReclaimOutcome, compute_ws_url_suffix,
+    lock_path_for_ws_url, lock_path_for_ws_url_in, reclaim_lock_if_unheld, socket_path_for_ws_url,
+    socket_path_for_ws_url_in, ws_url_suffix_from_paths,
 };
 pub use protocol::{
     ClientCapabilities, ClientId, ClientMode, ControlCommand, ControlPayload,
@@ -517,15 +517,47 @@ async fn discover_leaders_in(root: &Path) -> Vec<LeaderDescriptor> {
 pub async fn discover_leaders() -> Vec<LeaderDescriptor> {
     discover_leaders_in(&crate::util::grok_home::grok_home()).await
 }
-/// (pid, leader_binary_version) of socket-verified (Reachable) leaders; a
-/// stale-lock-only descriptor is skipped (its `pid_from_lock` may be recycled).
+/// The startup kill path sends a Unix signal via `Pid::from_raw(pid as i32)`.
+/// A wire PID is plausible for that cast only when it maps to a positive `pid_t`
+/// (`pid != 0 && pid <= i32::MAX`): 0 targets the caller's process group, and
+/// larger `u32` values reinterpret to negative `pid_t`s.
+fn is_plausible_signal_pid(pid: u32) -> bool {
+    pid != 0 && pid <= i32::MAX as u32
+}
+/// Corroborate the lock holder from local filesystem evidence.
+///
+/// Socket payload values are attacker-controlled input. This check trusts only
+/// what the local lock can prove: lock-file PID == confirmed flock holder, and
+/// that live holder currently has this lock file open.
+///
+/// On non-Linux, `/proc` lacks the data needed to confirm the holder, so this
+/// returns `None` and callers must treat the socket PID as uncorroborated.
+fn corroborated_lock_holder_pid(lock_path: &Path) -> Option<u32> {
+    let file_pid = LeaderLock::read_pid_from_path(lock_path)?;
+    let pid = evictable_holder(file_pid, confirmed_flock_holder(lock_path))?;
+    evictable_if_ours(
+        pid,
+        crate::util::is_process_alive(pid),
+        holder_has_lock_file_open(pid, lock_path),
+    )
+}
+/// (pid, leader_binary_version) of reachable leaders whose socket PID is both
+/// plausible and corroborated by the lock holder. Stale-lock-only descriptors,
+/// implausible socket PIDs, and uncorroborated socket PIDs are all skipped.
 fn reachable_leader_pids(leaders: &[LeaderDescriptor]) -> Vec<(u32, String)> {
     leaders
         .iter()
         .filter_map(|d| {
-            d.live_info
-                .as_ref()
-                .map(|li| (li.pid, li.leader_binary_version.clone()))
+            let live_info = d.live_info.as_ref()?;
+            if !is_plausible_signal_pid(live_info.pid) {
+                return None;
+            }
+            let lock_holder = d
+                .lock_path
+                .as_deref()
+                .and_then(corroborated_lock_holder_pid);
+            (lock_holder == Some(live_info.pid))
+                .then(|| (live_info.pid, live_info.leader_binary_version.clone()))
         })
         .collect()
 }
@@ -1284,13 +1316,7 @@ fn zombie_evict_decision(
 /// so the holder is unconfirmable and this returns `None` (eviction skipped),
 /// accepting that a genuine zombie there is not auto-killed.
 fn live_grok_lock_holder(lock: &LeaderLock) -> Option<u32> {
-    let file_pid = lock.read_pid()?;
-    let pid = evictable_holder(file_pid, confirmed_flock_holder(lock.lock_path()))?;
-    evictable_if_ours(
-        pid,
-        crate::util::is_process_alive(pid),
-        holder_has_lock_file_open(pid, lock.lock_path()),
-    )
+    corroborated_lock_holder_pid(lock.lock_path())
 }
 /// Safety gate: evict only a PID that is both alive AND demonstrably ours.
 ///
@@ -2147,8 +2173,17 @@ mod tests {
         };
         assert_eq!(
             reachable_leader_pids(&[reachable, stale]),
-            vec![(222, "0.2.52".to_string())]
+            Vec::<(u32, String)>::new(),
+            "socket PID must be corroborated by a lock holder before startup \
+             auto-kill can trust it"
         );
+    }
+    #[test]
+    fn startup_kill_socket_pid_plausibility_bounds() {
+        assert!(!is_plausible_signal_pid(0));
+        assert!(!is_plausible_signal_pid(u32::MAX));
+        assert!(is_plausible_signal_pid(1));
+        assert!(is_plausible_signal_pid(i32::MAX as u32));
     }
     #[test]
     fn leader_is_older_than_directional() {

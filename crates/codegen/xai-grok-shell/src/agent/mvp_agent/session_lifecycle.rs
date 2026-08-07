@@ -59,6 +59,9 @@ impl MvpAgent {
     /// not to this funnel.
     pub(super) fn take_session(&self, id: &acp::SessionId) -> Option<SessionHandle> {
         let handle = self.sessions.borrow_mut().remove(id);
+        // Session-scoped side tables die with the session here, so this funnel
+        // is the reason they cannot leak (#161).
+        self.web_search_disabled.borrow_mut().remove(id);
         if let Some(handle) = &handle
             && let Some(scope) = &handle.tool_context.process_scope
         {

@@ -1311,6 +1311,7 @@ fn dashboard_effort_stash_refused_while_other_switch_in_flight_completes_once() 
             session_id: acp::SessionId::new("b-session"),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1382,6 +1383,7 @@ fn dashboard_effort_stash_admitted_when_slot_free() {
             session_id: acp::SessionId::new("b-session"),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -1470,6 +1472,7 @@ fn dashboard_dispatch_refused_pick_mirrors_error_and_drops_cli_stash() {
             session_id: acp::SessionId::new("b-session"),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -2455,6 +2458,7 @@ fn dashboard_deferred_plan_mode_applied_on_session_created() {
             session_id: session_id.clone(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );
@@ -5971,6 +5975,7 @@ fn dashboard_attach_roster_focuses_existing_local_agent() {
             session_id: "local-owned".into(),
             models: None,
             scheduler_background_loops: None,
+            web_search_disabled: None,
         }),
         &mut app,
     );

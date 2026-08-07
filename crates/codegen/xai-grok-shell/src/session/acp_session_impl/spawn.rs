@@ -2559,7 +2559,16 @@ impl crate::session::mcp_restart::RestartActions for SessionRestartActions {
             .is_shutting_down(server)
     }
     async fn respawn_stdio(&self, server: &str) -> Result<(), String> {
-        self.session.respawn_stdio(server).await
+        let shutdown = std::sync::Arc::clone(&self.shutdown);
+        let server_name = server.to_string();
+        self.session
+            .respawn_stdio_then(server, move || {
+                shutdown
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .note_ready(&server_name);
+            })
+            .await
     }
     async fn is_http_server_configured(&self, server: &str) -> bool {
         self.session.is_http_server_configured(server).await
