@@ -8990,13 +8990,8 @@ reasoning_effort = "low"
     /// #13: duplicate normalized names keep first-seen order only once.
     #[test]
     fn env_keys_normalize_dedupes_preserving_first_order() {
-        let (keys, rejected) = EnvKeys::normalize([
-            " PRIMARY ",
-            "FALLBACK",
-            "PRIMARY",
-            " FALLBACK ",
-            "OTHER",
-        ]);
+        let (keys, rejected) =
+            EnvKeys::normalize([" PRIMARY ", "FALLBACK", "PRIMARY", " FALLBACK ", "OTHER"]);
         assert!(rejected.is_empty(), "{rejected:?}");
         assert_eq!(keys.names(), vec!["PRIMARY", "FALLBACK", "OTHER"]);
     }
@@ -9052,7 +9047,10 @@ reasoning_effort = "low"
         let resolved = keys.resolve_value_with(|n| {
             (n == "API_KEY").then(|| "sk-super-secret-credential-value".into())
         });
-        assert_eq!(resolved.as_deref(), Some("sk-super-secret-credential-value"));
+        assert_eq!(
+            resolved.as_deref(),
+            Some("sk-super-secret-credential-value")
+        );
         assert!(
             !display.contains("sk-super-secret") && !debug.contains("sk-super-secret"),
             "diagnostics must not include resolved credential bytes (Value withheld.): display={display} debug={debug}"
