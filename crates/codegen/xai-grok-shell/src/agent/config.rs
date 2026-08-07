@@ -7609,6 +7609,62 @@ reasoning_effort = "low"
         );
     }
     #[test]
+    #[serial]
+    fn web_search_falls_back_to_models_default_and_keeps_model_scoped_credential() {
+        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+        use xai_grok_sampler::CredentialSource;
+        use xai_grok_test_support::EnvGuard;
+
+        let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+        let raw: toml::Value = toml::from_str(
+            r#"
+            [models]
+            default = "my-openai"
+
+            [model.my-openai]
+            model = "gpt-4.1"
+            base_url = "https://api.openai.com/v1"
+            api_key = "sk-model-scoped"
+            "#,
+        )
+        .expect("test config must parse");
+        let cfg = Config::new_from_toml_cfg(&raw).expect("config should parse");
+        assert_eq!(
+            cfg.web_search_model, "my-openai",
+            "web_search should default to [models].default when no explicit web_search override exists"
+        );
+
+        let models = resolve_model_list(&cfg, None);
+        let resolved = resolve_web_search_sampling_config(
+            &cfg.web_search_model,
+            &models,
+            Some("XAI_SESSION_SENTINEL"),
+            false,
+            None,
+            None,
+            &cfg.endpoints,
+        )
+        .expect("default-model web_search route should resolve");
+        assert_eq!(
+            resolved.base_url, "https://api.openai.com/v1",
+            "resolved web_search route should use the default model's endpoint"
+        );
+        assert!(
+            resolved.api_key.as_ref().is_some_and(|k| !k.is_empty()),
+            "resolved route should carry the model-scoped credential (Value withheld.)"
+        );
+        assert_eq!(
+            resolved.credential_source,
+            Some(CredentialSource::ModelApiKey),
+            "web_search should keep the model's own credential provenance label"
+        );
+        assert!(
+            has_usable_credential(&resolved),
+            "model-scoped credential should keep web_search enabled"
+        );
+    }
+    #[test]
     fn hidden_default_web_search_resolution_is_explicit_and_responses_only() {
         let endpoints = EndpointsConfig::default();
         let resolved = resolve_web_search_sampling_config(
