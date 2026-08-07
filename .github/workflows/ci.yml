@@ -558,6 +558,11 @@ jobs:
           # were equally unrun.
           cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
             deferred_switch_ -- --nocapture
+          # #11: the two persist-failure mirrors. These live in the pager's
+          # dispatch, not the shell -- the issue is about model persistence and
+          # the tests are about what the pager mirrors after a failed write.
+          cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
+            preferred_model_persist_failure -- --nocapture
 
       # #159: a runtime-only model was judged absent by a config-only lookup,
       # and the turn stripped its credentials. Filters written out rather than
