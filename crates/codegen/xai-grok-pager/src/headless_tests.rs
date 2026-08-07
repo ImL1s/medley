@@ -805,8 +805,7 @@ async fn headless_web_search_notice_surfaces_on_session_load() {
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if let xai_acp_lib::AcpAgentMessage::LoadSession(args) = msg {
-                let resp =
-                    acp::LoadSessionResponse::new().meta(Some(headless_ws_notice_meta()));
+                let resp = acp::LoadSessionResponse::new().meta(Some(headless_ws_notice_meta()));
                 let _ = args.response_tx.send(Ok(resp));
             }
         }
