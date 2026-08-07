@@ -142,6 +142,7 @@ pub struct TaskWakeAdmission {
 /// zero-turn prerequisites before mutating either harness or model state.
 pub struct PreparedModelSwitch {
     pub catalog_model_id: acp::ModelId,
+    pub resolved_model: crate::agent::config::ModelEntry,
     pub sampling_config: xai_grok_sampler::SamplerConfig,
     pub use_concise: bool,
     pub auto_compact_threshold_percent: u8,

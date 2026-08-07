@@ -2075,7 +2075,7 @@ fn resolve_catalog_key_prefers_exact_key_match() {
 }
 
 #[test]
-fn resolve_catalog_key_last_slug_match_wins() {
+fn resolve_catalog_key_none_when_slug_is_ambiguous() {
     let mut models = IndexMap::new();
     models.insert(
         "default-grok-build".to_string(),
@@ -2084,8 +2084,10 @@ fn resolve_catalog_key_last_slug_match_wins() {
     models.insert("user-grok-build".to_string(), make_model_entry("grok-4.5"));
 
     let persisted = acp::ModelId::new("grok-4.5");
-    let key = resolve_catalog_key(&models, &persisted).expect("slug must resolve");
-    assert_eq!(key.0.as_ref(), "user-grok-build");
+    assert!(
+        resolve_catalog_key(&models, &persisted).is_none(),
+        "ambiguous routing slugs must not silently pick one catalog key"
+    );
 }
 
 #[test]
@@ -2155,6 +2157,31 @@ fn selectable_prefers_exact_key_over_later_slug_match() {
     let key = selectable_catalog_key_for_persisted(&models, &available, &persisted)
         .expect("exact selectable key must win");
     assert_eq!(key.0.as_ref(), "grok-build");
+}
+
+#[test]
+fn selectable_catalog_resolution_reports_ambiguous_slug() {
+    let mut models = IndexMap::new();
+    models.insert("local-fast".to_string(), make_model_entry("qwen"));
+    models.insert("remote-accurate".to_string(), make_model_entry("qwen"));
+    let available = test_available_keys(&["local-fast", "remote-accurate"]);
+    let persisted = acp::ModelId::new("qwen");
+
+    let resolution = selectable_catalog_resolution_for_persisted(&models, &available, &persisted);
+    assert_eq!(
+        resolution,
+        PersistedCatalogKeyResolution::AmbiguousSlug {
+            slug: acp::ModelId::new("qwen"),
+            matches: vec![
+                acp::ModelId::new("local-fast"),
+                acp::ModelId::new("remote-accurate")
+            ],
+        }
+    );
+    assert!(
+        selectable_catalog_key_for_persisted(&models, &available, &persisted).is_none(),
+        "legacy slug-only restores must require an explicit catalog key when ambiguous"
+    );
 }
 
 fn test_available_keys(keys: &[&str]) -> IndexMap<acp::ModelId, acp::ModelInfo> {
