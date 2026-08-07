@@ -488,10 +488,11 @@ impl SessionContextFactory for WorkspaceSessionContextFactory {
                                 tier_restricted: false,
                             },
                             WebSearchConfig::Enabled {
-                                api_key: token,
+                                api_key: Some(token),
                                 base_url: url.clone(),
                                 model: default_web_search_model(),
                                 extra_headers: headers,
+                                env_http_headers: Default::default(),
                                 alpha_test_key: None,
                                 api_key_provider: None,
                             },
