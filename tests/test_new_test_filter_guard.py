@@ -240,8 +240,40 @@ class TargetOf(unittest.TestCase):
         self.assertEqual(target_of("crates/codegen/xai-grok-sampler/src/auth.rs", "xai-grok-sampler"), "lib")
         self.assertEqual(target_of("crates/codegen/xai-grok-update/tests/test_dist_channel_gate.rs", "xai-grok-update"), "test:test_dist_channel_gate")
         self.assertEqual(target_of("crates/codegen/xai-grok-update/tests/test_dist_channel_gate/main.rs", "xai-grok-update"), "test:test_dist_channel_gate")
-        self.assertEqual(target_of("crates/codegen/xai-grok-pager-bin/src/main.rs", "xai-grok-pager-bin"), "bin:xai-grok-pager-bin")
         self.assertEqual(target_of("crates/codegen/xai-grok-pager-bin/src/bin/xai-grok-pager.rs", "xai-grok-pager-bin"), "bin:xai-grok-pager")
+
+    def test_a_tests_module_under_src_is_lib_not_an_integration_target(self):
+        """`tests` below `src/` is a module named `tests`, not a `tests/` target.
+
+        Matching the component at any depth classified these as `test:<parent>` -- a
+        target that does not exist, so no filter could ever match and every test in
+        those modules was reported as running nowhere. Three PRs failed the gate on
+        this, which is the inverse of the failure the gate exists to catch and just as
+        corrosive: false positives teach people to route around it.
+        """
+        for path in (
+            "crates/codegen/xai-grok-shell/src/agent/subagent/tests/rest.rs",
+            "crates/codegen/xai-grok-pager/src/app/dispatch/tests/session/load.rs",
+            "crates/codegen/xai-grok-shell/src/session/acp_session_tests/mod.rs",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(target_of(path, crate_of(path)), "lib")
+
+    def test_bin_target_name_is_read_from_cargo_toml_not_the_crate_name(self):
+        """The crate is `xai-grok-pager-bin`; the target is `xai-grok-pager`.
+
+        That divergence is deliberate and documented in CLAUDE.md -- renaming the cargo
+        target would churn every upstream sync, so the rename to `medley` happens at
+        packaging instead. Deriving the target name from the crate name put every
+        `main.rs` test in a bucket no `ci.yml` filter could name.
+
+        This asserts against the real manifest on purpose: a fixture would pass while
+        the checked-in `Cargo.toml` said something else.
+        """
+        self.assertEqual(
+            target_of("crates/codegen/xai-grok-pager-bin/src/main.rs", "xai-grok-pager-bin"),
+            "bin:xai-grok-pager",
+        )
 
 
 if __name__ == "__main__":

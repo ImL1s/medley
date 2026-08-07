@@ -40,44 +40,101 @@ _FN = re.compile(r"^\+\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A
 _DIFF_FILE = re.compile(r"^\+\+\+ b/(.+)$")
 
 
-def crate_of(path: str) -> str | None:
-    """`crates/codegen/xai-grok-shell/src/...` -> `xai-grok-shell`."""
+def _crate_split(path: str) -> tuple[str, tuple[str, ...]] | None:
+    """`crates/codegen/xai-grok-shell/src/a/b.rs` -> `("crates/codegen/xai-grok-shell",
+    ("src", "a", "b.rs"))`.
+
+    Returning the crate *directory* as well as the name is what lets `target_of`
+    anchor on it. Cargo's layout is only meaningful relative to the crate root:
+    `tests/` there is an integration-test target, `tests/` anywhere below `src/` is
+    an ordinary module that happens to be called that.
+    """
     parts = Path(path).parts
     if "crates" not in parts:
         return None
     i = parts.index("crates")
     # crates/<group>/<crate>/...
-    if len(parts) > i + 2:
-        return parts[i + 2]
-    return None
+    if len(parts) <= i + 3:
+        return None
+    return str(Path(*parts[: i + 3])), parts[i + 3 :]
+
+
+def crate_of(path: str) -> str | None:
+    """`crates/codegen/xai-grok-shell/src/...` -> `xai-grok-shell`."""
+    split = _crate_split(path)
+    if split is None:
+        # A file directly in the crate directory (`Cargo.toml`) still names a crate.
+        parts = Path(path).parts
+        if "crates" in parts:
+            i = parts.index("crates")
+            if len(parts) > i + 2:
+                return parts[i + 2]
+        return None
+    return Path(split[0]).name
+
+
+def _bin_target_name(crate_dir: str, rel_path: str, crate_name: str | None) -> str:
+    """The name cargo gives the binary at `rel_path`, which is **not** the crate name
+    whenever `Cargo.toml` says otherwise.
+
+    This fork is exactly that case: the crate is `xai-grok-pager-bin` and the target is
+    `[[bin]] name = "xai-grok-pager"` (see CLAUDE.md -- renaming the target would churn
+    every upstream sync, so the rename happens at packaging instead). Guessing the target
+    name from the crate name put every `main.rs` test in a bucket no filter could ever
+    land in, and the checker then reported them all as unselected.
+    """
+    manifest = Path(crate_dir) / "Cargo.toml"
+    try:
+        text = manifest.read_text()
+    except OSError:
+        return crate_name or "bin"
+    # Minimal scan rather than a TOML parse: this runs in a job with no dependencies.
+    for block in re.split(r"^\s*\[\[bin\]\]\s*$", text, flags=re.M)[1:]:
+        block = re.split(r"^\s*\[", block, maxsplit=1, flags=re.M)[0]
+        name = re.search(r'^\s*name\s*=\s*"([^"]+)"', block, flags=re.M)
+        path_m = re.search(r'^\s*path\s*=\s*"([^"]+)"', block, flags=re.M)
+        if name and (path_m is None or path_m.group(1) == rel_path):
+            return name.group(1)
+    return crate_name or "bin"
 
 
 def target_of(path: str, crate_name: str | None) -> str | None:
-    """Determine the target name and type from a file path.
+    """Which cargo target compiles this file.
 
-    - `src/**` (excluding `main.rs`, `bin/**`) is `lib`
-    - `tests/foo.rs` is `test:foo`
-    - `src/main.rs`/`src/bin/**` is `bin:<crate_name>` / `bin:<name>`
+    Anchored on the crate root, because that is the only place cargo's layout means
+    anything:
+
+    - `<crate>/src/**` is `lib` -- including `src/**/tests/*.rs`, which is a module
+      named `tests`, not an integration-test target
+    - `<crate>/tests/foo.rs` (or `tests/foo/main.rs`) is `test:foo`
+    - `<crate>/src/main.rs` is `bin:<name from Cargo.toml>`; `<crate>/src/bin/foo.rs`
+      is `bin:foo`
+    - `<crate>/examples/foo.rs` is `example:foo`, `<crate>/benches/foo.rs` is `bench:foo`
+
+    Matching `tests` at any depth -- which is what this did first -- classified
+    `src/agent/subagent/tests/rest.rs` as `test:rest`, a target that does not exist, so
+    no filter could match and every test in those modules was reported as never run.
+    Note the shape of that mistake: scoping filters per target replaced a rule that was
+    too permissive with a *classifier*, and the classifier became the new place to be
+    wrong. It is worth being suspicious of the next one too.
     """
-    parts = Path(path).parts
-    if "tests" in parts:
-        idx = parts.index("tests")
-        if len(parts) > idx + 1:
-            name = parts[idx + 1].rsplit(".rs", 1)[0]
-            return f"test:{name}"
-    if "examples" in parts:
-        idx = parts.index("examples")
-        if len(parts) > idx + 1:
-            name = parts[idx + 1].rsplit(".rs", 1)[0]
-            return f"example:{name}"
-    if "src" in parts:
-        if "bin" in parts:
-            b_idx = parts.index("bin")
-            if len(parts) > b_idx + 1:
-                name = parts[b_idx + 1].rsplit(".rs", 1)[0]
-                return f"bin:{name}"
-        if parts[-1] == "main.rs":
-            return f"bin:{crate_name}" if crate_name else "bin"
+    split = _crate_split(path)
+    if split is None:
+        return None
+    crate_dir, rel = split
+    if not rel:
+        return None
+    if rel[0] == "tests" and len(rel) > 1:
+        return f"test:{rel[1].rsplit('.rs', 1)[0]}"
+    if rel[0] == "examples" and len(rel) > 1:
+        return f"example:{rel[1].rsplit('.rs', 1)[0]}"
+    if rel[0] == "benches" and len(rel) > 1:
+        return f"bench:{rel[1].rsplit('.rs', 1)[0]}"
+    if rel[0] == "src":
+        if len(rel) > 2 and rel[1] == "bin":
+            return f"bin:{rel[2].rsplit('.rs', 1)[0]}"
+        if rel[-1] == "main.rs" and len(rel) == 2:
+            return f"bin:{_bin_target_name(crate_dir, 'src/main.rs', crate_name)}"
         return "lib"
     return None
 
