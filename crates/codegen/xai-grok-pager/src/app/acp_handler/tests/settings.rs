@@ -203,6 +203,7 @@
                 session_id: acp::SessionId::new("sess-loop"),
                 models: None,
                 scheduler_background_loops: Some(false),
+                web_search_disabled: None,
             }),
             &mut app,
         );
@@ -238,6 +239,7 @@
                 session_id: acp::SessionId::new("sess-loop-load"),
                 models: None,
                 scheduler_background_loops: Some(false),
+                web_search_disabled: None,
             }),
             &mut app,
         );
@@ -251,6 +253,7 @@
                 restore_degree: None,
                 running_prompt_id: None,
                 scheduler_background_loops: Some(true),
+                web_search_disabled: None,
             }),
             &mut app,
         );
