@@ -714,6 +714,13 @@ pub(crate) struct ModelAuthMemo {
     pub(crate) model_id: String,
     pub(crate) facts: crate::agent::config::ModelAuthFacts,
     pub(crate) provider: Option<crate::auth::AuthProviderRef>,
+    /// [`crate::agent::models::ModelsManager::catalog_generation`] at write
+    /// time. A later catalog publish (etag refresh, config re-resolve, …)
+    /// advances that counter; memos whose generation no longer matches are
+    /// ignored so a transient `NotInCatalog` cannot permanently strip a
+    /// restored model (#159). Hand-seeded test fixtures use `0`, matching a
+    /// fresh manager.
+    pub(crate) catalog_generation: u64,
 }
 /// Phase 3: Post-flight handling after dispatch (inline in execute_tool_calls for now).
 pub(crate) struct SessionActor {
@@ -728,14 +735,19 @@ pub(crate) struct SessionActor {
     /// [`SessionActor::model_auth_facts`] and
     /// [`SessionActor::model_auth_provider`].
     ///
-    /// A fresh `Unknown` (config currently unparseable) falls back to the
-    /// last definite value for the same model rather than demoting a live
-    /// session to non-refreshable api-key mode. Because a config edit can
-    /// turn the selected model into a per-model BYOK model (or flip
-    /// `auth_scheme` to `none`) without changing its id, keying on the id
-    /// alone is insufficient: each model/credential chokepoint — including
-    /// `x.ai/internal/reload_models` / `reload_models_cache` — must clear
-    /// this memo (`replace(None)`).
+    /// Only **definite** facts (`byok != Unknown`) are written. Incomplete
+    /// lookups are returned live and never frozen. Because a config edit or
+    /// catalog publish can flip `auth_scheme` / BYOK / membership without
+    /// changing the model id, keying on the id alone is insufficient:
+    ///
+    /// - each model/credential chokepoint — including
+    ///   `x.ai/internal/reload_models` / `reload_models_cache` — must clear
+    ///   this memo (`replace(None)`);
+    /// - catalog publishes also bump
+    ///   [`crate::agent::models::ModelsManager::catalog_generation`], and
+    ///   memos store that generation so background etag refreshes (which
+    ///   never reach the agent invalidate path) still drop a stale
+    ///   `NotInCatalog` after the model is restored (#159).
     pub(crate) model_auth_memo: std::cell::RefCell<Option<ModelAuthMemo>>,
     /// 401-attribution callback. Receives the sampler's secret-free
     /// final-attempt credential comparison at each `OaiCompatClient` 401 arm.
