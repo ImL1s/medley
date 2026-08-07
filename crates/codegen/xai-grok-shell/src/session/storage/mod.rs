@@ -2321,14 +2321,8 @@ pub fn collect_assistant_text(
                     }
                 }
             }
-            SessionUpdate::Xai(_) => {
-                if !current.is_empty() {
-                    let t = current.trim().to_string();
-                    if !t.is_empty() {
-                        texts.push(t);
-                    }
-                    current.clear();
-                }
+            SessionUpdate::Xai(n) => {
+                apply_assistant_text_xai_boundary(&n.update, &mut current, &mut texts);
             }
         }
     }
@@ -2339,6 +2333,115 @@ pub fn collect_assistant_text(
         }
     }
     texts
+}
+
+/// How an xAI session update affects the in-progress assistant-text buffer used
+/// for FTS indexing ([`collect_assistant_text`] and the single-pass indexer).
+///
+/// Every [`crate::extensions::notification::SessionUpdate`] variant is classified
+/// explicitly — a catch-all that flushes is how #165 was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AssistantTextXaiBoundary {
+    /// Seal `current` into `texts` (legitimate turn / timeline boundary).
+    Flush,
+    /// Drop `current` without indexing (abandoned / retracted sampling attempt).
+    Discard,
+}
+
+/// Classify an xAI update for the assistant-text FTS buffer. Exhaustive on
+/// purpose: each arm documents why flush vs discard.
+pub(crate) fn assistant_text_xai_boundary(
+    update: &crate::extensions::notification::SessionUpdate,
+) -> AssistantTextXaiBoundary {
+    use crate::extensions::notification::SessionUpdate as Xai;
+    use AssistantTextXaiBoundary::{Discard, Flush};
+
+    match update {
+        // --- Discard: streamed text was never the committed assistant turn (#165) ---
+        // Persisted between attempts when `SamplingEvent::Retrying` fires; flushing
+        // would push abandoned attempt text into the FTS index.
+        Xai::RetryState(_) => Discard,
+        // Explicit retraction of a streamed attempt (#44); same non-indexing rule.
+        Xai::AttemptDiscarded => Discard,
+
+        // --- Flush: genuine timeline / compaction boundaries ---
+        // Rewind creates a timeline branch; seal pre-marker text as its own entry.
+        Xai::RewindMarker { .. } => Flush,
+        // Compaction checkpoint is a persist-only boundary in updates.jsonl.
+        Xai::CompactionCheckpoint(_) => Flush,
+
+        // --- Flush: keep today's boundary for non-abandonment xAI records ---
+        // (#165 not in scope: do not rethink the flush boundary for these.)
+        Xai::DiffReview { .. } => Flush,
+        Xai::AutoCompactStarted { .. } => Flush,
+        Xai::AutoCompactCompleted { .. } => Flush,
+        Xai::AutoCompactFailed { .. } => Flush,
+        Xai::MemoryFlushStarted => Flush,
+        Xai::MemoryFlushCompleted { .. } => Flush,
+        Xai::MemoryDreamCompleted { .. } => Flush,
+        Xai::MemorySessionSaved { .. } => Flush,
+        Xai::AutoCompactCancelled { .. } => Flush,
+        Xai::AutoContinueCompleted { .. } => Flush,
+        Xai::FeedbackRequest(_) => Flush,
+        Xai::RelaySyncStatus(_) => Flush,
+        Xai::AutoRecoveryStarted { .. } => Flush,
+        Xai::AutoRecoveryExhausted { .. } => Flush,
+        Xai::HookAnnotation { .. } => Flush,
+        Xai::HookExecution { .. } => Flush,
+        Xai::HooksChanged { .. } => Flush,
+        Xai::PluginsChanged { .. } => Flush,
+        Xai::PluginUpdatesInstalled { .. } => Flush,
+        Xai::SessionSummaryGenerated { .. } => Flush,
+        Xai::SessionRecap { .. } => Flush,
+        Xai::SessionRecapUnavailable => Flush,
+        Xai::TaskCompleted { .. } => Flush,
+        Xai::SubagentSpawned { .. } => Flush,
+        Xai::SubagentProgress { .. } => Flush,
+        Xai::SubagentFinished { .. } => Flush,
+        Xai::TaskBackgrounded { .. } => Flush,
+        Xai::ScheduledTaskCreated { .. } => Flush,
+        Xai::ScheduledTaskFired { .. } => Flush,
+        Xai::ScheduledTaskDeleted { .. } => Flush,
+        Xai::MonitorEvent { .. } => Flush,
+        Xai::ModelAutoSwitched { .. } => Flush,
+        Xai::ModelChanged { .. } => Flush,
+        Xai::ToolCallDeltaChunk { .. } => Flush,
+        Xai::ImageCompressed { .. } => Flush,
+        Xai::ImageDropped { .. } => Flush,
+        Xai::WebSearchDisabled { .. } => Flush,
+        Xai::MemoryFiles { .. } => Flush,
+        Xai::WorkflowUpdated { .. } => Flush,
+        Xai::GoalUpdated { .. } => Flush,
+        Xai::PendingInteraction { .. } => Flush,
+        Xai::InteractionResolved { .. } => Flush,
+        Xai::TurnCompleted { .. } => Flush,
+        Xai::ResponseStarted { .. } => Flush,
+        Xai::ReasoningCompleted { .. } => Flush,
+        Xai::ResponseCompleted { .. } => Flush,
+        // Forward-compat unknown wire tags: preserve prior flush behaviour.
+        Xai::Unknown => Flush,
+    }
+}
+
+pub(crate) fn apply_assistant_text_xai_boundary(
+    update: &crate::extensions::notification::SessionUpdate,
+    current: &mut String,
+    texts: &mut Vec<String>,
+) {
+    match assistant_text_xai_boundary(update) {
+        AssistantTextXaiBoundary::Flush => {
+            if !current.is_empty() {
+                let t = current.trim().to_string();
+                if !t.is_empty() {
+                    texts.push(t);
+                }
+                current.clear();
+            }
+        }
+        AssistantTextXaiBoundary::Discard => {
+            current.clear();
+        }
+    }
 }
 
 /// Collect tool metadata from a stream of [`SessionUpdate`]s.
@@ -4209,6 +4312,149 @@ mod tests {
         assert!(
             result.iter().any(|s| s.contains("café")),
             "non-ASCII should be preserved"
+        );
+    }
+
+    /// #165: RetryState between two attempts must discard the abandoned
+    /// attempt's text, not flush it into the FTS-bound collector.
+    #[test]
+    fn collect_assistant_text_discards_abandoned_retry_attempt_phrase() {
+        let lines = vec![
+            acp_envelope(
+                r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"here is the migration plan abandoned-xyzzy-165"}}"#,
+            ),
+            xai_envelope(
+                r#"{"sessionUpdate":"retry_state","type":"retrying","attempt":1,"max_retries":3,"reason":"transport reset"}"#,
+            ),
+            acp_envelope(
+                r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"retry succeeded with different wording kept-plugh-165"}}"#,
+            ),
+        ];
+        let updates: Vec<_> = lines
+            .into_iter()
+            .map(|s| Ok(serde_json::from_str(&s).unwrap()))
+            .collect();
+        let result = collect_assistant_text(updates.into_iter());
+        let joined = result.join("\n");
+        assert!(
+            !joined.contains("abandoned-xyzzy-165"),
+            "abandoned attempt text must not be indexed: {result:?}"
+        );
+        assert!(
+            joined.contains("kept-plugh-165"),
+            "retry attempt text must still be indexed: {result:?}"
+        );
+    }
+
+    /// #165: AttemptDiscarded is a retraction, not a flush boundary.
+    #[test]
+    fn collect_assistant_text_discards_attempt_discarded_retraction_phrase() {
+        let lines = vec![
+            acp_envelope(
+                r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"retracted-attempt-quux-165"}}"#,
+            ),
+            xai_envelope(r#"{"sessionUpdate":"attempt_discarded"}"#),
+            acp_envelope(
+                r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"visible-retry-zork-165"}}"#,
+            ),
+        ];
+        let updates: Vec<_> = lines
+            .into_iter()
+            .map(|s| Ok(serde_json::from_str(&s).unwrap()))
+            .collect();
+        let result = collect_assistant_text(updates.into_iter());
+        let joined = result.join("\n");
+        assert!(
+            !joined.contains("retracted-attempt-quux-165"),
+            "retracted attempt text must not be indexed: {result:?}"
+        );
+        assert!(
+            joined.contains("visible-retry-zork-165"),
+            "post-retraction text must still be indexed: {result:?}"
+        );
+    }
+
+    /// #165: RewindMarker remains a legitimate flush boundary.
+    #[test]
+    fn collect_assistant_text_still_flushes_on_rewind_marker_boundary() {
+        let lines = vec![
+            acp_envelope(
+                r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"pre-rewind-flush-165"}}"#,
+            ),
+            xai_envelope(
+                r#"{"sessionUpdate":"rewind_marker","target_prompt_index":0,"created_at":"2024-01-01T00:00:00Z"}"#,
+            ),
+            acp_envelope(
+                r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"post-rewind-text-165"}}"#,
+            ),
+        ];
+        let updates: Vec<_> = lines
+            .into_iter()
+            .map(|s| Ok(serde_json::from_str(&s).unwrap()))
+            .collect();
+        let result = collect_assistant_text(updates.into_iter());
+        assert_eq!(
+            result,
+            vec![
+                "pre-rewind-flush-165".to_string(),
+                "post-rewind-text-165".to_string()
+            ]
+        );
+    }
+
+    /// #165: CompactionCheckpoint remains a legitimate flush boundary.
+    #[test]
+    fn collect_assistant_text_still_flushes_on_compaction_checkpoint_boundary() {
+        let lines = vec![
+            acp_envelope(
+                r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"pre-compact-flush-165"}}"#,
+            ),
+            xai_envelope(
+                r#"{"sessionUpdate":"compaction_checkpoint","checkpoint_id":"ck-165","prompt_index_at_compaction":1,"checkpoint_file":"compaction_checkpoints/ck-165.json","schema_version":1,"created_at":"2024-01-01T00:00:00Z"}"#,
+            ),
+            acp_envelope(
+                r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"post-compact-text-165"}}"#,
+            ),
+        ];
+        let updates: Vec<_> = lines
+            .into_iter()
+            .map(|s| Ok(serde_json::from_str(&s).unwrap()))
+            .collect();
+        let result = collect_assistant_text(updates.into_iter());
+        assert_eq!(
+            result,
+            vec![
+                "pre-compact-flush-165".to_string(),
+                "post-compact-text-165".to_string()
+            ]
+        );
+    }
+
+    /// #165: A completed turn with a non-retry xAI record still indexes as today
+    /// (flush, not merge/split differently).
+    #[test]
+    fn collect_assistant_text_completed_turn_still_indexes_across_hook_annotation() {
+        let lines = vec![
+            acp_envelope(
+                r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"completed-turn-alpha-165"}}"#,
+            ),
+            xai_envelope(r#"{"sessionUpdate":"hook_annotation","message":"hook ran"}"#),
+            acp_envelope(
+                r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"completed-turn-beta-165"}}"#,
+            ),
+        ];
+        let updates: Vec<_> = lines
+            .into_iter()
+            .map(|s| Ok(serde_json::from_str(&s).unwrap()))
+            .collect();
+        let result = collect_assistant_text(updates.into_iter());
+        // Today's flush-on-xAI behaviour: two separate entries, not one merged string.
+        assert_eq!(
+            result,
+            vec![
+                "completed-turn-alpha-165".to_string(),
+                "completed-turn-beta-165".to_string()
+            ]
         );
     }
 

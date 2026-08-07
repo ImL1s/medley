@@ -205,6 +205,17 @@ jobs:
             provider_controlled_stream_error_is_secret_free_for_all_stream_apis -- --nocapture
           run_nonzero -p xai-grok-mcp --lib \
             callback_errors_never_echo_provider_controlled_credentials -- --nocapture
+          # #151: an unlabelled chat-state credential reaching an external origin
+          # on `Unknown(CatalogUnavailable)`. Closed in code by #136, and the two
+          # tests that pin it matched no filter at all -- so the highest-stakes
+          # property in this fork was defended by tests no job ran (#171).
+          #
+          # Deliberately in this step rather than the auth one above: that step
+          # uses bare `cargo test`, where a filter matching zero tests exits 0.
+          # For a security property "the filter stopped matching" and "the
+          # property still holds" must not look the same, and only `run_nonzero`
+          # tells them apart.
+          run_nonzero -p xai-grok-shell --lib catalog_unavailable -- --nocapture
           run_nonzero -p xai-grok-mcp --lib \
             callback_payload_debug_never_emits_code_state_or_issuer -- --nocapture
           run_nonzero -p xai-file-utils --lib \
@@ -387,6 +398,39 @@ jobs:
           cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
             deferred_switch_ -- --nocapture
 
+      # #159: a runtime-only model was judged absent by a config-only lookup,
+      # and the turn stripped its credentials. Filters written out rather than
+      # looped, so the #171 check can see them. Quoted name: an unquoted `#159`
+      # truncates at the comment marker.
+      - name: 'Runtime-catalog lookup and memo generation (issue #159)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib runtime_catalog -- --nocapture
+          run_nonzero -p xai-grok-shell --lib runtime_only_catalog -- --nocapture
+          run_nonzero -p xai-grok-shell --lib config_only_miss -- --nocapture
+          run_nonzero -p xai-grok-shell --lib memoized_as_definite -- --nocapture
+          run_nonzero -p xai-grok-shell --lib catalog_refresh_that_drops -- --nocapture
+          run_nonzero -p xai-grok-shell --lib bundled_fallback_rebuild -- --nocapture
+          # `agent::models` as a module filter: the generation asserts added to
+          # the pre-existing `rebuild_updates_models_and_available` live there
+          # and matched no name-based filter, so that guard ran nowhere. A new
+          # assertion in an old unfiltered test is invisible to the #171 check,
+          # which looks for added `#[test]` attributes.
+          run_nonzero -p xai-grok-shell --lib agent::models -- --nocapture
+
       # #166: these assert on colour, and used to inherit the ambient colour
       # level. Run them under both settings of NO_COLOR -- one pass alone would
       # not have caught the original bug, because it only showed up on the axis
@@ -461,6 +505,38 @@ jobs:
             rm -f "$output"
           }
           run_nonzero -p xai-grok-shell --lib workflow_restore -- --nocapture
+
+      # #165: abandoned sampling attempts must not enter the FTS index.
+      # Unique filters so run_nonzero proves each new test is selected.
+      # Quoted name: an unquoted `#165` truncates at the comment marker.
+      - name: 'Abandoned attempt text omitted from search index (issue #165)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib \
+            collect_assistant_text_discards_abandoned_retry_attempt_phrase -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            collect_assistant_text_discards_attempt_discarded_retraction_phrase -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            collect_assistant_text_still_flushes_on_rewind_marker_boundary -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            collect_assistant_text_still_flushes_on_compaction_checkpoint_boundary -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            collect_assistant_text_completed_turn_still_indexes_across_hook_annotation -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            single_pass_omits_abandoned_retry_attempt_from_fts_content -- --nocapture
 
       # #160: six of the seven tests this branch originally added matched no
       # filter. The seventh, `web_search_resolves_an_env_backed_credential_header`,
