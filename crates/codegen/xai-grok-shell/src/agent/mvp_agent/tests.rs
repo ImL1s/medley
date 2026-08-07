@@ -7018,8 +7018,10 @@ fn initialize_publishes_substituted_default_model_meta() {
             std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let gateway = GatewaySender::new(tx);
-        let mut cfg = AgentConfig::default();
-        cfg.default_model_override = Some("typo-provider-131".to_owned());
+        let cfg = AgentConfig {
+            default_model_override: Some("typo-provider-131".to_owned()),
+            ..AgentConfig::default()
+        };
 
         let mut catalog = IndexMap::new();
         let mut info = ModelInfo::fallback("grok-4");
@@ -7082,8 +7084,10 @@ fn initialize_omits_substituted_default_model_meta_when_honoured() {
             std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let gateway = GatewaySender::new(tx);
-        let mut cfg = AgentConfig::default();
-        cfg.default_model_override = Some("honoured-131".to_owned());
+        let cfg = AgentConfig {
+            default_model_override: Some("honoured-131".to_owned()),
+            ..AgentConfig::default()
+        };
 
         let mut catalog = IndexMap::new();
         let mut info = ModelInfo::fallback("honoured-131");
