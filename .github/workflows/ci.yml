@@ -242,6 +242,32 @@ jobs:
           run_nonzero -p xai-file-utils --lib \
             upload_config_debug_redacts_all_secret_carriers -- --nocapture
 
+      - name: Provider docs examples and fixtures
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
+              echo "test filter matched zero tests: $*" >&2
+              rm -f "$output"
+              return 1
+            }
+            rm -f "$output"
+          }
+          # #31: validate executable provider docs. Unique filters so
+          # run_nonzero proves each docs guard still runs after refactors.
+          run_nonzero -p xai-grok-shell --lib \
+            docs_examples_extractor_handles_markers_ignores_unmarked_and_rejects_malformed -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            docs_examples_parse_and_resolve_provider_toml_examples -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            docs_examples_enforce_readiness_and_secret_policy -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            docs_examples_validate_offline_commands_and_links -- --nocapture
+
       - name: Update channel isolation guards
         # The fork's worst failure mode is a medley binary self-updating into
         # upstream's release channel and replacing itself with the official CLI
