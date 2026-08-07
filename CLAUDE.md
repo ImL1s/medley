@@ -29,6 +29,12 @@ CI runs on `providers` only. `main` moving triggers nothing.
 
 **`cargo check --lib` does not compile `#[cfg(test)]` code.** Neither does clippy on `--lib`. A workspace can pass check, clippy, fmt, and a filtered hot-path run while the test build of the largest crate is broken — that is exactly what the 2026-08-04 upstream sync did, and only CI caught it. Run `cargo test --workspace --no-run` before pushing anything that touches shared types: it compiles every test target without running them, which is the cheapest way to find a fork test still calling something upstream deleted.
 
+**Fork fields on `SamplingConfig` / `SamplerConfig` are a per-sync tax (#121).** Rust struct literals must name every field. The 2026-08-04 sync paid **11 of 25** test-build errors for a single fork field (`endpoint_trust`) on `SamplingConfig` — all upstream constructors that did not know the field existed. Today `SamplingConfig` still carries **one** fork field (`endpoint_trust`); `SamplerConfig` carries **two** (`endpoint_trust`, `credential_source`). Before adding another:
+
+1. Prefer a **fork-owned type** (as #136 step 1 did with `Credentials` / `StoredAuth`) over a new field on either of those two structs.
+2. If the field must live on `SamplingConfig`, set it in `SamplingConfig::for_test` and use FRU (`..for_test(..)`) at test sites. Do **not** add `#[derive(Default)]` / empty-URL defaults — that trades a compile error for a distant runtime one — and do **not** put `api_key` on `SamplingConfig` (provenance is bound on `Credentials` / `SamplerConfig`, #180).
+3. The structural cap (one fork-namespaced field absorbing the rest) is sequenced behind #136's envelope, not a standalone refactor.
+
 **Isolating the install does not isolate the run.** When checking a built binary, pass `HOME` (or `MEDLEY_HOME`) to *every invocation*, not just to `install.sh`. Otherwise `grok_home()` falls back to the developer's `~/.grok` and answers plausibly wrong — `channel` reads `stable` instead of `unknown`, and nothing errors.
 
 **`~/.medley/bin/medley` is a launcher script, not the binary.** It bakes `MEDLEY_HOME` at install time. To test binary behaviour, run `~/.medley/versions/<v>/medley` directly. `file <path>` tells you which you have.
