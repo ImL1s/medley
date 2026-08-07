@@ -3028,6 +3028,9 @@ impl MvpAgent {
         session_id: &acp::SessionId,
         budget: std::time::Duration,
     ) {
+        if self.session_registry.resident_handle(session_id).is_some() {
+            return;
+        }
         match self.session_registry.thread_is_finished(session_id) {
             None => return,
             Some(true) => {

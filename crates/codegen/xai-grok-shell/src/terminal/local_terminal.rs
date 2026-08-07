@@ -253,12 +253,13 @@ mod tests {
             return;
         }
 
-        let result = LocalTerminalRunner
-            .run(make_request(
-                "(exec 3>/dev/tty && echo ATTACHED || echo DETACHED) 2>/dev/null",
-            ))
-            .await
-            .unwrap();
+        let temp_home = tempfile::tempdir().expect("temporary HOME for shell startup");
+        let mut request = make_request("(exec 3>/dev/tty && echo ATTACHED || echo DETACHED) 2>/dev/null");
+        request.env.insert(
+            "HOME".to_owned(),
+            temp_home.path().to_string_lossy().into_owned(),
+        );
+        let result = LocalTerminalRunner.run(request).await.unwrap();
 
         assert_eq!(
             result.combined_output.trim(),
@@ -291,8 +292,13 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn test_timeout_kills_grandchildren_and_returns_promptly() {
+        let temp_home = tempfile::tempdir().expect("temporary HOME for shell startup");
         let mut request = make_request("sleep 5 & echo bgpid=$!; sleep 5");
-        request.timeout = std::time::Duration::from_millis(300);
+        request.env.insert(
+            "HOME".to_owned(),
+            temp_home.path().to_string_lossy().into_owned(),
+        );
+        request.timeout = std::time::Duration::from_millis(800);
 
         let started = std::time::Instant::now();
         let result = LocalTerminalRunner.run(request).await.unwrap();

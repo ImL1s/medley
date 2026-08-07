@@ -7,7 +7,7 @@ use std::path::Path;
 use super::search_fts::{SessionDoc, SessionSearchIndex};
 use super::{
     ContentPeek, PromptExtractEvent, RawLinePeek, RawParamsPeek, XAI_SESSION_UPDATE_METHOD,
-    collect_prompts_from_events,
+    apply_assistant_text_xai_boundary, collect_prompts_from_events,
 };
 use crate::session::persistence::Summary;
 use crate::session::wire_tags::{REWIND_MARKER, USER_MESSAGE_CHUNK};
@@ -294,9 +294,20 @@ pub(super) fn collect_all_indexable_content_single_pass(
                 }
             }
         } else {
+            if let Ok(notif) = serde_json::from_str::<
+                crate::extensions::notification::SessionNotification,
+            >(raw_params)
+            {
+                apply_assistant_text_xai_boundary(
+                    &notif.update,
+                    &mut current_assistant,
+                    &mut assistant_texts,
+                );
+            } else {
+                flush_assistant(&mut current_assistant, &mut assistant_texts);
+            }
             match tag {
                 Some(t) if t == *REWIND_MARKER => {
-                    flush_assistant(&mut current_assistant, &mut assistant_texts);
                     if let Some(ref u) = update_peek
                         && let Some(idx) = u.target_prompt_index
                     {
@@ -306,7 +317,6 @@ pub(super) fn collect_all_indexable_content_single_pass(
                     }
                 }
                 _ => {
-                    flush_assistant(&mut current_assistant, &mut assistant_texts);
                     prompt_events.push(PromptExtractEvent::NotUserMessage);
                 }
             }
