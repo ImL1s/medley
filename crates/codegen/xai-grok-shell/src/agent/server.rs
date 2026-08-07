@@ -537,11 +537,11 @@ async fn run_persistent_agent(
     tokio::task::spawn_local(async move {
         while let Some(msg) = gw_rx.recv().await {
             let maybe_tx = relay_dest_for_task.borrow().clone();
-            if let Some(tx) = maybe_tx {
-                if tx.send(msg).await.is_err() {
-                    // Connection's gateway receiver was dropped — clear it.
-                    *relay_dest_for_task.borrow_mut() = None;
-                }
+            if let Some(tx) = maybe_tx
+                && tx.send(msg).await.is_err()
+            {
+                // Connection's gateway receiver was dropped — clear it.
+                *relay_dest_for_task.borrow_mut() = None;
             }
             // If no connection, the message (and its response_tx) is dropped.
             // The caller (session actor) gets a send error which is already
