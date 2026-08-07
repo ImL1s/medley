@@ -1339,6 +1339,12 @@ mod tests {
         }
     }
 
+    // `dev_t` and `ino_t` are already `u64` on Linux and narrower on Darwin, so
+    // exactly one platform sees these casts as redundant. Widening is correct on
+    // both and there is no `From` impl that covers the signed Darwin `dev_t`, so
+    // the lint is allowed here rather than the cast removed -- removing it breaks
+    // the build on macOS, which is where this test was written.
+    #[allow(clippy::unnecessary_cast)]
     fn stat_fd_identity(fd: std::os::fd::RawFd) -> std::io::Result<(u64, u64)> {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         let rc = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
