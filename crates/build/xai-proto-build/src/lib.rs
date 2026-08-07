@@ -38,7 +38,6 @@ fn find_protoc_include_dir(protoc: Option<&Path>) -> Option<PathBuf> {
     //
     // Ahead of `is_dir` only because it answers without a syscall; the two
     // gates are independent and either order gives the same result.
-    include_dir.to_str()?;
 
     include_dir.is_dir().then_some(include_dir)
 }
@@ -166,14 +165,15 @@ impl XaiProtoBuilder {
             // This is needed for Bazel sandboxed builds where protoc and its
             // include files are in different locations.
             if let Some(include_dir) = protoc_include_dir {
-                command.arg(format!(
-                    "-I{}",
-                    include_dir.to_str().context("include path not UTF-8")?
-                ));
+                let mut arg = std::ffi::OsString::from("-I");
+                arg.push(include_dir.as_os_str());
+                command.arg(arg);
             }
 
             for include in &includes {
-                command.arg(format!("-I{}", include.to_str().context("path not UTF-8")?));
+                let mut arg = std::ffi::OsString::from("-I");
+                arg.push(include.as_os_str());
+                command.arg(arg);
             }
 
             command.arg(proto);
@@ -186,30 +186,49 @@ impl XaiProtoBuilder {
                 return Err(anyhow::anyhow!("protoc command failed"));
             }
 
-            let output =
-                String::from_utf8(output.stdout).context("protoc command output not UTF-8")?;
-
-            let mut lines = output.lines();
+            let mut lines = output.stdout.split(|&b| b == b'\n');
             let first_line = lines.next().context("protoc command output is empty")?;
-            let prefix = "/dev/null:";
-            let rem = first_line.strip_prefix(prefix).with_context(|| {
-                format!("protoc command output must start with /dev/null: {output:?}")
-            })?;
+            let prefix = b"/dev/null:";
+            let rem = if first_line.starts_with(prefix) {
+                &first_line[prefix.len()..]
+            } else {
+                return Err(anyhow::anyhow!(
+                    "protoc command output must start with /dev/null: {:?}",
+                    String::from_utf8_lossy(first_line)
+                ));
+            };
             for line in iter::once(rem).chain(lines) {
-                let line = line.trim();
-                let line = line.strip_suffix("\\").unwrap_or(line);
+                let mut line = trim_ascii(line);
+                if line.is_empty() {
+                    continue;
+                }
+                if line.ends_with(b"\\") {
+                    line = &line[..line.len() - 1];
+                }
+                let line = trim_ascii(line);
+                if line.is_empty() {
+                    continue;
+                }
                 // Depending on absolute paths like
                 // /Users/user/homebrew/Cellar/protobuf/29.1/include/google/protobuf/timestamp.proto
                 // is valid, but we want to have output more deterministic.
-                if line.contains("/include/google/protobuf/") {
+                let pattern = b"/include/google/protobuf/";
+                if line.windows(pattern.len()).any(|w| w == pattern) {
                     continue;
                 }
 
-                if !fs::exists(line)? {
-                    return Err(anyhow::anyhow!("dependency file not found: {line}"));
+                let line_str = std::str::from_utf8(line)
+                    .context("dependency path is not valid UTF-8")?;
+
+                if !fs::exists(line_str)? {
+                    return Err(anyhow::anyhow!("dependency file not found: {line_str}"));
                 }
 
-                println!("cargo:rerun-if-changed={line}");
+                if line_str.contains('\n') || line_str.contains('\r') {
+                    return Err(anyhow::anyhow!("dependency path contains newline: {line_str}"));
+                }
+
+                println!("cargo:rerun-if-changed={line_str}");
             }
         }
 
@@ -477,4 +496,59 @@ mod tests {
 
         fs::remove_dir_all(&parent).ok();
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn emit_rerun_if_changed_handles_non_utf8_well_known_types_dependency() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = temp_dir_named("nonutf8-dep");
+        let proto_file = dir.join("test.proto");
+        fs::write(&proto_file, b"").expect("write proto");
+
+        let protoc_script = dir.join("protoc");
+        let mut script_content = Vec::new();
+        script_content.extend_from_slice(b"#!/bin/sh\n");
+        script_content.extend_from_slice(b"printf '/dev/null: ");
+        script_content.extend_from_slice(proto_file.to_str().expect("temp path is utf8").as_bytes());
+        script_content.extend_from_slice(b" \\\\\\n  /opt/we\\xffird/include/google/protobuf/timestamp.proto\\n'\n");
+        script_content.extend_from_slice(b"exit 0\n");
+
+        fs::write(&protoc_script, script_content).expect("write stub protoc");
+        fs::set_permissions(&protoc_script, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let include_dir_bytes = b"/opt/we\xffird/include";
+        let include_dir = Path::new(OsStr::from_bytes(include_dir_bytes));
+
+        let res = XaiProtoBuilder::emit_rerun_if_changed(
+            Some(&protoc_script),
+            Some(include_dir),
+            [proto_file.as_path()],
+            [] as [&Path; 0]
+        );
+
+        assert!(res.is_ok(), "should succeed despite non-UTF-8 paths, err: {:?}", res.err());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+}
+
+fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
+    while let Some((first, rest)) = bytes.split_first() {
+        if first.is_ascii_whitespace() {
+            bytes = rest;
+        } else {
+            break;
+        }
+    }
+    while let Some((last, rest)) = bytes.split_last() {
+        if last.is_ascii_whitespace() {
+            bytes = rest;
+        } else {
+            break;
+        }
+    }
+    bytes
 }
