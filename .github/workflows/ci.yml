@@ -905,10 +905,12 @@ jobs:
             rm -f "$output"
           }
           run_nonzero -p xai-grok-shell --lib session_meta_publishes_the_web_search_disable -- --nocapture
+          run_nonzero -p xai-grok-shell --lib session_meta_keeps_web_search_notices_session_scoped -- --nocapture
           run_nonzero -p xai-grok-shell --lib take_session_drops_the_web_search_notice -- --nocapture
           run_nonzero -p xai-grok-pager --lib web_search_disabled_meta -- --nocapture
           run_nonzero -p xai-grok-pager --lib no_web_search_notice -- --nocapture
           run_nonzero -p xai-grok-pager --lib parse_session_web_search_disabled -- --nocapture
+          run_nonzero -p xai-grok-pager --lib headless_web_search_notice -- --nocapture
 
       # #167: pure seams split out of `kill_leaders` so summary/exit and PID
       # guards are unit-testable. The earlier "Leader kill safety" step already
