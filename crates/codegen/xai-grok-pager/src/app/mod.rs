@@ -33,7 +33,7 @@ pub(crate) mod session_title_resolve;
 pub mod status_blocks;
 pub mod subagent;
 pub mod subscription;
-pub(crate) use effects::sanitize_user_error;
+pub(crate) use effects::{parse_session_web_search_disabled, sanitize_user_error};
 mod event_loop;
 pub(crate) mod external_editor;
 mod foreign_sessions;
