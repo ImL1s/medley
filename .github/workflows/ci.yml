@@ -483,7 +483,57 @@ jobs:
           run_nonzero -p xai-grok-workspace-types --lib \
             rpc::repos:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
-            agent:: -- --nocapture
+            agent::activity:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::app:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::auth_method:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::chat_modes:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::config:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::config_model_override_parse:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::docs_examples_tests:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::ext_parsers:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::feedback_client:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::folder_trust:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::handlers:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::model_providers:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::models:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::mvp_agent:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::otel_gate:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::proxy:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::relay:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::restore_code:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::roster:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::server:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::session_config:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::session_registry_client:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::storage_client_tests:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::subagent:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::subscription_check:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            agent::update_chunk_merge:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             auth:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
