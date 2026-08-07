@@ -625,6 +625,36 @@ jobs:
           cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
             preferred_model_persist_failure -- --nocapture
 
+      # #170: the dashboard's mirror obligations. A refused pre-session pick
+      # completes with a toast on the new agent; whenever the view stays on
+      # the dashboard the caller must mirror it onto the dashboard's error
+      # slot. The two mirror guards landed with this subsystem's fix but
+      # matched no filter, so the obligation's tests ran nowhere (#171); the
+      # new button-path test pins why THAT path may discard the refusal
+      # signal. Full unique names so run_nonzero proves each one still runs.
+      - name: 'Dashboard refused-pick mirror obligations (issue #170)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-pager --lib \
+            dashboard_dispatch_refused_pick_mirrors_error_and_drops_cli_stash -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            dashboard_confirm_worktree_refused_pick_mirrors_error_toast -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            dashboard_new_agent_button_refused_pick_toast_follows_the_view -- --nocapture
+
       # #159: a runtime-only model was judged absent by a config-only lookup,
       # and the turn stripped its credentials. Filters written out rather than
       # looped, so the #171 check can see them. Quoted name: an unquoted `#159`
