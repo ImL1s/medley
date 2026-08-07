@@ -642,3 +642,30 @@ jobs:
           # bearer_resolver arm of has_usable_credential.
           run_nonzero -p xai-grok-shell --lib survives_into_sampler_config -- --nocapture
           run_nonzero -p xai-grok-shell --lib accepts_a_bearer_resolver_alone -- --nocapture
+
+      # #161: the web_search disable notice now rides the session response
+      # `_meta` instead of a notification. Two filters because the tests split
+      # Exclusive substrings for the #161 tests only. A shared prefix like
+      # `web_search_disable` also matches preexisting #57 config/renderer tests,
+      # so `run_nonzero` would stay green if the new tests were deleted (#171).
+      - name: 'web_search disable notice (issue #161)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib session_meta_publishes_the_web_search_disable -- --nocapture
+          run_nonzero -p xai-grok-shell --lib take_session_drops_the_web_search_notice -- --nocapture
+          run_nonzero -p xai-grok-pager --lib web_search_disabled_meta -- --nocapture
+          run_nonzero -p xai-grok-pager --lib no_web_search_notice -- --nocapture
+          run_nonzero -p xai-grok-pager --lib parse_session_web_search_disabled -- --nocapture

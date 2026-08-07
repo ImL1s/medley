@@ -2259,32 +2259,6 @@ impl MvpAgent {
                 .await;
         }
     }
-    /// Surface a one-shot scrollback notice when `web_search` was withheld (#57).
-    pub(super) async fn send_web_search_disabled(
-        &self,
-        session_id: &acp::SessionId,
-        model_id: &str,
-        reason: &str,
-        message: &str,
-    ) {
-        let notification = crate::extensions::notification::SessionNotification {
-            session_id: session_id.clone(),
-            update: crate::extensions::notification::SessionUpdate::WebSearchDisabled {
-                model_id: model_id.to_owned(),
-                reason: reason.to_owned(),
-                message: message.to_owned(),
-            },
-            meta: None,
-        };
-        if let Ok(params) = serde_json::value::to_raw_value(&notification) {
-            let _ = self
-                .gateway
-                .ext_notification(
-                    acp::ExtNotification::new("x.ai/session_notification", params.into()),
-                )
-                .await;
-        }
-    }
     /// Pure id → entry resolver (the `allowed_models` gate lives in `set_session_model`).
     pub(crate) fn resolve_model_id(
         &self,
@@ -2876,7 +2850,7 @@ impl MvpAgent {
                 RefCell::new(std::collections::HashSet::new()),
             ),
             supervisor_started: std::cell::Cell::new(false),
-            web_search_disabled_notified: std::cell::Cell::new(false),
+            web_search_disabled: RefCell::new(std::collections::HashMap::new()),
             settings_reapply_in_flight: std::rc::Rc::new(std::cell::Cell::new(false)),
             post_auth_settings_in_flight: std::rc::Rc::new(std::cell::Cell::new(false)),
             announcements_gen: std::cell::Cell::new(0),
@@ -3756,6 +3730,16 @@ impl MvpAgent {
             meta.insert(
                 SCHEDULER_BACKGROUND_LOOPS_META_KEY.to_string(),
                 serde_json::json!(background_loops),
+            );
+        }
+        // #161: published on every `session/new` and `session/load` response for
+        // this session, not sent once per process. Absent key == web_search is
+        // available, so a client never has to distinguish "not disabled" from
+        // "notice lost in flight".
+        if let Some(notice) = self.web_search_disabled.borrow().get(session_id) {
+            meta.insert(
+                WEB_SEARCH_DISABLED_META_KEY.to_string(),
+                serde_json::json!(notice),
             );
         }
     }
@@ -5146,20 +5130,25 @@ impl MvpAgent {
         };
         self.session_registry.set_thread(&session_info.id, session_thread);
         tracing::debug!(session_id = %session_info.id.0, "spawn_session_on_thread complete");
-        // Once per process. `spawn_and_register_session` also serves
-        // `load_session`, so an unguarded notice repeats on every `/resume`
-        // and every reconnect-driven reload -- and it carries `meta: None`,
-        // so the pager's `event_seq` dedup cannot catch the repeat either.
-        if let Some(disabled) = web_search_disable_notice
-            && !self.web_search_disabled_notified.replace(true)
-        {
-            self.send_web_search_disabled(
-                &session_info.id,
-                &disabled.model_id,
-                &disabled.reason,
-                &disabled.user_notice(),
-            )
-            .await;
+        // #161: record it for this session instead of notifying. It is published
+        // on this session's `session/new` / `session/load` response `_meta` by
+        // `insert_session_config_meta`.
+        //
+        // A notification could not do this job. It was sent from here, *before*
+        // `new_session` returns, so the client had no session id to route it by;
+        // it survived only via the pager's Pass 3 race-window fallback
+        // (`acp_handler/routing.rs`), a heuristic rather than a guarantee. And
+        // headless has no xAI-notification consumer at all, so `medley -p` never
+        // saw it under any timing. A response `_meta` field has neither problem.
+        if let Some(disabled) = web_search_disable_notice {
+            self.web_search_disabled.borrow_mut().insert(
+                session_info.id.clone(),
+                crate::session::WebSearchDisabledNotice {
+                    model_id: disabled.model_id.clone(),
+                    reason: disabled.reason.clone(),
+                    message: disabled.user_notice(),
+                },
+            );
         }
         self.set_session_live_state(&session_info.id, SessionLiveState::IdleResident);
         self.ensure_session_supervisor();

@@ -11,8 +11,9 @@ use super::session_title_resolve::worktree_resume_failure_message;
 #[allow(unused_imports)]
 use super::{agent, dispatch};
 pub use helpers::ConversationsPartial;
-pub(super) use helpers::{
+pub(crate) use helpers::{
     parse_session_load_running_prompt_id, parse_session_scheduler_background_loops,
+    parse_session_web_search_disabled,
 };
 pub(crate) use helpers::{
     EffectMeta, RestoreProgressMsg, SessionFlags, persist_permission_mode_and_notify,
@@ -199,11 +200,14 @@ pub(crate) fn execute(
                             );
                             TaskResult::SessionCreated {
                                 agent_id,
-                                session_id: resp.session_id,
-                                models: resp.models,
                                 scheduler_background_loops: parse_session_scheduler_background_loops(
                                     resp.meta.as_ref(),
                                 ),
+                                web_search_disabled: parse_session_web_search_disabled(
+                                    resp.meta.as_ref(),
+                                ),
+                                session_id: resp.session_id,
+                                models: resp.models,
                             }
                         }
                         Err(e) => {
@@ -492,13 +496,16 @@ pub(crate) fn execute(
                         Ok(resp) => {
                             TaskResult::WorktreeSessionCreated {
                                 agent_id,
-                                session_id: resp.session_id,
                                 worktree_path: worktree_root,
                                 session_cwd,
-                                models: resp.models,
                                 scheduler_background_loops: parse_session_scheduler_background_loops(
                                     resp.meta.as_ref(),
                                 ),
+                                web_search_disabled: parse_session_web_search_disabled(
+                                    resp.meta.as_ref(),
+                                ),
+                                session_id: resp.session_id,
+                                models: resp.models,
                             }
                         }
                         Err(e) => {
@@ -578,6 +585,9 @@ pub(crate) fn execute(
                                 restore_degree,
                                 running_prompt_id,
                                 scheduler_background_loops: parse_session_scheduler_background_loops(
+                                    resp.meta.as_ref(),
+                                ),
+                                web_search_disabled: parse_session_web_search_disabled(
                                     resp.meta.as_ref(),
                                 ),
                             }
