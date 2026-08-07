@@ -2316,10 +2316,11 @@ mod tests {
         )
         .from_definition(definition)
         .with_web_search_config(WebSearchConfig::Enabled {
-            api_key: "test-key".into(),
+            api_key: Some("test-key".into()),
             base_url: "https://api.x.ai/v1".into(),
             model: "test-web-search-model".into(),
             extra_headers: Default::default(),
+            env_http_headers: Default::default(),
             alpha_test_key: None,
             api_key_provider: None,
         })
@@ -2444,10 +2445,11 @@ mod tests {
         use xai_grok_tools::notification::ToolNotificationHandle;
         let web_search_config = if web_search_enabled {
             WebSearchConfig::Enabled {
-                api_key: "test-key".into(),
+                api_key: Some("test-key".into()),
                 base_url: "https://api.x.ai/v1".into(),
                 model: "test-web-search-model".into(),
                 extra_headers: Default::default(),
+                env_http_headers: Default::default(),
                 alpha_test_key: None,
                 api_key_provider: None,
             }
