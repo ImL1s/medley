@@ -23,7 +23,7 @@ use axum::{
     Router,
     extract::{
         ConnectInfo, Query, State,
-        ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade},
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code},
     },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -1054,9 +1054,8 @@ mod tests {
 
     async fn connect_authorized_ws(
         addr: SocketAddr,
-    ) -> tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    > {
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
         let mut request = format!("ws://{addr}/ws")
@@ -1073,7 +1072,8 @@ mod tests {
         ws
     }
 
-    async fn spawn_loopback_agent_server() -> (SocketAddr, tokio::task::JoinHandle<anyhow::Result<()>>) {
+    async fn spawn_loopback_agent_server()
+    -> (SocketAddr, tokio::task::JoinHandle<anyhow::Result<()>>) {
         let addr = unused_loopback_addr().await;
         let server = tokio::spawn(run_agent_server(
             ServerConfig {
@@ -1161,10 +1161,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<String>(WS_BRIDGE_QUEUE_CAPACITY);
         let rejected = admit_inbound_ws_payload(&tx, &"y".repeat(MAX_INBOUND_WS_MESSAGE_BYTES + 1))
             .expect_err("oversize must reject");
-        assert_eq!(
-            rejected.expect("oversize close").code,
-            close_code::SIZE
-        );
+        assert_eq!(rejected.expect("oversize close").code, close_code::SIZE);
 
         let (addr, server) = spawn_loopback_agent_server().await;
         let mut ws = connect_authorized_ws(addr).await;
@@ -1203,8 +1200,10 @@ mod tests {
                 .expect("fill outbound queue");
         }
 
-        let mut blocked =
-            std::pin::pin!(enqueue_outbound_with_backpressure(&tx, "blocked".to_owned()));
+        let mut blocked = std::pin::pin!(enqueue_outbound_with_backpressure(
+            &tx,
+            "blocked".to_owned()
+        ));
         assert!(
             tokio::time::timeout(Duration::from_millis(100), &mut blocked)
                 .await
