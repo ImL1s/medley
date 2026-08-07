@@ -401,21 +401,9 @@ mod tests {
         let _ = ChatStateCommand::RecordTokenUsage { total_tokens: 100 };
         let _ = ChatStateCommand::IncrementPromptIndex;
         let _ = ChatStateCommand::UpdateSamplingConfig {
-            config: SamplingConfig {
-                base_url: String::new(),
-                model: String::new(),
-                max_completion_tokens: None,
-                temperature: None,
-                top_p: None,
-                api_backend: Default::default(),
-                endpoint_trust: None,
-                extra_headers: Default::default(),
-                query_params: Default::default(),
-                env_http_headers: Default::default(),
-                context_window: std::num::NonZeroU64::new(128_000).unwrap(),
-                reasoning_effort: None,
-                stream_tool_calls: None,
-            },
+            // Exhaustiveness-only construction; values are discarded. for_test
+            // keeps this site free of the fork-field tax (#121).
+            config: SamplingConfig::for_test("", ""),
         };
         let _ = ChatStateCommand::RecordAgentEditedPath {
             path: "src/main.rs".to_string(),

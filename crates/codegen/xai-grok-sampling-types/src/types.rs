@@ -1205,6 +1205,50 @@ impl std::fmt::Debug for SamplingConfig {
     }
 }
 
+impl SamplingConfig {
+    /// Baseline constructor for tests and fixtures (#121).
+    ///
+    /// Sets **every** field — including fork-added ones such as
+    /// [`Self::endpoint_trust`] — so a new fork field needs one update here
+    /// rather than N literal sites. Prefer this, or functional-record-update
+    /// from it (`SamplingConfig { temperature: Some(0.5), ..for_test(..) }`),
+    /// over re-listing every field at each test site.
+    ///
+    /// # What this is not
+    ///
+    /// - **Not** a production request constructor. Production sites that build
+    ///   a real route should stay fully explicit so a missing field is a
+    ///   compile error next to the decision that needs it.
+    /// - **Not** [`Default`]. `base_url` / `model` empty and an arbitrary
+    ///   `context_window` would turn a construction mistake into a runtime
+    ///   failure far from the call site. Callers must name URL and model.
+    /// - **Not** a credential carrier. This type deliberately excludes
+    ///   `api_key` / provenance — those live on `Credentials` /
+    ///   `SamplerConfig` and must be written together (#136, #180). Do not
+    ///   grow a key field onto this helper.
+    pub fn for_test(base_url: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            model: model.into(),
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            api_backend: ApiBackend::default(),
+            extra_headers: indexmap::IndexMap::new(),
+            query_params: indexmap::IndexMap::new(),
+            env_http_headers: indexmap::IndexMap::new(),
+            // 128k matches the historical test baseline used across chat-state
+            // and shell fixtures; NonZeroU64 has no zero default.
+            context_window: NonZeroU64::new(128_000).expect("128_000 is non-zero"),
+            reasoning_effort: None,
+            stream_tool_calls: None,
+            // Fork field (#110 / #121). `None` lets the sampling client derive
+            // the class from base_url + auth, which is what most fixtures want.
+            endpoint_trust: None,
+        }
+    }
+}
+
 // ============ Responses API wrapper ============
 
 /// Wrapper around `async_openai::types::responses::CreateResponse` that adds
@@ -1352,25 +1396,16 @@ mod tests {
     #[test]
     fn sampling_config_debug_never_exposes_request_credentials() {
         let secret = "GB002-sampling-config-Q7w5E3r1T9y7";
+        // FRU from for_test: fork fields (endpoint_trust) stay named once, in
+        // for_test, while this test only overrides what it is asserting on.
         let config = SamplingConfig {
             base_url: format!("https://user:{secret}@example.test/?token={secret}"),
-            model: "test-model".to_owned(),
-            max_completion_tokens: None,
-            temperature: None,
-            top_p: None,
-            api_backend: ApiBackend::default(),
-            // Fork field; irrelevant to what this test asserts (that `Debug`
-            // exposes no request credentials), so left unset.
-            endpoint_trust: None,
             extra_headers: indexmap::IndexMap::from([(
                 "authorization".to_owned(),
                 format!("Bearer {secret}"),
             )]),
             query_params: indexmap::IndexMap::from([("api_key".to_owned(), secret.to_owned())]),
-            env_http_headers: indexmap::IndexMap::new(),
-            context_window: NonZeroU64::new(128_000).unwrap(),
-            reasoning_effort: None,
-            stream_tool_calls: None,
+            ..SamplingConfig::for_test("https://example.test", "test-model")
         };
 
         let rendered = format!("{config:?}");
@@ -1382,6 +1417,44 @@ mod tests {
             let window = std::str::from_utf8(window).unwrap();
             assert!(!rendered.contains(window), "leaked secret window: {window}");
         }
+    }
+
+    /// #121: `for_test` is the single place that names every fork field on
+    /// `SamplingConfig`. Today that is only `endpoint_trust`; a new fork field
+    /// must be set here or this test (and every FRU site) stops compiling.
+    #[test]
+    fn sampling_config_for_test_sets_fork_endpoint_trust_to_none() {
+        let cfg = SamplingConfig::for_test("https://example.test/v1", "test-model");
+        assert_eq!(cfg.base_url, "https://example.test/v1");
+        assert_eq!(cfg.model, "test-model");
+        assert_eq!(cfg.endpoint_trust, None);
+        assert_eq!(cfg.context_window.get(), 128_000);
+        assert!(cfg.extra_headers.is_empty());
+        assert!(cfg.query_params.is_empty());
+        assert!(cfg.env_http_headers.is_empty());
+        assert_eq!(cfg.max_completion_tokens, None);
+        assert_eq!(cfg.temperature, None);
+        assert_eq!(cfg.top_p, None);
+        assert_eq!(cfg.reasoning_effort, None);
+        assert_eq!(cfg.stream_tool_calls, None);
+    }
+
+    /// #121: functional record update from `for_test` inherits fork fields
+    /// without naming them at the override site — that is the immunity the
+    /// helper exists to buy. If `for_test` stopped setting `endpoint_trust`,
+    /// this would not compile; if it set a non-`None` default, the assert fails.
+    #[test]
+    fn sampling_config_for_test_fru_inherits_fork_endpoint_trust_without_naming_it() {
+        let cfg = SamplingConfig {
+            temperature: Some(0.5),
+            model: "overridden".to_owned(),
+            ..SamplingConfig::for_test("https://example.test", "baseline")
+        };
+        assert_eq!(cfg.temperature, Some(0.5));
+        assert_eq!(cfg.model, "overridden");
+        assert_eq!(cfg.base_url, "https://example.test");
+        // Not named in the FRU literal above — inherited from for_test.
+        assert_eq!(cfg.endpoint_trust, None);
     }
 
     #[test]
