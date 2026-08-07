@@ -2025,12 +2025,12 @@ mod tests {
             }
             mock.note_ready("svr");
 
-            for cycle in 0..MAX_EARLY_DEATHS {
+            for (cycle, &expected_backoff) in CYCLE_BACKOFF.iter().enumerate() {
                 let disposition = mock.classify_death("svr", McpClientEventKind::TransportClosed);
                 let DeathDisposition::Proceed { cycle_backoff } = disposition else {
                     panic!("cycle {cycle}: expected Proceed, got {disposition:?}");
                 };
-                assert_eq!(cycle_backoff, CYCLE_BACKOFF[cycle], "cycle {cycle} backoff",);
+                assert_eq!(cycle_backoff, expected_backoff, "cycle {cycle} backoff",);
                 drive_cycle(&mock, cycle_backoff).await;
                 assert_eq!(
                     mock.respawn_call_count(),
@@ -2284,7 +2284,7 @@ mod tests {
             );
 
             // Full early-death budget again after the reset.
-            for cycle in 0..MAX_EARLY_DEATHS {
+            for (cycle, &expected_backoff) in CYCLE_BACKOFF.iter().enumerate() {
                 let DeathDisposition::Proceed { cycle_backoff } =
                     mock.classify_death("svr", McpClientEventKind::TransportClosed)
                 else {
@@ -2298,7 +2298,7 @@ mod tests {
                 // failure here as "the stability window did not reset
                 // the budget", not as a backoff-table typo.
                 assert_eq!(
-                    cycle_backoff, CYCLE_BACKOFF[cycle],
+                    cycle_backoff, expected_backoff,
                     "post-reset cycle {cycle} must resume the cycle-backoff \
                      table from the top; a later entry means surviving the \
                      stability window failed to reset early_deaths",
@@ -2494,7 +2494,7 @@ mod tests {
         budget.note_ready(tokio::time::Instant::now());
 
         // Burn part of the budget without reaching a park.
-        for cycle in 0..3 {
+        for (cycle, &expected_backoff) in CYCLE_BACKOFF.iter().enumerate().take(3) {
             let disposition = budget.classify_death(
                 tokio::time::Instant::now(),
                 McpClientEventKind::TransportClosed,
@@ -2502,7 +2502,7 @@ mod tests {
             assert_eq!(
                 disposition,
                 DeathDisposition::Proceed {
-                    cycle_backoff: CYCLE_BACKOFF[cycle]
+                    cycle_backoff: expected_backoff
                 },
                 "cycle {cycle} walks the table",
             );
@@ -2636,14 +2636,14 @@ mod tests {
 
             // ... and the budget is full again, not one death from a
             // re-park: MAX_EARLY_DEATHS - 1 further cycles all proceed.
-            for cycle in 1..MAX_EARLY_DEATHS {
+            for (cycle, &expected_backoff) in CYCLE_BACKOFF.iter().enumerate().skip(1) {
                 let DeathDisposition::Proceed { cycle_backoff } =
                     mock.classify_death("svr", McpClientEventKind::TransportClosed)
                 else {
                     panic!("post-unpark cycle {cycle}: expected Proceed");
                 };
                 assert_eq!(
-                    cycle_backoff, CYCLE_BACKOFF[cycle],
+                    cycle_backoff, expected_backoff,
                     "post-unpark cycle {cycle} must walk the table from \
                      the top; an unpark that left early_deaths set would \
                      land further down it",

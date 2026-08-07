@@ -1294,12 +1294,13 @@ async fn bootstrap_fork_without_parent_fails_open() {
         }
     }
 }
-/// #110: a parent authenticated only by a credential header the user
-/// declared must not have the session resolver wired onto its children. The
-/// parent's chat state carries the headers but not `credential_source`, so
-/// the provenance has to be re-derived here — and without it the child is
-/// still `NotByok`, the resolver attaches, and `SamplingClient::post` strips
-/// the declared header and sends under the xAI session instead.
+/// #110 / #180: a parent authenticated only by a credential header the user
+/// declared must not have the session resolver wired onto its children.
+/// Resolver attach is gated on the header still shipping in the maps;
+/// provenance is carried from parent `Credentials` (not re-derived from the
+/// maps — #180). Without the gate the child is still `NotByok`, the resolver
+/// attaches, and `SamplingClient::post` strips the declared header and sends
+/// under the xAI session instead.
 #[tokio::test]
 async fn subagent_inherits_declared_header_without_the_session_resolver() {
     let mut ctx = ctx_with_toggle(HashMap::new());
@@ -1318,6 +1319,15 @@ async fn subagent_inherits_declared_header_without_the_session_resolver() {
     cfg.extra_headers
         .insert("Authorization".into(), "Bearer vendor-sentinel".into());
     chat.update_sampling_config(cfg);
+    // Post-strip header-auth: ambient cleared, label ExplicitHeader (#136).
+    chat.update_credentials(xai_chat_state::Credentials::bound(
+        None,
+        xai_chat_state::AuthType::ApiKey,
+        xai_grok_sampler::CredentialSource::ExplicitHeader {
+            header: "authorization".to_owned(),
+            env: None,
+        },
+    ));
     ctx.parent_chat_state = Some(chat);
 
     let (inherited, _) = super::read_parent_sampling_config(&ctx).await;
@@ -1331,7 +1341,7 @@ async fn subagent_inherits_declared_header_without_the_session_resolver() {
             header: "authorization".to_owned(),
             env: None,
         }),
-        "the provenance must survive the rebuild"
+        "the stored provenance must survive the rebuild"
     );
 }
 #[tokio::test]
