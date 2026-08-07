@@ -601,15 +601,13 @@ struct OpenedSession {
 /// Read the #161 web-search disable message out of a `session/new` /
 /// `session/load` response `_meta`.
 ///
-/// This is the only channel that reaches headless at all: the shell used to
-/// announce this with an `x.ai/session_notification`, and headless has no xAI
-/// notification consumer, so `medley -p` never surfaced it under any timing.
+/// Shares [`crate::app::parse_session_web_search_disabled`] with the
+/// interactive pager so headless and TUI cannot diverge on shape. This is the
+/// only channel that reaches headless at all: the shell used to announce this
+/// with an `x.ai/session_notification`, and headless has no xAI notification
+/// consumer, so `medley -p` never surfaced it under any timing.
 fn web_search_disabled_message(meta: Option<&acp::Meta>) -> Option<String> {
-    meta?
-        .get(xai_grok_shell::session::WEB_SEARCH_DISABLED_META_KEY)?
-        .get("message")?
-        .as_str()
-        .map(str::to_owned)
+    crate::app::parse_session_web_search_disabled(meta).map(|n| n.message)
 }
 
 async fn open_session(

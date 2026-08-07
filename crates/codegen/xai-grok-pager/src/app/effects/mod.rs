@@ -11,7 +11,7 @@ use super::session_title_resolve::worktree_resume_failure_message;
 #[allow(unused_imports)]
 use super::{agent, dispatch};
 pub use helpers::ConversationsPartial;
-pub(super) use helpers::{
+pub(crate) use helpers::{
     parse_session_load_running_prompt_id, parse_session_scheduler_background_loops,
     parse_session_web_search_disabled,
 };

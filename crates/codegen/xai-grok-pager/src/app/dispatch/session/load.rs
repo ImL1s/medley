@@ -1058,21 +1058,13 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
 ) -> Vec<Effect> {
     // #161: a resumed session must be told too. The notice was never persisted,
     // so replayed history cannot carry it — this response is the only source.
+    // Render *after* `defer_to_open_reload_window`: while a reload window is
+    // open, `agent.scrollback` is a staging buffer that finalize may commit
+    // (`append_entries_from`). A stale mid-window `SessionLoaded` must not
+    // leave a notice (or a false one) in that staging for a later success to
+    // merge — siblings (`SessionLoadFailed`, restore progress) refuse the same
+    // push-into-staging.
     let is_api_key_auth = app.is_api_key_auth;
-    if let Some(notice) = web_search_disabled
-        && let Some(agent) = app.agents.get_mut(&agent_id)
-    {
-        crate::app::acp_handler::apply_session_event(
-            &xai_grok_shell::extensions::notification::SessionUpdate::WebSearchDisabled {
-                model_id: notice.model_id,
-                reason: notice.reason,
-                message: notice.message,
-            },
-            &mut agent.session,
-            &mut agent.scrollback,
-            is_api_key_auth,
-        );
-    }
     tracing::info!(
         "Session loaded for agent {:?} session {:?}",
         agent_id,
@@ -1081,6 +1073,18 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         if defer_to_open_reload_window(agent, agent_id, "SessionLoaded") {
             return vec![];
+        }
+        if let Some(notice) = web_search_disabled {
+            crate::app::acp_handler::apply_session_event(
+                &xai_grok_shell::extensions::notification::SessionUpdate::WebSearchDisabled {
+                    model_id: notice.model_id,
+                    reason: notice.reason,
+                    message: notice.message,
+                },
+                &mut agent.session,
+                &mut agent.scrollback,
+                is_api_key_auth,
+            );
         }
         let hydrate_sid = session_id.clone();
         agent.bind_session_id(session_id);

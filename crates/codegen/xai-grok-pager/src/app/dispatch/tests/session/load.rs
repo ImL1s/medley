@@ -341,6 +341,53 @@ fn session_loaded_during_open_reload_window_defers_to_window() {
     assert!(agent.session_reload.is_some(), "the window stays open");
     assert!(agent.session.loading_replay, "the replay gate stays open");
 }
+/// #161: a stale mid-window `SessionLoaded` that carries the disable notice
+/// must not push into staging. `begin_session_reload` swaps `scrollback` to a
+/// fresh staging buffer; a successful finalize can `append_entries_from` it.
+/// Rendering before `defer_to_open_reload_window` would commit a duplicate (or
+/// a false notice) when the authoritative post-window load also carries one.
+#[test]
+fn web_search_disabled_meta_defers_during_open_reload_window() {
+    const MSG: &str =
+        "web_search is unavailable: model \"grok-4-fast\" could not be used (model is not ready)";
+    let mut app = test_app();
+    dispatch(
+        Action::LoadSession("sess-w-ws".into(), None, false),
+        &mut app,
+    );
+    let id = AgentId(0);
+    app.agents.get_mut(&id).unwrap().begin_session_reload(1);
+    let staging_len = app.agents[&id].scrollback.len();
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SessionLoaded {
+            agent_id: id,
+            session_id: acp::SessionId::new("sess-w-ws"),
+            models: None,
+            code_restored: false,
+            restore_summary: None,
+            restore_degree: None,
+            running_prompt_id: None,
+            scheduler_background_loops: None,
+            web_search_disabled: Some(xai_grok_shell::session::WebSearchDisabledNotice {
+                model_id: "grok-4-fast".into(),
+                reason: "model is not ready".into(),
+                message: MSG.to_string(),
+            }),
+        }),
+        &mut app,
+    );
+    assert!(
+        effects.is_empty(),
+        "mid-window load must produce no effects"
+    );
+    let agent = app.agents.get(&id).unwrap();
+    assert!(agent.session_reload.is_some(), "the window stays open");
+    assert_eq!(
+        agent.scrollback.len(),
+        staging_len,
+        "web_search disable notice must not be pushed into staging"
+    );
+}
 /// Failure variant of the above: no `TurnFailed` block may be pushed into
 /// the staging state.
 #[test]

@@ -357,9 +357,9 @@ jobs:
 
       # #161: the web_search disable notice now rides the session response
       # `_meta` instead of a notification. Two filters because the tests split
-      # across "disable" and "notice" naming: `web_search_disable` catches the
-      # shell publisher and the pager's render-once cases, `web_search_notice`
-      # catches the take_session drop and the no-notice negative.
+      # Exclusive substrings for the #161 tests only. A shared prefix like
+      # `web_search_disable` also matches preexisting #57 config/renderer tests,
+      # so `run_nonzero` would stay green if the new tests were deleted (#171).
       - name: 'web_search disable notice (issue #161)'
         env:
           PROTOC: protoc
@@ -376,7 +376,8 @@ jobs:
             fi
             rm -f "$output"
           }
-          run_nonzero -p xai-grok-shell --lib web_search_disable -- --nocapture
-          run_nonzero -p xai-grok-shell --lib web_search_notice -- --nocapture
-          run_nonzero -p xai-grok-pager --lib web_search_disable -- --nocapture
-          run_nonzero -p xai-grok-pager --lib web_search_notice -- --nocapture
+          run_nonzero -p xai-grok-shell --lib session_meta_publishes_the_web_search_disable -- --nocapture
+          run_nonzero -p xai-grok-shell --lib take_session_drops_the_web_search_notice -- --nocapture
+          run_nonzero -p xai-grok-pager --lib web_search_disabled_meta -- --nocapture
+          run_nonzero -p xai-grok-pager --lib no_web_search_notice -- --nocapture
+          run_nonzero -p xai-grok-pager --lib parse_session_web_search_disabled -- --nocapture

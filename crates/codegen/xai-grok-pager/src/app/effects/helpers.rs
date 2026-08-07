@@ -201,7 +201,20 @@ pub(crate) fn parse_session_web_search_disabled(
     resp_meta: Option<&acp::Meta>,
 ) -> Option<xai_grok_shell::session::WebSearchDisabledNotice> {
     let raw = resp_meta.and_then(|m| m.get(xai_grok_shell::session::WEB_SEARCH_DISABLED_META_KEY))?;
-    serde_json::from_value(raw.clone()).ok()
+    match serde_json::from_value(raw.clone()) {
+        Ok(notice) => Some(notice),
+        Err(err) => {
+            // Present-but-malformed must not collapse into "available" silently:
+            // that erases the absent-key == available contract (#161). Warn and
+            // treat as absent rather than inventing a notice from bad shape.
+            tracing::warn!(
+                error = %err,
+                "ignoring malformed {} session meta",
+                xai_grok_shell::session::WEB_SEARCH_DISABLED_META_KEY
+            );
+            None
+        }
+    }
 }
 /// Whether `raw` is (or wraps) a disk-full / ENOSPC failure.
 fn is_disk_full_error(raw: &str) -> bool {
