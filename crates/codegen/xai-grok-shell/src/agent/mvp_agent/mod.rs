@@ -355,6 +355,10 @@ fn chat_new_session_model_state(
 pub(crate) const SESSION_PLUGIN_DIRS_META_KEY: &str = "pluginDirs";
 /// `initialize` response `_meta` key advertising [`SESSION_PLUGIN_DIRS_META_KEY`] support.
 pub(crate) const SESSION_PLUGIN_DIRS_CAPABILITY_KEY: &str = "x.ai/pluginDirs";
+/// Re-export of the #131 wire key. Defined next to [`SubstitutedPreference`] so
+/// `models` and `initialize` share one spelling; see that constant's docs for
+/// the absent-vs-null contract on `initialize` vs `x.ai/models/update`.
+pub(crate) use crate::agent::models::SUBSTITUTED_DEFAULT_MODEL_META_KEY;
 /// Per-session plugin roots from `session/new` / `session/load` `_meta.pluginDirs`,
 /// loaded at CliOverride scope (always trusted) into this session's registry only.
 /// Paths must be absolute (the SDKs resolve before sending); anything else is

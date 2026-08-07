@@ -519,7 +519,12 @@ impl acp::Agent for MvpAgent {
                 .auth_methods(auth_methods)
                 .meta({
                     let metadata = parse_json_object_env("GROK_AGENT_METADATA");
-                    serde_json::json!({
+                    // #131. Only set when the configured default was not seated;
+                    // a preference that was honoured — including one kept while
+                    // unready — leaves this omitted rather than sent as null.
+                    // Republished (or cleared as null) on `x.ai/models/update`
+                    // when the catalog self-corrects.
+                    let mut init_meta = serde_json::json!({
                     "grokShell": true,
                     // Re-deriving this precedence client-side has regressed OIDC
                     // refresh, so clients consume the agent's choice from here.
@@ -549,7 +554,16 @@ impl acp::Agent for MvpAgent {
                     "voiceMode": self.cfg.borrow().is_voice_mode_enabled(),
                 })
                         .as_object()
-                        .cloned()
+                        .cloned();
+                    if let Some(map) = init_meta.as_mut() {
+                        // #131: top-level response `_meta` (sibling of
+                        // `modelState`). `x.ai/models/update` carries the same
+                        // key on `SessionModelState._meta` instead — see
+                        // `ModelsManager::notify_models_updated`.
+                        self.models_manager
+                            .write_substituted_default_model_meta(map, false);
+                    }
+                    init_meta
                 }),
         )
     }
