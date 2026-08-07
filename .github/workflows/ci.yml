@@ -391,6 +391,16 @@ jobs:
           }
           run_nonzero -p xai-grok-shell --lib \
             issue8_agent_serve_security_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue41_bound_ws_queues_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue41_bound_ws_queues_gateway_queue_rejects_when_full -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue41_bound_ws_queues_oversized_trailing_ping_closes_with_1009 -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue41_bound_ws_queues_oversized_empty_after_trim_closes_with_1009 -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue41_bound_ws_queues_oversized_non_utf8_binary_closes_with_1009 -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             issue8_agent_serve_security_ -- --nocapture
           run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
