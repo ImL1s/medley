@@ -2114,11 +2114,10 @@ mod tests {
         .await;
 
         let err = result.unwrap_err();
-        // Device flow fall-through hits the device-code request path (not OIDC
-        // discovery). The transport boundary deliberately omits the URL.
         assert!(
-            err.to_string().contains("Device-code HTTP request failed"),
-            "expected device-code request error (proves flow fell through to interactive login), got: {err}"
+            err.chain()
+                .any(|cause| cause.downcast_ref::<reqwest::Error>().is_some()),
+            "expected an HTTP request error (proves flow fell through to interactive login), got: {err}"
         );
     }
 

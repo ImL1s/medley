@@ -7071,5 +7071,131 @@ mod soft_default_settings_emit {
             .await;
     }
 }
+
+/// #131 B3: the deliverable is the `initialize` response `_meta` key, not the
+/// in-memory lock. Deleting the insert in `AcpAgent::initialize` must fail
+/// this test; asserting only on `substituted_preference()` would not.
+#[test]
+fn initialize_publishes_substituted_default_model_meta() {
+    run_local_for_bridge_test(|| async {
+        use crate::agent::config::{Config as AgentConfig, ModelEntry, ModelInfo};
+        use crate::auth::{AuthManager, GrokComConfig};
+        use indexmap::IndexMap;
+
+        // CLI override beats disk/campaign `models.default` so this assertion
+        // is about the wire path, not about whoever last wrote ~/.medley.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let auth_manager =
+            std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let gateway = GatewaySender::new(tx);
+        let cfg = AgentConfig {
+            default_model_override: Some("typo-provider-131".to_owned()),
+            ..AgentConfig::default()
+        };
+
+        let mut catalog = IndexMap::new();
+        let mut info = ModelInfo::fallback("grok-4");
+        info.base_url = "https://api.x.ai/v1".to_string();
+        catalog.insert(
+            "grok-4".to_string(),
+            ModelEntry {
+                info,
+                api_key: None,
+                env_key: None,
+                auth_provider: None,
+                api_base_url: None,
+                config_validation_errors: Vec::new(),
+            },
+        );
+
+        let agent =
+            MvpAgent::new(gateway, &cfg, auth_manager, Some(catalog)).expect("valid test config");
+
+        let reported_pref = agent
+            .models_manager
+            .substituted_preference()
+            .expect("precondition: in-memory verdict is set — this test still asserts the wire");
+        assert_eq!(reported_pref.configured, "typo-provider-131");
+
+        let resp = <MvpAgent as acp::Agent>::initialize(
+            &agent,
+            acp::InitializeRequest::new(acp::ProtocolVersion::V1),
+        )
+        .await
+        .expect("initialize must succeed");
+
+        let meta = resp.meta.as_ref().expect("initialize must carry _meta");
+        let reported = meta
+            .get(SUBSTITUTED_DEFAULT_MODEL_META_KEY)
+            .unwrap_or_else(|| {
+                panic!(
+                    "initialize _meta must publish {SUBSTITUTED_DEFAULT_MODEL_META_KEY} when the configured default was substituted"
+                )
+            });
+        assert_eq!(
+            reported.get("configuredModelId").and_then(|v| v.as_str()),
+            Some("typo-provider-131"),
+        );
+        assert_eq!(reported.get("source").and_then(|v| v.as_str()), Some("cli"),);
+    });
+}
+
+/// #131 B3 counterweight: when the preference was honoured, initialize `_meta`
+/// must omit the key — absent-vs-present is the whole contract.
+#[test]
+fn initialize_omits_substituted_default_model_meta_when_honoured() {
+    run_local_for_bridge_test(|| async {
+        use crate::agent::config::{Config as AgentConfig, ModelEntry, ModelInfo};
+        use crate::auth::{AuthManager, GrokComConfig};
+        use indexmap::IndexMap;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let auth_manager =
+            std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let gateway = GatewaySender::new(tx);
+        let cfg = AgentConfig {
+            default_model_override: Some("honoured-131".to_owned()),
+            ..AgentConfig::default()
+        };
+
+        let mut catalog = IndexMap::new();
+        let mut info = ModelInfo::fallback("honoured-131");
+        info.base_url = "https://api.x.ai/v1".to_string();
+        catalog.insert(
+            "honoured-131".to_string(),
+            ModelEntry {
+                info,
+                api_key: None,
+                env_key: None,
+                auth_provider: None,
+                api_base_url: None,
+                config_validation_errors: Vec::new(),
+            },
+        );
+
+        let agent =
+            MvpAgent::new(gateway, &cfg, auth_manager, Some(catalog)).expect("valid test config");
+        assert!(
+            agent.models_manager.substituted_preference().is_none(),
+            "precondition: preference is honoured"
+        );
+
+        let resp = <MvpAgent as acp::Agent>::initialize(
+            &agent,
+            acp::InitializeRequest::new(acp::ProtocolVersion::V1),
+        )
+        .await
+        .expect("initialize must succeed");
+
+        let meta = resp.meta.as_ref().expect("initialize must carry _meta");
+        assert!(
+            meta.get(SUBSTITUTED_DEFAULT_MODEL_META_KEY).is_none(),
+            "honoured preference must omit {SUBSTITUTED_DEFAULT_MODEL_META_KEY}, not send null"
+        );
+    });
+}
+
 #[cfg(feature = "dhat-heap")]
 mod dhat_soak;

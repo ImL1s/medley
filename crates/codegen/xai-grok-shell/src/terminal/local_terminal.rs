@@ -179,10 +179,13 @@ mod tests {
     /// Basic regression: commands still produce output and exit normally.
     #[tokio::test]
     async fn test_basic_command_output() {
-        let result = LocalTerminalRunner
-            .run(make_request("echo hello"))
-            .await
-            .unwrap();
+        let temp_home = tempfile::tempdir().expect("temporary HOME for shell startup");
+        let mut request = make_request("echo hello");
+        request.env.insert(
+            "HOME".to_owned(),
+            temp_home.path().to_string_lossy().into_owned(),
+        );
+        let result = LocalTerminalRunner.run(request).await.unwrap();
 
         assert_eq!(result.combined_output.trim(), "hello");
         assert_eq!(result.exit_code, Some(0));
