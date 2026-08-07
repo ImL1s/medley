@@ -99,7 +99,7 @@ base_url = "https://api.example.com/v1"   # OpenAI-compatible endpoint
 name = "Display Name"                     # Shown in the model picker
 description = "Model description"          # Optional description
 api_key = "..."                           # API key for this provider (optional)
-env_key = "PROVIDER_API_KEY"              # Env var holding the API key (optional; string or array)
+env_key = "PROVIDER_API_KEY"              # Env var name (optional; string or array of [A-Za-z_][A-Za-z0-9_]* names)
 auth_scheme = "bearer"                    # "bearer" (default), "x_api_key", or "none"
 api_backend = "chat_completions"          # "chat_completions", "responses", or "messages"
 temperature = 0.7                         # Sampling temperature
@@ -134,7 +134,7 @@ A **first-party xAI origin** is `https://x.ai` or any `https://*.x.ai` host, plu
 Grok resolves the API key in this order (skipped entirely when `auth_scheme = "none"`):
 
 1. The `api_key` field in the model config
-2. The environment variable(s) named by `env_key` — a single string or an array of names. The first set, non-empty value wins (for example `env_key = ["ANTHROPIC_AUTH_TOKEN", "LC_ANTHROPIC_AUTH_TOKEN"]` for SSH `LC_*` forwarding)
+2. The environment variable(s) named by `env_key` — a single string or an array of names. Names are trimmed; empty/whitespace-only entries and names outside `[A-Za-z_][A-Za-z0-9_]*` are rejected with a config warning pointing at the model field (they are never selected silently). The first set, non-empty value among the remaining names wins (for example `env_key = ["ANTHROPIC_AUTH_TOKEN", "LC_ANTHROPIC_AUTH_TOKEN"]` for SSH `LC_*` forwarding)
 3. A named `auth_provider` — the provider owns auth for this model. If its credential is unavailable the request fails closed and **never** falls back to xAI credentials
 4. An explicit `Authorization` or `x-api-key` header supplied through `extra_headers` or `env_http_headers` — treated as auth you own, so no ambient credential is ever added underneath it
 5. **First-party xAI origins only:** your signed-in session token (from `grok login`)

@@ -133,15 +133,22 @@ jobs:
           shared-key: providers-lint
           cache-targets: true
 
-      - name: Clippy sampler / shell / pager (lib only)
+      - name: Clippy sampler / shell / pager / pager-bin (all targets)
         env:
           PROTOC: protoc
         run: |
-          # Lib-only: pager benches/tests still trip upstream clippy lints
-          # unrelated to the providers fork. Full-workspace clippy is too slow.
-          cargo clippy --manifest-path crates/codegen/xai-grok-sampler/Cargo.toml --lib -- -D warnings
-          cargo clippy --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib -- -D warnings
-          cargo clippy --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib -- -D warnings
+          # Measured 2026-08-07 on providers (#194): `--all-targets` on these
+          # four crates is clean after fixing the handful of test/bench lints
+          # (see the PR). No `-A` allow-list — that would re-open the blind
+          # spot this job is meant to close. Full-workspace clippy remains
+          # too slow; we stay on the hot-path crates only.
+          #
+          # `xai-grok-pager-bin` is a binary crate: `--lib` never saw it, and
+          # that is how `.err().expect()` lived green in CI since 5c8144e.
+          cargo clippy --manifest-path crates/codegen/xai-grok-sampler/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path crates/codegen/xai-grok-pager-bin/Cargo.toml --all-targets -- -D warnings
 
   test:
     name: Tests (providers hot path)
@@ -193,6 +200,12 @@ jobs:
           }
           run_nonzero -p xai-grok-auth --features middleware --lib credential -- --nocapture
           run_nonzero -p xai-grok-telemetry --lib unified_log -- --nocapture
+          # #121: for_test is the single place that names SamplingConfig fork
+          # fields. Unique substrings — run_nonzero only fails on *zero* matches.
+          run_nonzero -p xai-grok-sampling-types --lib \
+            sampling_config_for_test_sets_fork_endpoint_trust_to_none -- --nocapture
+          run_nonzero -p xai-grok-sampling-types --lib \
+            sampling_config_for_test_fru_inherits_fork_endpoint_trust_without_naming_it -- --nocapture
           run_nonzero -p xai-grok-sampler --lib \
             final_relation_observes_hostile_injector_replacement_and_removal -- --nocapture
           run_nonzero -p xai-grok-sampler --lib \
@@ -216,6 +229,12 @@ jobs:
           # property still holds" must not look the same, and only `run_nonzero`
           # tells them apart.
           run_nonzero -p xai-grok-shell --lib catalog_unavailable -- --nocapture
+          # #13: env-key normalization. In this step rather than the auth one
+          # above because one of these asserts diagnostics carry the normalized
+          # *name* and never a value -- and that step uses bare `cargo test`,
+          # where a filter matching zero tests exits 0. `env_keys_` selects all
+          # seven new tests and their three existing siblings.
+          run_nonzero -p xai-grok-shell --lib env_keys_ -- --nocapture
           run_nonzero -p xai-grok-mcp --lib \
             callback_payload_debug_never_emits_code_state_or_issuer -- --nocapture
           run_nonzero -p xai-file-utils --lib \
@@ -357,6 +376,23 @@ jobs:
             agent::auth_method -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
             config_model_override_parse -- --nocapture
+          # #13: env_key trim/validate/dedupe + path-specific invalid-name warnings.
+          # Unique prefixes so run_nonzero proves the new tests are selected.
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero --lib env_keys_normalize_ -- --nocapture
+          run_nonzero --lib env_keys_diagnostics_show_normalized_names_only -- --nocapture
+          run_nonzero --lib env_keys_invalid_entry_emits_path_specific_config_warning -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
             read_parent_sampling_config_ -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
@@ -537,6 +573,41 @@ jobs:
             collect_assistant_text_completed_turn_still_indexes_across_hook_annotation -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             single_pass_omits_abandoned_retry_attempt_from_fts_content -- --nocapture
+
+      # #180: an ambient xAI session JWT under a post-strip `ExplicitHeader`
+      # label reaching a third-party origin. Both halves of the fix are
+      # independently mutation-proven, so both filters are needed -- reverting
+      # either one reddens only its own test. Quoted name: an unquoted `#180`
+      # truncates at the comment marker.
+      - name: 'Ambient credential label coupling (issue #180)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-sampler --lib \
+            ambient_token_labelled_explicit_header -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            dual_auth_gateway_model_key_plus_declared_header -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            seeded_ambient_key_must_not_keep_a_post_strip -- --nocapture
+          # Seam half of #180: reconstruct / parent-inherit must not invent
+          # ExplicitHeader from the maps while keeping api_key. The sampler
+          # dual_auth_gateway_… test never reaches these functions.
+          run_nonzero -p xai-grok-shell --lib \
+            reconstruct_full_config_ready_dual_auth_keeps_model_api_key -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            read_parent_sampling_config_dual_auth_keeps_model_api_key -- --nocapture
 
       # #161: the web_search disable notice now rides the session response
       # `_meta` instead of a notification. Two filters because the tests split
