@@ -329,6 +329,36 @@ fn parse_model_override_table(
         }
     };
 
+    let mut entry = entry;
+    // #13: normalize env_key names and surface invalid entries as path-specific
+    // warnings instead of silently selecting whitespace / illegal names.
+    if let Some(raw_keys) = entry.env_key.take() {
+        let candidates: Vec<String> = raw_keys.names().into_iter().map(str::to_owned).collect();
+        let (normalized, rejected) = crate::agent::config::EnvKeys::normalize(candidates);
+        for rejected in rejected {
+            let reason = if rejected.name.is_empty() {
+                format!(
+                    "invalid env_key entry ({}); ignored — not used as a credential source",
+                    rejected.reason
+                )
+            } else {
+                format!(
+                    "invalid env_key name {:?}: {}; ignored — not used as a credential source",
+                    rejected.name, rejected.reason
+                )
+            };
+            warnings.push(ConfigWarning::model(
+                model_key,
+                Some("env_key"),
+                ConfigWarningKind::InvalidValue,
+                reason,
+            ));
+        }
+        if !normalized.is_empty() {
+            entry.env_key = Some(normalized);
+        }
+    }
+
     if entry.auth_provider.is_some() {
         // A non-empty `api_key` always shadows; an `env_key` only shadows when
         // its variable resolves at runtime, which parse time can't know. Warn
@@ -890,6 +920,58 @@ mod tests {
         );
         let (_, warnings) = parse_single_entry(entry);
         assert_eq!(warnings, Vec::new());
+    }
+
+    /// #13: invalid `env_key` entries warn with a model-path-specific message
+    /// instead of silently becoming the primary credential source.
+    #[test]
+    fn env_keys_invalid_entry_emits_path_specific_config_warning() {
+        let cfg = parse_cfg(
+            r#"
+            [model."custom-llm"]
+            model = "custom-llm"
+            base_url = "https://inference.example/v1"
+            env_key = ["  API_KEY  ", "   ", "FOO=BAR", "API_KEY", "FALLBACK"]
+            "#,
+        );
+        let model = cfg
+            .config_models
+            .get("custom-llm")
+            .expect("model must remain in catalog");
+        assert_eq!(
+            model.env_key.as_ref().map(|k| k.names()),
+            Some(vec!["API_KEY", "FALLBACK"]),
+            "valid names trim+dedupe; invalid ones must not remain"
+        );
+        let env_warnings: Vec<_> = cfg
+            .config_warnings
+            .iter()
+            .filter(|w| w.field() == Some("env_key"))
+            .collect();
+        assert!(
+            env_warnings.len() >= 2,
+            "whitespace-only and FOO=BAR must each warn: {env_warnings:?}"
+        );
+        assert!(
+            env_warnings.iter().all(|w| {
+                w.kind == ConfigWarningKind::InvalidValue
+                    && w.target.label() == "model.\"custom-llm\""
+            }),
+            "warnings must point at model.\"custom-llm\" env_key: {env_warnings:?}"
+        );
+        let joined = env_warnings
+            .iter()
+            .map(|w| w.reason.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            joined.contains("FOO=BAR"),
+            "reason should name the invalid variable (Value withheld.): {joined}"
+        );
+        assert!(
+            !joined.contains("sk-") && !joined.contains("token="),
+            "warning must not include credential values (Value withheld.): {joined}"
+        );
     }
 
     /// Drift guard: every `#[serde(alias)]` on [`ConfigModelOverride`] must

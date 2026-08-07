@@ -3270,8 +3270,7 @@ mod tests {
 
         assert_eq!(
             dispatch_after_cli_preflight(parsed, true, |_, _| continuation_ran.set(true))
-                .err()
-                .expect("remote serve must fail before startup continuation")
+                .expect_err("remote serve must fail before startup continuation")
                 .to_string(),
             SERVE_REMOTE_ACK_REQUIRED
         );

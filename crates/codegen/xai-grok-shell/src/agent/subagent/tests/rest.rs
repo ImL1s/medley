@@ -1947,6 +1947,78 @@ async fn read_parent_sampling_config_live_carries_stored_byok_source() {
     );
     assert_eq!(config.api_key.as_deref(), Some("parent-byok-key"));
 }
+/// #180 seam: dual-auth parent — model `api_key` plus a declared credential
+/// header still in the maps. `read_parent_sampling_config` must keep the
+/// stored `ModelApiKey` label, not invent `ExplicitHeader` from the maps
+/// while leaving `api_key` set (the L3 false-refuse on External).
+///
+/// Cheap fixture: same parent-chat spawn as the BYOK / declared-header
+/// siblings. Also asserts `SamplingClient::new` accepts the inherited
+/// config — coverage through the crate boundary.
+#[tokio::test]
+async fn read_parent_sampling_config_dual_auth_keeps_model_api_key_not_explicit_header() {
+    const MODEL_KEY: &str = "sk-upstream-byok";
+    const EDGE_HEADER: &str = "x-api-key";
+    const EDGE_VALUE: &str = "sk-gateway-edge";
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.auth_method_id = acp::AuthMethodId::new(
+        crate::agent::auth_method::XAI_API_KEY_METHOD_ID,
+    );
+    let chat = spawn_test_parent_chat_state("grok-4.5");
+    let mut cfg = chat
+        .get_sampling_config()
+        .await
+        .expect("test parent has a sampling config");
+    cfg.base_url = "https://gateway.example/v1".to_string();
+    cfg.endpoint_trust = Some(xai_grok_sampler::EndpointTrustClass::External);
+    cfg.extra_headers
+        .insert(EDGE_HEADER.to_string(), EDGE_VALUE.to_string());
+    chat.update_sampling_config(cfg);
+    chat.update_credentials(xai_chat_state::Credentials::bound(
+        Some(MODEL_KEY.to_string()),
+        xai_chat_state::AuthType::ApiKey,
+        xai_grok_sampler::CredentialSource::ModelApiKey,
+    ));
+    ctx.parent_chat_state = Some(chat);
+
+    let (inherited, _) = read_parent_sampling_config(&ctx).await;
+    assert!(
+        matches!(
+            inherited.credential_source,
+            Some(xai_grok_sampler::CredentialSource::ModelApiKey)
+        ),
+        "dual-auth parent inherit must keep stored ModelApiKey; inventing \
+         ExplicitHeader from the maps while api_key remains is the #180 L3 \
+         false-refuse. got={:?}",
+        inherited.credential_source
+    );
+    assert!(
+        !matches!(
+            inherited.credential_source,
+            Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
+        ),
+        "dual-auth parent inherit must not invent ExplicitHeader from the \
+         header maps. (Value withheld.)"
+    );
+    assert!(
+        inherited.api_key.as_deref() == Some(MODEL_KEY),
+        "dual-auth parent inherit must keep the model-owned api_key. \
+         (Value withheld.)"
+    );
+    assert!(
+        inherited
+            .extra_headers
+            .get(EDGE_HEADER)
+            .is_some_and(|v| v.as_str() == EDGE_VALUE),
+        "declared gateway edge header must still ship in extra_headers. \
+         (Value withheld.)"
+    );
+    xai_grok_sampler::SamplingClient::new(inherited).expect(
+        "dual-auth parent inherit with stored ModelApiKey must construct on \
+         an external origin; re-labelling ExplicitHeader while keeping \
+         api_key is the #180 L3 false-refuse",
+    );
+}
 /// `would_strip_fallback_key` on the inherit-fallback path: the baseline
 /// keeps the env `XAI_API_KEY` even while `auth_type` flips to
 /// `SessionToken`, and no resolver may displace it.
