@@ -245,6 +245,7 @@ jobs:
           # property still holds" must not look the same, and only `run_nonzero`
           # tells them apart.
           run_nonzero -p xai-grok-shell --lib catalog_unavailable -- --nocapture
+          run_nonzero -p xai-grok-shell --lib test_catalog_auth_schemes_and_override -- --nocapture
           # #132: the reader's dup must not be inherited by children. Named
           # explicitly rather than by a `pty_session` prefix: the rest of that
           # module is the hang this change fixes, and this one is the fd leak

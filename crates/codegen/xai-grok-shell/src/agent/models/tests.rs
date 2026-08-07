@@ -2755,3 +2755,202 @@ fn warm_cache_refresh_does_not_reseat_over_user_model_pick() {
         "a /model pick must survive the preference becoming available"
     );
 }
+
+#[test]
+fn test_catalog_auth_schemes_and_override() {
+    use crate::remote::client::fetch_models_blocking;
+    use xai_grok_test_support::EnvGuard;
+
+    let target_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let last_auth_header = Arc::new(std::sync::Mutex::new(None));
+    let last_custom_header = Arc::new(std::sync::Mutex::new(None));
+    let last_extra_header = Arc::new(std::sync::Mutex::new(None));
+
+    let target_reqs_clone = target_requests.clone();
+    let auth_header_clone = last_auth_header.clone();
+    let custom_header_clone = last_custom_header.clone();
+    let extra_header_clone = last_extra_header.clone();
+
+    let app = axum::Router::new().route(
+        "/v1/models",
+        axum::routing::get(move |headers: axum::http::HeaderMap| async move {
+            target_reqs_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(auth) = headers.get("authorization") {
+                if let Ok(s) = auth.to_str() {
+                    *auth_header_clone.lock().unwrap() = Some(s.to_string());
+                }
+            }
+            if let Some(custom) = headers.get("x-api-key") {
+                if let Ok(s) = custom.to_str() {
+                    *custom_header_clone.lock().unwrap() = Some(s.to_string());
+                }
+            }
+            if let Some(extra) = headers.get("X-Organization") {
+                if let Ok(s) = extra.to_str() {
+                    *extra_header_clone.lock().unwrap() = Some(s.to_string());
+                }
+            }
+            axum::Json(serde_json::json!({
+                "data": [
+                    {
+                        "id": "my-mock-model",
+                        "model": "my-mock-model",
+                        "contextWindow": 4096,
+                        "baseUrl": "https://api.example.com/v1"
+                    }
+                ]
+            }))
+        }),
+    );
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let listener =
+        rt.block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap() });
+    let addr = listener.local_addr().unwrap();
+    let mock_endpoint = format!("http://{}/v1/models", addr);
+
+    let server_task = rt.spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // Test cases:
+    // 1. None auth scheme (anonymous)
+    {
+        let mut cfg = config::Config::default();
+        cfg.models.endpoint = Some(mock_endpoint.clone());
+        cfg.models.catalog_auth_scheme = Some("none".to_string());
+
+        let catalog_auth = cfg.models.catalog_auth_config().unwrap();
+        cfg.endpoints.catalog_auth = catalog_auth;
+
+        *last_auth_header.lock().unwrap() = None;
+        *last_custom_header.lock().unwrap() = None;
+
+        let result = fetch_models_blocking(
+            &cfg.endpoints,
+            None,
+            crate::agent::models::ModelFetchAuth::CustomEndpoint,
+        );
+        assert!(result.is_ok());
+        assert_eq!(*last_auth_header.lock().unwrap(), None);
+        assert_eq!(*last_custom_header.lock().unwrap(), None);
+    }
+
+    // 2. Bearer auth scheme
+    {
+        let _g = EnvGuard::set("CATALOG_KEY", "dummy-bearer-token");
+        let mut cfg = config::Config::default();
+        cfg.models.endpoint = Some(mock_endpoint.clone());
+        cfg.models.catalog_auth_scheme = Some("bearer".to_string());
+        cfg.models.catalog_env_key = Some(config::EnvKeys::One("CATALOG_KEY".to_string()));
+
+        let catalog_auth = cfg.models.catalog_auth_config().unwrap();
+        cfg.endpoints.catalog_auth = catalog_auth;
+
+        *last_auth_header.lock().unwrap() = None;
+
+        let result = fetch_models_blocking(
+            &cfg.endpoints,
+            None,
+            crate::agent::models::ModelFetchAuth::CustomEndpoint,
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            *last_auth_header.lock().unwrap(),
+            Some("Bearer dummy-bearer-token".to_string())
+        );
+    }
+
+    // 3. X-API-KEY auth scheme
+    {
+        let _g = EnvGuard::set("CATALOG_KEY", "dummy-x-api-key");
+        let mut cfg = config::Config::default();
+        cfg.models.endpoint = Some(mock_endpoint.clone());
+        cfg.models.catalog_auth_scheme = Some("x_api_key".to_string());
+        cfg.models.catalog_env_key = Some(config::EnvKeys::One("CATALOG_KEY".to_string()));
+
+        let catalog_auth = cfg.models.catalog_auth_config().unwrap();
+        cfg.endpoints.catalog_auth = catalog_auth;
+
+        *last_custom_header.lock().unwrap() = None;
+
+        let result = fetch_models_blocking(
+            &cfg.endpoints,
+            None,
+            crate::agent::models::ModelFetchAuth::CustomEndpoint,
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            *last_custom_header.lock().unwrap(),
+            Some("dummy-x-api-key".to_string())
+        );
+    }
+
+    // 4. Extra headers
+    {
+        let mut cfg = config::Config::default();
+        cfg.models.endpoint = Some(mock_endpoint.clone());
+        cfg.models.catalog_auth_scheme = Some("none".to_string());
+        let mut headers = IndexMap::new();
+        headers.insert("X-Organization".to_string(), "Anthropic".to_string());
+        headers.insert("Host".to_string(), "bad-host.com".to_string());
+        cfg.models.catalog_headers = headers;
+
+        let catalog_auth = cfg.models.catalog_auth_config().unwrap();
+        cfg.endpoints.catalog_auth = catalog_auth;
+
+        *last_extra_header.lock().unwrap() = None;
+
+        // Validation fails because Host is a protected header
+        let validate_result = crate::remote::validate_models_catalog_auth(
+            &cfg.endpoints,
+            crate::agent::models::ModelFetchAuth::CustomEndpoint,
+            true,
+        );
+        assert!(validate_result.is_err());
+        assert!(
+            validate_result
+                .unwrap_err()
+                .contains("protected and cannot be overridden")
+        );
+    }
+
+    // 5. Invalid validation (empty env var or missing env var name)
+    {
+        let mut cfg = config::Config::default();
+        cfg.models.endpoint = Some(mock_endpoint.clone());
+        cfg.models.catalog_auth_scheme = Some("bearer".to_string());
+        let catalog_auth = cfg.models.catalog_auth_config().unwrap();
+        cfg.endpoints.catalog_auth = catalog_auth;
+        let validate_result = crate::remote::validate_models_catalog_auth(
+            &cfg.endpoints,
+            crate::agent::models::ModelFetchAuth::CustomEndpoint,
+            true,
+        );
+        assert!(validate_result.is_err());
+        assert!(
+            validate_result
+                .unwrap_err()
+                .contains("catalog_env_key is missing")
+        );
+
+        let _g = EnvGuard::set("EMPTY_KEY", "");
+        let mut cfg2 = config::Config::default();
+        cfg2.models.endpoint = Some(mock_endpoint.clone());
+        cfg2.models.catalog_auth_scheme = Some("bearer".to_string());
+        cfg2.models.catalog_env_key = Some(config::EnvKeys::One("EMPTY_KEY".to_string()));
+        cfg2.endpoints.catalog_auth = cfg2.models.catalog_auth_config().unwrap();
+        let validate_result = crate::remote::validate_models_catalog_auth(
+            &cfg2.endpoints,
+            crate::agent::models::ModelFetchAuth::CustomEndpoint,
+            true,
+        );
+        assert!(validate_result.is_err());
+    }
+
+    server_task.abort();
+}
