@@ -257,6 +257,13 @@ jobs:
           # where a filter matching zero tests exits 0. `env_keys_` selects all
           # seven new tests and their three existing siblings.
           run_nonzero -p xai-grok-shell --lib env_keys_ -- --nocapture
+          # #73: strict-storage hardening. One guard proves strict reads stay on
+          # the already-open inode, one proves strict writes fail closed on a
+          # post-rename owner-only permission assertion failure.
+          run_nonzero -p xai-grok-shell --lib \
+            strict_read_uses_open_file_handle_when_path_is_swapped_after_open -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            strict_atomic_write_fails_when_post_rename_permission_assertion_fails -- --nocapture
           run_nonzero -p xai-grok-mcp --lib \
             callback_payload_debug_never_emits_code_state_or_issuer -- --nocapture
           run_nonzero -p xai-file-utils --lib \
