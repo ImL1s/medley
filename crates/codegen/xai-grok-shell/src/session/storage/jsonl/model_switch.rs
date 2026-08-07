@@ -6,6 +6,8 @@ const MODEL_SWITCH_LOCK_FILE: &str = "model_switch.intent.lock";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModelSwitchCommitStep {
+    IntentBeforeRename,
+    IntentAfterRename,
     Intent,
     Chat,
     Summary,
@@ -54,7 +56,7 @@ impl JsonlStorageAdapter {
         let bytes = serde_json::to_vec_pretty(&intent).map_err(|error| {
             ModelSwitchCommitError::NotCommitted(io::Error::new(io::ErrorKind::InvalidData, error))
         })?;
-        if let Err(error) = super::super::write_bytes_atomic_durable(&journal, &bytes) {
+        if let Err(error) = self.write_model_switch_intent_durable(&journal, &bytes) {
             let committed = journal.exists();
             let _ = lock.unlock();
             return Err(if committed {
@@ -70,6 +72,24 @@ impl JsonlStorageAdapter {
         let result = self.materialize_model_switch_intent(&session_dir, &intent);
         let _ = lock.unlock();
         result.map_err(ModelSwitchCommitError::Committed)
+    }
+
+    fn write_model_switch_intent_durable(&self, journal: &Path, bytes: &[u8]) -> io::Result<()> {
+        let tmp = super::super::temp_sibling(journal);
+        let result = (|| {
+            let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+            file.write_all(bytes)?;
+            super::super::sync_file_durable(&file)?;
+            self.probe_model_switch(ModelSwitchCommitStep::IntentBeforeRename)?;
+            drop(file);
+            super::super::replace_file_atomic_durable(&tmp, journal)?;
+            self.probe_model_switch(ModelSwitchCommitStep::IntentAfterRename)?;
+            super::super::sync_parent_directory(journal)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
     }
 
     pub(super) fn recover_model_switch_sync(&self, info: &Info) -> io::Result<()> {

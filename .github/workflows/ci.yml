@@ -631,6 +631,35 @@ jobs:
           # which looks for added `#[test]` attributes.
           run_nonzero -p xai-grok-shell --lib agent::models -- --nocapture
 
+      # #50: crash-consistent model-switch persistence boundaries. Each filter
+      # is unique so run_nonzero proves the targeted test still runs.
+      - name: 'Crash-consistent model-switch boundaries (issue #50)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib \
+            model_switch_interruption_before_intent_rename_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            model_switch_interruption_after_intent_rename_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            list_sessions_recovers_pending_model_switch_intent_before_loading_summary -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            list_sessions_recent_recovers_pending_model_switch_intent_before_loading_summary -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            dropped_model_switch_ack_preserves_live_candidate_generation -- --nocapture
+
       # #166: these assert on colour, and used to inherit the ambient colour
       # level. Run them under both settings of NO_COLOR -- one pass alone would
       # not have caught the original bug, because it only showed up on the axis
