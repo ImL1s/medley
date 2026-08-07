@@ -7285,6 +7285,63 @@ mod direct_hub_cloud_removed {
         assert_eq!(from_legacy.url.as_deref(), Some("wss://hub.example/ws"));
     }
 }
+mod local_workspace_removed {
+    use super::super::{
+        LOCAL_WORKSPACE_REMOVED_MSG, reject_removed_local_workspace_meta,
+    };
+    fn assert_local_workspace_removed_error(err: agent_client_protocol::Error) {
+        assert_eq!(
+            err.code,
+            agent_client_protocol::ErrorCode::InvalidParams,
+            "must be invalid_params, got: {err:?}"
+        );
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|d| d.get("code"))
+                .and_then(|v| v.as_str()),
+            Some("local_workspace_removed"),
+            "error code must identify removed local-workspace surface"
+        );
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|d| d.get("message"))
+                .and_then(|v| v.as_str()),
+            Some(LOCAL_WORKSPACE_REMOVED_MSG),
+            "error message must preserve the removed-surface guidance"
+        );
+    }
+    #[test]
+    fn local_workspace_removed_meta_rejected_fail_closed_matrix() {
+        let cases: &[(&str, serde_json::Value, bool)] = &[
+            (
+                "present_object",
+                serde_json::json!({ "x.ai/local_workspace": { "mode": "attach", "server_id": "srv-1" } }),
+                true,
+            ),
+            (
+                "present_null",
+                serde_json::json!({ "x.ai/local_workspace": null }),
+                true,
+            ),
+            (
+                "absent_key",
+                serde_json::json!({ "envId": "env-1" }),
+                false,
+            ),
+        ];
+        for (label, meta, expect_error) in cases {
+            let outcome = reject_removed_local_workspace_meta(meta.as_object());
+            match (expect_error, outcome) {
+                (true, Err(err)) => assert_local_workspace_removed_error(err),
+                (false, Ok(())) => {}
+                (true, Ok(())) => panic!("[{label}] expected local-workspace rejection"),
+                (false, Err(err)) => panic!("[{label}] unexpected rejection: {err:?}"),
+            }
+        }
+    }
+}
 mod soft_default_settings_emit {
     use super::*;
     #[tokio::test]

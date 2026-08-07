@@ -996,6 +996,28 @@ jobs:
           run_nonzero -p xai-grok-mcp --lib \
             arm_liveness_watcher_then_has_no_scheduler_yield_after_spawning -- --nocapture
 
+      # #35: the removed local-workspace bridge surface must fail closed if a
+      # client still sends `x.ai/local_workspace`; silent ignore would read as
+      # supported and then degrade to NotAttached behavior.
+      - name: 'Removed local-workspace meta guard (issue #35)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib \
+            local_workspace_removed_meta_rejected_fail_closed_matrix -- --nocapture
+
       # #36: restore fd bundling only with a public PI caller and contract.
       # The tests are split by build mode: override-path bundle and release
       # auto-download bundle. Filters are written explicitly so #171 can prove
