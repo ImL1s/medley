@@ -138,10 +138,31 @@ impl XaiProtoBuilder {
         protos: impl IntoIterator<Item = &'a Path>,
         includes: impl IntoIterator<Item = &'a Path>,
     ) -> anyhow::Result<()> {
+        Self::emit_rerun_if_changed_with_emitter(
+            protoc,
+            protoc_include_dir,
+            protos,
+            includes,
+            |path| {
+                let path = std::str::from_utf8(path)
+                    .context("rerun-if-changed path is not valid UTF-8")?;
+                println!("cargo:rerun-if-changed={path}");
+                Ok(())
+            },
+        )
+    }
+
+    fn emit_rerun_if_changed_with_emitter<'a>(
+        protoc: Option<&Path>,
+        protoc_include_dir: Option<&Path>,
+        protos: impl IntoIterator<Item = &'a Path>,
+        includes: impl IntoIterator<Item = &'a Path>,
+        mut emit: impl FnMut(&[u8]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         let includes = Vec::from_iter(includes);
 
         if let Some(path) = protoc.and_then(rerun_if_changed_for_protoc) {
-            println!("cargo:rerun-if-changed={path}");
+            emit(path.as_bytes())?;
         }
 
         // Can only process one input file when using --dependency_out=FILE.
@@ -220,7 +241,7 @@ impl XaiProtoBuilder {
                     ));
                 }
 
-                println!("cargo:rerun-if-changed={line_str}");
+                emit(line)?;
             }
         }
 
@@ -516,20 +537,22 @@ mod tests {
         use std::io::Write;
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
 
         let dir = temp_dir_named("nonutf8-dep");
         let proto_file = dir.join("test.proto");
         fs::write(&proto_file, b"").expect("write proto");
 
         let protoc_script = dir.join("protoc");
+        let well_known_dep = b"/opt/we\xffird/include/google/protobuf/timestamp.proto";
         let mut script_content = Vec::new();
         script_content.extend_from_slice(b"#!/bin/sh\n");
         script_content.extend_from_slice(b"printf '/dev/null: ");
         script_content
             .extend_from_slice(proto_file.to_str().expect("temp path is utf8").as_bytes());
-        script_content.extend_from_slice(
-            b" \\\\\\n  /opt/we\\xffird/include/google/protobuf/timestamp.proto\\n'\n",
-        );
+        script_content.extend_from_slice(b" \\\n  ");
+        script_content.extend_from_slice(well_known_dep);
+        script_content.extend_from_slice(b"\n'\n");
         script_content.extend_from_slice(b"exit 0\n");
 
         // Linux can return ETXTBSY when executing a file still open for write.
@@ -544,17 +567,50 @@ mod tests {
         let include_dir_bytes = b"/opt/we\xffird/include";
         let include_dir = Path::new(OsStr::from_bytes(include_dir_bytes));
 
-        let res = XaiProtoBuilder::emit_rerun_if_changed(
+        let output = Command::new(&protoc_script)
+            .output()
+            .expect("run stub protoc for fixture verification");
+        assert!(
+            output
+                .stdout
+                .windows(well_known_dep.len())
+                .any(|window| window == well_known_dep),
+            "fixture must emit the non-UTF-8 byte sequence in dependency output"
+        );
+
+        let mut emitted = Vec::<Vec<u8>>::new();
+        XaiProtoBuilder::emit_rerun_if_changed_with_emitter(
             Some(&protoc_script),
             Some(include_dir),
             [proto_file.as_path()],
             [] as [&Path; 0],
-        );
+            |path| {
+                emitted.push(path.to_vec());
+                Ok(())
+            },
+        )
+        .expect("well-known dependency with non-UTF-8 bytes should be ignored");
 
+        let expected = vec![
+            protoc_script
+                .to_str()
+                .expect("temp path is utf8")
+                .as_bytes()
+                .to_vec(),
+            proto_file
+                .to_str()
+                .expect("temp path is utf8")
+                .as_bytes()
+                .to_vec(),
+        ];
+        assert_eq!(
+            emitted, expected,
+            "only protoc and proto source should be emitted; \
+             non-UTF-8 well-known dependency must be filtered before UTF-8 decoding"
+        );
         assert!(
-            res.is_ok(),
-            "should succeed despite non-UTF-8 paths, err: {:?}",
-            res.err()
+            emitted.iter().all(|path| path.as_slice() != well_known_dep),
+            "the well-known dependency path must not be emitted"
         );
 
         fs::remove_dir_all(&dir).ok();
