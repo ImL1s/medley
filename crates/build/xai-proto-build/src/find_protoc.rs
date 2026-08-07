@@ -4,9 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn check_protoc_good(protoc: &Path) -> anyhow::Result<()> {
-    let output = Command::new(protoc)
-        .arg("--version")
-        .output()
+    let output = crate::output_retrying_while_busy(Command::new(protoc).arg("--version"))
         .context("Failed to execute protoc")?;
 
     if !output.status.success() {
