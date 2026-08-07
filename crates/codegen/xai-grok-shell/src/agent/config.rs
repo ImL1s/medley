@@ -5841,10 +5841,13 @@ fn explicit_credential_header(info: &ModelInfo) -> Option<(String, Option<String
 }
 /// As [`explicit_credential_header`], but over the header maps alone.
 ///
-/// The reconstruction seams (turn config, subagent inheritance) rebuild from a
-/// `SamplingConfig`, which carries the headers but not the model entry and not
-/// `credential_source` — so provenance there has to be re-derived rather than
-/// carried, and this is what they derive it from (#110).
+/// Reports whether a declared credential header is still present on the wire
+/// (for resolver attach and identity gating). After #136, `Credentials`
+/// carries `source`; reconstruction seams take the provenance *label* from
+/// `creds.source_cloned()` and must not invent `ExplicitHeader` from these
+/// maps alone (#180) — a dual-auth gateway keeps both a model key and a
+/// declared header, and re-deriving the label while leaving `api_key` set
+/// is the post-strip mislabel L3 refuses.
 pub(crate) fn explicit_credential_header_in(
     extra_headers: &IndexMap<String, String>,
     env_http_headers: &IndexMap<String, String>,

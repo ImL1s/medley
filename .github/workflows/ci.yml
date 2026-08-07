@@ -537,3 +537,38 @@ jobs:
             collect_assistant_text_completed_turn_still_indexes_across_hook_annotation -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             single_pass_omits_abandoned_retry_attempt_from_fts_content -- --nocapture
+
+      # #180: an ambient xAI session JWT under a post-strip `ExplicitHeader`
+      # label reaching a third-party origin. Both halves of the fix are
+      # independently mutation-proven, so both filters are needed -- reverting
+      # either one reddens only its own test. Quoted name: an unquoted `#180`
+      # truncates at the comment marker.
+      - name: 'Ambient credential label coupling (issue #180)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-sampler --lib \
+            ambient_token_labelled_explicit_header -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            dual_auth_gateway_model_key_plus_declared_header -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            seeded_ambient_key_must_not_keep_a_post_strip -- --nocapture
+          # Seam half of #180: reconstruct / parent-inherit must not invent
+          # ExplicitHeader from the maps while keeping api_key. The sampler
+          # dual_auth_gateway_… test never reaches these functions.
+          run_nonzero -p xai-grok-shell --lib \
+            reconstruct_full_config_ready_dual_auth_keeps_model_api_key -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            read_parent_sampling_config_dual_auth_keeps_model_api_key -- --nocapture

@@ -2738,6 +2738,128 @@ fn build_agent_with_auth(auth: crate::auth::GrokAuth) -> MvpAgent {
     let cfg = AgentConfig::default();
     MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config")
 }
+/// #180: `seed_client_config_auth_if_available` must not reinject ambient
+/// credentials into a post-strip header-auth route.
+///
+/// `sampling_config_for_model` treats `ExplicitHeader` as a **post-strip**
+/// label: for a model that authenticates by a header the user declared, it
+/// sets `credentials.api_key = None` and *then* writes `ExplicitHeader`, so
+/// the label means "the ambient credential has been removed". The seed's
+/// `api_key.is_none()` gate is satisfied by exactly that strip; without the
+/// early return it would put the ambient session bytes back.
+///
+/// The property is stronger than "do not leave the inconsistent pair": the
+/// seed must not reinject ambient bytes **at all**. Stamping `XaiSession` on
+/// reinjection would make the pair consistent and L3-refuse the route, while
+/// an assertion that only checks `!(api_key.is_some() && ExplicitHeader)`
+/// would stay green. See the sampler-side companion
+/// `ambient_token_labelled_explicit_header_must_not_reach_an_external_origin`.
+#[tokio::test(flavor = "current_thread")]
+async fn seeded_ambient_key_must_not_keep_a_post_strip_explicit_header_label() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(seeded_ambient_key_body())
+        .await;
+}
+
+async fn seeded_ambient_key_body() {
+    use crate::agent::config::{Config as AgentConfig, ConfigModelOverride};
+    use crate::auth::{AuthManager, GrokComConfig};
+
+    const VENDOR_MODEL: &str = "vendor-header-auth";
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let auth_manager =
+        std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
+    // A live ambient xAI session, as any signed-in user has.
+    auth_manager.hot_swap(crate::auth::GrokAuth {
+        key: "ambient-xai-session-jwt".into(),
+        auth_mode: crate::auth::AuthMode::WebLogin,
+        ..crate::auth::GrokAuth::test_default()
+    });
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let gateway = GatewaySender::new(tx);
+
+    // An ordinary third-party provider: external origin, authenticated by a
+    // declared `x-api-key`, with no `api_key` / `env_key` of its own.
+    let mut cfg = AgentConfig::default();
+    cfg.models.default = Some(VENDOR_MODEL.to_owned());
+    let mut extra_headers = indexmap::IndexMap::new();
+    extra_headers.insert("x-api-key".to_owned(), "sk-vendor-declared".to_owned());
+    cfg.config_models.insert(
+        VENDOR_MODEL.to_owned(),
+        ConfigModelOverride {
+            model: Some(VENDOR_MODEL.to_owned()),
+            base_url: Some("https://vendor.example/v1".to_owned()),
+            extra_headers,
+            ..Default::default()
+        },
+    );
+    let agent = MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config");
+    agent
+        .models_manager
+        .set_current_model_id(acp::ModelId::new(VENDOR_MODEL));
+
+    // `MvpAgent::new` resolves the agent-level config once, and which model
+    // wins there depends on default-model resolution rather than on anything
+    // this test is about. Recompute it through the production path now that
+    // the vendor model is current: `ModelsManager::sampling_config()` is the
+    // same function `new` calls, so this is the state a user whose default is
+    // the vendor model starts with — not a hand-built config.
+    *agent.sampling_config.borrow_mut() = agent.models_manager.sampling_config();
+
+    // Precondition: the strip ran and labelled the route honestly. If this
+    // fails the fixture no longer reaches the seam under test.
+    {
+        let seeded = agent.sampling_config.borrow();
+        assert!(
+            seeded.api_key.is_none(),
+            "precondition: the ambient strip must have cleared the key for a \
+             header-authenticated model on an external origin. \
+             model={:?} base_url={:?} source={:?} auth_scheme={:?} \
+             extra_header_names={:?}",
+            seeded.model,
+            seeded.base_url,
+            seeded.credential_source,
+            seeded.auth_scheme,
+            seeded.extra_headers.keys().collect::<Vec<_>>(),
+        );
+        assert!(
+            matches!(
+                seeded.credential_source,
+                Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
+            ),
+            "precondition: the strip labels the route ExplicitHeader; got {:?}",
+            seeded.credential_source
+        );
+    }
+
+    agent.seed_client_config_auth_if_available();
+
+    let seeded = agent.sampling_config.borrow();
+    // Property: the seed must not reinject ambient bytes into a post-strip
+    // header-auth route *at all* — not merely avoid leaving the inconsistent
+    // pair. Removing only the ExplicitHeader early-return while keeping the
+    // XaiSession stamp reinjects ambient under a consistent ambient label;
+    // the old `!(api_key.is_some() && ExplicitHeader)` assertion stayed green
+    // on that mutation while the route became ambient-labelled and L3-refused.
+    assert!(
+        seeded.api_key.is_none(),
+        "the seed reinjected a credential into a post-strip header-auth \
+         route. That route authenticates by the user's declared header on an \
+         external origin; ambient bytes must stay absent under every label. \
+         (Value withheld.)"
+    );
+    assert!(
+        matches!(
+            seeded.credential_source,
+            Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
+        ),
+        "post-strip header-auth label must remain ExplicitHeader after seed; \
+         got {:?}",
+        seeded.credential_source
+    );
+}
 /// Regression: boot-time plugin discovery is deferred past ACP
 /// `initialize`, so the shared plugin registry starts empty.
 /// `resolve_mcp_servers` reads that snapshot to merge plugin-contributed
