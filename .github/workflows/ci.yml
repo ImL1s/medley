@@ -35,6 +35,12 @@ jobs:
       - name: Enforce credential-safe observability
         run: python3 -B -m unittest tests.test_credential_observability_guard -v
 
+      # The `new-test-filters` job below is the thing that notices a Rust test
+      # no filter selects. These are its own tests -- without them it would be
+      # an unverified checker guarding against unverified tests (#171).
+      - name: Test the new-test filter guard
+        run: python3 -B -m unittest tests.test_new_test_filter_guard -v
+
   installer:
     name: Installer
     runs-on: ubuntu-latest
@@ -87,6 +93,25 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
+  new-test-filters:
+    name: New tests run somewhere
+    runs-on: ubuntu-latest
+    steps:
+      # Full history: the check needs a merge base to find what this branch added.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # No Rust toolchain and no build: this reads the diff, not a test listing.
+      # That is what makes it cheap, and it is also what makes it correct for
+      # `#[cfg(target_os = ...)]` tests -- they are in the diff on every
+      # platform, whereas `cargo test -- --list` omits them off their target.
+      - name: Every new test matches a CI filter
+        run: |
+          python3 scripts/check_new_tests_are_filtered.py \
+            --workflow .github/workflows/ci.yml \
+            --base "origin/${{ github.base_ref || 'providers' }}"
+
   lint:
     name: Clippy (hot path)
     runs-on: ubuntu-latest
@@ -108,15 +133,22 @@ jobs:
           shared-key: providers-lint
           cache-targets: true
 
-      - name: Clippy sampler / shell / pager (lib only)
+      - name: Clippy sampler / shell / pager / pager-bin (all targets)
         env:
           PROTOC: protoc
         run: |
-          # Lib-only: pager benches/tests still trip upstream clippy lints
-          # unrelated to the providers fork. Full-workspace clippy is too slow.
-          cargo clippy --manifest-path crates/codegen/xai-grok-sampler/Cargo.toml --lib -- -D warnings
-          cargo clippy --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib -- -D warnings
-          cargo clippy --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib -- -D warnings
+          # Measured 2026-08-07 on providers (#194): `--all-targets` on these
+          # four crates is clean after fixing the handful of test/bench lints
+          # (see the PR). No `-A` allow-list — that would re-open the blind
+          # spot this job is meant to close. Full-workspace clippy remains
+          # too slow; we stay on the hot-path crates only.
+          #
+          # `xai-grok-pager-bin` is a binary crate: `--lib` never saw it, and
+          # that is how `.err().expect()` lived green in CI since 5c8144e.
+          cargo clippy --manifest-path crates/codegen/xai-grok-sampler/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path crates/codegen/xai-grok-pager-bin/Cargo.toml --all-targets -- -D warnings
 
   test:
     name: Tests (providers hot path)
@@ -168,6 +200,12 @@ jobs:
           }
           run_nonzero -p xai-grok-auth --features middleware --lib credential -- --nocapture
           run_nonzero -p xai-grok-telemetry --lib unified_log -- --nocapture
+          # #121: for_test is the single place that names SamplingConfig fork
+          # fields. Unique substrings — run_nonzero only fails on *zero* matches.
+          run_nonzero -p xai-grok-sampling-types --lib \
+            sampling_config_for_test_sets_fork_endpoint_trust_to_none -- --nocapture
+          run_nonzero -p xai-grok-sampling-types --lib \
+            sampling_config_for_test_fru_inherits_fork_endpoint_trust_without_naming_it -- --nocapture
           run_nonzero -p xai-grok-sampler --lib \
             final_relation_observes_hostile_injector_replacement_and_removal -- --nocapture
           run_nonzero -p xai-grok-sampler --lib \
@@ -180,6 +218,23 @@ jobs:
             provider_controlled_stream_error_is_secret_free_for_all_stream_apis -- --nocapture
           run_nonzero -p xai-grok-mcp --lib \
             callback_errors_never_echo_provider_controlled_credentials -- --nocapture
+          # #151: an unlabelled chat-state credential reaching an external origin
+          # on `Unknown(CatalogUnavailable)`. Closed in code by #136, and the two
+          # tests that pin it matched no filter at all -- so the highest-stakes
+          # property in this fork was defended by tests no job ran (#171).
+          #
+          # Deliberately in this step rather than the auth one above: that step
+          # uses bare `cargo test`, where a filter matching zero tests exits 0.
+          # For a security property "the filter stopped matching" and "the
+          # property still holds" must not look the same, and only `run_nonzero`
+          # tells them apart.
+          run_nonzero -p xai-grok-shell --lib catalog_unavailable -- --nocapture
+          # #13: env-key normalization. In this step rather than the auth one
+          # above because one of these asserts diagnostics carry the normalized
+          # *name* and never a value -- and that step uses bare `cargo test`,
+          # where a filter matching zero tests exits 0. `env_keys_` selects all
+          # seven new tests and their three existing siblings.
+          run_nonzero -p xai-grok-shell --lib env_keys_ -- --nocapture
           run_nonzero -p xai-grok-mcp --lib \
             callback_payload_debug_never_emits_code_state_or_issuer -- --nocapture
           run_nonzero -p xai-file-utils --lib \
@@ -321,6 +376,23 @@ jobs:
             agent::auth_method -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
             config_model_override_parse -- --nocapture
+          # #13: env_key trim/validate/dedupe + path-specific invalid-name warnings.
+          # Unique prefixes so run_nonzero proves the new tests are selected.
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero --lib env_keys_normalize_ -- --nocapture
+          run_nonzero --lib env_keys_diagnostics_show_normalized_names_only -- --nocapture
+          run_nonzero --lib env_keys_invalid_entry_emits_path_specific_config_warning -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
             read_parent_sampling_config_ -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
@@ -392,3 +464,219 @@ jobs:
             catalog_miss -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
             toctou -- --nocapture
+          # The three tests this change fixes matched none of the filters
+          # above, so registering their models bought nothing: they ran in no
+          # job at all (#171). This selects them and the six sibling
+          # deferred-switch tests, which belong to this step by subject and
+          # were equally unrun.
+          cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
+            deferred_switch_ -- --nocapture
+
+      # #159: a runtime-only model was judged absent by a config-only lookup,
+      # and the turn stripped its credentials. Filters written out rather than
+      # looped, so the #171 check can see them. Quoted name: an unquoted `#159`
+      # truncates at the comment marker.
+      - name: 'Runtime-catalog lookup and memo generation (issue #159)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib runtime_catalog -- --nocapture
+          run_nonzero -p xai-grok-shell --lib runtime_only_catalog -- --nocapture
+          run_nonzero -p xai-grok-shell --lib config_only_miss -- --nocapture
+          run_nonzero -p xai-grok-shell --lib memoized_as_definite -- --nocapture
+          run_nonzero -p xai-grok-shell --lib catalog_refresh_that_drops -- --nocapture
+          run_nonzero -p xai-grok-shell --lib bundled_fallback_rebuild -- --nocapture
+          # `agent::models` as a module filter: the generation asserts added to
+          # the pre-existing `rebuild_updates_models_and_available` live there
+          # and matched no name-based filter, so that guard ran nowhere. A new
+          # assertion in an old unfiltered test is invisible to the #171 check,
+          # which looks for added `#[test]` attributes.
+          run_nonzero -p xai-grok-shell --lib agent::models -- --nocapture
+
+      # #166: these assert on colour, and used to inherit the ambient colour
+      # level. Run them under both settings of NO_COLOR -- one pass alone would
+      # not have caught the original bug, because it only showed up on the axis
+      # CI never varied. Quoted name: an unquoted `#166` truncates at the
+      # comment marker.
+      - name: 'Colour-asserting pager tests, both NO_COLOR settings (issue #166)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          # Filters written out rather than looped over a shell variable, so
+          # they stay greppable in this file -- the #171 check parses these
+          # lines, and a filter built at runtime is invisible to it.
+          #
+          # Do not use bare `teal`: Cargo substring-matches, and `steal` /
+          # `steals` / `resteal` contain `teal`, as does
+          # `teal_highlighting_on_second_line` (which skips its colour assert
+          # under NO_COLOR). `keeps_teal` + `each_teal` select only the four
+          # fixed skill-accent tests that filter on accent_skill spans.
+          run_nonzero -p xai-grok-pager --lib keeps_teal -- --nocapture
+          run_nonzero -p xai-grok-pager --lib each_teal -- --nocapture
+          run_nonzero -p xai-grok-pager --lib invalid_token_ranges_are_dropped -- --nocapture
+          run_nonzero -p xai-grok-pager --lib token_on_second_logical_line -- --nocapture
+          run_nonzero -p xai-grok-pager --lib search_bar_cursor -- --nocapture
+          # Made hermetic by this change like the others, but pre-existing, so
+          # the #171 check cannot see it: that check reads the diff for a new
+          # `#[test]`, and this test is not new -- only its contract is.
+          run_nonzero -p xai-grok-pager --lib \
+            user_prompt_band_is_semantic -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            colour_asserting_tests_do_not_use_theme_current -- --nocapture
+          NO_COLOR=1 run_nonzero -p xai-grok-pager --lib keeps_teal -- --nocapture
+          NO_COLOR=1 run_nonzero -p xai-grok-pager --lib each_teal -- --nocapture
+          NO_COLOR=1 run_nonzero -p xai-grok-pager --lib invalid_token_ranges_are_dropped -- --nocapture
+          NO_COLOR=1 run_nonzero -p xai-grok-pager --lib token_on_second_logical_line -- --nocapture
+          NO_COLOR=1 run_nonzero -p xai-grok-pager --lib search_bar_cursor -- --nocapture
+          NO_COLOR=1 run_nonzero -p xai-grok-pager --lib \
+            user_prompt_band_is_semantic -- --nocapture
+          NO_COLOR=1 run_nonzero -p xai-grok-pager --lib \
+            colour_asserting_tests_do_not_use_theme_current -- --nocapture
+
+      # #162: the restore-direction and the tombstone-wall cases. The
+      # pre-existing `workflow_restore_rejects_symlinks_and_caps_run_count`
+      # stays green under both defects, so `workflow_restore` as one filter
+      # covers all three and the two new ones carry the protection. Quoted
+      # name: an unquoted `#162` truncates at the comment marker.
+      - name: 'Workflow restore ordering and scan budget (issue #162)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib workflow_restore -- --nocapture
+
+      # #165: abandoned sampling attempts must not enter the FTS index.
+      # Unique filters so run_nonzero proves each new test is selected.
+      # Quoted name: an unquoted `#165` truncates at the comment marker.
+      - name: 'Abandoned attempt text omitted from search index (issue #165)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib \
+            collect_assistant_text_discards_abandoned_retry_attempt_phrase -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            collect_assistant_text_discards_attempt_discarded_retraction_phrase -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            collect_assistant_text_still_flushes_on_rewind_marker_boundary -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            collect_assistant_text_still_flushes_on_compaction_checkpoint_boundary -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            collect_assistant_text_completed_turn_still_indexes_across_hook_annotation -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            single_pass_omits_abandoned_retry_attempt_from_fts_content -- --nocapture
+
+      # #180: an ambient xAI session JWT under a post-strip `ExplicitHeader`
+      # label reaching a third-party origin. Both halves of the fix are
+      # independently mutation-proven, so both filters are needed -- reverting
+      # either one reddens only its own test. Quoted name: an unquoted `#180`
+      # truncates at the comment marker.
+      - name: 'Ambient credential label coupling (issue #180)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-sampler --lib \
+            ambient_token_labelled_explicit_header -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            dual_auth_gateway_model_key_plus_declared_header -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            seeded_ambient_key_must_not_keep_a_post_strip -- --nocapture
+          # Seam half of #180: reconstruct / parent-inherit must not invent
+          # ExplicitHeader from the maps while keeping api_key. The sampler
+          # dual_auth_gateway_… test never reaches these functions.
+          run_nonzero -p xai-grok-shell --lib \
+            reconstruct_full_config_ready_dual_auth_keeps_model_api_key -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            read_parent_sampling_config_dual_auth_keeps_model_api_key -- --nocapture
+
+      # #160: six of the seven tests this branch originally added matched no
+      # filter. The seventh, `web_search_resolves_an_env_backed_credential_header`,
+      # is already selected by the existing `credential_header` filter. Written
+      # out rather than looped so the #171 check can see them. Quoted name: an
+      # unquoted `#160` truncates at the comment marker.
+      - name: 'web_search env header forwarding (issue #160)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib spawn_gates_web_search -- --nocapture
+          run_nonzero -p xai-grok-shell --lib spawn_forwards_env_http_headers -- --nocapture
+          run_nonzero -p xai-grok-shell --lib web_search_env_header_overrides -- --nocapture
+          run_nonzero -p xai-grok-shell --lib env_backed_credential_header -- --nocapture
+          # Also this PR's earlier commit, whose three tests matched nothing either.
+          run_nonzero -p xai-grok-shell --lib keeps_web_search_and_is_told_nothing -- --nocapture
+          run_nonzero -p xai-grok-shell --lib credential_less_route -- --nocapture
+          run_nonzero -p xai-grok-shell --lib invents_no_bearer -- --nocapture
+          # Review follow-up: resolve→SamplerConfig map copy, and the
+          # bearer_resolver arm of has_usable_credential.
+          run_nonzero -p xai-grok-shell --lib survives_into_sampler_config -- --nocapture
+          run_nonzero -p xai-grok-shell --lib accepts_a_bearer_resolver_alone -- --nocapture

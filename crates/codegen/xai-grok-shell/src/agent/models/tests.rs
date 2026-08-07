@@ -632,11 +632,17 @@ fn rebuild_updates_models_and_available() {
         },
     );
 
+    let gen_before = mgr.catalog_generation();
     mgr.rebuild(&cfg, Some(prefetched));
 
     assert!(
         !mgr.models().is_empty(),
         "models should be populated after rebuild"
+    );
+    assert_ne!(
+        mgr.catalog_generation(),
+        gen_before,
+        "rebuild must bump catalog_generation so auth memos cannot outlive the swap (#159 F1)"
     );
 }
 

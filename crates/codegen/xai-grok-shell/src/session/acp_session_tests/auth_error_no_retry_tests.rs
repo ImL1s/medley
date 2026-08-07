@@ -191,6 +191,7 @@ async fn pin_first_party_session_model(actor: &SessionActor) {
                 readiness: crate::agent::auth_method::ModelReadiness::Ready,
             },
             provider: None,
+            catalog_generation: 0,
         }));
 }
 
@@ -1024,6 +1025,7 @@ async fn reconstruct_full_config_ready_byok_carries_stored_source() {
                         readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
+                    catalog_generation: 0,
                 }));
 
             let cfg = actor.reconstruct_full_config().await;
@@ -1035,6 +1037,103 @@ async fn reconstruct_full_config_ready_byok_carries_stored_source() {
             );
             assert_eq!(cfg.api_key.as_deref(), Some("byok-model-key"));
             assert!(cfg.bearer_resolver.is_none());
+        })
+        .await;
+}
+
+/// #180 seam: Ready dual-auth gateway — model owns an `api_key` *and* a
+/// declared credential header still sits in the maps. Reconstruction must
+/// keep the stored `ModelApiKey` label (bound with the secret), not invent
+/// `ExplicitHeader` from the maps while leaving `api_key` set.
+///
+/// That invented pair is what L3 treats as ambient and refuses on External;
+/// inventing it at this seam is how a legitimate gateway route died for
+/// users. The sampler-side `dual_auth_gateway_…` constructs
+/// `SamplingClient::new` directly and never reaches this function, so it
+/// stays green under the header-preference mutation at
+/// `sampler_turn.rs` Ready-path provenance.
+///
+/// Also asserts the reconstructed `SamplingConfig` is one
+/// `SamplingClient::new` accepts — coverage through the crate boundary.
+#[tokio::test(flavor = "current_thread")]
+async fn reconstruct_full_config_ready_dual_auth_keeps_model_api_key_not_explicit_header() {
+    use crate::agent::auth_method::ModelByok;
+    use crate::agent::config::ModelAuthFacts;
+    const MODEL_KEY: &str = "sk-upstream-byok";
+    const EDGE_HEADER: &str = "x-api-key";
+    const EDGE_VALUE: &str = "sk-gateway-edge";
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                None,
+                "xai.api_key",
+                xai_chat_state::AuthType::ApiKey,
+                MODEL_KEY.to_string(),
+            )
+            .await;
+            let mut cfg = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("test actor sampling config");
+            cfg.base_url = "https://gateway.example/v1".to_string();
+            cfg.endpoint_trust = Some(xai_grok_sampler::EndpointTrustClass::External);
+            cfg.extra_headers
+                .insert(EDGE_HEADER.to_string(), EDGE_VALUE.to_string());
+            let model = cfg.model.clone();
+            actor.chat_state_handle.update_sampling_config(cfg);
+            actor
+                .model_auth_memo
+                .replace(Some(crate::session::acp_session::ModelAuthMemo {
+                    model_id: model,
+                    facts: ModelAuthFacts {
+                        byok: ModelByok::Byok,
+                        auth_scheme: xai_grok_sampler::AuthScheme::Bearer,
+                        readiness: crate::agent::auth_method::ModelReadiness::Ready,
+                    },
+                    provider: None,
+                    catalog_generation: 0,
+                }));
+
+            let cfg = actor.reconstruct_full_config().await;
+
+            assert!(
+                matches!(
+                    cfg.credential_source,
+                    Some(xai_grok_sampler::CredentialSource::ModelApiKey)
+                ),
+                "Ready dual-auth reconstruct must keep stored ModelApiKey; \
+                 inventing ExplicitHeader from the maps while api_key remains \
+                 is the #180 L3 false-refuse. got={:?}",
+                cfg.credential_source
+            );
+            assert!(
+                !matches!(
+                    cfg.credential_source,
+                    Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
+                ),
+                "Ready dual-auth reconstruct must not invent ExplicitHeader \
+                 from the header maps. (Value withheld.)"
+            );
+            assert!(
+                cfg.api_key.as_deref() == Some(MODEL_KEY),
+                "Ready dual-auth reconstruct must keep the model-owned api_key. \
+                 (Value withheld.)"
+            );
+            assert!(
+                cfg.extra_headers
+                    .get(EDGE_HEADER)
+                    .is_some_and(|v| v.as_str() == EDGE_VALUE),
+                "declared gateway edge header must still ship in extra_headers. \
+                 (Value withheld.)"
+            );
+
+            xai_grok_sampler::SamplingClient::new(cfg).expect(
+                "dual-auth gateway with stored ModelApiKey must construct on \
+                 an external origin; re-labelling ExplicitHeader while keeping \
+                 api_key is the #180 L3 false-refuse",
+            );
         })
         .await;
 }
@@ -1139,6 +1238,7 @@ async fn codex_401_forces_one_refresh_one_retry_then_second_401_is_terminal() {
                         readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: Some(provider),
+                    catalog_generation: 0,
                 }));
 
             let reconstructed = actor.reconstruct_full_config().await;
@@ -1317,6 +1417,7 @@ async fn model_auth_memo_serves_cached_status_and_keys_on_model() {
                         readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
+                    catalog_generation: 0,
                 }));
 
             // Cache hit: served without consulting config.
@@ -1362,6 +1463,7 @@ async fn reconstruct_full_config_no_bearer_resolver_for_byok_model_on_session_me
                         readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
+                    catalog_generation: 0,
                 }));
 
             let cfg = actor.reconstruct_full_config().await;
@@ -1413,6 +1515,7 @@ async fn reconstruct_full_config_no_bearer_resolver_for_none_auth_scheme_on_sess
                         readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
+                    catalog_generation: 0,
                 }));
 
             let cfg = actor.reconstruct_full_config().await;
@@ -1468,6 +1571,7 @@ async fn reconstruct_full_config_strips_credentials_when_model_not_ready() {
                         ),
                     },
                     provider: None,
+                    catalog_generation: 0,
                 }));
 
             let cfg = actor.reconstruct_full_config().await;
@@ -1531,6 +1635,7 @@ async fn prepare_refuses_unusable_external_but_allows_unknown() {
                         readiness: ModelReadiness::Unknown(UnknownReason::NotInCatalog),
                     },
                     provider: None,
+                    catalog_generation: 0,
                 }));
             actor
                 .prepare_chat_completion(false)
@@ -1550,6 +1655,7 @@ async fn prepare_refuses_unusable_external_but_allows_unknown() {
                         )),
                     },
                     provider: None,
+                    catalog_generation: 0,
                 }));
             let err = actor
                 .prepare_chat_completion(false)
@@ -1612,6 +1718,7 @@ async fn an_unusable_route_reports_on_the_turn_path_and_stays_quiet_on_the_aux_p
                         )),
                     },
                     provider: None,
+                    catalog_generation: 0,
                 }));
 
             // `RetryState` reaches the client through the persistence channel
@@ -1716,6 +1823,7 @@ async fn absent_from_catalog_strips_the_credential_for_every_auth_method() {
                             readiness: ModelReadiness::Unknown(UnknownReason::NotInCatalog),
                         },
                         provider: None,
+                        catalog_generation: 0,
                     }));
 
                 let cfg = actor.reconstruct_full_config().await;
@@ -1746,6 +1854,476 @@ async fn absent_from_catalog_strips_the_credential_for_every_auth_method() {
         .await;
 }
 
+/// #159: a model present only in the runtime/prefetched catalog (no local
+/// `[model.*]`) must keep its credentials across turn reconstruction. Before
+/// the fix, `resolve_model_auth_facts_and_provider` re-resolved config with
+/// `prefetched = None`, classified the model as `NotInCatalog`, and the turn
+/// stripped the session bearer while still aiming at the original endpoint.
+#[tokio::test(flavor = "current_thread")]
+async fn runtime_only_catalog_model_keeps_credentials_across_reconstruct() {
+    use xai_grok_sampler::AuthScheme;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_dir, am) = auth_manager_with_valid_token("session-token");
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                Some(am),
+                "cached_token",
+                xai_chat_state::AuthType::SessionToken,
+                "live-session-jwt".to_string(),
+            )
+            .await;
+
+            // Runtime-only model: present in ModelsManager, absent from any
+            // config-only resolve_model_list(&cfg, None).
+            let remote_id = "remote-grok-x";
+            let mut entry = crate::agent::config::ModelEntry::fallback(
+                remote_id,
+                &crate::agent::config::EndpointsConfig::default(),
+            );
+            entry.info.base_url = "https://api.x.ai/v1".to_string();
+            entry.info.auth_scheme = AuthScheme::Bearer;
+            actor.models_manager.insert_test_entry(remote_id, entry);
+            // Non-empty catalog that does not rely on the synthetic "test" id.
+            actor.models_manager.insert_test_entry(
+                "other-bundled",
+                crate::agent::config::ModelEntry::fallback(
+                    "other-bundled",
+                    &crate::agent::config::EndpointsConfig::default(),
+                ),
+            );
+
+            if let Some(mut cfg) = actor.chat_state_handle.get_sampling_config().await {
+                cfg.model = remote_id.to_string();
+                cfg.base_url = "https://api.x.ai/v1".to_string();
+                actor.chat_state_handle.update_sampling_config(cfg);
+            }
+            actor.catalog_model_id.set(remote_id.to_string());
+            // No seeded memo — force a fresh resolution through the session path.
+            actor.model_auth_memo.replace(None);
+
+            let facts = actor.model_auth_facts(remote_id);
+            assert_eq!(
+                facts.readiness,
+                crate::agent::auth_method::ModelReadiness::Ready,
+                "runtime-catalog hit must be Ready, not NotInCatalog"
+            );
+
+            let cfg = actor.reconstruct_full_config().await;
+            assert_eq!(cfg.model, remote_id);
+            assert_eq!(cfg.base_url, "https://api.x.ai/v1");
+            assert!(
+                cfg.api_key.is_some() || cfg.bearer_resolver.is_some(),
+                "runtime-only model must keep credentials; got api_key={:?} resolver={}",
+                cfg.api_key.as_ref().map(|_| "<redacted>"),
+                cfg.bearer_resolver.is_some()
+            );
+            assert_ne!(
+                cfg.auth_scheme,
+                AuthScheme::None,
+                "must not strip auth_scheme for a catalogued runtime-only model"
+            );
+            assert_ne!(
+                cfg.credential_source,
+                Some(xai_grok_sampler::CredentialSource::Missing),
+                "must not label a surviving credential as Missing"
+            );
+        })
+        .await;
+}
+
+/// #159 companion: a genuine miss against a non-empty runtime catalog still
+/// strips. Without this, the fix could become a blanket credential keep.
+#[tokio::test(flavor = "current_thread")]
+async fn genuine_runtime_catalog_miss_still_strips_credentials() {
+    use xai_grok_sampler::AuthScheme;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_dir, am) = auth_manager_with_valid_token("session-token");
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                Some(am),
+                "cached_token",
+                xai_chat_state::AuthType::SessionToken,
+                "live-session-jwt".to_string(),
+            )
+            .await;
+
+            // Authoritative catalog that does NOT contain the active model.
+            actor.models_manager.insert_test_entry(
+                "known-model",
+                crate::agent::config::ModelEntry::fallback(
+                    "known-model",
+                    &crate::agent::config::EndpointsConfig::default(),
+                ),
+            );
+
+            let missing_id = "definitely-not-in-catalog";
+            if let Some(mut cfg) = actor.chat_state_handle.get_sampling_config().await {
+                cfg.model = missing_id.to_string();
+                cfg.base_url = "https://vendor.example/v1".to_string();
+                actor.chat_state_handle.update_sampling_config(cfg);
+            }
+            actor.catalog_model_id.set(missing_id.to_string());
+            actor.model_auth_memo.replace(None);
+
+            let facts = actor.model_auth_facts(missing_id);
+            assert_eq!(
+                facts.readiness,
+                crate::agent::auth_method::ModelReadiness::Unknown(
+                    crate::agent::auth_method::UnknownReason::NotInCatalog
+                ),
+            );
+
+            let cfg = actor.reconstruct_full_config().await;
+            assert!(
+                cfg.api_key.is_none(),
+                "genuine catalog miss must strip the chat-state key"
+            );
+            assert_eq!(cfg.auth_scheme, AuthScheme::None);
+            assert!(cfg.bearer_resolver.is_none());
+            assert_eq!(
+                cfg.credential_source,
+                Some(xai_grok_sampler::CredentialSource::Missing),
+            );
+        })
+        .await;
+}
+
+/// #159: a verdict from an incomplete lookup must not freeze in the memo as
+/// definite. Empty ModelsManager + config-only miss → CatalogUnavailable /
+/// byok Unknown → memo stays empty so a later real catalog can re-resolve.
+#[tokio::test(flavor = "current_thread")]
+async fn incomplete_auth_lookup_is_not_memoized_as_definite() {
+    use crate::agent::auth_method::{ModelByok, ModelReadiness, UnknownReason};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                None,
+                "cached_token",
+                xai_chat_state::AuthType::SessionToken,
+                "k".to_string(),
+            )
+            .await;
+
+            // Default test ModelsManager is empty → runtime catalog not
+            // authoritative; slug absent from config-only defaults.
+            let id = "remote-only-never-in-config";
+            assert!(
+                actor.models_manager.models().is_empty(),
+                "fixture starts with an empty runtime catalog"
+            );
+            actor.model_auth_memo.replace(None);
+
+            let facts = actor.model_auth_facts(id);
+            assert_eq!(facts.byok, ModelByok::Unknown);
+            assert_eq!(
+                facts.readiness,
+                ModelReadiness::Unknown(UnknownReason::CatalogUnavailable),
+            );
+            assert!(
+                actor.model_auth_memo.borrow().is_none(),
+                "incomplete lookup must not populate the memo as definite"
+            );
+
+            // Later: the runtime catalog gains the model. Without a frozen
+            // wrong memo, re-resolve must see Ready.
+            let mut entry = crate::agent::config::ModelEntry::fallback(
+                id,
+                &crate::agent::config::EndpointsConfig::default(),
+            );
+            entry.info.auth_scheme = xai_grok_sampler::AuthScheme::Bearer;
+            actor.models_manager.insert_test_entry(id, entry);
+            // Also ensure non-empty catalog path is taken.
+            actor.models_manager.insert_test_entry(
+                "padding",
+                crate::agent::config::ModelEntry::fallback(
+                    "padding",
+                    &crate::agent::config::EndpointsConfig::default(),
+                ),
+            );
+
+            let facts = actor.model_auth_facts(id);
+            assert_eq!(facts.readiness, ModelReadiness::Ready);
+            assert_eq!(facts.byok, ModelByok::NotByok);
+            assert!(
+                actor.model_auth_memo.borrow().is_some(),
+                "a definite Ready verdict may now be memoized"
+            );
+        })
+        .await;
+}
+
+/// #159 F1: `on_auth_changed`'s bundled-fallback path wholesale-replaces the
+/// catalog via `rebuild`. That mutation must bump `catalog_generation` so a
+/// Ready memo under generation *N* cannot survive a swap that dropped its
+/// subject (mirror of the etag-flicker permanent-strip case, other side).
+///
+/// Sequence under test:
+/// 1. runtime-only model present (insert_test_entry; never a "real" fetch)
+/// 2. session memoizes Ready at generation *N*
+/// 3. `on_auth_changed` → remote fetch fails → `needs_bundled_fallback` → `rebuild`
+/// 4. generation advances; re-resolve sees NotInCatalog (not the frozen Ready)
+#[tokio::test(flavor = "current_thread")]
+async fn on_auth_changed_bundled_fallback_rebuild_invalidates_model_auth_memo() {
+    use crate::agent::auth_method::{ModelByok, ModelReadiness, UnknownReason};
+    use crate::agent::models::{
+        ModelFetchAuth, ModelsEndpoint, ModelsFetchFuture, ModelsManagerBuilder,
+    };
+    use indexmap::IndexMap;
+    use xai_grok_sampler::AuthScheme;
+
+    /// Fetch always fails so `on_auth_changed` lands in the bundled-fallback
+    /// branch rather than publishing a real catalog.
+    struct AlwaysFailEndpoint;
+    impl ModelsEndpoint for AlwaysFailEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: crate::agent::config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            Box::pin(async move { None })
+        }
+    }
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_dir, am) = auth_manager_with_valid_token("session-token");
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                Some(am.clone()),
+                "cached_token",
+                xai_chat_state::AuthType::SessionToken,
+                "live-session-jwt".to_string(),
+            )
+            .await;
+
+            // Unique Arc so we can swap in a manager with a failing endpoint.
+            let mut actor = match Arc::try_unwrap(actor) {
+                Ok(a) => a,
+                Err(_) => panic!("actor Arc is unique"),
+            };
+            let fail_mgr = ModelsManagerBuilder::new(
+                None,
+                IndexMap::new(),
+                acp::ModelId::new("default"),
+                am,
+                crate::agent::config::Config::default(),
+            )
+            .endpoint(Arc::new(AlwaysFailEndpoint))
+            .build();
+            actor.models_manager = fail_mgr;
+            let actor = Arc::new(actor);
+
+            let model_id = "rebuild-fallback-only-model";
+            let mut entry = crate::agent::config::ModelEntry::fallback(
+                model_id,
+                &crate::agent::config::EndpointsConfig::default(),
+            );
+            entry.info.auth_scheme = AuthScheme::Bearer;
+            entry.info.base_url = "https://api.x.ai/v1".to_string();
+            // insert_test_entry (not apply_catalog): leaves has_fetched_real_catalog
+            // false so on_auth_changed can still enter needs_bundled_fallback.
+            actor.models_manager.insert_test_entry(model_id, entry);
+            actor.models_manager.insert_test_entry(
+                "padding",
+                crate::agent::config::ModelEntry::fallback(
+                    "padding",
+                    &crate::agent::config::EndpointsConfig::default(),
+                ),
+            );
+
+            if let Some(mut cfg) = actor.chat_state_handle.get_sampling_config().await {
+                cfg.model = model_id.to_string();
+                cfg.base_url = "https://api.x.ai/v1".to_string();
+                actor.chat_state_handle.update_sampling_config(cfg);
+            }
+            actor.catalog_model_id.set(model_id.to_string());
+            actor.model_auth_memo.replace(None);
+
+            let gen_before = actor.models_manager.catalog_generation();
+            assert!(
+                gen_before > 0,
+                "insert_test_entry must have advanced generation before the memo"
+            );
+
+            let facts = actor.model_auth_facts(model_id);
+            assert_eq!(facts.readiness, ModelReadiness::Ready);
+            assert_eq!(facts.byok, ModelByok::NotByok);
+            assert!(
+                actor.model_auth_memo.borrow().is_some(),
+                "Ready must freeze in the memo under generation {gen_before}"
+            );
+            assert_eq!(
+                actor
+                    .model_auth_memo
+                    .borrow()
+                    .as_ref()
+                    .map(|m| m.catalog_generation),
+                Some(gen_before),
+            );
+
+            // Auth change + failed remote fetch → rebuild to bundled defaults.
+            actor.models_manager.on_auth_changed().await;
+
+            let gen_after = actor.models_manager.catalog_generation();
+            assert_ne!(
+                gen_after, gen_before,
+                "rebuild via on_auth_changed fallback must bump catalog_generation \
+                 so the Ready memo cannot outlive a catalog that dropped its subject"
+            );
+            assert!(
+                !actor.models_manager.models().contains_key(model_id),
+                "bundled-fallback rebuild must drop the runtime-only model"
+            );
+
+            let facts = actor.model_auth_facts(model_id);
+            assert_eq!(
+                facts.readiness,
+                ModelReadiness::Unknown(UnknownReason::NotInCatalog),
+                "after rebuild, must not keep serving a frozen Ready memo"
+            );
+            let stripped = actor.reconstruct_full_config().await;
+            assert!(
+                stripped.api_key.is_none(),
+                "model dropped by rebuild must strip credentials"
+            );
+            assert_eq!(stripped.auth_scheme, AuthScheme::None);
+        })
+        .await;
+}
+
+/// #159 F1: a catalog publish that momentarily drops a model must not leave
+/// the session permanently stripped after the model is restored.
+///
+/// Without catalog-generation invalidation, the turn that sees the empty
+/// publish freezes `NotByok`+`NotInCatalog` in the memo; the restore only
+/// fires `notify_models_updated` and never clears the memo, so every later
+/// turn keeps stripping credentials.
+#[tokio::test(flavor = "current_thread")]
+async fn catalog_refresh_that_drops_then_restores_must_not_leave_permanent_strip() {
+    use crate::agent::auth_method::{ModelByok, ModelReadiness, UnknownReason};
+    use indexmap::IndexMap;
+    use xai_grok_sampler::AuthScheme;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_dir, am) = auth_manager_with_valid_token("session-token");
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                Some(am),
+                "cached_token",
+                xai_chat_state::AuthType::SessionToken,
+                "live-session-jwt".to_string(),
+            )
+            .await;
+
+            let model_id = "etag-flicker-model";
+            let mut entry = crate::agent::config::ModelEntry::fallback(
+                model_id,
+                &crate::agent::config::EndpointsConfig::default(),
+            );
+            entry.info.auth_scheme = AuthScheme::Bearer;
+            entry.info.base_url = "https://api.x.ai/v1".to_string();
+
+            // Present in catalog → Ready, memoized at current generation.
+            // Must go through apply_catalog (not insert_test_entry) so the
+            // generation key is proven on the production publish path.
+            let mut with_model = IndexMap::new();
+            with_model.insert(model_id.to_string(), entry.clone());
+            // Padding keeps the catalog non-empty so a later miss is a real
+            // NotInCatalog rather than an empty-catalog fallthrough.
+            with_model.insert(
+                "padding".to_string(),
+                crate::agent::config::ModelEntry::fallback(
+                    "padding",
+                    &crate::agent::config::EndpointsConfig::default(),
+                ),
+            );
+            // Session has M selected; first auth resolve lands after a bad
+            // refresh (memo still empty) — the review's permanent-strip path.
+            actor
+                .models_manager
+                .apply_catalog_for_test(with_model.clone());
+            let gen_with_model = actor.models_manager.catalog_generation();
+            assert!(
+                gen_with_model > 0,
+                "apply_catalog_for_test must bump generation on the production path"
+            );
+
+            if let Some(mut cfg) = actor.chat_state_handle.get_sampling_config().await {
+                cfg.model = model_id.to_string();
+                cfg.base_url = "https://api.x.ai/v1".to_string();
+                actor.chat_state_handle.update_sampling_config(cfg);
+            }
+            actor.catalog_model_id.set(model_id.to_string());
+            actor.model_auth_memo.replace(None);
+
+            // Transient etag refresh: model missing from an otherwise non-empty catalog.
+            let mut without_model = IndexMap::new();
+            without_model.insert(
+                "padding".to_string(),
+                crate::agent::config::ModelEntry::fallback(
+                    "padding",
+                    &crate::agent::config::EndpointsConfig::default(),
+                ),
+            );
+            actor.models_manager.apply_catalog_for_test(without_model);
+            assert_ne!(
+                actor.models_manager.catalog_generation(),
+                gen_with_model,
+                "drop publish must advance catalog generation"
+            );
+
+            let facts = actor.model_auth_facts(model_id);
+            assert_eq!(
+                facts.readiness,
+                ModelReadiness::Unknown(UnknownReason::NotInCatalog),
+                "authoritative miss during the flicker is still NotInCatalog"
+            );
+            assert_eq!(facts.byok, ModelByok::NotByok);
+            assert!(
+                actor.model_auth_memo.borrow().is_some(),
+                "definite NotInCatalog must freeze in the memo"
+            );
+            let stripped = actor.reconstruct_full_config().await;
+            assert!(
+                stripped.api_key.is_none(),
+                "genuine miss during the flicker must strip"
+            );
+            assert_eq!(stripped.auth_scheme, AuthScheme::None);
+            assert_eq!(
+                stripped.credential_source,
+                Some(xai_grok_sampler::CredentialSource::Missing),
+            );
+
+            // Restore through the real publish path only. Without generation
+            // keyed into the memo, this freezes NotInCatalog forever.
+            actor.models_manager.apply_catalog_for_test(with_model);
+
+            let facts = actor.model_auth_facts(model_id);
+            assert_eq!(
+                facts.readiness,
+                ModelReadiness::Ready,
+                "after restore, must not keep serving a frozen NotInCatalog memo"
+            );
+            let cfg = actor.reconstruct_full_config().await;
+            assert!(
+                cfg.api_key.is_some() || cfg.bearer_resolver.is_some(),
+                "restored catalog must keep credentials; got api_key={:?} resolver={}",
+                cfg.api_key.as_ref().map(|_| "<redacted>"),
+                cfg.bearer_resolver.is_some()
+            );
+            assert_ne!(
+                cfg.auth_scheme,
+                AuthScheme::None,
+                "must not permanently strip after a transient catalog drop"
+            );
+        })
+        .await;
+}
+
 /// A transient catalog failure is not a verdict: it must leave a live session
 /// alone rather than de-credentialing the turn.
 ///
@@ -1754,6 +2332,10 @@ async fn absent_from_catalog_strips_the_credential_for_every_auth_method() {
 /// classification must not demote a live session to non-refreshable api-key
 /// mode; clearing the resolvers here would do worse -- send nothing at all, and
 /// 401 every turn until restart.
+///
+/// Hand-seeds keep `byok = NotByok` so the memo is cacheable; a readiness-only
+/// non-cacheable clause would bypass the seed and re-resolve both arms to
+/// `CatalogUnavailable` against an empty test manager (#159 F2).
 #[tokio::test(flavor = "current_thread")]
 async fn a_transient_catalog_failure_leaves_a_live_session_intact() {
     use crate::agent::auth_method::{ModelByok, ModelReadiness, UnknownReason};
@@ -1775,17 +2357,38 @@ async fn a_transient_catalog_failure_leaves_a_live_session_intact() {
                 )
                 .await;
                 pin_first_party_session_model(&actor).await;
+                let model_id = actor.catalog_model_id_str();
                 actor
                     .model_auth_memo
                     .replace(Some(crate::session::acp_session::ModelAuthMemo {
-                        model_id: actor.catalog_model_id_str(),
+                        model_id: model_id.clone(),
                         facts: ModelAuthFacts {
                             byok: ModelByok::NotByok,
                             auth_scheme: AuthScheme::Bearer,
                             readiness: ModelReadiness::Unknown(reason),
                         },
                         provider: None,
+                        catalog_generation: actor.models_manager.catalog_generation(),
                     }));
+
+                // F2: the seeded readiness must actually be served at the
+                // reconstruct arm (`sampler_turn` Unknown(reason) path) — not
+                // collapsed by a fresh empty-catalog resolve. Assert on
+                // reason.as_str() so the two loop iterations are proven to
+                // reach *different* reasons (auth_scheme alone does not).
+                let served = actor.model_auth_facts(&model_id);
+                match &served.readiness {
+                    ModelReadiness::Unknown(got) => {
+                        assert_eq!(
+                            got.as_str(),
+                            reason.as_str(),
+                            "{reason:?}: memo must be served so UnidentifiedModel stays distinct from CatalogUnavailable"
+                        );
+                    }
+                    other => panic!(
+                        "{reason:?}: expected Unknown, got {other:?} (memo disarmed?)"
+                    ),
+                }
 
                 let cfg = actor.reconstruct_full_config().await;
 
@@ -1885,6 +2488,7 @@ async fn catalog_unavailable_external_refuses_ambient_session_credential() {
                         readiness: ModelReadiness::Unknown(UnknownReason::CatalogUnavailable),
                     },
                     provider: None,
+                    catalog_generation: 0,
                 }));
 
             let cfg = actor.reconstruct_full_config().await;
@@ -1974,6 +2578,7 @@ async fn catalog_unavailable_url_derived_external_refuses_ambient_session_creden
                         readiness: ModelReadiness::Unknown(UnknownReason::CatalogUnavailable),
                     },
                     provider: None,
+                    catalog_generation: 0,
                 }));
 
             let cfg = actor.reconstruct_full_config().await;
@@ -2042,6 +2647,7 @@ async fn refresh_token_if_expired_skips_session_refresh_for_none_auth_scheme() {
                         readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
+                    catalog_generation: 0,
                 }));
 
             actor.refresh_token_if_expired().await;
@@ -2091,6 +2697,7 @@ async fn reconstruct_full_config_uses_catalog_key_for_none_alias_with_shared_wir
                         readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
+                    catalog_generation: 0,
                 }));
 
             let cfg = actor.reconstruct_full_config().await;
@@ -2144,6 +2751,7 @@ async fn set_session_model_preserves_catalog_key_for_none_alias_with_shared_wire
                         readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
+                    catalog_generation: 0,
                 }));
 
             let switch_cfg = xai_grok_sampler::SamplerConfig {
@@ -2203,6 +2811,7 @@ async fn set_session_model_preserves_catalog_key_for_none_alias_with_shared_wire
                         readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
+                    catalog_generation: 0,
                 }));
 
             let cfg = actor.reconstruct_full_config().await;
@@ -2337,6 +2946,7 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                         readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
+                    catalog_generation: 0,
                 }));
 
             // Switch to the same model_id, now a per-model BYOK model on a
@@ -2416,6 +3026,7 @@ async fn seed_provider_memo(actor: &Arc<SessionActor>, provider: crate::auth::Au
                 readiness: crate::agent::auth_method::ModelReadiness::Ready,
             },
             provider: Some(provider),
+            catalog_generation: 0,
         }));
 }
 

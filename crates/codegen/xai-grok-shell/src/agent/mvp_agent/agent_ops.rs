@@ -3765,11 +3765,27 @@ impl MvpAgent {
     /// `current_model_id` — that's deferred to session creation time to avoid
     /// cross-client contamination in leader mode (where `current_model_id` is
     /// shared mutable state).
+    ///
+    /// #180: bytes and label are written together. `ExplicitHeader` is a
+    /// **post-strip** label (`sampling_config_for_model` clears ambient then
+    /// writes it), so `api_key.is_none()` there is intentional, not a vacancy.
+    /// Re-injecting ambient session bytes under that label disarms L3's
+    /// `is_ambient_xai()` refusal. When this seed *does* write ambient bytes,
+    /// it stamps `CredentialSource::XaiSession` to match.
     pub(super) fn seed_client_config_auth_if_available(&self) {
         let mut sampling_config = self.sampling_config.borrow_mut();
+        // Post-strip: ambient was removed on purpose for a header-auth route.
+        if matches!(
+            sampling_config.credential_source,
+            Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
+        ) {
+            return;
+        }
         if sampling_config.api_key.is_none() {
             if let Some(auth) = self.auth_manager.current_or_expired() {
                 sampling_config.api_key = Some(auth.key);
+                sampling_config.credential_source =
+                    Some(xai_grok_sampler::CredentialSource::XaiSession);
                 tracing::debug!("auth: seed_client_config set auth (SessionToken)");
                 xai_grok_telemetry::unified_log::debug(
                     "auth: seed_client_config set auth (SessionToken)",
@@ -4786,9 +4802,13 @@ impl MvpAgent {
         let web_search_disable_notice = if disable_web_search {
             None
         } else {
+            // Same predicate as the spawn path and the reason text, so the
+            // notice fires exactly when web_search is really disabled. Asking
+            // `api_key.is_none()` here notified users who were authenticated
+            // by an explicit header and whose search still worked (#160).
             let needs_notice = web_search_sampling_config
                 .as_ref()
-                .is_none_or(|cfg| cfg.api_key.is_none());
+                .is_none_or(|cfg| !config::has_usable_credential(cfg));
             if !needs_notice {
                 None
             } else if let Some(reason) = web_search_disable_reason {
