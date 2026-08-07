@@ -757,7 +757,7 @@ fn add_models_session_headers_blocking(
 /// Catalog requests carry credentials and therefore use a redirect-denying
 /// client. Keeping this policy catalog-local avoids changing unrelated startup
 /// requests while ensuring credentials cannot be replayed to another origin.
-fn models_catalog_blocking_client() -> reqwest::blocking::Client {
+pub fn models_catalog_blocking_client() -> reqwest::blocking::Client {
     static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
     CLIENT
         .get_or_init(|| {

@@ -1079,6 +1079,38 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             local_workspace_removed_meta_rejected_fail_closed_matrix -- --nocapture
 
+      # #188 (one slice): the Codex catalog is fetched instead of hardcoded to a
+      # single preset. Every failure here degrades to that preset, which looks
+      # exactly like the old behaviour -- so the parser shape and the required
+      # query parameter both need a test that fails loudly when they drift.
+      # Full unique names so run_nonzero proves each one still runs.
+      - name: 'Codex account model catalog (issue #188)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_parser_reads_the_shape_the_endpoint_actually_returns -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_parser_tolerates_other_shapes_and_prefers_max_context_window -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_url_carries_the_required_client_version -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_fallback_uses_builtin_preset_when_fetch_is_empty -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_credential_source_must_be_openai_codex_provider -- --nocapture
+
       # #36: restore fd bundling only with a public PI caller and contract.
       # The tests are split by build mode: override-path bundle and release
       # auto-download bundle. Filters are written explicitly so #171 can prove
