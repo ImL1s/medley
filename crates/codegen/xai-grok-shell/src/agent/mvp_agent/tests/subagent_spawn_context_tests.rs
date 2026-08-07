@@ -294,3 +294,149 @@ async fn subagent_spawn_context_inherits_parent_process_scope() {
         "the child sees the owner enrolled through the parent scope"
     );
 }
+
+fn issue14_stdio_server(name: &str) -> acp::McpServer {
+    acp::McpServer::Stdio(acp::McpServerStdio::new(name.to_string(), "true"))
+}
+
+/// #14: spawn-time refresh must overwrite bootstrap snapshots so children see
+/// current capabilities, not the parent handle's stale copies.
+#[tokio::test]
+async fn issue14_spawn_refresh_replaces_stale_parent_capabilities() {
+    use crate::session::commands::SubagentCapabilitySnapshot;
+    use crate::session::{SessionCommand, mcp_servers::mcp_server_name};
+
+    let agent = build_minimal_agent_for_tests();
+    let sid = acp::SessionId::new("issue14-refresh-parent");
+    let (mut handle, _cmd_tx, mut cmd_rx) = super::make_live_session_handle(&sid, None);
+    handle.mcp_servers = vec![issue14_stdio_server("stale-bootstrap-mcp")];
+    agent.sessions.borrow_mut().insert(sid.clone(), handle);
+
+    tokio::spawn(async move {
+        while let Some(cmd) = cmd_rx.recv().await {
+            if let SessionCommand::SnapshotSubagentCapabilities { respond_to } = cmd {
+                let _ = respond_to.send(Ok(SubagentCapabilitySnapshot {
+                    mcp_configs: vec![issue14_stdio_server("fresh-live-mcp")],
+                    mcp_pool: None,
+                    client_hooks: Default::default(),
+                    tool_definitions: vec![xai_grok_sampling_types::ToolSpec {
+                        name: "issue14_fresh_tool".to_string(),
+                        description: Some("spawn-refresh tool".to_string()),
+                        parameters: serde_json::json!({
+                            "type": "object",
+                            "properties": {}
+                        }),
+                    }],
+                    skills: vec![xai_grok_tools::implementations::skills::types::SkillInfo {
+                        name: "issue14-fresh-skill".to_string(),
+                        description: "spawn-refresh skill".to_string(),
+                        ..Default::default()
+                    }],
+                    mcp_generation: 41,
+                }));
+                break;
+            }
+        }
+    });
+
+    let mut ctx = agent.build_subagent_spawn_context(sid.0.as_ref());
+    assert_eq!(
+        ctx.parent_mcp_configs
+            .iter()
+            .map(mcp_server_name)
+            .collect::<Vec<_>>(),
+        vec!["stale-bootstrap-mcp"],
+        "precondition: bootstrap context starts from SessionHandle snapshot"
+    );
+    assert!(ctx.parent_skills.is_none());
+    assert!(ctx.parent_tool_definitions.is_none());
+
+    let handle = agent
+        .sessions
+        .borrow()
+        .get(&sid)
+        .cloned()
+        .expect("parent handle should exist");
+    let refreshed = agent
+        .refresh_subagent_capabilities_for_spawn(&mut ctx, &handle)
+        .await
+        .expect("capability refresh should succeed");
+
+    assert_eq!(refreshed.mcp_generation, 41);
+    assert_eq!(
+        ctx.parent_mcp_configs
+            .iter()
+            .map(mcp_server_name)
+            .collect::<Vec<_>>(),
+        vec!["fresh-live-mcp"],
+        "spawn refresh must replace stale MCP configs before child construction"
+    );
+    assert_eq!(
+        ctx.parent_tool_definitions
+            .as_ref()
+            .expect("refreshed tools should be set")
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["issue14_fresh_tool"]
+    );
+    assert_eq!(
+        ctx.parent_skills
+            .as_ref()
+            .expect("refreshed skills should be set")
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["issue14-fresh-skill"]
+    );
+}
+
+/// #14: when the parent actor is unavailable, capability refresh must fail
+/// explicitly and leave the bootstrap snapshot untouched.
+#[tokio::test]
+async fn issue14_spawn_refresh_parent_actor_unavailable_is_actionable_error() {
+    use crate::session::mcp_servers::mcp_server_name;
+
+    let agent = build_minimal_agent_for_tests();
+    let sid = acp::SessionId::new("issue14-refresh-unavailable");
+    let mut handle = make_test_handle("test-model", false, None);
+    handle.info = crate::session::info::Info {
+        id: sid.clone(),
+        cwd: "/tmp".to_string(),
+    };
+    handle.mcp_servers = vec![issue14_stdio_server("stale-bootstrap-mcp")];
+    agent.sessions.borrow_mut().insert(sid.clone(), handle);
+
+    let mut ctx = agent.build_subagent_spawn_context(sid.0.as_ref());
+    let original = ctx
+        .parent_mcp_configs
+        .iter()
+        .map(|server| mcp_server_name(server).to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(original, vec!["stale-bootstrap-mcp".to_string()]);
+
+    let handle = agent
+        .sessions
+        .borrow()
+        .get(&sid)
+        .cloned()
+        .expect("parent handle should exist");
+    let err = agent
+        .refresh_subagent_capabilities_for_spawn(&mut ctx, &handle)
+        .await
+        .expect_err("refresh must fail when parent actor channel is closed");
+    assert!(
+        err.contains("unavailable"),
+        "error should be actionable, got: {err}"
+    );
+    assert_eq!(
+        ctx.parent_mcp_configs
+            .iter()
+            .map(|server| mcp_server_name(server).to_string())
+            .collect::<Vec<_>>(),
+        original,
+        "failed refresh must not partially mutate capability snapshots"
+    );
+    assert!(ctx.parent_tool_definitions.is_none());
+    assert!(ctx.parent_skills.is_none());
+}
