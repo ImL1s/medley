@@ -2775,20 +2775,20 @@ fn test_catalog_auth_schemes_and_override() {
         "/v1/models",
         axum::routing::get(move |headers: axum::http::HeaderMap| async move {
             target_reqs_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if let Some(auth) = headers.get("authorization") {
-                if let Ok(s) = auth.to_str() {
-                    *auth_header_clone.lock().unwrap() = Some(s.to_string());
-                }
+            if let Some(auth) = headers.get("authorization")
+                && let Ok(s) = auth.to_str()
+            {
+                *auth_header_clone.lock().unwrap() = Some(s.to_string());
             }
-            if let Some(custom) = headers.get("x-api-key") {
-                if let Ok(s) = custom.to_str() {
-                    *custom_header_clone.lock().unwrap() = Some(s.to_string());
-                }
+            if let Some(custom) = headers.get("x-api-key")
+                && let Ok(s) = custom.to_str()
+            {
+                *custom_header_clone.lock().unwrap() = Some(s.to_string());
             }
-            if let Some(extra) = headers.get("X-Organization") {
-                if let Ok(s) = extra.to_str() {
-                    *extra_header_clone.lock().unwrap() = Some(s.to_string());
-                }
+            if let Some(extra) = headers.get("X-Organization")
+                && let Ok(s) = extra.to_str()
+            {
+                *extra_header_clone.lock().unwrap() = Some(s.to_string());
             }
             axum::Json(serde_json::json!({
                 "data": [

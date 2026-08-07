@@ -867,10 +867,10 @@ pub(crate) fn validate_models_catalog_auth(
             if reqwest::header::HeaderName::from_bytes(key.as_bytes()).is_err() {
                 return Err(format!("invalid header name {:?}", key));
             }
-            if let Some(val) = catalog_auth.headers.get(key) {
-                if reqwest::header::HeaderValue::from_str(val).is_err() {
-                    return Err(format!("invalid header value for {:?}", key));
-                }
+            if let Some(val) = catalog_auth.headers.get(key)
+                && reqwest::header::HeaderValue::from_str(val).is_err()
+            {
+                return Err(format!("invalid header value for {:?}", key));
             }
         }
         match scheme {

@@ -459,10 +459,10 @@ impl EndpointsConfig {
         }
         let mut resolved: Self = base.try_into().unwrap_or_default();
         resolved.external_otel_master_switch = external_otel_master_switch;
-        if let Some(models_val) = config.get("models") {
-            if let Ok(catalog_auth) = Config::parse_catalog_auth_from_models_toml(models_val) {
-                resolved.catalog_auth = catalog_auth;
-            }
+        if let Some(models_val) = config.get("models")
+            && let Ok(catalog_auth) = Config::parse_catalog_auth_from_models_toml(models_val)
+        {
+            resolved.catalog_auth = catalog_auth;
         }
         resolved
     }
