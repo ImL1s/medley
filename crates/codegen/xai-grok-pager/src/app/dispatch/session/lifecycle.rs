@@ -1519,6 +1519,17 @@ pub(in crate::app::dispatch) fn handle_session_created(
         };
         effects.extend(drain.effects);
         if let Some((model_id, reasoning_effort)) = replacement_default {
+            let (rollback_model_id, rollback_reasoning_effort) = app
+                .model_switch_transaction
+                .as_ref()
+                .filter(|transaction| transaction.owner_agent_id == agent_id)
+                .map(|transaction| {
+                    (
+                        transaction.app_model_id.clone(),
+                        transaction.app_reasoning_effort,
+                    )
+                })
+                .unwrap_or((app.models.current.clone(), app.models.reasoning_effort));
             agent.session.user_model_preference = Some(model_id.clone());
             if app.models.available.contains_key(&model_id) {
                 app.models.set_current(model_id.clone(), reasoning_effort);
@@ -1533,6 +1544,8 @@ pub(in crate::app::dispatch) fn handle_session_created(
             effects.push(Effect::PersistPreferredModel {
                 model_id,
                 reasoning_effort,
+                rollback_model_id,
+                rollback_reasoning_effort,
             });
         }
         agent.session.prompt_history_loading = true;
@@ -1990,6 +2003,8 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                     vec![Effect::PersistPreferredModel {
                         model_id: model_id.clone(),
                         reasoning_effort: resolved_effort,
+                        rollback_model_id: transaction.app_model_id.clone(),
+                        rollback_reasoning_effort: transaction.app_reasoning_effort,
                     }]
                 }
             }

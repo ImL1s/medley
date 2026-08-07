@@ -1174,6 +1174,7 @@ fn switch_model_complete_persists_resolved_effort_from_catalog_meta() {
         Effect::PersistPreferredModel {
             model_id: mid,
             reasoning_effort,
+            ..
         } => {
             assert_eq!(*mid, model_id);
             assert_eq!(
@@ -2286,6 +2287,7 @@ fn confirmed_default_model_switch_persists_after_optimistic_mirror_update() {
         Effect::PersistPreferredModel {
             model_id,
             reasoning_effort: None,
+            ..
         } if model_id == &next_model
     ));
     assert_eq!(app.agents[&id].scrollback.len(), initial_scrollback + 1);
@@ -2380,6 +2382,7 @@ fn replacement_session_persists_confirmed_default_after_creation() {
                 Effect::PersistPreferredModel {
                     model_id,
                     reasoning_effort: None,
+                    ..
                 } if model_id == &target
             )
         })
@@ -2452,6 +2455,98 @@ fn chat_mode_default_switch_does_not_persist_build_default() {
             .iter()
             .any(|effect| matches!(effect, Effect::PersistPreferredModel { .. })),
         "chat catalog IDs must not overwrite the Build default"
+    );
+}
+
+#[test]
+fn preferred_model_persist_failure_restores_previous_default_mirror() {
+    use xai_grok_shell::sampling::types::ReasoningEffort;
+
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let previous = acp::ModelId::new("global-original");
+    let attempted = acp::ModelId::new("global-attempted");
+    for (model_id, name) in [
+        (previous.clone(), "Global Original"),
+        (attempted.clone(), "Global Attempted"),
+    ] {
+        app.models
+            .available
+            .insert(model_id.clone(), acp::ModelInfo::new(model_id, name));
+    }
+    app.models.current = Some(attempted.clone());
+    app.models.reasoning_effort = Some(ReasoningEffort::High);
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::PreferredModelPersisted {
+            model_id: attempted,
+            reasoning_effort: Some(ReasoningEffort::High),
+            rollback_model_id: Some(previous.clone()),
+            rollback_reasoning_effort: Some(ReasoningEffort::Low),
+            result: Err("disk full".into()),
+        }),
+        &mut app,
+    );
+
+    assert!(effects.is_empty());
+    assert_eq!(app.models.current, Some(previous));
+    assert_eq!(app.models.reasoning_effort, Some(ReasoningEffort::Low));
+    assert!(
+        app.agents[&id]
+            .scrollback
+            .iter_entries()
+            .any(|(_, entry)| matches!(
+                &entry.block,
+                RenderBlock::System(block) if block.text.contains("default restored")
+            )),
+        "persist failure should explain that the default mirror rolled back",
+    );
+}
+
+#[test]
+fn preferred_model_persist_failure_keeps_newer_default_mirror() {
+    use xai_grok_shell::sampling::types::ReasoningEffort;
+
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let rollback = acp::ModelId::new("global-original");
+    let attempted = acp::ModelId::new("global-attempted");
+    let newer = acp::ModelId::new("global-newer");
+    for (model_id, name) in [
+        (rollback.clone(), "Global Original"),
+        (attempted.clone(), "Global Attempted"),
+        (newer.clone(), "Global Newer"),
+    ] {
+        app.models
+            .available
+            .insert(model_id.clone(), acp::ModelInfo::new(model_id, name));
+    }
+    app.models.current = Some(newer.clone());
+    app.models.reasoning_effort = Some(ReasoningEffort::Low);
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::PreferredModelPersisted {
+            model_id: attempted,
+            reasoning_effort: Some(ReasoningEffort::High),
+            rollback_model_id: Some(rollback),
+            rollback_reasoning_effort: None,
+            result: Err("permission denied".into()),
+        }),
+        &mut app,
+    );
+
+    assert!(effects.is_empty());
+    assert_eq!(app.models.current, Some(newer));
+    assert_eq!(app.models.reasoning_effort, Some(ReasoningEffort::Low));
+    assert!(
+        app.agents[&id]
+            .scrollback
+            .iter_entries()
+            .any(|(_, entry)| matches!(
+                &entry.block,
+                RenderBlock::System(block) if block.text.contains("newer default kept")
+            )),
+        "stale persist failure should not clobber a newer committed default",
     );
 }
 

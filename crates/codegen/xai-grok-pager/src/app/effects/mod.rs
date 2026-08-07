@@ -1995,7 +1995,12 @@ pub(crate) fn execute(
             );
             persist_hint(tasks, config_key, mode.as_config_str(), "worktree mode");
         }
-        Effect::PersistPreferredModel { model_id, reasoning_effort } => {
+        Effect::PersistPreferredModel {
+            model_id,
+            reasoning_effort,
+            rollback_model_id,
+            rollback_reasoning_effort,
+        } => {
             let model_id_str = model_id.0.to_string();
             tasks
                 .spawn(async move {
@@ -2009,6 +2014,10 @@ pub(crate) fn execute(
                         tracing::warn!("failed to save default model preference: {e}");
                     }
                     TaskResult::PreferredModelPersisted {
+                        model_id,
+                        reasoning_effort,
+                        rollback_model_id,
+                        rollback_reasoning_effort,
                         result,
                     }
                 });

@@ -502,13 +502,31 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             vec![]
         }
-        TaskResult::PreferredModelPersisted { result } => {
-            if let Err(err) = result
-                && let Some(agent) = get_active_agent_mut(app)
-            {
-                agent.scrollback.push_block(RenderBlock::system(format!(
-                    "Couldn't save preferred model: {err} (still active for this session)"
-                )));
+        TaskResult::PreferredModelPersisted {
+            model_id,
+            reasoning_effort,
+            rollback_model_id,
+            rollback_reasoning_effort,
+            result,
+        } => {
+            if let Err(err) = result {
+                let should_rollback = app.models.current.as_ref() == Some(&model_id)
+                    && app.models.reasoning_effort == reasoning_effort;
+                if should_rollback {
+                    app.models.current = rollback_model_id;
+                    app.models.reasoning_effort = rollback_reasoning_effort;
+                }
+                if let Some(agent) = get_active_agent_mut(app) {
+                    let status = if should_rollback {
+                        "default restored"
+                    } else {
+                        "newer default kept"
+                    };
+                    agent.scrollback.push_block(RenderBlock::system(format!(
+                        "Couldn't save preferred model: {err} (still active for this session; \
+                         {status})"
+                    )));
+                }
             }
             vec![]
         }
