@@ -11,8 +11,7 @@
 
 use std::collections::{HashMap, VecDeque};
 #[cfg(not(unix))]
-use std::io::Read;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::{Arc, LazyLock};
 
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -34,7 +33,8 @@ const REAP_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
 
 pub(crate) struct PtySession {
     master: Option<Box<dyn MasterPty + Send>>,
-    /// Taken at teardown so the writer loop ends and releases its master dup.
+    /// Taken at teardown; the writer loop also watches `cancel`, so sender
+    /// clones cannot keep it parked in `recv`.
     input_tx: Option<mpsc::Sender<Vec<u8>>>,
     output_offset: u64,
     output_ring: VecDeque<u8>,
@@ -49,8 +49,10 @@ pub(crate) struct PtySession {
     gateway: GatewaySender,
     /// Signaled by teardown so the output reader leaves its wait points.
     cancel: CancellationToken,
-    /// Signaled by the output loop once the reader has stopped (fd released).
+    /// Signaled by the reader thread once it exits (reader fd released).
     reader_finished: CancellationToken,
+    /// Signaled by the writer thread once it exits (writer fd released).
+    writer_finished: CancellationToken,
 }
 
 /// A shell and the group that can signal it.
@@ -296,13 +298,18 @@ pub(crate) async fn create_pty(
     // while another thread sits in read(2). Non-unix keeps the portable-pty
     // reader trait object.
     #[cfg(unix)]
-    let reader_fd = {
+    let (reader_fd, writer_fd) = {
         let raw = pair
             .master
             .as_raw_fd()
             .ok_or_else(|| TerminalExtError::Internal("pty master has no raw fd".to_string()))?;
-        dup_fd(raw)
-            .map_err(|e| TerminalExtError::Internal(format!("failed to prepare pty reader: {e}")))?
+        let reader_fd = dup_fd(raw).map_err(|e| {
+            TerminalExtError::Internal(format!("failed to prepare pty reader: {e}"))
+        })?;
+        let writer_fd = dup_fd(raw).map_err(|e| {
+            TerminalExtError::Internal(format!("failed to prepare pty writer: {e}"))
+        })?;
+        (reader_fd, writer_fd)
     };
     #[cfg(not(unix))]
     let reader = pair
@@ -310,6 +317,7 @@ pub(crate) async fn create_pty(
         .try_clone_reader()
         .map_err(|e| TerminalExtError::Internal(format!("failed to clone pty reader: {e}")))?;
 
+    #[cfg(not(unix))]
     let writer = pair
         .master
         .take_writer()
@@ -317,9 +325,13 @@ pub(crate) async fn create_pty(
 
     let cancel = CancellationToken::new();
     let reader_finished = CancellationToken::new();
+    let writer_finished = CancellationToken::new();
 
     let (input_tx, input_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
-    spawn_pty_input_loop(writer, input_rx, cancel.clone());
+    #[cfg(unix)]
+    spawn_pty_input_loop_unix(writer_fd, input_rx, cancel.clone(), writer_finished.clone());
+    #[cfg(not(unix))]
+    spawn_pty_input_loop_blocking(writer, input_rx, cancel.clone(), writer_finished.clone());
 
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -376,6 +388,7 @@ pub(crate) async fn create_pty(
         gateway: gateway.clone(),
         cancel: cancel.clone(),
         reader_finished: reader_finished.clone(),
+        writer_finished: writer_finished.clone(),
     }));
     registry.insert(pty_id.clone(), entry.clone());
     drop(registry);
@@ -403,30 +416,90 @@ pub(crate) async fn create_pty(
     Ok(pty_id)
 }
 
-/// #132: writer loop. Ends when every `input_tx` is dropped (teardown takes the
-/// session's sender) or `cancel` fires between chunks.
+/// Wait for one input chunk, but also wake when `cancel` fires.
 ///
-/// Kept on the blocking pool because `portable-pty`'s writer is a plain
-/// `Write` (and its `Drop` sends VEOF). The master stays **blocking**: we
-/// never set `O_NONBLOCK` on the shared open-file-description, so `write_all`
-/// cannot spin on `WouldBlock` the way the AsyncFd experiment did.
-///
-/// `blocking_recv` cannot observe `cancel` by itself. Teardown always drops
-/// `input_tx` alongside cancel so this loop is guaranteed a wake. The cancel
-/// check between chunks is belt-and-suspenders for a mid-write race.
-fn spawn_pty_input_loop(
-    mut writer: Box<dyn Write + Send>,
-    mut input_rx: mpsc::Receiver<Vec<u8>>,
+/// Outside a runtime this falls back to polling `try_recv` with a short sleep.
+fn recv_input_chunk(
+    runtime: Option<&tokio::runtime::Handle>,
+    input_rx: &mut mpsc::Receiver<Vec<u8>>,
+    cancel: &CancellationToken,
+) -> Option<Vec<u8>> {
+    if let Some(runtime) = runtime {
+        return runtime.block_on(async {
+            tokio::select! {
+                _ = cancel.cancelled() => None,
+                chunk = input_rx.recv() => chunk,
+            }
+        });
+    }
+
+    loop {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        match input_rx.try_recv() {
+            Ok(chunk) => return Some(chunk),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                if input_rx.is_closed() {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return None,
+        }
+    }
+}
+
+/// Cancels its token on drop, used for reader/writer lifecycle signals.
+struct SignalFinished(CancellationToken);
+
+impl Drop for SignalFinished {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// #132 unix writer: poll for writable + cancel checks around each bounded
+/// write syscall so shutdown is not gated on sender-drop or `write_all`.
+#[cfg(unix)]
+fn spawn_pty_input_loop_unix(
+    writer_fd: std::os::fd::OwnedFd,
+    input_rx: mpsc::Receiver<Vec<u8>>,
     cancel: CancellationToken,
+    writer_finished: CancellationToken,
 ) {
-    // #132: not `spawn_blocking` — a session abandoned without close_pty
-    // (test panic, task cancel) would otherwise park BlockingPool::shutdown
-    // forever. std::thread is reaped when the process exits.
+    use std::os::fd::AsRawFd;
+
+    let runtime = tokio::runtime::Handle::try_current().ok();
     std::thread::spawn(move || {
-        while let Some(mut chunk) = input_rx.blocking_recv() {
-            if cancel.is_cancelled() {
+        let _signal_writer_finished = SignalFinished(writer_finished);
+        let runtime = runtime.as_ref();
+        let mut input_rx = input_rx;
+        while let Some(mut chunk) = recv_input_chunk(runtime, &mut input_rx, &cancel) {
+            while let Ok(more) = input_rx.try_recv() {
+                chunk.extend_from_slice(&more);
+            }
+            if write_pty_fd_cancelable(writer_fd.as_raw_fd(), &chunk, &cancel).is_err() {
                 break;
             }
+        }
+    });
+}
+
+/// #132 non-unix writer: still uses the portable-pty writer trait object.
+#[cfg(not(unix))]
+fn spawn_pty_input_loop_blocking(
+    mut writer: Box<dyn Write + Send>,
+    input_rx: mpsc::Receiver<Vec<u8>>,
+    cancel: CancellationToken,
+    writer_finished: CancellationToken,
+) {
+    let runtime = tokio::runtime::Handle::try_current().ok();
+    std::thread::spawn(move || {
+        let _signal_writer_finished = SignalFinished(writer_finished);
+        let runtime = runtime.as_ref();
+        let mut input_rx = input_rx;
+        while let Some(mut chunk) = recv_input_chunk(runtime, &mut input_rx, &cancel) {
             while let Ok(more) = input_rx.try_recv() {
                 chunk.extend_from_slice(&more);
             }
@@ -444,7 +517,7 @@ fn spawn_pty_input_loop(
 fn dup_fd(raw: std::os::fd::RawFd) -> std::io::Result<std::os::fd::OwnedFd> {
     use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
-    let duped: RawFd = unsafe { libc::dup(raw) };
+    let duped: RawFd = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 0) };
     if duped < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -466,6 +539,62 @@ fn read_pty_fd(fd: std::os::fd::RawFd, buf: &mut [u8]) -> std::io::Result<usize>
     Ok(n as usize)
 }
 
+#[cfg(unix)]
+fn write_pty_fd(fd: std::os::fd::RawFd, buf: &[u8]) -> std::io::Result<usize> {
+    let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(n as usize)
+}
+
+#[cfg(unix)]
+fn write_pty_fd_cancelable(
+    fd: std::os::fd::RawFd,
+    mut buf: &[u8],
+    cancel: &CancellationToken,
+) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+
+    while !buf.is_empty() {
+        if cancel.is_cancelled() {
+            return Err(std::io::Error::new(
+                ErrorKind::Interrupted,
+                "pty input cancelled",
+            ));
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let pret = unsafe { libc::poll(&mut pfd, 1, IO_POLL_TIMEOUT_MS) };
+        if pret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if pret == 0 {
+            continue;
+        }
+        let to_write = buf.len().min(4096);
+        match write_pty_fd(fd, &buf[..to_write]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::WriteZero,
+                    "pty writer produced a zero-byte write",
+                ));
+            }
+            Ok(n) => buf = &buf[n..],
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
 async fn ingest_output(pty: &Arc<Mutex<PtySession>>, pending: &mut Vec<u8>, data: &[u8]) {
     {
         let mut session = pty.lock().await;
@@ -479,19 +608,9 @@ async fn ingest_output(pty: &Arc<Mutex<PtySession>>, pending: &mut Vec<u8>, data
     pending.extend_from_slice(data);
 }
 
-/// Cancels `reader_finished` on drop so a panicked output loop cannot leave
-/// `close_pty` waiting forever.
-struct SignalReaderFinished(CancellationToken);
-
-impl Drop for SignalReaderFinished {
-    fn drop(&mut self) {
-        self.0.cancel();
-    }
-}
-
-/// #132: how often the blocking reader wakes to observe `cancel`. Bounded so
-/// `BlockingPool::shutdown` cannot wait forever on a parked `read(2)`.
-const READER_POLL_TIMEOUT_MS: i32 = 50;
+/// #132: reader/writer poll cadence for checking cancellation while keeping
+/// idle wakeups bounded.
+const IO_POLL_TIMEOUT_MS: i32 = 50;
 
 /// #132: reads PTY output via a cancellable `poll(2)` loop on a blocking
 /// thread, batches on a 16ms tick, and sends notifications.
@@ -518,15 +637,13 @@ async fn run_pty_output_loop_unix(
     use tokio::sync::mpsc;
     use tokio::time::{Duration, interval};
 
-    // Must outlive the read loop and be signaled *before* exit wait, so
-    // close_pty can kill the child without deadlocking on this task.
-    let signal_finished = SignalReaderFinished(reader_finished);
     let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(64);
 
     let cancel_reader = cancel.clone();
     // #132: see spawn_pty_input_loop — avoid BlockingPool::shutdown wedging
     // on an abandoned poll loop when close_pty never ran.
     std::thread::spawn(move || {
+        let _signal_reader_finished = SignalFinished(reader_finished);
         let reader_fd = reader_fd;
         let mut buf = [0u8; 4096];
         while !cancel_reader.is_cancelled() {
@@ -535,7 +652,7 @@ async fn run_pty_output_loop_unix(
                 events: libc::POLLIN,
                 revents: 0,
             };
-            let pret = unsafe { libc::poll(&mut pfd, 1, READER_POLL_TIMEOUT_MS) };
+            let pret = unsafe { libc::poll(&mut pfd, 1, IO_POLL_TIMEOUT_MS) };
             if cancel_reader.is_cancelled() {
                 break;
             }
@@ -614,10 +731,9 @@ async fn run_pty_output_loop_unix(
         flush_output(&pty, &pty_id, &mut pending, &gateway).await;
     }
 
-    // Dropping the receiver makes try_send fail closed; the poll loop exits on
-    // cancel (or EOF) and releases the master dup.
+    // Dropping the receiver makes try_send fail closed. `reader_finished` is
+    // signaled by the reader thread itself once that fd has actually closed.
     drop(data_rx);
-    drop(signal_finished);
 
     wait_and_notify_exit(&pty, &pty_id, &gateway).await;
 }
@@ -636,11 +752,11 @@ async fn run_pty_output_loop_blocking(
     use tokio::sync::mpsc;
     use tokio::time::{Duration, interval};
 
-    let signal_finished = SignalReaderFinished(reader_finished);
     let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(64);
 
     let cancel_reader = cancel.clone();
     tokio::task::spawn_blocking(move || {
+        let _signal_reader_finished = SignalFinished(reader_finished);
         let mut reader = reader;
         let mut buf = [0u8; 4096];
         loop {
@@ -707,10 +823,8 @@ async fn run_pty_output_loop_blocking(
         flush_output(&pty, &pty_id, &mut pending, &gateway).await;
     }
 
-    // Dropping the receiver makes try_send fail closed; the blocking task may
-    // still be parked in read until descriptors are torn down by reap.
+    // Dropping the receiver makes try_send fail closed.
     drop(data_rx);
-    drop(signal_finished);
 
     wait_and_notify_exit(&pty, &pty_id, &gateway).await;
 }
@@ -906,7 +1020,13 @@ pub(crate) async fn close_pty(pty_id: &str) -> Result<(), String> {
 /// a bare `spawn_blocking` `read(2)` (upstream) wedged `#[tokio::test]` runtime
 /// drop for as long as any descendant held the slave.
 async fn shutdown_pty_session(entry: Arc<Mutex<PtySession>>) -> Result<(), String> {
-    let reader_finished = entry.lock().await.reader_finished.clone();
+    let (reader_finished, writer_finished) = {
+        let session = entry.lock().await;
+        (
+            session.reader_finished.clone(),
+            session.writer_finished.clone(),
+        )
+    };
 
     // Hang up while master + reader fd are still open. `killpg(SIGHUP)` alone
     // is not enough if the shell has already lost its controlling terminal.
@@ -921,17 +1041,19 @@ async fn shutdown_pty_session(entry: Arc<Mutex<PtySession>>) -> Result<(), Strin
         let mut session = entry.lock().await;
         session.cancel.cancel();
         session.master.take();
-        // Ends the writer loop, which holds another dup of the master.
+        // Drops the session-owned sender; writer exit is keyed off cancel.
         session.input_tx.take();
     }
 
-    // On unix the reader is fully async and exits on `cancel` (or EOF after
-    // the shell dies). Non-unix cannot interrupt a blocked `read(2)` portably.
+    // On unix the reader/writer signals are tied to thread exit (and fd drop).
+    // Non-unix may still block in a read/write syscall until teardown effects.
     #[cfg(unix)]
-    reader_finished.cancelled().await;
+    {
+        let _ = tokio::join!(reader_finished.cancelled(), writer_finished.cancelled());
+    }
     #[cfg(not(unix))]
     {
-        let _ = reader_finished;
+        let _ = (reader_finished, writer_finished);
     }
 
     Ok(())
@@ -1215,6 +1337,86 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    fn stat_fd_identity(fd: std::os::fd::RawFd) -> std::io::Result<(u64, u64)> {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let rc = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let stat = unsafe { stat.assume_init() };
+        Ok((stat.st_dev as u64, stat.st_ino as u64))
+    }
+
+    #[test]
+    fn dup_fd_is_not_inherited_by_exec_child() {
+        use std::os::fd::AsRawFd;
+        use std::process::Command;
+
+        const PROBE_FD_ENV: &str = "XAI_GROK_SHELL_DUP_FD_PROBE";
+        const PROBE_DEV_ENV: &str = "XAI_GROK_SHELL_DUP_FD_DEV";
+        const PROBE_INO_ENV: &str = "XAI_GROK_SHELL_DUP_FD_INO";
+        const SELF_TEST: &str =
+            "terminal::pty_session::tests::dup_fd_is_not_inherited_by_exec_child";
+
+        if let Ok(probe_fd) = std::env::var(PROBE_FD_ENV) {
+            let fd: std::os::fd::RawFd = probe_fd.parse().expect("probe fd parse");
+            let expected_dev: u64 = std::env::var(PROBE_DEV_ENV)
+                .expect("missing probe dev")
+                .parse()
+                .expect("probe dev parse");
+            let expected_ino: u64 = std::env::var(PROBE_INO_ENV)
+                .expect("missing probe ino")
+                .parse()
+                .expect("probe ino parse");
+
+            match stat_fd_identity(fd) {
+                Ok((dev, ino)) => {
+                    assert_ne!(
+                        (dev, ino),
+                        (expected_dev, expected_ino),
+                        "fd {fd} was inherited across exec"
+                    );
+                }
+                Err(err) => {
+                    assert_eq!(
+                        err.raw_os_error(),
+                        Some(libc::EBADF),
+                        "expected fd {fd} to be closed after exec, got {err}"
+                    );
+                }
+            }
+            return;
+        }
+
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let raw = pair.master.as_raw_fd().expect("raw pty master fd");
+        let duped = dup_fd(raw).expect("dup pty master");
+        let (dev, ino) = stat_fd_identity(duped.as_raw_fd()).expect("stat duped fd");
+
+        let test_binary = std::env::current_exe().expect("test binary path");
+        let status = Command::new(test_binary)
+            .arg("--exact")
+            .arg(SELF_TEST)
+            .arg("--test-threads=1")
+            .env(PROBE_FD_ENV, duped.as_raw_fd().to_string())
+            .env(PROBE_DEV_ENV, dev.to_string())
+            .env(PROBE_INO_ENV, ino.to_string())
+            .status()
+            .expect("spawn exec child probe");
+
+        assert!(
+            status.success(),
+            "exec child observed inherited dup fd: {status}"
+        );
     }
 
     #[tokio::test]

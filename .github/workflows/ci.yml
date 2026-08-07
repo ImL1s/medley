@@ -366,6 +366,10 @@ jobs:
             callback_errors_never_echo_provider_controlled_values -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
             snapshot_never_derives_stable_ids_from_credentials -- --nocapture
+          # #132: CLOEXEC regression guard; full test path keeps the filter
+          # unique so #171 can prove this exact test is selected.
+          cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
+            terminal::pty_session::tests::dup_fd_is_not_inherited_by_exec_child -- --nocapture
 
       - name: Pager model picker / readiness
         env:
