@@ -35,6 +35,12 @@ jobs:
       - name: Enforce credential-safe observability
         run: python3 -B -m unittest tests.test_credential_observability_guard -v
 
+      # The `new-test-filters` job below is the thing that notices a Rust test
+      # no filter selects. These are its own tests -- without them it would be
+      # an unverified checker guarding against unverified tests (#171).
+      - name: Test the new-test filter guard
+        run: python3 -B -m unittest tests.test_new_test_filter_guard -v
+
   installer:
     name: Installer
     runs-on: ubuntu-latest
@@ -86,6 +92,25 @@ jobs:
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
+
+  new-test-filters:
+    name: New tests run somewhere
+    runs-on: ubuntu-latest
+    steps:
+      # Full history: the check needs a merge base to find what this branch added.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # No Rust toolchain and no build: this reads the diff, not a test listing.
+      # That is what makes it cheap, and it is also what makes it correct for
+      # `#[cfg(target_os = ...)]` tests -- they are in the diff on every
+      # platform, whereas `cargo test -- --list` omits them off their target.
+      - name: Every new test matches a CI filter
+        run: |
+          python3 scripts/check_new_tests_are_filtered.py \
+            --workflow .github/workflows/ci.yml \
+            --base "origin/${{ github.base_ref || 'providers' }}"
 
   lint:
     name: Clippy (hot path)
@@ -403,4 +428,29 @@ jobs:
           NO_COLOR=1 run_nonzero -p xai-grok-pager --lib token_on_second_logical_line -- --nocapture
           NO_COLOR=1 run_nonzero -p xai-grok-pager --lib search_bar_cursor -- --nocapture
           NO_COLOR=1 run_nonzero -p xai-grok-pager --lib \
+            user_prompt_band_is_semantic -- --nocapture
+          NO_COLOR=1 run_nonzero -p xai-grok-pager --lib \
             colour_asserting_tests_do_not_use_theme_current -- --nocapture
+
+      # #162: the restore-direction and the tombstone-wall cases. The
+      # pre-existing `workflow_restore_rejects_symlinks_and_caps_run_count`
+      # stays green under both defects, so `workflow_restore` as one filter
+      # covers all three and the two new ones carry the protection. Quoted
+      # name: an unquoted `#162` truncates at the comment marker.
+      - name: 'Workflow restore ordering and scan budget (issue #162)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib workflow_restore -- --nocapture
