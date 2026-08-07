@@ -379,13 +379,21 @@ jobs:
           # Filters written out rather than looped over a shell variable, so
           # they stay greppable in this file -- the #171 check parses these
           # lines, and a filter built at runtime is invisible to it.
-          run_nonzero -p xai-grok-pager --lib teal -- --nocapture
+          #
+          # Do not use bare `teal`: Cargo substring-matches, and `steal` /
+          # `steals` / `resteal` contain `teal`, as does
+          # `teal_highlighting_on_second_line` (which skips its colour assert
+          # under NO_COLOR). `keeps_teal` + `each_teal` select only the four
+          # fixed skill-accent tests that filter on accent_skill spans.
+          run_nonzero -p xai-grok-pager --lib keeps_teal -- --nocapture
+          run_nonzero -p xai-grok-pager --lib each_teal -- --nocapture
           run_nonzero -p xai-grok-pager --lib invalid_token_ranges_are_dropped -- --nocapture
           run_nonzero -p xai-grok-pager --lib token_on_second_logical_line -- --nocapture
           run_nonzero -p xai-grok-pager --lib search_bar_cursor -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             colour_asserting_tests_do_not_use_theme_current -- --nocapture
-          NO_COLOR=1 run_nonzero -p xai-grok-pager --lib teal -- --nocapture
+          NO_COLOR=1 run_nonzero -p xai-grok-pager --lib keeps_teal -- --nocapture
+          NO_COLOR=1 run_nonzero -p xai-grok-pager --lib each_teal -- --nocapture
           NO_COLOR=1 run_nonzero -p xai-grok-pager --lib invalid_token_ranges_are_dropped -- --nocapture
           NO_COLOR=1 run_nonzero -p xai-grok-pager --lib token_on_second_logical_line -- --nocapture
           NO_COLOR=1 run_nonzero -p xai-grok-pager --lib search_bar_cursor -- --nocapture
