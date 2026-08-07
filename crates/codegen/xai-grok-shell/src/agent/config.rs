@@ -62,29 +62,99 @@ pub const XAI_API_BASE_URL_DEFAULT: &str = "https://api.x.ai/v1";
 ///
 /// At resolve time the **first set, non-blank** value wins (e.g. SSH
 /// `AcceptEnv LC_*` forwarding of the Bottlerocket token).
+///
+/// Names are normalized on construction (`EnvKeys::new` / [`Self::normalize`]):
+/// trimmed, empty dropped, invalid rejected, duplicates collapsed to first
+/// occurrence. See [`Self::is_valid_name`] for the acceptance rule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum EnvKeys {
     One(String),
     Many(Vec<String>),
 }
+
+/// A configured env-key candidate that was rejected during normalization.
+///
+/// Carries the normalized-for-display **name** only — never an environment
+/// variable's value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectedEnvKey {
+    /// Candidate name after trim (empty string when the entry was whitespace-only).
+    pub name: String,
+    /// Why it was rejected (safe for diagnostics / config warnings).
+    pub reason: &'static str,
+}
+
 impl EnvKeys {
-    /// Single-name convenience constructor.
-    pub fn single(name: impl Into<String>) -> Self {
-        Self::One(name.into())
+    /// Conservative cross-platform env-var name rule used for `env_key`.
+    ///
+    /// After trim, a name must match `^[A-Za-z_][A-Za-z0-9_]*$`. That rejects
+    /// the issue floor (control characters, `=`, whitespace) and also rejects
+    /// hyphens, dots, leading digits, and non-ASCII — unusual-but-legal names
+    /// such as `My-API-Key`, `FOO.BAR`, or `1TOKEN` produce a path-specific
+    /// config warning instead of being selected.
+    pub fn is_valid_name(name: &str) -> bool {
+        let mut chars = name.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+            _ => return false,
+        }
+        chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
     }
-    /// Construct from an ordered list (empty names dropped; 0/1/N → Many/One/Many).
-    pub fn new(names: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        let names: Vec<String> = names
-            .into_iter()
-            .map(Into::into)
-            .filter(|s| !s.is_empty())
-            .collect();
+
+    /// Trim, drop empties, reject invalid names, dedupe (first occurrence wins).
+    ///
+    /// Rejected entries are returned for path-specific config warnings — callers
+    /// must not silently ignore them in user-facing config paths.
+    pub fn normalize(
+        names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> (Self, Vec<RejectedEnvKey>) {
+        let mut out = Vec::new();
+        let mut rejected = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for raw in names {
+            let raw = raw.into();
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                rejected.push(RejectedEnvKey {
+                    name: String::new(),
+                    reason: "empty or whitespace-only",
+                });
+                continue;
+            }
+            if !Self::is_valid_name(trimmed) {
+                rejected.push(RejectedEnvKey {
+                    name: trimmed.to_owned(),
+                    reason: "must match [A-Za-z_][A-Za-z0-9_]* (rejects '=', whitespace, controls, hyphens, dots)",
+                });
+                continue;
+            }
+            if !seen.insert(trimmed.to_owned()) {
+                continue;
+            }
+            out.push(trimmed.to_owned());
+        }
+        (Self::from_normalized(out), rejected)
+    }
+
+    fn from_normalized(names: Vec<String>) -> Self {
         match names.as_slice() {
             [] => Self::Many(Vec::new()),
             [_] => Self::One(names.into_iter().next().expect("len 1")),
             _ => Self::Many(names),
         }
+    }
+
+    /// Single-name convenience constructor (normalized).
+    pub fn single(name: impl Into<String>) -> Self {
+        Self::new([name.into()])
+    }
+    /// Construct from an ordered list: trim, drop empty/invalid, dedupe.
+    ///
+    /// Prefer [`Self::normalize`] when rejected entries must surface as
+    /// path-specific config warnings.
+    pub fn new(names: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self::normalize(names).0
     }
     pub fn is_empty(&self) -> bool {
         match self {
@@ -8890,6 +8960,103 @@ reasoning_effort = "low"
         assert_eq!(
             EnvKeys::single("GROK_TEST_WS_PAD").resolve_value_with(|_| Some("  tok  ".into())),
             Some("  tok  ".into())
+        );
+    }
+    /// #13: whitespace-only names must not become a credential source.
+    #[test]
+    fn env_keys_normalize_rejects_whitespace_only_name() {
+        let (keys, rejected) = EnvKeys::normalize(["", "   ", "\t\n"]);
+        assert!(
+            keys.is_empty(),
+            "whitespace-only names must not survive normalization: {:?}",
+            keys.names()
+        );
+        assert_eq!(rejected.len(), 3);
+        for r in &rejected {
+            assert!(
+                r.reason.contains("empty") || r.reason.contains("whitespace"),
+                "reject reason must explain emptiness (Value withheld.): {}",
+                r.reason
+            );
+        }
+        assert!(EnvKeys::new(["   "]).is_empty());
+        assert!(EnvKeys::single("   ").is_empty());
+    }
+    /// #13: surrounding whitespace is trimmed before use.
+    #[test]
+    fn env_keys_normalize_trims_surrounding_whitespace() {
+        let (keys, rejected) = EnvKeys::normalize([" API_KEY "]);
+        assert!(rejected.is_empty(), "{rejected:?}");
+        assert_eq!(keys.names(), vec!["API_KEY"]);
+        assert_eq!(EnvKeys::new([" API_KEY "]).primary(), Some("API_KEY"));
+    }
+    /// #13: duplicate normalized names keep first-seen order only once.
+    #[test]
+    fn env_keys_normalize_dedupes_preserving_first_order() {
+        let (keys, rejected) =
+            EnvKeys::normalize([" PRIMARY ", "FALLBACK", "PRIMARY", " FALLBACK ", "OTHER"]);
+        assert!(rejected.is_empty(), "{rejected:?}");
+        assert_eq!(keys.names(), vec!["PRIMARY", "FALLBACK", "OTHER"]);
+    }
+    /// #13: `=` and control characters are invalid env-var names.
+    #[test]
+    fn env_keys_normalize_rejects_equals_and_control_characters() {
+        let (keys, rejected) =
+            EnvKeys::normalize(["GOOD_KEY", "FOO=BAR", "HAS\u{0001}CTRL", "BAD-NAME"]);
+        assert_eq!(keys.names(), vec!["GOOD_KEY"]);
+        let reasons: Vec<&str> = rejected.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(reasons, vec!["FOO=BAR", "HAS\u{0001}CTRL", "BAD-NAME"]);
+        for r in &rejected {
+            assert!(
+                !r.reason.is_empty(),
+                "each reject needs a reason (Value withheld.)"
+            );
+            // Diagnostics may name the variable; they must never look like a value dump.
+            assert!(
+                !r.reason.contains("sk-") && !r.reason.contains("token="),
+                "reject reason must not resemble a credential value (Value withheld.): {}",
+                r.reason
+            );
+        }
+    }
+    /// #13: multiple distinct valid fallbacks keep precedence order.
+    #[test]
+    fn env_keys_normalize_keeps_multiple_valid_fallbacks() {
+        let keys = EnvKeys::new([
+            "GROK_TEST_ENV_KEY_PRIMARY",
+            "GROK_TEST_ENV_KEY_FALLBACK",
+            "GROK_TEST_ENV_KEY_THIRD",
+        ]);
+        assert_eq!(
+            keys.names(),
+            vec![
+                "GROK_TEST_ENV_KEY_PRIMARY",
+                "GROK_TEST_ENV_KEY_FALLBACK",
+                "GROK_TEST_ENV_KEY_THIRD",
+            ]
+        );
+        assert_eq!(keys.primary(), Some("GROK_TEST_ENV_KEY_PRIMARY"));
+    }
+    /// #13: Display/Debug expose normalized names only — never env values.
+    #[test]
+    fn env_keys_diagnostics_show_normalized_names_only() {
+        let keys = EnvKeys::new([" API_KEY ", "FALLBACK"]);
+        let display = keys.to_string();
+        let debug = format!("{keys:?}");
+        assert!(display.contains("API_KEY"), "{display}");
+        assert!(display.contains("FALLBACK"), "{display}");
+        assert!(debug.contains("API_KEY"), "{debug}");
+        // EnvKeys stores names, not values; a resolved secret must not appear.
+        let resolved = keys.resolve_value_with(|n| {
+            (n == "API_KEY").then(|| "sk-super-secret-credential-value".into())
+        });
+        assert_eq!(
+            resolved.as_deref(),
+            Some("sk-super-secret-credential-value")
+        );
+        assert!(
+            !display.contains("sk-super-secret") && !debug.contains("sk-super-secret"),
+            "diagnostics must not include resolved credential bytes (Value withheld.): display={display} debug={debug}"
         );
     }
     #[test]
