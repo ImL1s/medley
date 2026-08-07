@@ -12,8 +12,12 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Push runs are release candidates keyed by commit SHA; if a later merge lands
+  # while one is running, we still need the earlier SHA to reach a completed
+  # verdict for release.yml's SHA-exact gate.
+  group: ci-${{ github.event_name == 'push' && github.sha || github.ref }}
+  # PRs and manual runs should still drop superseded attempts.
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
   CARGO_TERM_COLOR: always
