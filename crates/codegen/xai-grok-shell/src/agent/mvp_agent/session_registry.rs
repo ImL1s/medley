@@ -32,13 +32,18 @@ pub(super) enum SessionPresence {
         thread: Option<SessionThread>,
         activity: Activity,
     },
-    /// A load/resume is building the actor. `waiter` wakes racing requests;
-    /// `displaced` is what the attach replaced and what a failed attach
-    /// restores. A handle, thread, or `settled_activity` may land here before
-    /// the attach finishes; only [`SessionRegistry::settle_attach`] retires this
-    /// variant.
+    /// A load/resume is building the actor. `active` is the newest load allowed
+    /// to use the during-load bypass; `waiters` keeps every in-flight load
+    /// visible to external waiters until each guard drops. `displaced` is what
+    /// the attach replaced and what a failed attach restores once *all*
+    /// waiters settle. A handle, thread, or `settled_activity` may land here
+    /// before the attach finishes; only the last [`SessionRegistry::settle_attach`]
+    /// retires this variant.
     Attaching {
-        waiter: tokio::sync::watch::Receiver<bool>,
+        /// Marker currently allowed to use the during-load bypass.
+        active: Option<tokio::sync::watch::Receiver<bool>>,
+        /// All in-flight load markers for waiter-side gating.
+        waiters: Vec<tokio::sync::watch::Receiver<bool>>,
         displaced: Option<Box<SessionPresence>>,
         handle: Option<SessionHandle>,
         thread: Option<SessionThread>,
@@ -102,7 +107,8 @@ impl SessionPresence {
             SessionLiveState::Attaching => {
                 let (_tx, waiter) = tokio::sync::watch::channel(false);
                 Self::Attaching {
-                    waiter,
+                    active: Some(waiter.clone()),
+                    waiters: vec![waiter],
                     displaced: None,
                     handle,
                     thread,
@@ -474,7 +480,9 @@ impl SessionRegistry {
     }
     /// Start an attach. Current presence becomes `displaced` so a failed
     /// attach can restore it. An attach over a missing entry creates one,
-    /// which `settle_attach` removes.
+    /// which the last `settle_attach` removes. A concurrent attach over an
+    /// already-Attaching entry keeps every prior waiter visible and makes the
+    /// new marker the sole owner of the during-load bypass.
     pub(super) fn begin_attach(
         &self,
         id: &acp::SessionId,
@@ -485,38 +493,65 @@ impl SessionRegistry {
         let (tx, rx) = tokio::sync::watch::channel(false);
         self.edit(id, |e| {
             let previous = e.presence.take();
-            let (handle, thread, displaced) = match previous {
+            e.presence = match previous {
                 Some(SessionPresence::Attaching {
+                    mut waiters,
                     handle,
                     thread,
                     displaced,
+                    settled_activity,
                     ..
-                }) => (handle, thread, displaced),
+                }) => {
+                    waiters.push(rx.clone());
+                    Some(SessionPresence::Attaching {
+                        active: Some(rx.clone()),
+                        waiters,
+                        displaced,
+                        handle,
+                        thread,
+                        settled_activity,
+                    })
+                }
                 other => {
                     let handle = other
                         .as_ref()
                         .and_then(SessionPresence::hosted_handle)
                         .cloned();
-                    (handle, None, other.map(Box::new))
+                    Some(SessionPresence::Attaching {
+                        active: Some(rx.clone()),
+                        waiters: vec![rx.clone()],
+                        displaced: other.map(Box::new),
+                        handle,
+                        thread: None,
+                        settled_activity: None,
+                    })
                 }
             };
-            e.presence = Some(SessionPresence::Attaching {
-                waiter: rx.clone(),
-                displaced,
-                handle,
-                thread,
-                settled_activity: None,
-            });
         });
         (tx, rx)
     }
-    /// Clone of the in-flight attach waiter, if any.
+    /// Clone of the newest in-flight attach waiter, if any. External waiters
+    /// re-check via this; when concurrent loads exist the gate stays shut until
+    /// every waiter has settled (see [`Self::settle_attach`]).
     pub(super) fn attach_waiter(
         &self,
         id: &acp::SessionId,
     ) -> Option<tokio::sync::watch::Receiver<bool>> {
         self.with(id, |e| match &e.presence {
-            Some(SessionPresence::Attaching { waiter, .. }) => Some(waiter.clone()),
+            Some(SessionPresence::Attaching { waiters, .. }) => waiters.last().cloned(),
+            _ => None,
+        })
+        .flatten()
+    }
+    /// Clone of the load marker currently allowed to use the during-load
+    /// bypass. A superseded older load does not regain ownership when a newer
+    /// marker drops — `active` is cleared, not handed back.
+    pub(super) fn attach_active(
+        &self,
+        id: &acp::SessionId,
+    ) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.with(id, |e| match &e.presence {
+            Some(SessionPresence::Attaching { active, .. }) => active.clone(),
             _ => None,
         })
         .flatten()
@@ -534,9 +569,11 @@ impl SessionRegistry {
             .filter(|e| matches!(e.presence, Some(SessionPresence::Attaching { .. })))
             .count()
     }
-    /// Retire an attach: every guard drop lands here, success or failure.
-    /// `waiter` identifies the owning guard; a superseded one is a no-op.
-    /// Settles from the hosted handle when present, else restores `displaced`.
+    /// Retire one in-flight attach marker. Every guard drop lands here.
+    /// `waiter` identifies the dropping guard; an unknown channel is a no-op.
+    /// When other waiters remain, the entry stays `Attaching` (and if this was
+    /// `active`, bypass stays closed for everyone). Only the last waiter
+    /// settles presence from the hosted handle or restores `displaced`.
     pub(super) fn settle_attach(
         &self,
         id: &acp::SessionId,
@@ -546,13 +583,27 @@ impl SessionRegistry {
         let Some(entry) = entries.get_mut(id) else {
             return;
         };
-        let owns = match &entry.presence {
+        let still_waiting = match &mut entry.presence {
             Some(SessionPresence::Attaching {
-                waiter: current, ..
-            }) => current.same_channel(waiter),
-            _ => false,
+                active, waiters, ..
+            }) => {
+                let before = waiters.len();
+                waiters.retain(|rx| !rx.same_channel(waiter));
+                if waiters.len() == before {
+                    // Unknown / already-settled channel — no-op.
+                    return;
+                }
+                if active.as_ref().is_some_and(|rx| rx.same_channel(waiter)) {
+                    // A superseded older load must not regain bypass ownership
+                    // when the newer marker drops; owner-bound bypass remains
+                    // closed until a fresh begin_attach installs a new active.
+                    *active = None;
+                }
+                !waiters.is_empty()
+            }
+            _ => return,
         };
-        if !owns {
+        if still_waiting {
             return;
         }
         let Some(SessionPresence::Attaching {

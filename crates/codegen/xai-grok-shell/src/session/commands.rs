@@ -210,6 +210,26 @@ pub struct CancelOptions {
     /// Drives the cancel-rate metric.
     pub user_initiated: bool,
 }
+/// Atomic parent-session capability snapshot used at subagent spawn.
+///
+/// Captured by the session actor immediately before child construction so
+/// subagents inherit current MCP/tool/skill capabilities instead of the
+/// session-handle bootstrap snapshot.
+#[derive(Clone)]
+pub struct SubagentCapabilitySnapshot {
+    /// Live MCP server configs (`mcp_state.configs`) at snapshot time.
+    pub mcp_configs: Vec<acp::McpServer>,
+    /// Optional inherited MCP pool snapshot for child-client reuse.
+    pub mcp_pool: Option<crate::session::mcp_servers::SharedMcpPool>,
+    /// Client-registered hooks inherited by the child.
+    pub client_hooks: crate::extensions::hooks::ClientHooks,
+    /// Parent session's resolved tool schema for verbatim forks.
+    pub tool_definitions: Vec<xai_grok_sampling_types::ToolSpec>,
+    /// Parent session's current slash-skill baseline.
+    pub skills: Vec<xai_grok_tools::implementations::skills::types::SkillInfo>,
+    /// MCP generation observed when this snapshot stabilized.
+    pub mcp_generation: u64,
+}
 pub enum SessionCommand {
     Initialize {
         system_prompt: String,
@@ -475,6 +495,14 @@ pub enum SessionCommand {
     /// Snapshot the session's live MCP client pool for subagent inheritance.
     SnapshotMcpPool {
         respond_to: oneshot::Sender<Option<crate::session::mcp_servers::SharedMcpPool>>,
+    },
+    /// Snapshot the parent capabilities a subagent inherits at spawn.
+    ///
+    /// Returns an error when the snapshot cannot be stabilized (e.g. MCP
+    /// generation churn while collecting multi-surface state), so callers fail
+    /// the spawn instead of silently falling back to stale bootstrap copies.
+    SnapshotSubagentCapabilities {
+        respond_to: oneshot::Sender<Result<SubagentCapabilitySnapshot, String>>,
     },
     /// Snapshot the session's client-registered hooks so a subagent inherits the same
     /// PreToolUse gate and observe hooks over the parent's connection.

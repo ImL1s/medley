@@ -2134,11 +2134,10 @@ async fn promoter_arms_rewind_window_and_first_update_disarms_it() {
 
 /// Welds the flag to the real promoter and commit sites so moving either
 /// fails the suite.
-#[tokio::test(flavor = "current_thread")]
-async fn promoter_clears_committed_flag_and_handle_prompt_sets_it() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
+#[test]
+fn promoter_clears_committed_flag_and_handle_prompt_sets_it() {
+    on_large_stack(|| {
+        block_on_local(false, async {
             let actor = actor_with_persistence_drain().await;
             {
                 let mut state = actor.state.lock().await;
@@ -2189,7 +2188,7 @@ async fn promoter_clears_committed_flag_and_handle_prompt_sets_it() {
             );
             prompt_task.abort();
         })
-        .await;
+    });
 }
 
 /// A terminal whose commands never finish, holding a bash turn mid-run.

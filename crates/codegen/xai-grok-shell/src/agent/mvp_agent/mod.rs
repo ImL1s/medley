@@ -103,6 +103,11 @@ use xai_grok_workspace::session::git::GitDiscoveryResult;
 use xai_hunk_tracker::HunkTrackerActor;
 /// Hard-error message for legacy Direct hub-bind sessions (`x.ai/cloud_server_id`).
 pub(crate) const DIRECT_HUB_CLOUD_REMOVED_MSG: &str = "Direct hub cloud removed; use Gateway (envId or existing-workspace attach)";
+/// Hard-error message for the removed local-workspace bridge metadata key.
+pub(crate) const LOCAL_WORKSPACE_REMOVED_MSG: &str =
+    "Local workspace bridge is unavailable in public builds; remove x.ai/local_workspace metadata";
+/// ACP `_meta` key for local-workspace intent.
+const LOCAL_WORKSPACE_META_KEY: &str = "x.ai/local_workspace";
 /// Reject session `_meta` that still requests Direct hub bind (D8).
 ///
 /// Shared by `new_session` / `load_session` via [`MvpAgent::spawn_and_register_session`].
@@ -111,6 +116,21 @@ pub(crate) fn reject_direct_hub_cloud_meta(
 ) -> Result<(), acp::Error> {
     if session_meta.and_then(|m| m.get("x.ai/cloud_server_id")).is_some() {
         return Err(acp::Error::invalid_params().data(DIRECT_HUB_CLOUD_REMOVED_MSG));
+    }
+    Ok(())
+}
+/// Reject session `_meta` that still requests the removed local-workspace bridge.
+pub(crate) fn reject_removed_local_workspace_meta(
+    session_meta: Option<&acp::Meta>,
+) -> Result<(), acp::Error> {
+    if session_meta
+        .and_then(|m| m.get(LOCAL_WORKSPACE_META_KEY))
+        .is_some()
+    {
+        return Err(acp::Error::invalid_params().data(serde_json::json!({
+            "code": "local_workspace_removed",
+            "message": LOCAL_WORKSPACE_REMOVED_MSG,
+        })));
     }
     Ok(())
 }
@@ -185,9 +205,6 @@ pub(crate) fn jwt_claim_matches_user_subscription_tier(
         _ => jwt_claim.parse::<u64>().is_ok_and(|n| n != 0),
     }
 }
-/// ACP `_meta` key for chat+local workspace intent (pager stamps on chat create).
-#[cfg(feature = "local-workspace")]
-const LOCAL_WORKSPACE_META_KEY: &str = "x.ai/local_workspace";
 /// True when `_meta` carries a valid chat+local intent object
 /// (`mode` is `"own"` or `"attach"`).
 #[cfg(feature = "local-workspace")]
@@ -234,9 +251,10 @@ fn parse_session_computer_sessions(_meta: Option<&acp::Meta>) -> Option<Vec<()>>
     None
 }
 fn resolve_session_computer_sessions(
-    _meta: Option<&acp::Meta>,
+    meta: Option<&acp::Meta>,
 ) -> Result<Option<Vec<()>>, acp::Error> {
-    Ok(None)
+    reject_removed_local_workspace_meta(meta)?;
+    Ok(parse_session_computer_sessions(meta))
 }
 pub(crate) struct SessionSpawnOptions<'a> {
     pub session_info: SessionInfo,

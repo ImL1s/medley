@@ -3124,10 +3124,10 @@ impl MvpAgent {
     ///
     /// Unlike [`Self::session_handle_waiting_for_load`], this deliberately does
     /// not wait for the marker owned by its caller. The bypass is bound to the
-    /// caller's own [`SessionLoadGuard`]: the marker in the map must be the one
-    /// that guard created. With duplicate loads of the same session the second
-    /// `begin_session_load` replaces the marker, so an older (or unrelated)
-    /// load can no longer ride the newer load's marker.
+    /// caller's own [`SessionLoadGuard`]: only the newest load marker is
+    /// `active` for bypass, and it must be the one that guard created. A
+    /// superseded older load cannot ride a newer marker, and when the newer
+    /// marker drops, `active` clears rather than falling back to the older one.
     pub(crate) fn session_handle_during_load(
         &self,
         session_id: &acp::SessionId,
@@ -3135,7 +3135,7 @@ impl MvpAgent {
     ) -> Option<crate::session::SessionHandle> {
         let owns_marker = self
             .session_registry
-            .attach_waiter(session_id)
+            .attach_active(session_id)
             .is_some_and(|rx| rx.same_channel(&load_guard.rx));
         owns_marker
             .then(|| self.resident_handle(session_id))

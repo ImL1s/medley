@@ -1702,6 +1702,61 @@ pub(super) async fn run_session(
                             };
                             let _ = respond_to.send(pool);
                         }
+                        SessionCommand::SnapshotSubagentCapabilities { respond_to } => {
+                            const MAX_ATTEMPTS: usize = 3;
+                            let mut attempts = 0usize;
+                            let snapshot_result = loop {
+                                attempts += 1;
+                                let (mcp_generation, mcp_configs, mcp_pool) = {
+                                    let mcp_state = session.mcp_state.lock().await;
+                                    let pool = if mcp_state.owned_clients.is_empty()
+                                        && mcp_state.shared_clients.is_empty()
+                                    {
+                                        None
+                                    } else {
+                                        Some(
+                                            crate::session::mcp_servers::SharedMcpPool::from_state(
+                                                &mcp_state,
+                                            ),
+                                        )
+                                    };
+                                    (mcp_state.generation(), mcp_state.configs.clone(), pool)
+                                };
+                                let client_hooks = session.client_hooks.borrow().clone();
+                                // Use the same helper as parent turns so child verbatim prefixes
+                                // cannot drift from the parent's exposed tool schema.
+                                let defs = session.prepare_tool_definitions_inner().await;
+                                let tool_definitions = session.turn_base_tool_specs(&defs);
+                                let skills = session.slash_skills_for_resolve().await;
+                                let mcp_generation_after = {
+                                    let mcp_state = session.mcp_state.lock().await;
+                                    mcp_state.generation()
+                                };
+                                if mcp_generation_after == mcp_generation {
+                                    break Ok(crate::session::commands::SubagentCapabilitySnapshot {
+                                        mcp_configs,
+                                        mcp_pool,
+                                        client_hooks,
+                                        tool_definitions,
+                                        skills,
+                                        mcp_generation,
+                                    });
+                                }
+                                if attempts >= MAX_ATTEMPTS {
+                                    break Err(format!(
+                                        "parent MCP generation changed during snapshot refresh \
+                                         (start={mcp_generation}, end={mcp_generation_after})"
+                                    ));
+                                }
+                                tracing::debug!(
+                                    attempt = attempts,
+                                    start_generation = mcp_generation,
+                                    end_generation = mcp_generation_after,
+                                    "retrying subagent capability snapshot after MCP generation changed",
+                                );
+                            };
+                            let _ = respond_to.send(snapshot_result);
+                        }
                         SessionCommand::SnapshotClientHooks { respond_to } => {
                             let _ = respond_to.send(session.client_hooks.borrow().clone());
                         }

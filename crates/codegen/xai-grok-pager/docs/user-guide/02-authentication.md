@@ -49,6 +49,11 @@ Running `grok login` starts the sign-in flow again, replacing your cached sessio
 To sign out of xAI, run `grok logout` (equivalent to
 `grok logout --provider xai`).
 
+Logout clears this process's in-memory session and removes the scoped entry on
+disk. It does not send a cross-process invalidation signal: another already
+running `grok` process can keep using a cached token until that process next
+reconciles with `auth.json` or receives a server-side rejection.
+
 ---
 
 ## OpenAI Codex (ChatGPT OAuth)

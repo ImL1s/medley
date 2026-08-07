@@ -293,22 +293,20 @@ pub(crate) struct SubagentSpawnContext {
     /// `None` when the model is not in the catalog.
     pub parent_model_agent_type: Option<String>,
     pub allowed_subagent_types: Option<Vec<String>>,
-    /// Parent's MCP server configs for resolving named references in agent mcpServers.
-    ///
-    /// NOTE: This is a snapshot from `SessionHandle` (populated at spawn_session_actor
-    /// time). Servers added later via `UpdateMcpServers` (managed MCPs, plugin reload)
-    /// will not appear here. Named references only resolve against the initial config.
+    /// Parent's MCP server configs for resolving named references in agent
+    /// `mcpServers`. Refreshed from the live parent session actor immediately
+    /// before each child spawn.
     pub parent_mcp_configs: Vec<agent_client_protocol::McpServer>,
     /// Parent's managed MCP state handle (Arc-shared, no re-fetch).
     pub managed_mcp_state: crate::session::managed_mcp::ManagedMcpStateHandle,
     /// Live child-session command channels participating in managed-gateway
     /// admission/refresh barriers.
     pub managed_gateway_child_sessions: Option<ManagedGatewayChildSessionRegistry>,
-    /// Snapshot of the parent session's MCP client pool at spawn time.
+    /// Parent session's MCP client pool snapshot for this child.
     pub parent_mcp_pool: Option<crate::session::mcp_servers::SharedMcpPool>,
     /// Exact parent tool schema for verbatim non-workflow forks.
     pub parent_tool_definitions: Option<Vec<xai_grok_sampling_types::ToolSpec>>,
-    /// Pre-discovered skills from the parent session, captured at spawn time.
+    /// Parent session's slash-skill baseline captured at child spawn time.
     pub parent_skills: Option<Vec<xai_grok_tools::implementations::skills::types::SkillInfo>>,
     /// Parent's skills config for the child's SkillManager.
     pub parent_skills_config: xai_grok_agent::prompt::skills::SkillsConfig,

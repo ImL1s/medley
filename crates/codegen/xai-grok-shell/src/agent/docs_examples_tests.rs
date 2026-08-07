@@ -32,6 +32,10 @@ fn custom_models_doc_path() -> PathBuf {
         .join("../xai-grok-pager/docs/user-guide/11-custom-models.md")
 }
 
+fn root_readme_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../README.md")
+}
+
 fn negative_fixture_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../../tests/fixtures/docs_examples/negative-provider-examples.md")
@@ -319,6 +323,37 @@ fn validate_markdown_links(doc_path: &Path, markdown: &str) -> Result<(), String
         }
     }
     Ok(())
+}
+
+fn extract_language_fences(markdown: &str, language: &str) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = markdown.lines().collect();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
+        if let Some(rest) = trimmed.strip_prefix("```") {
+            let fence_lang = rest.split_whitespace().next().unwrap_or_default();
+            if fence_lang == language {
+                let fence_line = i + 1;
+                let mut body = Vec::new();
+                let mut j = i + 1;
+                while j < lines.len() {
+                    if lines[j].trim_start().starts_with("```") {
+                        break;
+                    }
+                    body.push(lines[j]);
+                    j += 1;
+                }
+                if j < lines.len() {
+                    out.push((fence_line, body.join("\n")));
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    out
 }
 
 #[test]
@@ -640,4 +675,33 @@ fn docs_examples_validate_offline_commands_and_links() {
     }
 
     validate_markdown_links(&doc_path, &markdown).unwrap_or_else(|error| panic!("{error}"));
+
+    let readme_path = root_readme_path();
+    let readme = std::fs::read_to_string(&readme_path).expect("read root README");
+    validate_markdown_links(&readme_path, &readme).unwrap_or_else(|error| panic!("{error}"));
+
+    let readme_violations = secret_and_credential_violations(&readme);
+    assert!(
+        readme_violations.is_empty(),
+        "{} has credential-like literals: {:?}",
+        readme_path.display(),
+        readme_violations
+    );
+
+    for (line, block) in extract_language_fences(&readme, "toml") {
+        let raw = toml::from_str::<toml::Value>(&block).unwrap_or_else(|error| {
+            panic!(
+                "{}:{} README TOML fence parse failed: {error}",
+                readme_path.display(),
+                line
+            )
+        });
+        Config::new_from_toml_cfg(&raw).unwrap_or_else(|error| {
+            panic!(
+                "{}:{} README TOML fence production parse failed: {error}",
+                readme_path.display(),
+                line
+            )
+        });
+    }
 }
