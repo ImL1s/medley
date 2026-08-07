@@ -3058,7 +3058,10 @@ impl MvpAgent {
         session_id: &acp::SessionId,
     ) -> SessionLoadGuard<'_> {
         let (tx, rx) = tokio::sync::watch::channel(false);
-        self.loading_sessions.borrow_mut().insert(session_id.clone(), rx.clone());
+        let mut loading = self.loading_sessions.borrow_mut();
+        let markers = loading.entry(session_id.clone()).or_default();
+        markers.active = Some(rx.clone());
+        markers.waiters.push(rx.clone());
         SessionLoadGuard {
             agent: self,
             session_id: session_id.clone(),
@@ -3101,10 +3104,9 @@ impl MvpAgent {
     ///
     /// Unlike [`Self::session_handle_waiting_for_load`], this deliberately does
     /// not wait for the marker owned by its caller. The bypass is bound to the
-    /// caller's own [`SessionLoadGuard`]: the marker in the map must be the one
-    /// that guard created. With duplicate loads of the same session the second
-    /// `begin_session_load` replaces the marker, so an older (or unrelated)
-    /// load can no longer ride the newer load's marker.
+    /// caller's own [`SessionLoadGuard`]: only the newest load marker is active
+    /// for bypass, and it must be the one that guard created. A superseded
+    /// (older or unrelated) load cannot ride another load's marker.
     pub(crate) fn session_handle_during_load(
         &self,
         session_id: &acp::SessionId,
@@ -3114,6 +3116,7 @@ impl MvpAgent {
             .loading_sessions
             .borrow()
             .get(session_id)
+            .and_then(|markers| markers.active.as_ref())
             .is_some_and(|rx| rx.same_channel(&load_guard.rx));
         owns_marker
             .then(|| self.sessions.borrow().get(session_id).cloned())
@@ -3141,7 +3144,11 @@ impl MvpAgent {
         );
         let deadline = tokio::time::Instant::now() + LOAD_WAIT_TIMEOUT;
         loop {
-            let rx = self.loading_sessions.borrow().get(session_id).cloned();
+            let rx = self
+                .loading_sessions
+                .borrow()
+                .get(session_id)
+                .and_then(|markers| markers.waiters.last().cloned());
             let Some(mut rx) = rx else { return SessionLoadWait::Resolved };
             let now = tokio::time::Instant::now();
             if now >= deadline {

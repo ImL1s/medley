@@ -709,6 +709,13 @@ struct RetainedResources {
         tokio::sync::mpsc::UnboundedReceiver<PermissionEvent>,
     >,
 }
+#[derive(Default)]
+struct SessionLoadMarkers {
+    /// Marker currently allowed to use the during-load bypass.
+    active: Option<tokio::sync::watch::Receiver<bool>>,
+    /// All in-flight load markers for waiter-side gating.
+    waiters: Vec<tokio::sync::watch::Receiver<bool>>,
+}
 pub struct MvpAgent {
     /// LEADER-SAFE(per-session). Removed by `remove_session` / `sweep_dead_sessions`.
     pub(crate) sessions: RefCell<HashMap<acp::SessionId, SessionHandle>>,
@@ -718,9 +725,11 @@ pub struct MvpAgent {
     pub(crate) activity: crate::agent::activity::AgentActivity,
     /// LEADER-SAFE(per-session).
     session_registry: SessionRegistry,
-    /// A load guard rather than session state: it exists before the session.
+    /// Per-session load markers. `active` tracks the newest load allowed to use
+    /// the during-load bypass; `waiters` keeps every in-flight load visible to
+    /// external waiters until each guard drops.
     loading_sessions: RefCell<
-        HashMap<acp::SessionId, tokio::sync::watch::Receiver<bool>>,
+        HashMap<acp::SessionId, SessionLoadMarkers>,
     >,
     /// Title per resident session id, refreshed each `build_roster`. Lets the
     /// synchronous roster deltas reuse the title instead of emitting an empty
@@ -1502,7 +1511,22 @@ pub(crate) struct SessionLoadGuard<'a> {
 impl Drop for SessionLoadGuard<'_> {
     fn drop(&mut self) {
         let mut map = self.agent.loading_sessions.borrow_mut();
-        if map.get(&self.session_id).is_some_and(|rx| rx.same_channel(&self.rx)) {
+        let remove_entry = if let Some(markers) = map.get_mut(&self.session_id) {
+            markers.waiters.retain(|rx| !rx.same_channel(&self.rx));
+            if markers
+                .active
+                .as_ref()
+                .is_some_and(|rx| rx.same_channel(&self.rx))
+            {
+                // A superseded older load must not regain bypass ownership when
+                // the newer marker drops; owner-bound bypass remains closed.
+                markers.active = None;
+            }
+            markers.waiters.is_empty()
+        } else {
+            false
+        };
+        if remove_entry {
             map.remove(&self.session_id);
         }
     }
