@@ -364,6 +364,12 @@ jobs:
             readonly_gateway_target_rejects_unclassified_and_external_mutation -- --nocapture
           run_nonzero -p xai-grok-tools --lib \
             issue39_deploy_app_requires_all_capability_mode -- --nocapture
+          # #181: a route that declares its own Authorization must keep it when
+          # an ambient bearer becomes available mid-session. Named in full --
+          # the property is about the *transition*, and a prefix that also
+          # matched the steady-state cases would go green on those alone.
+          run_nonzero -p xai-grok-tools --lib \
+            first_party_declared_authorization_header_survives_mid_session_login -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             restricted_gateway_snapshot_exposes_only_trusted_permitted_tools_per_session -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
