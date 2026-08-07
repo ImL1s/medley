@@ -49,14 +49,14 @@ def _crate_from_manifest(path: str) -> str:
     return Path(path).parent.name
 
 
-def parse_workflow(text: str) -> dict[str, set[str]]:
-    """Map crate -> set of filter strings used against it.
+def parse_workflow(text: str) -> dict[str, dict[str, set[str]]]:
+    """Map crate -> target -> set of filter strings used against it.
 
     Joins YAML line continuations first: `ci.yml` wraps long invocations with a
     trailing backslash, and the filter is usually on the continuation line.
     """
     joined = re.sub(r"\\\s*\n\s*", " ", text)
-    per_crate: dict[str, set[str]] = defaultdict(set)
+    per_crate: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
 
     for line in joined.splitlines():
         m = _RUNNER.match(line)
@@ -72,11 +72,8 @@ def parse_workflow(text: str) -> dict[str, set[str]]:
 
         crate: str | None = None
         filters: list[str] = []
-        # `--test <target>` / `--bin <target>` restrict the run to one
-        # integration target, so whatever they select says nothing about the
-        # crate's lib tests. Tracked so those invocations cannot contribute the
-        # blanket "covers everything" filter below.
-        target_scoped = False
+        targets: list[str] = []
+        has_original_filters = False
         i = 0
         while i < len(args):
             a = args[i]
@@ -87,11 +84,28 @@ def parse_workflow(text: str) -> dict[str, set[str]]:
                         crate = val
                     elif a == "--manifest-path":
                         crate = _crate_from_manifest(val)
-                    elif a in ("--test", "--bin", "--example"):
-                        target_scoped = True
+                    elif a == "--test":
+                        targets.append(f"test:{val}")
+                    elif a == "--bin":
+                        targets.append(f"bin:{val}")
+                    elif a == "--example":
+                        targets.append(f"example:{val}")
                 i += 2
                 continue
+            if a == "--lib":
+                targets.append("lib")
+                i += 1
+                continue
+            if a == "--all-targets":
+                targets.append("*")
+                i += 1
+                continue
             if a in _BARE_FLAGS or a.startswith("-"):
+                i += 1
+                continue
+            has_original_filters = True
+            if "$" in a:
+                print(f"warning: ignoring filter token '{a}' containing shell variable in workflow line: {line.strip()}", file=sys.stderr)
                 i += 1
                 continue
             filters.append(a)
@@ -99,20 +113,24 @@ def parse_workflow(text: str) -> dict[str, set[str]]:
 
         if crate is None:
             continue
+
+        if not targets:
+            targets = ["*"]
+
         if filters:
-            per_crate[crate].update(filters)
-        elif not target_scoped:
+            for t in targets:
+                per_crate[crate][t].update(filters)
+        elif not has_original_filters:
             # No positional filter and no target restriction: the crate's lib
             # tests run unfiltered, so everything in it is covered. The
             # empty string is a substring of every name.
-            per_crate[crate].add("")
-        else:
-            # A target-scoped invocation with no filter covers that target's
-            # tests, not the lib's. Record the crate so it is not reported as
-            # "no filter at all", but contribute nothing to lib coverage.
-            per_crate.setdefault(crate, set())
+            # Decide for yourself whether an unfiltered target-scoped invocation should still count as full coverage for that target only, and say why in the code.
+            # Ans: Yes, because an unfiltered target-scoped cargo test runs all tests within that target, covering all of them.
+            for t in targets:
+                per_crate[crate][t].add("")
 
-    return dict(per_crate)
+    # Convert defaultdicts to regular dicts for a clean return shape
+    return {c: dict(targets_dict) for c, targets_dict in per_crate.items()}
 
 
 def list_tests(crate: str, manifest_root: Path) -> list[str]:
@@ -179,8 +197,8 @@ def main() -> int:
     newly_uncovered: list[str] = []
 
     for crate in crates:
-        filters = per_crate.get(crate)
-        if filters is None:
+        target_filters = per_crate.get(crate)
+        if target_filters is None:
             print(f"{crate}: no filter in the workflow at all -- every test in it runs nowhere")
             continue
 
@@ -197,6 +215,7 @@ def main() -> int:
         if not tests:
             continue
 
+        filters = target_filters.get("lib", set()) | target_filters.get("*", set())
         missing = uncovered(tests, filters)
         fresh = [t for t in missing if f"{crate}::{t}" not in baseline]
         pct = 100.0 * (len(tests) - len(missing)) / len(tests)

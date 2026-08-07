@@ -52,6 +52,36 @@ def crate_of(path: str) -> str | None:
     return None
 
 
+def target_of(path: str, crate_name: str | None) -> str | None:
+    """Determine the target name and type from a file path.
+
+    - `src/**` (excluding `main.rs`, `bin/**`) is `lib`
+    - `tests/foo.rs` is `test:foo`
+    - `src/main.rs`/`src/bin/**` is `bin:<crate_name>` / `bin:<name>`
+    """
+    parts = Path(path).parts
+    if "tests" in parts:
+        idx = parts.index("tests")
+        if len(parts) > idx + 1:
+            name = parts[idx + 1].rsplit(".rs", 1)[0]
+            return f"test:{name}"
+    if "examples" in parts:
+        idx = parts.index("examples")
+        if len(parts) > idx + 1:
+            name = parts[idx + 1].rsplit(".rs", 1)[0]
+            return f"example:{name}"
+    if "src" in parts:
+        if "bin" in parts:
+            b_idx = parts.index("bin")
+            if len(parts) > b_idx + 1:
+                name = parts[b_idx + 1].rsplit(".rs", 1)[0]
+                return f"bin:{name}"
+        if parts[-1] == "main.rs":
+            return f"bin:{crate_name}" if crate_name else "bin"
+        return "lib"
+    return None
+
+
 def added_tests(diff: str) -> list[tuple[str, str]]:
     """(file, test_fn_name) for every test function this diff adds.
 
@@ -77,11 +107,11 @@ def added_tests(diff: str) -> list[tuple[str, str]]:
                 out.append((current_file, fn.group(1)))
                 pending_attr = False
             elif line.startswith("+") and line.strip() not in ("+", "+}"):
-                # Another added attribute (`#[serial]`, `#[ignore]`, a doc
-                # comment) between the test attribute and the fn: keep looking.
-                if not line.lstrip("+").lstrip().startswith("#["):
-                    if not line.lstrip("+").lstrip().startswith("///"):
-                        pending_attr = False
+                # Another added attribute, comment, or other helper between
+                # the test attribute and the fn: keep looking as long as it
+                # cannot end a Rust item (items end with ';' or '}').
+                if ";" in line or "}" in line:
+                    pending_attr = False
     return out
 
 
@@ -136,7 +166,11 @@ def main() -> int:
         crate = crate_of(file_path)
         if crate is None:
             continue
-        filters = per_crate.get(crate, set())
+        target_filters = per_crate.get(crate, {})
+        t = target_of(file_path, crate)
+        if t is None:
+            t = "lib"
+        filters = target_filters.get(t, set()) | target_filters.get("*", set())
         if not selected(fn, file_path, filters):
             unselected.append((crate, file_path, fn))
 
@@ -148,8 +182,13 @@ def main() -> int:
     for crate, file_path, fn in unselected:
         print(f"  {fn}")
         print(f"      {file_path}")
-        known = sorted(per_crate.get(crate, set()))
-        print(f"      crate `{crate}` filters: {known if known else '(none)'}")
+        target_filters = per_crate.get(crate, {})
+        formatted_filters = []
+        for tgt in sorted(target_filters):
+            flts = sorted(target_filters[tgt])
+            if flts:
+                formatted_filters.append(f"{tgt}: {flts}")
+        print(f"      crate `{crate}` filters: {formatted_filters if formatted_filters else '(none)'}")
     print()
     print("These tests will not run in CI. `ci.yml` has no unfiltered test job, so a")
     print("test no filter selects executes nowhere -- not on a developer machine if it")

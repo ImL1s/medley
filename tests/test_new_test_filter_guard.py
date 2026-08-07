@@ -17,14 +17,14 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 
-from check_new_tests_are_filtered import added_tests, crate_of, selected  # noqa: E402
+from check_new_tests_are_filtered import added_tests, crate_of, selected, target_of  # noqa: E402
 from check_test_filter_coverage import parse_workflow, uncovered  # noqa: E402
 
 
 class ParseWorkflow(unittest.TestCase):
     def test_extracts_the_positional_filter_not_the_flag_values(self):
         wf = "          run_nonzero -p xai-grok-shell --lib auth_scheme -- --nocapture\n"
-        self.assertEqual(parse_workflow(wf), {"xai-grok-shell": {"auth_scheme"}})
+        self.assertEqual(parse_workflow(wf), {"xai-grok-shell": {"lib": {"auth_scheme"}}})
 
     def test_joins_line_continuations(self):
         """`ci.yml` wraps long invocations, and the filter is on the second line."""
@@ -32,22 +32,22 @@ class ParseWorkflow(unittest.TestCase):
             "          run_nonzero -p xai-grok-sampler --lib \\\n"
             "            hostile_injector -- --nocapture\n"
         )
-        self.assertEqual(parse_workflow(wf), {"xai-grok-sampler": {"hostile_injector"}})
+        self.assertEqual(parse_workflow(wf), {"xai-grok-sampler": {"lib": {"hostile_injector"}}})
 
     def test_libtest_args_after_the_separator_are_not_filters(self):
         wf = "          run_nonzero -p xai-grok-shell --lib foo -- --skip bar --nocapture\n"
-        self.assertEqual(parse_workflow(wf), {"xai-grok-shell": {"foo"}})
+        self.assertEqual(parse_workflow(wf), {"xai-grok-shell": {"lib": {"foo"}}})
 
     def test_manifest_path_resolves_to_a_crate_name(self):
         wf = (
             "          cargo test --manifest-path crates/codegen/xai-grok-sampler/Cargo.toml \\\n"
             "            --lib none_scheme_ -- --nocapture\n"
         )
-        self.assertEqual(parse_workflow(wf), {"xai-grok-sampler": {"none_scheme_"}})
+        self.assertEqual(parse_workflow(wf), {"xai-grok-sampler": {"lib": {"none_scheme_"}}})
 
     def test_unfiltered_invocation_covers_everything(self):
         wf = "          run_nonzero -p xai-grok-update --lib -- --nocapture\n"
-        self.assertEqual(parse_workflow(wf), {"xai-grok-update": {""}})
+        self.assertEqual(parse_workflow(wf), {"xai-grok-update": {"lib": {""}}})
         self.assertEqual(uncovered(["anything::at::all"], {""}), [])
 
     def test_target_scoped_invocation_does_not_blanket_cover_the_lib(self):
@@ -58,11 +58,23 @@ class ParseWorkflow(unittest.TestCase):
         """
         wf = "          run_nonzero -p xai-grok-update --test test_dist_channel_gate -- --nocapture\n"
         parsed = parse_workflow(wf)
-        self.assertEqual(parsed, {"xai-grok-update": set()})
+        self.assertEqual(parsed, {"xai-grok-update": {"test:test_dist_channel_gate": {""}}})
+        target_filters = parsed.get("xai-grok-update", {})
+        filters = target_filters.get("lib", set()) | target_filters.get("*", set())
         self.assertEqual(
-            uncovered(["some::lib::test"], parsed["xai-grok-update"]),
+            uncovered(["some::lib::test"], filters),
             ["some::lib::test"],
         )
+
+    def test_ignores_shell_variable_filters_and_warns(self):
+        wf = "          run_nonzero -p xai-grok-shell --lib $filter -- --nocapture\n"
+        import io
+        import contextlib
+        f = io.StringIO()
+        with contextlib.redirect_stderr(f):
+            res = parse_workflow(wf)
+        self.assertEqual(res, {})
+        self.assertIn("warning: ignoring filter token '$filter'", f.getvalue())
 
 
 class AddedTests(unittest.TestCase):
@@ -121,6 +133,17 @@ class AddedTests(unittest.TestCase):
                 ("crates/codegen/xai-grok-shell/src/y.rs", "two"),
             ],
         )
+
+    def test_plain_comment_keeps_attribute(self):
+        diff = self._diff(
+            """\
+            +#[test]
+            +// note
+            +fn with_comment() {}
+            """
+        )
+        self.assertEqual([fn for _, fn in added_tests(diff)], ["with_comment"])
+
 
 
 class CrateOf(unittest.TestCase):
@@ -196,6 +219,29 @@ class EndToEnd(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("no new tests", proc.stdout)
+
+    def test_target_scoped_filter_regression(self):
+        # Reaches: main() in check_new_tests_are_filtered.py
+        # Mutation: in check_new_tests_are_filtered.py, change:
+        #   filters = target_filters.get(t, set()) | target_filters.get("*", set())
+        # to:
+        #   filters = set().union(*target_filters.values())
+        diff = (
+            "+++ b/crates/codegen/xai-grok-sampler/src/auth.rs\n"
+            "+#[test]\n+fn none_auth_scheme_lib_regression_for_171() {}\n"
+        )
+        proc = self._run(diff)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("none_auth_scheme_lib_regression_for_171", proc.stdout)
+
+
+class TargetOf(unittest.TestCase):
+    def test_target_of_paths(self):
+        self.assertEqual(target_of("crates/codegen/xai-grok-sampler/src/auth.rs", "xai-grok-sampler"), "lib")
+        self.assertEqual(target_of("crates/codegen/xai-grok-update/tests/test_dist_channel_gate.rs", "xai-grok-update"), "test:test_dist_channel_gate")
+        self.assertEqual(target_of("crates/codegen/xai-grok-update/tests/test_dist_channel_gate/main.rs", "xai-grok-update"), "test:test_dist_channel_gate")
+        self.assertEqual(target_of("crates/codegen/xai-grok-pager-bin/src/main.rs", "xai-grok-pager-bin"), "bin:xai-grok-pager-bin")
+        self.assertEqual(target_of("crates/codegen/xai-grok-pager-bin/src/bin/xai-grok-pager.rs", "xai-grok-pager-bin"), "bin:xai-grok-pager")
 
 
 if __name__ == "__main__":
