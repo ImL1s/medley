@@ -159,6 +159,10 @@ impl RestartActions for E2eActions {
                 .await
                 .owned_clients
                 .insert(server.to_string(), Arc::new(McpClient::stub(server)));
+            self.shutdown
+                .lock()
+                .expect("ShutdownState mutex poisoned")
+                .note_ready(server);
         }
         outcome
     }

@@ -440,6 +440,10 @@ jobs:
           }
           run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
             leaders_kill -- --nocapture
+          # Unique selector for #183: proves the race-repro test itself runs
+          # (shared `leaders_kill` prefixes would stay green if it were deleted).
+          run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
+            leaders_kill_issue183_interleaving_preserves_new_leader_socket -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             leader::lock::tests::reclaim -- --nocapture
 
@@ -822,10 +826,42 @@ jobs:
           # (substring shared with `leaders_kill` alone would not).
           run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
             leaders_kill_failed_kill_counts -- --nocapture
+          # Unique filter: proves startup kill PID plausibility bounds run.
+          run_nonzero -p xai-grok-shell --lib \
+            startup_kill_socket_pid_plausibility_bounds -- --nocapture
           # `reclaim_` rather than the NotFound test alone: this branch's two
           # mutation-proven invariant tests (`reclaim_removes_a_lock_no_process_holds`,
           # `reclaim_refuses_a_lock_a_live_process_holds`) are also selected here.
           run_nonzero -p xai-grok-shell --lib reclaim_ -- --nocapture
+
+      # #173: the arm/note_ready ordering invariant from #45 is defended by a
+      # comment spanning two crates. These are source-scanning guards: the
+      # shell test asserts respawn_stdio inserts into owned_clients BEFORE
+      # arming the watcher and never awaits between the arm and Ok(()); the
+      # mcp test asserts arm_liveness_watcher itself never awaits after
+      # spawn_transport_liveness. Full test names as filters so each selects
+      # its test uniquely. Quoted name: an unquoted `#173` truncates at the
+      # comment marker.
+      - name: 'MCP respawn arm/insert ordering guards (issue #173)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib \
+            respawn_stdio_then_inserts_before_arming_and_has_no_post_arm_yields -- --nocapture
+          run_nonzero -p xai-grok-mcp --lib \
+            arm_liveness_watcher_then_has_no_scheduler_yield_after_spawning -- --nocapture
 
       # #36: restore fd bundling only with a public PI caller and contract.
       # The tests are split by build mode: override-path bundle and release
