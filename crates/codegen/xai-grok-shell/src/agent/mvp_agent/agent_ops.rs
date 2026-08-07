@@ -3731,6 +3731,82 @@ impl MvpAgent {
             current_effort,
         )
     }
+    /// Warm-load seam for #201: recompute this session's disable notice from
+    /// current auth/catalog state instead of reusing the spawn snapshot.
+    ///
+    /// Tri-state guardrail (#133): if readiness is `Unknown(CatalogUnavailable)`
+    /// we cannot tell whether web search is usable, so stay silent (remove any
+    /// stale map entry) rather than misreport "disabled".
+    pub(super) async fn recompute_web_search_disable_notice_for_session(
+        &self,
+        session_id: &acp::SessionId,
+    ) {
+        if self.cfg.borrow().disable_web_search {
+            self.web_search_disabled.borrow_mut().remove(session_id);
+            return;
+        }
+        let model_id = self.cfg.borrow().web_search_model.clone();
+        let models = self.models_manager.models();
+        let (facts, _) = crate::agent::config::resolve_model_auth_facts_and_provider(
+            &model_id,
+            Some(&models),
+        );
+        if matches!(
+            facts.readiness,
+            crate::agent::auth_method::ModelReadiness::Unknown(
+                crate::agent::auth_method::UnknownReason::CatalogUnavailable
+            )
+        ) {
+            tracing::debug!(
+                session_id = %session_id.0,
+                web_search_model = %model_id,
+                "web_search disable notice recompute deferred: catalog readiness unknown"
+            );
+            self.web_search_disabled.borrow_mut().remove(session_id);
+            return;
+        }
+
+        let mut web_search_disable_reason = None;
+        let web_search_sampling_config = self
+            .prepare_web_search_sampling_config_preflight(&mut web_search_disable_reason)
+            .await;
+        let needs_notice = web_search_sampling_config
+            .as_ref()
+            .is_none_or(|cfg| !config::has_usable_credential(cfg));
+        if !needs_notice {
+            self.web_search_disabled.borrow_mut().remove(session_id);
+            return;
+        }
+
+        let disabled = if let Some(reason) = web_search_disable_reason {
+            Some(reason)
+        } else {
+            let cfg = self.cfg.borrow();
+            let session = self.current_or_buffered_auth();
+            config::web_search_disable_details(
+                &cfg.web_search_model,
+                &models,
+                session.as_ref().map(|a| a.key.as_str()),
+                cfg.grok_com_config.api_key_auth_disabled(),
+                cfg.endpoints.alpha_test_key.clone(),
+                cfg.client_version.clone(),
+                &cfg.endpoints,
+            )
+        };
+
+        if let Some(disabled) = disabled {
+            self.web_search_disabled.borrow_mut().insert(
+                session_id.clone(),
+                crate::session::WebSearchDisabledNotice {
+                    model_id: disabled.model_id.clone(),
+                    reason: disabled.reason.clone(),
+                    message: disabled.user_notice(),
+                },
+            );
+        } else {
+            self.web_search_disabled.borrow_mut().remove(session_id);
+        }
+    }
     /// Insert the per-session `_meta` keys (`x.ai/sessionConfig`,
     /// `x.ai/sessionDetail`, `x.ai/schedulerBackgroundLoops`) shared by
     /// `new_session` and `load_session`. Keeping both response paths on this one
