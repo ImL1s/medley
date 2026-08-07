@@ -355,9 +355,9 @@ jobs:
           cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
             toctou -- --nocapture
 
-      # #160: three of the four tests this branch adds matched no filter. The
-      # fourth, `web_search_resolves_an_env_backed_credential_header`, is
-      # already selected by the existing `credential_header` filter. Written
+      # #160: six of the seven tests this branch originally added matched no
+      # filter. The seventh, `web_search_resolves_an_env_backed_credential_header`,
+      # is already selected by the existing `credential_header` filter. Written
       # out rather than looped so the #171 check can see them. Quoted name: an
       # unquoted `#160` truncates at the comment marker.
       - name: 'web_search env header forwarding (issue #160)'
@@ -384,3 +384,7 @@ jobs:
           run_nonzero -p xai-grok-shell --lib keeps_web_search_and_is_told_nothing -- --nocapture
           run_nonzero -p xai-grok-shell --lib credential_less_route -- --nocapture
           run_nonzero -p xai-grok-shell --lib invents_no_bearer -- --nocapture
+          # Review follow-up: resolve→SamplerConfig map copy, and the
+          # bearer_resolver arm of has_usable_credential.
+          run_nonzero -p xai-grok-shell --lib survives_into_sampler_config -- --nocapture
+          run_nonzero -p xai-grok-shell --lib accepts_a_bearer_resolver_alone -- --nocapture

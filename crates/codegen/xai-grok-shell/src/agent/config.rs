@@ -9440,11 +9440,16 @@ reasoning_effort = "low"
     /// `Authorization` header they supplied, that message is not unhelpful, it
     /// is false.
     ///
-    /// Reverting **either of the two readers this test reaches** — the disable
-    /// reason and the notice decision — to `cfg.api_key.is_none()` fails it.
+    /// This test reaches `resolve_web_search_sampling_config`,
+    /// `has_usable_credential`, and `web_search_disable_details` (the disable
+    /// reason). Reverting that reason's gate to `cfg.api_key.is_none()` fails
+    /// it. It does **not** enter `agent_ops`'s notice decision
+    /// (`needs_notice` / `has_usable_credential` at the preflight site) — that
+    /// is defense-in-depth sharing the same predicate, not coverage claimed
+    /// here.
     ///
-    /// It does **not** reach the third, `spawn.rs`'s gate, which is the one
-    /// that actually turns the tool off. That reader is guarded separately by
+    /// It also does not reach `spawn.rs`'s gate, which is the one that
+    /// actually turns the tool off. That reader is guarded separately by
     /// [`spawn_gates_web_search_on_the_shared_credential_predicate`], because
     /// reverting it still compiles and no behavioural test reaches it.
     #[test]
@@ -9556,6 +9561,157 @@ reasoning_effort = "low"
              Dropping it compiles, leaves every behavioural test green, and enables \
              web_search with the credential removed — the request then goes out \
              unauthenticated (#160)."
+        );
+    }
+    /// #160: enablement for an env-only credential header is labelled from
+    /// `model.info`, but the secret only reaches the web_search client if
+    /// `sampling_config_for_model` still copies `info.env_http_headers` into
+    /// `SamplerConfig`.
+    ///
+    /// Replacing that clone with `IndexMap::new()` leaves
+    /// `has_usable_credential` true (classifier still sees the model map),
+    /// spawn still enables, and the request goes out **unauthenticated** —
+    /// the spawn-forward scan and the client wire tests stay green because
+    /// they never build this config through resolve. Mutation target: the
+    /// `env_http_headers: info.env_http_headers.clone()` field in
+    /// `sampling_config_for_model`.
+    #[test]
+    #[serial]
+    fn env_only_credential_header_survives_into_sampler_config() {
+        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+        use xai_grok_test_support::EnvGuard;
+        const VAR: &str = "MEDLEY_TEST_WS_ENV_ONLY_MAP_160";
+        let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+        // Value must be non-empty so the classifier labels ExplicitHeader; the
+        // assertion below checks the env *name* on the map, never the value.
+        let _env = EnvGuard::set(VAR, "env-only-map-sentinel");
+
+        let mut entry = test_model_entry("env-map", "https://third.example/v1", None, None, None);
+        entry
+            .info
+            .env_http_headers
+            .insert("x-api-key".into(), VAR.into());
+        let mut catalog = IndexMap::new();
+        catalog.insert("env-map".to_string(), entry);
+
+        let cfg = resolve_web_search_sampling_config(
+            "env-map",
+            &catalog,
+            None,
+            false,
+            None,
+            None,
+            &EndpointsConfig::default(),
+        )
+        .expect("an env-header-authenticated model must resolve a web-search config");
+
+        assert!(
+            cfg.api_key.is_none(),
+            "precondition: env-header auth means there is no bearer in hand"
+        );
+        assert!(
+            matches!(
+                cfg.credential_source,
+                Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
+            ),
+            "precondition: the classifier labels this route ExplicitHeader, got {:?}",
+            cfg.credential_source
+        );
+        assert!(
+            has_usable_credential(&cfg),
+            "an env-backed credential header is a usable credential"
+        );
+        // The load-bearing copy: name → env NAME must survive resolve. Emptied
+        // at sampling_config_for_model, every other #160 test stays green.
+        assert_eq!(
+            cfg.env_http_headers.get("x-api-key").map(String::as_str),
+            Some(VAR),
+            "resolved SamplerConfig must still map x-api-key to the env name \
+             (Value withheld.)"
+        );
+
+        // Mirror spawn's Enabled construction so a missing map cannot hide
+        // behind "spawn would have forwarded whatever resolve produced".
+        let handed_off = xai_grok_tools::implementations::web_search::WebSearchConfig::Enabled {
+            api_key: cfg.api_key.clone(),
+            base_url: cfg.base_url.clone(),
+            model: cfg.model.clone(),
+            extra_headers: cfg.extra_headers.clone(),
+            env_http_headers: cfg.env_http_headers.clone(),
+            alpha_test_key: None,
+            api_key_provider: None,
+        };
+        match handed_off {
+            xai_grok_tools::implementations::web_search::WebSearchConfig::Enabled {
+                env_http_headers,
+                ..
+            } => {
+                assert_eq!(
+                    env_http_headers.get("x-api-key").map(String::as_str),
+                    Some(VAR),
+                    "WebSearchConfig handoff must carry the env name mapping \
+                     (Value withheld.)"
+                );
+            }
+            xai_grok_tools::implementations::web_search::WebSearchConfig::Disabled => {
+                panic!("handoff must stay Enabled when has_usable_credential is true");
+            }
+        }
+
+        assert!(
+            web_search_disable_details(
+                "env-map",
+                &catalog,
+                None,
+                false,
+                None,
+                None,
+                &EndpointsConfig::default(),
+            )
+            .is_none(),
+            "a route with an env-backed credential must produce no disable notice"
+        );
+    }
+    /// #160: `has_usable_credential`'s bearer_resolver arm is independent of
+    /// `api_key` and of `ExplicitHeader`. Main-session preflight often snapshots
+    /// a token into `api_key`, so that path can look covered without ever
+    /// exercising this arm; non-preflight builders (e.g.
+    /// `prepare_web_search_sampling_config`) still consult it.
+    ///
+    /// Removing `|| cfg.bearer_resolver.is_some()` fails this test and leaves
+    /// every other #160 test green.
+    #[test]
+    fn has_usable_credential_accepts_a_bearer_resolver_alone() {
+        #[derive(Debug)]
+        struct AloneResolver;
+        impl xai_grok_sampler::BearerResolver for AloneResolver {
+            fn current_bearer(&self) -> Option<String> {
+                Some("resolver-only-token".into())
+            }
+        }
+        let with_resolver = SamplerConfig {
+            bearer_resolver: Some(std::sync::Arc::new(AloneResolver)),
+            ..SamplerConfig::default()
+        };
+        assert!(
+            with_resolver.api_key.is_none(),
+            "precondition: no api_key in hand"
+        );
+        assert!(
+            !matches!(
+                with_resolver.credential_source,
+                Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
+            ),
+            "precondition: not an ExplicitHeader route"
+        );
+        assert!(
+            has_usable_credential(&with_resolver),
+            "a bearer_resolver alone is a usable credential"
+        );
+        assert!(
+            !has_usable_credential(&SamplerConfig::default()),
+            "an empty SamplerConfig must remain unusable"
         );
     }
     /// #160 counterweight: the fix must not become "enable everything". A route
