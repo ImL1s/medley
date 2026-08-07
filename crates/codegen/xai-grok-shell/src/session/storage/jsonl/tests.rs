@@ -109,6 +109,58 @@ async fn model_switch_recovers_new_generation_after_chat_materialization() {
 }
 
 #[tokio::test]
+async fn model_switch_recovers_new_generation_after_summary_materialization() {
+    let temp_dir = TempDir::new().unwrap();
+    let info = create_test_info();
+    let base = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    base.init_session(&info, acp::ModelId::new("old-model"))
+        .await
+        .unwrap();
+    base.replace_chat_history(&info, &[ConversationItem::user("old-chat")])
+        .await
+        .unwrap();
+
+    let crashing = JsonlStorageAdapter::with_model_switch_probe(
+        temp_dir.path().to_path_buf(),
+        |step| {
+            if step == ModelSwitchCommitStep::Summary {
+                Err(std::io::Error::other(
+                    "simulated process crash after summary materialization",
+                ))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(
+        crashing
+            .commit_model_switch(
+                &info,
+                &[ConversationItem::user("new-chat")],
+                &acp::ModelId::new("new-model"),
+                Some("new-agent"),
+                None,
+            )
+            .await
+            .expect_err("the crash seam must interrupt intent cleanup")
+            .is_committed()
+    );
+
+    let resumed = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let loaded = resumed.load_session_without_updates(&info).await.unwrap();
+    assert_eq!(loaded.summary.current_model_id.0.as_ref(), "new-model");
+    assert_eq!(loaded.summary.agent_name.as_deref(), Some("new-agent"));
+    assert_eq!(
+        serde_json::to_value(loaded.chat_history).unwrap(),
+        serde_json::to_value([ConversationItem::user("new-chat")]).unwrap()
+    );
+    assert!(
+        !resumed.model_switch_journal_file(&info).exists(),
+        "summary-step recovery must clear the pending intent once resumed"
+    );
+}
+
+#[tokio::test]
 async fn model_switch_recovers_pending_intent_before_installing_next_intent() {
     let temp_dir = TempDir::new().unwrap();
     let info = create_test_info();
@@ -285,6 +337,104 @@ async fn ordinary_model_update_recovers_committed_model_switch_before_writing() 
     assert!(
         !base.model_switch_journal_file(&info).exists(),
         "ordinary model mutation must recover and clear the pending intent first"
+    );
+}
+
+#[tokio::test]
+async fn list_sessions_recovers_pending_model_switch_intent_before_loading_summary() {
+    let temp_dir = TempDir::new().unwrap();
+    let info = create_test_info();
+    let base = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    base.init_session(&info, acp::ModelId::new("old-model"))
+        .await
+        .unwrap();
+    base.replace_chat_history(&info, &[ConversationItem::user("old-chat")])
+        .await
+        .unwrap();
+
+    let crashing = JsonlStorageAdapter::with_model_switch_probe(
+        temp_dir.path().to_path_buf(),
+        |step| {
+            if step == ModelSwitchCommitStep::Intent {
+                Err(std::io::Error::other("leave committed intent pending"))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(
+        crashing
+            .commit_model_switch(
+                &info,
+                &[ConversationItem::user("listed-chat")],
+                &acp::ModelId::new("listed-model"),
+                Some("listed-agent"),
+                None,
+            )
+            .await
+            .expect_err("the committed intent must remain pending")
+            .is_committed()
+    );
+
+    let listed = base.list_sessions(Some(&info.cwd)).await.unwrap();
+    let summary = listed
+        .iter()
+        .find(|summary| summary.info.id == info.id)
+        .expect("session summary should be listed after recovery");
+    assert_eq!(summary.current_model_id.0.as_ref(), "listed-model");
+    assert_eq!(summary.agent_name.as_deref(), Some("listed-agent"));
+    assert!(
+        !base.model_switch_journal_file(&info).exists(),
+        "listing must recover and clear the pending model-switch intent first"
+    );
+}
+
+#[tokio::test]
+async fn list_sessions_recent_recovers_pending_model_switch_intent_before_loading_summary() {
+    let temp_dir = TempDir::new().unwrap();
+    let info = create_test_info();
+    let base = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    base.init_session(&info, acp::ModelId::new("old-model"))
+        .await
+        .unwrap();
+    base.replace_chat_history(&info, &[ConversationItem::user("old-chat")])
+        .await
+        .unwrap();
+
+    let crashing = JsonlStorageAdapter::with_model_switch_probe(
+        temp_dir.path().to_path_buf(),
+        |step| {
+            if step == ModelSwitchCommitStep::Intent {
+                Err(std::io::Error::other("leave committed intent pending"))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(
+        crashing
+            .commit_model_switch(
+                &info,
+                &[ConversationItem::user("recent-chat")],
+                &acp::ModelId::new("recent-model"),
+                Some("recent-agent"),
+                None,
+            )
+            .await
+            .expect_err("the committed intent must remain pending")
+            .is_committed()
+    );
+
+    let listed = base.list_sessions_recent(10).await.unwrap();
+    let summary = listed
+        .iter()
+        .find(|summary| summary.info.id == info.id)
+        .expect("recent listing should include recovered summary");
+    assert_eq!(summary.current_model_id.0.as_ref(), "recent-model");
+    assert_eq!(summary.agent_name.as_deref(), Some("recent-agent"));
+    assert!(
+        !base.model_switch_journal_file(&info).exists(),
+        "recent listing must recover and clear the pending model-switch intent first"
     );
 }
 fn create_test_info() -> Info {

@@ -631,6 +631,37 @@ jobs:
           # which looks for added `#[test]` attributes.
           run_nonzero -p xai-grok-shell --lib agent::models -- --nocapture
 
+      # #54 residual windows: owner-bound load markers for waiter-side lookups,
+      # dropped-ack candidate preservation, and listing-time recovery of pending
+      # model-switch intent journals. Filters are unique so run_nonzero proves
+      # each test is selected.
+      - name: 'Model-switch transaction narrow windows (issue #54)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib \
+            dropping_newer_duplicate_load_keeps_older_wait_marker_alive -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            dropped_model_switch_ack_preserves_live_candidate_generation -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            model_switch_recovers_new_generation_after_summary_materialization -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            list_sessions_recovers_pending_model_switch_intent_before_loading_summary -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            list_sessions_recent_recovers_pending_model_switch_intent_before_loading_summary -- --nocapture
+
       # #166: these assert on colour, and used to inherit the ambient colour
       # level. Run them under both settings of NO_COLOR -- one pass alone would
       # not have caught the original bug, because it only showed up on the axis
