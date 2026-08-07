@@ -2,6 +2,7 @@ use super::types::WebSearchConfig;
 use crate::attribution::{SharedAttributionCallback, ToolConsumer};
 use crate::types::{ApiCredential, ApiTransportProfile, SharedApiKeyProvider};
 use async_openai::types::responses as rs;
+use indexmap::IndexMap;
 use reqwest::header::{
     AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT,
 };
@@ -44,6 +45,25 @@ fn accepts_xai_session_provider(base_url: &str) -> bool {
             || candidate_path
                 .strip_prefix(trusted_path)
                 .is_some_and(|suffix| suffix.starts_with('/')))
+}
+
+fn has_declared_credential_header(
+    extra_headers: &IndexMap<String, String>,
+    env_http_headers: &IndexMap<String, String>,
+) -> bool {
+    fn is_credential_header(name: &str) -> bool {
+        name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("x-api-key")
+    }
+
+    extra_headers
+        .iter()
+        .any(|(name, value)| is_credential_header(name) && !value.trim().is_empty())
+        || env_http_headers.iter().any(|(name, env_var)| {
+            is_credential_header(name)
+                && std::env::var(env_var)
+                    .ok()
+                    .is_some_and(|value| !value.trim().is_empty())
+        })
 }
 
 fn strip_codex_routing_headers(headers: &mut HeaderMap) {
@@ -262,8 +282,10 @@ impl WebSearchClient {
         } else {
             strip_codex_routing_headers(&mut headers);
         }
+        let route_declares_credential_header =
+            has_declared_credential_header(extra_headers, env_http_headers);
         let request_api_key_provider = api_key_provider.clone().or_else(|| {
-            if accepts_xai_session_provider(&base_url) {
+            if accepts_xai_session_provider(&base_url) && !route_declares_credential_header {
                 default_api_key_provider
             } else {
                 None
@@ -1483,6 +1505,78 @@ mod tests {
         assert_eq!(
             request.headers().get(AUTHORIZATION).unwrap(),
             "Bearer fresh-xai-session-key"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_party_declared_authorization_header_survives_mid_session_login() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        struct LoginTransitionProvider {
+            logged_in: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl crate::types::ApiKeyProvider for LoginTransitionProvider {
+            fn current_api_key(&self) -> Option<String> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.logged_in
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .then(|| "ambient-xai-session-key".to_string())
+            }
+        }
+
+        let login_state = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider: SharedApiKeyProvider = std::sync::Arc::new(LoginTransitionProvider {
+            logged_in: std::sync::Arc::clone(&login_state),
+            calls: std::sync::Arc::clone(&calls),
+        });
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("Authorization", "Bearer route-owned-key"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(successful_search_response("route-owned result")),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let config = WebSearchConfig::Enabled {
+            api_key: None,
+            base_url: "https://api.x.ai/v1".to_string(),
+            model: "test-model".to_string(),
+            extra_headers: IndexMap::from([(
+                "Authorization".to_string(),
+                "Bearer route-owned-key".to_string(),
+            )]),
+            env_http_headers: Default::default(),
+            alpha_test_key: None,
+            api_key_provider: None,
+        };
+        let mut client =
+            WebSearchClient::new(&config, Some(provider)).expect("client should build");
+        // Keep the credential-provider decision from the first-party endpoint,
+        // but send to an in-process server for deterministic assertions.
+        client.base_url = server.uri();
+        let (before_login, _) = client
+            .search("before login", None)
+            .await
+            .expect("request should build before login");
+        assert_eq!(before_login, "route-owned result");
+
+        login_state.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (after_login, _) = client
+            .search("after login", None)
+            .await
+            .expect("request should build after login");
+        assert_eq!(after_login, "route-owned result");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "declared route credential must bypass the ambient session provider"
         );
     }
 

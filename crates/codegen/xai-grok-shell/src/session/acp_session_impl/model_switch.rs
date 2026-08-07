@@ -51,12 +51,23 @@ impl SessionActor {
     ) -> Result<AppliedModelSwitch, acp::Error> {
         let PreparedModelSwitch {
             catalog_model_id,
+            resolved_model,
             sampling_config,
             use_concise,
             auto_compact_threshold_percent,
             required_agent_type,
             required_definition,
         } = prepared;
+        let resolved_model_slug = resolved_model.info().model.clone();
+        if resolved_model_slug != sampling_config.model {
+            tracing::warn!(
+                session_id = %self.session_info.id.0,
+                catalog_model_id = %catalog_model_id.0,
+                resolved_model_slug = %resolved_model_slug,
+                sampling_model_slug = %sampling_config.model,
+                "prepared model switch carries mismatched catalog/wire model identity"
+            );
+        }
         let active_agent_type = self
             .active_agent_type
             .lock()
@@ -463,7 +474,8 @@ impl SessionActor {
         if prev_threshold != auto_compact_threshold_percent {
             tracing::info!(
                 session_id = %self.session_info.id.0,
-                new_model = %sampling_config.model,
+                catalog_model_id = %catalog_model_id.0,
+                wire_model_slug = %sampling_config.model,
                 old_threshold = prev_threshold,
                 new_threshold = auto_compact_threshold_percent,
                 "auto_compact_threshold_percent updated for model switch"
@@ -473,7 +485,8 @@ impl SessionActor {
             "backend_search: model switch",
             Some(self.session_info.id.0.as_ref()),
             Some(serde_json::json!({
-                "new_model": &sampling_config.model,
+                "catalog_model_id": &catalog_model_id.0,
+                "wire_model_slug": &sampling_config.model,
                 "api_backend": format!("{:?}", sampling_config.api_backend),
                 "supports_backend_search": sampling_config.supports_backend_search,
             })),
@@ -890,8 +903,14 @@ mod model_switch_transaction_tests {
         required_agent_type: &str,
         definition: Option<xai_grok_agent::AgentDefinition>,
     ) -> PreparedModelSwitch {
+        let mut resolved_model = crate::agent::config::ModelEntry::fallback(
+            "target-wire-model",
+            &crate::agent::config::EndpointsConfig::default(),
+        );
+        resolved_model.info.model = "target-wire-model".to_owned();
         PreparedModelSwitch {
             catalog_model_id: acp::ModelId::new("target-model"),
+            resolved_model,
             sampling_config: switch_sampling_config("target-wire-model"),
             use_concise: false,
             auto_compact_threshold_percent: 73,

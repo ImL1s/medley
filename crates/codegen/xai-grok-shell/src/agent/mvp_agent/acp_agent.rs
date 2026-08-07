@@ -1617,6 +1617,7 @@ impl acp::Agent for MvpAgent {
         });
         let session_exists = self.sessions.borrow().contains_key(&session_id);
         let mut cold_spawn_selection = None;
+        let mut ambiguous_persisted_slug_matches: Option<Vec<acp::ModelId>> = None;
         if session_exists {
             tracing::info!(
                 session_id = %session_id.0,
@@ -1925,18 +1926,37 @@ impl acp::Agent for MvpAgent {
             );
             let mut spawn_timer = crate::instrumentation_timer!("session.spawn_and_register_session");
             spawn_timer.with_field("session_id", session_id.0.as_ref());
+            let available = self.models_manager.available();
+            let models = self.models_manager.models();
+            let persisted_resolution = crate::agent::models::selectable_catalog_resolution_for_persisted(
+                &models,
+                &available,
+                &summary.current_model_id,
+            );
+            let resolved_persisted_catalog_id = match &persisted_resolution {
+                crate::agent::models::PersistedCatalogKeyResolution::Resolved(id) => {
+                    Some(id.clone())
+                }
+                crate::agent::models::PersistedCatalogKeyResolution::AmbiguousSlug { matches, .. } => {
+                    ambiguous_persisted_slug_matches = Some(matches.clone());
+                    None
+                }
+                crate::agent::models::PersistedCatalogKeyResolution::Missing => None,
+            };
+            let persisted_model_for_spawn = resolved_persisted_catalog_id
+                .clone()
+                .unwrap_or_else(|| summary.current_model_id.clone());
             let persisted_agent_name: Option<String> = summary
                 .agent_name
                 .clone()
                 .or_else(|| {
                     self
-                        .resolve_model_id(&summary.current_model_id)
+                        .resolve_model_id(&persisted_model_for_spawn)
                         .ok()
                         .map(|m| m.info().agent_type.clone())
                 });
             // Fail-closed before spawn: never build the actor on an unready
             // persisted model (would attach ambient Bearer via sampling_config).
-            let available = self.models_manager.available();
             let plugin_registry = self.plugin_registry_handle.snapshot();
             let active_definition = {
                 let cfg = self.cfg.borrow();
@@ -1963,86 +1983,100 @@ impl acp::Agent for MvpAgent {
                     },
                 )
             };
-            let spawn_selection = match self.resolve_model_id(&summary.current_model_id) {
-                Ok(entry) if crate::agent::config::model_readiness(&entry).0 => {
-                    ColdSpawnModelSelection {
-                        model_id: summary.current_model_id.clone(),
-                        unavailable_model: None,
+            let spawn_selection = if let Some(matches) = ambiguous_persisted_slug_matches.as_ref() {
+                tracing::warn!(
+                    session_id = %session_id.0,
+                    persisted = %summary.current_model_id.0,
+                    matching_catalog_ids = ?matches.iter().map(|id| id.0.as_ref()).collect::<Vec<_>>(),
+                    "load_session: persisted legacy model slug is ambiguous; requiring explicit model selection"
+                );
+                cold_spawn_fallback_selection(
+                    &summary.current_model_id,
+                    None,
+                    ready_compatible_fallback(vec![self.models_manager.current_model_id()]),
+                )
+            } else {
+                match self.resolve_model_id(&persisted_model_for_spawn) {
+                    Ok(entry) if crate::agent::config::model_readiness(&entry).0 => {
+                        ColdSpawnModelSelection {
+                            model_id: persisted_model_for_spawn.clone(),
+                            unavailable_model: None,
+                        }
                     }
-                }
-                Ok(entry) => {
-                    let reason = crate::agent::config::model_readiness(&entry)
-                        .1
-                        .unwrap_or_else(|| "model is not ready".to_owned());
-                    if let Some(fallback) =
-                        ready_compatible_fallback(available.keys().cloned().collect())
-                    {
+                    Ok(entry) => {
+                        let reason = crate::agent::config::model_readiness(&entry)
+                            .1
+                            .unwrap_or_else(|| "model is not ready".to_owned());
+                        if let Some(fallback) =
+                            ready_compatible_fallback(available.keys().cloned().collect())
+                        {
+                            tracing::warn!(
+                                session_id = %session_id.0,
+                                previous = %summary.current_model_id.0,
+                                new = %fallback.0,
+                                %reason,
+                                "load_session: persisted model not ready before spawn; using ready fallback"
+                            );
+                            cold_spawn_fallback_selection(
+                                &summary.current_model_id,
+                                Some(fallback),
+                                None,
+                            )
+                        } else if let Some(current) = ready_compatible_fallback(vec![
+                            self.models_manager.current_model_id(),
+                        ])
+                        {
+                            tracing::warn!(
+                                session_id = %session_id.0,
+                                previous = %summary.current_model_id.0,
+                                new = %current.0,
+                                %reason,
+                                "load_session: persisted model not ready; spawning on current ready default and latching"
+                            );
+                            cold_spawn_fallback_selection(
+                                &summary.current_model_id,
+                                None,
+                                Some(current),
+                            )
+                        } else {
+                            tracing::warn!(
+                                session_id = %session_id.0,
+                                previous = %summary.current_model_id.0,
+                                %reason,
+                                "load_session: persisted model not ready and no ready fallback; latching prompts"
+                            );
+                            cold_spawn_fallback_selection(&summary.current_model_id, None, None)
+                        }
+                    }
+                    Err(_) if !available.is_empty() => {
+                        if let Some(fallback) =
+                            ready_compatible_fallback(available.keys().cloned().collect())
+                        {
+                            tracing::warn!(
+                                session_id = %session_id.0,
+                                previous = %summary.current_model_id.0,
+                                new = %fallback.0,
+                                "load_session: persisted model unresolved; spawning on ready fallback"
+                            );
+                            cold_spawn_fallback_selection(
+                                &summary.current_model_id,
+                                Some(fallback),
+                                None,
+                            )
+                        } else {
+                            cold_spawn_fallback_selection(&summary.current_model_id, None, None)
+                        }
+                    }
+                    Err(_) => {
+                        // Catalog empty / still loading: latch so prompts cannot run
+                        // on an unverified persisted model with ambient credentials.
                         tracing::warn!(
                             session_id = %session_id.0,
-                            previous = %summary.current_model_id.0,
-                            new = %fallback.0,
-                            %reason,
-                            "load_session: persisted model not ready before spawn; using ready fallback"
-                        );
-                        cold_spawn_fallback_selection(
-                            &summary.current_model_id,
-                            Some(fallback),
-                            None,
-                        )
-                    } else if let Some(current) = ready_compatible_fallback(vec![
-                        self.models_manager.current_model_id(),
-                    ])
-                    {
-                        tracing::warn!(
-                            session_id = %session_id.0,
-                            previous = %summary.current_model_id.0,
-                            new = %current.0,
-                            %reason,
-                            "load_session: persisted model not ready; spawning on current ready default and latching"
-                        );
-                        cold_spawn_fallback_selection(
-                            &summary.current_model_id,
-                            None,
-                            Some(current),
-                        )
-                    } else {
-                        tracing::warn!(
-                            session_id = %session_id.0,
-                            previous = %summary.current_model_id.0,
-                            %reason,
-                            "load_session: persisted model not ready and no ready fallback; latching prompts"
+                            persisted = %summary.current_model_id.0,
+                            "load_session: catalog empty at spawn; latching until a ready model is confirmed"
                         );
                         cold_spawn_fallback_selection(&summary.current_model_id, None, None)
                     }
-                }
-                Err(_) if !available.is_empty() => {
-                    if let Some(fallback) =
-                        ready_compatible_fallback(available.keys().cloned().collect())
-                    {
-                        tracing::warn!(
-                            session_id = %session_id.0,
-                            previous = %summary.current_model_id.0,
-                            new = %fallback.0,
-                            "load_session: persisted model unresolved; spawning on ready fallback"
-                        );
-                        cold_spawn_fallback_selection(
-                            &summary.current_model_id,
-                            Some(fallback),
-                            None,
-                        )
-                    } else {
-                        cold_spawn_fallback_selection(&summary.current_model_id, None, None)
-                    }
-                }
-                Err(_) => {
-                    // Catalog empty / still loading: latch so prompts cannot run
-                    // on an unverified persisted model with ambient credentials.
-                    tracing::warn!(
-                        session_id = %session_id.0,
-                        persisted = %summary.current_model_id.0,
-                        "load_session: catalog empty at spawn; latching until a ready model is confirmed"
-                    );
-                    cold_spawn_fallback_selection(&summary.current_model_id, None, None)
                 }
             };
             let spawn_model_id = spawn_selection.model_id.clone();
@@ -2247,10 +2281,16 @@ impl acp::Agent for MvpAgent {
             self.session_registry.take_unavailable_model(&session_id);
         }
         let resolved_catalog_key = resolve_catalog_key(&models, &persisted_model);
+        let selectable_resolution = crate::agent::models::selectable_catalog_resolution_for_persisted(
+            &models,
+            &available,
+            &persisted_model,
+        );
         tracing::debug!(
             session_id = %session_id.0,
             persisted = %persisted_model.0,
             resolved_catalog_key = ?resolved_catalog_key.as_ref().map(|k| k.0.as_ref()),
+            selectable_resolution = ?selectable_resolution,
             available_count = available.len(),
             contains_persisted = available.contains_key(&persisted_model),
             available_keys = ?available.keys().take(10).collect::<Vec<_>>(),
@@ -2262,18 +2302,26 @@ impl acp::Agent for MvpAgent {
         } else {
             available.keys().find(|id| !id.0.starts_with("grok-build")).cloned()
         };
-        let selectable_catalog_key = selectable_catalog_key_for_persisted(
-            &models,
-            &available,
-            &persisted_model,
-        );
         let model_id = if let Some(preflight) = cold_spawn_selection.as_ref() {
             preflight.replace_unavailable_latch(&self.session_registry, &session_id);
             if preflight.unavailable_model.is_some() {
-                let reason = format!(
-                    "Model \"{}\" is unavailable. Please start a new session or switch models.",
-                    persisted_model.0,
-                );
+                let reason = if let Some(matches) = ambiguous_persisted_slug_matches.as_ref() {
+                    let options = matches
+                        .iter()
+                        .map(|id| id.0.as_ref())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(
+                        "Model slug \"{}\" matches multiple configured models ({}). \
+                         Use /model with one of those catalog IDs to resume this session.",
+                        persisted_model.0, options,
+                    )
+                } else {
+                    format!(
+                        "Model \"{}\" is unavailable. Please start a new session or switch models.",
+                        persisted_model.0,
+                    )
+                };
                 self.send_model_auto_switched(
                     &session_id,
                     &persisted_model,
@@ -2295,101 +2343,145 @@ impl acp::Agent for MvpAgent {
                 .await;
             }
             preflight.model_id.clone()
-        } else if let Some(catalog_key) = selectable_catalog_key {
-            if catalog_key != persisted_model {
-                tracing::info!(
-                    session_id = %session_id.0,
-                    persisted = %persisted_model.0,
-                    catalog_key = %catalog_key.0,
-                    "load_session: mapped persisted routing slug to catalog key"
-                );
-                xai_grok_telemetry::unified_log::info(
-                    "load_session: mapped persisted routing slug to catalog key",
-                    Some(session_id.0.as_ref()),
-                    Some(
-                        serde_json::json!({
-                        "persisted_model": persisted_model.0.as_ref(),
-                        "catalog_key": catalog_key.0.as_ref(),
-                    }),
-                    ),
-                );
-            }
-            catalog_key
-        } else if available.is_empty() {
-            tracing::warn!(
-                session_id = %session_id.0,
-                persisted = %persisted_model.0,
-                "load_session: model catalog empty at load; keeping persisted model unverified (catalog fetch may still be in flight)"
-            );
-            xai_grok_telemetry::unified_log::warn(
-                "load_session: model catalog empty, keeping persisted model unverified",
-                Some(session_id.0.as_ref()),
-                Some(
-                    serde_json::json!({
-                    "persisted_model": persisted_model.0.as_ref(),
-                }),
-                ),
-            );
-            persisted_model
-        } else if let Some(fallback) = same_family_fallback {
-            tracing::warn!(
-                session_id = %session_id.0,
-                previous = %persisted_model.0,
-                new = %fallback.0,
-                "Persisted model no longer available, auto-switching within family"
-            );
-            let reason = format!(
-                "Model \"{}\" is no longer available for your account.",
-                persisted_model.0,
-            );
-            self.send_model_auto_switched(
-                    &session_id,
-                    &persisted_model,
-                    &fallback,
-                    &reason,
-                )
-                .await;
-            fallback
         } else {
-            let fallback = available
-                .keys()
-                .next()
-                .cloned()
-                .unwrap_or_else(|| persisted_model.clone());
-            tracing::warn!(
-                session_id = %session_id.0,
-                previous = %persisted_model.0,
-                fallback = %fallback.0,
-                available_count = available.len(),
-                available_keys = ?available.keys().take(10).collect::<Vec<_>>(),
-                "Persisted model no longer available, no same-family fallback — blocking prompts for this session"
-            );
-            xai_grok_telemetry::unified_log::warn(
-                "load_session: persisted model unavailable, no same-family fallback",
-                Some(session_id.0.as_ref()),
-                Some(
-                    serde_json::json!({
-                    "persisted_model": persisted_model.0.as_ref(),
-                    "fallback_model": fallback.0.as_ref(),
-                    "available_count": available.len(),
-                }),
-                ),
-            );
-            let reason = format!(
-                "Model \"{}\" is no longer available. Please start a new session.",
-                persisted_model.0,
-            );
-            let empty_id = acp::ModelId::new(String::new());
-            self.send_model_auto_switched(
-                    &session_id,
-                    &persisted_model,
-                    &empty_id,
-                    &reason,
-                )
-                .await;
-            self.session_registry
-                .set_unavailable_model(&session_id, persisted_model.clone());
-            fallback
+            match selectable_resolution {
+                crate::agent::models::PersistedCatalogKeyResolution::Resolved(catalog_key) => {
+                    if catalog_key != persisted_model {
+                        tracing::info!(
+                            session_id = %session_id.0,
+                            persisted = %persisted_model.0,
+                            catalog_key = %catalog_key.0,
+                            "load_session: mapped persisted routing slug to catalog key"
+                        );
+                        xai_grok_telemetry::unified_log::info(
+                            "load_session: mapped persisted routing slug to catalog key",
+                            Some(session_id.0.as_ref()),
+                            Some(
+                                serde_json::json!({
+                                "persisted_model": persisted_model.0.as_ref(),
+                                "catalog_key": catalog_key.0.as_ref(),
+                            }),
+                            ),
+                        );
+                    }
+                    catalog_key
+                }
+                crate::agent::models::PersistedCatalogKeyResolution::AmbiguousSlug {
+                    matches,
+                    ..
+                } => {
+                    let options = matches
+                        .iter()
+                        .map(|id| id.0.as_ref())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let fallback = available
+                        .keys()
+                        .next()
+                        .cloned()
+                        .unwrap_or_else(|| self.models_manager.current_model_id());
+                    tracing::warn!(
+                        session_id = %session_id.0,
+                        persisted = %persisted_model.0,
+                        matching_catalog_ids = ?matches.iter().map(|id| id.0.as_ref()).collect::<Vec<_>>(),
+                        fallback = %fallback.0,
+                        "load_session: persisted legacy model slug is ambiguous; blocking prompts for explicit model selection"
+                    );
+                    let reason = format!(
+                        "Model slug \"{}\" matches multiple configured models ({}). \
+                         Use /model with one of those catalog IDs to resume this session.",
+                        persisted_model.0, options,
+                    );
+                    self.send_model_auto_switched(
+                            &session_id,
+                            &persisted_model,
+                            &acp::ModelId::new(String::new()),
+                            &reason,
+                        )
+                        .await;
+                    self.session_registry
+                        .set_unavailable_model(&session_id, persisted_model.clone());
+                    fallback
+                }
+                crate::agent::models::PersistedCatalogKeyResolution::Missing => {
+                    if available.is_empty() {
+                        tracing::warn!(
+                            session_id = %session_id.0,
+                            persisted = %persisted_model.0,
+                            "load_session: model catalog empty at load; keeping persisted model unverified (catalog fetch may still be in flight)"
+                        );
+                        xai_grok_telemetry::unified_log::warn(
+                            "load_session: model catalog empty, keeping persisted model unverified",
+                            Some(session_id.0.as_ref()),
+                            Some(
+                                serde_json::json!({
+                                "persisted_model": persisted_model.0.as_ref(),
+                            }),
+                            ),
+                        );
+                        persisted_model
+                    } else if let Some(fallback) = same_family_fallback {
+                        tracing::warn!(
+                            session_id = %session_id.0,
+                            previous = %persisted_model.0,
+                            new = %fallback.0,
+                            "Persisted model no longer available, auto-switching within family"
+                        );
+                        let reason = format!(
+                            "Model \"{}\" is no longer available for your account.",
+                            persisted_model.0,
+                        );
+                        self.send_model_auto_switched(
+                                &session_id,
+                                &persisted_model,
+                                &fallback,
+                                &reason,
+                            )
+                            .await;
+                        fallback
+                    } else {
+                        let fallback = available
+                            .keys()
+                            .next()
+                            .cloned()
+                            .unwrap_or_else(|| persisted_model.clone());
+                        tracing::warn!(
+                            session_id = %session_id.0,
+                            previous = %persisted_model.0,
+                            fallback = %fallback.0,
+                            available_count = available.len(),
+                            available_keys = ?available.keys().take(10).collect::<Vec<_>>(),
+                            "Persisted model no longer available, no same-family fallback — blocking prompts for this session"
+                        );
+                        xai_grok_telemetry::unified_log::warn(
+                            "load_session: persisted model unavailable, no same-family fallback",
+                            Some(session_id.0.as_ref()),
+                            Some(
+                                serde_json::json!({
+                                "persisted_model": persisted_model.0.as_ref(),
+                                "fallback_model": fallback.0.as_ref(),
+                                "available_count": available.len(),
+                            }),
+                            ),
+                        );
+                        let reason = format!(
+                            "Model \"{}\" is no longer available. Please start a new session.",
+                            persisted_model.0,
+                        );
+                        let empty_id = acp::ModelId::new(String::new());
+                        self.send_model_auto_switched(
+                                &session_id,
+                                &persisted_model,
+                                &empty_id,
+                                &reason,
+                            )
+                            .await;
+                        self.session_registry
+                            .set_unavailable_model(&session_id, persisted_model.clone());
+                        fallback
+                    }
+                }
+            }
         };
         // Fail-closed: never apply an unready catalog entry (invalid auth_scheme,
         // missing BYOK key, etc.) — that would attach ambient Bearer to the session.
@@ -2677,99 +2769,128 @@ impl acp::Agent for MvpAgent {
         if let Some(unavailable_model) = latched_model {
             let models = self.models_manager.models();
             let available = self.models_manager.available();
-            let restore_model_id = selectable_catalog_key_for_persisted(
-                    &models,
-                    &available,
-                    &unavailable_model,
-                )
-                .unwrap_or(unavailable_model.clone());
-            if available.contains_key(&restore_model_id) {
-                let restore_ready = self
-                    .resolve_model_id(&restore_model_id)
-                    .ok()
-                    .is_some_and(|m| crate::agent::config::model_readiness(&m).0);
-                if !restore_ready {
-                    tracing::warn!(
+            match crate::agent::models::selectable_catalog_resolution_for_persisted(
+                &models,
+                &available,
+                &unavailable_model,
+            ) {
+                crate::agent::models::PersistedCatalogKeyResolution::Resolved(restore_model_id) => {
+                    let restore_ready = self
+                        .resolve_model_id(&restore_model_id)
+                        .ok()
+                        .is_some_and(|m| crate::agent::config::model_readiness(&m).0);
+                    if !restore_ready {
+                        tracing::warn!(
+                            session_id = %arguments.session_id.0,
+                            model_id = %restore_model_id.0,
+                            "prompt: previously-unavailable model is back but still not ready; keeping block"
+                        );
+                        self.send_model_auto_switched(
+                                &arguments.session_id,
+                                &acp::ModelId::new(String::new()),
+                                &acp::ModelId::new(String::new()),
+                                "Your previous model is still not ready (missing credentials or invalid auth_scheme).",
+                            )
+                            .await;
+                        return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+                    }
+                    tracing::info!(
                         session_id = %arguments.session_id.0,
                         model_id = %restore_model_id.0,
-                        "prompt: previously-unavailable model is back but still not ready; keeping block"
+                        "prompt: previously-unavailable model is back in the catalog; restoring it and unblocking the session"
                     );
-                    self.send_model_auto_switched(
-                            &arguments.session_id,
-                            &acp::ModelId::new(String::new()),
-                            &acp::ModelId::new(String::new()),
-                            "Your previous model is still not ready (missing credentials or invalid auth_scheme).",
-                        )
-                        .await;
-                    return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
-                }
-                tracing::info!(
-                    session_id = %arguments.session_id.0,
-                    model_id = %restore_model_id.0,
-                    "prompt: previously-unavailable model is back in the catalog; restoring it and unblocking the session"
-                );
-                xai_grok_telemetry::unified_log::info(
-                    "prompt: previously-unavailable model recovered, unblocking session",
-                    Some(arguments.session_id.0.as_ref()),
-                    Some(
-                        serde_json::json!({
-                        "model_id": restore_model_id.0.as_ref(),
-                    }),
-                    ),
-                );
-                if let Err(e) = crate::agent::handlers::model_switch::apply(
-                        self,
-                        acp::SetSessionModelRequest::new(
-                            arguments.session_id.clone(),
-                            restore_model_id.clone(),
+                    xai_grok_telemetry::unified_log::info(
+                        "prompt: previously-unavailable model recovered, unblocking session",
+                        Some(arguments.session_id.0.as_ref()),
+                        Some(
+                            serde_json::json!({
+                            "model_id": restore_model_id.0.as_ref(),
+                        }),
                         ),
-                    )
-                    .await
-                {
+                    );
+                    if let Err(e) = crate::agent::handlers::model_switch::apply(
+                            self,
+                            acp::SetSessionModelRequest::new(
+                                arguments.session_id.clone(),
+                                restore_model_id.clone(),
+                            ),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            session_id = %arguments.session_id.0,
+                            model_id = %restore_model_id.0,
+                            error = ?e,
+                            "prompt: failed to restore previously-unavailable model; keeping block"
+                        );
+                        self.send_model_auto_switched(
+                                &arguments.session_id,
+                                &acp::ModelId::new(String::new()),
+                                &acp::ModelId::new(String::new()),
+                                "Could not restore your previous model; prompts stay blocked until a successful switch.",
+                            )
+                            .await;
+                        return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+                    }
+                    self.session_registry
+                        .take_unavailable_model(&arguments.session_id);
+                }
+                crate::agent::models::PersistedCatalogKeyResolution::AmbiguousSlug {
+                    matches,
+                    ..
+                } => {
+                    let options = matches
+                        .iter()
+                        .map(|id| id.0.as_ref())
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     tracing::warn!(
                         session_id = %arguments.session_id.0,
-                        model_id = %restore_model_id.0,
-                        error = ?e,
-                        "prompt: failed to restore previously-unavailable model; keeping block"
+                        unavailable_model = %unavailable_model.0,
+                        matching_catalog_ids = ?matches.iter().map(|id| id.0.as_ref()).collect::<Vec<_>>(),
+                        "prompt blocked: persisted legacy model slug is ambiguous"
                     );
                     self.send_model_auto_switched(
                             &arguments.session_id,
                             &acp::ModelId::new(String::new()),
                             &acp::ModelId::new(String::new()),
-                            "Could not restore your previous model; prompts stay blocked until a successful switch.",
+                            &format!(
+                                "Your previous model slug \"{}\" matches multiple configured models ({}). \
+                                 Use /model with one of those catalog IDs to continue.",
+                                unavailable_model.0, options
+                            ),
                         )
                         .await;
                     return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
                 }
-                self.session_registry
-                    .take_unavailable_model(&arguments.session_id);
-            } else {
-                tracing::warn!(
-                    session_id = %arguments.session_id.0,
-                    unavailable_model = %unavailable_model.0,
-                    available_count = available.len(),
-                    available_keys = ?available.keys().take(10).collect::<Vec<_>>(),
-                    "prompt blocked: session model unavailable since load and still missing from the catalog"
-                );
-                xai_grok_telemetry::unified_log::warn(
-                    "prompt blocked: model unavailable",
-                    Some(arguments.session_id.0.as_ref()),
-                    Some(
-                        serde_json::json!({
-                        "unavailable_model": unavailable_model.0.as_ref(),
-                        "available_count": available.len(),
-                    }),
-                    ),
-                );
-                self.send_model_auto_switched(
-                        &arguments.session_id,
-                        &acp::ModelId::new(String::new()),
-                        &acp::ModelId::new(String::new()),
-                        "Your previous model is no longer available and could not \
-                     be switched to a compatible model. Please start a new session.",
-                    )
-                    .await;
-                return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+                crate::agent::models::PersistedCatalogKeyResolution::Missing => {
+                    tracing::warn!(
+                        session_id = %arguments.session_id.0,
+                        unavailable_model = %unavailable_model.0,
+                        available_count = available.len(),
+                        available_keys = ?available.keys().take(10).collect::<Vec<_>>(),
+                        "prompt blocked: session model unavailable since load and still missing from the catalog"
+                    );
+                    xai_grok_telemetry::unified_log::warn(
+                        "prompt blocked: model unavailable",
+                        Some(arguments.session_id.0.as_ref()),
+                        Some(
+                            serde_json::json!({
+                            "unavailable_model": unavailable_model.0.as_ref(),
+                            "available_count": available.len(),
+                        }),
+                        ),
+                    );
+                    self.send_model_auto_switched(
+                            &arguments.session_id,
+                            &acp::ModelId::new(String::new()),
+                            &acp::ModelId::new(String::new()),
+                            "Your previous model is no longer available and could not \
+                         be switched to a compatible model. Please start a new session.",
+                        )
+                        .await;
+                    return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+                }
             }
         }
         let dispatch_lock = self.dispatch_lock(&arguments.session_id);

@@ -77,6 +77,18 @@ fn emit_failure_telemetry(event: xai_grok_telemetry::events::ModelSwitched) {
     xai_grok_telemetry::session_ctx::log_event(event);
 }
 
+fn resolve_model_switch_auto_compact_threshold_percent(
+    cfg: &config::Config,
+    catalog_model_id: &acp::ModelId,
+    resolved_model: &config::ModelEntry,
+) -> u8 {
+    crate::util::config::resolve_auto_compact_threshold_percent(
+        cfg,
+        catalog_model_id.0.as_ref(),
+        Some(resolved_model.info()),
+    )
+}
+
 #[cfg(test)]
 static CAPTURED_FAILURE_TELEMETRY: std::sync::LazyLock<std::sync::Mutex<Vec<serde_json::Value>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
@@ -132,12 +144,12 @@ async fn apply_with_load_gate(
     let effort_override = parse_reasoning_effort_meta(args.meta.as_ref());
     let acp::SetSessionModelRequest {
         session_id,
-        model_id,
+        model_id: requested_model_id,
         ..
     } = args;
     // Armed until the complete actor receipt and outer mirrors have committed.
     // Every early return therefore emits exactly one sanitized failure event.
-    let mut failure_telemetry = FailureTelemetry::new(&session_id, &model_id);
+    let mut failure_telemetry = FailureTelemetry::new(&session_id, &requested_model_id);
     let handle = match load_guard {
         Some(guard) => agent.session_handle_during_load(&session_id, guard),
         None => agent.session_handle_waiting_for_load(&session_id).await,
@@ -152,17 +164,51 @@ async fn apply_with_load_gate(
     // outer-handle sequence with prompt intake and other model switches.
     let dispatch_lock = agent.dispatch_lock(&session_id);
     let _dispatch_guard = dispatch_lock.lock().await;
-    let model = agent.resolve_model_id(&model_id)?;
+    let models = agent.models_manager.models();
+    let requested_model_str = requested_model_id.0.as_ref();
+    let slug_matches: Vec<String> = models
+        .iter()
+        .filter(|(_, entry)| entry.info().model == requested_model_str)
+        .map(|(key, _)| key.clone())
+        .collect();
+    let Some(catalog_model_id) =
+        crate::agent::models::resolve_catalog_key(&models, &requested_model_id)
+    else {
+        if !models.contains_key(requested_model_str) && slug_matches.len() > 1 {
+            return Err(acp::Error::invalid_params().data(format!(
+                "model slug '{}' matches multiple catalog ids: {}. \
+                 Choose an explicit catalog id.",
+                requested_model_str,
+                slug_matches.join(", ")
+            )));
+        }
+        return Err(acp::Error::invalid_params().data("unknown model id"));
+    };
+    let model = models
+        .get(catalog_model_id.0.as_ref())
+        .cloned()
+        .expect("resolve_catalog_key returned key present in models()");
+    failure_telemetry.new_model_id = catalog_model_id.0.to_string();
     let (ready, reason) = config::model_readiness(&model);
     if !ready {
         tracing::warn!(
             session_id = %session_id.0,
-            model_id = %model_id.0,
+            model_id = %catalog_model_id.0,
+            model_slug = %model.info().model,
             reason = ?reason,
             "model_switch::apply: rejecting unready model (fail-closed)"
         );
         return Err(acp::Error::invalid_params()
             .data(reason.unwrap_or_else(|| "model is not ready".to_owned())));
+    }
+    if requested_model_id != catalog_model_id {
+        tracing::info!(
+            session_id = %session_id.0,
+            requested_model_id = %requested_model_id.0,
+            resolved_catalog_model_id = %catalog_model_id.0,
+            model_slug = %model.info().model,
+            "set_session_model: normalized non-canonical model id to catalog id"
+        );
     }
     let use_concise = model.info().use_concise;
     let session_default = handle
@@ -216,7 +262,8 @@ async fn apply_with_load_gate(
     );
     tracing::info!(
         session_id = %session_id.0,
-        model_id = %model_id.0,
+        model_id = %catalog_model_id.0,
+        model_slug = %model.info().model,
         ?required_agent_type,
         active_agent_type = %observed_active_agent_type,
         is_mismatch,
@@ -236,7 +283,7 @@ async fn apply_with_load_gate(
     if let Some(eff) = effort_override {
         if agent
             .models_manager
-            .model_supports_reasoning_effort(model_id.0.as_ref())
+            .model_supports_reasoning_effort(catalog_model_id.0.as_ref())
         {
             tracing::info!(
                 session_id = %session_id.0,
@@ -247,7 +294,8 @@ async fn apply_with_load_gate(
         } else {
             tracing::warn!(
                 session_id = %session_id.0,
-                model_id = %model_id.0,
+                model_id = %catalog_model_id.0,
+                model_slug = %model.info().model,
                 effort = %eff,
                 "set_session_model: ignoring reasoning_effort override — model does not support it"
             );
@@ -256,20 +304,15 @@ async fn apply_with_load_gate(
     let applied_effort = model_sampling.reasoning_effort;
     let new_threshold = {
         let cfg = agent.cfg.borrow();
-        let models = agent.models_manager.models();
-        let model = config::find_model_by_id(&models, model_sampling.model.as_str());
-        crate::util::config::resolve_auto_compact_threshold_percent(
-            &cfg,
-            model_sampling.model.as_str(),
-            model.map(|e| &e.info),
-        )
+        resolve_model_switch_auto_compact_threshold_percent(&cfg, &catalog_model_id, &model)
     };
     let (tx, rx) = oneshot::channel();
     handle
         .cmd_tx
         .send(SessionCommand::ApplyModelSwitch {
             prepared: Box::new(crate::session::PreparedModelSwitch {
-                catalog_model_id: model_id.clone(),
+                catalog_model_id: catalog_model_id.clone(),
+                resolved_model: model.clone(),
                 sampling_config: model_sampling,
                 use_concise,
                 auto_compact_threshold_percent: new_threshold,
@@ -298,7 +341,7 @@ async fn apply_with_load_gate(
     let committed_previous_model_id = receipt.previous_model_id.0.to_string();
     let updated_model = receipt.catalog_model_id;
     if let Some(handle) = agent.sessions.borrow_mut().get_mut(&session_id) {
-        handle.model_id = model_id.clone();
+        handle.model_id = catalog_model_id.clone();
         handle.reasoning_effort = applied_effort;
         handle.agent_name =
             agent_name_after_model_switch(did_rebuild, &required_agent_type, &handle.agent_name);
@@ -306,30 +349,32 @@ async fn apply_with_load_gate(
     broadcast_model_changed(
         agent,
         &session_id,
-        model_id.0.as_ref(),
+        catalog_model_id.0.as_ref(),
         applied_effort.map(|eff| eff.to_string()),
     );
     xai_grok_telemetry::unified_log::info(
         "model changed",
         Some(session_id.0.as_ref()),
-        Some(serde_json::json!({"model": model_id.0.as_ref()})),
+        Some(serde_json::json!({"model": catalog_model_id.0.as_ref()})),
     );
     xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::ModelSwitched {
         session_id: session_id.0.to_string(),
         previous_model_id: committed_previous_model_id,
-        new_model_id: model_id.0.to_string(),
+        new_model_id: catalog_model_id.0.to_string(),
         success: true,
         error_code: None,
         required_agent_type: Some(required_agent_type.clone()),
         current_agent_type: receipt.active_agent_type,
     });
     if agent.cfg.borrow().mode != config::AgentMode::Leader {
-        agent.models_manager.set_current_model_id(model_id.clone());
+        agent
+            .models_manager
+            .set_current_model_id(catalog_model_id.clone());
         agent
             .models_manager
             .set_current_reasoning_effort(applied_effort);
     }
-    agent.sync_process_static_api_key(Some(model_id.0.as_ref()));
+    agent.sync_process_static_api_key(Some(catalog_model_id.0.as_ref()));
     failure_telemetry.disarm();
     Ok(acp::SetSessionModelResponse::new().meta(
         serde_json::json!({
@@ -397,5 +442,37 @@ mod tests {
         assert_eq!(telemetry.error_code, config::MODEL_SWITCH_COMMIT_FAILED);
 
         telemetry.disarm();
+    }
+
+    #[test]
+    fn auto_compact_threshold_resolves_by_catalog_id_not_wire_slug() {
+        let mut cfg = config::Config::default();
+        cfg.config_models.insert(
+            "local-fast".to_string(),
+            config::ConfigModelOverride {
+                auto_compact_threshold_percent: Some(63),
+                ..Default::default()
+            },
+        );
+        cfg.config_models.insert(
+            "qwen".to_string(),
+            config::ConfigModelOverride {
+                auto_compact_threshold_percent: Some(27),
+                ..Default::default()
+            },
+        );
+        let mut resolved_model =
+            config::ModelEntry::fallback("qwen", &config::EndpointsConfig::default());
+        resolved_model.info.auto_compact_threshold_percent = Some(91);
+
+        let threshold = resolve_model_switch_auto_compact_threshold_percent(
+            &cfg,
+            &acp::ModelId::new("local-fast"),
+            &resolved_model,
+        );
+        assert_eq!(
+            threshold, 63,
+            "model-switch threshold must resolve from the selected catalog id, not the wire slug"
+        );
     }
 }

@@ -172,17 +172,13 @@ mod tests {
     /// accepts it. Returns the directory holding it.
     #[cfg(unix)]
     fn stub_protoc_dir(tag: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!(
             "xai-proto-build-{tag}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let protoc = dir.join("protoc");
-        std::fs::write(&protoc, b"#!/bin/sh\nexit 0\n").expect("write stub");
-        std::fs::set_permissions(&protoc, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod stub");
+        crate::write_executable_stub(dir.join("protoc"), b"#!/bin/sh\nexit 0\n");
         dir
     }
 

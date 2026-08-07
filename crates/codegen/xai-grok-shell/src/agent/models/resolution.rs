@@ -1,6 +1,32 @@
 use super::*;
 
+/// Model-id restore resolution outcome for persisted session identities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PersistedCatalogKeyResolution {
+    /// Resolved to one authoritative catalog key.
+    Resolved(acp::ModelId),
+    /// The persisted value is a routing slug shared by multiple selectable
+    /// catalog entries. Caller must require an explicit user choice.
+    AmbiguousSlug {
+        slug: acp::ModelId,
+        matches: Vec<acp::ModelId>,
+    },
+    /// No selectable catalog entry maps to this persisted identity.
+    Missing,
+}
+
+fn catalog_keys_for_slug(models: &IndexMap<String, ModelEntry>, slug: &str) -> Vec<acp::ModelId> {
+    models
+        .iter()
+        .filter(|(_, entry)| entry.info.model == slug)
+        .map(|(key, _)| acp::ModelId::new(key.clone()))
+        .collect()
+}
+
 /// Map a model id (catalog key or routing slug) to its catalog key.
+///
+/// Slug matches must be unique. Ambiguous slugs (multiple catalog keys sharing
+/// the same wire model) return `None` so callers cannot silently pick one.
 pub(crate) fn resolve_catalog_key(
     models: &IndexMap<String, ModelEntry>,
     id: &acp::ModelId,
@@ -9,11 +35,41 @@ pub(crate) fn resolve_catalog_key(
     if models.contains_key(id_str) {
         return Some(id.clone());
     }
-    models
+    let mut matches = catalog_keys_for_slug(models, id_str);
+    if matches.len() == 1 {
+        return matches.pop();
+    }
+    None
+}
+
+/// Persisted-model resolver constrained to selectable (`available`) entries.
+///
+/// Unlike `resolve_catalog_key`, this reports ambiguity explicitly so restore
+/// paths can block and ask the user to choose an exact catalog key.
+pub(crate) fn selectable_catalog_resolution_for_persisted(
+    models: &IndexMap<String, ModelEntry>,
+    available: &IndexMap<acp::ModelId, acp::ModelInfo>,
+    id: &acp::ModelId,
+) -> PersistedCatalogKeyResolution {
+    if available.contains_key(id) {
+        return PersistedCatalogKeyResolution::Resolved(id.clone());
+    }
+    let id_str = id.0.as_ref();
+    let matches: Vec<acp::ModelId> = models
         .iter()
-        .rev()
-        .find(|(_, entry)| entry.info.model == id_str)
+        .filter(|(key, entry)| {
+            available.contains_key(&acp::ModelId::new((*key).clone())) && entry.info.model == id_str
+        })
         .map(|(key, _)| acp::ModelId::new(key.clone()))
+        .collect();
+    match matches.len() {
+        0 => PersistedCatalogKeyResolution::Missing,
+        1 => PersistedCatalogKeyResolution::Resolved(matches[0].clone()),
+        _ => PersistedCatalogKeyResolution::AmbiguousSlug {
+            slug: id.clone(),
+            matches,
+        },
+    }
 }
 
 /// Catalog key for a persisted session model id, restricted to **selectable**
@@ -22,16 +78,11 @@ pub(crate) fn selectable_catalog_key_for_persisted(
     available: &IndexMap<acp::ModelId, acp::ModelInfo>,
     id: &acp::ModelId,
 ) -> Option<acp::ModelId> {
-    if available.contains_key(id) {
-        return Some(id.clone());
+    match selectable_catalog_resolution_for_persisted(models, available, id) {
+        PersistedCatalogKeyResolution::Resolved(key) => Some(key),
+        PersistedCatalogKeyResolution::AmbiguousSlug { .. }
+        | PersistedCatalogKeyResolution::Missing => None,
     }
-    let id_str = id.0.as_ref();
-    if let Some((key, _)) = models.iter().rev().find(|(key, entry)| {
-        available.contains_key(&acp::ModelId::new((*key).clone())) && entry.info.model == id_str
-    }) {
-        return Some(acp::ModelId::new(key.clone()));
-    }
-    resolve_catalog_key(models, id).filter(|key| available.contains_key(key))
 }
 
 /// A "campaign-only" preferred flip: the default changed and either side's value
@@ -124,12 +175,9 @@ pub(crate) fn resolve_default_model(
             // the ready-only filter. An explicit preference that is present
             // but unusable must not be silently replaced (#131).
             //
-            // `.rev()` on the slug scan, not plain `.find()`: duplicate
-            // routing slugs under distinct keys are first-class here (the
-            // `auto` A/B alias), and `resolve_catalog_key` and
-            // `selectable_catalog_key_for_persisted` both take the last match.
-            // Taking the first here would seat a different entry than every
-            // other lookup in this module resolves to.
+            // Slug scans must stay deterministic and aligned with resume paths:
+            // duplicate routing slugs are first-class and require an explicit
+            // catalog key whenever lookup would be ambiguous.
             if let Some((key, entry)) = catalog
                 .get_key_value(&pref.value)
                 .or_else(|| catalog.iter().rev().find(|(_, m)| m.model == pref.value))

@@ -64,6 +64,105 @@ async fn model_switch_recovers_new_generation_after_durable_intent_only() {
 }
 
 #[tokio::test]
+async fn model_switch_interruption_before_intent_rename_keeps_previous_generation() {
+    let temp_dir = TempDir::new().unwrap();
+    let info = create_test_info();
+    let base = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    base.init_session(&info, acp::ModelId::new("old-model"))
+        .await
+        .unwrap();
+    base.replace_chat_history(&info, &[ConversationItem::user("old-chat")])
+        .await
+        .unwrap();
+
+    let crashing = JsonlStorageAdapter::with_model_switch_probe(
+        temp_dir.path().to_path_buf(),
+        |step| {
+            if step == ModelSwitchCommitStep::IntentBeforeRename {
+                Err(std::io::Error::other("simulated process crash before rename"))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    let error = crashing
+        .commit_model_switch(
+            &info,
+            &[ConversationItem::user("new-chat")],
+            &acp::ModelId::new("new-model"),
+            Some("new-agent"),
+            None,
+        )
+        .await
+        .expect_err("the crash seam must stop before installing durable intent");
+    assert!(
+        !error.is_committed(),
+        "pre-rename interruption must not report a committed switch"
+    );
+
+    let resumed = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let loaded = resumed.load_session_without_updates(&info).await.unwrap();
+    assert_eq!(loaded.summary.current_model_id.0.as_ref(), "old-model");
+    assert_eq!(
+        serde_json::to_value(loaded.chat_history).unwrap(),
+        serde_json::to_value([ConversationItem::user("old-chat")]).unwrap()
+    );
+    assert!(
+        !resumed.model_switch_journal_file(&info).exists(),
+        "pre-rename interruption must not leave a pending intent journal"
+    );
+}
+
+#[tokio::test]
+async fn model_switch_interruption_after_intent_rename_still_recovers_new_generation() {
+    let temp_dir = TempDir::new().unwrap();
+    let info = create_test_info();
+    let base = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    base.init_session(&info, acp::ModelId::new("old-model"))
+        .await
+        .unwrap();
+    base.replace_chat_history(&info, &[ConversationItem::user("old-chat")])
+        .await
+        .unwrap();
+
+    let crashing = JsonlStorageAdapter::with_model_switch_probe(
+        temp_dir.path().to_path_buf(),
+        |step| {
+            if step == ModelSwitchCommitStep::IntentAfterRename {
+                Err(std::io::Error::other(
+                    "simulated crash after rename, before directory sync",
+                ))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    let error = crashing
+        .commit_model_switch(
+            &info,
+            &[ConversationItem::user("new-chat")],
+            &acp::ModelId::new("new-model"),
+            Some("new-agent"),
+            None,
+        )
+        .await
+        .expect_err("the crash seam must interrupt after rename");
+    assert!(
+        error.is_committed(),
+        "post-rename interruption must preserve a recoverable committed intent"
+    );
+
+    let resumed = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let loaded = resumed.load_session_without_updates(&info).await.unwrap();
+    assert_eq!(loaded.summary.current_model_id.0.as_ref(), "new-model");
+    assert_eq!(loaded.summary.agent_name.as_deref(), Some("new-agent"));
+    assert_eq!(
+        serde_json::to_value(loaded.chat_history).unwrap(),
+        serde_json::to_value([ConversationItem::user("new-chat")]).unwrap()
+    );
+}
+
+#[tokio::test]
 async fn model_switch_recovers_new_generation_after_chat_materialization() {
     let temp_dir = TempDir::new().unwrap();
     let info = create_test_info();
@@ -437,6 +536,7 @@ async fn list_sessions_recent_recovers_pending_model_switch_intent_before_loadin
         "recent listing must recover and clear the pending model-switch intent first"
     );
 }
+
 fn create_test_info() -> Info {
     Info {
         id: acp::SessionId::new("test-session-123"),

@@ -364,6 +364,12 @@ jobs:
             readonly_gateway_target_rejects_unclassified_and_external_mutation -- --nocapture
           run_nonzero -p xai-grok-tools --lib \
             issue39_deploy_app_requires_all_capability_mode -- --nocapture
+          # #181: a route that declares its own Authorization must keep it when
+          # an ambient bearer becomes available mid-session. Named in full --
+          # the property is about the *transition*, and a prefix that also
+          # matched the steady-state cases would go green on those alone.
+          run_nonzero -p xai-grok-tools --lib \
+            first_party_declared_authorization_header_survives_mid_session_login -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             restricted_gateway_snapshot_exposes_only_trusted_permitted_tools_per_session -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
@@ -374,6 +380,10 @@ jobs:
             issue39_harness_rejection_cleans_fresh_worktree_before_handoff -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             issue39_pre_handoff_guard_cleans_worktree_on_panic -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue14_spawn_refresh_replaces_stale_parent_capabilities -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue14_spawn_refresh_parent_actor_unavailable_is_actionable_error -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             issue39_verbatim_fork_tools_intersect_session_admission -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
@@ -631,11 +641,17 @@ jobs:
           # which looks for added `#[test]` attributes.
           run_nonzero -p xai-grok-shell --lib agent::models -- --nocapture
 
+<<<<<<< HEAD
       # #54 residual windows: owner-bound load markers for waiter-side lookups,
       # dropped-ack candidate preservation, and listing-time recovery of pending
       # model-switch intent journals. Filters are unique so run_nonzero proves
       # each test is selected.
       - name: 'Model-switch transaction narrow windows (issue #54)'
+=======
+      # #50: crash-consistent model-switch persistence boundaries. Each filter
+      # is unique so run_nonzero proves the targeted test still runs.
+      - name: 'Crash-consistent model-switch boundaries (issue #50)'
+>>>>>>> origin/providers
         env:
           PROTOC: protoc
         run: |
@@ -652,15 +668,26 @@ jobs:
             rm -f "$output"
           }
           run_nonzero -p xai-grok-shell --lib \
+<<<<<<< HEAD
             dropping_newer_duplicate_load_keeps_older_wait_marker_alive -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             dropped_model_switch_ack_preserves_live_candidate_generation -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             model_switch_recovers_new_generation_after_summary_materialization -- --nocapture
+=======
+            model_switch_interruption_before_intent_rename_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            model_switch_interruption_after_intent_rename_ -- --nocapture
+>>>>>>> origin/providers
           run_nonzero -p xai-grok-shell --lib \
             list_sessions_recovers_pending_model_switch_intent_before_loading_summary -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             list_sessions_recent_recovers_pending_model_switch_intent_before_loading_summary -- --nocapture
+<<<<<<< HEAD
+=======
+          run_nonzero -p xai-grok-shell --lib \
+            dropped_model_switch_ack_preserves_live_candidate_generation -- --nocapture
+>>>>>>> origin/providers
 
       # #166: these assert on colour, and used to inherit the ambient colour
       # level. Run them under both settings of NO_COLOR -- one pass alone would
@@ -736,6 +763,32 @@ jobs:
             rm -f "$output"
           }
           run_nonzero -p xai-grok-shell --lib workflow_restore -- --nocapture
+
+      # #10: catalog IDs and wire slugs are distinct identities. These filters
+      # must be unique so run_nonzero proves each guard test still executes.
+      # Quoted name: an unquoted `#10` truncates at the comment marker.
+      - name: 'Catalog ID vs wire slug restore/switch guards (issue #10)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib \
+            auto_compact_threshold_resolves_by_catalog_id_not_wire_slug -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            resolve_catalog_key_none_when_slug_is_ambiguous -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            selectable_catalog_resolution_reports_ambiguous_slug -- --nocapture
 
       # #165: abandoned sampling attempts must not enter the FTS index.
       # Unique filters so run_nonzero proves each new test is selected.
@@ -968,3 +1021,28 @@ jobs:
 
           run_nonzero --release -p xai-grok-tools --features pi --lib \
             bundled_fd_release_artifact_extracts_exact_and_executes -- --nocapture
+
+      # #88: `xai-proto-build` is run by every build script in this workspace and
+      # was in no test job at all -- so the code that decides whether protoc is
+      # findable, and what gets emitted to cargo's stdout, was never exercised by
+      # CI. That stdout is parsed one directive per line, so a value carrying a
+      # newline injects further directives; a non-UTF-8 path is exactly the input
+      # that reaches it. Quoted name: an unquoted `#88` truncates at the comment
+      # marker.
+      - name: 'Build-script protoc discovery and rerun-if-changed emission (issue #88)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-proto-build --lib -- --nocapture

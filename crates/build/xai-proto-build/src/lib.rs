@@ -23,22 +23,11 @@ fn find_protoc_include_dir(protoc: Option<&Path>) -> Option<PathBuf> {
     let grandparent = parent.parent()?; // .../
     let include_dir = grandparent.join("include");
 
-    // Everything downstream needs this decoded — the `-I` flag is built with
-    // `format!`, and protoc's dependency output is read back as UTF-8 — so an
-    // undecodable include directory fails the build rather than being used.
-    //
-    // Discovering it at all is new. This is reached from a `protoc` resolved
-    // off `PATH`, which used to be the bare name: `parent()` of that is `""`
-    // and `parent()` of `""` is `None`, so the walk stopped here and no
-    // include directory was ever derived. Resolving the real path is what
-    // exposed the sibling `include`, so declining an undecodable one restores
-    // exactly what those builds had before, rather than trading a slow build
-    // for a broken one. Handling such a path end to end is worth doing, but it
-    // is a different change than this one: tracked in #88.
-    //
-    // Ahead of `is_dir` only because it answers without a syscall; the two
-    // gates are independent and either order gives the same result.
-    include_dir.to_str()?;
+    // Keep this in `OsStr` terms. A valid include directory can carry
+    // non-UTF-8 bytes, and we pass it to protoc as an `OsString` `-I` arg.
+    // Build-script dependency parsing still validates UTF-8 before emission
+    // where needed; this lookup should only answer whether the sibling
+    // directory exists.
 
     include_dir.is_dir().then_some(include_dir)
 }
@@ -149,10 +138,31 @@ impl XaiProtoBuilder {
         protos: impl IntoIterator<Item = &'a Path>,
         includes: impl IntoIterator<Item = &'a Path>,
     ) -> anyhow::Result<()> {
+        Self::emit_rerun_if_changed_with_emitter(
+            protoc,
+            protoc_include_dir,
+            protos,
+            includes,
+            |path| {
+                let path = std::str::from_utf8(path)
+                    .context("rerun-if-changed path is not valid UTF-8")?;
+                println!("cargo:rerun-if-changed={path}");
+                Ok(())
+            },
+        )
+    }
+
+    fn emit_rerun_if_changed_with_emitter<'a>(
+        protoc: Option<&Path>,
+        protoc_include_dir: Option<&Path>,
+        protos: impl IntoIterator<Item = &'a Path>,
+        includes: impl IntoIterator<Item = &'a Path>,
+        mut emit: impl FnMut(&[u8]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         let includes = Vec::from_iter(includes);
 
         if let Some(path) = protoc.and_then(rerun_if_changed_for_protoc) {
-            println!("cargo:rerun-if-changed={path}");
+            emit(path.as_bytes())?;
         }
 
         // Can only process one input file when using --dependency_out=FILE.
@@ -166,14 +176,15 @@ impl XaiProtoBuilder {
             // This is needed for Bazel sandboxed builds where protoc and its
             // include files are in different locations.
             if let Some(include_dir) = protoc_include_dir {
-                command.arg(format!(
-                    "-I{}",
-                    include_dir.to_str().context("include path not UTF-8")?
-                ));
+                let mut arg = std::ffi::OsString::from("-I");
+                arg.push(include_dir.as_os_str());
+                command.arg(arg);
             }
 
             for include in &includes {
-                command.arg(format!("-I{}", include.to_str().context("path not UTF-8")?));
+                let mut arg = std::ffi::OsString::from("-I");
+                arg.push(include.as_os_str());
+                command.arg(arg);
             }
 
             command.arg(proto);
@@ -186,30 +197,51 @@ impl XaiProtoBuilder {
                 return Err(anyhow::anyhow!("protoc command failed"));
             }
 
-            let output =
-                String::from_utf8(output.stdout).context("protoc command output not UTF-8")?;
-
-            let mut lines = output.lines();
+            let mut lines = output.stdout.split(|&b| b == b'\n');
             let first_line = lines.next().context("protoc command output is empty")?;
-            let prefix = "/dev/null:";
-            let rem = first_line.strip_prefix(prefix).with_context(|| {
-                format!("protoc command output must start with /dev/null: {output:?}")
-            })?;
+            let prefix = b"/dev/null:";
+            let rem = if first_line.starts_with(prefix) {
+                &first_line[prefix.len()..]
+            } else {
+                return Err(anyhow::anyhow!(
+                    "protoc command output must start with /dev/null: {:?}",
+                    String::from_utf8_lossy(first_line)
+                ));
+            };
             for line in iter::once(rem).chain(lines) {
-                let line = line.trim();
-                let line = line.strip_suffix("\\").unwrap_or(line);
+                let mut line = trim_ascii(line);
+                if line.is_empty() {
+                    continue;
+                }
+                if line.ends_with(b"\\") {
+                    line = &line[..line.len() - 1];
+                }
+                let line = trim_ascii(line);
+                if line.is_empty() {
+                    continue;
+                }
                 // Depending on absolute paths like
                 // /Users/user/homebrew/Cellar/protobuf/29.1/include/google/protobuf/timestamp.proto
                 // is valid, but we want to have output more deterministic.
-                if line.contains("/include/google/protobuf/") {
+                let pattern = b"/include/google/protobuf/";
+                if line.windows(pattern.len()).any(|w| w == pattern) {
                     continue;
                 }
 
-                if !fs::exists(line)? {
-                    return Err(anyhow::anyhow!("dependency file not found: {line}"));
+                let line_str =
+                    std::str::from_utf8(line).context("dependency path is not valid UTF-8")?;
+
+                if !fs::exists(line_str)? {
+                    return Err(anyhow::anyhow!("dependency file not found: {line_str}"));
                 }
 
-                println!("cargo:rerun-if-changed={line}");
+                if line_str.contains('\n') || line_str.contains('\r') {
+                    return Err(anyhow::anyhow!(
+                        "dependency path contains newline: {line_str}"
+                    ));
+                }
+
+                emit(line)?;
             }
         }
 
@@ -332,6 +364,41 @@ pub fn configure() -> XaiProtoBuilder {
     }
 }
 
+fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
+    while let Some((first, rest)) = bytes.split_first() {
+        if first.is_ascii_whitespace() {
+            bytes = rest;
+        } else {
+            break;
+        }
+    }
+    while let Some((last, rest)) = bytes.split_last() {
+        if last.is_ascii_whitespace() {
+            bytes = rest;
+        } else {
+            break;
+        }
+    }
+    bytes
+}
+
+#[cfg(test)]
+pub(crate) fn write_executable_stub(path: impl AsRef<Path>, contents: &[u8]) -> PathBuf {
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = path.as_ref();
+    let mut file = fs::File::create(path).expect("create executable stub");
+    file.write_all(contents).expect("write executable stub");
+    file.sync_all().expect("sync executable stub");
+    // Linux can return ETXTBSY if the executable is still open for write.
+    drop(file);
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod executable stub");
+    path.to_path_buf()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,16 +514,15 @@ mod tests {
         assert_eq!(find_protoc_include_dir(Some(protoc)), None);
     }
 
-    /// The half that actually pins the decode gate, and it can only run where
-    /// the filesystem accepts the name: APFS and HFS+ reject non-UTF-8
-    /// filenames with `Illegal byte sequence`, so this is unconstructible on
-    /// macOS. Without the gate the directory exists, `is_dir` accepts it, and
-    /// the build fails later in `emit_rerun_if_changed` — for a protoc that
-    /// runs perfectly well and that, before #87, derived no include directory
-    /// at all.
+    /// This can only run where the filesystem accepts non-UTF-8 names: APFS
+    /// and HFS+ reject these with `Illegal byte sequence`, so this shape is
+    /// unconstructible on macOS.
+    ///
+    /// The point is to pin the new contract: once a sibling include directory
+    /// exists, `find_protoc_include_dir` returns it without requiring UTF-8.
     #[cfg(target_os = "linux")]
     #[test]
-    fn an_existing_non_utf8_include_dir_is_declined() {
+    fn an_existing_non_utf8_include_dir_is_accepted() {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
 
@@ -473,8 +539,88 @@ mod tests {
              cannot be decoded; without the first half `is_dir` would reject \
              it and the decode gate would go unexercised"
         );
-        assert_eq!(find_protoc_include_dir(Some(&protoc)), None);
+        assert_eq!(
+            find_protoc_include_dir(Some(&protoc)),
+            Some(root.join("include"))
+        );
 
         fs::remove_dir_all(&parent).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn emit_rerun_if_changed_handles_non_utf8_well_known_types_dependency() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        use std::process::Command;
+
+        let dir = temp_dir_named("nonutf8-dep");
+        let proto_file = dir.join("test.proto");
+        fs::write(&proto_file, b"").expect("write proto");
+
+        let protoc_script = dir.join("protoc");
+        let well_known_dep = b"/opt/we\xffird/include/google/protobuf/timestamp.proto";
+        let mut script_content = Vec::new();
+        script_content.extend_from_slice(b"#!/bin/sh\n");
+        script_content.extend_from_slice(b"printf '/dev/null: ");
+        script_content
+            .extend_from_slice(proto_file.to_str().expect("temp path is utf8").as_bytes());
+        script_content.extend_from_slice(b" \\\n  ");
+        script_content.extend_from_slice(well_known_dep);
+        script_content.extend_from_slice(b"\n'\n");
+        script_content.extend_from_slice(b"exit 0\n");
+
+        let protoc_script = write_executable_stub(protoc_script, &script_content);
+
+        let include_dir_bytes = b"/opt/we\xffird/include";
+        let include_dir = Path::new(OsStr::from_bytes(include_dir_bytes));
+
+        let output = Command::new(&protoc_script)
+            .output()
+            .expect("run stub protoc for fixture verification");
+        assert!(
+            output
+                .stdout
+                .windows(well_known_dep.len())
+                .any(|window| window == well_known_dep),
+            "fixture must emit the non-UTF-8 byte sequence in dependency output"
+        );
+
+        let mut emitted = Vec::<Vec<u8>>::new();
+        XaiProtoBuilder::emit_rerun_if_changed_with_emitter(
+            Some(&protoc_script),
+            Some(include_dir),
+            [proto_file.as_path()],
+            [] as [&Path; 0],
+            |path| {
+                emitted.push(path.to_vec());
+                Ok(())
+            },
+        )
+        .expect("well-known dependency with non-UTF-8 bytes should be ignored");
+
+        let expected = vec![
+            protoc_script
+                .to_str()
+                .expect("temp path is utf8")
+                .as_bytes()
+                .to_vec(),
+            proto_file
+                .to_str()
+                .expect("temp path is utf8")
+                .as_bytes()
+                .to_vec(),
+        ];
+        assert_eq!(
+            emitted, expected,
+            "only protoc and proto source should be emitted; \
+             non-UTF-8 well-known dependency must be filtered before UTF-8 decoding"
+        );
+        assert!(
+            emitted.iter().all(|path| path.as_slice() != well_known_dep),
+            "the well-known dependency path must not be emitted"
+        );
+
+        fs::remove_dir_all(&dir).ok();
     }
 }
