@@ -455,8 +455,12 @@ jobs:
             permission::prompter:: -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
             permission::types:: -- --nocapture
+          # Upstream moved these tests into an external `restore_fetch_tests.rs`
+          # but declares it `mod tests;`, so the module path is
+          # `restore_fetch::tests::` — the old filter named the *file*, matched
+          # nothing, and `run_nonzero` is what noticed.
           run_nonzero -p xai-grok-workspace --lib \
-            restore_fetch_tests:: -- --nocapture
+            restore_fetch::tests:: -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
             session::git:: -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
