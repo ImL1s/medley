@@ -1791,6 +1791,10 @@ fn deferred_switch_updates_display_and_persists() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
     let model_id = acp::ModelId::new(std::sync::Arc::from("model-b"));
+    // #145's readiness hard-block refuses a pre-session pick of a model the
+    // session catalog does not know, so the target has to be registered for
+    // this test to reach the display/stash behaviour it is about (#163).
+    insert_ready_model(&mut app, id, &model_id);
     app.agents.get_mut(&id).unwrap().session.session_id = None;
     let effects = dispatch(
         Action::SwitchModel {

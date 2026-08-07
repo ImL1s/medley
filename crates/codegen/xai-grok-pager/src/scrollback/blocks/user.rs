@@ -246,6 +246,11 @@ impl UserPromptBlock {
     /// Wrap and style the prompt text, returning visual lines. When
     /// `max_lines` is set and content exceeds it, the last line is
     /// truncated with a " …" ellipsis.
+    ///
+    /// Uses process-global [`Theme::current()`]. Colour-asserting unit tests
+    /// must call [`Self::wrap_prompt_lines_with_theme`] with an explicitly
+    /// quantized theme instead — `Theme::current()` inherits ambient
+    /// `NO_COLOR` / `COLOR_LEVEL` and collapses skill accents to `Reset`.
     fn wrap_prompt_lines(
         &self,
         width: u16,
@@ -253,11 +258,32 @@ impl UserPromptBlock {
         show_prefix: bool,
         is_selected: bool,
     ) -> Vec<BlockLine> {
-        let theme = Theme::current();
+        self.wrap_prompt_lines_with_theme(
+            width,
+            max_lines,
+            show_prefix,
+            is_selected,
+            &Theme::current(),
+        )
+    }
+
+    /// Like [`Self::wrap_prompt_lines`], but styles against a caller-supplied
+    /// theme. Production always routes through `wrap_prompt_lines` (which
+    /// reads `Theme::current()`); tests that assert on skill teal / body
+    /// colours pass a locally quantized theme so they stay hermetic under
+    /// `NO_COLOR`.
+    fn wrap_prompt_lines_with_theme(
+        &self,
+        width: u16,
+        max_lines: Option<usize>,
+        show_prefix: bool,
+        is_selected: bool,
+        theme: &Theme,
+    ) -> Vec<BlockLine> {
         // Minimal mode engages this lock; read it here instead of app state.
         let terminal_native = crate::theme::cache::terminal_native_locked();
-        let (prefix_style, text_style, skill_style) = Self::prompt_styles(&theme, terminal_native);
-        let band = Self::prompt_band_color_for(&theme, is_selected, terminal_native);
+        let (prefix_style, text_style, skill_style) = Self::prompt_styles(theme, terminal_native);
+        let band = Self::prompt_band_color_for(theme, is_selected, terminal_native);
         // Semantic line bg (not a "panel") so it survives minimal's flat_background.
         let with_band = |line: BlockLine| -> BlockLine {
             match band {
@@ -537,6 +563,15 @@ impl BlockContent for UserPromptBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::color_support::ColorLevel;
+
+    /// Hermetic theme for colour-asserting tests. `Theme::current()` is a
+    /// process-global OnceLock that collapses every colour to `Reset` under
+    /// `NO_COLOR`; constructing GrokNight at TrueColor keeps skill teal
+    /// distinct from body text regardless of the ambient environment.
+    fn truecolor_theme() -> Theme {
+        Theme::groknight().quantized(ColorLevel::TrueColor)
+    }
 
     /// Helper to get line text content (excluding styles)
     fn line_text(line: &Line) -> String {
@@ -697,10 +732,10 @@ mod tests {
     fn mid_text_multiple_tokens_each_teal() {
         let text = "run /commit then /review please";
         let block = UserPromptBlock::with_skill_tokens(text, vec![4..11, 17..24]);
-        let lines = block.wrap_prompt_lines(80, None, true, false);
+        let theme = truecolor_theme();
+        let lines = block.wrap_prompt_lines_with_theme(80, None, true, false, &theme);
         assert_eq!(lines.len(), 1);
 
-        let theme = Theme::current();
         let teal: Vec<&str> = lines[0]
             .content
             .spans
@@ -716,10 +751,10 @@ mod tests {
         let text = "first line\nthen /model here";
         // "/model" starts after "first line\nthen " = 16 bytes.
         let block = UserPromptBlock::with_skill_tokens(text, vec![16..22]);
-        let lines = block.wrap_prompt_lines(80, None, true, false);
+        let theme = truecolor_theme();
+        let lines = block.wrap_prompt_lines_with_theme(80, None, true, false, &theme);
         assert_eq!(lines.len(), 2);
 
-        let theme = Theme::current();
         let line0 = &lines[0].content.spans;
         assert!(
             line0.iter().all(|s| s.style.fg != Some(theme.accent_skill)),
@@ -748,8 +783,8 @@ mod tests {
         );
         assert_eq!(block.skill_token_ranges, vec![7..13]);
 
-        let lines = block.wrap_prompt_lines(80, None, true, false);
-        let theme = Theme::current();
+        let theme = truecolor_theme();
+        let lines = block.wrap_prompt_lines_with_theme(80, None, true, false, &theme);
         let teal: Vec<&str> = lines[0]
             .content
             .spans
@@ -787,10 +822,10 @@ mod tests {
         // truncating re-wrap must keep the visible head teal.
         let text = "one\ntwo\n/pr-workflow tail";
         let block = UserPromptBlock::with_skill_tokens(text, vec![8..20]);
-        let lines = block.wrap_prompt_lines(8, Some(3), false, false);
+        let theme = truecolor_theme();
+        let lines = block.wrap_prompt_lines_with_theme(8, Some(3), false, false, &theme);
         assert_eq!(lines.len(), 3);
 
-        let theme = Theme::current();
         let last = &lines[2].content;
         assert!(line_text(last).ends_with(" \u{2026}"));
         let teal = teal_text(last, &theme);
@@ -806,10 +841,10 @@ mod tests {
         // the ellipsis-reduced width, so it must survive whole and teal.
         let text = "one\ntwo\n/do-it more words here";
         let block = UserPromptBlock::with_skill_tokens(text, vec![8..14]);
-        let lines = block.wrap_prompt_lines(20, Some(3), false, false);
+        let theme = truecolor_theme();
+        let lines = block.wrap_prompt_lines_with_theme(20, Some(3), false, false, &theme);
         assert_eq!(lines.len(), 3);
 
-        let theme = Theme::current();
         let last = &lines[2].content;
         assert!(line_text(last).ends_with(" \u{2026}"));
         assert_eq!(teal_text(last, &theme), "/do-it");
@@ -828,10 +863,10 @@ mod tests {
         // the wrapper splits it mid-token; every piece must stay teal.
         let text = "aa /pr-workflow zz";
         let block = UserPromptBlock::with_skill_tokens(text, vec![3..15]);
-        let lines = block.wrap_prompt_lines(8, None, false, false);
+        let theme = truecolor_theme();
+        let lines = block.wrap_prompt_lines_with_theme(8, None, false, false, &theme);
         assert!(lines.len() >= 2);
 
-        let theme = Theme::current();
         let teal_by_line: Vec<String> = lines
             .iter()
             .map(|l| teal_text(&l.content, &theme))
@@ -1162,5 +1197,80 @@ mod tests {
                 crate::theme::cache::terminal_native_locked(),
             )
         );
+    }
+
+    /// Source-scan guard (same idiom as
+    /// `no_user_facing_message_hardcodes_the_state_directory`): colour-asserting
+    /// tests must not call `Theme::current()`. That path quantizes through a
+    /// process-global `OnceLock` that collapses every colour to `Reset` under
+    /// `NO_COLOR`, so skill-teal filters match every span and inverse-video
+    /// cursor detectors match every cell. Construct a local theme instead:
+    /// `Theme::groknight().quantized(ColorLevel::TrueColor)`.
+    #[test]
+    fn colour_asserting_tests_do_not_use_theme_current() {
+        // Named colour-asserting tests from issue #166 (teal + cursor).
+        const COLOUR_TESTS: &[&str] = &[
+            "mid_text_multiple_tokens_each_teal",
+            "mid_text_token_on_second_logical_line",
+            "invalid_token_ranges_are_dropped",
+            "collapsed_truncation_keeps_teal_on_straddling_token",
+            "collapsed_truncation_keeps_teal_on_token_within_last_line",
+            "narrow_wrap_keeps_teal_on_both_rows_of_split_token",
+            "search_bar_cursor_visible_only_when_search_active",
+            "command_palette_search_bar_cursor_only_when_focused",
+        ];
+        let sources: &[(&str, &str)] = &[
+            ("scrollback/blocks/user.rs", include_str!("user.rs")),
+            ("views/picker.rs", include_str!("../../views/picker.rs")),
+            ("app/modals.rs", include_str!("../../app/modals.rs")),
+        ];
+        for (file, src) in sources {
+            for test_name in COLOUR_TESTS {
+                if let Some(body) = test_fn_body(src, test_name)
+                    && body.contains("Theme::current()")
+                {
+                    panic!(
+                        "{file}: colour-asserting test `{test_name}` calls \
+                         Theme::current(), which inherits the ambient colour \
+                         level (OnceLock + NO_COLOR → ColorLevel::None → every \
+                         colour becomes Reset). Skill-teal filters then match \
+                         every span, and inverse-video cursor detectors match \
+                         every cell — so the test is environment-sensitive and \
+                         can false-green. Build a local theme instead:\n  \
+                         let theme = Theme::groknight()\n      \
+                         .quantized(ColorLevel::TrueColor);\n  \
+                         and (for user-prompt wraps) pass it through \
+                         wrap_prompt_lines_with_theme / render with that theme."
+                    );
+                }
+            }
+        }
+    }
+
+    /// Extract the source body of `fn name` (from the `fn` line through the
+    /// matching closing brace at column 0 / next top-level `fn` / end).
+    fn test_fn_body<'a>(src: &'a str, name: &str) -> Option<&'a str> {
+        let needle = format!("fn {name}(");
+        let start = src.find(&needle)?;
+        let after = &src[start..];
+        // Walk braces from the first `{` after the signature.
+        let brace_start = after.find('{')?;
+        let mut depth = 0i32;
+        let bytes = after.as_bytes();
+        let mut i = brace_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&after[..=i]);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        Some(after)
     }
 }
