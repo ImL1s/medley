@@ -346,18 +346,36 @@ jobs:
             restricted_capability_matrix_finalizes_and_dispatches_with_one_policy -- --nocapture
           run_nonzero -p xai-grok-tools --lib \
             readonly_gateway_target_rejects_unclassified_and_external_mutation -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            issue39_deploy_app_requires_all_capability_mode -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             restricted_gateway_snapshot_exposes_only_trusted_permitted_tools_per_session -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             restricted_children_reject_agent_owned_mcp_servers_before_session_spawn -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
+            issue39_cleanup_rejected_spawn_worktree_removes_only_fresh_worktrees -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue39_harness_rejection_cleans_fresh_worktree_before_handoff -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue39_pre_handoff_guard_cleans_worktree_on_panic -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue39_verbatim_fork_tools_intersect_session_admission -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue39_rebuild_respects_capability_mode_ceiling -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
             explicit_gateway_cache_invalidation_waits_for_all_session_admissions -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue39_gateway_invalidation_includes_registered_child_sessions -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            issue39_aborted_explicit_gateway_refresh_recovers_waiters -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             gateway_refresh_fence_prevents_stale_snapshot_reconciliation -- --nocapture
           run_nonzero -p xai-grok-shell-session-support --lib \
             explicit_gateway_refresh_fence_clears_only_on_fresh_commit -- --nocapture
           run_nonzero -p xai-grok-shell-session-support --lib \
             legacy_config_invalidation_preserves_gateway_catalog -- --nocapture
+          run_nonzero -p xai-grok-shell-session-support --lib \
+            issue39_abort_gateway_tool_fetch_recovers_waiters -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             subagent_trusted_tool_capabilities_render_in_human_and_json_views -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \

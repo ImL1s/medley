@@ -126,6 +126,7 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
         allowed_subagent_types: None,
         parent_mcp_configs: vec![],
         managed_mcp_state: crate::session::managed_mcp::ManagedMcpStateHandle::default(),
+        managed_gateway_child_sessions: None,
         managed_mcp_proxy_base_url: String::new(),
         parent_mcp_pool: None,
         parent_tool_definitions: None,

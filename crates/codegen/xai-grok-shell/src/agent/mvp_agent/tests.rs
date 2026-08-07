@@ -2375,6 +2375,93 @@ async fn explicit_gateway_cache_invalidation_waits_for_all_session_admissions() 
         .await;
 }
 #[tokio::test(flavor = "current_thread")]
+async fn issue39_gateway_invalidation_includes_registered_child_sessions() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let agent = std::rc::Rc::new(build_agent_with_auth(crate::auth::GrokAuth {
+                key: "eligible".into(),
+                auth_mode: crate::auth::AuthMode::WebLogin,
+                ..crate::auth::GrokAuth::test_default()
+            }));
+            agent.cfg.borrow_mut().managed_mcp_gateway_tools_enabled = true;
+            {
+                let mut state = agent.managed_mcp_cache.lock().await;
+                state.enable_gateway_tools();
+                let epoch = state.start_gateway_tool_fetch().unwrap();
+                assert!(state.complete_gateway_tool_fetch(
+                    epoch,
+                    crate::session::managed_mcp::GatewayToolCatalog {
+                        tools: vec![],
+                        total_tools: 0,
+                        connectors_needing_reauth: vec![],
+                    },
+                ));
+            }
+
+            let sid = acp::SessionId::new("sess-issue39-parent");
+            let (handle, _tx, mut parent_rx) = make_live_session_handle(&sid, None);
+            agent.sessions.borrow_mut().insert(sid, handle);
+
+            let child_sid = acp::SessionId::new("sess-issue39-child");
+            let (child_tx, mut child_rx) = tokio::sync::mpsc::unbounded_channel();
+            agent
+                .managed_gateway_child_sessions
+                .borrow_mut()
+                .insert(child_sid, child_tx);
+
+            let invalidate_agent = agent.clone();
+            let invalidate = tokio::task::spawn_local(async move {
+                invalidate_agent
+                    .invalidate_gateway_tool_cache_after_session_admission()
+                    .await
+            });
+
+            let parent = tokio::time::timeout(std::time::Duration::from_secs(1), parent_rx.recv())
+                .await
+                .expect("parent admission must be queued")
+                .expect("parent channel must remain open");
+            let SessionCommand::BeginManagedGatewayAdmission {
+                respond_to: parent_ack,
+            } = parent
+            else {
+                panic!("expected parent gateway admission barrier");
+            };
+
+            let child = tokio::time::timeout(std::time::Duration::from_secs(1), child_rx.recv())
+                .await
+                .expect("child admission must be queued")
+                .expect("child channel must remain open");
+            let SessionCommand::BeginManagedGatewayAdmission {
+                respond_to: child_ack,
+            } = child
+            else {
+                panic!("expected child gateway admission barrier");
+            };
+
+            parent_ack
+                .send(())
+                .expect("parent barrier receiver remains live");
+            assert!(
+                !invalidate.is_finished(),
+                "refresh invalidation must wait for child-session admission too"
+            );
+            child_ack
+                .send(())
+                .expect("child barrier receiver remains live");
+
+            invalidate
+                .await
+                .expect("cache invalidation should finish after both barriers");
+            let state = agent.managed_mcp_cache.lock().await;
+            assert!(state.gateway_refresh_in_progress);
+            assert!(matches!(
+                state.gateway_tool_cache,
+                crate::session::managed_mcp::GatewayToolCatalogCache::NotFetched
+            ));
+        })
+        .await;
+}
+#[tokio::test(flavor = "current_thread")]
 async fn ineligible_gateway_auth_queues_barrier_before_revoking_catalog() {
     tokio::task::LocalSet::new()
         .run_until(async {
@@ -2414,6 +2501,107 @@ async fn ineligible_gateway_auth_queues_barrier_before_revoking_catalog() {
                 Some(SessionCommand::RefreshMcpSearchIndex)
             ));
             assert!(!agent.managed_mcp_cache.lock().await.gateway_tools_active);
+        })
+        .await;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn issue39_aborted_explicit_gateway_refresh_recovers_waiters() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let hold_fetch = std::sync::Arc::new(tokio::sync::Notify::new());
+            let app_hold = hold_fetch.clone();
+            let app = axum::Router::new().route(
+                "/mcp/tools/list",
+                axum::routing::get(move || {
+                    let hold = app_hold.clone();
+                    async move {
+                        hold.notified().await;
+                        axum::Json(serde_json::json!({
+                            "tools": [],
+                            "total_tools": 0,
+                            "connectors_needing_reauth": []
+                        }))
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("listener");
+            let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let auth = crate::auth::GrokAuth {
+                key: "eligible".into(),
+                auth_mode: crate::auth::AuthMode::WebLogin,
+                ..crate::auth::GrokAuth::test_default()
+            };
+            let (agent, _rx) =
+                build_agent_with_auth_and_proxy(auth, base_url, crate::agent::config::AgentMode::Leader);
+            agent.cfg.borrow_mut().managed_mcp_gateway_tools_enabled = true;
+            let sid = acp::SessionId::new("sess-issue39-refresh-cancel");
+            let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
+            agent.sessions.borrow_mut().insert(sid, handle);
+
+            let agent = std::rc::Rc::new(agent);
+            let refresh_agent = agent.clone();
+            let refresh = tokio::task::spawn_local(async move {
+                refresh_agent.refresh_managed_mcp_gateway_tool_catalog().await
+            });
+
+            let barrier = tokio::time::timeout(std::time::Duration::from_secs(1), cmd_rx.recv())
+                .await
+                .expect("admission barrier should be queued")
+                .expect("session command channel should stay open");
+            let SessionCommand::BeginManagedGatewayAdmission { respond_to } = barrier else {
+                panic!("expected gateway admission barrier before fetch");
+            };
+            respond_to
+                .send(())
+                .expect("test barrier acknowledgement should be received");
+
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if matches!(
+                        agent.managed_mcp_cache.lock().await.gateway_tool_cache,
+                        crate::session::managed_mcp::GatewayToolCatalogCache::Fetching(_)
+                    ) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("refresh must reach Fetching before cancellation");
+
+            let waiter_cache = agent.managed_mcp_cache.clone();
+            let waiter = tokio::task::spawn_local(async move {
+                crate::session::managed_mcp::get_or_fetch_gateway_tool_catalog(
+                    &waiter_cache,
+                    "http://127.0.0.1:0",
+                    None,
+                )
+                .await
+            });
+
+            refresh.abort();
+            let _ = refresh.await;
+
+            let waiter_result =
+                tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+                    .await
+                    .expect("aborted refresh must wake gateway waiters")
+                    .expect("waiter task should not panic");
+            assert!(
+                waiter_result.is_none(),
+                "auth-less waiter should wake and fail closed instead of hanging"
+            );
+            assert!(matches!(
+                agent.managed_mcp_cache.lock().await.gateway_tool_cache,
+                crate::session::managed_mcp::GatewayToolCatalogCache::NotFetched
+            ));
+
+            hold_fetch.notify_waiters();
+            server.abort();
         })
         .await;
 }

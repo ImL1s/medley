@@ -364,6 +364,16 @@ impl ManagedMcpState {
         self.gateway_tool_fetch_notify.notify_waiters();
     }
 
+    /// Recover an abandoned gateway fetch (e.g. task cancellation) so waiters
+    /// can retry instead of hanging behind a stale `Fetching` marker.
+    pub fn abort_gateway_tool_fetch(&mut self) {
+        if let GatewayToolCatalogCache::Fetching(epoch) = &self.gateway_tool_cache {
+            self.fail_gateway_tool_fetch(*epoch);
+            return;
+        }
+        self.gateway_tool_fetch_notify.notify_waiters();
+    }
+
     pub fn disable_gateway_tools(&mut self) {
         self.gateway_tools_active = false;
         self.gateway_tool_epoch = self.gateway_tool_epoch.wrapping_add(1);
@@ -1818,6 +1828,27 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), registered)
             .await
             .expect("registered gateway catalog waiter must observe notify_waiters");
+    }
+
+    #[tokio::test]
+    async fn issue39_abort_gateway_tool_fetch_recovers_waiters() {
+        let handle = ManagedMcpStateHandle::default();
+        let registered = {
+            let mut state = handle.lock().await;
+            state.enable_gateway_tools();
+            state.start_gateway_tool_fetch().unwrap();
+            state.gateway_tool_fetch_notify.clone().notified_owned()
+        };
+
+        handle.lock().await.abort_gateway_tool_fetch();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), registered)
+            .await
+            .expect("aborted gateway fetch must wake registered waiters");
+        assert!(matches!(
+            handle.lock().await.gateway_tool_cache,
+            GatewayToolCatalogCache::NotFetched
+        ));
     }
 
     /// Concurrent callers must not hang when the in-flight fetch fails:

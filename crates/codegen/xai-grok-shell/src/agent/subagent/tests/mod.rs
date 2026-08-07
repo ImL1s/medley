@@ -4,11 +4,13 @@ use super::handle_request::{
     canonical_total_tokens, record_subagent_usage, usage_is_incomplete,
 };
 use crate::test_support::lsp_runtime::{
-    DummyLspDispatch, ctx_with_toggle, test_gateway_with_receiver,
+    DummyLspDispatch, ctx_with_toggle, test_gateway, test_gateway_with_receiver,
 };
 use xai_grok_subagent_resolution::resolve_effective_overrides;
+use xai_grok_tools::implementations::grok_build::task::backend::{ChannelBackend, SubagentBackend};
 use xai_grok_tools::implementations::grok_build::task::coordinator::{
-    ChildCompletion, CompletionDisposition,
+    ChildCompletion, ChildRunOutput, ChildRunRequest, ChildRunner, CompletionDisposition,
+    CoordinatorConfig, LocalBoxFuture, SubagentCoordinator,
 };
 #[test]
 fn canonical_total_tokens_does_not_double_count_reasoning() {
@@ -1864,6 +1866,160 @@ async fn run_promote_cancel_with_worktree(
         ));
     assert!(result.cancelled);
 }
+struct Issue39ShellChildRunner {
+    ctx: std::cell::RefCell<Option<SubagentSpawnContext>>,
+    gateway: xai_acp_lib::AcpAgentGatewaySender,
+}
+impl ChildRunner for Issue39ShellChildRunner {
+    type Control = ShellChildRuntime;
+    type CompletionData = ShellCompletionData;
+    type RunFuture = LocalBoxFuture<ChildRunOutput<Self::CompletionData>>;
+    type ValidateFuture = std::future::Ready<SubagentValidateTypeOutcome>;
+    type DescribeFuture = std::future::Ready<SubagentDescribeOutcome>;
+    fn run(&self, run: ChildRunRequest<Self::Control>) -> Self::RunFuture {
+        let ctx = self
+            .ctx
+            .borrow_mut()
+            .take()
+            .expect("runner context should be consumed once");
+        let gateway = self.gateway.clone();
+        Box::pin(async move {
+            let ChildRunRequest {
+                request,
+                cancellation,
+                reporter,
+                ..
+            } = run;
+            super::run_shell_child(request, ctx, cancellation, reporter, &gateway).await
+        })
+    }
+    fn validate_type(
+        &self,
+        _subagent_type: String,
+        _parent_session_id: String,
+    ) -> Self::ValidateFuture {
+        std::future::ready(SubagentValidateTypeOutcome::Ok)
+    }
+    fn describe_type(
+        &self,
+        _subagent_type: String,
+        _harness_agent_type: Option<String>,
+        _parent_session_id: String,
+    ) -> Self::DescribeFuture {
+        std::future::ready(SubagentDescribeOutcome::Unavailable)
+    }
+    fn on_completed(&self, _completion: ChildCompletion<Self::CompletionData>) {}
+}
+async fn run_issue39_spawn(request: SubagentRequest, ctx: SubagentSpawnContext) -> SubagentResult {
+    let (command_tx, command_rx) = mpsc::unbounded_channel();
+    let backend = ChannelBackend::new(command_tx);
+    let actor = tokio::task::spawn_local(
+        SubagentCoordinator::new(
+            command_rx,
+            Issue39ShellChildRunner {
+                ctx: std::cell::RefCell::new(Some(ctx)),
+                gateway: test_gateway(),
+            },
+            CoordinatorConfig::default(),
+        )
+        .run(),
+    );
+    let result = backend
+        .spawn(request)
+        .await
+        .expect("spawn request should return a result");
+    actor.abort();
+    result
+}
+#[tokio::test(flavor = "current_thread")]
+async fn issue39_harness_rejection_cleans_fresh_worktree_before_handoff() {
+    xai_test_utils::require_git!();
+    use xai_test_utils::git::{git_commit_all, init_git_repo};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let temp = tempfile::TempDir::new().unwrap();
+            let repo = temp.path().join("repo");
+            std::fs::create_dir(&repo).unwrap();
+            init_git_repo(&repo);
+            std::fs::write(repo.join("tracked.txt"), "original").unwrap();
+            git_commit_all(&repo, "initial");
+            let model_id = "issue39-codex-model";
+            let mut model_entry = test_model_entry(model_id);
+            model_entry.info.agent_type = "codex".to_string();
+            let mut models = indexmap::IndexMap::new();
+            models.insert(model_id.to_string(), model_entry.clone());
+            let mut ctx = ctx_with_toggle(HashMap::new());
+            ctx.parent_cwd = repo.clone();
+            ctx.parent_session_info = Some(SessionInfo {
+                id: acp::SessionId::new("parent"),
+                cwd: repo.to_string_lossy().into_owned(),
+            });
+            ctx.fs = Arc::new(xai_grok_workspace::file_system::LocalFs::new(repo.clone()));
+            ctx.model_id = acp::ModelId::new(model_id);
+            ctx.sampling_config.model = model_id.to_string();
+            ctx.available_models = models.clone();
+            ctx.models_manager = crate::agent::models::ModelsManager::new(
+                None,
+                models,
+                acp::ModelId::new(model_id),
+                ctx.auth_manager.clone(),
+                crate::agent::config::Config::default(),
+            );
+            let request_id = format!("issue39-cleanup-{}", uuid::Uuid::now_v7());
+            let mut request = auto_wake_test_request(&request_id);
+            request.run_in_background = false;
+            request.surface_completion = false;
+            request.runtime_overrides.model = Some(model_id.to_string());
+            request.runtime_overrides.model_override_provenance = ModelOverrideProvenance::Tool;
+            request.runtime_overrides.isolation = Some(xai_tool_types::SubagentIsolationMode::Worktree);
+            let expected_worktree = crate::session::worktree::worktree_base_dir_for_source(&repo)
+                .expect("worktree base dir")
+                .join(format!("subagent-{}", request.id));
+            let result = run_issue39_spawn(request, ctx).await;
+            let error = result.error.unwrap_or_default();
+            assert!(
+                error.contains(
+                    "required harness 'codex' is incompatible with the selected subagent harness"
+                ),
+                "must fail at explicit-model harness preflight: {error}"
+            );
+            assert!(
+                !expected_worktree.exists(),
+                "fresh pre-handoff worktree must be removed on harness rejection"
+            );
+        })
+        .await;
+}
+#[test]
+fn issue39_pre_handoff_guard_cleans_worktree_on_panic() {
+    xai_test_utils::require_git!();
+    use xai_test_utils::git::{git_commit_all, init_git_repo};
+    let temp = tempfile::TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_git_repo(&repo);
+    std::fs::write(repo.join("tracked.txt"), "original").unwrap();
+    git_commit_all(&repo, "initial");
+    let fresh = temp.path().join("subagent-fresh");
+    xai_fast_worktree::WorktreeBuilder::new(&repo, &fresh)
+        .standalone(true)
+        .create()
+        .unwrap();
+    assert!(fresh.exists());
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = super::handle_request::PreHandoffWorktreeCleanupGuard::new(
+            "issue39-panic",
+            Some(fresh.as_path()),
+            true,
+        );
+        panic!("synthetic panic between worktree creation and child handoff");
+    }));
+    assert!(panic.is_err());
+    assert!(
+        !fresh.exists(),
+        "panic unwind before handoff must clean up a fresh worktree"
+    );
+}
 /// A pending cancel removes a freshly-created worktree but preserves a
 /// resumed child worktree owned by its source.
 #[tokio::test]
@@ -1904,6 +2060,47 @@ async fn cancel_pending_at_promote_removes_fresh_worktree_preserves_resumed() {
             "source edit",
             "the source's working state must be left untouched"
         );
+}
+#[tokio::test]
+async fn issue39_cleanup_rejected_spawn_worktree_removes_only_fresh_worktrees() {
+    xai_test_utils::require_git!();
+    use xai_test_utils::git::{git_commit_all, init_git_repo};
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_git_repo(&repo);
+    std::fs::write(repo.join("tracked.txt"), "original").unwrap();
+    git_commit_all(&repo, "initial");
+
+    let fresh = temp.path().join("subagent-fresh");
+    xai_fast_worktree::WorktreeBuilder::new(&repo, &fresh)
+        .standalone(true)
+        .create()
+        .unwrap();
+    assert!(fresh.exists());
+    super::cleanup_rejected_spawn_worktree("issue39-fresh", Some(&fresh), true).await;
+    assert!(
+        !fresh.exists(),
+        "spawn rejection must clean up a just-created worktree"
+    );
+
+    let resumed = temp.path().join("subagent-resumed");
+    xai_fast_worktree::WorktreeBuilder::new(&repo, &resumed)
+        .standalone(true)
+        .create()
+        .unwrap();
+    std::fs::write(resumed.join("tracked.txt"), "source edit").unwrap();
+    super::cleanup_rejected_spawn_worktree("issue39-resumed", Some(&resumed), false).await;
+    assert!(
+        resumed.exists(),
+        "spawn rejection must not remove a resumed source-owned worktree"
+    );
+    assert_eq!(
+        std::fs::read_to_string(resumed.join("tracked.txt")).unwrap(),
+        "source edit",
+        "source-owned resumed worktree content must remain untouched"
+    );
 }
 fn test_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
     crate::agent::config::ModelEntry {

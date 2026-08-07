@@ -54,6 +54,83 @@ pub(super) fn task_model_override_error(
     let requested = requested?;
     crate::agent::models::task_model_error_for_catalog(requested, available, is_session_auth)
 }
+/// Lifecycle guard that keeps managed-gateway refresh barriers aware of live
+/// child sessions until this spawn path exits.
+struct ManagedGatewayChildSessionRegistration {
+    registry: Option<ManagedGatewayChildSessionRegistry>,
+    session_id: acp::SessionId,
+}
+
+impl ManagedGatewayChildSessionRegistration {
+    fn register(
+        registry: Option<ManagedGatewayChildSessionRegistry>,
+        session_id: &acp::SessionId,
+        cmd_tx: tokio::sync::mpsc::UnboundedSender<SessionCommand>,
+    ) -> Self {
+        if let Some(registry_ref) = registry.as_ref() {
+            registry_ref.borrow_mut().insert(session_id.clone(), cmd_tx);
+        }
+        Self {
+            registry,
+            session_id: session_id.clone(),
+        }
+    }
+}
+
+impl Drop for ManagedGatewayChildSessionRegistration {
+    fn drop(&mut self) {
+        if let Some(registry) = self.registry.as_ref() {
+            registry.borrow_mut().remove(&self.session_id);
+        }
+    }
+}
+/// Removes a freshly-created worktree if subagent spawn exits before the child
+/// session is handed off to the coordinator.
+pub(super) struct PreHandoffWorktreeCleanupGuard {
+    subagent_id: String,
+    worktree_path: Option<PathBuf>,
+    armed: bool,
+}
+
+impl PreHandoffWorktreeCleanupGuard {
+    pub(super) fn new(
+        subagent_id: &str,
+        worktree_path: Option<&Path>,
+        worktree_freshly_created: bool,
+    ) -> Self {
+        Self {
+            subagent_id: subagent_id.to_owned(),
+            worktree_path: worktree_path.map(Path::to_path_buf),
+            armed: worktree_freshly_created && worktree_path.is_some(),
+        }
+    }
+
+    pub(super) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PreHandoffWorktreeCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(worktree_path) = self.worktree_path.take() else {
+            return;
+        };
+        if let Err(e) = xai_fast_worktree::remove_worktree_with_delegate(
+            &worktree_path,
+            crate::session::worktree::btrfs_delegate_from_env(),
+        ) {
+            tracing::warn!(
+                subagent_id = %self.subagent_id,
+                worktree_path = %worktree_path.display(),
+                error = %e,
+                "failed to remove freshly created subagent worktree after pre-handoff exit"
+            );
+        }
+    }
+}
 /// Runtime adapter for one shell child. Shared lifecycle state is owned by the
 /// `xai-grok-tools` coordinator actor and reached only through `reporter`.
 #[tracing::instrument(
@@ -231,6 +308,32 @@ pub(crate) async fn run_shell_child(
     ) {
         return child_run_output(failure_result(&request, &error), completion_data, None);
     }
+    if effective_runtime.reasoning_effort.is_some() || effective_runtime.capability_mode.is_some() {
+        tracing::info!(
+            subagent_id = %request.id,
+            reasoning_effort = ?effective_runtime.reasoning_effort,
+            capability_mode = ?effective_runtime.capability_mode,
+            "Resolved runtime overrides for subagent"
+        );
+    }
+    effective_runtime.capability_mode =
+        xai_grok_subagent_resolution::intersect_capability_mode_ceiling(
+            effective_runtime.capability_mode,
+            definition.capability_mode,
+            ctx.parent_capability_mode,
+        );
+    definition.capability_mode = effective_runtime.capability_mode;
+    if let Some(error) =
+        agent_owned_mcp_server_admission_error(&definition, effective_runtime.capability_mode)
+    {
+        tracing::warn!(
+            subagent_id = %request.id,
+            agent = %definition.name,
+            capability_mode = ?effective_runtime.capability_mode,
+            "Rejected agent-owned MCP server startup for restricted subagent"
+        );
+        return child_run_output(failure_result(&request, error), completion_data, None);
+    }
     let worktree_path = if let Some(ref source) = resume_source {
         if effective_runtime.isolation != xai_tool_types::SubagentIsolationMode::None
             && source.worktree_path.is_none()
@@ -348,6 +451,11 @@ pub(crate) async fn run_shell_child(
         None
     };
     let worktree_freshly_created = resume_source.is_none() && worktree_path.is_some();
+    let mut pre_handoff_worktree_cleanup = PreHandoffWorktreeCleanupGuard::new(
+        &request.id,
+        worktree_path.as_deref(),
+        worktree_freshly_created,
+    );
     if let Some(raw_cwd) = request.cwd.as_deref() {
         match sanitize_cwd_value(raw_cwd) {
             Some(cwd_path) => {
@@ -370,32 +478,6 @@ pub(crate) async fn run_shell_child(
             }
             None => request.cwd = None,
         }
-    }
-    if effective_runtime.reasoning_effort.is_some() || effective_runtime.capability_mode.is_some() {
-        tracing::info!(
-            subagent_id = %request.id,
-            reasoning_effort = ?effective_runtime.reasoning_effort,
-            capability_mode = ?effective_runtime.capability_mode,
-            "Resolved runtime overrides for subagent"
-        );
-    }
-    effective_runtime.capability_mode =
-        xai_grok_subagent_resolution::intersect_capability_mode_ceiling(
-            effective_runtime.capability_mode,
-            definition.capability_mode,
-            ctx.parent_capability_mode,
-        );
-    definition.capability_mode = effective_runtime.capability_mode;
-    if let Some(error) =
-        agent_owned_mcp_server_admission_error(&definition, effective_runtime.capability_mode)
-    {
-        tracing::warn!(
-            subagent_id = %request.id,
-            agent = %definition.name,
-            capability_mode = ?effective_runtime.capability_mode,
-            "Rejected agent-owned MCP server startup for restricted subagent"
-        );
-        return child_run_output(failure_result(&request, error), completion_data, None);
     }
     let child_depth = request
         .runtime_overrides
@@ -1256,7 +1338,10 @@ pub(crate) async fn run_shell_child(
     )
     .await;
     let (child_handle, mut permission_rx, _system_prompt, child_thread) = match spawn_result {
-        Ok(r) => r,
+        Ok(r) => {
+            pre_handoff_worktree_cleanup.disarm();
+            r
+        }
         Err(e) => {
             let msg = format!("Failed to spawn child session: {e}");
             let result = fail_subagent(
@@ -1270,6 +1355,12 @@ pub(crate) async fn run_shell_child(
             return child_run_output(result, completion_data, None);
         }
     };
+    let _managed_gateway_child_session_registration =
+        ManagedGatewayChildSessionRegistration::register(
+            ctx.managed_gateway_child_sessions.clone(),
+            &child_session_id,
+            child_handle.cmd_tx.clone(),
+        );
     let promoted = reporter
         .started(StartedChild {
             child_session_id: child_session_id.0.to_string(),
