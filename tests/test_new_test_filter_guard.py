@@ -236,11 +236,36 @@ class EndToEnd(unittest.TestCase):
 
 
 class TargetOf(unittest.TestCase):
+    # Every path these assertions classify, so one test can check they all exist.
+    REAL_PATHS = (
+        "crates/codegen/xai-grok-sampler/src/client.rs",
+        "crates/codegen/xai-grok-shell/src/agent/subagent/tests/rest.rs",
+        "crates/codegen/xai-grok-pager/src/app/dispatch/tests/session/load.rs",
+        "crates/codegen/xai-grok-pager-bin/src/main.rs",
+        "crates/codegen/xai-grok-pager/src/bin/mouse_events_playground.rs",
+    )
+
+    def test_every_classified_path_exists_on_disk(self):
+        """A classification asserted against a path that does not exist proves nothing.
+
+        Two assertions here did exactly that and were green throughout: one named
+        `pager-bin/src/bin/xai-grok-pager.rs` (the crate has only `main.rs`) and one
+        named `acp_session_tests/mod.rs` (that directory is `#[path=...]` includes, not
+        a module tree). The second was worse than useless -- its path component is
+        `acp_session_tests`, not `tests`, so the *old* classifier returned `lib` for it
+        too. It passed before and after the fix it was added to prove, and a reader
+        counting three cases had been told about coverage that was not there.
+
+        Nothing noticed, because a wrong path fails no assertion. This does.
+        """
+        for path in self.REAL_PATHS:
+            with self.subTest(path=path):
+                self.assertTrue((REPO / path).exists(), f"{path} does not exist")
+
     def test_target_of_paths(self):
-        self.assertEqual(target_of("crates/codegen/xai-grok-sampler/src/auth.rs", "xai-grok-sampler"), "lib")
+        self.assertEqual(target_of("crates/codegen/xai-grok-sampler/src/client.rs", "xai-grok-sampler"), "lib")
         self.assertEqual(target_of("crates/codegen/xai-grok-update/tests/test_dist_channel_gate.rs", "xai-grok-update"), "test:test_dist_channel_gate")
         self.assertEqual(target_of("crates/codegen/xai-grok-update/tests/test_dist_channel_gate/main.rs", "xai-grok-update"), "test:test_dist_channel_gate")
-        self.assertEqual(target_of("crates/codegen/xai-grok-pager-bin/src/bin/xai-grok-pager.rs", "xai-grok-pager-bin"), "bin:xai-grok-pager")
 
     def test_a_tests_module_under_src_is_lib_not_an_integration_target(self):
         """`tests` below `src/` is a module named `tests`, not a `tests/` target.
@@ -254,25 +279,33 @@ class TargetOf(unittest.TestCase):
         for path in (
             "crates/codegen/xai-grok-shell/src/agent/subagent/tests/rest.rs",
             "crates/codegen/xai-grok-pager/src/app/dispatch/tests/session/load.rs",
-            "crates/codegen/xai-grok-shell/src/session/acp_session_tests/mod.rs",
         ):
             with self.subTest(path=path):
                 self.assertEqual(target_of(path, crate_of(path)), "lib")
 
-    def test_bin_target_name_is_read_from_cargo_toml_not_the_crate_name(self):
-        """The crate is `xai-grok-pager-bin`; the target is `xai-grok-pager`.
+    def test_bin_target_name_is_read_from_cargo_toml_not_inferred(self):
+        """A `[[bin]]` entry can rename either kind of binary, so neither is inferable.
 
-        That divergence is deliberate and documented in CLAUDE.md -- renaming the cargo
-        target would churn every upstream sync, so the rename to `medley` happens at
-        packaging instead. Deriving the target name from the crate name put every
-        `main.rs` test in a bucket no `ci.yml` filter could name.
+        `src/main.rs` defaults to the package name -- except the crate here is
+        `xai-grok-pager-bin` and the target is `xai-grok-pager`, deliberately, because
+        renaming the cargo target would churn every upstream sync (CLAUDE.md).
 
-        This asserts against the real manifest on purpose: a fixture would pass while
-        the checked-in `Cargo.toml` said something else.
+        `src/bin/foo.rs` autobins to the stem -- except this workspace renames five of
+        them, and an underscore-to-hyphen change is enough: the filter map is keyed by
+        the cargo name, so the lookup finds nothing and a test CI runs is reported as
+        running nowhere.
+
+        The first of these was fixed and the second was left inferring from the stem one
+        branch away. Both assert against the real manifests on purpose: a fixture would
+        stay green while the checked-in `Cargo.toml` said something else.
         """
         self.assertEqual(
             target_of("crates/codegen/xai-grok-pager-bin/src/main.rs", "xai-grok-pager-bin"),
             "bin:xai-grok-pager",
+        )
+        self.assertEqual(
+            target_of("crates/codegen/xai-grok-pager/src/bin/mouse_events_playground.rs", "xai-grok-pager"),
+            "bin:mouse-events-playground",
         )
 
 

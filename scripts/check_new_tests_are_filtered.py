@@ -73,29 +73,50 @@ def crate_of(path: str) -> str | None:
     return Path(split[0]).name
 
 
-def _bin_target_name(crate_dir: str, rel_path: str, crate_name: str | None) -> str:
-    """The name cargo gives the binary at `rel_path`, which is **not** the crate name
-    whenever `Cargo.toml` says otherwise.
+def _bin_target_name(crate_dir: str, rel_path: str, fallback: str) -> str:
+    """The name cargo gives the binary at `rel_path`, which is **not** derivable from
+    the path whenever `Cargo.toml` says otherwise.
 
-    This fork is exactly that case: the crate is `xai-grok-pager-bin` and the target is
-    `[[bin]] name = "xai-grok-pager"` (see CLAUDE.md -- renaming the target would churn
-    every upstream sync, so the rename happens at packaging instead). Guessing the target
-    name from the crate name put every `main.rs` test in a bucket no filter could ever
-    land in, and the checker then reported them all as unselected.
+    Two ways to get this wrong, and this repo has both:
+
+    - `src/main.rs` defaults to the *package* name, except here the crate is
+      `xai-grok-pager-bin` and the target is `[[bin]] name = "xai-grok-pager"` --
+      deliberately, because renaming the cargo target would churn every upstream sync
+      (CLAUDE.md), so the rename to `medley` happens at packaging instead.
+    - `src/bin/foo.rs` autobins to the *stem*, except a `[[bin]]` entry may rename it.
+      Measured in this workspace: `mouse_events_playground` -> `mouse-events-playground`,
+      `cli` -> `fast-worktree`, `workspace_server` -> `xai-workspace-server`,
+      `code_graph` -> `code-graph`, `pty_scenario` -> `pty-scenario`.
+
+    An underscore-vs-hyphen miss is enough: the filter map is keyed by the cargo name,
+    so the lookup finds nothing and a test CI runs is reported as running nowhere.
+
+    `fallback` is what cargo would do with no `[[bin]]` entry -- the package name for
+    `src/main.rs`, the file stem for `src/bin/*`.
     """
     manifest = Path(crate_dir) / "Cargo.toml"
     try:
         text = manifest.read_text()
     except OSError:
-        return crate_name or "bin"
+        return fallback
+    want = rel_path.removeprefix("./")
     # Minimal scan rather than a TOML parse: this runs in a job with no dependencies.
     for block in re.split(r"^\s*\[\[bin\]\]\s*$", text, flags=re.M)[1:]:
         block = re.split(r"^\s*\[", block, maxsplit=1, flags=re.M)[0]
         name = re.search(r'^\s*name\s*=\s*"([^"]+)"', block, flags=re.M)
+        if not name:
+            continue
         path_m = re.search(r'^\s*path\s*=\s*"([^"]+)"', block, flags=re.M)
-        if name and (path_m is None or path_m.group(1) == rel_path):
+        if path_m is None:
+            # No `path`: cargo infers it from the name, so this entry only claims
+            # `rel_path` if the inferred location matches.
+            inferred = {f"src/bin/{name.group(1)}.rs", "src/main.rs"}
+            if want in inferred:
+                return name.group(1)
+            continue
+        if path_m.group(1).removeprefix("./") == want:
             return name.group(1)
-    return crate_name or "bin"
+    return fallback
 
 
 def target_of(path: str, crate_name: str | None) -> str | None:
@@ -107,8 +128,9 @@ def target_of(path: str, crate_name: str | None) -> str | None:
     - `<crate>/src/**` is `lib` -- including `src/**/tests/*.rs`, which is a module
       named `tests`, not an integration-test target
     - `<crate>/tests/foo.rs` (or `tests/foo/main.rs`) is `test:foo`
-    - `<crate>/src/main.rs` is `bin:<name from Cargo.toml>`; `<crate>/src/bin/foo.rs`
-      is `bin:foo`
+    - `<crate>/src/main.rs` and `<crate>/src/bin/foo.rs` are both
+      `bin:<name cargo actually uses>` -- read from `Cargo.toml`, never inferred from
+      the path, because a `[[bin]]` entry may rename either
     - `<crate>/examples/foo.rs` is `example:foo`, `<crate>/benches/foo.rs` is `bench:foo`
 
     Matching `tests` at any depth -- which is what this did first -- classified
@@ -116,7 +138,10 @@ def target_of(path: str, crate_name: str | None) -> str | None:
     no filter could match and every test in those modules was reported as never run.
     Note the shape of that mistake: scoping filters per target replaced a rule that was
     too permissive with a *classifier*, and the classifier became the new place to be
-    wrong. It is worth being suspicious of the next one too.
+    wrong. Review then found the same class one branch away -- `src/bin/**` was still
+    inferring the target from the filename stem, in a workspace with five bins whose
+    `[[bin]] name` differs from it. Fixing one instance of a mistake is not fixing the
+    mistake.
     """
     split = _crate_split(path)
     if split is None:
@@ -132,9 +157,11 @@ def target_of(path: str, crate_name: str | None) -> str | None:
         return f"bench:{rel[1].rsplit('.rs', 1)[0]}"
     if rel[0] == "src":
         if len(rel) > 2 and rel[1] == "bin":
-            return f"bin:{rel[2].rsplit('.rs', 1)[0]}"
+            stem = rel[2].rsplit(".rs", 1)[0]
+            rel_posix = "/".join(rel)
+            return f"bin:{_bin_target_name(crate_dir, rel_posix, stem)}"
         if rel[-1] == "main.rs" and len(rel) == 2:
-            return f"bin:{_bin_target_name(crate_dir, 'src/main.rs', crate_name)}"
+            return f"bin:{_bin_target_name(crate_dir, 'src/main.rs', crate_name or 'bin')}"
         return "lib"
     return None
 
