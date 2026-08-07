@@ -22,8 +22,8 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
 use xai_grok_sampler::{
-    ApiBackend, EndpointTrustClass, RequestId, RetryPolicy, SamplerActor, SamplerConfig,
-    SamplingChannel, SamplingErrorKind, SamplingEvent,
+    ApiBackend, CredentialSource, EndpointTrustClass, RequestId, RetryPolicy, SamplerActor,
+    SamplerConfig, SamplingChannel, SamplingErrorKind, SamplingEvent,
 };
 use xai_grok_sampling_types::{
     ConversationItem, ConversationRequest, DoomLoopRecoveryPolicy, UserItem,
@@ -81,7 +81,9 @@ fn test_config(base_url: String, model: &str) -> SamplerConfig {
         // xAI endpoints; without this the metadata boundary classifies them
         // Local and disables first-party features (doom-loop check, x-grok-*).
         endpoint_trust: Some(EndpointTrustClass::FirstPartyXai),
-        credential_source: None,
+        // Bound test key needs a non-ambient source (#136 step 4): attach-side
+        // first-party is https-only, so loopback + unlabelled material refuses.
+        credential_source: Some(CredentialSource::ModelApiKey),
         api_backend: ApiBackend::ChatCompletions,
         auth_scheme: Default::default(),
         extra_headers: IndexMap::new(),

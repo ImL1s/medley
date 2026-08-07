@@ -2959,7 +2959,8 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                 temperature: None,
                 top_p: None,
                 endpoint_trust: None,
-                credential_source: None,
+                // Bound BYOK key needs a non-ambient source (#136 step 4).
+                credential_source: Some(xai_grok_sampler::CredentialSource::ModelApiKey),
                 api_backend: crate::sampling::ApiBackend::ChatCompletions,
                 auth_scheme: Default::default(),
                 extra_headers: Default::default(),
@@ -3066,7 +3067,8 @@ async fn switch_to_first_party_model_drops_minted_provider_token() {
                 temperature: None,
                 top_p: None,
                 endpoint_trust: None,
-                credential_source: None,
+                // Session JWT on first-party; stamp ambient source honestly (#136).
+                credential_source: Some(xai_grok_sampler::CredentialSource::XaiSession),
                 api_backend: crate::sampling::ApiBackend::ChatCompletions,
                 auth_scheme: Default::default(),
                 extra_headers: Default::default(),

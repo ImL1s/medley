@@ -58,8 +58,42 @@ const GROK_BUILD_ORIGINATOR: HeaderValue = HeaderValue::from_static("grok_build"
 pub(crate) const AMBIENT_XAI_NON_FIRST_PARTY_REFUSAL: &str =
     "ambient xAI credential is not allowed for a non-first-party endpoint";
 
+/// L3 unlabelled-material refusal (#136 step 4). A non-first-party endpoint
+/// that carries bound auth must name a provenance; absence is no longer a
+/// silent pass for the ambient-origin guard.
+pub(crate) const CREDENTIAL_PROVENANCE_REQUIRED_REFUSAL: &str =
+    "credential provenance is required for a non-first-party endpoint";
+
+/// L3 label/material inconsistency refusal (#136 step 4). The label claims
+/// there is no (or only header-based) credential while the config carries
+/// bound `api_key` / `bearer_resolver` material — a self-contradiction that
+/// can only mean a write site lost the truth.
+pub(crate) const CREDENTIAL_PROVENANCE_INCONSISTENT_REFUSAL: &str =
+    "credential provenance is inconsistent with bound credential material";
+
 fn should_send_xai_identity_headers(auth_scheme: AuthScheme, base_url: &str) -> bool {
     !matches!(auth_scheme, AuthScheme::None) && crate::util::is_xai_api_url(base_url)
+}
+
+/// Attach-side first-party predicate for L3 provenance (#136 step 4): https
+/// required, loopback rejected. Independent of any `endpoint_trust` override
+/// so a declared trust cannot smuggle an unlabelled credential to a host that
+/// is not actually first-party xAI.
+fn is_actual_https_first_party_xai(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    if url.scheme() != "https" {
+        return false;
+    }
+    if is_loopback_url(base_url) {
+        return false;
+    }
+    if crate::util::is_prod_cli_chat_proxy_url(base_url) {
+        return true;
+    }
+    url.host_str()
+        .is_some_and(|host| host == "x.ai" || host.ends_with(".x.ai"))
 }
 
 fn strip_xai_identity_headers(headers: &mut HeaderMap) {
@@ -834,19 +868,52 @@ impl SamplingClient {
                         .is_ok_and(|url| url.scheme() == "https")
             }
         };
-        // Labelled ambient, or ambient bytes under a post-strip ExplicitHeader
-        // label (#180). ExplicitHeader alone is legitimate header auth and must
-        // keep working; only the inconsistent pair (label + api_key bytes) is
-        // treated as ambient so a re-injection upstream cannot disarm this gate.
+        // Bound auth material that would actually leave as a managed secret.
+        // AuthScheme::None never emits api_key / resolver output, so a leftover
+        // key under None is not "carrying" a credential for this gate.
+        let carries_bound_auth = config.auth_scheme != AuthScheme::None
+            && (config.api_key.is_some() || config.bearer_resolver.is_some());
+
+        // #136 step 4 — refuse before the ambient-origin guard so L3 does not
+        // rest solely on a self-reported label. Material presence is observed
+        // directly; the label is only consulted for consistency / ambient class.
+        //
+        // Ordering: inconsistent labels first (always, any origin), then
+        // unlabelled material on a non-first-party endpoint. The first-party
+        // test is attach-side (https, no loopback) — not the scheme-agnostic
+        // refusal-side trust class — so a self-hosted endpoint cannot receive
+        // an unlabelled credential.
+        if carries_bound_auth {
+            match config.credential_source.as_ref() {
+                // Label claims no credential, or only a post-strip header, while
+                // bound material is still present — a write site lost the truth.
+                Some(xai_grok_sampling_types::CredentialSource::None)
+                | Some(xai_grok_sampling_types::CredentialSource::Missing)
+                | Some(xai_grok_sampling_types::CredentialSource::ExplicitHeader { .. }) => {
+                    return Err(SamplingError::InvalidConfiguration(
+                        CREDENTIAL_PROVENANCE_INCONSISTENT_REFUSAL,
+                    ));
+                }
+                // Unlabelled bound auth on a non-first-party origin is the #151
+                // residual: L3 used to pass because it only refused *labelled*
+                // ambient sources. After steps 1–3, production seams stamp a
+                // source; this closes the remaining "forget the label" hole.
+                None if !is_actual_https_first_party_xai(&config.base_url) => {
+                    return Err(SamplingError::InvalidConfiguration(
+                        CREDENTIAL_PROVENANCE_REQUIRED_REFUSAL,
+                    ));
+                }
+                None | Some(_) => {}
+            }
+        }
+
+        // Labelled ambient only. The ExplicitHeader + api_key pair is refused
+        // above as inconsistency (#136 step 4 / #180); keeping it out of this
+        // ambient arm avoids double-classifying the same defect.
         let ambient_credential_present = config
             .credential_source
             .as_ref()
-            .is_some_and(xai_grok_sampling_types::CredentialSource::is_ambient_xai)
-            || (config.api_key.is_some()
-                && matches!(
-                    config.credential_source.as_ref(),
-                    Some(xai_grok_sampling_types::CredentialSource::ExplicitHeader { .. })
-                ));
+            .is_some_and(xai_grok_sampling_types::CredentialSource::is_ambient_xai);
         if !ambient_origin_allowed && ambient_credential_present {
             return Err(SamplingError::InvalidConfiguration(
                 AMBIENT_XAI_NON_FIRST_PARTY_REFUSAL,
@@ -2552,7 +2619,9 @@ mod tests {
             top_p: None,
             api_backend: ApiBackend::ChatCompletions,
             endpoint_trust: None,
-            credential_source: None,
+            // Bound test key must carry a non-ambient source (#136 step 4):
+            // unlabelled material is refused on non-first-party origins.
+            credential_source: Some(crate::config::CredentialSource::ModelApiKey),
             auth_scheme: AuthScheme::Bearer,
             extra_headers: IndexMap::new(),
             query_params: IndexMap::new(),
@@ -3227,6 +3296,126 @@ mod tests {
             ..minimal_config()
         })
         .expect("an ambient credential on a first-party origin is the normal flow");
+    }
+
+    /// #136 step 4: bound auth on a non-first-party origin with no provenance
+    /// label is refused. L3 used to key only on `is_ambient_xai()` of the label,
+    /// so an unlabelled ambient key (or any unlabelled secret) passed.
+    ///
+    /// Mutation: drop the `credential_source.is_none()` arm (or the whole
+    /// `carries_bound_auth && source is None` check) and this fails green.
+    #[test]
+    fn unlabelled_bound_auth_on_external_origin_requires_provenance() {
+        let err = SamplingClient::new(SamplerConfig {
+            api_key: Some("unlabelled-key".to_string()),
+            base_url: "https://vendor.example/v1".to_string(),
+            credential_source: None,
+            auth_scheme: AuthScheme::Bearer,
+            ..minimal_config()
+        })
+        .expect_err(
+            "bound auth without provenance on a non-first-party origin must refuse \
+             (Value withheld.)",
+        );
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains(super::CREDENTIAL_PROVENANCE_REQUIRED_REFUSAL),
+            "expected provenance-required refusal, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("unlabelled-key"),
+            "the error leaked the credential: {rendered}"
+        );
+    }
+
+    /// #136 step 4: first-party https xAI still tolerates an unlabelled key
+    /// (residual gap for in-process first-party turns). Loopback / cleartext
+    /// xAI hosts do not get this exemption — attach-side https only.
+    #[test]
+    fn unlabelled_bound_auth_on_https_first_party_xai_still_constructs() {
+        SamplingClient::new(SamplerConfig {
+            api_key: Some("session-or-key".to_string()),
+            base_url: "https://api.x.ai/v1".to_string(),
+            credential_source: None,
+            auth_scheme: AuthScheme::Bearer,
+            ..minimal_config()
+        })
+        .expect(
+            "unlabelled bound auth on actual https first-party xAI remains constructable \
+             (Value withheld.)",
+        );
+    }
+
+    /// #136 step 4: `Missing` / `None` labels claim no credential; carrying
+    /// material alongside either is a self-contradiction and is refused on any
+    /// origin. Not a blanket `Missing` block — keyless `Missing` still constructs.
+    #[test]
+    fn missing_or_none_label_with_bound_material_is_inconsistent() {
+        for source in [
+            crate::config::CredentialSource::Missing,
+            crate::config::CredentialSource::None,
+        ] {
+            let err = SamplingClient::new(SamplerConfig {
+                api_key: Some("should-not-travel".to_string()),
+                base_url: "https://api.x.ai/v1".to_string(),
+                credential_source: Some(source),
+                auth_scheme: AuthScheme::Bearer,
+                ..minimal_config()
+            })
+            .expect_err("inconsistent label/material must refuse (Value withheld.)");
+            let rendered = format!("{err}");
+            assert!(
+                rendered.contains(super::CREDENTIAL_PROVENANCE_INCONSISTENT_REFUSAL),
+                "expected inconsistency refusal, got: {rendered}"
+            );
+            assert!(
+                !rendered.contains("should-not-travel"),
+                "the error leaked the credential: {rendered}"
+            );
+        }
+
+        // Keyless Missing still constructs — the non-blocking contract.
+        SamplingClient::new(SamplerConfig {
+            api_key: None,
+            base_url: "https://vendor.example/v1".to_string(),
+            credential_source: Some(crate::config::CredentialSource::Missing),
+            auth_scheme: AuthScheme::Bearer,
+            ..minimal_config()
+        })
+        .expect("keyless Missing must remain constructable (Value withheld.)");
+    }
+
+    /// #136 step 4 / #180: `ExplicitHeader` is a post-strip label. Carrying a
+    /// separate `api_key` (or bearer_resolver) alongside it is inconsistent and
+    /// is refused even on first-party — the strip already removed ambient.
+    #[test]
+    fn explicit_header_label_with_separate_api_key_is_inconsistent() {
+        let mut extra_headers = IndexMap::new();
+        extra_headers.insert("x-api-key".to_string(), "sk-declared".to_string());
+        let err = SamplingClient::new(SamplerConfig {
+            api_key: Some("reinjected-ambient".to_string()),
+            base_url: "https://api.x.ai/v1".to_string(),
+            credential_source: Some(crate::config::CredentialSource::ExplicitHeader {
+                header: "x-api-key".to_string(),
+                env: None,
+            }),
+            extra_headers,
+            auth_scheme: AuthScheme::Bearer,
+            ..minimal_config()
+        })
+        .expect_err(
+            "ExplicitHeader + separate api_key must refuse as inconsistent \
+             (Value withheld.)",
+        );
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains(super::CREDENTIAL_PROVENANCE_INCONSISTENT_REFUSAL),
+            "expected inconsistency refusal, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("reinjected-ambient") && !rendered.contains("sk-declared"),
+            "the error leaked a credential: {rendered}"
+        );
     }
 
     /// #180: dual-auth gateway — model owns an `api_key` *and* declares a
@@ -4064,20 +4253,22 @@ mod tests {
         });
 
         // Property: ambient session bytes must not leave for an external origin.
-        // Either L3 refuses construction with the ambient-origin refusal, or
+        // Either L3 refuses construction (inconsistent ExplicitHeader + api_key
+        // under #136 step 4, or ambient-origin under the labelled path), or
         // construction succeeds and the wire has no ambient token. An unexamined
         // `Err` early-return would green on unrelated construction failures.
         let client = match built {
             Ok(client) => client,
             Err(SamplingError::InvalidConfiguration(msg))
-                if msg == super::AMBIENT_XAI_NON_FIRST_PARTY_REFUSAL =>
+                if msg == super::AMBIENT_XAI_NON_FIRST_PARTY_REFUSAL
+                    || msg == super::CREDENTIAL_PROVENANCE_INCONSISTENT_REFUSAL =>
             {
                 return;
             }
             Err(other) => {
                 panic!(
                     "SamplingClient::new failed for a reason other than the ambient-origin \
-                     refusal (property not examined): {other:?}"
+                     or provenance-inconsistency refusal (property not examined): {other:?}"
                 );
             }
         };

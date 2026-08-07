@@ -69,10 +69,12 @@ pub struct SamplerConfig {
     #[serde(default)]
     pub endpoint_trust: Option<EndpointTrustClass>,
     /// Which source produced `api_key`, for the construction-time origin
-    /// assertion (#110). `None` means a legacy or deserialized config that
-    /// predates the field, and is never asserted against — absence has to be
-    /// distinguishable from a known-safe source, or old sessions would trip
-    /// a check they cannot answer.
+    /// assertion (#110 / #136). `None` means a legacy or deserialized config
+    /// that predates the field. On a **first-party** https xAI origin that is
+    /// still tolerated (residual gap for in-process first-party turns); on a
+    /// non-first-party endpoint with bound auth material, L3 refuses
+    /// (`credential provenance is required…`) so forgetting the label cannot
+    /// disarm the ambient-origin guard.
     ///
     /// Names only, never bytes: see [`CredentialSource`].
     #[serde(default)]
