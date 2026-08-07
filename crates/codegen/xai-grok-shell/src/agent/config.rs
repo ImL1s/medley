@@ -314,6 +314,9 @@ pub struct EndpointsConfig {
     /// Read by `load_gcs_service_account_key_sync()`. Declared for `serde_ignored`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gcs_service_account_key: Option<String>,
+    /// Runtime-only: linked catalog auth config parsed from `[models]`.
+    #[serde(skip)]
+    pub catalog_auth: CatalogAuthConfig,
 }
 
 impl std::fmt::Debug for EndpointsConfig {
@@ -404,6 +407,7 @@ impl std::fmt::Debug for EndpointsConfig {
                 "gcs_service_account_key_present",
                 &self.gcs_service_account_key.is_some(),
             )
+            .field("catalog_auth", &self.catalog_auth)
             .finish()
     }
 }
@@ -455,6 +459,11 @@ impl EndpointsConfig {
         }
         let mut resolved: Self = base.try_into().unwrap_or_default();
         resolved.external_otel_master_switch = external_otel_master_switch;
+        if let Some(models_val) = config.get("models")
+            && let Ok(catalog_auth) = Config::parse_catalog_auth_from_models_toml(models_val)
+        {
+            resolved.catalog_auth = catalog_auth;
+        }
         resolved
     }
     /// The cli-chat-proxy base URL through which all auxiliary services (and
@@ -728,6 +737,7 @@ impl Default for EndpointsConfig {
                 .and_then(|s| s.parse().ok()),
             management_api_key: None,
             gcs_service_account_key: None,
+            catalog_auth: CatalogAuthConfig::default(),
         }
     }
 }
@@ -1287,6 +1297,67 @@ pub struct ModelsConfig {
     pub inference_idle_timeout_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_auth_scheme: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_env_key: Option<EnvKeys>,
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub catalog_headers: IndexMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_timeout_secs: Option<u64>,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CatalogAuthConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_scheme: Option<AuthScheme>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env_key: Option<EnvKeys>,
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub headers: IndexMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+impl std::fmt::Debug for CatalogAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CatalogAuthConfig")
+            .field("endpoint_present", &self.endpoint.is_some())
+            .field("auth_scheme", &self.auth_scheme)
+            .field("env_key_present", &self.env_key.is_some())
+            .field("headers_present", &!self.headers.is_empty())
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
+}
+
+impl ModelsConfig {
+    pub fn catalog_auth_config(&self) -> Result<CatalogAuthConfig, String> {
+        let auth_scheme = match self.catalog_auth_scheme.as_deref() {
+            None => None,
+            Some("bearer") => Some(AuthScheme::Bearer),
+            Some("x_api_key") => Some(AuthScheme::XApiKey),
+            Some("none") => Some(AuthScheme::None),
+            Some(raw) => {
+                return Err(format!(
+                    "invalid catalog_auth_scheme {:?}: expected \"bearer\", \"x_api_key\", or \"none\"",
+                    raw
+                ));
+            }
+        };
+        Ok(CatalogAuthConfig {
+            endpoint: self.endpoint.clone(),
+            auth_scheme,
+            env_key: self.catalog_env_key.clone(),
+            headers: self.catalog_headers.clone(),
+            timeout_secs: self.catalog_timeout_secs,
+        })
+    }
 }
 
 impl std::fmt::Debug for ModelsConfig {
@@ -1335,6 +1406,11 @@ impl std::fmt::Debug for ModelsConfig {
                 &self.inference_idle_timeout_secs,
             )
             .field("stream_tool_calls", &self.stream_tool_calls)
+            .field("endpoint_present", &self.endpoint.is_some())
+            .field("catalog_auth_scheme", &self.catalog_auth_scheme)
+            .field("catalog_env_key_present", &self.catalog_env_key.is_some())
+            .field("catalog_headers_present", &!self.catalog_headers.is_empty())
+            .field("catalog_timeout_secs", &self.catalog_timeout_secs)
             .finish()
     }
 }
@@ -2310,6 +2386,7 @@ impl Config {
         }
         let (mut config, mut unrecognized_keys) =
             Self::deserialize_collecting_unrecognized(base, &raw_without_model_sections)?;
+        config.endpoints.catalog_auth = config.models.catalog_auth_config()?;
         config.mcp_servers = parsed_mcp_servers.into_iter().collect();
         config.config_models = config_models;
         config.config_warnings = config_warnings;
@@ -2408,6 +2485,20 @@ impl Config {
         config.prompt_suggest_model_pin = model_overrides.prompt_suggestion;
         config.apply_env_overrides();
         Ok(config)
+    }
+    pub(crate) fn from_effective_config() -> Self {
+        match crate::config::load_effective_config() {
+            Ok(cfg) => Self::new_from_toml_cfg(&cfg).unwrap_or_else(|_| Self::default()),
+            Err(_) => Self::default(),
+        }
+    }
+
+    pub(crate) fn parse_catalog_auth_from_models_toml(
+        models_val: &toml::Value,
+    ) -> Result<CatalogAuthConfig, String> {
+        let models_cfg =
+            ModelsConfig::deserialize(models_val.clone()).map_err(|e| e.to_string())?;
+        models_cfg.catalog_auth_config()
     }
     /// Populate trust-independent `#[serde(skip)]` subagent base fields.
     ///
