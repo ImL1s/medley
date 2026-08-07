@@ -2497,7 +2497,7 @@ fn acp_model_switch_validation_and_apply_handoff_emit_one_failure_event() {
             )
             .await
             .expect_err("public ACP validation must reject the request");
-            assert_eq!(error.code, acp::ErrorCode::InvalidParams.into(), "{rejection}");
+            assert_eq!(error.code, acp::ErrorCode::InvalidParams, "{rejection}");
 
             let events = crate::agent::handlers::model_switch::take_captured_failure_telemetry(
                 session_id.0.as_ref(),

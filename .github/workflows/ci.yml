@@ -133,15 +133,22 @@ jobs:
           shared-key: providers-lint
           cache-targets: true
 
-      - name: Clippy sampler / shell / pager (lib only)
+      - name: Clippy sampler / shell / pager / pager-bin (all targets)
         env:
           PROTOC: protoc
         run: |
-          # Lib-only: pager benches/tests still trip upstream clippy lints
-          # unrelated to the providers fork. Full-workspace clippy is too slow.
-          cargo clippy --manifest-path crates/codegen/xai-grok-sampler/Cargo.toml --lib -- -D warnings
-          cargo clippy --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib -- -D warnings
-          cargo clippy --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib -- -D warnings
+          # Measured 2026-08-07 on providers (#194): `--all-targets` on these
+          # four crates is clean after fixing the handful of test/bench lints
+          # (see the PR). No `-A` allow-list — that would re-open the blind
+          # spot this job is meant to close. Full-workspace clippy remains
+          # too slow; we stay on the hot-path crates only.
+          #
+          # `xai-grok-pager-bin` is a binary crate: `--lib` never saw it, and
+          # that is how `.err().expect()` lived green in CI since 5c8144e.
+          cargo clippy --manifest-path crates/codegen/xai-grok-sampler/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path crates/codegen/xai-grok-pager-bin/Cargo.toml --all-targets -- -D warnings
 
   test:
     name: Tests (providers hot path)
