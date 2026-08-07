@@ -62,29 +62,99 @@ pub const XAI_API_BASE_URL_DEFAULT: &str = "https://api.x.ai/v1";
 ///
 /// At resolve time the **first set, non-blank** value wins (e.g. SSH
 /// `AcceptEnv LC_*` forwarding of the Bottlerocket token).
+///
+/// Names are normalized on construction (`EnvKeys::new` / [`Self::normalize`]):
+/// trimmed, empty dropped, invalid rejected, duplicates collapsed to first
+/// occurrence. See [`Self::is_valid_name`] for the acceptance rule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum EnvKeys {
     One(String),
     Many(Vec<String>),
 }
+
+/// A configured env-key candidate that was rejected during normalization.
+///
+/// Carries the normalized-for-display **name** only — never an environment
+/// variable's value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectedEnvKey {
+    /// Candidate name after trim (empty string when the entry was whitespace-only).
+    pub name: String,
+    /// Why it was rejected (safe for diagnostics / config warnings).
+    pub reason: &'static str,
+}
+
 impl EnvKeys {
-    /// Single-name convenience constructor.
-    pub fn single(name: impl Into<String>) -> Self {
-        Self::One(name.into())
+    /// Conservative cross-platform env-var name rule used for `env_key`.
+    ///
+    /// After trim, a name must match `^[A-Za-z_][A-Za-z0-9_]*$`. That rejects
+    /// the issue floor (control characters, `=`, whitespace) and also rejects
+    /// hyphens, dots, leading digits, and non-ASCII — unusual-but-legal names
+    /// such as `My-API-Key`, `FOO.BAR`, or `1TOKEN` produce a path-specific
+    /// config warning instead of being selected.
+    pub fn is_valid_name(name: &str) -> bool {
+        let mut chars = name.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+            _ => return false,
+        }
+        chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
     }
-    /// Construct from an ordered list (empty names dropped; 0/1/N → Many/One/Many).
-    pub fn new(names: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        let names: Vec<String> = names
-            .into_iter()
-            .map(Into::into)
-            .filter(|s| !s.is_empty())
-            .collect();
+
+    /// Trim, drop empties, reject invalid names, dedupe (first occurrence wins).
+    ///
+    /// Rejected entries are returned for path-specific config warnings — callers
+    /// must not silently ignore them in user-facing config paths.
+    pub fn normalize(
+        names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> (Self, Vec<RejectedEnvKey>) {
+        let mut out = Vec::new();
+        let mut rejected = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for raw in names {
+            let raw = raw.into();
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                rejected.push(RejectedEnvKey {
+                    name: String::new(),
+                    reason: "empty or whitespace-only",
+                });
+                continue;
+            }
+            if !Self::is_valid_name(trimmed) {
+                rejected.push(RejectedEnvKey {
+                    name: trimmed.to_owned(),
+                    reason: "must match [A-Za-z_][A-Za-z0-9_]* (rejects '=', whitespace, controls, hyphens, dots)",
+                });
+                continue;
+            }
+            if !seen.insert(trimmed.to_owned()) {
+                continue;
+            }
+            out.push(trimmed.to_owned());
+        }
+        (Self::from_normalized(out), rejected)
+    }
+
+    fn from_normalized(names: Vec<String>) -> Self {
         match names.as_slice() {
             [] => Self::Many(Vec::new()),
             [_] => Self::One(names.into_iter().next().expect("len 1")),
             _ => Self::Many(names),
         }
+    }
+
+    /// Single-name convenience constructor (normalized).
+    pub fn single(name: impl Into<String>) -> Self {
+        Self::new([name.into()])
+    }
+    /// Construct from an ordered list: trim, drop empty/invalid, dedupe.
+    ///
+    /// Prefer [`Self::normalize`] when rejected entries must surface as
+    /// path-specific config warnings.
+    pub fn new(names: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self::normalize(names).0
     }
     pub fn is_empty(&self) -> bool {
         match self {
@@ -5841,10 +5911,13 @@ fn explicit_credential_header(info: &ModelInfo) -> Option<(String, Option<String
 }
 /// As [`explicit_credential_header`], but over the header maps alone.
 ///
-/// The reconstruction seams (turn config, subagent inheritance) rebuild from a
-/// `SamplingConfig`, which carries the headers but not the model entry and not
-/// `credential_source` — so provenance there has to be re-derived rather than
-/// carried, and this is what they derive it from (#110).
+/// Reports whether a declared credential header is still present on the wire
+/// (for resolver attach and identity gating). After #136, `Credentials`
+/// carries `source`; reconstruction seams take the provenance *label* from
+/// `creds.source_cloned()` and must not invent `ExplicitHeader` from these
+/// maps alone (#180) — a dual-auth gateway keeps both a model key and a
+/// declared header, and re-deriving the label while leaving `api_key` set
+/// is the post-strip mislabel L3 refuses.
 pub(crate) fn explicit_credential_header_in(
     extra_headers: &IndexMap<String, String>,
     env_http_headers: &IndexMap<String, String>,
@@ -5948,6 +6021,34 @@ fn classify_credential_source(
             .map(|(header, env)| CredentialSource::ExplicitHeader { header, env })
             .unwrap_or(CredentialSource::Missing),
     }
+}
+/// Does `cfg` carry a credential the request can actually authenticate with?
+///
+/// Deliberately **not** `api_key.is_some()`. Three readers asked that narrower
+/// question and it has been wrong since `CredentialSource::ExplicitHeader`
+/// existed: a model authenticated purely by an `authorization` / `x-api-key`
+/// entry resolves with `api_key == None` and is nonetheless fully
+/// authenticated. That disabled `web_search` for those users, and once #153
+/// started showing a reason it told them "no API key or session credential
+/// available" — not merely unhelpful but false, for a user looking at the
+/// header they supplied (#160).
+///
+/// The three arms are the three ways a request can be authenticated:
+/// a key in hand, a resolver that mints a bearer per request, or a credential
+/// the user attached to the headers themselves.
+///
+/// `api_key_provider` is deliberately **not** a fourth arm. It is not an
+/// independent signal: `spawn.rs` derives it from this same `bearer_resolver`
+/// (`cfg.bearer_resolver.clone().map(..)`), so it is `Some` exactly when
+/// `bearer_resolver` is — and it is not a field of `SamplerConfig`, so the
+/// other two readers could not consult it even if it were.
+pub(crate) fn has_usable_credential(cfg: &SamplerConfig) -> bool {
+    cfg.api_key.is_some()
+        || cfg.bearer_resolver.is_some()
+        || matches!(
+            cfg.credential_source,
+            Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
+        )
 }
 pub(crate) fn sampling_config_for_model(
     model: &ModelEntry,
@@ -6316,9 +6417,11 @@ pub(crate) fn web_search_disable_details(
         endpoints,
     ) {
         Err(disabled) => Some(disabled),
-        // spawn.rs disables when `api_key` is missing even if a bearer
-        // resolver is present — mirror that so the notice matches reality.
-        Ok(cfg) if cfg.api_key.is_none() => Some(WebSearchDisabled::new(
+        // Mirror spawn.rs's enable condition, through the one shared
+        // predicate, so this reason can never describe a state the spawn path
+        // does not actually produce. Asking `api_key.is_none()` here reported
+        // "no credential" to users who had supplied an auth header (#160).
+        Ok(cfg) if !has_usable_credential(&cfg) => Some(WebSearchDisabled::new(
             model_id,
             "no API key or session credential available",
         )),
@@ -8889,6 +8992,103 @@ reasoning_effort = "low"
             Some("  tok  ".into())
         );
     }
+    /// #13: whitespace-only names must not become a credential source.
+    #[test]
+    fn env_keys_normalize_rejects_whitespace_only_name() {
+        let (keys, rejected) = EnvKeys::normalize(["", "   ", "\t\n"]);
+        assert!(
+            keys.is_empty(),
+            "whitespace-only names must not survive normalization: {:?}",
+            keys.names()
+        );
+        assert_eq!(rejected.len(), 3);
+        for r in &rejected {
+            assert!(
+                r.reason.contains("empty") || r.reason.contains("whitespace"),
+                "reject reason must explain emptiness (Value withheld.): {}",
+                r.reason
+            );
+        }
+        assert!(EnvKeys::new(["   "]).is_empty());
+        assert!(EnvKeys::single("   ").is_empty());
+    }
+    /// #13: surrounding whitespace is trimmed before use.
+    #[test]
+    fn env_keys_normalize_trims_surrounding_whitespace() {
+        let (keys, rejected) = EnvKeys::normalize([" API_KEY "]);
+        assert!(rejected.is_empty(), "{rejected:?}");
+        assert_eq!(keys.names(), vec!["API_KEY"]);
+        assert_eq!(EnvKeys::new([" API_KEY "]).primary(), Some("API_KEY"));
+    }
+    /// #13: duplicate normalized names keep first-seen order only once.
+    #[test]
+    fn env_keys_normalize_dedupes_preserving_first_order() {
+        let (keys, rejected) =
+            EnvKeys::normalize([" PRIMARY ", "FALLBACK", "PRIMARY", " FALLBACK ", "OTHER"]);
+        assert!(rejected.is_empty(), "{rejected:?}");
+        assert_eq!(keys.names(), vec!["PRIMARY", "FALLBACK", "OTHER"]);
+    }
+    /// #13: `=` and control characters are invalid env-var names.
+    #[test]
+    fn env_keys_normalize_rejects_equals_and_control_characters() {
+        let (keys, rejected) =
+            EnvKeys::normalize(["GOOD_KEY", "FOO=BAR", "HAS\u{0001}CTRL", "BAD-NAME"]);
+        assert_eq!(keys.names(), vec!["GOOD_KEY"]);
+        let reasons: Vec<&str> = rejected.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(reasons, vec!["FOO=BAR", "HAS\u{0001}CTRL", "BAD-NAME"]);
+        for r in &rejected {
+            assert!(
+                !r.reason.is_empty(),
+                "each reject needs a reason (Value withheld.)"
+            );
+            // Diagnostics may name the variable; they must never look like a value dump.
+            assert!(
+                !r.reason.contains("sk-") && !r.reason.contains("token="),
+                "reject reason must not resemble a credential value (Value withheld.): {}",
+                r.reason
+            );
+        }
+    }
+    /// #13: multiple distinct valid fallbacks keep precedence order.
+    #[test]
+    fn env_keys_normalize_keeps_multiple_valid_fallbacks() {
+        let keys = EnvKeys::new([
+            "GROK_TEST_ENV_KEY_PRIMARY",
+            "GROK_TEST_ENV_KEY_FALLBACK",
+            "GROK_TEST_ENV_KEY_THIRD",
+        ]);
+        assert_eq!(
+            keys.names(),
+            vec![
+                "GROK_TEST_ENV_KEY_PRIMARY",
+                "GROK_TEST_ENV_KEY_FALLBACK",
+                "GROK_TEST_ENV_KEY_THIRD",
+            ]
+        );
+        assert_eq!(keys.primary(), Some("GROK_TEST_ENV_KEY_PRIMARY"));
+    }
+    /// #13: Display/Debug expose normalized names only — never env values.
+    #[test]
+    fn env_keys_diagnostics_show_normalized_names_only() {
+        let keys = EnvKeys::new([" API_KEY ", "FALLBACK"]);
+        let display = keys.to_string();
+        let debug = format!("{keys:?}");
+        assert!(display.contains("API_KEY"), "{display}");
+        assert!(display.contains("FALLBACK"), "{display}");
+        assert!(debug.contains("API_KEY"), "{debug}");
+        // EnvKeys stores names, not values; a resolved secret must not appear.
+        let resolved = keys.resolve_value_with(|n| {
+            (n == "API_KEY").then(|| "sk-super-secret-credential-value".into())
+        });
+        assert_eq!(
+            resolved.as_deref(),
+            Some("sk-super-secret-credential-value")
+        );
+        assert!(
+            !display.contains("sk-super-secret") && !debug.contains("sk-super-secret"),
+            "diagnostics must not include resolved credential bytes (Value withheld.): display={display} debug={debug}"
+        );
+    }
     #[test]
     #[serial]
     fn first_own_credential_empty_api_key_falls_through_to_env_key() {
@@ -9438,6 +9638,337 @@ reasoning_effort = "low"
         assert!(
             notice.contains(readiness_reason.as_str()),
             "notice must include the readiness reason ({readiness_reason}): {notice}"
+        );
+    }
+    /// #160: a model authenticated purely by an explicit credential header
+    /// resolves with `api_key == None` and is nonetheless fully authenticated.
+    /// It must keep `web_search`, and it must never be handed #153's
+    /// "no API key or session credential available" — for a user looking at the
+    /// `Authorization` header they supplied, that message is not unhelpful, it
+    /// is false.
+    ///
+    /// This test reaches `resolve_web_search_sampling_config`,
+    /// `has_usable_credential`, and `web_search_disable_details` (the disable
+    /// reason). Reverting that reason's gate to `cfg.api_key.is_none()` fails
+    /// it. It does **not** enter `agent_ops`'s notice decision
+    /// (`needs_notice` / `has_usable_credential` at the preflight site) — that
+    /// is defense-in-depth sharing the same predicate, not coverage claimed
+    /// here.
+    ///
+    /// It also does not reach `spawn.rs`'s gate, which is the one that
+    /// actually turns the tool off. That reader is guarded separately by
+    /// [`spawn_gates_web_search_on_the_shared_credential_predicate`], because
+    /// reverting it still compiles and no behavioural test reaches it.
+    #[test]
+    #[serial]
+    fn header_authenticated_model_keeps_web_search_and_is_told_nothing() {
+        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+        use xai_grok_test_support::EnvGuard;
+        let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+        let mut entry =
+            test_model_entry("hdr-search", "https://third.example/v1", None, None, None);
+        entry
+            .info
+            .extra_headers
+            .insert("Authorization".into(), "Bearer user-supplied".into());
+        let mut catalog = IndexMap::new();
+        catalog.insert("hdr-search".to_string(), entry);
+
+        let cfg = resolve_web_search_sampling_config(
+            "hdr-search",
+            &catalog,
+            None,
+            false,
+            None,
+            None,
+            &EndpointsConfig::default(),
+        )
+        .expect("a header-authenticated model must resolve a web-search config");
+
+        // The precondition the old readers got wrong: authenticated, no key.
+        assert!(
+            cfg.api_key.is_none(),
+            "precondition: header auth means there is no bearer in hand"
+        );
+        assert!(
+            matches!(
+                cfg.credential_source,
+                Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
+            ),
+            "precondition: the classifier labels this route ExplicitHeader, got {:?}",
+            cfg.credential_source
+        );
+        assert!(
+            has_usable_credential(&cfg),
+            "an explicit credential header is a usable credential"
+        );
+        // The header itself has to survive to the tool, or enabling it just
+        // moves the failure from 'disabled' to 'enabled and unauthorized'.
+        assert_eq!(
+            cfg.extra_headers.get("Authorization").map(String::as_str),
+            Some("Bearer user-supplied"),
+            "the resolved config must still carry the user's header"
+        );
+
+        assert!(
+            web_search_disable_details(
+                "hdr-search",
+                &catalog,
+                None,
+                false,
+                None,
+                None,
+                &EndpointsConfig::default(),
+            )
+            .is_none(),
+            "a route with a credential must produce no disable notice"
+        );
+    }
+    /// #160: the reader that actually turns `web_search` off is `spawn.rs`'s
+    /// gate, and it must go through the shared predicate.
+    ///
+    /// Guarded by scanning source rather than by running anything, because the
+    /// regression is **type-decidable and silent**: `api_key` is now
+    /// `Option<String>`, so reverting the gate to `cfg.api_key.is_some()`
+    /// compiles cleanly, no behavioural test reaches that branch, and #160's
+    /// original symptom returns with the suite green. Same technique as
+    /// `no_user_facing_message_hardcodes_the_state_directory`, and for the same
+    /// reason — the property is not observable from the outside.
+    #[test]
+    fn spawn_gates_web_search_on_the_shared_credential_predicate() {
+        const SPAWN_SRC: &str = include_str!("../session/acp_session_impl/spawn.rs");
+        assert!(
+            SPAWN_SRC.contains("if crate::agent::config::has_usable_credential(&cfg) {"),
+            "spawn.rs must gate WebSearchConfig::Enabled on has_usable_credential. \
+             Inspecting `cfg.api_key` directly compiles and passes every other test, \
+             and re-disables web_search for header-authenticated models (#160)."
+        );
+    }
+    /// #160: the enable arm must also **forward** `env_http_headers`, not just
+    /// decide to enable.
+    ///
+    /// Sibling of [`spawn_gates_web_search_on_the_shared_credential_predicate`]
+    /// and silent for the same reason: the field has a `Default`, so dropping
+    /// it — or writing `Default::default()` — compiles cleanly. The failure it
+    /// produces is the worst shape available here: `web_search` is enabled and
+    /// then sends its request **unauthenticated**, because the credential lived
+    /// only in the env mapping. `has_usable_credential` returns true either way,
+    /// so the gate guarded above does not notice.
+    ///
+    /// The two wire tests in `web_search_e2e_tests` prove the client resolves
+    /// the map once it arrives; nothing else proves it arrives.
+    #[test]
+    fn spawn_forwards_env_http_headers_into_the_enabled_web_search_config() {
+        const SPAWN_SRC: &str = include_str!("../session/acp_session_impl/spawn.rs");
+        assert!(
+            SPAWN_SRC.contains("env_http_headers: cfg.env_http_headers,"),
+            "spawn.rs must forward `env_http_headers` into WebSearchConfig::Enabled. \
+             Dropping it compiles, leaves every behavioural test green, and enables \
+             web_search with the credential removed — the request then goes out \
+             unauthenticated (#160)."
+        );
+    }
+    /// #160: enablement for an env-only credential header is labelled from
+    /// `model.info`, but the secret only reaches the web_search client if
+    /// `sampling_config_for_model` still copies `info.env_http_headers` into
+    /// `SamplerConfig`.
+    ///
+    /// Replacing that clone with `IndexMap::new()` leaves
+    /// `has_usable_credential` true (classifier still sees the model map),
+    /// spawn still enables, and the request goes out **unauthenticated** —
+    /// the spawn-forward scan and the client wire tests stay green because
+    /// they never build this config through resolve. Mutation target: the
+    /// `env_http_headers: info.env_http_headers.clone()` field in
+    /// `sampling_config_for_model`.
+    #[test]
+    #[serial]
+    fn env_only_credential_header_survives_into_sampler_config() {
+        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+        use xai_grok_test_support::EnvGuard;
+        const VAR: &str = "MEDLEY_TEST_WS_ENV_ONLY_MAP_160";
+        let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+        // Value must be non-empty so the classifier labels ExplicitHeader; the
+        // assertion below checks the env *name* on the map, never the value.
+        let _env = EnvGuard::set(VAR, "env-only-map-sentinel");
+
+        let mut entry = test_model_entry("env-map", "https://third.example/v1", None, None, None);
+        entry
+            .info
+            .env_http_headers
+            .insert("x-api-key".into(), VAR.into());
+        let mut catalog = IndexMap::new();
+        catalog.insert("env-map".to_string(), entry);
+
+        let cfg = resolve_web_search_sampling_config(
+            "env-map",
+            &catalog,
+            None,
+            false,
+            None,
+            None,
+            &EndpointsConfig::default(),
+        )
+        .expect("an env-header-authenticated model must resolve a web-search config");
+
+        assert!(
+            cfg.api_key.is_none(),
+            "precondition: env-header auth means there is no bearer in hand"
+        );
+        assert!(
+            matches!(
+                cfg.credential_source,
+                Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
+            ),
+            "precondition: the classifier labels this route ExplicitHeader, got {:?}",
+            cfg.credential_source
+        );
+        assert!(
+            has_usable_credential(&cfg),
+            "an env-backed credential header is a usable credential"
+        );
+        // The load-bearing copy: name → env NAME must survive resolve. Emptied
+        // at sampling_config_for_model, every other #160 test stays green.
+        assert_eq!(
+            cfg.env_http_headers.get("x-api-key").map(String::as_str),
+            Some(VAR),
+            "resolved SamplerConfig must still map x-api-key to the env name \
+             (Value withheld.)"
+        );
+
+        // Mirror spawn's Enabled construction so a missing map cannot hide
+        // behind "spawn would have forwarded whatever resolve produced".
+        let handed_off = xai_grok_tools::implementations::web_search::WebSearchConfig::Enabled {
+            api_key: cfg.api_key.clone(),
+            base_url: cfg.base_url.clone(),
+            model: cfg.model.clone(),
+            extra_headers: cfg.extra_headers.clone(),
+            env_http_headers: cfg.env_http_headers.clone(),
+            alpha_test_key: None,
+            api_key_provider: None,
+        };
+        match handed_off {
+            xai_grok_tools::implementations::web_search::WebSearchConfig::Enabled {
+                env_http_headers,
+                ..
+            } => {
+                assert_eq!(
+                    env_http_headers.get("x-api-key").map(String::as_str),
+                    Some(VAR),
+                    "WebSearchConfig handoff must carry the env name mapping \
+                     (Value withheld.)"
+                );
+            }
+            xai_grok_tools::implementations::web_search::WebSearchConfig::Disabled => {
+                panic!("handoff must stay Enabled when has_usable_credential is true");
+            }
+        }
+
+        assert!(
+            web_search_disable_details(
+                "env-map",
+                &catalog,
+                None,
+                false,
+                None,
+                None,
+                &EndpointsConfig::default(),
+            )
+            .is_none(),
+            "a route with an env-backed credential must produce no disable notice"
+        );
+    }
+    /// #160: `has_usable_credential`'s bearer_resolver arm is independent of
+    /// `api_key` and of `ExplicitHeader`. Main-session preflight often snapshots
+    /// a token into `api_key`, so that path can look covered without ever
+    /// exercising this arm; non-preflight builders (e.g.
+    /// `prepare_web_search_sampling_config`) still consult it.
+    ///
+    /// Removing `|| cfg.bearer_resolver.is_some()` fails this test and leaves
+    /// every other #160 test green.
+    #[test]
+    fn has_usable_credential_accepts_a_bearer_resolver_alone() {
+        #[derive(Debug)]
+        struct AloneResolver;
+        impl xai_grok_sampler::BearerResolver for AloneResolver {
+            fn current_bearer(&self) -> Option<String> {
+                Some("resolver-only-token".into())
+            }
+        }
+        let with_resolver = SamplerConfig {
+            bearer_resolver: Some(std::sync::Arc::new(AloneResolver)),
+            ..SamplerConfig::default()
+        };
+        assert!(
+            with_resolver.api_key.is_none(),
+            "precondition: no api_key in hand"
+        );
+        assert!(
+            !matches!(
+                with_resolver.credential_source,
+                Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
+            ),
+            "precondition: not an ExplicitHeader route"
+        );
+        assert!(
+            has_usable_credential(&with_resolver),
+            "a bearer_resolver alone is a usable credential"
+        );
+        assert!(
+            !has_usable_credential(&SamplerConfig::default()),
+            "an empty SamplerConfig must remain unusable"
+        );
+    }
+    /// #160 counterweight: the fix must not become "enable everything". A route
+    /// that genuinely has no credential stays disabled, and keeps #153's
+    /// reason — which is what makes the notice worth showing at all.
+    #[test]
+    #[serial]
+    fn credential_less_route_stays_disabled_with_the_153_reason() {
+        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+        use xai_grok_test_support::EnvGuard;
+        let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+        // `auth_scheme = "none"` is ready by design (a keyless local server),
+        // so it resolves `Ok` and reaches the credential check rather than
+        // being turned away by readiness first.
+        let mut entry = test_model_entry("local", "http://127.0.0.1:11434/v1", None, None, None);
+        entry.info.auth_scheme = AuthScheme::None;
+        let mut catalog = IndexMap::new();
+        catalog.insert("local".to_string(), entry);
+
+        let cfg = resolve_web_search_sampling_config(
+            "local",
+            &catalog,
+            None,
+            false,
+            None,
+            None,
+            &EndpointsConfig::default(),
+        )
+        .expect("an auth_scheme=none model resolves; the credential check is what stops it");
+        assert!(
+            !has_usable_credential(&cfg),
+            "auth_scheme=none is a deliberate absence, not a credential"
+        );
+
+        let notice = web_search_disable_details(
+            "local",
+            &catalog,
+            None,
+            false,
+            None,
+            None,
+            &EndpointsConfig::default(),
+        )
+        .expect("a credential-less route must still produce a notice")
+        .user_notice();
+        assert!(
+            notice.contains("no API key or session credential available"),
+            "#153's reason must survive the #160 fix: {notice}"
         );
     }
     /// #110 (Layer 0): a model that needs a bearer, declares no credential of

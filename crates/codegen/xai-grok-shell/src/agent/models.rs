@@ -114,6 +114,16 @@ struct Inner {
     catalog: RwLock<CatalogState>,
     current_model_id: RwLock<acp::ModelId>,
     current_reasoning_effort: RwLock<Option<ReasoningEffort>>,
+    /// Set when the user's configured default was not seated and a substitute
+    /// was used (#131). Refreshed at every `resolve_default_model` call site —
+    /// including the early-return of `reselect_current_model_if_missing` — so a
+    /// catalog that arrives late corrects a verdict taken against an emptier
+    /// one rather than leaving it stale. On the warm-cache path that correction
+    /// also reseats the preference when it becomes honourable (unless the user
+    /// already picked via `/model`), so clearing the verdict cannot disagree
+    /// with `current_model_id`. Republished on `x.ai/models/update` via
+    /// [`Self::notify_models_updated`].
+    substituted_preference: RwLock<Option<resolution::SubstitutedPreference>>,
     // ── Owned context for self-contained refresh ────────────────
     auth_manager: Arc<AuthManager>,
     cfg: RwLock<config::Config>,
@@ -221,6 +231,7 @@ impl ModelsManagerBuilder {
                 }),
                 current_model_id: RwLock::new(self.current_model_id),
                 current_reasoning_effort: RwLock::new(current_reasoning_effort),
+                substituted_preference: RwLock::new(None),
                 auth_manager: self.auth_manager,
                 cfg: RwLock::new(self.cfg),
                 fetch_auth: RwLock::new(fetch_auth),
@@ -343,6 +354,7 @@ impl ModelsManager {
             auth_manager,
             cfg.clone(),
         );
+        mgr.record_substituted_preference(cfg, model_source);
         if has_prefetched {
             mgr.inner.catalog.write().has_fetched_real_catalog = true;
         }
@@ -492,6 +504,65 @@ impl ModelsManager {
 
     pub fn current_model_id(&self) -> acp::ModelId {
         self.inner.current_model_id.read().clone()
+    }
+
+    /// The configured default that resolve fell through on (absent from the
+    /// catalog, or present but not user-selectable), so a substitute is what
+    /// `current_model_id` names (#131). Derived from
+    /// [`resolve_default_model`]'s source: an explicit preference that was
+    /// seated — ready, or kept-unready under #145 — comes back carrying its
+    /// own source, not `Default`. `None` covers every other outcome, including
+    /// kept-but-unready (already reported per-model as `readinessReason`).
+    ///
+    /// After a later catalog makes the preference honourable, the warm-cache
+    /// path reseats it (when the user has not `/model`-picked), so a cleared
+    /// verdict means the preference is seated — not merely "would be seated if
+    /// we reselected".
+    pub(crate) fn substituted_preference(&self) -> Option<resolution::SubstitutedPreference> {
+        self.inner.substituted_preference.read().clone()
+    }
+
+    /// Write the #131 verdict into a `_meta` map.
+    ///
+    /// - `clear_when_absent = false` (`initialize`): omit the key when there is
+    ///   no substitution — the omit-not-null contract.
+    /// - `clear_when_absent = true` (`x.ai/models/update`): write JSON `null`
+    ///   so a client holding a prior accusation can retract it.
+    pub(crate) fn write_substituted_default_model_meta(
+        &self,
+        map: &mut serde_json::Map<String, serde_json::Value>,
+        clear_when_absent: bool,
+    ) {
+        match self.substituted_preference() {
+            Some(pref) => {
+                map.insert(
+                    resolution::SUBSTITUTED_DEFAULT_MODEL_META_KEY.to_string(),
+                    pref.to_meta_value(),
+                );
+            }
+            None if clear_when_absent => {
+                map.insert(
+                    resolution::SUBSTITUTED_DEFAULT_MODEL_META_KEY.to_string(),
+                    serde_json::Value::Null,
+                );
+            }
+            None => {}
+        }
+    }
+
+    /// Refresh the substitution verdict from a resolution that just ran.
+    ///
+    /// Called at every `resolve_default_model` site rather than only at
+    /// construction: the catalog is populated asynchronously, so a verdict
+    /// taken against an empty catalog would otherwise accuse the user of
+    /// configuring a model that had simply not loaded yet.
+    fn record_substituted_preference(
+        &self,
+        cfg: &config::Config,
+        resolved_source: config::ConfigSource,
+    ) {
+        *self.inner.substituted_preference.write() =
+            resolution::substituted_preference(cfg, resolved_source);
     }
 
     pub(crate) fn set_current_model_id(&self, id: acp::ModelId) {
@@ -744,8 +815,22 @@ impl ModelsManager {
             })),
         );
         if let Some(ref gw) = *self.inner.gateway.read() {
-            let model_state =
+            // #131: republish (or clear) the substitution verdict on every
+            // catalog push. `initialize` is one-shot; without this, a verdict
+            // taken against a bundled/empty catalog survives on the only
+            // surface a client can see after the remote catalog corrects it.
+            //
+            // Path asymmetry (intentional until a consumer unifies them):
+            // `initialize` writes the key on the *response* top-level `_meta`
+            // (sibling of `modelState`); this notification writes it on
+            // `SessionModelState._meta` (inside the update params). Same key
+            // name, different JSON path — first consumers must branch.
+            // JSON `null` means "no longer substituted".
+            let mut model_state =
                 acp::SessionModelState::new(current, available.values().cloned().collect());
+            let mut meta = serde_json::Map::new();
+            self.write_substituted_default_model_meta(&mut meta, true);
+            model_state = model_state.meta(meta);
             if let Ok(params) = serde_json::value::to_raw_value(&model_state) {
                 gw.forward_fire_and_forget(acp::ExtNotification::new(
                     "x.ai/models/update",
@@ -952,6 +1037,9 @@ impl ModelsManager {
         self.inner
             .user_selected_model
             .store(false, Ordering::Relaxed);
+        // Same invariant for #131: a previous identity's substitution verdict
+        // must not accuse the new one of rejecting a preference it never held.
+        *self.inner.substituted_preference.write() = None;
         // The catalog just became empty, which is a content change like any
         // other -- without this a memo taken under the previous identity stays
         // valid at the same generation and is served after the wipe (#159).
@@ -1247,6 +1335,18 @@ impl ModelsManager {
     }
 
     /// Re-pick the default if `current_model_id` is gone from the catalog *or*
+    /// no longer user-selectable. Always refreshes the #131 verdict: the
+    /// early-return path is exactly when a stale `Some` taken against an
+    /// emptier catalog would otherwise survive.
+    ///
+    /// Warm-cache path: a prefetched disk catalog already set
+    /// `has_fetched_real_catalog`, so later remote catalogs take this method
+    /// rather than [`Self::reselect_default_model`]. When a prior substitution
+    /// verdict exists and resolve now honours an explicit preference that is
+    /// not the seated id (and the user has not `/model`-picked), reseat —
+    /// otherwise clearing the verdict would retract the accusation while the
+    /// substitute stayed seated. Gating on a prior verdict also keeps
+    /// campaign-only preferred flips from yanking a live session.
     fn reselect_current_model_if_missing(&self, config: &config::Config) {
         let current = self.inner.current_model_id.read().clone();
         let needs_reselection = {
@@ -1257,19 +1357,38 @@ impl ModelsManager {
                 Some(entry) => !entry.info.user_selectable,
             }
         };
-        if !needs_reselection {
-            return;
-        }
         let (key, _, source, _) = {
             let cat = self.inner.catalog.read();
             let models = &cat.models;
             resolve_default_model(config, models, self.is_session_auth())
         };
+        let user_picked = self.inner.user_selected_model.load(Ordering::Relaxed);
+        // Only reseat when we previously recorded a substitution: that is the
+        // warm-cache "preference was missing, now honourable" path. Without
+        // this gate, a campaign-only preferred flip (which deliberately takes
+        // this method rather than reselect_default_model) would yank a live
+        // session onto the pushed default.
+        let had_substitution = self.substituted_preference().is_some();
+        let honour_explicit_preference = had_substitution
+            && !user_picked
+            && key.as_str() != current.0.as_ref()
+            && resolution::is_explicit_preference(source);
+        self.record_substituted_preference(config, source);
+        if !needs_reselection && !honour_explicit_preference {
+            return;
+        }
         let new_id = acp::ModelId::new(Arc::from(key));
-        tracing::info!(
-            old = %current.0, new = %new_id.0, source = %source,
-            "current model not in new catalog, reselecting default"
-        );
+        if honour_explicit_preference && !needs_reselection {
+            tracing::info!(
+                old = %current.0, new = %new_id.0, source = %source,
+                "configured preference now honourable, reseating"
+            );
+        } else {
+            tracing::info!(
+                old = %current.0, new = %new_id.0, source = %source,
+                "current model not in new catalog, reselecting default"
+            );
+        }
         self.set_current_model_id_internal(new_id);
     }
 
@@ -1281,6 +1400,11 @@ impl ModelsManager {
             resolve_default_model(config, models, self.is_session_auth())
         };
         let new_id = acp::ModelId::new(Arc::from(key));
+        // Recorded whether or not the selection changes: the catalog landing is
+        // exactly when an "absent" verdict taken against an emptier catalog
+        // becomes wrong, and that correction is independent of whether the
+        // resolved key moved.
+        self.record_substituted_preference(config, source);
         let current = self.inner.current_model_id.read().clone();
         if current.0.as_ref() != new_id.0.as_ref() {
             if let Some(reason) = &unready_reason {

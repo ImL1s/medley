@@ -1,3 +1,4 @@
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -8,7 +9,7 @@ use tracing::Instrument;
 
 use crate::{
     AcpMethod, acp_send,
-    common::AcpResult,
+    common::{AcpChannelFailure, AcpResult, acp_channel_failure_error},
     message::{AcpAgentMessage, AcpArgs, AcpClientMessage, AcpRequest, AcpSide},
 };
 
@@ -19,15 +20,42 @@ type OnMetaFn = Rc<dyn Fn(&acp::Meta) -> tracing::Span>;
 /// Gateway receiver - allows sending messages to it via a channel and it will
 /// forward them to an underlying connection.
 pub struct AcpGatewayReceiver<S: AcpSide, C> {
-    rx: mpsc::UnboundedReceiver<S::OutMessage>,
+    rx: GatewayRx<S::OutMessage>,
     conn: C,
     tracing: bool,
     spawn_fn: SpawnFn,
     on_meta: Option<OnMetaFn>,
 }
 
+enum GatewayRx<T> {
+    Unbounded(mpsc::UnboundedReceiver<T>),
+    Bounded(mpsc::Receiver<T>),
+}
+
+enum GatewayTx<T> {
+    Unbounded(mpsc::UnboundedSender<T>),
+    Bounded(mpsc::Sender<T>),
+}
+
+impl<T> Clone for GatewayTx<T> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Unbounded(tx) => Self::Unbounded(tx.clone()),
+            Self::Bounded(tx) => Self::Bounded(tx.clone()),
+        }
+    }
+}
+
 impl<S: AcpSide, C> AcpGatewayReceiver<S, C> {
     pub fn new(rx: mpsc::UnboundedReceiver<S::OutMessage>, conn: C) -> Self {
+        Self::new_with_rx(GatewayRx::Unbounded(rx), conn)
+    }
+
+    pub fn new_bounded(rx: mpsc::Receiver<S::OutMessage>, conn: C) -> Self {
+        Self::new_with_rx(GatewayRx::Bounded(rx), conn)
+    }
+
+    fn new_with_rx(rx: GatewayRx<S::OutMessage>, conn: C) -> Self {
         Self {
             rx,
             conn,
@@ -63,11 +91,18 @@ impl<S: AcpSide, C> AcpGatewayReceiver<S, C> {
     }
 }
 
+async fn recv_from_gateway_rx<T>(rx: &mut GatewayRx<T>) -> Option<T> {
+    match rx {
+        GatewayRx::Unbounded(rx) => rx.recv().await,
+        GatewayRx::Bounded(rx) => rx.recv().await,
+    }
+}
+
 /// The other side of the gateway. Allows to send messages to a channel so that
 /// they will be forwarded automatically to a connection (as long as gateway
 /// receiver side is running in the background).
 pub struct AcpGatewaySender<S: AcpSide> {
-    tx: mpsc::UnboundedSender<S::OutMessage>,
+    tx: GatewayTx<S::OutMessage>,
     tracing: bool,
 }
 
@@ -82,11 +117,26 @@ impl<S: AcpSide> Clone for AcpGatewaySender<S> {
 
 impl<S: AcpSide> AcpGatewaySender<S> {
     pub fn new(tx: mpsc::UnboundedSender<S::OutMessage>) -> Self {
-        Self { tx, tracing: false }
+        Self {
+            tx: GatewayTx::Unbounded(tx),
+            tracing: false,
+        }
+    }
+
+    pub fn new_bounded(tx: mpsc::Sender<S::OutMessage>) -> Self {
+        Self {
+            tx: GatewayTx::Bounded(tx),
+            tracing: false,
+        }
     }
 
     pub fn tx(&self) -> mpsc::UnboundedSender<S::OutMessage> {
-        self.tx.clone()
+        match &self.tx {
+            GatewayTx::Unbounded(tx) => tx.clone(),
+            GatewayTx::Bounded(_) => {
+                panic!("AcpGatewaySender::tx is only available for unbounded senders")
+            }
+        }
     }
 
     pub fn with_tracing(mut self, tracing: bool) -> Self {
@@ -171,50 +221,48 @@ macro_rules! handle {
 }
 
 impl<C: acp::Agent + 'static> AcpGatewayReceiver<acp::ClientSide, C> {
-    pub async fn run(mut self) {
-        let conn = Rc::new(self.conn);
-        let spawn = self.spawn_fn.clone();
-        let on_meta = self.on_meta.clone();
-        while let Some(msg) = self.rx.recv().await {
+    pub async fn run(self) {
+        let AcpGatewayReceiver {
+            mut rx,
+            conn,
+            tracing,
+            spawn_fn,
+            on_meta,
+        } = self;
+        let conn = Rc::new(conn);
+        let spawn = spawn_fn;
+        while let Some(msg) = recv_from_gateway_rx(&mut rx).await {
             let conn = conn.clone();
             match msg {
                 AcpAgentMessage::Initialize(args) => {
-                    handle!(args, self.tracing, conn, initialize, spawn, on_meta);
+                    handle!(args, tracing, conn, initialize, spawn, on_meta);
                 }
                 AcpAgentMessage::Authenticate(args) => {
-                    handle!(args, self.tracing, conn, authenticate, spawn, on_meta);
+                    handle!(args, tracing, conn, authenticate, spawn, on_meta);
                 }
                 AcpAgentMessage::NewSession(args) => {
-                    handle!(args, self.tracing, conn, new_session, spawn, on_meta);
+                    handle!(args, tracing, conn, new_session, spawn, on_meta);
                 }
                 AcpAgentMessage::LoadSession(args) => {
-                    handle!(args, self.tracing, conn, load_session, spawn, on_meta);
+                    handle!(args, tracing, conn, load_session, spawn, on_meta);
                 }
                 AcpAgentMessage::SetSessionMode(args) => {
-                    handle!(args, self.tracing, conn, set_session_mode, spawn, on_meta);
+                    handle!(args, tracing, conn, set_session_mode, spawn, on_meta);
                 }
                 AcpAgentMessage::Prompt(args) => {
-                    handle!(args, self.tracing, conn, prompt, spawn, on_meta);
+                    handle!(args, tracing, conn, prompt, spawn, on_meta);
                 }
                 AcpAgentMessage::Cancel(args) => {
-                    handle!(args, self.tracing, conn, cancel, spawn, on_meta);
+                    handle!(args, tracing, conn, cancel, spawn, on_meta);
                 }
                 AcpAgentMessage::ExtMethod(args) => {
-                    handle!(
-                        no_meta,
-                        args,
-                        self.tracing,
-                        conn,
-                        ext_method,
-                        spawn,
-                        on_meta
-                    );
+                    handle!(no_meta, args, tracing, conn, ext_method, spawn, on_meta);
                 }
                 AcpAgentMessage::ExtNotification(args) => {
                     handle!(
                         no_meta,
                         args,
-                        self.tracing,
+                        tracing,
                         conn,
                         ext_notification,
                         spawn,
@@ -222,81 +270,65 @@ impl<C: acp::Agent + 'static> AcpGatewayReceiver<acp::ClientSide, C> {
                     );
                 }
                 AcpAgentMessage::SetSessionModel(args) => {
-                    handle!(args, self.tracing, conn, set_session_model, spawn, on_meta);
+                    handle!(args, tracing, conn, set_session_model, spawn, on_meta);
                 }
             }
         }
-        if self.tracing {
+        if tracing {
             tracing::trace!("stopping gateway loop: receiver channel is closed");
         }
     }
 }
 
 impl<C: acp::Client + 'static> AcpGatewayReceiver<acp::AgentSide, C> {
-    pub async fn run(mut self) {
-        let conn = Rc::new(self.conn);
-        let spawn = self.spawn_fn.clone();
-        let on_meta = self.on_meta.clone();
-        while let Some(msg) = self.rx.recv().await {
+    pub async fn run(self) {
+        let AcpGatewayReceiver {
+            mut rx,
+            conn,
+            tracing,
+            spawn_fn,
+            on_meta,
+        } = self;
+        let conn = Rc::new(conn);
+        let spawn = spawn_fn;
+        while let Some(msg) = recv_from_gateway_rx(&mut rx).await {
             let conn = conn.clone();
             match msg {
                 AcpClientMessage::RequestPermission(args) => {
-                    handle!(args, self.tracing, conn, request_permission, spawn, on_meta);
+                    handle!(args, tracing, conn, request_permission, spawn, on_meta);
                 }
                 AcpClientMessage::ReadTextFile(args) => {
-                    handle!(args, self.tracing, conn, read_text_file, spawn, on_meta);
+                    handle!(args, tracing, conn, read_text_file, spawn, on_meta);
                 }
                 AcpClientMessage::WriteTextFile(args) => {
-                    handle!(args, self.tracing, conn, write_text_file, spawn, on_meta);
+                    handle!(args, tracing, conn, write_text_file, spawn, on_meta);
                 }
                 AcpClientMessage::SessionNotification(args) => {
-                    handle!(
-                        args,
-                        self.tracing,
-                        conn,
-                        session_notification,
-                        spawn,
-                        on_meta
-                    );
+                    handle!(args, tracing, conn, session_notification, spawn, on_meta);
                 }
                 AcpClientMessage::CreateTerminal(args) => {
-                    handle!(args, self.tracing, conn, create_terminal, spawn, on_meta);
+                    handle!(args, tracing, conn, create_terminal, spawn, on_meta);
                 }
                 AcpClientMessage::TerminalOutput(args) => {
-                    handle!(args, self.tracing, conn, terminal_output, spawn, on_meta);
+                    handle!(args, tracing, conn, terminal_output, spawn, on_meta);
                 }
                 AcpClientMessage::ReleaseTerminal(args) => {
-                    handle!(args, self.tracing, conn, release_terminal, spawn, on_meta);
+                    handle!(args, tracing, conn, release_terminal, spawn, on_meta);
                 }
                 AcpClientMessage::WaitForTerminalExit(args) => {
-                    handle!(
-                        args,
-                        self.tracing,
-                        conn,
-                        wait_for_terminal_exit,
-                        spawn,
-                        on_meta
-                    );
+                    handle!(args, tracing, conn, wait_for_terminal_exit, spawn, on_meta);
                 }
                 AcpClientMessage::KillTerminalCommand(args) => {
-                    handle!(args, self.tracing, conn, kill_terminal, spawn, on_meta);
+                    handle!(args, tracing, conn, kill_terminal, spawn, on_meta);
                 }
                 AcpClientMessage::ExtMethod(args) => {
-                    handle!(
-                        no_meta,
-                        args,
-                        self.tracing,
-                        conn,
-                        ext_method,
-                        spawn,
-                        on_meta
-                    );
+                    handle!(no_meta, args, tracing, conn, ext_method, spawn, on_meta);
                 }
                 AcpClientMessage::ExtNotification(args) => {
                     handle!(
                         no_meta,
                         args,
-                        self.tracing,
+                        tracing,
                         conn,
                         ext_notification,
                         spawn,
@@ -305,13 +337,23 @@ impl<C: acp::Client + 'static> AcpGatewayReceiver<acp::AgentSide, C> {
                 }
             }
         }
-        if self.tracing {
+        if tracing {
             tracing::trace!("stopping gateway loop: receiver channel is closed");
         }
     }
 }
 
 impl<S: AcpSide> AcpGatewaySender<S> {
+    fn try_enqueue_out_message(&self, msg: S::OutMessage) -> Result<(), &'static str> {
+        match &self.tx {
+            GatewayTx::Unbounded(tx) => tx.send(msg).map_err(|_| "receiver dropped"),
+            GatewayTx::Bounded(tx) => tx.try_send(msg).map_err(|err| match err {
+                mpsc::error::TrySendError::Full(_) => "queue full",
+                mpsc::error::TrySendError::Closed(_) => "receiver dropped",
+            }),
+        }
+    }
+
     /// Shared enqueue for the forward variants; `caller` attributes the
     /// dropped-receiver log to the right public method.
     fn enqueue<T>(
@@ -329,11 +371,11 @@ impl<S: AcpSide> AcpGatewaySender<S> {
             request,
             response_tx,
         };
-        let accepted = self.tx.send(args.into()).is_ok();
-        if !accepted {
-            tracing::debug!(method, "{caller}: receiver dropped, notification discarded");
+        let enqueue = self.try_enqueue_out_message(args.into());
+        if let Err(reason) = enqueue {
+            tracing::debug!(method, "{caller}: {reason}, notification discarded");
         }
-        (accepted, response_rx)
+        (enqueue.is_ok(), response_rx)
     }
 
     /// Enqueue a request and return a completion receiver for handler finish.
@@ -384,8 +426,42 @@ impl<S: AcpSide> AcpGatewaySender<S> {
                 request_present = true
             );
         }
-        acp_send(request, &self.tx).await
+        match &self.tx {
+            GatewayTx::Unbounded(tx) => acp_send(request, tx).await,
+            GatewayTx::Bounded(tx) => acp_send_bounded(request, tx).await,
+        }
     }
+}
+
+async fn acp_send_bounded<R, T>(request: T, tx: &mpsc::Sender<R>) -> AcpResult<T::Response>
+where
+    T: AcpRequest,
+    R: From<AcpArgs<T>> + fmt::Debug,
+{
+    let (response_tx, response_rx) = oneshot::channel();
+    let method = request.method_name();
+    let args = AcpArgs {
+        request,
+        response_tx,
+    };
+
+    tx.try_send(args.into()).map_err(|err| match err {
+        mpsc::error::TrySendError::Full(_) => acp_channel_failure_error(
+            format!("unable to send '{method}' request, channel full"),
+            AcpChannelFailure::SendFailed,
+        ),
+        mpsc::error::TrySendError::Closed(_) => acp_channel_failure_error(
+            format!("unable to send '{method}' request, channel closed"),
+            AcpChannelFailure::SendFailed,
+        ),
+    })?;
+
+    response_rx.await.map_err(|_| {
+        acp_channel_failure_error(
+            format!("unable to receive '{method}' response, channel closed"),
+            AcpChannelFailure::RecvFailed,
+        )
+    })?
 }
 
 #[async_trait::async_trait(?Send)]

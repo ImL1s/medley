@@ -19,6 +19,7 @@ By default, Grok uses models hosted by SpaceXAI, and new sessions start with `gr
 
 List all available models:
 
+<!-- medley-doc-test:shell-offline:offline-list-models -->
 ```bash
 grok models
 ```
@@ -57,6 +58,7 @@ Each row shows a short provider hint and a readiness badge (`ready`, `missing`, 
 
 Set a persistent default in `~/.medley/config.toml`:
 
+<!-- medley-doc-test:toml:models-default -->
 ```toml
 [models]
 default = "grok-4.5"
@@ -99,7 +101,7 @@ base_url = "https://api.example.com/v1"   # OpenAI-compatible endpoint
 name = "Display Name"                     # Shown in the model picker
 description = "Model description"          # Optional description
 api_key = "..."                           # API key for this provider (optional)
-env_key = "PROVIDER_API_KEY"              # Env var holding the API key (optional; string or array)
+env_key = "PROVIDER_API_KEY"              # Env var name (optional; string or array of [A-Za-z_][A-Za-z0-9_]* names)
 auth_scheme = "bearer"                    # "bearer" (default), "x_api_key", or "none"
 api_backend = "chat_completions"          # "chat_completions", "responses", or "messages"
 temperature = 0.7                         # Sampling temperature
@@ -127,6 +129,27 @@ A **first-party xAI origin** is `https://x.ai` or any `https://*.x.ai` host, plu
 
 **Duplicate routing slugs.** The catalog is keyed by each entry's config key (`[model.<key>]`). Two entries may share the same wire `model` slug but must use distinct catalog keys. Always pick models by their catalog key in config and `/model`; slug-only lookups can bind to the wrong entry when duplicates exist.
 
+When you need two routes for the same upstream slug, keep distinct catalog keys
+and point defaults at those keys (not the wire slug):
+
+<!-- medley-doc-test:toml:catalog-key-wire-slug-default-refs -->
+```toml
+[model.prod-grok-build]
+model = "grok-4.5"
+base_url = "https://api.x.ai/v1"
+context_window = 256000
+
+[model.canary-grok-build]
+model = "grok-4.5"
+base_url = "https://api.x.ai/v1"
+context_window = 256000
+
+[models]
+default = "canary-grok-build"
+web_search = "prod-grok-build"
+session_summary = "canary-grok-build"
+```
+
 **xAI identity headers.** On third-party endpoints or when `auth_scheme = "none"`, Grok omits `x-grok-user-id` and `x-grok-deployment-id` so account metadata is not sent to external hosts.
 
 ### Credential Resolution
@@ -134,7 +157,7 @@ A **first-party xAI origin** is `https://x.ai` or any `https://*.x.ai` host, plu
 Grok resolves the API key in this order (skipped entirely when `auth_scheme = "none"`):
 
 1. The `api_key` field in the model config
-2. The environment variable(s) named by `env_key` — a single string or an array of names. The first set, non-empty value wins (for example `env_key = ["ANTHROPIC_AUTH_TOKEN", "LC_ANTHROPIC_AUTH_TOKEN"]` for SSH `LC_*` forwarding)
+2. The environment variable(s) named by `env_key` — a single string or an array of names. Names are trimmed; empty/whitespace-only entries and names outside `[A-Za-z_][A-Za-z0-9_]*` are rejected with a config warning pointing at the model field (they are never selected silently). The first set, non-empty value among the remaining names wins (for example `env_key = ["ANTHROPIC_AUTH_TOKEN", "LC_ANTHROPIC_AUTH_TOKEN"]` for SSH `LC_*` forwarding)
 3. A named `auth_provider` — the provider owns auth for this model. If its credential is unavailable the request fails closed and **never** falls back to xAI credentials
 4. An explicit `Authorization` or `x-api-key` header supplied through `extra_headers` or `env_http_headers` — treated as auth you own, so no ambient credential is ever added underneath it
 5. **First-party xAI origins only:** your signed-in session token (from `grok login`)
@@ -346,6 +369,7 @@ When you override a built-in model, Grok starts with the default configuration (
 
 Use Claude models directly via the Anthropic Messages API:
 
+<!-- medley-doc-test:toml:provider-anthropic-claude -->
 ```toml
 [model.claude-opus]
 model = "claude-opus-4-6"
@@ -362,6 +386,7 @@ The `messages` backend uses the Anthropic Messages protocol. Set `auth_scheme = 
 
 ### OpenAI (Chat Completions)
 
+<!-- medley-doc-test:toml:provider-openai-chat -->
 ```toml
 [model.gpt-4o]
 model = "gpt-4o"
@@ -376,6 +401,7 @@ env_key = "OPENAI_API_KEY"
 
 If your provider supports the newer Responses API:
 
+<!-- medley-doc-test:toml:provider-openai-responses -->
 ```toml
 [model.gpt-4o-responses]
 model = "gpt-4o"
@@ -428,6 +454,7 @@ not apply to it.
 
 To add a *different* Codex model, give it its own key and name the provider:
 
+<!-- medley-doc-test:toml:provider-openai-codex-secondary -->
 ```toml
 [model.my-other-codex-model]
 model = "<the wire id>"
@@ -458,6 +485,7 @@ OpenAI examples above for the separate OpenAI Platform API transport.
 
 Google's OpenAI-compatible endpoint uses Bearer auth:
 
+<!-- medley-doc-test:toml:provider-gemini -->
 ```toml
 [model.gemini-flash]
 model = "gemini-2.0-flash"
@@ -468,6 +496,7 @@ env_key = "GEMINI_API_KEY"
 
 ### OpenRouter
 
+<!-- medley-doc-test:toml:provider-openrouter -->
 ```toml
 [model.openrouter-llama]
 model = "meta-llama/llama-3.3-70b-instruct"
@@ -481,6 +510,7 @@ Optional attribution headers (`HTTP-Referer`, `X-Title`) are non-secret; put the
 
 ### Together AI
 
+<!-- medley-doc-test:toml:provider-together -->
 ```toml
 [model.together-mixtral]
 model = "mistralai/Mixtral-8x7B-Instruct-v0.1"
@@ -493,6 +523,7 @@ env_key = "TOGETHER_API_KEY"
 
 Any hosted OpenAI-compatible Chat Completions endpoint:
 
+<!-- medley-doc-test:toml:provider-hosted-generic -->
 ```toml
 [model.hosted-custom]
 model = "provider-model-id"
@@ -509,6 +540,7 @@ Tools, reasoning, images, and structured output depend on what the local server 
 
 #### Ollama
 
+<!-- medley-doc-test:toml:provider-local-ollama -->
 ```toml
 [model.ollama-codellama]
 model = "codellama"
@@ -522,6 +554,7 @@ Make sure Ollama is running (`ollama serve`) and the model is pulled (`ollama pu
 
 #### LM Studio
 
+<!-- medley-doc-test:toml:provider-local-lmstudio -->
 ```toml
 [model.lmstudio-local]
 model = "local-model"
@@ -533,6 +566,7 @@ context_window = 32768
 
 #### llama.cpp
 
+<!-- medley-doc-test:toml:provider-local-llamacpp -->
 ```toml
 [model.llamacpp]
 model = "local-model"
@@ -544,6 +578,7 @@ context_window = 8192
 
 #### vLLM
 
+<!-- medley-doc-test:toml:provider-local-vllm -->
 ```toml
 [model.vllm-local]
 model = "meta-llama/Llama-3.1-8B-Instruct"
