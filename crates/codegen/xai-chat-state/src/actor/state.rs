@@ -265,21 +265,8 @@ mod tests {
     use super::*;
 
     fn test_sampling_config() -> SamplingConfig {
-        SamplingConfig {
-            base_url: "https://api.example.com".to_string(),
-            model: "test-model".to_string(),
-            max_completion_tokens: None,
-            temperature: None,
-            top_p: None,
-            api_backend: Default::default(),
-            endpoint_trust: None,
-            extra_headers: Default::default(),
-            query_params: Default::default(),
-            env_http_headers: Default::default(),
-            context_window: std::num::NonZeroU64::new(128_000).unwrap(),
-            reasoning_effort: None,
-            stream_tool_calls: None,
-        }
+        // #121: single-line baseline; fork fields (endpoint_trust) come from for_test.
+        SamplingConfig::for_test("https://api.example.com", "test-model")
     }
 
     #[test]
