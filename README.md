@@ -18,6 +18,7 @@ local models, each with its credentials kept in its own lane.
 
 [Fork notice](#fork-notice) ·
 [What Medley adds](#what-medley-adds) ·
+[Quick start](#quick-start-providers-branch) ·
 [Coexistence](#coexistence-with-official-grok-build) ·
 [Installing](#installing) ·
 [Documentation](#documentation) ·
@@ -90,6 +91,66 @@ and [Authentication](crates/codegen/xai-grok-pager/docs/user-guide/02-authentica
 > OpenAI. Your account entitlements, workspace policy, and OpenAI's terms still
 > govern what works. See the service boundary in [`NOTICE.md`](NOTICE.md).
 
+## Quick start (providers branch)
+
+Use this section for the fork-specific path (`providers`) with no literal
+credentials in config files.
+
+### 1) Keyless local model (Ollama example)
+
+`auth_scheme = "none"` keeps local requests credential-free:
+
+```toml
+# ~/.medley/config.toml
+[model.ollama-qwen]
+label = "Ollama Qwen"
+model = "qwen2.5-coder:14b"
+base_url = "http://127.0.0.1:11434/v1"
+api_backend = "chat_completions"
+auth_scheme = "none"
+context_window = 128000
+
+[models]
+default = "ollama-qwen"
+```
+
+### 2) External provider (env-var credential)
+
+Keep secrets in the environment, not in `config.toml`:
+
+```sh
+export OPENAI_API_KEY="your-api-key-here"
+```
+
+```toml
+# ~/.medley/config.toml
+[model.gpt-4o]
+label = "OpenAI GPT-4o"
+model = "gpt-4o"
+base_url = "https://api.openai.com/v1"
+api_backend = "chat_completions"
+env_key = "OPENAI_API_KEY"
+context_window = 128000
+
+[models]
+default = "gpt-4o"
+```
+
+Then run whichever command name your install provides (`medley` from release
+archives, `grok` in many source-build examples):
+
+```sh
+medley --model gpt-4o "Summarize this repository's branch model."
+```
+
+> [!WARNING]
+> Third-party provider credentials can authorize billable API usage. Prefer
+> environment variables, avoid long-lived high-privilege keys, and never commit
+> tokens, API keys, or credential-bearing URLs.
+
+For more providers and tested config blocks, see
+[Custom Models](crates/codegen/xai-grok-pager/docs/user-guide/11-custom-models.md).
+
 ## Coexistence with official Grok Build
 
 Medley now installs under its own command and keeps its state in its own
@@ -158,6 +219,20 @@ curl -fsSL https://raw.githubusercontent.com/ImL1s/medley/providers/install.sh |
 | `MEDLEY_REPO` | Source repository (default: `ImL1s/medley`) |
 | `MEDLEY_DRYRUN` | Set to `1` to print the plan and skip the download, extraction, and install. The release version is still resolved first, so this queries the GitHub API unless `MEDLEY_VERSION` is also set |
 
+Verify what you installed:
+
+```sh
+medley --version
+medley version --json
+```
+
+`medley version --json` includes the build identity fields used by this fork:
+
+- `distChannel` (fork packaging marker; expected `providers` for fork releases)
+- `channel` (configured update channel name)
+- `upstreamBase` (upstream commit this build is based on)
+- `buildTarget` (target triple baked into the binary)
+
 Releases are published for `aarch64`/`x86_64` macOS and Linux. The installer
 refuses to install into `~/.grok`, never touches an existing `grok` binary, and
 warns when it finds one. Windows is not covered — build from source there.
@@ -170,6 +245,23 @@ floor out of each binary and fails rather than publishing an archive that would
 not start, so the number above is asserted, not aspirational. Lowering it —
 static musl builds, or building against an older glibc in a container — is
 tracked in [#82](https://github.com/ImL1s/medley/issues/82).
+
+### Install upstream Grok Build (official xAI)
+
+If you explicitly want the upstream product rather than this fork, use xAI's
+installer:
+
+```sh
+curl -fsSL https://x.ai/cli/install.sh | bash
+```
+
+Or on Windows PowerShell:
+
+```powershell
+irm https://x.ai/cli/install.ps1 | iex
+```
+
+Those commands install and update the official build, not Medley.
 
 ### Building from source
 
@@ -198,6 +290,7 @@ cd medley
 cargo run -p xai-grok-pager-bin              # build + launch the TUI
 cargo build -p xai-grok-pager-bin --release  # release binary: target/release/xai-grok-pager
 cargo check -p xai-grok-pager-bin            # fast validation
+cargo run -p xai-grok-pager-bin -- version --json
 ```
 
 Check out `providers` — `main` is the pristine upstream mirror and contains none
@@ -266,13 +359,8 @@ Report Medley bugs and request features on the fork's tracker:
 <https://github.com/ImL1s/medley/issues>. Feature branches target
 `providers`, never `main`.
 
-> [!WARNING]
-> [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`SECURITY.md`](SECURITY.md) are
-> inherited upstream documents describing **xAI's** policies for the official
-> project — including a HackerOne program that does not cover this fork. Do not
-> send Medley bugs or vulnerability reports there. The fork's own contribution
-> and security policy is tracked in
-> [#28](https://github.com/ImL1s/medley/issues/28).
+- Contribution workflow and branch targeting: [`CONTRIBUTING.md`](CONTRIBUTING.md)
+- Vulnerability reporting for this fork: [`SECURITY.md`](SECURITY.md)
 
 ## License and notices
 
