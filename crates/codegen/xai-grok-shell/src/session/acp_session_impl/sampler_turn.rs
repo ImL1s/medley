@@ -737,6 +737,19 @@ impl SessionActor {
         } else {
             creds.api_key_cloned()
         };
+        // #136 step 4: a bound resolver *is* credential material. L3 refuses
+        // `Missing`/`None` labels paired with material, so the label must name
+        // the path that actually supplies the secret — not a pre-login gap
+        // still sitting in chat state. Overwrite only when a resolver is
+        // attached; BYOK / ExplicitHeader turns keep the stored source.
+        if use_session_bearer_resolver {
+            credential_source = Some(xai_grok_sampler::CredentialSource::XaiSession);
+        } else if use_provider_bearer_resolver && let Some(provider) = model_auth_provider.as_ref()
+        {
+            credential_source = Some(xai_grok_sampler::CredentialSource::AuthProvider {
+                name: provider.name.clone(),
+            });
+        }
         // Identity headers: gate on endpoint + credential-provider scope, not
         // catalog readiness (#133). Omit when no first-party identity is in play.
         let identity_in_scope = gate.endpoint_is_first_party

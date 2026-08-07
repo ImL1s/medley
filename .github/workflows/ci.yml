@@ -862,6 +862,34 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             read_parent_sampling_config_dual_auth_keeps_model_api_key -- --nocapture
 
+      # #136 step 4: L3 refuses unlabelled / inconsistent bound auth from the
+      # material itself, not from a self-reported ambient label alone. Unique
+      # filters so run_nonzero proves each new test is selected (#171).
+      - name: 'L3 provenance-required and inconsistency (issue #136 step 4)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-sampler --lib \
+            unlabelled_bound_auth_on_external_origin_requires_provenance -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            unlabelled_bound_auth_on_https_first_party_xai_still_constructs -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            missing_or_none_label_with_bound_material_is_inconsistent -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            explicit_header_label_with_separate_api_key_is_inconsistent -- --nocapture
+
       # #160: six of the seven tests this branch originally added matched no
       # filter. The seventh, `web_search_resolves_an_env_backed_credential_header`,
       # is already selected by the existing `credential_header` filter. Written
