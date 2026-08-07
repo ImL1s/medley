@@ -744,12 +744,11 @@ impl SessionActor {
         // attached; BYOK / ExplicitHeader turns keep the stored source.
         if use_session_bearer_resolver {
             credential_source = Some(xai_grok_sampler::CredentialSource::XaiSession);
-        } else if use_provider_bearer_resolver {
-            if let Some(provider) = model_auth_provider.as_ref() {
-                credential_source = Some(xai_grok_sampler::CredentialSource::AuthProvider {
-                    name: provider.name.clone(),
-                });
-            }
+        } else if use_provider_bearer_resolver && let Some(provider) = model_auth_provider.as_ref()
+        {
+            credential_source = Some(xai_grok_sampler::CredentialSource::AuthProvider {
+                name: provider.name.clone(),
+            });
         }
         // Identity headers: gate on endpoint + credential-provider scope, not
         // catalog readiness (#133). Omit when no first-party identity is in play.
