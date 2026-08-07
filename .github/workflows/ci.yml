@@ -211,6 +211,17 @@ jobs:
             provider_controlled_stream_error_is_secret_free_for_all_stream_apis -- --nocapture
           run_nonzero -p xai-grok-mcp --lib \
             callback_errors_never_echo_provider_controlled_credentials -- --nocapture
+          # #151: an unlabelled chat-state credential reaching an external origin
+          # on `Unknown(CatalogUnavailable)`. Closed in code by #136, and the two
+          # tests that pin it matched no filter at all -- so the highest-stakes
+          # property in this fork was defended by tests no job ran (#171).
+          #
+          # Deliberately in this step rather than the auth one above: that step
+          # uses bare `cargo test`, where a filter matching zero tests exits 0.
+          # For a security property "the filter stopped matching" and "the
+          # property still holds" must not look the same, and only `run_nonzero`
+          # tells them apart.
+          run_nonzero -p xai-grok-shell --lib catalog_unavailable -- --nocapture
           run_nonzero -p xai-grok-mcp --lib \
             callback_payload_debug_never_emits_code_state_or_issuer -- --nocapture
           run_nonzero -p xai-file-utils --lib \
@@ -500,3 +511,35 @@ jobs:
             rm -f "$output"
           }
           run_nonzero -p xai-grok-shell --lib workflow_restore -- --nocapture
+
+      # #165: abandoned sampling attempts must not enter the FTS index.
+      # Unique filters so run_nonzero proves each new test is selected.
+      # Quoted name: an unquoted `#165` truncates at the comment marker.
+      - name: 'Abandoned attempt text omitted from search index (issue #165)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-shell --lib \
+            collect_assistant_text_discards_abandoned_retry_attempt_phrase -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            collect_assistant_text_discards_attempt_discarded_retraction_phrase -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            collect_assistant_text_still_flushes_on_rewind_marker_boundary -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            collect_assistant_text_still_flushes_on_compaction_checkpoint_boundary -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            collect_assistant_text_completed_turn_still_indexes_across_hook_annotation -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            single_pass_omits_abandoned_retry_attempt_from_fts_content -- --nocapture
