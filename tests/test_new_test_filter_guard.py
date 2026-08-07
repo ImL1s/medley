@@ -324,5 +324,22 @@ class TargetOf(unittest.TestCase):
         )
 
 
+class CIConcurrencyContract(unittest.TestCase):
+    WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"
+
+    def test_push_runs_are_sha_scoped_and_only_non_push_cancels(self):
+        workflow = self.WORKFLOW.read_text(encoding="utf-8")
+        expected_group = "group: ci-${{ github.event_name == 'push' && github.sha || github.ref }}"
+        self.assertTrue(
+            expected_group in workflow,
+            f"missing push SHA-scoped concurrency group: {expected_group}",
+        )
+        expected_cancel = "cancel-in-progress: ${{ github.event_name != 'push' }}"
+        self.assertTrue(
+            expected_cancel in workflow,
+            f"missing non-push cancellation policy: {expected_cancel}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
