@@ -340,12 +340,12 @@ async fn apply_with_load_gate(
     let did_rebuild = receipt.did_rebuild;
     let committed_previous_model_id = receipt.previous_model_id.0.to_string();
     let updated_model = receipt.catalog_model_id;
-    if let Some(handle) = agent.sessions.borrow_mut().get_mut(&session_id) {
+    agent.with_resident_mut(&session_id, |handle| {
         handle.model_id = catalog_model_id.clone();
         handle.reasoning_effort = applied_effort;
         handle.agent_name =
             agent_name_after_model_switch(did_rebuild, &required_agent_type, &handle.agent_name);
-    }
+    });
     broadcast_model_changed(
         agent,
         &session_id,

@@ -36,7 +36,7 @@ pub mod version_overrides;
 pub use campaigns::{
     CampaignEntry, CampaignOverrides, filter_active_campaigns, ids_touching_paths,
 };
-pub use display::{display_grok_home_prefix, display_user_grok_path};
+pub use display::{display_grok_home_prefix, display_grok_home_prefix_for, display_user_grok_path};
 pub use global_hook_sources::{
     GlobalHookSource, GlobalHookSourceError, GlobalHookSourceKind, ResolvedGlobalHookSources,
     ensure_grok_hook_slots, existing_ancestor_chain, is_direct_hook_json_name,

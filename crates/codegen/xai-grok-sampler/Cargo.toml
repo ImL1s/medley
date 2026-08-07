@@ -9,7 +9,7 @@ description = "Actor-based sampling/inference layer for xAI grok (HTTP streaming
 sha2.workspace = true
 # Internal
 xai-grok-env = { workspace = true }
-xai-grok-auth = { path = "../xai-grok-auth" }
+xai-grok-auth = { workspace = true }
 xai-grok-extra-ca = { workspace = true }
 xai-grok-sampling-types = { path = "../xai-grok-sampling-types" }
 xai-grok-version = { workspace = true }

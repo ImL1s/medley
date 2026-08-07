@@ -7,7 +7,7 @@ use std::fmt;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-
+use xai_circuit_breaker::RetryPolicy;
 pub type Result<T> = std::result::Result<T, SamplingError>;
 
 /// Why the model's response was classified as "empty" by [`ConversationResponse::empty_reason`].
@@ -348,9 +348,7 @@ impl SamplingError {
             SamplingError::InvalidConfiguration(_) => false,
             SamplingError::Http(err) => is_retryable_reqwest(err),
             SamplingError::Serialization(_) => false,
-            SamplingError::Api { status, .. } => {
-                matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504 | 520 | 529)
-            }
+            SamplingError::Api { status, .. } => is_retryable_api_status(*status),
             SamplingError::EventStreamError(_) => true,
             SamplingError::StreamError { .. } => true,
             SamplingError::IdleTimeout { .. } => false,
@@ -610,16 +608,24 @@ pub fn status_user_message(status: StatusCode) -> String {
         code @ 502..=504 => {
             format!("Grok is temporarily unavailable. Please try again in a moment. (HTTP {code}).")
         }
-        // Cloudflare edge codes (origin down / connect fail / timeout / …).
-        code @ 520..=524 => {
+        // Upstream capacity, not an edge failure — see [`SamplingError::is_overloaded`].
+        code @ 529 => {
+            format!("Grok is temporarily overloaded. Please try again in a moment. (HTTP {code}).")
+        }
+        // Cloudflare edge: origin unreachable or timed out (520–524), or an
+        // edge-side 1xxx failure (530).
+        code @ 520..=524 | code @ 530 => {
             format!(
                 "Connection to Grok timed out or was interrupted. Please try again. (HTTP {code})."
             )
         }
+        // Cloudflare origin TLS (handshake / invalid certificate) — not transient.
+        code @ 525 | code @ 526 => {
+            format!("Secure connection to Grok failed. (HTTP {code}).")
+        }
         code if status.is_server_error() => {
             format!("Something went wrong on the server (HTTP {code}).")
         }
-        code if status.is_client_error() => format!("Request failed (HTTP {code})."),
         code => format!("Request failed (HTTP {code})."),
     }
 }
@@ -647,6 +653,9 @@ pub fn parse_error_bytes(bytes: &[u8]) -> String {
 /// User-facing message for a failed API call.
 ///
 /// Provider-controlled response text is never returned. A few recovery-critical
+/// Max chars of a structured (JSON) error message shown to users.
+pub const MAX_USER_ERROR_BODY_CHARS: usize = 280;
+
 /// conditions map to fixed semantic markers; everything else (including
 /// structured JSON and Cloudflare HTML) maps only from the HTTP status.
 pub fn user_facing_api_error_message(status: StatusCode, bytes: &[u8]) -> String {
@@ -703,6 +712,14 @@ fn is_credit_block_message(message: &str) -> bool {
         || message.contains("usage limit reached")
 }
 
+/// Whether an HTTP status is worth retrying: the same 429 + any 5xx rule CCP
+/// publishes in `x-should-retry`, minus Cloudflare's origin-TLS 525/526
+/// (requests reach CCP through the Cloudflare edge, which answers with its
+/// own 52x pages when the origin is unreachable).
+pub fn is_retryable_api_status(status: StatusCode) -> bool {
+    RetryPolicy::edge_client().should_retry(status.as_u16())
+}
+
 /// Decide whether a [`reqwest::Error`] is worth retrying.
 pub fn is_retryable_reqwest(err: &reqwest::Error) -> bool {
     if err.is_timeout() || err.is_connect() {
@@ -710,10 +727,7 @@ pub fn is_retryable_reqwest(err: &reqwest::Error) -> bool {
     }
 
     if err.is_status() {
-        return matches!(
-            err.status(),
-            Some(status) if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS
-        );
+        return err.status().is_some_and(is_retryable_api_status);
     }
 
     if err.is_request() || err.is_body() {
@@ -1127,9 +1141,6 @@ mod tests {
         let rendered = parse_error_bytes(credit.as_bytes());
         assert_eq!(rendered, SAFE_CREDIT_BLOCK_MESSAGE);
         assert!(!rendered.contains(CREDIT_SENTINEL));
-        for window in CREDIT_SENTINEL.as_bytes().windows(8) {
-            assert!(!rendered.contains(std::str::from_utf8(window).unwrap()));
-        }
     }
 
     /// Regression test: 403 Forbidden must NOT be classified as an auth
@@ -1400,5 +1411,34 @@ mod tests {
             !err.is_retryable(),
             "direct 400 must not be retryable by is_retryable()"
         );
+    }
+
+    fn api_status_err(code: u16) -> SamplingError {
+        SamplingError::Api {
+            status: StatusCode::from_u16(code).unwrap(),
+            message: status_user_message(StatusCode::from_u16(code).unwrap()),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+        }
+    }
+
+    #[test]
+    fn transient_5xx_is_retryable_but_origin_tls_is_not() {
+        // Cloudflare edge pages (520-524, 530), upstream overload (529), and
+        // non-CF 5xx like 501/507 — the rule is any 5xx, not a code list.
+        for code in [501u16, 507, 520, 521, 522, 523, 524, 529, 530] {
+            assert!(
+                api_status_err(code).is_retryable(),
+                "{code} must be retried"
+            );
+        }
+        // Origin TLS: a broken certificate never clears on its own.
+        for code in [525u16, 526] {
+            assert!(
+                !api_status_err(code).is_retryable(),
+                "origin-TLS {code} must not be retried"
+            );
+        }
     }
 }

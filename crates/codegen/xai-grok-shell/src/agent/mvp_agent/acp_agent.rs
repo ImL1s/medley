@@ -115,6 +115,9 @@ impl acp::Agent for MvpAgent {
     ) -> Result<acp::InitializeResponse, acp::Error> {
         tracing::debug!(target: "sampling_log", "Received initialize request");
         xai_grok_telemetry::unified_log::info("agent initialized", None, None);
+        if xai_grok_telemetry::startup::agent_owned().is_some() {
+            xai_grok_telemetry::startup::clear();
+        }
         self.start_subagent_coordinator();
         if self.cfg.borrow().remote_settings.is_none() {
             self.spawn_settings_reapply();
@@ -313,9 +316,32 @@ impl acp::Agent for MvpAgent {
                 );
             }
         }
-        let has_external_api_key = auth_method::should_advertise_xai_api_key(
+        let preferred_method_early = self.cfg.borrow().grok_com_config.preferred_method;
+        let xai_api_base_url = self.cfg.borrow().endpoints.xai_api_base_url.clone();
+        let has_byok = self
+            .models_manager
+            .models()
+            .values()
+            .any(crate::agent::config::ModelEntry::has_own_credentials);
+        let first_party_env_ok = if crate::auth::should_probe_first_party_env_key(
+            disable_api_key_auth,
+            has_byok,
+            auth_method::has_xai_api_key_env(),
+            preferred_method_early.is_some(),
+        ) {
+            crate::auth::first_party_env_key_allows_advertise(
+                    &xai_api_base_url,
+                    crate::auth::DEFAULT_PROBE_TIMEOUT,
+                )
+                .await
+        } else {
+            true
+        };
+        self.auth_manager.set_first_party_env_api_key_ok(first_party_env_ok);
+        let has_external_api_key = auth_method::should_advertise_xai_api_key_with_env_ok(
             disable_api_key_auth,
             self.models_manager.models().values(),
+            first_party_env_ok,
         );
         let init_has_current = self.auth_manager.current().is_some();
         let init_is_expired = self.auth_manager.is_expired();
@@ -370,7 +396,7 @@ impl acp::Agent for MvpAgent {
                 "auth: advertising grok.com auth method",
             );
         }
-        let preferred_method = self.cfg.borrow().grok_com_config.preferred_method;
+        let preferred_method = preferred_method_early;
         let has_external_api_key = match preferred_method {
             Some(crate::auth::PreferredAuthMethod::Oidc) => false,
             _ => has_external_api_key,
@@ -410,6 +436,7 @@ impl acp::Agent for MvpAgent {
                 "grok_home": crate::util::grok_home::grok_home().display().to_string(),
                 "HOME": std::env::var("HOME").unwrap_or_else(|_| "(unset)".into()),
                 "has_external_api_key": has_external_api_key,
+                "first_party_env_api_key_ok": first_party_env_ok,
                 "disable_api_key_auth": disable_api_key_auth,
                 "has_cached_token": has_cached_token,
                 "has_enterprise_oidc": has_enterprise_oidc,
@@ -481,10 +508,14 @@ impl acp::Agent for MvpAgent {
         } else {
             self.model_state(None)
         };
+        let session_capabilities = acp::SessionCapabilities::new()
+            .close(acp::SessionCloseCapabilities::new());
         let session_capabilities = if crate::agent::chat_modes::process_chat_mode_enabled() {
-            acp::SessionCapabilities::new()
+            session_capabilities
         } else {
-            acp::SessionCapabilities::new().list(acp::SessionListCapabilities::new())
+            session_capabilities
+                    .list(acp::SessionListCapabilities::new())
+                    .resume(acp::SessionResumeCapabilities::new())
         };
         Ok(
             acp::InitializeResponse::new(acp::ProtocolVersion::V1)
@@ -1042,7 +1073,7 @@ impl acp::Agent for MvpAgent {
         let session_computer_sessions = resolve_session_computer_sessions(
             arguments.meta.as_ref(),
         )?;
-        let is_chat_kind = is_chat_session_kind(arguments.meta.as_ref());
+        let is_chat_kind = wants_chat_session_kind(arguments.meta.as_ref());
         let session_yolo_mode = arguments
             .meta
             .as_ref()
@@ -1615,7 +1646,7 @@ impl acp::Agent for MvpAgent {
                 Some(&current_session_dir),
             );
         });
-        let session_exists = self.sessions.borrow().contains_key(&session_id);
+        let session_exists = self.resident_handle(&session_id).is_some();
         let mut cold_spawn_selection = None;
         let mut ambiguous_persisted_slug_matches: Option<Vec<acp::ModelId>> = None;
         if session_exists {
@@ -1623,7 +1654,7 @@ impl acp::Agent for MvpAgent {
                 session_id = %session_id.0,
                 "Reconnect detected: flushing persistence buffer before replay"
             );
-            if let Some(handle) = self.sessions.borrow().get(&session_id) {
+            if let Some(handle) = self.resident_handle(&session_id) {
                 handle
                     .gateway_enabled
                     .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1887,7 +1918,7 @@ impl acp::Agent for MvpAgent {
             };
             (tokens, completions, unfinished_subagents)
         };
-        if let Some(handle) = self.sessions.borrow().get(&session_id) {
+        if let Some(handle) = self.resident_handle(&session_id) {
             handle.gateway_enabled.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         for rx in delta_completions {
@@ -1919,7 +1950,7 @@ impl acp::Agent for MvpAgent {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .or_else(|| summary.prompt_display_cwd.clone());
-        if self.sessions.borrow().get(&session_id).is_none() {
+        if self.resident_handle(&session_id).is_none() {
             tracing::info!(
                 session_id = %session_id.0,
                 "load_session: spawning new session actor (session not in memory)"
@@ -2178,7 +2209,7 @@ impl acp::Agent for MvpAgent {
                 mcp_server_count = mcp_servers.len(),
                 "load_session: reconnecting to existing session, updating MCP servers"
             );
-            if let Some(handle) = self.sessions.borrow_mut().get_mut(&session_id) {
+            self.with_resident_mut(&session_id, |handle| {
                 handle.initial_client_mcp_servers = initial_client_mcp_servers;
                 let (tx, _rx) = tokio::sync::oneshot::channel();
                 let _ = handle
@@ -2187,14 +2218,14 @@ impl acp::Agent for MvpAgent {
                         mcp_servers,
                         respond_to: tx,
                     });
-            }
+            });
         }
         {
             let init_meta = self
                 .initialize_request
                 .get()
                 .and_then(|init| init.meta.as_ref());
-            if let Some(handle) = self.sessions.borrow().get(&session_id) {
+            if let Some(handle) = self.resident_handle(&session_id) {
                 enqueue_replace_system_prompt_override(
                     &handle.cmd_tx,
                     request_meta.as_ref(),
@@ -2205,7 +2236,7 @@ impl acp::Agent for MvpAgent {
         if session_exists
             && let Some(hooks) = crate::extensions::hooks::reconnect_client_hooks(
                 request_meta.as_ref(),
-            ) && let Some(handle) = self.sessions.borrow().get(&session_id)
+            ) && let Some(handle) = self.resident_handle(&session_id)
         {
             handle.set_client_hooks(hooks);
         }
@@ -2215,7 +2246,7 @@ impl acp::Agent for MvpAgent {
                 .as_ref()
                 .and_then(|p| std::fs::metadata(p).ok())
                 .is_some_and(|m| m.len() > 0);
-        if let Some(handle) = self.sessions.borrow_mut().get_mut(&session_id) {
+        self.with_resident_mut(&session_id, |handle| {
             handle.code_nav_enabled = client_code_nav_enabled;
             if session_yolo_mode && !handle.yolo_mode {
                 tracing::debug!(
@@ -2225,7 +2256,7 @@ impl acp::Agent for MvpAgent {
                 handle.yolo_mode = true;
                 let _ = handle
                     .cmd_tx
-                    .send(SessionCommand::SetYoloMode {
+                    .send(crate::session::SessionCommand::SetYoloMode {
                         enabled: true,
                     });
             }
@@ -2243,18 +2274,15 @@ impl acp::Agent for MvpAgent {
                         enabled: true,
                     });
             }
-        }
+        });
         self.maybe_spawn_interactive_trust_prompt(
             &session_id,
             cwd.as_path(),
             remote_settings.as_ref(),
         );
-        let orphan_parent = {
-            let sessions = self.sessions.borrow();
-            sessions
-                .get(&session_id)
-                .map(|handle| (handle.cmd_tx.clone(), handle.info.cwd.clone()))
-        };
+        let orphan_parent = self
+            .resident_handle(&session_id)
+            .map(|handle| (handle.cmd_tx.clone(), handle.info.cwd.clone()));
         if let Some((parent_cmd_tx, session_cwd)) = orphan_parent {
             let session_dir = crate::session::persistence::session_dir(
                 &SessionInfo {
@@ -2594,9 +2622,7 @@ impl acp::Agent for MvpAgent {
             response_meta_map.insert("x.ai/persist".to_string(), persist);
         }
         let session_cwd = self
-            .sessions
-            .borrow()
-            .get(&session_id)
+            .resident_handle(&session_id)
             .map(|h| h.info.cwd.clone());
         let indexed_roots = session_cwd
             .as_deref()
@@ -2639,9 +2665,7 @@ impl acp::Agent for MvpAgent {
             response_meta_map.insert("codeRestore".to_string(), info);
         }
         if let Some(running_prompt_id) = self
-            .sessions
-            .borrow()
-            .get(&session_id)
+            .resident_handle(&session_id)
             .and_then(|h| h.current_prompt_id.lock().ok().and_then(|g| g.clone()))
         {
             response_meta_map
@@ -2660,9 +2684,7 @@ impl acp::Agent for MvpAgent {
         );
         let applied_tool_overrides = {
             let cmd_tx = self
-                .sessions
-                .borrow()
-                .get(&session_id)
+                .resident_handle(&session_id)
                 .map(|handle| handle.cmd_tx.clone());
             match cmd_tx {
                 Some(cmd_tx) => read_applied_tool_overrides(&cmd_tx).await,
@@ -2688,7 +2710,7 @@ impl acp::Agent for MvpAgent {
         let response = acp::LoadSessionResponse::new()
             .models(Some(model_state))
             .meta(response_meta.as_object().cloned());
-        if let Some(handle) = self.sessions.borrow().get(&session_id) {
+        if let Some(handle) = self.resident_handle(&session_id) {
             let _ = handle.cmd_tx.send(SessionCommand::AdvertiseCommands);
             if restored_awaiting_plan_approval {
                 let _ = handle.cmd_tx.send(SessionCommand::RestorePlanApproval);
@@ -2721,6 +2743,18 @@ impl acp::Agent for MvpAgent {
         args: acp::ListSessionsRequest,
     ) -> Result<acp::ListSessionsResponse, acp::Error> {
         crate::agent::handlers::session::handle_list_sessions(self, args).await
+    }
+    async fn resume_session(
+        &self,
+        args: acp::ResumeSessionRequest,
+    ) -> Result<acp::ResumeSessionResponse, acp::Error> {
+        self.resume_session_inner(args).await
+    }
+    async fn close_session(
+        &self,
+        args: acp::CloseSessionRequest,
+    ) -> Result<acp::CloseSessionResponse, acp::Error> {
+        self.close_session_inner(args).await
     }
     #[tracing::instrument(
         name = "agent.prompt",
@@ -3903,14 +3937,14 @@ impl acp::Agent for MvpAgent {
             .as_ref()
             .and_then(|m| m.get("cancelTrigger"))
             .and_then(|v| v.as_str())
-            .map(str::to_string);
+            .map(crate::session::CancelTrigger::from_client);
         xai_grok_telemetry::unified_log::info(
             "shell.cancel.received",
             Some(args.session_id.0.as_ref()),
             Some(
                 serde_json::json!({
                 "session_found": handle.is_some(),
-                "trigger": cancel_trigger,
+                "trigger": cancel_trigger.as_ref().map(crate::session::CancelTrigger::as_str),
             }),
             ),
         );
@@ -3921,22 +3955,27 @@ impl acp::Agent for MvpAgent {
                 .and_then(|m| m.get("cancelSubagents"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
-            let rewind_if_pristine = args
+            let rewind_if_no_output = args
                 .meta
                 .as_ref()
-                .and_then(|m| m.get("rewindIfPristine"))
+                .and_then(|m| {
+                    m.get("rewindIfNoOutput").or_else(|| m.get("rewindIfPristine"))
+                })
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             let dispatch_lock = self.dispatch_lock(&args.session_id);
             let _dispatch_guard = dispatch_lock.lock().await;
             let _ = handle
                 .cmd_tx
-                .send(SessionCommand::Cancel {
-                    cancel_subagents,
-                    kill_background_tasks: false,
-                    rewind_if_pristine,
-                    trigger: cancel_trigger,
-                });
+                .send(
+                    SessionCommand::Cancel(crate::session::CancelOptions {
+                        cancel_subagents,
+                        rewind_if_no_output,
+                        trigger: cancel_trigger,
+                        user_initiated: true,
+                        ..Default::default()
+                    }),
+                );
         }
         Ok(())
     }
@@ -4425,17 +4464,21 @@ impl acp::Agent for MvpAgent {
                 .unwrap_or("");
             let yolo_signal = params.get("yolo_mode").and_then(|v| v.as_bool());
             if let Some(yolo_mode) = yolo_signal {
-                let mut sessions = self.sessions.borrow_mut();
-                let updated_sessions = apply_yolo_mode_to_matching_sessions(
-                    &mut sessions,
-                    sender_id,
-                    yolo_mode,
-                );
+                let mut updated_sessions = 0;
+                self.session_registry
+                    .for_each_resident_mut(|_, handle| {
+                        updated_sessions
+                            += apply_yolo_mode_to_matching_sessions(
+                                std::iter::once(handle),
+                                sender_id,
+                                yolo_mode,
+                            );
+                    });
                 tracing::info!(
                     yolo_mode,
                     sender = ?sender_id,
                     target_sessions = updated_sessions,
-                    total_sessions = sessions.len(),
+                    total_sessions = self.resident_count(),
                     "Setting YOLO mode for matching sessions"
                 );
             }
@@ -4453,26 +4496,26 @@ impl acp::Agent for MvpAgent {
                         || h.origin_client.as_ref().map(|c| c.product.as_str())
                             == sender_id
                 };
-                let mut sessions = self.sessions.borrow_mut();
-                let total_sessions = sessions.len();
+                let total_sessions = self.resident_count();
                 let mut updated = 0;
-                for h in sessions.values_mut() {
-                    if !matches_sender(h) {
-                        continue;
-                    }
-                    if h
-                        .cmd_tx
-                        .send(crate::session::SessionCommand::SetAutoMode {
-                            enabled,
-                        })
-                        .is_ok()
-                    {
-                        if enabled {
-                            h.yolo_mode = false;
+                self.session_registry
+                    .for_each_resident_mut(|_, h| {
+                        if !matches_sender(h) {
+                            return;
                         }
-                        updated += 1;
-                    }
-                }
+                        if h
+                            .cmd_tx
+                            .send(crate::session::SessionCommand::SetAutoMode {
+                                enabled,
+                            })
+                            .is_ok()
+                        {
+                            if enabled {
+                                h.yolo_mode = false;
+                            }
+                            updated += 1;
+                        }
+                    });
                 tracing::info!(
                     auto_mode = enabled,
                     sender = ?sender_id,
@@ -4483,19 +4526,20 @@ impl acp::Agent for MvpAgent {
             }
         }
         if args.method.as_ref() == "x.ai/permissions/reset" {
-            let sessions = self.sessions.borrow();
-            let updated = sessions
-                .values()
-                .filter(|h| {
-                    h
+            let mut updated = 0;
+            self.session_registry
+                .for_each_resident(|_, h| {
+                    if h
                         .cmd_tx
                         .send(crate::session::SessionCommand::ResetPermissionState)
                         .is_ok()
-                })
-                .count();
+                    {
+                        updated += 1;
+                    }
+                });
             tracing::info!(
                 target_sessions = updated,
-                total_sessions = sessions.len(),
+                total_sessions = self.resident_count(),
                 "Permission state reset for matching sessions"
             );
         }
@@ -4511,12 +4555,7 @@ impl acp::Agent for MvpAgent {
                 .get("sessionId")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let handle = self
-                .sessions
-                .borrow()
-                .values()
-                .find(|s| s.info.id.0.as_ref() == session_id_str)
-                .cloned();
+            let handle = self.resident_handle(&acp::SessionId::new(session_id_str));
             if let Some(handle) = handle {
                 let is_engaged = handle.plan_mode.lock().state()
                     != crate::session::plan_mode::PlanModeState::Inactive;
@@ -4544,52 +4583,42 @@ impl acp::Agent for MvpAgent {
                 );
             }
         }
-        if matches!(
-            args.method.as_ref(),
-            "x.ai/queue/remove"
-                | "x.ai/queue/reorder"
-                | "x.ai/queue/clear"
-                | "x.ai/queue/edit"
-                | "x.ai/queue/interject"
-        )
+        if args.method.as_ref().starts_with("x.ai/queue/")
             && let Ok(params) = serde_json::from_str::<
                 serde_json::Value,
             >(args.params.get())
         {
-            let session_id_str = params
-                .get("sessionId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
             let owner = params
                 .get("owner")
                 .or_else(|| params.get("clientIdentifier"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            let handle = self
-                .sessions
-                .borrow()
-                .values()
-                .find(|s| s.info.id.0.as_ref() == session_id_str)
-                .cloned();
-            if let Some(handle) = handle {
-                let cmd = crate::agent::ext_parsers::parse_queue_edit_command(
-                    args.method.as_ref(),
-                    &params,
-                    owner,
-                );
-                if let Some(cmd) = cmd && handle.cmd_tx.send(cmd).is_err() {
+            if let Some(cmd) = crate::agent::ext_parsers::parse_queue_edit_command(
+                args.method.as_ref(),
+                &params,
+                owner,
+            ) {
+                let session_id_str = params
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if let Some(handle) = self
+                    .resident_handle(&acp::SessionId::new(session_id_str))
+                {
+                    if handle.cmd_tx.send(cmd).is_err() {
+                        tracing::warn!(
+                            session_id = %session_id_str,
+                            method = %args.method,
+                            "queue edit: failed to forward SessionCommand (session actor gone)"
+                        );
+                    }
+                } else {
                     tracing::warn!(
                         session_id = %session_id_str,
                         method = %args.method,
-                        "queue edit: failed to forward SessionCommand (session actor gone)"
+                        "queue edit: session not found"
                     );
                 }
-            } else {
-                tracing::warn!(
-                    session_id = %session_id_str,
-                    method = %args.method,
-                    "queue edit: session not found"
-                );
             }
         }
         if args.method.as_ref() == "x.ai/terminal/pty/input"
@@ -4607,11 +4636,7 @@ impl acp::Agent for MvpAgent {
                     "Storing xAI session notification: session_id={}",
                     notification.session_id.0
                 );
-                if let Some(handle) = self
-                    .sessions
-                    .borrow()
-                    .get(&notification.session_id)
-                {
+                if let Some(handle) = self.resident_handle(&notification.session_id) {
                     let _ = handle
                         .cmd_tx
                         .send(crate::session::SessionCommand::XaiSessionNotification {

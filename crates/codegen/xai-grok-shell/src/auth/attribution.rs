@@ -44,7 +44,7 @@ impl std::fmt::Debug for ShellAttribution {
 
 impl ShellAttribution {
     #[allow(clippy::new_ret_no_self)]
-    pub fn new(
+    pub(crate) fn new(
         auth_manager: Arc<AuthManager>,
         session_id: Option<String>,
     ) -> Arc<dyn Auth401AttributionCallback> {
@@ -365,7 +365,7 @@ mod tests {
         }
 
         impl SpanCollector {
-            pub fn new() -> (Self, std::sync::Arc<Mutex<Vec<CapturedSpan>>>) {
+            pub(crate) fn new() -> (Self, std::sync::Arc<Mutex<Vec<CapturedSpan>>>) {
                 let spans = std::sync::Arc::new(Mutex::new(Vec::new()));
                 (
                     Self {

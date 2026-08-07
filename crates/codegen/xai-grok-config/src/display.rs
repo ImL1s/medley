@@ -20,7 +20,7 @@ pub fn display_grok_home_prefix() -> String {
     display_grok_home_prefix_for(&grok_home())
 }
 
-pub(crate) fn display_grok_home_prefix_for(home: &Path) -> String {
+pub fn display_grok_home_prefix_for(home: &Path) -> String {
     let default = crate::default_grok_home();
     if home == default {
         // Name the directory that actually holds state — which of ~/.medley
