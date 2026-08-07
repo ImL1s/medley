@@ -229,6 +229,12 @@ jobs:
           # property still holds" must not look the same, and only `run_nonzero`
           # tells them apart.
           run_nonzero -p xai-grok-shell --lib catalog_unavailable -- --nocapture
+          # #132: the reader's dup must not be inherited by children. Named
+          # explicitly rather than by a `pty_session` prefix: the rest of that
+          # module is the hang this change fixes, and this one is the fd leak
+          # the fix introduced.
+          run_nonzero -p xai-grok-shell --lib \
+            dup_fd_is_not_inherited_by_exec_child -- --nocapture
           # #13: env-key normalization. In this step rather than the auth one
           # above because one of these asserts diagnostics carry the normalized
           # *name* and never a value -- and that step uses bare `cargo test`,
@@ -450,6 +456,10 @@ jobs:
             callback_errors_never_echo_provider_controlled_values -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
             snapshot_never_derives_stable_ids_from_credentials -- --nocapture
+          # #132: CLOEXEC regression guard; full test path keeps the filter
+          # unique so #171 can prove this exact test is selected.
+          cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
+            terminal::pty_session::tests::dup_fd_is_not_inherited_by_exec_child -- --nocapture
 
       - name: "Substituted default model meta (#131)"
         env:
