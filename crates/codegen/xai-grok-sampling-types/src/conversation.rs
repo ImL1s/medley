@@ -11,8 +11,8 @@ mod responses;
 pub use chat_completions::{conversation_item_to_chat_message, conversation_to_chat_messages};
 pub use messages::build_messages_request;
 pub use responses::{
-    extra_tool_entries, patch_codex_instructions, patch_reasoning_text_types,
-    response_to_conversation_items,
+    apply_codex_wire_capabilities, extra_tool_entries, patch_codex_instructions,
+    patch_reasoning_text_types, response_to_conversation_items,
 };
 
 use std::sync::Arc;

@@ -201,7 +201,7 @@ Beyond AGENTS.md files, the `.grok/` directory in your project root can contain 
 
 | Path | Purpose |
 |------|---------|
-| `.grok/config.toml` | Project-scoped MCP servers, plugins, and permission rules (other settings load only from `~/.medley/config.toml`) |
+| `.grok/config.toml` | Project-scoped MCP servers, plugins, permission rules, and model routing (`[models]`, `[model.*]`) when the workspace is trusted |
 | `.grok/skills/` | Project-scoped skill definitions |
 | `.grok/plugins/` | Project-scoped plugins |
 | `.grok/agents/` | Project-scoped agent definitions |

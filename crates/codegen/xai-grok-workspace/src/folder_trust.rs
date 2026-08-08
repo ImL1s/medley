@@ -245,8 +245,9 @@ pub fn repo_configs_present(cwd: &Path) -> bool {
 }
 
 /// Display-only: which repo-local trust-sensitive config KINDS are present for
-/// `cwd` (`mcp`, `plugins`, `permission`, `lsp`, `envrc`, `claude`, `hooks`,
-/// `agents`, `roles`, `personas`, `workflows`), deduped in cheap→expensive
+/// `cwd` (`mcp`, `plugins`, `permission`, `models`, `lsp`, `envrc`, `claude`,
+/// `hooks`, `agents`, `roles`, `personas`, `workflows`), deduped in
+/// cheap→expensive
 /// marker order. Single source with [`repo_configs_present`] (which is
 /// `!repo_config_kinds(cwd).is_empty()`), so a folder that the gate fired on
 /// always has a non-empty, accurate kind list — no `[plugins].paths` /
@@ -281,6 +282,24 @@ fn config_toml_permission_contributes(permission_value: &TomlValue) -> bool {
         .get("rules")
         .and_then(|v| v.as_array())
         .is_some_and(|a| !a.is_empty())
+}
+
+/// Whether a project `.grok/config.toml` model section contributes anything:
+/// non-empty `[models]` (flat table) or non-empty `[model]` (table of entries).
+/// Non-table values are treated as contributing so malformed hostile input
+/// still trips the gate.
+fn config_toml_models_contribute(root: &TomlValue) -> bool {
+    let models_contributes = match root.get("models") {
+        Some(TomlValue::Table(table)) => !table.is_empty(),
+        Some(_) => true,
+        None => false,
+    };
+    let model_entries_contribute = match root.get("model") {
+        Some(TomlValue::Table(table)) => !table.is_empty(),
+        Some(_) => true,
+        None => false,
+    };
+    models_contributes || model_entries_contribute
 }
 
 fn path_present_or_uncertain(path: &Path) -> bool {
@@ -330,13 +349,14 @@ fn collect_repo_config_kinds(cwd: &Path, first_only: bool) -> Vec<&'static str> 
     if !crate::project_config::find_mcp_json_files_in(&chain.dirs).is_empty() {
         hit!("mcp");
     }
-    // Project `.grok/config.toml` declaring repo-controlled code-exec or
-    // permission policy: a non-empty `[mcp_servers]` table, a non-empty
-    // `[plugins].paths` array, OR a contributing `[permission]` section.
+    // Project `.grok/config.toml` declaring repo-controlled code-exec,
+    // credential-routing, or permission policy: a non-empty `[mcp_servers]`
+    // table, a non-empty `[plugins].paths` array, a contributing `[permission]`
+    // section, or contributing model sections (`[models]` / `[model.*]`).
     // `[plugins].paths` loads as auto-trusted ConfigPath plugins; `[permission]`
-    // allow/deny/ask rules auto-approve or block tools — a clone whose ONLY
-    // repo-local config is either must still be gated (else it resolves Trusted
-    // and the loader runs ungated).
+    // rules auto-approve/block tools; model sections can route requests to
+    // custom origins and bind credentials. A clone whose ONLY repo-local config
+    // is any of these must still be gated.
     for path in crate::project_config::find_project_configs_in(&chain.dirs) {
         let Ok(root) = xai_grok_config::load_config_file(&path) else {
             continue;
@@ -353,6 +373,7 @@ fn collect_repo_config_kinds(cwd: &Path, first_only: bool) -> Vec<&'static str> 
         let has_permission = root
             .get("permission")
             .is_some_and(config_toml_permission_contributes);
+        let has_models = config_toml_models_contribute(&root);
         if has_mcp_servers {
             hit!("mcp");
         }
@@ -361,6 +382,9 @@ fn collect_repo_config_kinds(cwd: &Path, first_only: bool) -> Vec<&'static str> 
         }
         if has_permission {
             hit!("permission");
+        }
+        if has_models {
+            hit!("models");
         }
     }
     // Project `.grok/lsp.json`.
@@ -476,8 +500,8 @@ pub fn prompt_for_trust(key: &Path) -> bool {
     let _ = writeln!(err);
     let _ = writeln!(
         err,
-        "This folder contains repo-local config (.mcp.json / .grok/lsp.json / hooks) \
-         that can run commands on your machine."
+        "This folder contains repo-local config (.mcp.json / .grok/config.toml / \
+         .grok/lsp.json / hooks) that can run commands on your machine."
     );
     let _ = writeln!(err, "  Folder: {}", key.display());
     let _ = write!(
@@ -827,6 +851,43 @@ mod tests {
         let grok = tmp.path().join(".grok");
         std::fs::create_dir_all(&grok).unwrap();
         std::fs::write(grok.join("config.toml"), "[plugins]\npaths = []\n").unwrap();
+        assert!(!repo_configs_present(tmp.path()));
+    }
+
+    #[test]
+    fn repo_configs_present_detects_grok_config_models() {
+        // A repo whose ONLY project config is model routing (`[models]` /
+        // `[model.*]`) must still be gated: those sections can redirect model
+        // requests (and potentially credentials) to repo-chosen origins.
+        let tmp = repo_tmp();
+        let grok = tmp.path().join(".grok");
+        std::fs::create_dir_all(&grok).unwrap();
+        std::fs::write(
+            grok.join("config.toml"),
+            "[models]\ndefault = \"repo-model\"\n\n[model.repo-model]\nbase_url = \"https://example.invalid/v1\"\n",
+        )
+        .unwrap();
+        assert!(repo_configs_present(tmp.path()));
+        assert!(
+            repo_config_kinds(tmp.path()).contains(&"models"),
+            "models-only repo must report the models kind"
+        );
+        let subdir = tmp.path().join("crates").join("inner");
+        std::fs::create_dir_all(&subdir).unwrap();
+        assert!(
+            repo_configs_present(&subdir),
+            "models-only config at git root must gate subdir launches"
+        );
+    }
+
+    #[test]
+    fn repo_configs_present_false_for_empty_models_tables() {
+        // Empty `[models]` + empty `[model]` contribute nothing, so they should
+        // not trip the gate (mirrors empty mcp/plugins/permission sentinels).
+        let tmp = repo_tmp();
+        let grok = tmp.path().join(".grok");
+        std::fs::create_dir_all(&grok).unwrap();
+        std::fs::write(grok.join("config.toml"), "[models]\n\n[model]\n").unwrap();
         assert!(!repo_configs_present(tmp.path()));
     }
 

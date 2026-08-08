@@ -2136,6 +2136,7 @@ fn test_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
             show_model_fingerprint: false,
             stream_tool_calls: None,
             laziness_detector: crate::agent::config::LazinessDetectorPerModelConfig::default(),
+            codex_wire: None,
         },
         api_key: None,
         env_key: None,

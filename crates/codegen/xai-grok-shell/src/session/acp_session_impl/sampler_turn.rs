@@ -815,6 +815,13 @@ impl SessionActor {
             compaction_at_tokens: self.compaction_at_tokens.get(),
             doom_loop_recovery: self.doom_loop_recovery,
             header_injector: Some(std::sync::Arc::new(TraceContextInjector)),
+            // Live catalog lookup so a model switch's wire caps follow the
+            // selected entry rather than the session-start SamplingConfig (#245).
+            codex_wire: self
+                .models_manager
+                .models()
+                .get(catalog_model_id.as_str())
+                .and_then(|e| e.info.codex_wire.clone()),
         }
     }
     /// Install auto-mode permission classifier with a live LLM side-query
@@ -1201,8 +1208,33 @@ impl SessionActor {
         codex_retry_available: bool,
     ) -> Result<SamplerFailureRecovery, acp::Error> {
         use xai_grok_sampler::SamplingErrorKind;
+        // Sampler messages for Api are `API error (status N): <user_facing>`.
+        // For HTTP 400, user_facing may carry a truncated secret-scrubbed body
+        // preview (#245). Surface that preview here; never invent new text
+        // from raw provider bytes at this layer.
         let safe_provider_failure = || match error.status_code {
-            Some(status) => format!("Provider request failed (HTTP {status})."),
+            Some(status) => {
+                let mut out = format!("Provider request failed (HTTP {status}).");
+                if status == 400 {
+                    const PREFIXES: &[&str] = &[
+                        "API error (status 400): Request failed (HTTP 400). ",
+                        "API error (status 400): Request failed (HTTP 400).",
+                        "Request failed (HTTP 400). ",
+                        "Request failed (HTTP 400).",
+                    ];
+                    for prefix in PREFIXES {
+                        if let Some(rest) = error.message.strip_prefix(prefix) {
+                            let rest = rest.trim();
+                            if !rest.is_empty() {
+                                out.push(' ');
+                                out.push_str(rest);
+                            }
+                            break;
+                        }
+                    }
+                }
+                out
+            }
             None => format!("Provider request failed ({}).", error.kind.as_str()),
         };
         if self.tool_context.task_output_token_budget.is_some() {

@@ -2348,7 +2348,14 @@ impl Config {
         Ok((config, unrecognized_keys))
     }
     pub fn new_from_toml_cfg(raw_config: &toml::Value) -> Result<Self, String> {
-        let raw_config = &Self::expand_auth_alias(raw_config);
+        let raw_config_with_project_models = if let Ok(cwd) = std::env::current_dir() {
+            let project_trusted = crate::agent::folder_trust::project_scope_allowed(&cwd);
+            crate::config::merge_project_model_sections(raw_config, &cwd, project_trusted)
+        } else {
+            raw_config.clone()
+        };
+        let raw_config_with_alias = Self::expand_auth_alias(&raw_config_with_project_models);
+        let raw_config = &raw_config_with_alias;
         let super::config_model_override_parse::ParsedModelOverrides {
             models: mut config_models,
             warnings: config_warnings,
@@ -4510,6 +4517,10 @@ pub struct ConfigModelOverride {
     pub compaction_at_tokens: Option<CompactionAtTokens>,
     pub show_model_fingerprint: Option<bool>,
     pub stream_tool_calls: Option<bool>,
+    /// Codex catalog wire capabilities (#245). Not a user TOML field; catalog
+    /// parse fills it. Skipped in serde so unknown user keys stay ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_wire: Option<xai_grok_sampling_types::CodexWireCapabilities>,
     /// Raw `auth_scheme` string when TOML parsing failed. Not persisted; used to
     /// fail-closed at resolve time instead of defaulting to Bearer.
     #[serde(skip)]
@@ -4565,6 +4576,7 @@ impl std::fmt::Debug for ConfigModelOverride {
             .field("compaction_at_tokens", &self.compaction_at_tokens)
             .field("show_model_fingerprint", &self.show_model_fingerprint)
             .field("stream_tool_calls", &self.stream_tool_calls)
+            .field("codex_wire", &self.codex_wire)
             .field(
                 "invalid_auth_scheme_present",
                 &self.invalid_auth_scheme.is_some(),
@@ -4668,6 +4680,9 @@ impl ConfigModelOverride {
         if self.stream_tool_calls.is_some() {
             entry.info.stream_tool_calls = self.stream_tool_calls;
         }
+        if self.codex_wire.is_some() {
+            entry.info.codex_wire.clone_from(&self.codex_wire);
+        }
         if self.api_key.is_some() {
             entry.api_key.clone_from(&self.api_key);
         }
@@ -4766,6 +4781,11 @@ pub struct ModelInfo {
     /// injecting nudges. See [`LazinessDetectorPerModelConfig`].
     #[serde(default)]
     pub laziness_detector: LazinessDetectorPerModelConfig,
+    /// Codex catalog wire capabilities (#245). Not from user TOML; filled by
+    /// `parse_openai_codex_catalog_entry`. Fork-owned so individual flags do
+    /// not each tax SamplingConfig.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_wire: Option<xai_grok_sampling_types::CodexWireCapabilities>,
 }
 
 impl std::fmt::Debug for ModelInfo {
@@ -4812,6 +4832,7 @@ impl std::fmt::Debug for ModelInfo {
             .field("show_model_fingerprint", &self.show_model_fingerprint)
             .field("stream_tool_calls", &self.stream_tool_calls)
             .field("laziness_detector", &self.laziness_detector)
+            .field("codex_wire", &self.codex_wire)
             .finish()
     }
 }
@@ -4852,6 +4873,7 @@ impl ModelInfo {
             show_model_fingerprint: false,
             stream_tool_calls: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
+            codex_wire: None,
         }
     }
     /// Extract shared model metadata from a flat config entry.
@@ -4889,6 +4911,7 @@ impl ModelInfo {
             show_model_fingerprint: entry.show_model_fingerprint,
             stream_tool_calls: entry.stream_tool_calls,
             laziness_detector: entry.laziness_detector.clone(),
+            codex_wire: None,
         }
     }
     /// Derive the legacy effort gate/default from `reasoning_efforts` so the
@@ -5836,6 +5859,7 @@ pub(crate) fn resolve_aux_model_sampling_config(
                 show_model_fingerprint: false,
                 stream_tool_calls: None,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
+                codex_wire: None,
             },
             api_key: Some(bearer),
             env_key: None,
@@ -6329,6 +6353,7 @@ pub(crate) fn sampling_config_for_model(
         compaction_at_tokens: info.compaction_at_tokens,
         doom_loop_recovery: None,
         header_injector: None,
+        codex_wire: info.codex_wire.clone(),
     };
     if config.api_backend == ApiBackend::CodexResponses {
         // Codex request auth is a structured, provider-scoped snapshot. Never
@@ -6435,6 +6460,7 @@ fn resolve_hidden_default_web_search_sampling_config(
             show_model_fingerprint: false,
             stream_tool_calls: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
+            codex_wire: None,
         },
         api_key: None,
         env_key: None,
@@ -9030,6 +9056,7 @@ reasoning_effort = "low"
                 show_model_fingerprint: false,
                 stream_tool_calls: None,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
+                codex_wire: None,
             },
             api_key: api_key.map(|s| s.to_string()),
             env_key: env_key.map(EnvKeys::single),
@@ -16053,6 +16080,7 @@ default = "grok-4.5"
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
                 auto_compact_threshold_percent: None,
                 system_prompt_label: None,
+                codex_wire: None,
             },
             api_key: None,
             env_key: None,

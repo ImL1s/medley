@@ -4484,3 +4484,90 @@ fn no_web_search_notice_pushes_no_block() {
         .count();
     assert_eq!(hits, 0, "no notice must mean no block");
 }
+
+#[test]
+fn synthesized_switch_does_not_clear_transaction_with_live_request_id() {
+    let mut app = test_app_with_agent();
+    let source_id = AgentId(0);
+    app.cli_effort_token = Some("low".to_owned());
+
+    // Create target model id and info
+    let target_model = acp::ModelId::new(std::sync::Arc::from("cursor-model"));
+
+    // Set up the transaction that IncompatibleAgent would have left behind.
+    app.model_switch_transaction = Some(crate::app::app_view::ModelSwitchTransaction {
+        owner_agent_id: source_id,
+        request_id: None,
+        app_models_optimistic: false,
+        app_model_id: app.models.current.clone(),
+        app_reasoning_effort: app.models.reasoning_effort,
+    });
+
+    let effects = dispatch(
+        Action::AgentTypeMismatchAnswered {
+            source_id,
+            start_new: true,
+            model_id: target_model.clone(),
+            effort: None,
+        },
+        &mut app,
+    );
+
+    let create = effects
+        .iter()
+        .find(|e| matches!(e, Effect::CreateSession { .. }));
+    assert!(create.is_some(), "expected CreateSession effect");
+
+    let new_aid = match app.active_view {
+        ActiveView::Agent(id) => id,
+        _ => panic!("expected active view to be an Agent"),
+    };
+
+    assert!(app.model_switch_transaction.is_some());
+    let txn = app.model_switch_transaction.as_ref().unwrap();
+    assert_eq!(txn.owner_agent_id, new_aid);
+    assert!(txn.request_id.is_none());
+
+    let new_agent = app.agents.get(&new_aid).unwrap();
+    assert!(new_agent.session.deferred_model_switch.is_none());
+
+    let meta = Some(serde_json::json!({
+        "supportsReasoningEffort": true,
+        "reasoningEffort": "medium",
+        "reasoningEfforts": [
+            { "id": "low", "value": "low", "label": "Low" },
+        ],
+    }));
+    let info = acp::ModelInfo::new(target_model.clone(), "cursor-model".to_owned())
+        .meta(meta.and_then(|v| v.as_object().cloned()));
+    let models_payload = acp::SessionModelState::new(target_model.clone(), vec![info]);
+
+    let effects2 = dispatch(
+        Action::TaskComplete(TaskResult::SessionCreated {
+            agent_id: new_aid,
+            session_id: acp::SessionId::new("new-session-123"),
+            models: Some(models_payload),
+            scheduler_background_loops: None,
+            web_search_disabled: None,
+        }),
+        &mut app,
+    );
+
+    let has_switch = effects2
+        .iter()
+        .any(|e| matches!(e, Effect::SwitchModel { .. }));
+    assert!(
+        has_switch,
+        "expected SwitchModel effect in response to cli_effort_token synthesis"
+    );
+
+    assert!(
+        app.model_switch_transaction.is_some(),
+        "transaction was incorrectly cleared (orphaned switch)"
+    );
+    let final_txn = app.model_switch_transaction.as_ref().unwrap();
+    assert!(
+        final_txn.request_id.is_some(),
+        "expected transaction to have a request_id"
+    );
+}

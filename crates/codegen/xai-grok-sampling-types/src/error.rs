@@ -650,14 +650,207 @@ pub fn parse_error_bytes(bytes: &[u8]) -> String {
         .to_string()
 }
 
-/// User-facing message for a failed API call.
+/// Max chars retained from a provider error body in diagnostics (#245).
 ///
-/// Provider-controlled response text is never returned. A few recovery-critical
+/// Provider bodies are untrusted and may echo request credentials; anything
+/// that surfaces them must bound length and say when it truncated.
+pub const PROVIDER_ERROR_BODY_PREVIEW_MAX: usize = 256;
+
+/// Whether a short identifier is safe to surface from a provider body.
+///
+/// Rejects free-form text and long high-entropy tokens; keeps field names
+/// like `client_version`, `reasoning.summary`, `invalid_request_error`.
+fn is_safe_diagnostic_token(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() || s.len() > 64 {
+        return false;
+    }
+    if !s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | ':' | '/'))
+    {
+        return false;
+    }
+    // Charset and length alone do not separate a field *name* from a secret:
+    // `sk-...`, a JWT segment and a UUID are all "alphanumerics and dashes,
+    // under 64 characters". A hostile `param` was passing through verbatim
+    // until a test put the sentinel in every position rather than only the two
+    // an obvious hostile body would use.
+    //
+    // The two rules below are what a rejected-field name looks like in the
+    // APIs this talks to, and both are already used elsewhere in this file --
+    // `safe_validation_message` rejects long alnum runs carrying a digit for
+    // the same reason. Applied here at 16 rather than 24, because these are
+    // identifiers, not prose.
+    if has_credential_marker(s) {
+        return false;
+    }
+    if s.chars().any(|c| c.is_ascii_uppercase()) {
+        // `client_version`, `max_tokens`, `input.0.content`. Credentials are
+        // mixed-case far more often than parameter names are.
+        return false;
+    }
+    !s.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|run| run.len() >= 16 && run.bytes().any(|b| b.is_ascii_digit()))
+}
+
+fn has_credential_marker(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    lower.contains("bearer ")
+        || lower.contains("authorization:")
+        || lower.contains("x-api-key")
+        || lower.contains("sk-")
+        || lower.contains("api_key=")
+        || lower.contains("access_token")
+}
+
+/// Safe validation-style message: short, no credential markers, no long
+/// high-entropy runs. Returns `None` when the text is not safe to surface.
+fn safe_validation_message(message: &str) -> Option<String> {
+    let message = message.trim();
+    if message.is_empty() || message.len() > 200 {
+        return None;
+    }
+    if has_credential_marker(message) {
+        return None;
+    }
+    // Drop long alnum runs that look like tokens/keys (not ordinary words).
+    for word in message.split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-') {
+        if word.len() >= 24 && word.bytes().any(|b| b.is_ascii_digit()) {
+            return None;
+        }
+    }
+    Some(message.to_string())
+}
+
+fn truncate_with_notice(s: &str, max_chars: usize) -> String {
+    let char_len = s.chars().count();
+    if char_len <= max_chars {
+        return s.to_string();
+    }
+    let truncated: String = s.chars().take(max_chars).collect();
+    format!("{truncated} (truncated)")
+}
+
+/// Build a diagnostic summary from known error envelope shapes without
+/// echoing free-form provider text that may contain credentials.
+fn structured_diagnostic_summary(bytes: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(err) = value.get("error") {
+        if let Some(kind) = err
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .and_then(allowlisted_error_type)
+        {
+            parts.push(format!("type={kind}"));
+        }
+        if let Some(param) = err
+            .get("param")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| is_safe_diagnostic_token(s))
+        {
+            parts.push(format!("param={param}"));
+        }
+        if let Some(code) = err
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| is_safe_diagnostic_token(s) || allowlisted_error_type(s).is_some())
+        {
+            parts.push(format!("code={code}"));
+        }
+        if let Some(message) = err
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .and_then(safe_validation_message)
+        {
+            parts.push(format!("message={message}"));
+        }
+    }
+
+    // Flat gateway: {"code":"...","error":"..."} — only surface allowlisted code.
+    if parts.is_empty()
+        && let Some(code) = value
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .and_then(allowlisted_error_type)
+    {
+        parts.push(format!("code={code}"));
+    }
+
+    // FastAPI / pydantic style used by Codex catalog probes (#188):
+    // {"loc": ["query", "client_version"], "msg": "Field required"}
+    if let Some(loc) = value.get("loc") {
+        let loc_text = loc.to_string();
+        if loc_text.len() <= 120 && !has_credential_marker(&loc_text) {
+            parts.push(format!("loc={loc_text}"));
+        }
+    }
+    if let Some(msg) = value
+        .get("msg")
+        .and_then(serde_json::Value::as_str)
+        .and_then(safe_validation_message)
+    {
+        parts.push(format!("msg={msg}"));
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+/// Truncated, secret-scrubbed preview of a provider error body for logs and
+/// (when safe) user-facing 400 diagnostics (#245).
+///
+/// Provider bodies are untrusted. This returns either:
+/// - a structured summary of allowlisted / short validation fields, or
+/// - a length-bounded raw preview when the body has no credential markers, or
+/// - `body_len=N (provider body withheld)` when the body looks hostile.
+///
+/// Always bounds length and appends ` (truncated)` when it cuts.
+pub fn provider_error_body_preview(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+    // Structured summary or nothing. There is deliberately no raw-text
+    // fallback: every value that leaves here comes out of
+    // `structured_diagnostic_summary`, where each position is gated by a fixed
+    // vocabulary (`allowlisted_error_type`) or a charset check
+    // (`is_safe_diagnostic_token`, `safe_validation_message`).
+    //
+    // The fallback this replaces emitted the provider's own bytes whenever a
+    // credential *marker* was not spotted in them, which makes marker
+    // detection a second classifier standing between a provider and the log —
+    // and the one that decides in the permissive direction. A provider that
+    // echoes the failing request back does not have to name its credential in
+    // a way a marker list recognises. Absence of evidence was doing the work
+    // of evidence of absence.
+    //
+    // The cost is real and accepted: a 400 whose body is not JSON we can parse
+    // now contributes nothing beyond its status. That is the same information
+    // the caller had before #245, and it is the direction to fail in.
+    structured_diagnostic_summary(bytes)
+        .map(|summary| truncate_with_notice(&summary, PROVIDER_ERROR_BODY_PREVIEW_MAX))
+        .unwrap_or_default()
+}
+
 /// Max chars of a structured (JSON) error message shown to users.
+///
+/// Upstream's, and used by its `provider_error.rs`. Kept as its own item: the
+/// sync landed it *inside* the doc comment below, which compiles and reads as
+/// two half-sentences.
 pub const MAX_USER_ERROR_BODY_CHARS: usize = 280;
 
-/// conditions map to fixed semantic markers; everything else (including
-/// structured JSON and Cloudflare HTML) maps only from the HTTP status.
+/// User-facing message for a failed API call.
+///
+/// Recovery-critical conditions map to fixed semantic markers. For HTTP 400,
+/// a truncated secret-scrubbed body preview is appended when available so a
+/// rejected field name is visible without a proxy (#245). Every other status
+/// (including structured JSON on 429/5xx and Cloudflare HTML) maps only from
+/// the HTTP status — free-form provider text may echo credentials.
 pub fn user_facing_api_error_message(status: StatusCode, bytes: &[u8]) -> String {
     match safe_structured_error(bytes) {
         Some(safe)
@@ -672,6 +865,15 @@ pub fn user_facing_api_error_message(status: StatusCode, bytes: &[u8]) -> String
             ) =>
         {
             safe.message.to_string()
+        }
+        _ if status == StatusCode::BAD_REQUEST => {
+            let base = status_user_message(status);
+            let preview = provider_error_body_preview(bytes);
+            if preview.is_empty() {
+                base
+            } else {
+                format!("{base} {preview}")
+            }
         }
         _ => status_user_message(status),
     }
@@ -1063,6 +1265,131 @@ mod tests {
         let bytes = br#"{"error":{"message":"rate limit exceeded","type":"rate_limit_error"}}"#;
         let msg = user_facing_api_error_message(StatusCode::TOO_MANY_REQUESTS, bytes);
         assert_eq!(msg, status_user_message(StatusCode::TOO_MANY_REQUESTS));
+    }
+
+    /// #245: a 400 must surface the field the endpoint rejected. Structured
+    /// validation envelopes keep `param` / `loc` / short `msg` so a missing
+    /// `client_version` is visible without a proxy.
+    #[test]
+    fn user_facing_400_surfaces_structured_rejected_field() {
+        let bytes = br#"{"error":{"message":"Unsupported parameter: 'reasoning.summary' is not supported with this model.","type":"invalid_request_error","param":"reasoning.summary"}}"#;
+        let msg = user_facing_api_error_message(StatusCode::BAD_REQUEST, bytes);
+        assert!(
+            msg.contains("param=reasoning.summary"),
+            "400 must name the rejected field: {msg}"
+        );
+        assert!(
+            msg.contains("type=invalid_request_error"),
+            "400 must keep the allowlisted type: {msg}"
+        );
+        assert!(
+            msg.contains("Request failed (HTTP 400)"),
+            "400 keeps the status copy: {msg}"
+        );
+    }
+
+    /// #245 trap: provider-controlled bodies may echo credentials. The 400
+    /// A body that is not a structured error contributes **nothing**.
+    ///
+    /// This is the assertion that stops the raw-text fallback coming back. The
+    /// version of this function that shipped first emitted the provider's own
+    /// bytes whenever `has_credential_marker` did not spot something in them,
+    /// which made marker detection a classifier deciding, in the permissive
+    /// direction, whether a provider's bytes may be surfaced. A provider
+    /// echoing the failing request back need not name its credential in a
+    /// shape that list recognises.
+    ///
+    /// Each case below is a body a reasonable fallback would have surfaced.
+    #[test]
+    fn provider_error_body_preview_is_empty_for_anything_unstructured() {
+        for body in [
+            "upstream connect error or disconnect/reset before headers",
+            "{\"detail\":\"not a shape we parse\"}",
+            "<!DOCTYPE html><html><body>502 Bad Gateway</body></html>",
+            "{not json at all",
+            "\u{feff}",
+        ] {
+            assert_eq!(
+                provider_error_body_preview(body.as_bytes()),
+                "",
+                "unstructured body must contribute nothing: {body:?}"
+            );
+        }
+    }
+
+    /// preview path must stay secret-free (same family as
+    /// `full_and_partial_credential_echoes_never_escape_provider_errors`) and
+    /// must bound length with an explicit truncation notice.
+    #[test]
+    fn provider_error_body_preview_is_secret_free_and_bounded() {
+        const SENTINEL: &str = "GB245-secret-bearer-0123456789abcdef";
+        let hostile = format!(
+            r#"{{"error":{{"message":"Authorization: Bearer {SENTINEL}","type":"{SENTINEL}","param":"client_version"}}}}"#
+        );
+        let preview = provider_error_body_preview(hostile.as_bytes());
+        assert!(
+            !preview.contains(SENTINEL),
+            "full credential escaped preview: {preview}"
+        );
+        for window in SENTINEL.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(
+                !preview.contains(fragment),
+                "credential fragment {fragment:?} escaped: {preview}"
+            );
+        }
+        // Safe structural field must still diagnose the rejection.
+        assert!(
+            preview.contains("param=client_version"),
+            "safe param must survive scrubbing: {preview}"
+        );
+
+        // The sentinel in *every* position a summary can draw from, not just
+        // the two an obvious hostile body would use. Each position has its own
+        // gate, and a gate that was never asked about is a gate nobody knows
+        // the state of.
+        let everywhere = format!(
+            r#"{{"error":{{"type":"{SENTINEL}","param":"{SENTINEL}","code":"{SENTINEL}","message":"{SENTINEL}"}},
+                "code":"{SENTINEL}",
+                "detail":[{{"loc":["query","{SENTINEL}"],"msg":"{SENTINEL}","type":"{SENTINEL}"}}]}}"#
+        );
+        let preview_everywhere = provider_error_body_preview(everywhere.as_bytes());
+        for window in SENTINEL.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(
+                !preview_everywhere.contains(fragment),
+                "credential fragment {fragment:?} escaped via a summary position: \
+                 {preview_everywhere}"
+            );
+        }
+
+        // Truncation is exercised through the structured path, because that is
+        // the only path: every position is individually capped (param and code
+        // at 64, message at 200) but their sum exceeds the preview budget.
+        let long_param = "a".repeat(64);
+        let long_code = "b".repeat(64);
+        let long_message = "field required ".repeat(13);
+        let huge = format!(
+            r#"{{"error":{{"type":"invalid_request_error","param":"{long_param}","code":"{long_code}","message":"{long_message}"}}}}"#
+        );
+        let truncated = provider_error_body_preview(huge.as_bytes());
+        assert!(
+            truncated.contains("truncated"),
+            "unbounded body must announce truncation: {truncated}"
+        );
+        assert!(
+            truncated.chars().count()
+                <= PROVIDER_ERROR_BODY_PREVIEW_MAX + " (truncated)".chars().count(),
+            "preview must be bounded: len={}",
+            truncated.chars().count()
+        );
+
+        let user = user_facing_api_error_message(StatusCode::BAD_REQUEST, hostile.as_bytes());
+        assert!(!user.contains(SENTINEL));
+        for window in SENTINEL.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).expect("ASCII sentinel");
+            assert!(!user.contains(fragment), "fragment in user message: {user}");
+        }
     }
 
     #[test]

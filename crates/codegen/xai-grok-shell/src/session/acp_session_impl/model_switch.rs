@@ -344,12 +344,17 @@ impl SessionActor {
         let rollback = rollback.unwrap_or_else(|| ModelSwitchRollbackState {
             chat: current_chat.clone(),
         });
-        let new_context_window = self.compaction.context_window_override.unwrap_or_else(|| {
-            std::num::NonZeroU64::new(sampling_config.context_window).unwrap_or_else(|| {
+        // Catalog window of the *new* model is authoritative. Do not reuse a
+        // prior auto-compact / header-derived override from the previous
+        // model — that budgets a Spark session at Sol's 272K (#245 / #122).
+        // (`context_window_override` is not interior-mutable on `&self`, so
+        // we ignore it here rather than write; chat-state gets the catalog
+        // window, and subsequent compact paths re-derive from metadata.)
+        let new_context_window = std::num::NonZeroU64::new(sampling_config.context_window)
+            .unwrap_or_else(|| {
                 std::num::NonZeroU64::new(DEFAULT_CONTEXT_WINDOW)
                     .expect("DEFAULT_CONTEXT_WINDOW is non-zero")
-            })
-        });
+            });
         let mut committed_chat = current_chat.clone();
         committed_chat.sampling_config = xai_grok_sampling_types::SamplingConfig {
             base_url: sampling_config.base_url.clone(),
@@ -896,6 +901,7 @@ mod model_switch_transaction_tests {
             compaction_at_tokens: None,
             doom_loop_recovery: None,
             header_injector: None,
+            codex_wire: None,
         }
     }
 

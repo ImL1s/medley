@@ -1007,6 +1007,56 @@ pub fn reasoning_efforts_meta_value(opts: &[ReasoningEffortOption]) -> serde_jso
     serde_json::to_value(opts).unwrap_or_else(|_| serde_json::Value::Array(Vec::new()))
 }
 
+/// Per-model Codex wire capabilities from the account `GET /models` catalog.
+///
+/// Fork-owned type (#245 / #121): absorb the catalog flags that change request
+/// shape here instead of growing free fields on [`SamplingConfig`] /
+/// `SamplerConfig`. `None` on a parent field means "catalog did not say";
+/// request construction then keeps the preset / historical default.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexWireCapabilities {
+    /// When `Some(true)`, the account catalog marks this model for the lite
+    /// Responses transport. Stored for diagnostics; wire mapping is applied
+    /// only where the request path already has a concrete use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_responses_lite: Option<bool>,
+    /// Catalog `tool_mode` (e.g. `code_mode_only`). `None` means unrestricted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_mode: Option<String>,
+    /// When `Some(false)`, omit `reasoning.summary` on the wire — the field
+    /// is rejected for some catalog models (e.g. Spark) even though the
+    /// preset (Sol) accepts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_reasoning_summary_parameter: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_image_detail_original: Option<bool>,
+    /// e.g. `["text"]` or `["text","image"]`. Empty means unrestricted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_modalities: Vec<String>,
+    /// Catalog default reasoning level (`low` / `high` / …). Applied when the
+    /// session has not set an effort override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_reasoning_level: Option<String>,
+}
+
+impl CodexWireCapabilities {
+    /// Whether image input is listed (or unrestricted when the list is empty).
+    pub fn allows_image_input(&self) -> bool {
+        self.input_modalities.is_empty()
+            || self
+                .input_modalities
+                .iter()
+                .any(|m| m.eq_ignore_ascii_case("image"))
+    }
+
+    /// Whether the wire request should include `reasoning.summary`.
+    ///
+    /// `None` (catalog silent) keeps the historical default of including it.
+    pub fn include_reasoning_summary(&self) -> bool {
+        self.supports_reasoning_summary_parameter != Some(false)
+    }
+}
+
 /// Which API backend to use for model inference.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

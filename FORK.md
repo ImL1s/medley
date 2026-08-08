@@ -116,7 +116,19 @@ Scope is the fork hot path (not full workspace):
 - `clippy --lib -D warnings` on `xai-grok-sampler`, `xai-grok-shell`, `xai-grok-pager` (lib only; avoids unrelated upstream bench/test lints)
 - Targeted auth / readiness / model-picker tests (subagent None credential strip, session model-switch credential clear, pager unready hard-blocks)
 
-Pre-merge CI receipt check for PR heads (issue #202):
+**Merge pull requests with `scripts/merge-pr.sh`, not `gh pr merge`** (issue #202):
+
+```bash
+scripts/merge-pr.sh <number>            # --squash --delete-branch by default
+```
+
+It reconciles the PR head against the remote branch tip, requires a successful run of
+*this* repository's `ci.yml` for exactly that SHA, requires every check to have concluded,
+and then **re-reads the branch tip** before merging — a push that lands between the receipt
+and the merge would otherwise be merged with none of it verified. That last read is the
+step a human skips.
+
+The receipt check underneath can still be run alone, for diagnostics:
 
 ```bash
 python3 -B scripts/check_pr_head_ci_run.py --pr <number> --repo ImL1s/medley
