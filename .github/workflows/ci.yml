@@ -626,6 +626,13 @@ jobs:
             app:: -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             disk_usage_cmd:: -- --nocapture
+          # `xai-grok-config` had no filter at all, so every test in it ran
+          # nowhere. `display::` owns the state-directory label rules, which
+          # is exactly the fork behaviour a sync is most likely to break --
+          # `disk_usage_cmd::` above is one of its callers, and it caught a
+          # regression here that this crate's own tests could not report.
+          run_nonzero -p xai-grok-config --lib \
+            display:: -- --nocapture
           # Same `#[path]` move as `restore_fetch::` above, and stopped one
           # segment short for the same reason: the file is `fs_size_tests.rs`,
           # the module is `fs_size::tests`, and only `fs_size::` is a substring
