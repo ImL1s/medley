@@ -103,11 +103,11 @@ refreshable. Account entitlements, workspace policy, rate limits, and model
 availability are still enforced by OpenAI.
 
 Grok ships one built-in Codex model, `gpt-5.6-sol`, so no config editing is
-needed to use this provider. Before you log in it is listed as unready with
+needed to use this provider. Grok fetches the online models catalog from the Codex service ([`fetch_openai_codex_catalog_models`](file:///private/tmp/n193b/crates/codegen/xai-grok-shell/src/agent/model_providers.rs#L202-244)), falling back to the local preset ([`openai_codex_preset_models`](file:///private/tmp/n193b/crates/codegen/xai-grok-shell/src/agent/model_providers.rs#L274-286)) if the fetch fails. Before you log in it is listed as unready with
 the reason `sign in with grok login --provider openai-codex`; after a
 successful login it becomes selectable in `grok models` and the `/model`
 picker. To change its metadata (including `context_window` when the context
-bar looks too low) or add other Codex models, declare them in the **global**
+bar looks too low or is not reported online) or add other Codex models, declare them in the **global**
 `~/.medley/config.toml` — see
 [Custom Models](11-custom-models.md#openai-codex-chatgpt-subscription).
 
@@ -380,15 +380,15 @@ Grok picks up changes to `~/.medley/auth.json` automatically. If you update cred
 
 ## Auth Precedence
 
-Grok resolves credentials for each request in this order, highest to lowest:
+Grok resolves credentials for each request in this order, highest to lowest ([`sampling_config_for_model`](file:///private/tmp/n193b/crates/codegen/xai-grok-shell/src/agent/config.rs#L6151)):
 
-1. **Per-model `api_key` or `env_key`** -- set under `[model.<name>]` in `config.toml`. Wins whenever present.
-2. **A named `auth_provider`** -- when the model names one, that provider owns auth for the model; if its credential is unavailable the request fails closed and never falls back to xAI credentials.
-3. **An explicit credential header** -- an `Authorization` or `x-api-key` header from `extra_headers` / `env_http_headers`.
-4. **Active session token** -- obtained through browser, OIDC/OAuth2, or external-provider login and stored in `~/.medley/auth.json`. First-party xAI origins only.
-5. **`XAI_API_KEY`** -- fallback when no session token is active. First-party xAI origins only.
+1. **Per-model `api_key` or `env_key`** -- set under `[model.<name>]` in `config.toml` ([config.rs:5360](file:///private/tmp/n193b/crates/codegen/xai-grok-shell/src/agent/config.rs#L5360)). Wins whenever present.
+2. **A named `auth_provider`** -- when the model names one, that provider owns auth for the model ([config.rs:5366](file:///private/tmp/n193b/crates/codegen/xai-grok-shell/src/agent/config.rs#L5366)); if its credential is unavailable the request fails closed and never falls back to xAI credentials.
+3. **An explicit credential header** -- an `Authorization` or `x-api-key` header from `extra_headers` / `env_http_headers` ([config.rs:6007](file:///private/tmp/n193b/crates/codegen/xai-grok-shell/src/agent/config.rs#L6007)).
+4. **Active session token** -- obtained through browser, OIDC/OAuth2, or external-provider login and stored in `~/.medley/auth.json`. First-party xAI origins only ([config.rs:5373](file:///private/tmp/n193b/crates/codegen/xai-grok-shell/src/agent/config.rs#L5373)).
+5. **`XAI_API_KEY`** -- fallback when no session token is active. First-party xAI origins only ([config.rs:5379](file:///private/tmp/n193b/crates/codegen/xai-grok-shell/src/agent/config.rs#L5379)).
 
-Models with `auth_scheme = "none"` skip this chain entirely, and a model pointing at a non-xAI origin with none of sources 1–3 is marked unready rather than sent an ambient xAI credential. See [Custom Models > Credential Resolution](11-custom-models.md#credential-resolution) for the full rules.
+Models with `auth_scheme = "none"` ([config.rs:25](file:///private/tmp/n193b/crates/codegen/xai-grok-sampler/src/config.rs#L25)) skip this chain entirely ([config.rs:5352](file:///private/tmp/n193b/crates/codegen/xai-grok-shell/src/agent/config.rs#L5352)), and a model pointing at a non-xAI origin with none of sources 1–3 is marked unready rather than sent an ambient xAI credential ([client.rs:860-921](file:///private/tmp/n193b/crates/codegen/xai-grok-sampler/src/client.rs#L860-921)). See [Custom Models > Credential Resolution](11-custom-models.md#credential-resolution) for the full rules.
 
 When more than one login flow is configured, Grok populates the session token from the first available source, highest to lowest:
 
