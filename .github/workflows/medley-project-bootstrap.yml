@@ -4,6 +4,11 @@ on:
   push:
     branches:
       - automation/medley-project-247-20260808
+  pull_request:
+    branches:
+      - providers
+    paths:
+      - .github/workflows/medley-project-bootstrap.yml
 
 permissions:
   contents: write
@@ -30,6 +35,7 @@ jobs:
           set +x
           umask 077
           export GH_TOKEN="$AUTOMATION_TOKEN"
+          bootstrap_branch="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
 
           cleanup_files() {
             rm -f /tmp/medley-project-private.pem /tmp/medley-project-public.pem               /tmp/medley-project-token.enc /tmp/medley-project-token.txt               /tmp/medley-project-setup.py /tmp/medley-project-setup.py.gz               /tmp/medley-project-setup.b64
@@ -173,4 +179,4 @@ MEDLEY_SETUP_B64
 
           GH_TOKEN="$AUTOMATION_TOKEN" gh api -X DELETE             "repos/$REPO/issues/comments/$envelope_comment_id" >/dev/null 2>&1 || true
           GH_TOKEN="$AUTOMATION_TOKEN" gh api -X DELETE             "repos/$REPO/issues/comments/$request_comment_id" >/dev/null 2>&1 || true
-          GH_TOKEN="$AUTOMATION_TOKEN" gh api -X DELETE             "repos/$REPO/git/refs/heads/${{ github.ref_name }}" >/dev/null 2>&1 || true
+          GH_TOKEN="$AUTOMATION_TOKEN" gh api -X DELETE             "repos/$REPO/git/refs/heads/$bootstrap_branch" >/dev/null 2>&1 || true
