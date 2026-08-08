@@ -23,6 +23,21 @@ const TEST_TIMING: BootstrapTiming = BootstrapTiming {
 const _: () = assert!(TEST_TIMING.refresh.as_millis() < TEST_TIMING.lease.as_millis());
 const _: () = assert!(TEST_TIMING.poll.as_millis() < TEST_TIMING.peer_wait.as_millis());
 
+/// Timing for the contended-gates test, which parks both gates on a seeded
+/// peer claim: the peer wait has to outlast `PEER_CLAIM_HOLD` by a wide
+/// margin or a gate gives up waiting instead of contending.
+const CONTENDED_TIMING: BootstrapTiming = BootstrapTiming {
+    lease: TEST_TIMING.lease,
+    refresh: TEST_TIMING.refresh,
+    peer_wait: Duration::from_secs(30),
+    poll: TEST_TIMING.poll,
+};
+/// How long the seeded peer claim is held: long enough that both gates have
+/// certainly made their first claim attempt and latched `peer_seen`.
+/// Holding longer only costs wall time, never correctness.
+const PEER_CLAIM_HOLD: Duration = Duration::from_millis(250);
+const _: () = assert!(PEER_CLAIM_HOLD.as_millis() * 10 < CONTENDED_TIMING.peer_wait.as_millis());
+
 fn stamp_marker(db_path: &Path, value: &str) {
     with_search_index(db_path, |index| {
         index.set_meta(META_KEY_LAST_BOOTSTRAP, value)
@@ -252,7 +267,19 @@ async fn test_concurrent_gates_single_flight() {
             .await
             .unwrap();
     }
-    with_search_index(&search_db_path(&root), |_| Ok(())).unwrap();
+    // Seed a peer claim so neither gate can take the lease until both have
+    // observed contention. Without it this test is a race it usually loses
+    // on an idle machine: gate A claims, indexes two tiny sessions and
+    // releases before gate B's first claim attempt even returns, and B —
+    // still on its first iteration, where a launch deliberately ignores an
+    // existing marker — reindexes too. Once both gates have latched
+    // `peer_seen`, the loser's post-claim marker check adopts the winner's
+    // work however fast the winner finished.
+    let claim_now = chrono::Utc::now().timestamp();
+    with_search_index(&search_db_path(&root), |index| {
+        index.try_claim_bootstrap(claim_now, CONTENDED_TIMING.lease, "peer")
+    })
+    .unwrap();
 
     let progress_a = Arc::new(BootstrapProgress::default());
     let progress_b = Arc::new(BootstrapProgress::default());
@@ -265,30 +292,35 @@ async fn test_concurrent_gates_single_flight() {
     let start = Arc::new(tokio::sync::Barrier::new(2));
     let start_a = Arc::clone(&start);
     let start_b = Arc::clone(&start);
-    let (a, b) = tokio::join!(
-        tokio::spawn(async move {
-            start_a.wait().await;
-            bootstrap_with_lease_inner(
-                &root_a,
-                &storage_a,
-                &pa,
-                &TEST_TIMING,
-                BootstrapRole::Launch,
-            )
-            .await
-        }),
-        tokio::spawn(async move {
-            start_b.wait().await;
-            bootstrap_with_lease_inner(
-                &root_b,
-                &storage_b,
-                &pb,
-                &TEST_TIMING,
-                BootstrapRole::Launch,
-            )
-            .await
-        }),
-    );
+    let gate_a = tokio::spawn(async move {
+        start_a.wait().await;
+        bootstrap_with_lease_inner(
+            &root_a,
+            &storage_a,
+            &pa,
+            &CONTENDED_TIMING,
+            BootstrapRole::Launch,
+        )
+        .await
+    });
+    let gate_b = tokio::spawn(async move {
+        start_b.wait().await;
+        bootstrap_with_lease_inner(
+            &root_b,
+            &storage_b,
+            &pb,
+            &CONTENDED_TIMING,
+            BootstrapRole::Launch,
+        )
+        .await
+    });
+    // Both gates are now spinning on the seeded claim; hand it over.
+    tokio::time::sleep(PEER_CLAIM_HOLD).await;
+    with_search_index(&search_db_path(tmp.path()), |index| {
+        index.release_bootstrap_claim("peer")
+    })
+    .unwrap();
+    let (a, b) = tokio::join!(gate_a, gate_b);
     let a = a.expect("gate a task panicked");
     let b = b.expect("gate b task panicked");
     assert!(a.is_ok(), "gate a: {a:?}");
