@@ -20,9 +20,21 @@ pub fn display_grok_home_prefix() -> String {
     display_grok_home_prefix_for(&grok_home())
 }
 
+/// A symlinked default home is still the default home.
+///
+/// Compared only when **both** paths resolve: `canonicalize` fails on a path
+/// that does not exist, and treating two failures as a match would label every
+/// nonexistent directory as the default one.
+fn resolves_to_same_dir(a: &Path, b: &Path) -> bool {
+    match (dunce::canonicalize(a), dunce::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 pub fn display_grok_home_prefix_for(home: &Path) -> String {
     let default = crate::default_grok_home();
-    if home == default {
+    if home == default || resolves_to_same_dir(home, &default) {
         // Name the directory that actually holds state — which of ~/.medley
         // and ~/.grok that is depends on whether the migration has run.
         return match default.file_name() {
@@ -112,6 +124,36 @@ mod tests {
             display_user_grok_path_for(&custom, "sandbox.toml"),
             format!("{label}/sandbox.toml")
         );
+    }
+
+    /// A symlinked default home is still the default home, so it keeps the
+    /// `~/…` label instead of falling through to an override label naming a
+    /// variable the user never set.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_directory_resolves_to_its_target() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("on-disk");
+        let link = tmp.path().join("link");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(resolves_to_same_dir(&link, &target));
+    }
+
+    /// Two paths that fail to resolve must not read as "the same directory".
+    /// `canonicalize` errors on a missing path, and collapsing two errors into
+    /// a match would label every nonexistent directory as the default one —
+    /// which is the same class of confident lie this module exists to prevent.
+    /// Identity is already handled by the `==` check before this helper runs,
+    /// so returning `false` even for one missing path against itself is
+    /// correct here.
+    #[test]
+    fn unresolvable_paths_are_never_the_same_directory() {
+        let a = std::env::temp_dir().join("grok-display-missing-a");
+        let b = std::env::temp_dir().join("grok-display-missing-b");
+        assert!(!a.exists() && !b.exists(), "the test needs both absent");
+        assert!(!resolves_to_same_dir(&a, &b));
+        assert!(!resolves_to_same_dir(&a, &a));
     }
 
     /// The property every caller depends on and a literal cannot have: two
