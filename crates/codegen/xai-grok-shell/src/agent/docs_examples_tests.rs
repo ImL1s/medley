@@ -477,10 +477,19 @@ fn docs_examples_parse_and_resolve_provider_toml_examples() {
             "provider-local-vllm" => assert!(catalog.contains_key("vllm-local")),
             "models-catalog-auth" => {
                 let auth_cfg = cfg.models.catalog_auth_config().unwrap();
-                assert_eq!(auth_cfg.endpoint.as_deref(), Some("https://api.acme.com/v1/models"));
-                assert_eq!(auth_cfg.auth_scheme, Some(xai_grok_sampler::AuthScheme::Bearer));
+                assert_eq!(
+                    auth_cfg.endpoint.as_deref(),
+                    Some("https://api.acme.com/v1/models")
+                );
+                assert_eq!(
+                    auth_cfg.auth_scheme,
+                    Some(xai_grok_sampler::AuthScheme::Bearer)
+                );
                 assert_eq!(auth_cfg.timeout_secs, Some(15));
-                assert_eq!(auth_cfg.headers.get("X-Organization").map(|s| s.as_str()), Some("Acme"));
+                assert_eq!(
+                    auth_cfg.headers.get("X-Organization").map(|s| s.as_str()),
+                    Some("Acme")
+                );
             }
             other => panic!("unhandled canonical TOML id '{other}'"),
         }
