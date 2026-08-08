@@ -2336,7 +2336,14 @@ impl Config {
         Ok((config, unrecognized_keys))
     }
     pub fn new_from_toml_cfg(raw_config: &toml::Value) -> Result<Self, String> {
-        let raw_config = &Self::expand_auth_alias(raw_config);
+        let raw_config_with_project_models = if let Ok(cwd) = std::env::current_dir() {
+            let project_trusted = crate::agent::folder_trust::project_scope_allowed(&cwd);
+            crate::config::merge_project_model_sections(raw_config, &cwd, project_trusted)
+        } else {
+            raw_config.clone()
+        };
+        let raw_config_with_alias = Self::expand_auth_alias(&raw_config_with_project_models);
+        let raw_config = &raw_config_with_alias;
         let super::config_model_override_parse::ParsedModelOverrides {
             models: mut config_models,
             warnings: config_warnings,
