@@ -186,8 +186,15 @@ jobs:
         with:
           toolchain: "1.94.0"
 
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # `ripgrep` is a runtime dependency of the grep tool, not a convenience:
+      # `rg_path()` falls back to a bare `rg` on PATH when the crate is built
+      # without `bundle_rg`, and a failed spawn surfaces as exit code -1 with
+      # empty output. This job never needed it until the upstream sync brought
+      # the `implementations::` filter that runs those tests, at which point 44
+      # of them failed here and passed on a developer machine — because
+      # developer machines have `rg`.
+      - name: Install protoc and ripgrep
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler ripgrep
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
