@@ -858,13 +858,30 @@ impl ModelOverrideConfig {
         if let Some(v) = cli_session_summary_model {
             result.session_summary = non_empty_model_override(Some(v));
         }
+        // One rule for every auxiliary lane: an unset lane follows the
+        // configured default model before it falls back to a compiled
+        // constant. `web_search` already did this (above); these two jumped
+        // straight to `default_models.json`, every entry of which is xAI, so
+        // a Codex-only user silently routed summaries and image descriptions
+        // to a provider they may hold no credential for (#269).
+        //
+        // `prompt_suggestion` is deliberately not included: its consumer
+        // (`views::prompt_suggestion::resolve_model`) only returns a model
+        // that is actually in the catalog and otherwise returns `None`, so
+        // it already fails safe. Pinning it here would turn "stay quiet"
+        // into "ask the default model", which is a product decision, not
+        // this bug.
+        let configured_default = local_default
+            .clone()
+            .or_else(|| remote.and_then(|r| non_empty_model_override(r.default_model.as_deref())));
         if result.session_summary.is_none() {
-            result.session_summary =
-                Some(crate::models::default_session_summary_model().to_owned());
+            result.session_summary = configured_default
+                .clone()
+                .or_else(|| Some(crate::models::default_session_summary_model().to_owned()));
         }
         if result.image_description.is_none() {
-            result.image_description =
-                Some(crate::models::default_image_description_model().to_owned());
+            result.image_description = configured_default
+                .or_else(|| Some(crate::models::default_image_description_model().to_owned()));
         }
         result
     }

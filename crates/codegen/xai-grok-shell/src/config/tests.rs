@@ -1671,6 +1671,79 @@ fn model_overrides_default_session_summary_is_grok_build() {
     );
 }
 #[test]
+fn model_overrides_unset_auxiliary_lanes_follow_the_local_configured_default() {
+    with_model_overrides_env(
+        None,
+        None,
+        None,
+        || {
+            let config: toml::Value = toml::from_str(
+                    r#"
+                [models]
+                default = "gpt-5.3-codex-spark"
+                "#,
+                )
+                .unwrap();
+            let cfg = ModelOverrideConfig::resolve(None, None, &config, None);
+            // The point of the test: a Codex-only user must not have these
+            // two lanes silently resolve to the compiled xAI constant.
+            assert_eq!(cfg.session_summary, Some("gpt-5.3-codex-spark".to_owned()));
+            assert_eq!(
+                cfg.image_description,
+                Some("gpt-5.3-codex-spark".to_owned())
+            );
+            assert_eq!(cfg.web_search, "gpt-5.3-codex-spark".to_owned());
+            assert_ne!(
+                cfg.session_summary.as_deref(),
+                Some(crate::models::default_session_summary_model()),
+                "the compiled default is xAI; following it is the bug"
+            );
+        },
+    );
+}
+#[test]
+fn model_overrides_unset_auxiliary_lanes_follow_the_remote_configured_default() {
+    with_model_overrides_env(
+        None,
+        None,
+        None,
+        || {
+            let empty = toml::Value::Table(toml::map::Map::new());
+            let remote = crate::util::config::RemoteSettings {
+                default_model: Some("remote-default".to_owned()),
+                ..Default::default()
+            };
+            let cfg = ModelOverrideConfig::resolve(None, None, &empty, Some(&remote));
+            assert_eq!(cfg.session_summary, Some("remote-default".to_owned()));
+            assert_eq!(cfg.image_description, Some("remote-default".to_owned()));
+        },
+    );
+}
+#[test]
+fn model_overrides_a_configured_default_does_not_pin_prompt_suggestion() {
+    with_model_overrides_env(
+        None,
+        None,
+        None,
+        || {
+            let config: toml::Value = toml::from_str(
+                    r#"
+                [models]
+                default = "gpt-5.3-codex-spark"
+                "#,
+                )
+                .unwrap();
+            let cfg = ModelOverrideConfig::resolve(None, None, &config, None);
+            // Deliberate exclusion, pinned so it cannot be "tidied up" into
+            // the rule later: the consumer only returns a model that is in
+            // the catalog and otherwise returns None, so this lane already
+            // fails safe. Pinning it here would turn "stay quiet" into
+            // "ask the default model".
+            assert_eq!(cfg.prompt_suggestion, PromptSuggestModelPin::Unpinned);
+        },
+    );
+}
+#[test]
 fn model_overrides_local_session_summary_wins_over_remote() {
     with_model_overrides_env(
         None,
