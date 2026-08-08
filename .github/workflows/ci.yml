@@ -699,6 +699,12 @@ jobs:
             dashboard_confirm_worktree_refused_pick_mirrors_error_toast -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             dashboard_new_agent_button_refused_pick_toast_follows_the_view -- --nocapture
+          # `xai-fsnotify` had no filter at all, so nothing in it ran in CI --
+          # including the checkout classifier that decides where the file
+          # watcher stops. That is why #278 shipped: the test which catches it
+          # was never executed anywhere except a developer's macOS machine.
+          run_nonzero -p xai-fsnotify --lib \
+            checkout:: -- --nocapture
 
       # #159: a runtime-only model was judged absent by a config-only lookup,
       # and the turn stripped its credentials. Filters written out rather than
