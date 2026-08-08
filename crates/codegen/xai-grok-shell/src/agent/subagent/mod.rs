@@ -926,7 +926,11 @@ async fn read_parent_sampling_config(
                     .model_compaction_at_tokens(ctx.model_id.0.as_ref()),
                 doom_loop_recovery: ctx.sampling_config.doom_loop_recovery,
                 header_injector: ctx.sampling_config.header_injector.clone(),
-                codex_wire: ctx.sampling_config.codex_wire.clone(),
+                // Resolved from the subagent's own model, like the three
+                // catalog lookups above — not copied from the parent's
+                // config, whose `codex_wire` belongs to whatever model the
+                // parent is running (#277).
+                codex_wire: ctx.models_manager.model_codex_wire(ctx.model_id.0.as_ref()),
             };
             let model_id = ctx.model_id.clone();
             let global_model_id = ctx.models_manager.current_model_id();

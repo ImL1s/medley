@@ -669,6 +669,24 @@ impl ModelsManager {
             .unwrap_or(false)
     }
 
+    /// Catalog wire capabilities for one model.
+    ///
+    /// Read this instead of copying `codex_wire` off a `SamplingConfig`: the
+    /// config's copy belongs to whichever model was selected when it was
+    /// built, which is not necessarily the model about to be sampled (#245,
+    /// #277).
+    pub(crate) fn model_codex_wire(
+        &self,
+        model_id: &str,
+    ) -> Option<xai_grok_sampling_types::CodexWireCapabilities> {
+        self.inner
+            .catalog
+            .read()
+            .models
+            .get(model_id)
+            .and_then(|e| e.info().codex_wire.clone())
+    }
+
     pub(crate) fn model_compactions_remaining(
         &self,
         model_id: &str,

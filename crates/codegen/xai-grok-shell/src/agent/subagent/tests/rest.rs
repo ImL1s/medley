@@ -2210,6 +2210,38 @@ async fn read_parent_sampling_config_resolves_backend_search_from_catalog() {
         );
 }
 #[tokio::test]
+async fn read_parent_sampling_config_resolves_codex_wire_from_the_catalog_not_the_parent() {
+    // The two values must DIFFER or this test passes without proving
+    // anything — the parent and a subagent usually run the same model,
+    // which is exactly why #277 sat unnoticed.
+    //
+    // The asymmetry is real: `supports_reasoning_summary_parameter` is
+    // `Some(false)` for Spark, which rejects `reasoning.summary`, and
+    // `Some(true)` for the Sol preset, which accepts it. A subagent handed
+    // the parent's capabilities sends a field its own model rejects.
+    let child_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let parent_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut entry = test_model_entry("grok-4.5");
+    entry.info.codex_wire = Some(child_caps.clone());
+    let mut models = indexmap::IndexMap::new();
+    models.insert("auto".to_string(), entry);
+    let mut ctx = ctx_with_parent_chat_state("auto", "grok-4.5", "auto", models);
+    ctx.sampling_config.codex_wire = Some(parent_caps);
+    let (config, _model_id) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(
+        config.codex_wire,
+        Some(child_caps),
+        "the subagent's wire capabilities must come from its own catalog \
+         entry, not from whatever model the parent happened to be running"
+    );
+}
+#[tokio::test]
 async fn read_parent_sampling_config_fallback_resolves_backend_search_from_catalog() {
     let mut entry = test_model_entry("composer-2-fast");
     entry.info.supports_backend_search = true;
