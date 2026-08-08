@@ -1,0 +1,215 @@
+name: Medley Project bootstrap bridge (ephemeral)
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches: [providers]
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: medley-project-bootstrap-247
+  cancel-in-progress: true
+
+jobs:
+  bootstrap:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'automation/medley-project-247-20260808'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Create and seed personal Project v2
+        shell: bash
+        env:
+          AUTOMATION_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: "247"
+          EXPECTED_LOGIN: "ImL1s"
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BOOTSTRAP_BRANCH: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          set +x
+          umask 077
+          export GH_TOKEN="$AUTOMATION_TOKEN"
+
+          cleanup_files() {
+            rm -f \
+              /tmp/medley-project-private.pem \
+              /tmp/medley-project-public.pem \
+              /tmp/medley-project-token.enc \
+              /tmp/medley-project-token.txt \
+              /tmp/medley-project-head-workflow.yml \
+              /tmp/medley-project-setup.b64 \
+              /tmp/medley-project-setup.py.gz \
+              /tmp/medley-project-setup.py \
+              /tmp/medley-project-setup.out \
+              /tmp/medley-project-setup.err
+          }
+          trap cleanup_files EXIT
+
+          nonce="$(openssl rand -hex 20)"
+          key_marker="<!-- medley-project-bootstrap-key:${nonce} -->"
+          envelope_marker="<!-- medley-project-bootstrap-envelope:${nonce} -->"
+
+          openssl genpkey \
+            -algorithm RSA \
+            -pkeyopt rsa_keygen_bits:4096 \
+            -out /tmp/medley-project-private.pem \
+            >/dev/null 2>&1
+          openssl pkey \
+            -in /tmp/medley-project-private.pem \
+            -pubout \
+            -out /tmp/medley-project-public.pem \
+            >/dev/null 2>&1
+          public_key_b64="$(base64 -w0 /tmp/medley-project-public.pem)"
+
+          request_body="$(jq -rn \
+            --arg marker "$key_marker" \
+            --arg nonce "$nonce" \
+            --arg public_key "$public_key_b64" \
+            '$marker + "\nNonce: `" + $nonce + "`\nPublic key (base64 PEM):\n`" + $public_key + "`\n\nThis key is ephemeral and valid only while this workflow run is waiting."')"
+          request_comment_json="$(gh api -X POST \
+            "repos/$REPO/issues/$ISSUE_NUMBER/comments" \
+            -f body="$request_body")"
+          request_comment_id="$(jq -r '.id' <<<"$request_comment_json")"
+
+          envelope_comment_id=""
+          encrypted_token_b64=""
+          for _ in $(seq 1 40); do
+            comments="$(gh api "repos/$REPO/issues/$ISSUE_NUMBER/comments?per_page=100")"
+            match="$(jq -r \
+              --arg login "$EXPECTED_LOGIN" \
+              --arg marker "$envelope_marker" \
+              '.[]
+               | select(.user.login == $login)
+               | select(.body | startswith($marker + "\n"))
+               | [.id, (.body | split("\n")[1])]
+               | @tsv' \
+              <<<"$comments" | tail -n 1)"
+            if [[ -n "$match" ]]; then
+              envelope_comment_id="${match%%$'\t'*}"
+              encrypted_token_b64="${match#*$'\t'}"
+              break
+            fi
+            sleep 15
+          done
+
+          if [[ -z "$envelope_comment_id" || -z "$encrypted_token_b64" ]]; then
+            gh api -X POST \
+              "repos/$REPO/issues/$ISSUE_NUMBER/comments" \
+              -f body="Project bootstrap timed out waiting for the encrypted token envelope." \
+              >/dev/null
+            exit 1
+          fi
+
+          printf '%s' "$encrypted_token_b64" \
+            | base64 -d \
+            > /tmp/medley-project-token.enc 2>/dev/null || {
+              gh api -X POST \
+                "repos/$REPO/issues/$ISSUE_NUMBER/comments" \
+                -f body="Project bootstrap received an invalid encrypted envelope." \
+                >/dev/null
+              exit 1
+            }
+          openssl pkeyutl -decrypt \
+            -inkey /tmp/medley-project-private.pem \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256 \
+            -in /tmp/medley-project-token.enc \
+            -out /tmp/medley-project-token.txt \
+            2>/dev/null || {
+              gh api -X POST \
+                "repos/$REPO/issues/$ISSUE_NUMBER/comments" \
+                -f body="Project bootstrap could not decrypt the one-time token envelope." \
+                >/dev/null
+              exit 1
+            }
+
+          project_token="$(tr -d '\r\n' < /tmp/medley-project-token.txt)"
+          case "$project_token" in
+            ghp_*|github_pat_*) ;;
+            *)
+              gh api -X POST \
+                "repos/$REPO/issues/$ISSUE_NUMBER/comments" \
+                -f body="Project bootstrap decrypted a value that is not a recognized GitHub PAT." \
+                >/dev/null
+              exit 1
+              ;;
+          esac
+
+          gh api \
+            "repos/$REPO/contents/.github/workflows/medley-project-bootstrap.yml?ref=$HEAD_SHA" \
+            --jq '.content' \
+            | tr -d '\n' \
+            | base64 -d \
+            > /tmp/medley-project-head-workflow.yml
+
+          awk '
+            /^H4sI/ { capture = 1 }
+            /^MEDLEY_SETUP_B64$/ { capture = 0 }
+            capture { print }
+          ' /tmp/medley-project-head-workflow.yml \
+            > /tmp/medley-project-setup.b64
+
+          [[ -s /tmp/medley-project-setup.b64 ]] || {
+            gh api -X POST \
+              "repos/$REPO/issues/$ISSUE_NUMBER/comments" \
+              -f body="Project bootstrap could not recover the embedded setup payload." \
+              >/dev/null
+            exit 1
+          }
+
+          base64 -d /tmp/medley-project-setup.b64 \
+            > /tmp/medley-project-setup.py.gz
+          gzip -d -c /tmp/medley-project-setup.py.gz \
+            > /tmp/medley-project-setup.py
+          python3 -m py_compile /tmp/medley-project-setup.py
+
+          set +e
+          GH_TOKEN="$project_token" \
+            python3 /tmp/medley-project-setup.py \
+            > /tmp/medley-project-setup.out \
+            2> /tmp/medley-project-setup.err
+          setup_status=$?
+          set -e
+
+          if [[ $setup_status -ne 0 ]]; then
+            safe_error="$(tail -n 30 /tmp/medley-project-setup.err \
+              | sed "s/$project_token/[REDACTED]/g")"
+            failure_body="$(jq -rn \
+              --arg error "$safe_error" \
+              '"Project bootstrap failed while calling GitHub Projects v2.\n\n```text\n" + $error + "\n```"')"
+            GH_TOKEN="$AUTOMATION_TOKEN" gh api -X POST \
+              "repos/$REPO/issues/$ISSUE_NUMBER/comments" \
+              -f body="$failure_body" \
+              >/dev/null
+            exit "$setup_status"
+          fi
+
+          project_url="$(grep -E \
+            '^https://github.com/users/ImL1s/projects/[0-9]+$' \
+            /tmp/medley-project-setup.out \
+            | tail -n 1)"
+          [[ -n "$project_url" ]] || \
+            project_url="https://github.com/users/ImL1s/projects"
+          success_body="$(jq -rn \
+            --arg url "$project_url" \
+            '"Medley Product Roadmap has been created and seeded: " + $url + "\n\nConfigured: linked repository, Status/Workstream/Phase/Platform fields, initial issue portfolio, field values, native sub-issue relationships, and initial status update. Saved views and built-in Project workflows remain the UI-only checklist in #247."')"
+          GH_TOKEN="$AUTOMATION_TOKEN" gh api -X POST \
+            "repos/$REPO/issues/$ISSUE_NUMBER/comments" \
+            -f body="$success_body" \
+            >/dev/null
+
+          GH_TOKEN="$AUTOMATION_TOKEN" gh api -X DELETE \
+            "repos/$REPO/issues/comments/$envelope_comment_id" \
+            >/dev/null 2>&1 || true
+          GH_TOKEN="$AUTOMATION_TOKEN" gh api -X DELETE \
+            "repos/$REPO/issues/comments/$request_comment_id" \
+            >/dev/null 2>&1 || true
+          GH_TOKEN="$AUTOMATION_TOKEN" gh api -X DELETE \
+            "repos/$REPO/git/refs/heads/$BOOTSTRAP_BRANCH" \
+            >/dev/null 2>&1 || true
