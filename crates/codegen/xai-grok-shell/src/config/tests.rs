@@ -1735,10 +1735,12 @@ fn model_overrides_a_configured_default_does_not_pin_prompt_suggestion() {
                 .unwrap();
             let cfg = ModelOverrideConfig::resolve(None, None, &config, None);
             // Deliberate exclusion, pinned so it cannot be "tidied up" into
-            // the rule later: the consumer only returns a model that is in
-            // the catalog and otherwise returns None, so this lane already
-            // fails safe. Pinning it here would turn "stay quiet" into
-            // "ask the default model".
+            // the rule later. `helpers::prompt_suggest` documents this lane
+            // as "deliberately NOT a session-model fallback", and the
+            // configured default is usually the session model — so feeding
+            // it in would break the lane's own stated contract on every
+            // turn. Its gate, `effective_suggest_model`, already drops the
+            // request when the model is absent from the catalog.
             assert_eq!(cfg.prompt_suggestion, PromptSuggestModelPin::Unpinned);
         },
     );

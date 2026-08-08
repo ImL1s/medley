@@ -865,12 +865,20 @@ impl ModelOverrideConfig {
         // a Codex-only user silently routed summaries and image descriptions
         // to a provider they may hold no credential for (#269).
         //
-        // `prompt_suggestion` is deliberately not included: its consumer
-        // (`views::prompt_suggestion::resolve_model`) only returns a model
-        // that is actually in the catalog and otherwise returns `None`, so
-        // it already fails safe. Pinning it here would turn "stay quiet"
-        // into "ask the default model", which is a product decision, not
-        // this bug.
+        // `prompt_suggestion` is deliberately not included, for a reason
+        // its own lane already documents: it is "deliberately NOT a
+        // session-model fallback" (`helpers::prompt_suggest`) and "the
+        // session model is never used: a per-turn background call must stay
+        // on the small model" (`acp_session_impl::recap`). Feeding the
+        // configured default into it would do exactly what both forbid, on
+        // every turn.
+        //
+        // It also does not have this bug to fix. The gate is
+        // `helpers::prompt_suggest::effective_suggest_model`, which drops
+        // the request entirely when the model is not in the catalog, and
+        // `grok-build-0.1` only reaches the catalog through the xAI
+        // prefetch — which a user without xAI credentials never runs. So a
+        // Codex-only user is already silent here rather than misrouted.
         let configured_default = local_default
             .clone()
             .or_else(|| remote.and_then(|r| non_empty_model_override(r.default_model.as_deref())));
