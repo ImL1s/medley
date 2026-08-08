@@ -86,13 +86,15 @@ To send provider-specific non-secret headers -- for example, Anthropic's `anthro
 
 ## Configuring Custom Models
 
-Add custom model endpoints in `~/.medley/config.toml` under `[model.<name>]` sections.
+Add custom model endpoints under `[model.<name>]` sections.
 
-Model entries load from that **global** file only. A `[model.*]` or
-`[model_providers.*]` block in a project-local `.grok/config.toml` has no
-effect — the project tier contributes MCP servers, plugins, and permissions
-only. Grok warns at session start and lists the file under Config Warnings in
-`grok inspect` when it finds one.
+You can define them globally in `~/.medley/config.toml` and/or per-project in
+`.grok/config.toml`. Project `[models]` and `[model.*]` sections merge over the
+global config (repo root to cwd; closer files win) **when the workspace is
+trusted**. In an untrusted clone, project model sections are ignored.
+
+`[model_providers.*]` remains global-only. A project-local
+`[model_providers.*]` block is ignored and reported in config warnings.
 
 ```toml
 [model.my-model]

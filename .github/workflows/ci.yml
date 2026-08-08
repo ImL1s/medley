@@ -274,6 +274,12 @@ jobs:
             strict_read_uses_open_file_handle_when_path_is_swapped_after_open -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             strict_atomic_write_fails_when_post_rename_permission_assertion_fails -- --nocapture
+          # #56: trusted project [models]/[model.*] precedence + untrusted
+          # hostile-model boundary (no credential/env-key/origin injection).
+          run_nonzero -p xai-grok-shell --lib \
+            project_model_overlay_precedence_merges_global_repo_and_subdir_sections -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            project_model_overlay_untrusted_repo_cannot_introduce_or_redirect_credentials -- --nocapture
           run_nonzero -p xai-grok-mcp --lib \
             callback_payload_debug_never_emits_code_state_or_issuer -- --nocapture
           run_nonzero -p xai-file-utils --lib \
@@ -427,6 +433,10 @@ jobs:
             unavailable_handlers_are_absent_from_publish_and_dispatch -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
             dispatch_configure_mcp -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            repo_configs_present_detects_grok_config_models -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            repo_configs_present_false_for_empty_models_tables -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
             qualified_handler_fails_closed_when_session_generation_expires -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
