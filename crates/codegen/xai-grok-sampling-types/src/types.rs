@@ -1078,6 +1078,15 @@ pub enum EndpointTrustClass {
     External,
     /// A loopback endpoint (local model runtimes).
     Local,
+    /// A non-xAI origin the user explicitly declared trusted for their ambient
+    /// xAI credential (`trusted_xai_origins` in the user-tier config, #123).
+    ///
+    /// Narrower than [`Self::FirstPartyXai`] on purpose: the ambient credential
+    /// may be attached (and the session bearer refreshed), but identity headers
+    /// (`x-grok-user-id` / `x-grok-deployment-id`) stay off and the external
+    /// metadata boundary keeps stripping `x-grok-*` / `x-xai-*` — the user
+    /// trusted the origin with a credential, not with their account identity.
+    UserDeclared,
 }
 
 /// Which credential source won resolution for a model route (#110).

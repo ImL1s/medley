@@ -1491,12 +1491,21 @@ pub use xai_grok_workspace::project_config::find_project_configs;
 /// so model entries written there are inert. Project-scoped model support is
 /// tracked separately; until it lands, the only fix is moving them to the
 /// global config, which is what [`warn_inert_project_model_sections`] says.
+/// `trusted_xai_origins` (#123) is listed for the same reason and with the
+/// same fix — and doubly so because a trust declaration that arrives with a
+/// cloned repo must never be honoured: it is a trust decision only the local
+/// user tier can make.
 /// Each pair is the TOML key and how it is written in prose: `[models]` is a
-/// flat table, the other two are tables of entries.
-pub const PROJECT_INERT_MODEL_SECTIONS: [(&str, &str); 3] = [
+/// flat table, `model` / `model_providers` are tables of entries, and
+/// `trusted_xai_origins` is a flat array of origin strings.
+pub const PROJECT_INERT_MODEL_SECTIONS: [(&str, &str); 4] = [
     ("model", "[model.*]"),
     ("models", "[models]"),
     ("model_providers", "[model_providers.*]"),
+    (
+        crate::agent::trusted_origins::TRUSTED_XAI_ORIGINS_KEY,
+        "[trusted_xai_origins]",
+    ),
 ];
 /// One entry per project `.grok/config.toml` at or above `cwd` that declares a
 /// section from [`PROJECT_INERT_MODEL_SECTIONS`], naming the sections it

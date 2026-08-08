@@ -861,7 +861,16 @@ impl SamplingClient {
         // The message names no secret: a refusal that prints what it refused
         // has not refused anything.
         let ambient_origin_allowed = match config.endpoint_trust {
-            Some(trust) => trust == EndpointTrustClass::FirstPartyXai,
+            Some(EndpointTrustClass::FirstPartyXai) => true,
+            // #123: a user-declared trusted origin may receive a *labelled*
+            // ambient credential, but only over actually-https — recomputed
+            // here from the URL, so a smuggled label cannot push a session
+            // bearer over cleartext. (The unlabelled-material guard below
+            // stays strictly first-party-xAI either way.)
+            Some(EndpointTrustClass::UserDeclared) => {
+                reqwest::Url::parse(&config.base_url).is_ok_and(|url| url.scheme() == "https")
+            }
+            Some(_) => false,
             None => {
                 is_first_party
                     && reqwest::Url::parse(&config.base_url)
@@ -3296,6 +3305,115 @@ mod tests {
             ..minimal_config()
         })
         .expect("an ambient credential on a first-party origin is the normal flow");
+    }
+
+    /// #123: a user-declared trusted origin (`trusted_xai_origins` in local
+    /// config) may receive a *labelled* ambient credential — that is the whole
+    /// grant. The declaration is honoured only over actually-https, recomputed
+    /// from the URL at this layer, so a label smuggled onto a cleartext route
+    /// still refuses with the #110 refusal.
+    ///
+    /// Mutation: drop the `Some(EndpointTrustClass::UserDeclared)` arm in
+    /// `SamplingClient::new` (first half fails) or drop its https re-check
+    /// (second half fails).
+    #[test]
+    fn user_declared_trust_allows_labelled_ambient_only_over_https() {
+        use crate::config::{CredentialSource, EndpointTrustClass};
+        SamplingClient::new(SamplerConfig {
+            api_key: Some("XAI_SESSION_SENTINEL".to_string()),
+            base_url: "https://gateway.internal/v1".to_string(),
+            credential_source: Some(CredentialSource::XaiSession),
+            endpoint_trust: Some(EndpointTrustClass::UserDeclared),
+            ..minimal_config()
+        })
+        .expect("a labelled ambient credential on a user-declared https origin constructs");
+
+        let err = SamplingClient::new(SamplerConfig {
+            api_key: Some("XAI_SESSION_SENTINEL".to_string()),
+            base_url: "http://gateway.internal/v1".to_string(),
+            credential_source: Some(CredentialSource::XaiSession),
+            endpoint_trust: Some(EndpointTrustClass::UserDeclared),
+            ..minimal_config()
+        })
+        .expect_err("a declared trust label must never carry a bearer over cleartext");
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains(super::AMBIENT_XAI_NON_FIRST_PARTY_REFUSAL),
+            "expected the ambient-origin refusal, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("SENTINEL"),
+            "the error leaked the credential: {rendered}"
+        );
+    }
+
+    /// #123: the declaration widens *credential* trust only. Unlabelled bound
+    /// material on a declared origin is still the #151 residual and still
+    /// refused — the #136 provenance guard recomputes first-partiness from the
+    /// URL and does not consult the label.
+    ///
+    /// Mutation: make the `credential_source: None` provenance arm honour
+    /// `endpoint_trust` and this constructs instead of refusing.
+    #[test]
+    fn user_declared_trust_does_not_smuggle_unlabelled_material() {
+        use crate::config::EndpointTrustClass;
+        let err = SamplingClient::new(SamplerConfig {
+            api_key: Some("unlabelled-key".to_string()),
+            base_url: "https://gateway.internal/v1".to_string(),
+            credential_source: None,
+            endpoint_trust: Some(EndpointTrustClass::UserDeclared),
+            auth_scheme: AuthScheme::Bearer,
+            ..minimal_config()
+        })
+        .expect_err(
+            "unlabelled bound auth must refuse even on a declared origin (Value withheld.)",
+        );
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains(super::CREDENTIAL_PROVENANCE_REQUIRED_REFUSAL),
+            "expected provenance-required refusal, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("unlabelled-key"),
+            "the error leaked the credential: {rendered}"
+        );
+    }
+
+    /// #123: `UserDeclared` is deliberately narrower than `FirstPartyXai` —
+    /// the declared origin gets the ambient credential, but not xAI identity
+    /// headers, and the external metadata boundary keeps stripping `x-grok-*`
+    /// / `x-xai-*`. The user trusted the origin with a credential, not with
+    /// their account identity.
+    ///
+    /// Mutation: include `UserDeclared` in `sends_xai_identity_headers` (or in
+    /// the `is_first_party` derivation) and this goes green on the first-party
+    /// behaviour instead.
+    #[test]
+    fn user_declared_trust_keeps_external_metadata_boundary() {
+        use crate::config::EndpointTrustClass;
+        let mut config = boundary_config("https://gateway.internal/v1");
+        config.endpoint_trust = Some(EndpointTrustClass::UserDeclared);
+        let client = SamplingClient::new(config).expect("build");
+        assert!(
+            !client.sends_xai_identity_headers(),
+            "a user-declared origin is not first-party: no identity headers"
+        );
+        let req = client
+            .post("https://gateway.internal/v1/chat/completions")
+            .0
+            .build()
+            .expect("build request");
+        for name in INTERNAL_METADATA {
+            assert!(
+                req.headers().get(name).is_none(),
+                "user-declared endpoint must not receive {name}"
+            );
+        }
+        assert_eq!(
+            req.headers()[AUTHORIZATION],
+            "Bearer test-key",
+            "the credential itself is the one thing the declaration forwards"
+        );
     }
 
     /// #136 step 4: bound auth on a non-first-party origin with no provenance

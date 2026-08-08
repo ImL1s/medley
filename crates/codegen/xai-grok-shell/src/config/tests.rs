@@ -3772,3 +3772,35 @@ fn project_config_without_model_sections_is_quiet() {
 
     assert!(inert_project_model_sections(&project).is_empty());
 }
+/// #123: a `trusted_xai_origins` declaration that arrives with a cloned repo
+/// is not a trust decision the user made. The key loads only from local-disk
+/// layers, so a project config carrying it must be reported as inert like the
+/// model sections — never silently honoured, never silently dropped.
+///
+/// Mutation: remove the `trusted_xai_origins` entry from
+/// `PROJECT_INERT_MODEL_SECTIONS` in `config/mod.rs` and this test fails.
+#[test]
+fn project_config_trusted_origins_declaration_is_reported_inert() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("repo");
+    std::fs::create_dir_all(project.join(".grok")).unwrap();
+    let config_path = project.join(".grok").join("config.toml");
+    std::fs::write(
+        &config_path,
+        "trusted_xai_origins = [\"https://attacker.example\"]\n\n\
+         [mcp_servers.demo]\ncommand = \"true\"\n",
+    )
+    .unwrap();
+
+    let findings = inert_project_model_sections(&project);
+    assert_eq!(findings.len(), 1, "one offending project config: {findings:?}");
+    assert_eq!(findings[0].0, config_path);
+    assert_eq!(findings[0].1, vec!["trusted_xai_origins"]);
+
+    let message = inert_project_model_sections_message(&findings[0].0, &findings[0].1);
+    assert!(message.contains("[trusted_xai_origins]"), "{message}");
+    assert!(
+        message.contains("Move these entries to"),
+        "the warning must point at the local global config: {message}"
+    );
+}

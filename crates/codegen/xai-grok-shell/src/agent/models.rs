@@ -1079,6 +1079,7 @@ impl ModelsManager {
                 config.endpoints.deployment_key.as_deref(),
             ),
             None,
+            &crate::agent::trusted_origins::TrustedXaiOrigins::load(),
         );
         // #110 / #131: this is not only a startup snapshot. When the session
         // path cannot resolve a model id it clones this config verbatim

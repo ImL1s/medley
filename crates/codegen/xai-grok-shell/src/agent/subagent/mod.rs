@@ -1026,6 +1026,7 @@ fn resolve_model_override_to_config(
         ctx.sampling_config.client_version.clone(),
         ctx.sampling_config.deployment_id.clone(),
         ctx.sampling_config.user_id.clone(),
+        &crate::agent::trusted_origins::TrustedXaiOrigins::load(),
     );
     config.bearer_resolver = if entry.info.auth_scheme != xai_grok_sampler::AuthScheme::None
         && !ctx.would_strip_fallback_key(config.api_key.as_deref())
