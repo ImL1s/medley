@@ -635,6 +635,30 @@ jobs:
           cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
             preferred_model_persist_failure -- --nocapture
 
+      - name: 'Orphaned switch transaction via synthesized switch (issue #239)'
+        env:
+          PROTOC: protoc
+        run: |
+          # The stricter of the two `run_nonzero` shapes in this file: it reads
+          # cargo's own status out of PIPESTATUS before looking at the output.
+          # The grep-only shape cannot tell a failing run from a passing one
+          # when an invocation names more than one target -- one binary's
+          # `ok. N passed` line satisfies it while another binary failed.
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
+            synthesized_switch_does_not_clear_transaction_with_live_request_id -- --nocapture
+
       # #170: the dashboard's mirror obligations. A refused pre-session pick
       # completes with a toast on the new agent; whenever the view stays on
       # the dashboard the caller must mirror it onto the dashboard's error
