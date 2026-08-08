@@ -2266,6 +2266,101 @@ async fn read_parent_sampling_config_fallback_resolves_backend_search_from_catal
             "fallback path should also resolve backend-tools capability from the catalog"
         );
 }
+/// The fallback path (parent chat-state unavailable) re-resolves the other
+/// three catalog facts, so it must re-resolve this one too — the live-path
+/// test alone left half the surface uncovered.
+#[tokio::test]
+async fn read_parent_sampling_config_fallback_resolves_codex_wire_from_catalog() {
+    let child_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let parent_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut entry = test_model_entry("composer-2-fast");
+    entry.info.codex_wire = Some(child_caps.clone());
+    let mut models = indexmap::IndexMap::new();
+    models.insert("composer-2-fast".to_string(), entry);
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.model_id = acp::ModelId::new("composer-2-fast");
+    ctx.parent_chat_state = None;
+    ctx.sampling_config.model = "composer-2-fast".to_string();
+    ctx.sampling_config.codex_wire = Some(parent_caps);
+    ctx.models_manager = crate::agent::models::ModelsManager::new(
+        None,
+        models,
+        acp::ModelId::new("composer-2-fast"),
+        ctx.auth_manager.clone(),
+        crate::agent::config::Config::default(),
+    );
+    let (config, _model_id) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(
+        config.codex_wire,
+        Some(child_caps),
+        "the fallback path must resolve wire capabilities from the catalog too"
+    );
+}
+
+/// A catalog miss is not always "no capabilities". A runtime-only model
+/// (#159) can be absent from the config-derived catalog while the subagent
+/// inherits the parent's model, and returning `None` would silently strip
+/// capabilities the parent legitimately had.
+#[tokio::test]
+async fn read_parent_sampling_config_catalog_miss_keeps_parent_wire_for_the_same_model() {
+    let parent_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.model_id = acp::ModelId::new("runtime-only-model");
+    ctx.parent_chat_state = None;
+    ctx.sampling_config.model = "runtime-only-model".to_string();
+    ctx.sampling_config.codex_wire = Some(parent_caps.clone());
+    ctx.models_manager = crate::agent::models::ModelsManager::new(
+        None,
+        indexmap::IndexMap::new(),
+        acp::ModelId::new("runtime-only-model"),
+        ctx.auth_manager.clone(),
+        crate::agent::config::Config::default(),
+    );
+    let (config, _model_id) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(
+        config.codex_wire,
+        Some(parent_caps),
+        "same model, catalog miss: the parent's value is the right one"
+    );
+}
+
+/// ...but that fallback must not become a back door to #277. When the
+/// models differ, a catalog miss yields `None` rather than the parent's
+/// capabilities, which are exactly what must not be inherited.
+#[tokio::test]
+async fn read_parent_sampling_config_catalog_miss_never_inherits_wire_across_models() {
+    let parent_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.model_id = acp::ModelId::new("a-different-model");
+    ctx.parent_chat_state = None;
+    ctx.sampling_config.model = "the-parents-model".to_string();
+    ctx.sampling_config.codex_wire = Some(parent_caps);
+    ctx.models_manager = crate::agent::models::ModelsManager::new(
+        None,
+        indexmap::IndexMap::new(),
+        acp::ModelId::new("a-different-model"),
+        ctx.auth_manager.clone(),
+        crate::agent::config::Config::default(),
+    );
+    let (config, _model_id) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(
+        config.codex_wire, None,
+        "different model: no capabilities beats the wrong model's capabilities"
+    );
+}
+
 #[tokio::test]
 async fn read_parent_sampling_config_resolves_compactions_remaining_from_catalog() {
     use xai_grok_sampling_types::CompactionsRemaining;

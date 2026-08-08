@@ -930,7 +930,7 @@ async fn read_parent_sampling_config(
                 // catalog lookups above — not copied from the parent's
                 // config, whose `codex_wire` belongs to whatever model the
                 // parent is running (#277).
-                codex_wire: ctx.models_manager.model_codex_wire(ctx.model_id.0.as_ref()),
+                codex_wire: subagent_codex_wire(ctx),
             };
             let model_id = ctx.model_id.clone();
             let global_model_id = ctx.models_manager.current_model_id();
@@ -989,7 +989,34 @@ async fn read_parent_sampling_config(
     fallback.compaction_at_tokens = ctx
         .models_manager
         .model_compaction_at_tokens(ctx.model_id.0.as_ref());
+    // The three lines above already re-resolve catalog facts here;
+    // `codex_wire` is one too, and cloning the parent's would reintroduce
+    // #277 on the path taken whenever the parent's chat-state actor is
+    // unavailable — which `try_build_subagent_spawn_context` does not bail
+    // on, so a nested child outliving its parent lands here for real.
+    fallback.codex_wire = subagent_codex_wire(ctx);
     (fallback, ctx.model_id.clone())
+}
+
+/// Wire capabilities for the subagent's **own** model.
+///
+/// Falls back to the parent's value only when the subagent is running the
+/// same model. A catalog miss is not always "no capabilities": a
+/// runtime-only model (#159) can be absent from the config-derived catalog
+/// while the subagent inherits the parent's model, and returning `None`
+/// there would silently strip capabilities the parent legitimately had.
+/// When the models differ, the parent's value is precisely what #277 says
+/// not to use, so there is no fallback.
+fn subagent_codex_wire(
+    ctx: &SubagentSpawnContext,
+) -> Option<xai_grok_sampling_types::CodexWireCapabilities> {
+    ctx.models_manager
+        .model_codex_wire(ctx.model_id.0.as_ref())
+        .or_else(|| {
+            (ctx.sampling_config.model.as_str() == ctx.model_id.0.as_ref())
+                .then(|| ctx.sampling_config.codex_wire.clone())
+                .flatten()
+        })
 }
 /// `AuthType` for a subagent: BYOK ⇒ `ApiKey` (don't overwrite the BYOK
 /// key); session-based ACP method ⇒ `SessionToken` (keep refresh wired);
