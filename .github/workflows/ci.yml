@@ -456,16 +456,27 @@ jobs:
           run_nonzero -p xai-grok-workspace --lib \
             permission::types:: -- --nocapture
           # Upstream moved these tests into an external `restore_fetch_tests.rs`
-          # but declares it `mod tests;`, so the module path is
-          # `restore_fetch::tests::` — the old filter named the *file*, matched
-          # nothing, and `run_nonzero` is what noticed.
+          # via `#[path = "restore_fetch_tests.rs"] mod tests;` — the *file* was
+          # renamed, the module path was not, and a filter naming the file
+          # matched nothing. `run_nonzero` is what noticed.
+          #
+          # It stops at `restore_fetch::` rather than `restore_fetch::tests::`
+          # so that both readers agree. Cargo selects the same tests either way,
+          # but the #171 guard approximates a module path by turning `::` into
+          # `/` and looking for it in the file path, which cannot see through
+          # `#[path]`: it would look for `restore_fetch/tests` in a file called
+          # `restore_fetch_tests.rs` and report every test here as running
+          # nowhere. `restore_fetch::` is a substring of both.
           run_nonzero -p xai-grok-workspace --lib \
-            restore_fetch::tests:: -- --nocapture
+            restore_fetch:: -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
             session::git:: -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
             workspace_ops:: -- --nocapture
-          run_nonzero -p xai-fast-worktree --lib \
+          # `xai-fast-worktree` has no default features and its `db` module is
+          # gated on `metadata`, so without this the filter compiles a crate
+          # that contains none of the tests it names.
+          run_nonzero -p xai-fast-worktree --features metadata --lib \
             db::tests:: -- --nocapture
           run_nonzero -p xai-file-utils --lib \
             storage_client:: -- --nocapture
@@ -579,8 +590,14 @@ jobs:
             app:: -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             disk_usage_cmd:: -- --nocapture
+          # Same `#[path]` move as `restore_fetch::` above, and stopped one
+          # segment short for the same reason: the file is `fs_size_tests.rs`,
+          # the module is `fs_size::tests`, and only `fs_size::` is a substring
+          # of both. This filter named the file and matched zero tests — which
+          # `run_nonzero` catches, while the #171 guard called the same line
+          # covered. Wrong in both directions at once.
           run_nonzero -p xai-grok-pager --lib \
-            fs_size_tests:: -- --nocapture
+            fs_size:: -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             headless:: -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
