@@ -1644,6 +1644,7 @@ mod tests {
             None,
             None,
             None,
+            &crate::agent::trusted_origins::TrustedXaiOrigins::default(),
         );
         assert_eq!(sampler.base_url, "https://attacker.invalid/v1");
         assert_eq!(sampler.auth_scheme, xai_grok_sampler::AuthScheme::None);

@@ -5665,6 +5665,7 @@ pub(crate) fn resolve_aux_model_sampling_config(
     client_version: Option<String>,
 ) -> Option<SamplerConfig> {
     let catalog_entry = find_model_by_id(models, model_id).cloned();
+    let trusted_xai_origins = crate::agent::trusted_origins::TrustedXaiOrigins::load();
     if let Some(entry) = &catalog_entry {
         // #110: readiness first, because the choke point rewrites an unready
         // model's `auth_scheme` to `None` and the check further down reads
@@ -5689,6 +5690,7 @@ pub(crate) fn resolve_aux_model_sampling_config(
             client_version.clone(),
             None,
             None,
+            &trusted_xai_origins,
         );
         if sampler.api_backend == ApiBackend::CodexResponses {
             if sampler.bearer_resolver.is_some() {
@@ -5800,6 +5802,7 @@ pub(crate) fn resolve_aux_model_sampling_config(
             client_version,
             None,
             None,
+            &trusted_xai_origins,
         );
         // The synthetic entry above carries the ambient bearer as its *own*
         // `api_key`, so the classifier inside the choke point reads it as
@@ -6003,7 +6006,15 @@ pub(crate) fn effective_model_route(
         auth_type: credentials.auth_type,
         auth_scheme: credentials.auth_scheme,
     };
-    let config = sampling_config_for_model(model, credentials, None, None, None, None);
+    let config = sampling_config_for_model(
+        model,
+        credentials,
+        None,
+        None,
+        None,
+        None,
+        &crate::agent::trusted_origins::TrustedXaiOrigins::load(),
+    );
     EffectiveModelRoute {
         catalog_id: catalog_id.to_owned(),
         wire_model: config.model.clone(),
@@ -6172,8 +6183,9 @@ pub(crate) fn sampling_config_for_model(
     client_version: Option<String>,
     mut deployment_id: Option<String>,
     mut user_id: Option<String>,
+    trusted_xai_origins: &crate::agent::trusted_origins::TrustedXaiOrigins,
 ) -> SamplerConfig {
-    let (ready, reason) = model_readiness(model);
+    let (ready, reason) = model_readiness_with_origins(model, trusted_xai_origins);
     let mut credentials = credentials;
     let mut source = classify_credential_source(model, &credentials);
     // #110 origin binding. Whatever the resolver handed over, an ambient xAI
@@ -6183,16 +6195,27 @@ pub(crate) fn sampling_config_for_model(
     // An explicitly declared credential header is the user's own auth and wins
     // on every origin — an ambient credential must never slide underneath it.
     let first_party = crate::util::is_xai_api_bearer_url(&credentials.base_url);
+    // #123: the narrow, named exception. An origin the user declared trusted
+    // in *local* config (`trusted_xai_origins`) keeps the ambient credential.
+    // This widens credential trust only: the identity-header gate below keeps
+    // using the URL-derived `first_party`, and the emitted `UserDeclared`
+    // class keeps the sampler's external metadata boundary engaged. When the
+    // declaration is absent or does not match, nothing here changes — there
+    // is no fallback derivation.
+    let declared_trusted = !first_party && trusted_xai_origins.is_trusted(&credentials.base_url);
     if source.is_ambient_xai() {
         let explicit = explicit_credential_header(model.info());
-        if !first_party {
+        if !first_party && !declared_trusted {
             tracing::error!(
                 model = %model.info().model,
                 source = ?source,
                 "sampling_config_for_model: stripping ambient xAI credential for non-first-party origin"
             );
         }
-        if !first_party || explicit.is_some() {
+        if declared_trusted && explicit.is_none() && credentials.api_key.is_some() {
+            crate::agent::trusted_origins::warn_declared_origin_in_use_once(&credentials.base_url);
+        }
+        if (!first_party && !declared_trusted) || explicit.is_some() {
             credentials.api_key = None;
             source = match explicit {
                 Some((header, env)) => {
@@ -6253,7 +6276,14 @@ pub(crate) fn sampling_config_for_model(
         max_completion_tokens,
         temperature,
         top_p,
-        endpoint_trust: None,
+        endpoint_trust: if declared_trusted {
+            // #123: propagate the declaration so every downstream layer (turn
+            // gate, chat-state sampling config, L3) reads the same answer
+            // instead of re-deriving it.
+            Some(xai_grok_sampler::EndpointTrustClass::UserDeclared)
+        } else {
+            None
+        },
         credential_source: Some(source.clone()),
         api_backend,
         auth_scheme: credentials.auth_scheme,
@@ -6415,6 +6445,7 @@ fn resolve_hidden_default_web_search_sampling_config(
         client_version,
         None,
         None,
+        &crate::agent::trusted_origins::TrustedXaiOrigins::load(),
     ))
 }
 /// Why `web_search` was withheld from the session toolset.
@@ -6489,6 +6520,7 @@ pub(crate) fn resolve_web_search_sampling_config_result(
             client_version,
             None,
             None,
+            &crate::agent::trusted_origins::TrustedXaiOrigins::load(),
         ))
     } else if model_id == crate::models::default_web_search_model() {
         resolve_hidden_default_web_search_sampling_config(
@@ -6726,7 +6758,26 @@ fn is_codex_provider_origin(base_url: &str) -> bool {
 
 /// Picker readiness: keyless and typical xAI catalog stay selectable; BYOK
 /// models that declare `env_key`/`api_key` but lack a resolved value are not.
+///
+/// The ambient-destination rule consults the user's `trusted_xai_origins`
+/// declaration (#123), loaded fresh from local disk so a removed entry closes
+/// the gate on the next resolution; a load failure fails closed (no origin
+/// trusted). This is the same ambient-state category as the `env_key`
+/// resolution below, which already reads process env per call.
 pub(crate) fn model_readiness(model: &ModelEntry) -> (bool, Option<String>) {
+    model_readiness_with_origins(
+        model,
+        &crate::agent::trusted_origins::TrustedXaiOrigins::load(),
+    )
+}
+
+/// [`model_readiness`] with an explicit declaration set — the form the
+/// credential choke point (and its tests) use so the answer never depends on
+/// what happens to be on the developer's disk.
+pub(crate) fn model_readiness_with_origins(
+    model: &ModelEntry,
+    trusted_xai_origins: &crate::agent::trusted_origins::TrustedXaiOrigins,
+) -> (bool, Option<String>) {
     if let Some(reason) = model.config_validation_errors.first().map(|e| e.as_str()) {
         return (false, Some(reason.to_owned()));
     }
@@ -6855,10 +6906,12 @@ pub(crate) fn model_readiness(model: &ModelEntry) -> (bool, Option<String>) {
             .as_deref()
             .unwrap_or(&model.info.base_url),
     ];
+    let ambient_destination_allowed =
+        |url: &str| crate::util::is_xai_api_bearer_url(url) || trusted_xai_origins.is_trusted(url);
     if explicit_credential_header(&model.info).is_none()
         && !ambient_destinations
             .iter()
-            .all(|url| crate::util::is_xai_api_bearer_url(url))
+            .all(|url| ambient_destination_allowed(url))
     {
         // Name the origin(s) the ambient flow must not reach. Prefer a refused
         // URL over a safe sibling (split base_url / api_base_url), and keep the
@@ -6866,7 +6919,7 @@ pub(crate) fn model_readiness(model: &ModelEntry) -> (bool, Option<String>) {
         let refused_origin = ambient_destinations
             .iter()
             .copied()
-            .find(|url| !crate::util::is_xai_api_bearer_url(url))
+            .find(|url| !ambient_destination_allowed(url))
             .unwrap_or(model.info.base_url.as_str());
         return (
             false,
@@ -7131,7 +7184,14 @@ impl ModelSwitchIncompatibleAgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::trusted_origins::TrustedXaiOrigins;
     use base64::Engine;
+
+    /// No user-declared trusted origins: the state every pre-#123 test runs
+    /// under, and the fail-closed default the gate assumes.
+    fn no_trusted_origins() -> TrustedXaiOrigins {
+        TrustedXaiOrigins::default()
+    }
     use serial_test::serial;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -7999,7 +8059,15 @@ reasoning_effort = "low"
                 .cloned()
                 .expect("model resolves in the same running process");
             let credentials = resolve_credentials(&entry, Some(session));
-            sampling_config_for_model(&entry, credentials, None, None, None, None)
+            sampling_config_for_model(
+                &entry,
+                credentials,
+                None,
+                None,
+                None,
+                None,
+                &no_trusted_origins(),
+            )
         };
         let first_grok = resolve("grok", "grok-session-1");
         let codex = resolve("codex", "must-not-reach-codex");
@@ -9031,6 +9099,7 @@ reasoning_effort = "low"
             None,
             None,
             None,
+            &no_trusted_origins(),
         );
         assert_eq!(
             sampling_config.api_key,
@@ -9061,6 +9130,7 @@ reasoning_effort = "low"
                 None,
                 None,
                 None,
+                &no_trusted_origins(),
             );
             assert_eq!(sampling_config.api_key, expected, "at {base_url}");
         }
@@ -9358,6 +9428,7 @@ reasoning_effort = "low"
                     None,
                     Some("deployment-sentinel".to_owned()),
                     Some("user-sentinel".to_owned()),
+                    &no_trusted_origins(),
                 );
 
                 assert_eq!(
@@ -9376,6 +9447,171 @@ reasoning_effort = "low"
                 );
             }
         }
+    }
+
+    /// #123: the supported escape hatch. An origin named in
+    /// `trusted_xai_origins` (local config tiers only — see
+    /// `trusted_origins` module) keeps the ambient credential; the emitted
+    /// trust class is the narrow `UserDeclared`, so identity headers stay off
+    /// and the sampler's external metadata boundary keeps stripping. L3 must
+    /// agree with the choke point, so the built config is also constructed.
+    ///
+    /// Mutation: drop the `declared_trusted` disjunct in the choke point (the
+    /// key is stripped) or emit `None` for `endpoint_trust` (the class assert
+    /// and the L3 construction fail).
+    #[test]
+    #[serial]
+    fn choke_point_declared_trusted_origin_keeps_ambient_credential() {
+        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+        use xai_grok_sampler::{CredentialSource, EndpointTrustClass};
+
+        const SESSION: &str = "XAI_SESSION_SENTINEL";
+        let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+        let layers = crate::config::ConfigLayers {
+            user: toml::from_str("trusted_xai_origins = [\"https://gateway.internal:8443\"]")
+                .expect("test toml parses"),
+            ..Default::default()
+        };
+        let trusted = TrustedXaiOrigins::from_config_layers(&layers);
+
+        let model = test_model_entry("ext", "https://gateway.internal:8443/v1", None, None, None);
+        let config = sampling_config_for_model(
+            &model,
+            resolve_credentials(&model, Some(SESSION)),
+            None,
+            None,
+            Some("deployment-sentinel".to_owned()),
+            Some("user-sentinel".to_owned()),
+            &trusted,
+        );
+
+        assert_eq!(
+            config.api_key.as_deref(),
+            Some(SESSION),
+            "a declared trusted origin keeps the ambient credential"
+        );
+        assert_eq!(
+            config.credential_source,
+            Some(CredentialSource::XaiSession),
+            "the credential stays honestly labelled ambient"
+        );
+        assert_eq!(
+            config.endpoint_trust,
+            Some(EndpointTrustClass::UserDeclared),
+            "the declaration propagates as the narrow trust class"
+        );
+        assert_eq!(
+            config.deployment_id, None,
+            "identity headers do not follow the credential to a declared origin"
+        );
+        assert_eq!(
+            config.user_id, None,
+            "identity headers do not follow the credential to a declared origin"
+        );
+        xai_grok_sampler::SamplingClient::new(config)
+            .expect("L3 agrees with the choke point for a declared https origin");
+    }
+
+    /// #123: a declaration names exact origins. A declaration for a *other*
+    /// origin — or a candidate that differs in scheme, host, or port — strips
+    /// exactly as #110 requires. There is no fallback derivation when the
+    /// declaration does not match.
+    ///
+    /// Mutation: loosen `is_trusted` (suffix match, scheme-agnostic, default
+    /// port ignored) and one of these rows keeps its credential.
+    #[test]
+    #[serial]
+    fn choke_point_declaration_matches_exact_origin_only() {
+        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+        use xai_grok_sampler::CredentialSource;
+
+        const SESSION: &str = "XAI_SESSION_SENTINEL";
+        let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+        let layers = crate::config::ConfigLayers {
+            user: toml::from_str("trusted_xai_origins = [\"https://gateway.internal\"]")
+                .expect("test toml parses"),
+            ..Default::default()
+        };
+        let trusted = TrustedXaiOrigins::from_config_layers(&layers);
+
+        for base_url in [
+            // A different origin than the one declared.
+            "https://other.internal/v1",
+            // Same host, non-default port: a different origin.
+            "https://gateway.internal:8443/v1",
+            // Subdomain of the declared host: not the declared origin.
+            "https://sub.gateway.internal/v1",
+            // Cleartext on the declared host: never trusted.
+            "http://gateway.internal/v1",
+        ] {
+            let model = test_model_entry("ext", base_url, None, None, None);
+            let config = sampling_config_for_model(
+                &model,
+                resolve_credentials(&model, Some(SESSION)),
+                None,
+                None,
+                None,
+                None,
+                &trusted,
+            );
+            assert_eq!(
+                config.api_key, None,
+                "session token reached undeclared origin {base_url}"
+            );
+            assert_eq!(
+                config.credential_source,
+                Some(CredentialSource::Missing),
+                "{base_url}"
+            );
+            assert_eq!(config.endpoint_trust, None, "{base_url}");
+        }
+    }
+
+    /// #123: readiness agrees with the choke point. A credential-less model
+    /// whose ambient destinations are all user-declared origins is *ready*
+    /// (the declaration is the credential's legal route); the same model with
+    /// an empty declaration set stays unready exactly as #110 requires. The
+    /// split-route rule is preserved: one undeclared arm is enough to refuse.
+    ///
+    /// Mutation: drop the `trusted_xai_origins.is_trusted(url)` disjunct in
+    /// `model_readiness_with_origins` and the ready assertions fail.
+    #[test]
+    fn readiness_honours_declared_origin_only_where_declared() {
+        let layers = crate::config::ConfigLayers {
+            user: toml::from_str("trusted_xai_origins = [\"https://gateway.internal\"]")
+                .expect("test toml parses"),
+            ..Default::default()
+        };
+        let trusted = TrustedXaiOrigins::from_config_layers(&layers);
+
+        let m = test_model_entry("ext", "https://gateway.internal/v1", None, None, None);
+        assert_eq!(
+            model_readiness_with_origins(&m, &trusted),
+            (true, None),
+            "a declared origin satisfies the ambient-destination rule"
+        );
+        assert!(
+            !model_readiness_with_origins(&m, &no_trusted_origins()).0,
+            "without the declaration the #110 refusal stands"
+        );
+
+        // Both ambient arms must be legal: declared base_url + undeclared
+        // api_base_url stays unready.
+        let m = test_model_entry(
+            "split",
+            "https://gateway.internal/v1",
+            None,
+            None,
+            Some("https://third.example/v1"),
+        );
+        assert!(
+            !model_readiness_with_origins(&m, &trusted).0,
+            "an undeclared api_base_url arm keeps the model unready"
+        );
     }
 
     /// #110 gate predicate: the origin gate uses the existing canonical
@@ -10469,6 +10705,7 @@ reasoning_effort = "low"
             None,
             None,
             None,
+            &no_trusted_origins(),
         );
         assert_eq!(config.api_backend, ApiBackend::Messages);
         assert_eq!(config.auth_scheme, AuthScheme::Bearer);
@@ -10583,7 +10820,8 @@ reasoning_effort = "low"
         assert_eq!(creds.auth_scheme, AuthScheme::XApiKey);
         assert_eq!(creds.auth_type, xai_chat_state::AuthType::ApiKey);
         assert_eq!(creds.api_key, Some("sk-ant-test-key".to_string()));
-        let config = sampling_config_for_model(&model, creds, None, None, None, None);
+        let config =
+            sampling_config_for_model(&model, creds, None, None, None, None, &no_trusted_origins());
         assert_eq!(config.auth_scheme, AuthScheme::XApiKey);
         assert_eq!(config.api_backend, ApiBackend::Messages);
         let client = xai_grok_sampler::SamplingClient::new(config).expect("client should build");
@@ -10602,7 +10840,8 @@ reasoning_effort = "low"
         assert_eq!(model.info.auth_scheme, AuthScheme::Bearer);
         let creds = resolve_credentials(&model, None);
         assert_eq!(creds.auth_scheme, AuthScheme::Bearer);
-        let config = sampling_config_for_model(&model, creds, None, None, None, None);
+        let config =
+            sampling_config_for_model(&model, creds, None, None, None, None, &no_trusted_origins());
         assert_eq!(config.auth_scheme, AuthScheme::Bearer);
         let client = xai_grok_sampler::SamplingClient::new(config).expect("client should build");
         let info = client.auth_info();
@@ -11062,6 +11301,7 @@ reasoning_effort = "low"
             None,
             None,
             None,
+            &no_trusted_origins(),
         );
         assert_eq!(config.context_window, 200_000);
         let mut model = test_model_entry("any-model", "https://api.x.ai/v1", None, None, None);
@@ -11073,6 +11313,7 @@ reasoning_effort = "low"
             None,
             None,
             None,
+            &no_trusted_origins(),
         );
         assert_eq!(config.context_window, 256_000);
     }
@@ -11208,6 +11449,7 @@ reasoning_effort = "low"
             None,
             None,
             None,
+            &no_trusted_origins(),
         );
         assert_eq!(sampling_config.api_backend, ApiBackend::Responses);
     }
@@ -11736,6 +11978,7 @@ reasoning_effort = "low"
             None,
             Some("deploy".into()),
             Some("user".into()),
+            &no_trusted_origins(),
         );
 
         assert!(
@@ -11811,6 +12054,7 @@ reasoning_effort = "low"
             None,
             Some("deploy".into()),
             Some("user".into()),
+            &no_trusted_origins(),
         );
         assert_eq!(cfg.auth_scheme, AuthScheme::None);
         assert!(cfg.api_key.is_none());
@@ -12318,7 +12562,15 @@ reasoning_effort = "low"
     }
     fn resolve_sampling(model: &ModelEntry, session_key: Option<&str>) -> SamplerConfig {
         let credentials = resolve_credentials(model, session_key);
-        sampling_config_for_model(model, credentials, None, None, None, None)
+        sampling_config_for_model(
+            model,
+            credentials,
+            None,
+            None,
+            None,
+            None,
+            &no_trusted_origins(),
+        )
     }
     #[test]
     #[serial]

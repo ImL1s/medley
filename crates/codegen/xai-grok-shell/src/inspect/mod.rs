@@ -85,6 +85,16 @@ pub(crate) struct InspectReport {
     pub catalog_auth_scheme: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub catalog_credential_source: Option<String>,
+    /// #123: origins the local user/managed config tiers declare trusted for
+    /// ambient xAI credentials. Empty unless the user widened their
+    /// credential's blast radius — the report is how they can see that they
+    /// did.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub trusted_xai_origins: Vec<String>,
+    /// `trusted_xai_origins` entries that were refused, as
+    /// `"<sanitized entry> (<reason>)"`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub trusted_xai_origins_rejected: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -408,6 +418,14 @@ async fn build_report(cwd: &Path) -> InspectReport {
     }
     let mcp_config_problems = crate::util::config::load_mcp_server_problems_with_project(cwd);
 
+    let trusted_xai_origins = crate::agent::trusted_origins::TrustedXaiOrigins::load();
+    let trusted_xai_origins_rejected = trusted_xai_origins
+        .rejected()
+        .iter()
+        .map(|(entry, reason)| format!("{entry} ({reason})"))
+        .collect();
+    let trusted_xai_origins = trusted_xai_origins.declared_display();
+
     let (catalog_auth_scheme, catalog_credential_source) = if let Some(ref cfg) = parsed_config {
         let catalog_auth = cfg.models.catalog_auth_config().unwrap_or_default();
         let scheme_str = catalog_auth.auth_scheme.map(|s| match s {
@@ -473,6 +491,8 @@ async fn build_report(cwd: &Path) -> InspectReport {
         mcp_config_problems,
         catalog_auth_scheme,
         catalog_credential_source,
+        trusted_xai_origins,
+        trusted_xai_origins_rejected,
     }
 }
 
@@ -1559,6 +1579,17 @@ fn print_human(r: &InspectReport) {
     );
     if let Some(ref src) = r.catalog_credential_source {
         println!("  {TREE} Credential source: {}", src);
+    }
+
+    if !r.trusted_xai_origins.is_empty() || !r.trusted_xai_origins_rejected.is_empty() {
+        println!();
+        println!("  Trusted xAI Origins (user-declared)");
+        for origin in &r.trusted_xai_origins {
+            println!("  {TREE} {origin} — ambient xAI credentials are forwarded here");
+        }
+        for rejected in &r.trusted_xai_origins_rejected {
+            println!("  {TREE} ignored: {rejected}");
+        }
     }
 
     print_columns(
