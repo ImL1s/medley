@@ -22,6 +22,13 @@ fn setup_json_help() -> String {
     )
 }
 
+fn disk_usage_help() -> String {
+    format!(
+        "Show what {} uses on disk, broken down by what wrote it.",
+        crate::util::display_grok_home_prefix()
+    )
+}
+
 fn dashboard_help() -> String {
     format!(
         "Centralised, agent-native overview of every session (top-level and \
@@ -199,8 +206,12 @@ pub enum Command {
     },
     /// Manage git worktrees
     Worktree(crate::worktree_cmd::WorktreeArgs),
-    /// Show what the grok home (~/.grok) uses on disk
-    #[command(name = "du", visible_alias = "disk-usage")]
+    /// Show what the grok home uses on disk
+    #[command(
+        name = "du",
+        visible_alias = "disk-usage",
+        long_about = disk_usage_help()
+    )]
     DiskUsage(crate::disk_usage_cmd::DiskUsageArgs),
     /// Expose this workspace to the Computer Hub (via the leader).
     ///
