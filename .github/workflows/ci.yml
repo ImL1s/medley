@@ -647,6 +647,10 @@ jobs:
           # buys is the target compiling plus its one runnable case -- which is
           # the whole value, since a broken PTY harness fails to build.
           run_nonzero -p xai-grok-pager --test pty_e2e_minimal -- --nocapture
+          # `pty_e2e_queue` was named by nothing. It only became visible once
+          # the #171 guard stopped agreeing with `--test pty_e2e` -- the two
+          # readers were wrong together, so neither reported it.
+          run_nonzero -p xai-grok-pager --test pty_e2e_queue -- --nocapture
 
       - name: Agent serve exposure and authentication
         env:
