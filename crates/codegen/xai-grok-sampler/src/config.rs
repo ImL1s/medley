@@ -152,6 +152,12 @@ pub struct SamplerConfig {
     /// Per-request header injector (e.g. OTel traceparent). Called in `post()`.
     #[serde(skip)]
     pub header_injector: Option<SharedHeaderInjector>,
+
+    /// Per-model Codex catalog wire capabilities (#245). Fork-owned type so
+    /// individual flags do not each tax `SamplerConfig` on upstream sync.
+    /// `None` keeps the historical CreateResponse shape.
+    #[serde(default)]
+    pub codex_wire: Option<xai_grok_sampling_types::CodexWireCapabilities>,
 }
 
 impl std::fmt::Debug for SamplerConfig {
@@ -231,6 +237,7 @@ impl Default for SamplerConfig {
             compaction_at_tokens: None,
             doom_loop_recovery: None,
             header_injector: None,
+            codex_wire: None,
         }
     }
 }

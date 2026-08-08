@@ -231,6 +231,17 @@ jobs:
             sampling_config_for_test_sets_fork_endpoint_trust_to_none -- --nocapture
           run_nonzero -p xai-grok-sampling-types --lib \
             sampling_config_for_test_fru_inherits_fork_endpoint_trust_without_naming_it -- --nocapture
+          # #245: 400 body preview is secret-free and bounded; unique names.
+          run_nonzero -p xai-grok-sampling-types --lib \
+            provider_error_body_preview_is_secret_free_and_bounded -- --nocapture
+          run_nonzero -p xai-grok-sampling-types --lib \
+            provider_error_body_preview_is_empty_for_anything_unstructured -- --nocapture
+          run_nonzero -p xai-grok-sampling-types --lib \
+            user_facing_400_surfaces_structured_rejected_field -- --nocapture
+          run_nonzero -p xai-grok-sampling-types --lib \
+            codex_wire_capabilities_omit_reasoning_summary_when_unsupported -- --nocapture
+          run_nonzero -p xai-grok-sampling-types --lib \
+            codex_wire_capabilities_keep_summary_when_catalog_allows_or_is_silent -- --nocapture
           run_nonzero -p xai-grok-sampler --lib \
             final_relation_observes_hostile_injector_replacement_and_removal -- --nocapture
           run_nonzero -p xai-grok-sampler --lib \
@@ -1144,6 +1155,9 @@ jobs:
             codex_catalog_fallback_uses_builtin_preset_when_fetch_is_empty -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_credential_source_must_be_openai_codex_provider -- --nocapture
+          # #245: catalog wire flags that differ from the Sol preset must parse.
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_parser_reads_wire_capabilities_that_differ_from_the_preset -- --nocapture
 
       # #36: restore fd bundling only with a public PI caller and contract.
       # The tests are split by build mode: override-path bundle and release
