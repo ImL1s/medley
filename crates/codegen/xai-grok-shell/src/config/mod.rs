@@ -1486,21 +1486,55 @@ pub fn apply_sandbox(
     }
 }
 pub use xai_grok_workspace::project_config::find_project_configs;
-/// Config sections a project `.grok/config.toml` never contributes. The
-/// project tier is consulted for MCP servers, plugins, and permissions only,
-/// so model entries written there are inert. Project-scoped model support is
-/// tracked separately; until it lands, the only fix is moving them to the
-/// global config, which is what [`warn_inert_project_model_sections`] says.
-/// `trusted_xai_origins` (#123) is listed for the same reason and with the
-/// same fix — and doubly so because a trust declaration that arrives with a
-/// cloned repo must never be honoured: it is a trust decision only the local
-/// user tier can make.
-/// Each pair is the TOML key and how it is written in prose: `[models]` is a
-/// flat table, `model` / `model_providers` are tables of entries, and
-/// `trusted_xai_origins` is a flat array of origin strings.
-pub const PROJECT_INERT_MODEL_SECTIONS: [(&str, &str); 4] = [
-    ("model", "[model.*]"),
-    ("models", "[models]"),
+const PROJECT_MODEL_SECTION_KEYS: [&str; 2] = ["models", "model"];
+/// Project model sections that are merged when a workspace is trusted.
+///
+/// Merge order is global effective config first, then project configs from git
+/// root to `cwd` (later/closer paths win). The folder-trust gate decides
+/// whether project model sections are allowed to contribute at all.
+pub(crate) fn merge_project_model_sections(
+    base: &toml::Value,
+    cwd: &std::path::Path,
+    project_trusted: bool,
+) -> toml::Value {
+    fn project_model_overlay(root: &toml::Value) -> Option<toml::Value> {
+        let table = root.as_table()?;
+        let mut overlay = toml::map::Map::new();
+        for key in PROJECT_MODEL_SECTION_KEYS {
+            if let Some(value) = table.get(key) {
+                overlay.insert(key.to_string(), value.clone());
+            }
+        }
+        (!overlay.is_empty()).then_some(toml::Value::Table(overlay))
+    }
+
+    let mut merged = base.clone();
+    if !project_trusted {
+        return merged;
+    }
+    for config_path in find_project_configs(cwd) {
+        if let Ok(project_root) = load_config_file(&config_path)
+            && let Some(overlay) = project_model_overlay(&project_root)
+        {
+            deep_merge_toml(&mut merged, &overlay);
+        }
+    }
+    merged
+}
+/// Config sections a project `.grok/config.toml` still never contributes.
+///
+/// `[models]` and `[model.*]` are loaded from *trusted* project configs via
+/// [`merge_project_model_sections`] (#56); `[model_providers.*]` remains
+/// global-only.
+///
+/// `trusted_xai_origins` (#123) is inert **by design, not by omission**, and
+/// folder trust is not sufficient for it. Trusting a repository enough to run
+/// its code and take its model routes is a different decision from letting it
+/// name an origin that receives your ambient xAI credential — the second is a
+/// decision only the local user tier can make, and it cannot arrive with a
+/// clone. That distinction got sharper when #56 made project model sections
+/// loadable, not weaker.
+pub const PROJECT_INERT_MODEL_SECTIONS: [(&str, &str); 2] = [
     ("model_providers", "[model_providers.*]"),
     (
         crate::agent::trusted_origins::TRUSTED_XAI_ORIGINS_KEY,
@@ -1546,8 +1580,9 @@ pub fn inert_project_model_sections_message(
         .map(|home| home.join("config.toml").display().to_string())
         .unwrap_or_else(|| "$GROK_HOME/config.toml".to_owned());
     format!(
-        "{sections} in {} is ignored: a project config contributes MCP servers, \
-         plugins, and permissions only. Move these entries to {global} for them to load.",
+        "{sections} in {} is ignored: a project config contributes [models], \
+         [model.*], MCP servers, plugins, and permissions only. Move these entries \
+         to {global} for them to load.",
         path.display()
     )
 }

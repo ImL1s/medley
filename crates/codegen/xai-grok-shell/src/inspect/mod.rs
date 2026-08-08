@@ -404,8 +404,9 @@ async fn build_report(cwd: &Path) -> InspectReport {
         .as_ref()
         .map(|c| c.config_warnings.clone())
         .unwrap_or_default();
-    // Project `[model.*]` never reaches `Config`, so it produces no parse
-    // warning of its own; report it here rather than leave it silently inert.
+    // Some project config sections are intentionally global-only
+    // (`[model_providers.*]` today), so they produce no parse warning of their
+    // own. Surface them here rather than leave them silently inert.
     for (path, declared) in crate::config::inert_project_model_sections(cwd) {
         config_warnings.push(
             crate::agent::config_model_override_parse::ConfigWarning::config_key(

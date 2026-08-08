@@ -2786,6 +2786,7 @@ async fn set_session_model_preserves_catalog_key_for_none_alias_with_shared_wire
                 compaction_at_tokens: None,
                 doom_loop_recovery: None,
                 header_injector: None,
+                codex_wire: None,
             };
             let returned = actor
                 .handle_set_session_model(
@@ -2881,6 +2882,7 @@ async fn handle_set_session_model_clears_credentials_for_none() {
                 compaction_at_tokens: None,
                 doom_loop_recovery: None,
                 header_injector: None,
+                codex_wire: None,
             };
             let _ = actor
                 .handle_set_session_model(
@@ -2984,6 +2986,7 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                 compaction_at_tokens: None,
                 doom_loop_recovery: None,
                 header_injector: None,
+                codex_wire: None,
             };
             let _ = actor
                 .handle_set_session_model(
@@ -3092,6 +3095,7 @@ async fn switch_to_first_party_model_drops_minted_provider_token() {
                 compaction_at_tokens: None,
                 doom_loop_recovery: None,
                 header_injector: None,
+                codex_wire: None,
             };
             let _ = actor
                 .handle_set_session_model(

@@ -874,7 +874,7 @@ directory resolved to.
 | `~/.medley/agents/` | User-scoped agent definitions |
 | `~/.medley/lsp.json` | LSP server configuration (user-scoped) |
 | `~/.medley/logs/` | Internal log files (e.g. `unified.jsonl`, MCP server logs) |
-| `.grok/config.toml` | Project-scoped MCP servers, plugins, and permission rules |
+| `.grok/config.toml` | Project-scoped MCP servers, plugins, permission rules, and model routing (`[models]`, `[model.*]`) |
 | `.grok/skills/` | Project-scoped skill definitions |
 | `.grok/plugins/` | Project-scoped plugins |
 | `.grok/agents/` | Project-scoped agent definitions |
@@ -889,7 +889,7 @@ Some settings can be set per-project by placing files in `.grok/` inside your re
 
 | File | What it configures |
 |------|--------------------|
-| `.grok/config.toml` | MCP servers, plugins, permission rules, and the `[mcp] max_output_bytes` tool-result cap (other sections load only from `~/.medley/config.toml`) |
+| `.grok/config.toml` | MCP servers, plugins, permission rules, model routing (`[models]`, `[model.*]`), and the `[mcp] max_output_bytes` tool-result cap |
 | `.grok/skills/` | Project-specific skills |
 | `.grok/hooks/` | Project-specific lifecycle hooks |
 | `.grok/agents/` | Project-specific agent definitions |
@@ -898,6 +898,21 @@ Some settings can be set per-project by placing files in `.grok/` inside your re
 | `AGENTS.md` | Project instructions (system prompt) |
 
 Project-scoped MCP servers override global ones with the same name (full replacement, not a merge).
+
+Project model sections merge with global config in this order:
+
+1. `~/.medley/config.toml` (base)
+2. repo-root `.grok/config.toml`
+3. each nearer ancestor down to the current working directory
+
+For overlapping `[model.<id>]` entries, merge is deep and closer files win per
+field; omitted fields inherit from lower-priority layers. Example: a project
+file can override `base_url` for `model.foo` while inheriting `env_key` from
+the global layer.
+
+Model sections from `.grok/config.toml` are applied only when the workspace is
+trusted (folder trust gate). In an untrusted clone, those project model entries
+are ignored.
 
 ---
 

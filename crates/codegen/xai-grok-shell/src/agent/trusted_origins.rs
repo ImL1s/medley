@@ -17,12 +17,31 @@
 //!   (`system_managed`, `managed`, `user`) of [`crate::config::ConfigLayers`]
 //!   and nowhere else. It is never read from the merged effective config, so
 //!   server-synced `requirements.toml` and remote `[[campaigns]]` cannot inject
-//!   it; project `.grok/config.toml` never enters `ConfigLayers` at all (it
-//!   contributes MCP servers, plugins, and permissions only — see
+//!   it; and project `.grok/config.toml` never enters `ConfigLayers` at all.
+//!
+//!   The project tier is **not** limited to MCP servers, plugins and
+//!   permissions any more — #56 made a *trusted* repository able to declare
+//!   `[models]` and `[model.*]`. This key is still refused there, and the
+//!   distinction is the point: folder trust is consent to run a repository's
+//!   code and take its model routes, which is not consent to name the origin
+//!   that receives your ambient xAI credential. Only the local user tier can
+//!   give the second, and it cannot arrive with a clone. See
 //!   [`crate::config::PROJECT_INERT_MODEL_SECTIONS`], which reports this key
-//!   as inert when written there). There is deliberately no env-var form:
-//!   `.envrc` arrives with a cloned repo, so an env-declared trust origin is
-//!   not reliably the user's own decision.
+//!   as inert whether or not the repository is trusted.
+//!
+//!   There is deliberately no env-var form: `.envrc` arrives with a cloned
+//!   repo, so an env-declared trust origin is not reliably the user's own
+//!   decision.
+//!
+//!   The same reasoning has a residue worth naming rather than leaving
+//!   implicit: the *location* of the user tier is itself environment-controlled
+//!   (`GROK_HOME`). A cloned repo's `.envrc` pointing that inside the repo
+//!   makes the attacker's file the "user" layer. That is not new to this
+//!   feature — anyone who can set `GROK_HOME` can already redirect `env_key`
+//!   to steal a BYOK credential — but this feature adds the ambient session
+//!   token to what such a redirect reaches, so it belongs in the threat model
+//!   rather than in a footnote. `direnv` requiring an explicit `allow` is the
+//!   mitigation that actually holds.
 //! - **https only.** Non-https entries are rejected at parse, the matcher
 //!   requires an https candidate, and the sampler's L3 re-computes
 //!   `scheme == "https"` from the URL before honouring the label.

@@ -231,6 +231,17 @@ jobs:
             sampling_config_for_test_sets_fork_endpoint_trust_to_none -- --nocapture
           run_nonzero -p xai-grok-sampling-types --lib \
             sampling_config_for_test_fru_inherits_fork_endpoint_trust_without_naming_it -- --nocapture
+          # #245: 400 body preview is secret-free and bounded; unique names.
+          run_nonzero -p xai-grok-sampling-types --lib \
+            provider_error_body_preview_is_secret_free_and_bounded -- --nocapture
+          run_nonzero -p xai-grok-sampling-types --lib \
+            provider_error_body_preview_is_empty_for_anything_unstructured -- --nocapture
+          run_nonzero -p xai-grok-sampling-types --lib \
+            user_facing_400_surfaces_structured_rejected_field -- --nocapture
+          run_nonzero -p xai-grok-sampling-types --lib \
+            codex_wire_capabilities_omit_reasoning_summary_when_unsupported -- --nocapture
+          run_nonzero -p xai-grok-sampling-types --lib \
+            codex_wire_capabilities_keep_summary_when_catalog_allows_or_is_silent -- --nocapture
           run_nonzero -p xai-grok-sampler --lib \
             final_relation_observes_hostile_injector_replacement_and_removal -- --nocapture
           run_nonzero -p xai-grok-sampler --lib \
@@ -274,6 +285,12 @@ jobs:
             strict_read_uses_open_file_handle_when_path_is_swapped_after_open -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             strict_atomic_write_fails_when_post_rename_permission_assertion_fails -- --nocapture
+          # #56: trusted project [models]/[model.*] precedence + untrusted
+          # hostile-model boundary (no credential/env-key/origin injection).
+          run_nonzero -p xai-grok-shell --lib \
+            project_model_overlay_precedence_merges_global_repo_and_subdir_sections -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            project_model_overlay_untrusted_repo_cannot_introduce_or_redirect_credentials -- --nocapture
           run_nonzero -p xai-grok-mcp --lib \
             callback_payload_debug_never_emits_code_state_or_issuer -- --nocapture
           run_nonzero -p xai-file-utils --lib \
@@ -427,6 +444,10 @@ jobs:
             unavailable_handlers_are_absent_from_publish_and_dispatch -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
             dispatch_configure_mcp -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            repo_configs_present_detects_grok_config_models -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            repo_configs_present_false_for_empty_models_tables -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
             qualified_handler_fails_closed_when_session_generation_expires -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
@@ -624,6 +645,30 @@ jobs:
           # the tests are about what the pager mirrors after a failed write.
           cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
             preferred_model_persist_failure -- --nocapture
+
+      - name: 'Orphaned switch transaction via synthesized switch (issue #239)'
+        env:
+          PROTOC: protoc
+        run: |
+          # The stricter of the two `run_nonzero` shapes in this file: it reads
+          # cargo's own status out of PIPESTATUS before looking at the output.
+          # The grep-only shape cannot tell a failing run from a passing one
+          # when an invocation names more than one target -- one binary's
+          # `ok. N passed` line satisfies it while another binary failed.
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
+            synthesized_switch_does_not_clear_transaction_with_live_request_id -- --nocapture
 
       # #170: the dashboard's mirror obligations. A refused pre-session pick
       # completes with a toast on the new agent; whenever the view stays on
@@ -968,6 +1013,8 @@ jobs:
             readiness_honours_declared_origin_only_where_declared -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             project_config_trusted_origins_declaration_is_reported_inert -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            a_trusted_repo_still_cannot_declare_trusted_xai_origins -- --nocapture
 
       # #160: six of the seven tests this branch originally added matched no
       # filter. The seventh, `web_search_resolves_an_env_backed_credential_header`,
@@ -1158,6 +1205,9 @@ jobs:
             codex_catalog_fallback_uses_builtin_preset_when_fetch_is_empty -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_credential_source_must_be_openai_codex_provider -- --nocapture
+          # #245: catalog wire flags that differ from the Sol preset must parse.
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_parser_reads_wire_capabilities_that_differ_from_the_preset -- --nocapture
 
       # #36: restore fd bundling only with a public PI caller and contract.
       # The tests are split by build mode: override-path bundle and release

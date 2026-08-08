@@ -73,12 +73,12 @@ Grok supports the following API backends. Set `api_backend` in your
 
 | Value | API | Default |
 |-------|-----|---------|
-| `"chat_completions"` | OpenAI Chat Completions (`/v1/chat/completions`) | Yes |
-| `"responses"` | OpenAI Responses (`/v1/responses`) | |
-| `"codex_responses"` | ChatGPT Codex Responses (`/backend-api/codex/responses`) | Built-in provider only |
-| `"messages"` | Anthropic Messages (`/v1/messages`) | |
+| `"chat_completions"` | OpenAI Chat Completions (`/v1/chat/completions`) [types.rs:1016](file:///private/tmp/n193b/crates/codegen/xai-grok-sampling-types/src/types.rs#L1016), [client.rs:2471](file:///private/tmp/n193b/crates/codegen/xai-grok-sampler/src/client.rs#L2471) | Yes |
+| `"responses"` | OpenAI Responses (`/v1/responses`) [types.rs:1018](file:///private/tmp/n193b/crates/codegen/xai-grok-sampling-types/src/types.rs#L1018), [client.rs:2477](file:///private/tmp/n193b/crates/codegen/xai-grok-sampler/src/client.rs#L2477) | |
+| `"codex_responses"` | ChatGPT Codex Responses (`/backend-api/codex/responses`) [types.rs:1024](file:///private/tmp/n193b/crates/codegen/xai-grok-sampling-types/src/types.rs#L1024), [client.rs:2477](file:///private/tmp/n193b/crates/codegen/xai-grok-sampler/src/client.rs#L2477) | Built-in provider only |
+| `"messages"` | Anthropic Messages (`/v1/messages`) [types.rs:1026](file:///private/tmp/n193b/crates/codegen/xai-grok-sampling-types/src/types.rs#L1026), [client.rs:2483](file:///private/tmp/n193b/crates/codegen/xai-grok-sampler/src/client.rs#L2483) | |
 
-When you omit `api_backend`, Grok uses `chat_completions`.
+When you omit `api_backend`, Grok uses `chat_completions` ([types.rs:1015-1016](file:///private/tmp/n193b/crates/codegen/xai-grok-sampling-types/src/types.rs#L1015-1016)).
 
 To send provider-specific non-secret headers -- for example, Anthropic's `anthropic-version` -- use the `extra_headers` field described below. Grok sends those headers verbatim with every request to the endpoint. Prefer `auth_scheme` and `env_key` / `api_key` for credentials rather than putting secrets in `extra_headers`.
 
@@ -86,13 +86,15 @@ To send provider-specific non-secret headers -- for example, Anthropic's `anthro
 
 ## Configuring Custom Models
 
-Add custom model endpoints in `~/.medley/config.toml` under `[model.<name>]` sections.
+Add custom model endpoints under `[model.<name>]` sections.
 
-Model entries load from that **global** file only. A `[model.*]` or
-`[model_providers.*]` block in a project-local `.grok/config.toml` has no
-effect — the project tier contributes MCP servers, plugins, and permissions
-only. Grok warns at session start and lists the file under Config Warnings in
-`grok inspect` when it finds one.
+You can define them globally in `~/.medley/config.toml` and/or per-project in
+`.grok/config.toml`. Project `[models]` and `[model.*]` sections merge over the
+global config (repo root to cwd; closer files win) **when the workspace is
+trusted**. In an untrusted clone, project model sections are ignored.
+
+`[model_providers.*]` remains global-only. A project-local
+`[model_providers.*]` block is ignored and reported in config warnings.
 
 ```toml
 [model.my-model]
@@ -117,11 +119,11 @@ env_http_headers = { "X-Tenant" = "TENANT_TOKEN" }    # Headers from env vars, r
 
 | Value | Behavior |
 |-------|----------|
-| `"bearer"` | Default. Sends `Authorization: Bearer <key>` from `api_key` / `env_key`. The ambient fallback (your session token or `XAI_API_KEY`) applies **only when the final effective URL is a first-party xAI origin**. |
-| `"x_api_key"` | Sends `x-api-key: <key>` (Anthropic-style) instead of Bearer. Use with `env_key` or `api_key`. |
-| `"none"` | Sends **no** auth header. Required for keyless local servers so ambient xAI credentials are not attached. |
+| `"bearer"` | Default. Sends `Authorization: Bearer <key>` from `api_key` / `env_key` ([config.rs:23](file:///private/tmp/n193b/crates/codegen/xai-grok-sampler/src/config.rs#L23), [client.rs:946](file:///private/tmp/n193b/crates/codegen/xai-grok-sampler/src/client.rs#L946), [client.rs:1156](file:///private/tmp/n193b/crates/codegen/xai-grok-sampler/src/client.rs#L1156)). The ambient fallback (your session token or `XAI_API_KEY`) applies **only when the final effective URL is a first-party xAI origin** ([client.rs:860-921](file:///private/tmp/n193b/crates/codegen/xai-grok-sampler/src/client.rs#L860-921)). |
+| `"x_api_key"` | Sends `x-api-key: <key>` (Anthropic-style) instead of Bearer. Use with `env_key` or `api_key` ([config.rs:24](file:///private/tmp/n193b/crates/codegen/xai-grok-sampler/src/config.rs#L24), [client.rs:937](file:///private/tmp/n193b/crates/codegen/xai-grok-sampler/src/client.rs#L937), [client.rs:1151](file:///private/tmp/n193b/crates/codegen/xai-grok-sampler/src/client.rs#L1151)). |
+| `"none"` | Sends **no** auth header. Required for keyless local servers so ambient xAI credentials are not attached ([config.rs:25](file:///private/tmp/n193b/crates/codegen/xai-grok-sampler/src/config.rs#L25), [client.rs:952](file:///private/tmp/n193b/crates/codegen/xai-grok-sampler/src/client.rs#L952), [client.rs:1178](file:///private/tmp/n193b/crates/codegen/xai-grok-sampler/src/client.rs#L1178)). |
 
-When `auth_scheme` is omitted, Grok uses `"bearer"`.
+When `auth_scheme` is omitted, Grok uses `"bearer"` ([config.rs:22-23](file:///private/tmp/n193b/crates/codegen/xai-grok-sampler/src/config.rs#L22-23)).
 
 A **first-party xAI origin** is `https://x.ai` or any `https://*.x.ai` host, plus the built-in xAI API endpoint — HTTPS only, never loopback, never cleartext. On every other origin the ambient fallback (session token, `XAI_API_KEY`) is withheld.
 
@@ -360,6 +362,9 @@ reasoning_efforts = ["low", "medium", "high"]
 #### Web Search and Backend Search
 
 * `supports_backend_search` (boolean): For custom models that support server-side search, set this to `true` (e.g. `supports_backend_search = true`). This tells the shell to allow server-side web search for this model. Backend search is on by default; disable it globally with `[features].backend_tools = false` or the `GROK_BACKEND_SEARCH` environment variable. Hosted tools are only put on the wire by the Responses-family backends — Chat Completions and Messages requests never carry them, and the Codex backend excludes them — so set this only on a model using `api_backend = "responses"`. On any other backend the flag drops the local `web_search` tool without gaining server-side search.
+
+> [!NOTE]
+> For keyless local models configured with `auth_scheme = "none"`, the behavior of the `web_search` tool is currently an **open product question** (see issue [#178](https://github.com/ImL1s/medley/issues/178)). Do not assume the local web search tool is fully integrated or settled for these routes.
 
 ### Auto-Compaction Threshold
 
@@ -646,9 +651,9 @@ Point Grok at a custom OpenAI-compatible `/v1/models` endpoint instead of the de
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `GROK_MODELS_BASE_URL` | Yes | Base URL for inference. Grok fetches the model list from `{base_url}/models`. |
-| `XAI_API_KEY` | Yes | API key sent as `Authorization: Bearer`. Grok also accepts `GROK_CODE_XAI_API_KEY`. |
-| `GROK_MODELS_LIST_URL` | No | Override the model-list URL when it differs from `{base_url}/models`. Set the final URL; catalog redirects are rejected. |
+| `GROK_MODELS_BASE_URL` | Yes | Base URL for inference. Grok fetches the model list from `{base_url}/models` ([config.rs:715](file:///private/tmp/n193b/crates/codegen/xai-grok-shell/src/agent/config.rs#L715)). |
+| `XAI_API_KEY` | Yes | API key sent as `Authorization: Bearer` ([auth_method.rs:36](file:///private/tmp/n193b/crates/codegen/xai-grok-shell/src/agent/auth_method.rs#L36)). Grok also accepts `GROK_CODE_XAI_API_KEY`. |
+| `GROK_MODELS_LIST_URL` | No | Override the model-list URL when it differs from `{base_url}/models`. Set the final URL; catalog redirects are rejected ([config.rs:716](file:///private/tmp/n193b/crates/codegen/xai-grok-shell/src/agent/config.rs#L716)). |
 
 ### Setup
 
@@ -671,11 +676,32 @@ api_key = "my-api-key"
 
 When you use `[endpoints]` with partial model overrides, Grok inherits the `base_url` from the endpoints config, so you do not need to specify it in each `[model.*]` section.
 
-The per-model `api_key` above authenticates inference requests only. Catalog discovery still requires `XAI_API_KEY` (or the legacy `GROK_CODE_XAI_API_KEY`) in the environment.
+### Custom Catalog Discovery Authentication
+
+Grok supports configuring an explicit authentication scheme, custom headers, and custom timeout for remote catalog discovery under the global `[models]` section:
+
+<!-- medley-doc-test:toml:models-catalog-auth -->
+```toml
+[models]
+endpoint = "https://api.acme.com/v1/models"
+catalog_auth_scheme = "bearer"                  # "bearer", "x_api_key", or "none"
+catalog_env_key = "MY_COMPANY_CATALOG_KEY"      # Environment variable supplying the key
+catalog_headers = { "X-Organization" = "Acme" } # Custom request headers (optional)
+catalog_timeout_secs = 15                       # Request timeout in seconds (optional)
+```
+
+The fields are processed as follows:
+- `endpoint` ([config.rs:1303](file:///private/tmp/n193b/crates/codegen/xai-grok-shell/src/agent/config.rs#L1303)): Custom URL to fetch the model list from.
+- `catalog_auth_scheme` ([config.rs:1304](file:///private/tmp/n193b/crates/codegen/xai-grok-shell/src/agent/config.rs#L1304)): The authentication scheme used. Supported values are `"bearer"`, `"x_api_key"`, and `"none"`.
+- `catalog_env_key` ([config.rs:1305](file:///private/tmp/n193b/crates/codegen/xai-grok-shell/src/agent/config.rs#L1305)): The name of the environment variable (or array of variables) holding the API key.
+- `catalog_headers` ([config.rs:1307](file:///private/tmp/n193b/crates/codegen/xai-grok-shell/src/agent/config.rs#L1307)): Custom headers sent during discovery. Case-insensitive protected headers (`authorization`, `x-api-key`, `host`, and xAI client headers) cannot be overridden ([client.rs:917](file:///private/tmp/n193b/crates/codegen/xai-grok-shell/src/remote/client.rs#L917), [client.rs:859-866](file:///private/tmp/n193b/crates/codegen/xai-grok-shell/src/remote/client.rs#L859-866)).
+- `catalog_timeout_secs` ([config.rs:1310](file:///private/tmp/n193b/crates/codegen/xai-grok-shell/src/agent/config.rs#L1310)): HTTP timeout for catalog requests.
+
+The per-model `api_key` above authenticates inference requests only. Catalog discovery still requires `XAI_API_KEY` (or the legacy `GROK_CODE_XAI_API_KEY`) in the environment unless configured under `[models]` as shown above.
 
 ### Auth Behavior
 
-When you set `models_base_url` or `models_list_url`, Grok uses an explicit API key (`Authorization: Bearer`) instead of session auth. A `grok login` credential never authenticates a custom catalog, so set `XAI_API_KEY` (or its legacy alias) separately. Catalog redirects are rejected so the API key cannot be forwarded to a redirect target; configure `GROK_MODELS_LIST_URL` with the final URL.
+When you set `models_base_url` or `models_list_url`, Grok uses an explicit API key (`Authorization: Bearer`) instead of session auth. A `grok login` credential never authenticates a custom catalog, so set `XAI_API_KEY` (or its legacy alias) separately unless using the custom catalog config above. Catalog redirects are rejected so the API key cannot be forwarded to a redirect target; configure `GROK_MODELS_LIST_URL` or `[models].endpoint` with the final URL.
 
 ---
 
@@ -707,6 +733,9 @@ api_backend = "responses"        # hosted tools only ride the Responses-family w
 env_key = "PROVIDER_API_KEY"
 supports_backend_search = true
 ```
+
+> [!IMPORTANT]
+> **Credential Override Protection.** If the custom `web_search` model route has explicitly declared auth headers in its `extra_headers` or `env_http_headers` (verified via [`has_declared_credential_header`](file:///private/tmp/n193b/crates/codegen/xai-grok-tools/src/implementations/web_search/client.rs#L47)), an ambient xAI session token or credentials will **never** override or overwrite the route's custom headers (shipped in PR #181, verified at [`client.rs:282`](file:///private/tmp/n193b/crates/codegen/xai-grok-tools/src/implementations/web_search/client.rs#L282)).
 
 ---
 
@@ -761,10 +790,7 @@ telemetry = false
 
 ### Context bar shows 200K for Codex / auto-compact fires early
 
-The built-in `gpt-5.6-sol` preset's context window is a local default, not a
-provider-reported capacity. Override it in the global config — see
-[Context Window](#context-window) — or move only the compaction trigger with
-[Auto-Compaction Threshold](#auto-compaction-threshold).
+Grok attempts to fetch the live models list from the OpenAI Codex service online ([`fetch_openai_codex_catalog_models`](file:///private/tmp/n193b/crates/codegen/xai-grok-shell/src/agent/model_providers.rs#L202-244)). If the fetch fails (due to network issues or missing login credentials), it falls back to the built-in `gpt-5.6-sol` preset ([`openai_codex_preset_models`](file:///private/tmp/n193b/crates/codegen/xai-grok-shell/src/agent/model_providers.rs#L274-286)). This preset uses a local default context window of 200,000. You can override it in the global config — see [Context Window](#context-window) — or adjust the compaction trigger using [Auto-Compaction Threshold](#auto-compaction-threshold).
 
 ### Model Not Found
 

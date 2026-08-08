@@ -133,6 +133,7 @@ fn expected_toml_ids() -> BTreeSet<&'static str> {
         "provider-local-lmstudio",
         "provider-local-llamacpp",
         "provider-local-vllm",
+        "models-catalog-auth",
     ]
     .into_iter()
     .collect()
@@ -275,6 +276,7 @@ fn validate_markdown_links(doc_path: &Path, markdown: &str) -> Result<(), String
         if target.starts_with("http://")
             || target.starts_with("https://")
             || target.starts_with("mailto:")
+            || target.starts_with("file://")
         {
             continue;
         }
@@ -473,6 +475,22 @@ fn docs_examples_parse_and_resolve_provider_toml_examples() {
             "provider-local-lmstudio" => assert!(catalog.contains_key("lmstudio-local")),
             "provider-local-llamacpp" => assert!(catalog.contains_key("llamacpp")),
             "provider-local-vllm" => assert!(catalog.contains_key("vllm-local")),
+            "models-catalog-auth" => {
+                let auth_cfg = cfg.models.catalog_auth_config().unwrap();
+                assert_eq!(
+                    auth_cfg.endpoint.as_deref(),
+                    Some("https://api.acme.com/v1/models")
+                );
+                assert_eq!(
+                    auth_cfg.auth_scheme,
+                    Some(xai_grok_sampler::AuthScheme::Bearer)
+                );
+                assert_eq!(auth_cfg.timeout_secs, Some(15));
+                assert_eq!(
+                    auth_cfg.headers.get("X-Organization").map(|s| s.as_str()),
+                    Some("Acme")
+                );
+            }
             other => panic!("unhandled canonical TOML id '{other}'"),
         }
     }
