@@ -1,0 +1,176 @@
+name: Medley Project bootstrap (ephemeral)
+
+on:
+  push:
+    branches:
+      - automation/medley-project-247-20260808
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: medley-project-bootstrap-247
+  cancel-in-progress: true
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Create project through one-time encrypted PAT handoff
+        shell: bash
+        env:
+          AUTOMATION_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: "247"
+          EXPECTED_LOGIN: "ImL1s"
+        run: |
+          set -euo pipefail
+          set +x
+          umask 077
+          export GH_TOKEN="$AUTOMATION_TOKEN"
+
+          cleanup_files() {
+            rm -f /tmp/medley-project-private.pem /tmp/medley-project-public.pem               /tmp/medley-project-token.enc /tmp/medley-project-token.txt               /tmp/medley-project-setup.py /tmp/medley-project-setup.py.gz               /tmp/medley-project-setup.b64
+          }
+          trap cleanup_files EXIT
+
+          nonce="$(openssl rand -hex 20)"
+          marker="<!-- medley-project-bootstrap-key:${nonce} -->"
+          envelope_marker="<!-- medley-project-bootstrap-envelope:${nonce} -->"
+
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096             -out /tmp/medley-project-private.pem >/dev/null 2>&1
+          openssl pkey -in /tmp/medley-project-private.pem -pubout             -out /tmp/medley-project-public.pem >/dev/null 2>&1
+          public_key_b64="$(base64 -w0 /tmp/medley-project-public.pem)"
+
+          request_body="$(jq -rn --arg marker "$marker" --arg nonce "$nonce"             --arg public_key "$public_key_b64"             '$marker + "\nNonce: `" + $nonce + "`\nPublic key (base64 PEM):\n`" + $public_key + "`\n\nThis key is ephemeral and valid only while this workflow run is waiting."')"
+          request_comment_json="$(gh api -X POST             "repos/$REPO/issues/$ISSUE_NUMBER/comments" -f body="$request_body")"
+          request_comment_id="$(jq -r '.id' <<<"$request_comment_json")"
+
+          envelope_comment_id=""
+          encrypted_token_b64=""
+          for _ in $(seq 1 40); do
+            comments="$(gh api "repos/$REPO/issues/$ISSUE_NUMBER/comments?per_page=100")"
+            match="$(jq -r --arg login "$EXPECTED_LOGIN" --arg marker "$envelope_marker"               '.[] | select(.user.login == $login) | select(.body | startswith($marker + "\n")) | [.id, (.body | split("\n")[1])] | @tsv'               <<<"$comments" | tail -n 1)"
+            if [[ -n "$match" ]]; then
+              envelope_comment_id="${match%%$'\t'*}"
+              encrypted_token_b64="${match#*$'\t'}"
+              break
+            fi
+            sleep 15
+          done
+
+          if [[ -z "$envelope_comment_id" || -z "$encrypted_token_b64" ]]; then
+            gh api -X POST "repos/$REPO/issues/$ISSUE_NUMBER/comments"               -f body="Project bootstrap timed out waiting for the encrypted token envelope." >/dev/null
+            exit 1
+          fi
+
+          printf '%s' "$encrypted_token_b64" | base64 -d             > /tmp/medley-project-token.enc 2>/dev/null || {
+              gh api -X POST "repos/$REPO/issues/$ISSUE_NUMBER/comments"                 -f body="Project bootstrap received an invalid encrypted envelope." >/dev/null
+              exit 1
+            }
+          openssl pkeyutl -decrypt -inkey /tmp/medley-project-private.pem             -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256             -in /tmp/medley-project-token.enc -out /tmp/medley-project-token.txt             2>/dev/null || {
+              gh api -X POST "repos/$REPO/issues/$ISSUE_NUMBER/comments"                 -f body="Project bootstrap could not decrypt the one-time token envelope." >/dev/null
+              exit 1
+            }
+
+          project_token="$(tr -d '\r\n' < /tmp/medley-project-token.txt)"
+          case "$project_token" in
+            ghp_*|github_pat_*) ;;
+            *)
+              gh api -X POST "repos/$REPO/issues/$ISSUE_NUMBER/comments"                 -f body="Project bootstrap decrypted a value that is not a recognized GitHub PAT." >/dev/null
+              exit 1
+              ;;
+          esac
+
+          cat > /tmp/medley-project-setup.b64 <<'MEDLEY_SETUP_B64'
+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
+MEDLEY_SETUP_B64
+          base64 -d /tmp/medley-project-setup.b64 > /tmp/medley-project-setup.py.gz
+          gzip -d -c /tmp/medley-project-setup.py.gz > /tmp/medley-project-setup.py
+          python3 -m py_compile /tmp/medley-project-setup.py
+
+          set +e
+          GH_TOKEN="$project_token" python3 /tmp/medley-project-setup.py             > /tmp/medley-project-setup.out 2> /tmp/medley-project-setup.err
+          setup_status=$?
+          set -e
+
+          if [[ $setup_status -ne 0 ]]; then
+            safe_error="$(tail -n 30 /tmp/medley-project-setup.err | sed "s/$project_token/[REDACTED]/g")"
+            failure_body="$(jq -rn --arg error "$safe_error"               '"Project bootstrap failed while calling GitHub Projects v2.\n\n```text\n" + $error + "\n```"')"
+            GH_TOKEN="$AUTOMATION_TOKEN" gh api -X POST               "repos/$REPO/issues/$ISSUE_NUMBER/comments" -f body="$failure_body" >/dev/null
+            exit "$setup_status"
+          fi
+
+          project_url="$(grep -E '^https://github.com/users/ImL1s/projects/[0-9]+$'             /tmp/medley-project-setup.out | tail -n 1)"
+          [[ -n "$project_url" ]] || project_url="https://github.com/users/ImL1s/projects"
+          success_body="$(jq -rn --arg url "$project_url"             '"Medley Product Roadmap has been created and seeded: " + $url + "\n\nConfigured: linked repository, Status/Workstream/Phase/Platform fields, initial issue portfolio, field values, native sub-issue relationships, and initial status update. Saved views and built-in Project workflows remain the UI-only checklist in #247."')"
+          GH_TOKEN="$AUTOMATION_TOKEN" gh api -X POST             "repos/$REPO/issues/$ISSUE_NUMBER/comments" -f body="$success_body" >/dev/null
+
+          GH_TOKEN="$AUTOMATION_TOKEN" gh api -X DELETE             "repos/$REPO/issues/comments/$envelope_comment_id" >/dev/null 2>&1 || true
+          GH_TOKEN="$AUTOMATION_TOKEN" gh api -X DELETE             "repos/$REPO/issues/comments/$request_comment_id" >/dev/null 2>&1 || true
+          GH_TOKEN="$AUTOMATION_TOKEN" gh api -X DELETE             "repos/$REPO/git/refs/heads/${{ github.ref_name }}" >/dev/null 2>&1 || true
