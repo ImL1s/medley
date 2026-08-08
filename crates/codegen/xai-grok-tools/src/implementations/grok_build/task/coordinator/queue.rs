@@ -54,6 +54,11 @@ impl SpawnQueue {
 /// A spawn parked at the session concurrent limit.
 pub(super) struct QueuedSpawn {
     pub(super) request: Box<SubagentRequest>,
+    /// The session that actually spawned this child, captured before
+    /// `reparent_nested_spawn` flattened the request's parent to the root.
+    /// Carried through the queue so a dequeued nested child still builds its
+    /// capability context from its real parent (#271).
+    pub(super) spawn_parent_session_id: String,
     /// Tokio clock so paused-clock tests can assert the wait.
     pub(super) queued_at: tokio::time::Instant,
     pub(super) caller: QueuedCaller,
@@ -123,6 +128,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             if self.admission.has_capacity(running) {
                 let QueuedSpawn {
                     request,
+                    spawn_parent_session_id,
                     queued_at,
                     caller,
                 } = queued;
@@ -135,6 +141,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 };
                 self.start_child(
                     *request,
+                    spawn_parent_session_id,
                     spawn_reply,
                     StartOrigin::Dequeued {
                         queued_for: queued_at.elapsed(),
@@ -174,6 +181,8 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             request,
             caller,
             queued_at,
+            // Never started, so its spawn parent is not needed here.
+            spawn_parent_session_id: _,
         } = queued;
         // Token observers must see command-path cancels too.
         request.cancel_token.cancel();

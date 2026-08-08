@@ -504,9 +504,15 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         }
     }
 
+    /// `spawn_parent_session_id` is the session that *actually* spawned this
+    /// child, captured before `reparent_nested_spawn` flattens
+    /// `request.parent_session_id` to the root. The two differ only for a
+    /// nested spawn, which is why reading it from the request here went
+    /// unnoticed through a sync (#271).
     fn start_child(
         &mut self,
         request: SubagentRequest,
+        spawn_parent_session_id: String,
         spawn_reply: Option<oneshot::Sender<SubagentResult>>,
         origin: StartOrigin,
     ) {
@@ -540,7 +546,12 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         self.running_count_changed();
         // Computed after the pending insert, so a non-workflow spawn counts
         // itself; max over launches gives a session's peak concurrency.
-        let spawn_parent_session_id = request.parent_session_id.clone();
+        //
+        // `spawn_parent_session_id` is passed in rather than read from the
+        // request, because by this point `reparent_nested_spawn` has already
+        // rewritten `request.parent_session_id` to the *root*. Reading it here
+        // gave a nested child the root's session, and the fork uses this value
+        // to build the child's spawn context -- i.e. its capabilities (#271).
         let session_running = self.session_running_count(&spawn_parent_session_id);
         let reporter = ChildReporter {
             subagent_id: id.clone(),

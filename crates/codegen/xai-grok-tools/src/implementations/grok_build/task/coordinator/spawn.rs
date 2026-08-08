@@ -17,6 +17,11 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             mut request,
             result_tx,
         } = command;
+        // Before reparenting: `reparent_nested_spawn` rewrites
+        // `request.parent_session_id` to the root, and the fork needs the
+        // session that actually spawned this child to build its capability
+        // context (#271).
+        let spawn_parent_session_id = request.parent_session_id.clone();
         if let Err(rejection) = self.reparent_nested_spawn(&mut request) {
             let _ = result_tx.send(rejection);
             return;
@@ -49,9 +54,12 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         }
         let running = self.session_running_count(&request.parent_session_id);
         match self.admission.admit(&request, running) {
-            AdmissionDecision::Start => {
-                self.start_child(*request, Some(result_tx), StartOrigin::Direct)
-            }
+            AdmissionDecision::Start => self.start_child(
+                *request,
+                spawn_parent_session_id,
+                Some(result_tx),
+                StartOrigin::Direct,
+            ),
             AdmissionDecision::Enqueue => {
                 debug_assert!(
                     !request.owner.is_workflow(),
@@ -74,6 +82,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                     .then(|| tokio::time::Instant::now() + self.config.foreground_budget);
                 self.queued.push_back(QueuedSpawn {
                     request,
+                    spawn_parent_session_id,
                     queued_at: tokio::time::Instant::now(),
                     caller: QueuedCaller::Awaiting {
                         result_tx,

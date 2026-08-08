@@ -223,11 +223,12 @@ jobs:
             local output
             output="$(mktemp)"
             cargo test "$@" 2>&1 | tee "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
-              echo "test filter matched zero tests: $*" >&2
-              rm -f "$output"
-              return 1
-            }
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
             rm -f "$output"
           }
           run_nonzero -p xai-grok-auth --features middleware --lib credential -- --nocapture
@@ -313,11 +314,12 @@ jobs:
             local output
             output="$(mktemp)"
             cargo test "$@" 2>&1 | tee "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
-              echo "test filter matched zero tests: $*" >&2
-              rm -f "$output"
-              return 1
-            }
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
             rm -f "$output"
           }
           # #31: validate executable provider docs. Unique filters so
@@ -344,11 +346,12 @@ jobs:
             local output
             output="$(mktemp)"
             cargo test "$@" 2>&1 | tee "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
-              echo "test filter matched zero tests: $*" >&2
-              rm -f "$output"
-              return 1
-            }
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
             rm -f "$output"
           }
           run_nonzero -p xai-grok-update --lib dist_channel -- --nocapture
@@ -375,11 +378,12 @@ jobs:
             local output
             output="$(mktemp)"
             cargo test "$@" 2>&1 | tee "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
-              echo "test filter matched zero tests: $*" >&2
-              rm -f "$output"
-              return 1
-            }
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
             rm -f "$output"
           }
           run_nonzero -p xai-grok-shell --lib holder_has_lock_file_open -- --nocapture
@@ -392,11 +396,12 @@ jobs:
             local output
             output="$(mktemp)"
             cargo test "$@" 2>&1 | tee "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
-              echo "test filter matched zero tests: $*" >&2
-              rm -f "$output"
-              return 1
-            }
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
             rm -f "$output"
           }
           run_nonzero -p xai-grok-tools --lib \
@@ -689,11 +694,12 @@ jobs:
             local output
             output="$(mktemp)"
             cargo test "$@" 2>&1 | tee "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
-              echo "test filter matched zero tests: $*" >&2
-              rm -f "$output"
-              return 1
-            }
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
             rm -f "$output"
           }
           run_nonzero -p xai-grok-shell --lib \
@@ -738,11 +744,12 @@ jobs:
             local output
             output="$(mktemp)"
             cargo test "$@" 2>&1 | tee "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
-              echo "test filter matched zero tests: $*" >&2
-              rm -f "$output"
-              return 1
-            }
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
             rm -f "$output"
           }
           run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
@@ -816,11 +823,12 @@ jobs:
             local output
             output="$(mktemp)"
             cargo test "$@" 2>&1 | tee "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
-              echo "test filter matched zero tests: $*" >&2
-              rm -f "$output"
-              return 1
-            }
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
             rm -f "$output"
           }
           run_nonzero -p xai-grok-shell --lib \
