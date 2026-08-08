@@ -152,6 +152,48 @@ fn codex_catalog_context_window(obj: &serde_json::Map<String, serde_json::Value>
     .filter(|value| *value > 0)
 }
 
+fn codex_catalog_bool(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<bool> {
+    obj.get(key).and_then(serde_json::Value::as_bool)
+}
+
+fn codex_catalog_string_list(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Vec<String> {
+    obj.get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Read the load-bearing per-model wire flags from a live catalog entry.
+///
+/// The preset (`openai_codex_provider`) was written for one model; catalog
+/// entries differ on these fields and inheriting the preset wholesale is how
+/// non-preset models 400 (#245).
+fn codex_catalog_wire_capabilities(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> xai_grok_sampling_types::CodexWireCapabilities {
+    xai_grok_sampling_types::CodexWireCapabilities {
+        use_responses_lite: codex_catalog_bool(obj, "use_responses_lite"),
+        tool_mode: codex_catalog_string(obj, "tool_mode"),
+        supports_reasoning_summary_parameter: codex_catalog_bool(
+            obj,
+            "supports_reasoning_summary_parameter",
+        ),
+        supports_image_detail_original: codex_catalog_bool(obj, "supports_image_detail_original"),
+        input_modalities: codex_catalog_string_list(obj, "input_modalities"),
+        default_reasoning_level: codex_catalog_string(obj, "default_reasoning_level"),
+    }
+}
+
 fn parse_openai_codex_catalog_entry(
     value: &serde_json::Value,
 ) -> Option<(String, ConfigModelOverride)> {
@@ -164,6 +206,21 @@ fn parse_openai_codex_catalog_entry(
     let model = codex_catalog_string(obj, "model").unwrap_or_else(|| key.clone());
     let context_window =
         codex_catalog_context_window(obj).unwrap_or(OPENAI_CODEX_PRESET_CONTEXT_WINDOW);
+    let codex_wire = codex_catalog_wire_capabilities(obj);
+    // Apply catalog default effort when the entry names one we understand.
+    let reasoning_effort = codex_wire
+        .default_reasoning_level
+        .as_deref()
+        .and_then(|level| match level {
+            "none" => Some(xai_grok_sampling_types::ReasoningEffort::None),
+            "minimal" => Some(xai_grok_sampling_types::ReasoningEffort::Minimal),
+            "low" => Some(xai_grok_sampling_types::ReasoningEffort::Low),
+            "medium" => Some(xai_grok_sampling_types::ReasoningEffort::Medium),
+            "high" => Some(xai_grok_sampling_types::ReasoningEffort::High),
+            "xhigh" => Some(xai_grok_sampling_types::ReasoningEffort::Xhigh),
+            "max" => Some(xai_grok_sampling_types::ReasoningEffort::Max),
+            _ => None,
+        });
     Some((
         key,
         ConfigModelOverride {
@@ -175,6 +232,9 @@ fn parse_openai_codex_catalog_entry(
             description: codex_catalog_string(obj, "description")
                 .or(Some(OPENAI_CODEX_MODELS_CATALOG_DESCRIPTION.to_owned())),
             context_window: Some(context_window),
+            reasoning_effort,
+            supports_reasoning_effort: reasoning_effort.map(|_| true),
+            codex_wire: Some(codex_wire),
             ..ConfigModelOverride::default()
         },
     ))
@@ -333,6 +393,9 @@ pub(crate) fn merge_openai_codex_presets(
             name,
             description,
             context_window,
+            reasoning_effort,
+            supports_reasoning_effort,
+            codex_wire,
             ..
         } = preset;
         user_entry.model_provider = model_provider;
@@ -345,6 +408,15 @@ pub(crate) fn merge_openai_codex_presets(
         }
         if let Some(context_window) = context_window {
             user_entry.context_window.get_or_insert(context_window);
+        }
+        if user_entry.reasoning_effort.is_none() {
+            user_entry.reasoning_effort = reasoning_effort;
+        }
+        if user_entry.supports_reasoning_effort.is_none() {
+            user_entry.supports_reasoning_effort = supports_reasoning_effort;
+        }
+        if user_entry.codex_wire.is_none() {
+            user_entry.codex_wire = codex_wire;
         }
     }
 }
@@ -1977,6 +2049,79 @@ mod tests {
             .get("gpt-5.3-codex-spark")
             .expect("a second model must not be lost — one entry is the bug");
         assert_eq!(spark.context_window, Some(128_000));
+    }
+
+    /// #245: catalog entries that differ from the Sol preset on wire flags
+    /// must not be collapsed onto the preset's capabilities. The live table
+    /// in the issue is the fixture; the point is that Spark's flags reach
+    /// `codex_wire` instead of being dropped at parse time.
+    #[test]
+    fn codex_catalog_parser_reads_wire_capabilities_that_differ_from_the_preset() {
+        let payload = serde_json::json!({
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "display_name": "GPT-5.6 Sol",
+                    "context_window": 272000,
+                    "use_responses_lite": true,
+                    "tool_mode": "code_mode_only",
+                    "supports_reasoning_summary_parameter": true,
+                    "supports_image_detail_original": true,
+                    "input_modalities": ["text", "image"],
+                    "default_reasoning_level": "low"
+                },
+                {
+                    "slug": "gpt-5.3-codex-spark",
+                    "display_name": "GPT-5.3 Codex Spark",
+                    "context_window": 128000,
+                    "use_responses_lite": false,
+                    "tool_mode": null,
+                    "supports_reasoning_summary_parameter": false,
+                    "supports_image_detail_original": false,
+                    "input_modalities": ["text"],
+                    "default_reasoning_level": "high"
+                }
+            ]
+        });
+        let presets = parse_openai_codex_catalog_models(&payload);
+        let sol = presets
+            .get("gpt-5.6-sol")
+            .expect("sol")
+            .codex_wire
+            .as_ref()
+            .expect("sol wire caps");
+        let spark = presets
+            .get("gpt-5.3-codex-spark")
+            .expect("spark")
+            .codex_wire
+            .as_ref()
+            .expect("spark wire caps");
+
+        assert_eq!(sol.use_responses_lite, Some(true));
+        assert_eq!(spark.use_responses_lite, Some(false));
+        assert_eq!(sol.tool_mode.as_deref(), Some("code_mode_only"));
+        assert_eq!(spark.tool_mode, None);
+        assert_eq!(sol.supports_reasoning_summary_parameter, Some(true));
+        assert_eq!(spark.supports_reasoning_summary_parameter, Some(false));
+        assert_eq!(
+            sol.input_modalities,
+            vec!["text".to_owned(), "image".to_owned()]
+        );
+        assert_eq!(spark.input_modalities, vec!["text".to_owned()]);
+        assert_eq!(sol.default_reasoning_level.as_deref(), Some("low"));
+        assert_eq!(spark.default_reasoning_level.as_deref(), Some("high"));
+        assert!(
+            !spark.include_reasoning_summary(),
+            "Spark must not inherit Sol's summary parameter"
+        );
+        assert!(sol.include_reasoning_summary());
+
+        let spark_entry = presets.get("gpt-5.3-codex-spark").unwrap();
+        assert_eq!(
+            spark_entry.reasoning_effort,
+            Some(xai_grok_sampling_types::ReasoningEffort::High),
+            "catalog default_reasoning_level must become reasoning_effort"
+        );
     }
 
     /// `data` / `id` / `name` are tolerances for shapes this endpoint does not

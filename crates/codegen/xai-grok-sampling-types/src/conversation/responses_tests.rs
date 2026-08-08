@@ -48,6 +48,67 @@ fn codex_instructions_flatten_list_form_system_text() {
     assert_eq!(body["input"][0]["role"], "user");
 }
 
+/// #245: catalog models that set `supports_reasoning_summary_parameter=false`
+/// must not inherit Sol's `reasoning.summary` on the wire.
+#[test]
+fn codex_wire_capabilities_omit_reasoning_summary_when_unsupported() {
+    let mut body = serde_json::json!({
+        "model": "gpt-5.3-codex-spark",
+        "reasoning": { "effort": "high", "summary": "concise" },
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "hi"},
+                    {"type": "input_image", "image_url": "https://example.test/a.png"}
+                ]
+            }
+        ]
+    });
+    let caps = crate::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        input_modalities: vec!["text".to_owned()],
+        ..crate::CodexWireCapabilities::default()
+    };
+    apply_codex_wire_capabilities(&mut body, &caps);
+    assert!(
+        body["reasoning"].get("summary").is_none(),
+        "summary must be stripped when the catalog says the model rejects it: {body}"
+    );
+    assert_eq!(body["reasoning"]["effort"], "high");
+    let content = body["input"][0]["content"]
+        .as_array()
+        .expect("content array");
+    assert_eq!(
+        content.len(),
+        1,
+        "image parts stripped for text-only models"
+    );
+    assert_eq!(content[0]["type"], "input_text");
+}
+
+#[test]
+fn codex_wire_capabilities_keep_summary_when_catalog_allows_or_is_silent() {
+    let mut body = serde_json::json!({
+        "reasoning": { "effort": "low", "summary": "concise" }
+    });
+    apply_codex_wire_capabilities(&mut body, &crate::CodexWireCapabilities::default());
+    assert_eq!(body["reasoning"]["summary"], "concise");
+
+    let mut body = serde_json::json!({
+        "reasoning": { "effort": "low", "summary": "concise" }
+    });
+    apply_codex_wire_capabilities(
+        &mut body,
+        &crate::CodexWireCapabilities {
+            supports_reasoning_summary_parameter: Some(true),
+            ..crate::CodexWireCapabilities::default()
+        },
+    );
+    assert_eq!(body["reasoning"]["summary"], "concise");
+}
+
 #[test]
 fn codex_instructions_preserve_unsupported_system_content() {
     let original = serde_json::json!({

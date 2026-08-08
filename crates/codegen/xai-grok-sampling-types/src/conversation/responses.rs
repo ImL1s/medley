@@ -171,6 +171,35 @@ pub(super) fn build_responses_input(req: &ConversationRequest) -> rs::InputParam
     rs::InputParam::Items(items)
 }
 
+/// Apply per-model Codex catalog capabilities to a serialized Responses body.
+///
+/// The generic `CreateResponse` conversion cannot see catalog flags; the Codex
+/// transport calls this after serialize so a Spark entry that rejects
+/// `reasoning.summary` does not inherit Sol's wire shape (#245).
+pub fn apply_codex_wire_capabilities(
+    body: &mut serde_json::Value,
+    caps: &crate::CodexWireCapabilities,
+) {
+    if !caps.include_reasoning_summary()
+        && let Some(reasoning) = body.get_mut("reasoning").and_then(|v| v.as_object_mut())
+    {
+        reasoning.remove("summary");
+    }
+    if !caps.allows_image_input()
+        && let Some(input) = body.get_mut("input").and_then(|v| v.as_array_mut())
+    {
+        for item in input.iter_mut() {
+            if let Some(content) = item.get_mut("content").and_then(|v| v.as_array_mut()) {
+                content.retain(|part| {
+                    part.get("type")
+                        .and_then(|t| t.as_str())
+                        .is_none_or(|t| t != "input_image")
+                });
+            }
+        }
+    }
+}
+
 /// Codex expects system guidance in the top-level `instructions` field rather
 /// than as a `role: "system"` item inside `input`. Keep the generic Responses
 /// conversion unchanged and apply this only at the Codex transport boundary.

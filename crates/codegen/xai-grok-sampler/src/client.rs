@@ -505,6 +505,35 @@ fn safe_event_stream_error<E>(error: EventStreamError<E>) -> SamplingError {
     SamplingError::EventStreamError(class.to_string())
 }
 
+/// Report that a provider API call failed, and return the user-facing message.
+///
+/// #245 is about a 400 whose body named the rejected field being reduced to its
+/// status code. The body reaches the *user*, through
+/// [`user_facing_api_error_message`], which admits only a structured summary.
+///
+/// It does not reach the log. The log records that a body existed and how long
+/// it was, never any part of it: this fork keeps ~145 hand-written `Debug`
+/// impls reporting presence rather than values for exactly this reason, and
+/// `tests/test_credential_observability_guard.py` lists `body_preview` among
+/// the identifiers that must never appear as a logged value. A provider that
+/// echoes the failing request back is how a credential reaches a log file, and
+/// no amount of scrubbing on the way past changes that the bytes are the
+/// provider's to choose.
+fn log_and_user_facing_api_error(
+    endpoint: &'static str,
+    status: reqwest::StatusCode,
+    bytes: &[u8],
+) -> String {
+    tracing::error!(
+        endpoint,
+        status = %status,
+        body_len = bytes.len(),
+        body_present = !bytes.is_empty(),
+        "provider API error"
+    );
+    user_facing_api_error_message(status, bytes)
+}
+
 fn record_stream_request_failure(err: &reqwest::Error) {
     let span = tracing::Span::current();
     span.record("success", false);
@@ -659,6 +688,7 @@ struct ClientDefaults {
     endpoint_trust: EndpointTrustClass,
     stream_tool_calls: bool,
     doom_loop_recovery: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
+    codex_wire: Option<xai_grok_sampling_types::CodexWireCapabilities>,
 }
 
 /// Endpoint URL builder, resolved once at client construction so each request
@@ -1094,6 +1124,7 @@ impl SamplingClient {
             endpoint_trust,
             stream_tool_calls: config.stream_tool_calls,
             doom_loop_recovery: config.doom_loop_recovery,
+            codex_wire: config.codex_wire,
         };
 
         let endpoint = EndpointTemplate::new(&base_url, &config.query_params);
@@ -1358,13 +1389,14 @@ impl SamplingClient {
                     crate::attribution::SamplingConsumer::ChatCompletions,
                     &final_credential,
                 );
-                let server_message = user_facing_api_error_message(status, bytes.as_ref());
+                let server_message =
+                    log_and_user_facing_api_error("chat/completions", status, bytes.as_ref());
                 return Err(auth_rejected(
                     format!("Unauthorized (401): {server_message}"),
                     comparison,
                 ));
             }
-            let message = user_facing_api_error_message(status, bytes.as_ref());
+            let message = log_and_user_facing_api_error("chat/completions", status, bytes.as_ref());
             return Err(SamplingError::Api {
                 status,
                 message,
@@ -1501,7 +1533,8 @@ impl SamplingClient {
                     &final_credential,
                 );
                 let body = response.bytes().await.unwrap_or_default();
-                let server_message = user_facing_api_error_message(status, body.as_ref());
+                let server_message =
+                    log_and_user_facing_api_error("chat/completions", status, body.as_ref());
                 return Err(auth_rejected(
                     format!("Unauthorized (401): {server_message}"),
                     comparison,
@@ -1509,12 +1542,8 @@ impl SamplingClient {
             }
 
             let bytes = response.bytes().await?;
-            let message = user_facing_api_error_message(status, bytes.as_ref());
+            let message = log_and_user_facing_api_error("chat/completions", status, bytes.as_ref());
             span.record("error", "provider request failed");
-            tracing::error!(
-                status = %status,
-                "chat/completions API error"
-            );
             return Err(SamplingError::Api {
                 status,
                 message,
@@ -1681,6 +1710,9 @@ impl SamplingClient {
         })?;
         if self.is_codex() {
             xai_grok_sampling_types::patch_codex_instructions(&mut request_body);
+            if let Some(caps) = self.defaults.codex_wire.as_ref() {
+                xai_grok_sampling_types::apply_codex_wire_capabilities(&mut request_body, caps);
+            }
         }
         if !self.sends_xai_identity_headers() {
             anonymize_prompt_cache_key(&mut request_body);
@@ -1712,18 +1744,15 @@ impl SamplingClient {
                     crate::attribution::SamplingConsumer::Responses,
                     &final_credential,
                 );
-                let server_message = user_facing_api_error_message(status, bytes.as_ref());
+                let server_message =
+                    log_and_user_facing_api_error("responses", status, bytes.as_ref());
                 return Err(auth_rejected(
                     format!("Unauthorized (401): {server_message}"),
                     comparison,
                 ));
             }
 
-            let message = user_facing_api_error_message(status, bytes.as_ref());
-            tracing::warn!(
-                status = %status,
-                "responses API error"
-            );
+            let message = log_and_user_facing_api_error("responses", status, bytes.as_ref());
             return Err(SamplingError::Api {
                 status,
                 message,
@@ -1810,6 +1839,9 @@ impl SamplingClient {
         })?;
         if self.is_codex() {
             xai_grok_sampling_types::patch_codex_instructions(&mut request_body);
+            if let Some(caps) = self.defaults.codex_wire.as_ref() {
+                xai_grok_sampling_types::apply_codex_wire_capabilities(&mut request_body, caps);
+            }
         }
         if !self.sends_xai_identity_headers() {
             anonymize_prompt_cache_key(&mut request_body);
@@ -1876,7 +1908,8 @@ impl SamplingClient {
                     &final_credential,
                 );
                 let body = response.bytes().await.unwrap_or_default();
-                let server_message = user_facing_api_error_message(status, body.as_ref());
+                let server_message =
+                    log_and_user_facing_api_error("responses", status, body.as_ref());
                 return Err(auth_rejected(
                     format!("Unauthorized (401): {server_message}"),
                     comparison,
@@ -1886,12 +1919,8 @@ impl SamplingClient {
             let retry_after_secs = extract_retry_after(response.headers());
             let should_retry = extract_should_retry(response.headers());
             let bytes = response.bytes().await?;
-            let message = user_facing_api_error_message(status, bytes.as_ref());
+            let message = log_and_user_facing_api_error("responses", status, bytes.as_ref());
             span.record("error", "provider request failed");
-            tracing::error!(
-                status = %status,
-                "responses API error"
-            );
             return Err(SamplingError::Api {
                 status,
                 message,
@@ -2049,18 +2078,15 @@ impl SamplingClient {
                     crate::attribution::SamplingConsumer::Messages,
                     &final_credential,
                 );
-                let server_message = user_facing_api_error_message(status, bytes.as_ref());
+                let server_message =
+                    log_and_user_facing_api_error("messages", status, bytes.as_ref());
                 return Err(auth_rejected(
                     format!("Unauthorized (401): {server_message}"),
                     comparison,
                 ));
             }
 
-            let message = user_facing_api_error_message(status, bytes.as_ref());
-            tracing::warn!(
-                status = %status,
-                "messages API error"
-            );
+            let message = log_and_user_facing_api_error("messages", status, bytes.as_ref());
             return Err(SamplingError::Api {
                 status,
                 message,
@@ -2162,7 +2188,8 @@ impl SamplingClient {
                     &final_credential,
                 );
                 let body = response.bytes().await.unwrap_or_default();
-                let server_message = user_facing_api_error_message(status, body.as_ref());
+                let server_message =
+                    log_and_user_facing_api_error("messages", status, body.as_ref());
                 return Err(auth_rejected(
                     format!("Unauthorized (401): {server_message}"),
                     comparison,
@@ -2172,12 +2199,8 @@ impl SamplingClient {
             let retry_after_secs = extract_retry_after(response.headers());
             let should_retry = extract_should_retry(response.headers());
             let bytes = response.bytes().await?;
-            let message = user_facing_api_error_message(status, bytes.as_ref());
+            let message = log_and_user_facing_api_error("messages", status, bytes.as_ref());
             span.record("error", "provider request failed");
-            tracing::error!(
-                status = %status,
-                "messages API error"
-            );
             return Err(SamplingError::Api {
                 status,
                 message,
@@ -2644,6 +2667,7 @@ mod tests {
             compaction_at_tokens: None,
             doom_loop_recovery: None,
             header_injector: None,
+            codex_wire: None,
         }
     }
 
