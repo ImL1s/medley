@@ -1537,7 +1537,9 @@ pub(in crate::app::dispatch) fn handle_session_created(
             if app
                 .model_switch_transaction
                 .as_ref()
-                .is_some_and(|transaction| transaction.owner_agent_id == agent_id)
+                .is_some_and(|transaction| {
+                    transaction.owner_agent_id == agent_id && transaction.request_id.is_none()
+                })
             {
                 // Vestigial since the release moved into
                 // `begin_or_reject_deferred_model_switch` (#170 N3): this
@@ -1545,6 +1547,13 @@ pub(in crate::app::dispatch) fn handle_session_created(
                 // and that `deferred == None` arm above has already released
                 // any transaction this agent owned. Read it as a backstop,
                 // not load-bearing.
+                //
+                // Note for #239: if a CLI effort token was present, we might
+                // have synthesized a deferred model switch from it even when the
+                // stash was None. That synthesized switch is started with a live
+                // request ID. If the transaction already has a request ID, we must
+                // NOT clear it here, otherwise it becomes orphaned. Hence the
+                // `transaction.request_id.is_none()` check above.
                 //
                 // Record from the same review: that move also made the
                 // release roll back `app_models_optimistic` where the old

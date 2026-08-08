@@ -625,6 +625,24 @@ jobs:
           cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
             preferred_model_persist_failure -- --nocapture
 
+      - name: 'Orphaned switch transaction via synthesized switch (issue #239)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
+              echo "test filter matched zero tests: $*" >&2
+              rm -f "$output"
+              return 1
+            }
+            rm -f "$output"
+          }
+          run_nonzero --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
+            synthesized_switch_does_not_clear_transaction_with_live_request_id -- --nocapture
+
       # #170: the dashboard's mirror obligations. A refused pre-session pick
       # completes with a toast on the new agent; whenever the view stays on
       # the dashboard the caller must mirror it onto the dashboard's error
