@@ -629,15 +629,21 @@ jobs:
         env:
           PROTOC: protoc
         run: |
+          # The stricter of the two `run_nonzero` shapes in this file: it reads
+          # cargo's own status out of PIPESTATUS before looking at the output.
+          # The grep-only shape cannot tell a failing run from a passing one
+          # when an invocation names more than one target -- one binary's
+          # `ok. N passed` line satisfies it while another binary failed.
           run_nonzero() {
             local output
             output="$(mktemp)"
             cargo test "$@" 2>&1 | tee "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$output" || {
-              echo "test filter matched zero tests: $*" >&2
-              rm -f "$output"
-              return 1
-            }
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
             rm -f "$output"
           }
           run_nonzero --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
