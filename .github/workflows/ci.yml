@@ -492,8 +492,11 @@ jobs:
             theme:: -- --nocapture
           run_nonzero -p xai-grok-sampler --lib \
             retry:: -- --nocapture
-          run_nonzero -p xai-grok-sampler --test cf_edge_error_message \
-            cf_edge_error_message:: -- --nocapture
+          # `--test <target>` is already the restriction. The positional that
+          # used to follow named the *target* again, and an integration test's
+          # target name is not a module inside it -- these seven live at the
+          # binary's root, so `cf_edge_error_message::` selected none of them.
+          run_nonzero -p xai-grok-sampler --test cf_edge_error_message -- --nocapture
           run_nonzero -p xai-grok-sampling-types --lib \
             error:: -- --nocapture
           run_nonzero -p xai-grok-sandbox --lib \
@@ -614,12 +617,11 @@ jobs:
             slash:: -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             views:: -- --nocapture
-          run_nonzero -p xai-grok-pager --test grok_home_paths \
-            grok_home_paths:: -- --nocapture
-          run_nonzero -p xai-grok-pager --test signal_errno_preservation \
-            signal_errno_preservation:: -- --nocapture
-          run_nonzero -p xai-grok-pager --test settings_e2e \
-            settings_e2e:: -- --nocapture
+          # Same shape as `cf_edge_error_message` above: the positional repeated
+          # the target name, which is not a module path inside the binary.
+          run_nonzero -p xai-grok-pager --test grok_home_paths -- --nocapture
+          run_nonzero -p xai-grok-pager --test signal_errno_preservation -- --nocapture
+          run_nonzero -p xai-grok-pager --test settings_e2e -- --nocapture
           run_nonzero -p xai-grok-shell --test acp_session_setup_wire \
             acp_session_setup_conformance -- --nocapture
           run_nonzero -p xai-grok-sandbox --lib \
@@ -632,8 +634,19 @@ jobs:
             acp:: -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             actions:: -- --nocapture
-          run_nonzero -p xai-grok-pager --test pty_e2e_minimal --test pty_e2e \
-            pty_e2e:: -- --nocapture
+          # This one was wrong twice. `--test pty_e2e` names a target that does
+          # not exist -- upstream splits the PTY suites into `pty_e2e_smoke`,
+          # `_queue`, `_minimal`, `_config_ui` and so on, each an explicit
+          # `[[test]]` entry, and `tests/pty_e2e/` has no `main.rs` to make the
+          # directory one. `cargo test` errors out rather than reporting a
+          # count, so this never even reached the zero-match check. And the
+          # positional selected nothing in the target that *does* exist: those
+          # cases sit under `minimal::`, not `pty_e2e::`.
+          #
+          # 30 of the 31 are `#[ignore]`d without `PAGER_BINARY`, so what this
+          # buys is the target compiling plus its one runnable case -- which is
+          # the whole value, since a broken PTY harness fails to build.
+          run_nonzero -p xai-grok-pager --test pty_e2e_minimal -- --nocapture
 
       - name: Agent serve exposure and authentication
         env:
