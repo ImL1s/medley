@@ -2792,6 +2792,7 @@ fn model_overrides_live_cross_provider_switch_rebuilds_inherited_auxiliary_lanes
             web_search_follows_default: true,
             web_search_model: "source-provider".to_owned(),
             image_description_follows_default: true,
+            image_description_model: "source-provider".to_owned(),
         };
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         handle.cmd_tx = cmd_tx;
@@ -2891,6 +2892,7 @@ fn model_overrides_global_web_search_disable_skips_live_replacement() {
             web_search_follows_default: true,
             web_search_model: "source-provider".to_owned(),
             image_description_follows_default: true,
+            image_description_model: "source-provider".to_owned(),
         };
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         handle.cmd_tx = cmd_tx;
@@ -2957,6 +2959,7 @@ fn model_overrides_cold_web_search_notice_describes_operative_session_model() {
             web_search_follows_default: true,
             web_search_model: "source-provider".to_owned(),
             image_description_follows_default: true,
+            image_description_model: "source-provider".to_owned(),
         };
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         handle.cmd_tx = cmd_tx;
@@ -7235,6 +7238,8 @@ fn subagent_spawn_context_uses_parent_auxiliary_provenance_after_config_reload()
         handle.auxiliary_model_provenance = crate::session::AuxiliaryModelProvenance {
             web_search_follows_default: true,
             web_search_model: "spawn-default-search".to_owned(),
+            image_description_follows_default: true,
+            image_description_model: "spawn-default-image".to_owned(),
             ..Default::default()
         };
         agent.insert_resident(&sid, handle);
@@ -7242,11 +7247,15 @@ fn subagent_spawn_context_uses_parent_auxiliary_provenance_after_config_reload()
             let mut cfg = agent.cfg.borrow_mut();
             cfg.web_search_follows_default = false;
             cfg.web_search_model = "reloaded-explicit-search".to_owned();
+            cfg.image_description_follows_default = false;
+            cfg.image_description_model = Some("reloaded-explicit-image".to_owned());
         }
 
         let ctx = agent.build_subagent_spawn_context(sid.0.as_ref());
         assert!(ctx.web_search_follows_default);
         assert_eq!(ctx.web_search_model, "spawn-default-search");
+        assert!(ctx.image_description_follows_default);
+        assert_eq!(ctx.image_description_model, "spawn-default-image");
     });
 }
 #[test]

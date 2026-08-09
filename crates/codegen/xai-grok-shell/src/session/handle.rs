@@ -75,6 +75,7 @@ pub(crate) struct AuxiliaryModelProvenance {
     pub web_search_follows_default: bool,
     pub web_search_model: String,
     pub image_description_follows_default: bool,
+    pub image_description_model: String,
 }
 /// Handle for interacting with a session actor.
 /// Note: Permission event receivers are returned separately from `spawn_session_actor`

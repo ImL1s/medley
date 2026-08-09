@@ -487,16 +487,29 @@ impl MvpAgent {
             parent_model_id.0.as_ref(),
             web_search_follows_default,
         );
-        let (image_description_model, image_description_follows_default) = {
-            let cfg = self.cfg.borrow();
-            (
-                cfg.image_description_model
-                    .as_deref()
-                    .unwrap_or(crate::models::default_image_description_model())
-                    .to_owned(),
-                cfg.image_description_follows_default,
-            )
-        };
+        let (image_description_model, image_description_follows_default) = parent_handle
+            .as_ref()
+            .map(|handle| {
+                (
+                    handle
+                        .auxiliary_model_provenance
+                        .image_description_model
+                        .clone(),
+                    handle
+                        .auxiliary_model_provenance
+                        .image_description_follows_default,
+                )
+            })
+            .unwrap_or_else(|| {
+                let cfg = self.cfg.borrow();
+                (
+                    cfg.image_description_model
+                        .as_deref()
+                        .unwrap_or(crate::models::default_image_description_model())
+                        .to_owned(),
+                    cfg.image_description_follows_default,
+                )
+            });
         let (base_roles, base_personas, subagent_model_overrides, subagent_toggle) = {
             let cfg = self.cfg.borrow();
             (

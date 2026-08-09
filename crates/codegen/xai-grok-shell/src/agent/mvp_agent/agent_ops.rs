@@ -5522,6 +5522,11 @@ impl MvpAgent {
                 web_search_follows_default: cfg.web_search_follows_default,
                 web_search_model: cfg.web_search_model.clone(),
                 image_description_follows_default: cfg.image_description_follows_default,
+                image_description_model: cfg
+                    .image_description_model
+                    .as_deref()
+                    .unwrap_or(crate::models::default_image_description_model())
+                    .to_owned(),
             }
         };
         let source = if chat_history.is_empty() { "new" } else { "load" };
