@@ -3732,6 +3732,7 @@ async fn resolve_subagent_inherits_parent_model_without_pins() {
         let mut ctx = ctx_with_toggle(HashMap::new());
         ctx.sampling_config.model = parent_model.to_string();
         ctx.model_id = acp::ModelId::new(parent_model);
+        ctx.sampling_config_model_id = acp::ModelId::new(parent_model);
         let (config, model_id) = resolve_subagent_sampling_config(
                 "explore",
                 &ModelOverride::Inherit,
@@ -3824,6 +3825,7 @@ async fn resolve_subagent_config_override_unknown_model_falls_through_to_inherit
     let mut ctx = ctx_with_toggle(HashMap::new());
     ctx.sampling_config.model = "grok-4.5".to_string();
     ctx.model_id = acp::ModelId::new("grok-4.5");
+    ctx.sampling_config_model_id = acp::ModelId::new("grok-4.5");
     ctx.subagent_model_overrides
         .insert("explore".to_string(), "does-not-exist".to_string());
     let (config, model_id) = resolve_subagent_sampling_config(
@@ -3843,6 +3845,7 @@ async fn resolve_subagent_agent_definition_unknown_model_falls_through_to_inheri
     let mut ctx = ctx_with_toggle(HashMap::new());
     ctx.sampling_config.model = "grok-4.5".to_string();
     ctx.model_id = acp::ModelId::new("grok-4.5");
+    ctx.sampling_config_model_id = acp::ModelId::new("grok-4.5");
     let agent_model = ModelOverride::Override("does-not-exist".to_string());
     let (config, model_id) = resolve_subagent_sampling_config(
             "explore",
