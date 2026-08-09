@@ -70,9 +70,20 @@ pub(crate) fn task_model_error_for_catalog(
     let is_available = |entry: &ModelEntry| {
         entry.info.user_selectable && entry.info.visible_for_auth(is_session_auth)
     };
-    if config::find_model_by_id(available, requested).is_some_and(&is_available) {
+    if resolve_catalog_identity(available, &acp::ModelId::new(requested))
+        .and_then(|identity| available.get(identity.model_id.as_str()))
+        .is_some_and(&is_available)
+    {
         return None;
     }
+
+    let ambiguous_route = !available.contains_key(requested)
+        && available
+            .values()
+            .filter(|entry| entry.info().model == requested)
+            .take(2)
+            .count()
+            > 1;
 
     let mut slugs = available
         .iter()
@@ -89,7 +100,13 @@ pub(crate) fn task_model_error_for_catalog(
             slugs.join(", ")
         )
     };
-    Some(format!("Unknown Task.model slug '{requested}'. {guidance}"))
+    if ambiguous_route {
+        Some(format!(
+            "Ambiguous Task.model slug '{requested}'. Use an exact catalog key. {guidance}"
+        ))
+    } else {
+        Some(format!("Unknown Task.model slug '{requested}'. {guidance}"))
+    }
 }
 
 /// Thread-safe model manager.

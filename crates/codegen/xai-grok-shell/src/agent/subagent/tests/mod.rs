@@ -2249,10 +2249,33 @@ fn fresh_tool_model_rejects_unavailable_first_slug_collision() {
             )
             .as_deref(),
             Some(
-                "Unknown Task.model slug 'shared-routing-slug'. Valid model slugs: \
-                 visible-second. Omit `model` to inherit the parent model."
+                "Ambiguous Task.model slug 'shared-routing-slug'. Use an exact catalog key. \
+                 Valid model slugs: visible-second. Omit `model` to inherit the parent model."
             ),
-            "validation must inspect the first routing-slug entry selected by execution"
+            "validation must reject an ambiguous route instead of selecting either entry"
+        );
+}
+
+#[test]
+fn fresh_tool_model_rejects_ambiguous_visible_slug() {
+    let mut models = indexmap::IndexMap::new();
+    models.insert("first-key".to_string(), test_model_entry("shared-routing-slug"));
+    models.insert("second-key".to_string(), test_model_entry("shared-routing-slug"));
+
+    assert_eq!(
+            super::handle_request::task_model_override_error(
+                Some("shared-routing-slug"),
+                ModelOverrideProvenance::Tool,
+                false,
+                &models,
+                false,
+            )
+            .as_deref(),
+            Some(
+                "Ambiguous Task.model slug 'shared-routing-slug'. Use an exact catalog key. \
+                 Valid model slugs: first-key, second-key. Omit `model` to inherit the parent model."
+            ),
+            "an explicit Task.model must not silently inherit when its route is ambiguous"
         );
 }
 #[test]
