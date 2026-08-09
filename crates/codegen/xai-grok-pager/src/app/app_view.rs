@@ -6487,17 +6487,27 @@ pub(crate) mod tests {
             app.needs_animation(),
             "an open prompt history overlay must request animation ticks"
         );
-        let mut delivered = false;
-        for _ in 0..1000 {
-            if app.tick() && app.agents[&id].prompt.history_search.result_count() == 2 {
-                delivered = true;
-                break;
+        // `activate()` eagerly snapshots the daemon once. If the worker wins
+        // that race, the initial results can already be present without a
+        // subsequent tick reporting a new redraw.
+        let mut delivered = app.agents[&id].prompt.history_search.result_count() == 2;
+        if !delivered {
+            for _ in 0..1000 {
+                let needs_redraw = app.tick();
+                if app.agents[&id].prompt.history_search.result_count() == 2 {
+                    assert!(
+                        needs_redraw,
+                        "a tick that delivers history results must request a redraw"
+                    );
+                    delivered = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert!(
             delivered,
-            "tick() must poll the history daemon and deliver results"
+            "history daemon results were not delivered before the timeout"
         );
         app.agents
             .get_mut(&id)
