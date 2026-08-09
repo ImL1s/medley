@@ -2,15 +2,18 @@ use super::types::WebSearchConfig;
 use crate::attribution::{SharedAttributionCallback, ToolConsumer};
 use crate::types::{ApiCredential, ApiTransportProfile, SharedApiKeyProvider};
 use async_openai::types::responses as rs;
+use futures_util::StreamExt as _;
 use indexmap::IndexMap;
 use reqwest::header::{
-    AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT,
+    ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT,
 };
 
 const CHATGPT_ACCOUNT_ID: HeaderName = HeaderName::from_static("chatgpt-account-id");
 const OPENAI_FEDRAMP: HeaderName = HeaderName::from_static("x-openai-fedramp");
 const ORIGINATOR: HeaderName = HeaderName::from_static("originator");
 const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const MAX_CODEX_SSE_BYTES: usize = 16 * 1024 * 1024;
+const CODEX_SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Session-wide auth belongs only to xAI-operated endpoints. A custom model's
 /// static key is scoped to its configured endpoint and must never be replaced
@@ -134,6 +137,7 @@ fn retain_codex_headers(
         headers.insert(CONTENT_TYPE, value);
     }
     headers.insert(USER_AGENT, grok_build_user_agent()?);
+    headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
     headers.insert(AUTHORIZATION, authorization);
     if let Some(account_id) = account_id {
         let value = HeaderValue::from_str(account_id)
@@ -469,40 +473,59 @@ impl WebSearchClient {
         }
         Ok(request)
     }
-    /// Perform a web search query using the Responses API.
-    ///
-    /// Returns `(content, citations)` where content is the assistant's text
-    /// and citations are unique URLs found in the response annotations.
-    pub async fn search(
+
+    fn build_search_request(
         &self,
         query: &str,
         allowed_domains: Option<Vec<String>>,
-    ) -> Result<(String, Vec<String>), xai_tool_runtime::ToolError> {
-        let web_search = rs::WebSearchToolArgs::default()
-            .filters(rs::WebSearchToolFilters { allowed_domains })
-            .build()
-            .map_err(|e| {
-                xai_tool_runtime::ToolError::execution(
-                    xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                    format!("Failed to build web search tool: {e}"),
-                )
-            })?;
+    ) -> Result<rs::CreateResponse, xai_tool_runtime::ToolError> {
+        let mut web_search_builder = rs::WebSearchToolArgs::default();
+        if let Some(allowed_domains) = allowed_domains {
+            web_search_builder.filters(rs::WebSearchToolFilters {
+                allowed_domains: Some(allowed_domains),
+            });
+        }
+        let web_search = web_search_builder.build().map_err(|e| {
+            xai_tool_runtime::ToolError::execution(
+                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+                format!("Failed to build web search tool: {e}"),
+            )
+        })?;
+
+        let codex_transport = self.transport_profile == ApiTransportProfile::CodexResponses;
+        let input = if codex_transport {
+            rs::InputParam::Items(vec![rs::EasyInputMessage::from(query).into()])
+        } else {
+            rs::InputParam::Text(query.to_owned())
+        };
         let mut request_builder = rs::CreateResponseArgs::default();
         request_builder
             .model(self.model.clone())
-            .input(query.to_string())
+            .input(input)
             .tools(vec![rs::Tool::WebSearch(web_search)])
-            .store(false)
-            .max_output_tokens(8192u32);
-        if self.transport_profile != ApiTransportProfile::CodexResponses {
-            request_builder.temperature(0.1).top_p(0.95);
+            .store(false);
+        if codex_transport {
+            request_builder.stream(true);
+        } else {
+            request_builder
+                .max_output_tokens(8192u32)
+                .temperature(0.1)
+                .top_p(0.95);
         }
-        let request = request_builder.build().map_err(|e| {
+        request_builder.build().map_err(|e| {
             xai_tool_runtime::ToolError::execution(
                 xai_tool_protocol::ToolId::new("web_search").expect("valid"),
                 format!("Failed to build request: {e}"),
             )
-        })?;
+        })
+    }
+
+    async fn execute_search(
+        &self,
+        query: &str,
+        allowed_domains: Option<Vec<String>>,
+    ) -> Result<rs::Response, xai_tool_runtime::ToolError> {
+        let request = self.build_search_request(query, allowed_domains)?;
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
         let response = self.execute_authenticated(&url, &request).await?;
         let status = response.status();
@@ -512,18 +535,35 @@ impl WebSearchClient {
                 format!("Responses API request failed (HTTP {status})."),
             ));
         }
-        let bytes = response.bytes().await.map_err(|_| {
-            xai_tool_runtime::ToolError::execution(
-                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                "Failed to read Responses API response.".to_string(),
-            )
-        })?;
-        let response_obj: rs::Response = serde_json::from_slice(&bytes).map_err(|_| {
-            xai_tool_runtime::ToolError::execution(
-                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                "Responses API returned an invalid response.".to_string(),
-            )
-        })?;
+
+        if self.transport_profile == ApiTransportProfile::CodexResponses {
+            read_codex_sse_response(response).await
+        } else {
+            let bytes = response.bytes().await.map_err(|_| {
+                xai_tool_runtime::ToolError::execution(
+                    xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+                    "Failed to read Responses API response.".to_string(),
+                )
+            })?;
+            serde_json::from_slice(&bytes).map_err(|_| {
+                xai_tool_runtime::ToolError::execution(
+                    xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+                    "Responses API returned an invalid response.".to_string(),
+                )
+            })
+        }
+    }
+
+    /// Perform a web search query using the Responses API.
+    ///
+    /// Returns `(content, citations)` where content is the assistant's text
+    /// and citations are unique URLs found in the response annotations.
+    pub async fn search(
+        &self,
+        query: &str,
+        allowed_domains: Option<Vec<String>>,
+    ) -> Result<(String, Vec<String>), xai_tool_runtime::ToolError> {
+        let response_obj = self.execute_search(query, allowed_domains).await?;
         let content = response_obj
             .output_text()
             .unwrap_or_else(|| "No search results found.".to_string());
@@ -542,52 +582,7 @@ impl WebSearchClient {
         query: &str,
         allowed_domains: Option<Vec<String>>,
     ) -> Result<(String, Vec<(String, String)>), xai_tool_runtime::ToolError> {
-        let web_search = rs::WebSearchToolArgs::default()
-            .filters(rs::WebSearchToolFilters { allowed_domains })
-            .build()
-            .map_err(|e| {
-                xai_tool_runtime::ToolError::execution(
-                    xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                    format!("Failed to build web search tool: {e}"),
-                )
-            })?;
-        let mut request_builder = rs::CreateResponseArgs::default();
-        request_builder
-            .model(self.model.clone())
-            .input(query.to_string())
-            .tools(vec![rs::Tool::WebSearch(web_search)])
-            .store(false)
-            .max_output_tokens(8192u32);
-        if self.transport_profile != ApiTransportProfile::CodexResponses {
-            request_builder.temperature(0.1).top_p(0.95);
-        }
-        let request = request_builder.build().map_err(|e| {
-            xai_tool_runtime::ToolError::execution(
-                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                format!("Failed to build request: {e}"),
-            )
-        })?;
-        let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
-        let response = self.execute_authenticated(&url, &request).await?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(xai_tool_runtime::ToolError::execution(
-                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                format!("Responses API request failed (HTTP {status})."),
-            ));
-        }
-        let bytes = response.bytes().await.map_err(|_| {
-            xai_tool_runtime::ToolError::execution(
-                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                "Failed to read Responses API response.".to_string(),
-            )
-        })?;
-        let response_obj: rs::Response = serde_json::from_slice(&bytes).map_err(|_| {
-            xai_tool_runtime::ToolError::execution(
-                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                "Responses API returned an invalid response.".to_string(),
-            )
-        })?;
+        let response_obj = self.execute_search(query, allowed_domains).await?;
         let content = response_obj
             .output_text()
             .unwrap_or_else(|| "No search results found.".to_string());
@@ -595,6 +590,155 @@ impl WebSearchClient {
         Ok((content, pairs))
     }
 }
+
+async fn read_codex_sse_response(
+    response: reqwest::Response,
+) -> Result<rs::Response, xai_tool_runtime::ToolError> {
+    let mut stream = response.bytes_stream();
+    let mut decoder = CodexSseDecoder::default();
+    loop {
+        let chunk = tokio::time::timeout(CODEX_SSE_IDLE_TIMEOUT, stream.next())
+            .await
+            .map_err(|_| codex_stream_error("Responses API stream timed out."))?;
+        match chunk {
+            Some(Ok(chunk)) => {
+                if let Some(response) = decoder.push(&chunk)? {
+                    return Ok(response);
+                }
+            }
+            Some(Err(_)) => {
+                return Err(codex_stream_error("Failed to read Responses API stream."));
+            }
+            None => return Err(invalid_codex_stream()),
+        }
+    }
+}
+
+fn codex_stream_error(message: &str) -> xai_tool_runtime::ToolError {
+    xai_tool_runtime::ToolError::execution(
+        xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+        message.to_string(),
+    )
+}
+
+fn invalid_codex_stream() -> xai_tool_runtime::ToolError {
+    codex_stream_error("Responses API returned an invalid stream.")
+}
+
+fn sse_line_ending_len(bytes: &[u8], index: usize) -> Option<usize> {
+    match bytes.get(index) {
+        Some(b'\n') => Some(1),
+        Some(b'\r') if bytes.get(index + 1) == Some(&b'\n') => Some(2),
+        Some(b'\r') => Some(1),
+        _ => None,
+    }
+}
+
+fn next_sse_frame(bytes: &[u8]) -> Option<(usize, usize)> {
+    let mut index = 0;
+    while index < bytes.len() {
+        if let Some(first_len) = sse_line_ending_len(bytes, index) {
+            let next = index + first_len;
+            if let Some(second_len) = sse_line_ending_len(bytes, next) {
+                return Some((index, next + second_len));
+            }
+            index = next;
+        } else {
+            index += 1;
+        }
+    }
+    None
+}
+
+#[derive(Default)]
+struct CodexSseDecoder {
+    buffer: Vec<u8>,
+    received_bytes: usize,
+    done_output_items: std::collections::BTreeMap<u32, rs::OutputItem>,
+}
+
+impl CodexSseDecoder {
+    fn push(&mut self, chunk: &[u8]) -> Result<Option<rs::Response>, xai_tool_runtime::ToolError> {
+        self.received_bytes = self.received_bytes.saturating_add(chunk.len());
+        if self.received_bytes > MAX_CODEX_SSE_BYTES {
+            return Err(codex_stream_error(
+                "Responses API stream exceeded the safe size limit.",
+            ));
+        }
+        self.buffer.extend_from_slice(chunk);
+
+        while let Some((frame_end, consumed_end)) = next_sse_frame(&self.buffer) {
+            let frame = self.buffer[..frame_end].to_vec();
+            self.buffer.drain(..consumed_end);
+            if let Some(response) = self.decode_frame(&frame)? {
+                return Ok(Some(response));
+            }
+        }
+        Ok(None)
+    }
+
+    fn decode_frame(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<Option<rs::Response>, xai_tool_runtime::ToolError> {
+        let text = std::str::from_utf8(frame).map_err(|_| invalid_codex_stream())?;
+        let data = text
+            .split(['\r', '\n'])
+            .filter_map(|line| line.strip_prefix("data:").map(|data| data.trim_start()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if data.is_empty() {
+            return Ok(None);
+        }
+        if data == "[DONE]" {
+            return Err(invalid_codex_stream());
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(&data).map_err(|_| invalid_codex_stream())?;
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("response.output_item.done") => {
+                let event: rs::ResponseOutputItemDoneEvent =
+                    serde_json::from_value(value).map_err(|_| invalid_codex_stream())?;
+                self.done_output_items
+                    .insert(event.output_index, event.item);
+                Ok(None)
+            }
+            Some("response.completed") => {
+                let event: rs::ResponseCompletedEvent =
+                    serde_json::from_value(value).map_err(|_| invalid_codex_stream())?;
+                let mut response = event.response;
+                if response.status != rs::Status::Completed {
+                    return Err(invalid_codex_stream());
+                }
+                if response.output.is_empty() && !self.done_output_items.is_empty() {
+                    response.output = std::mem::take(&mut self.done_output_items)
+                        .into_values()
+                        .collect();
+                }
+                Ok(Some(response))
+            }
+            Some("response.failed") => {
+                Err(codex_stream_error("Responses API stream reported failure."))
+            }
+            Some("response.incomplete") => {
+                Err(codex_stream_error("Responses API stream ended incomplete."))
+            }
+            Some("error") => Err(codex_stream_error(
+                "Responses API stream reported an error.",
+            )),
+            Some(_) => Ok(None),
+            None => Err(invalid_codex_stream()),
+        }
+    }
+}
+
+#[cfg(test)]
+fn decode_codex_sse_response(body: &[u8]) -> Result<rs::Response, xai_tool_runtime::ToolError> {
+    CodexSseDecoder::default()
+        .push(body)?
+        .ok_or_else(invalid_codex_stream)
+}
+
 /// Extract citation URLs from the Response output items.
 /// The async-openai crate doesn't provide a helper for this, and the `url` field
 /// in `UrlCitationBody` is private, so we serialize to JSON to extract it.
@@ -1151,8 +1295,134 @@ mod tests {
         })
     }
 
+    fn search_sse_from_response(mut terminal: serde_json::Value) -> String {
+        let item = terminal["output"][0].clone();
+        terminal["output"] = serde_json::json!([]);
+        let item_done = serde_json::json!({
+            "type": "response.output_item.done",
+            "sequence_number": 1,
+            "output_index": 0,
+            "item": item,
+        });
+        let completed = serde_json::json!({
+            "type": "response.completed",
+            "sequence_number": 2,
+            "response": terminal,
+        });
+        format!(
+            "event: response.output_item.done\r\ndata: {item_done}\r\n\r\n\
+             event: response.completed\r\ndata: {completed}\r\n\r\n\
+             data: [DONE]\r\n\r\n"
+        )
+    }
+
+    fn successful_search_sse(text: &str) -> String {
+        search_sse_from_response(successful_search_response(text))
+    }
+
+    #[test]
+    fn codex_sse_backfills_done_items_from_empty_completed_terminal() {
+        let response =
+            decode_codex_sse_response(successful_search_sse("streamed result").as_bytes())
+                .expect("valid Codex SSE should decode");
+        assert_eq!(response.output_text().as_deref(), Some("streamed result"));
+        assert_eq!(response.output.len(), 1);
+    }
+
+    #[test]
+    fn codex_sse_decoder_returns_on_terminal_before_done_or_eof() {
+        let body = successful_search_sse("incremental result");
+        let mut decoder = CodexSseDecoder::default();
+        let mut terminal = None;
+        let mut consumed = 0;
+        for byte in body.as_bytes().chunks(1) {
+            consumed += byte.len();
+            if let Some(response) = decoder.push(byte).unwrap() {
+                terminal = Some(response);
+                break;
+            }
+        }
+        let response = terminal.expect("completed event should terminate the decoder");
+        assert_eq!(
+            response.output_text().as_deref(),
+            Some("incremental result")
+        );
+        assert!(
+            consumed < body.len(),
+            "decoder waited for the trailing [DONE] frame"
+        );
+    }
+
     #[tokio::test]
-    async fn codex_web_search_omits_unsupported_sampling_parameters() {
+    async fn codex_web_search_returns_when_terminal_arrives_before_http_eof() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = successful_search_sse("early terminal result");
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            socket
+                .write_all(format!("{:X}\r\n{body}\r\n", body.len()).as_bytes())
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+            let _ = release_rx.await;
+        });
+
+        let client =
+            WebSearchClient::new(&codex_config(&format!("http://{address}")), None).unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.search("query", None),
+        )
+        .await
+        .expect("completed SSE must not wait for HTTP EOF")
+        .unwrap();
+        assert_eq!(result.0, "early terminal result");
+        let _ = release_tx.send(());
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn codex_sse_terminal_failures_and_malformed_payloads_are_secret_safe() {
+        let secret = "provider-secret-payload-0123456789";
+        for body in [
+            format!("data: {{\"type\":\"response.failed\",\"message\":\"{secret}\"}}\n\n"),
+            format!("data: {{\"type\":\"response.incomplete\",\"message\":\"{secret}\"}}\n\n"),
+            format!("data: {{\"type\":\"error\",\"message\":\"{secret}\"}}\n\n"),
+            format!("data: {{\"type\":\"response.completed\",\"secret\":\"{secret}\"}}\n\n"),
+            format!("data: {secret}\n\n"),
+        ] {
+            let error = decode_codex_sse_response(body.as_bytes())
+                .expect_err("terminal failure or malformed SSE must fail")
+                .to_string();
+            assert_secret_absent(&error, secret);
+        }
+    }
+
+    #[test]
+    fn codex_sse_rejects_missing_terminal_and_oversized_body() {
+        let missing_terminal = b"data: {\"type\":\"response.queued\"}\n\n";
+        assert!(decode_codex_sse_response(missing_terminal).is_err());
+
+        let oversized = vec![b'x'; MAX_CODEX_SSE_BYTES + 1];
+        let error = decode_codex_sse_response(&oversized).unwrap_err();
+        assert!(error.to_string().contains("safe size limit"));
+    }
+
+    #[tokio::test]
+    async fn codex_web_search_uses_streaming_chatgpt_request_shape_for_both_entry_points() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1161,7 +1431,8 @@ mod tests {
             .and(path("/responses"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_json(successful_search_response("codex result")),
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(successful_search_sse("codex result")),
             )
             .expect(2)
             .mount(&server)
@@ -1188,6 +1459,16 @@ mod tests {
         assert_eq!(requests.len(), 2);
         for request in requests {
             let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(request.headers.get("accept").unwrap(), "text/event-stream");
+            assert!(
+                body["input"].is_array(),
+                "Codex input must be a list: {body}"
+            );
+            assert_eq!(body.get("stream"), Some(&serde_json::json!(true)));
+            assert!(
+                body.get("max_output_tokens").is_none(),
+                "Codex request must omit max_output_tokens: {body}"
+            );
             assert!(
                 body.get("temperature").is_none(),
                 "Codex request must omit temperature: {body}"
@@ -1196,7 +1477,87 @@ mod tests {
                 body.get("top_p").is_none(),
                 "Codex request must omit top_p: {body}"
             );
+            assert!(
+                body["tools"][0].get("filters").is_none(),
+                "absent domain filters must be omitted: {body}"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn codex_web_search_preserves_explicit_domain_filter_intent() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(successful_search_sse("codex result")),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = WebSearchClient::new(&codex_config(&server.uri()), None).unwrap();
+        client.search("empty", Some(Vec::new())).await.unwrap();
+        client
+            .search("restricted", Some(vec!["example.com".to_string()]))
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let empty: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let restricted: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(
+            empty["tools"][0]["filters"]["allowed_domains"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            restricted["tools"][0]["filters"]["allowed_domains"],
+            serde_json::json!(["example.com"])
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_web_search_extracts_streamed_citations_for_both_entry_points() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let mut response = successful_search_response("cited result");
+        response["output"][0]["content"][0]["annotations"] = serde_json::json!([{
+            "type": "url_citation",
+            "url": "https://example.com/source",
+            "title": "Example source",
+            "start_index": 0,
+            "end_index": 5
+        }]);
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(search_sse_from_response(response)),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = WebSearchClient::new(&codex_config(&server.uri()), None).unwrap();
+
+        let (content, citations) = client.search("query", None).await.unwrap();
+        assert_eq!(content, "cited result");
+        assert_eq!(citations, vec!["https://example.com/source"]);
+        let (content, citation_pairs) = client.search_with_titles("query", None).await.unwrap();
+        assert_eq!(content, "cited result");
+        assert_eq!(
+            citation_pairs,
+            vec![(
+                "Example source".to_string(),
+                "https://example.com/source".to_string()
+            )]
+        );
     }
 
     #[tokio::test]
@@ -1220,7 +1581,8 @@ mod tests {
                 .and(header("chatgpt-account-id", "fresh-codex-account"))
                 .respond_with(
                     ResponseTemplate::new(200)
-                        .set_body_json(successful_search_response("recovered result")),
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(successful_search_sse("recovered result")),
                 )
                 .expect(1)
                 .mount(&server)
@@ -1738,24 +2100,12 @@ mod tests {
                 "user-agent",
                 format!("xai-grok-build/{}", xai_grok_version::VERSION),
             ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "resp_test",
-                "object": "response",
-                "created_at": 1234567890,
-                "status": "completed",
-                "model": "test-model",
-                "output": [{
-                    "type": "message",
-                    "id": "msg_1",
-                    "status": "completed",
-                    "role": "assistant",
-                    "content": [{
-                        "type": "output_text",
-                        "text": "provider scoped result",
-                        "annotations": []
-                    }]
-                }]
-            })))
+            .and(header("accept", "text/event-stream"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(successful_search_sse("provider scoped result")),
+            )
             .mount(&server)
             .await;
 
