@@ -2701,35 +2701,43 @@ impl Config {
         &mut self,
         effective_default: Option<&str>,
     ) {
-        if !self.web_search_model_explicit {
-            if let Some(policy_model) = self.models.web_search.as_deref() {
-                self.web_search_model = policy_model.to_owned();
-                self.web_search_model_explicit = true;
-                self.web_search_follows_default = false;
-            } else if let Some(effective_default) = effective_default {
-                self.web_search_model = effective_default.to_owned();
-                self.web_search_follows_default = true;
-            }
+        if let Some(policy_model) = self.models.web_search.as_deref()
+            && (!self.web_search_model_explicit || self.web_search_model != policy_model)
+        {
+            self.web_search_model = policy_model.to_owned();
+            self.web_search_model_explicit = true;
+            self.web_search_follows_default = false;
+        } else if !self.web_search_model_explicit
+            && let Some(effective_default) = effective_default
+        {
+            self.web_search_model = effective_default.to_owned();
+            self.web_search_follows_default = true;
         }
-        if !self.session_summary_model_explicit {
-            if let Some(policy_model) = self.models.session_summary.as_deref() {
-                self.session_summary_model = Some(policy_model.to_owned());
-                self.session_summary_model_explicit = true;
-                self.session_summary_follows_default = false;
-            } else if let Some(effective_default) = effective_default {
-                self.session_summary_model = Some(effective_default.to_owned());
-                self.session_summary_follows_default = true;
-            }
+        if let Some(policy_model) = self.models.session_summary.as_deref()
+            && (!self.session_summary_model_explicit
+                || self.session_summary_model.as_deref() != Some(policy_model))
+        {
+            self.session_summary_model = Some(policy_model.to_owned());
+            self.session_summary_model_explicit = true;
+            self.session_summary_follows_default = false;
+        } else if !self.session_summary_model_explicit
+            && let Some(effective_default) = effective_default
+        {
+            self.session_summary_model = Some(effective_default.to_owned());
+            self.session_summary_follows_default = true;
         }
-        if !self.image_description_model_explicit {
-            if let Some(policy_model) = self.models.image_description.as_deref() {
-                self.image_description_model = Some(policy_model.to_owned());
-                self.image_description_model_explicit = true;
-                self.image_description_follows_default = false;
-            } else if let Some(effective_default) = effective_default {
-                self.image_description_model = Some(effective_default.to_owned());
-                self.image_description_follows_default = true;
-            }
+        if let Some(policy_model) = self.models.image_description.as_deref()
+            && (!self.image_description_model_explicit
+                || self.image_description_model.as_deref() != Some(policy_model))
+        {
+            self.image_description_model = Some(policy_model.to_owned());
+            self.image_description_model_explicit = true;
+            self.image_description_follows_default = false;
+        } else if !self.image_description_model_explicit
+            && let Some(effective_default) = effective_default
+        {
+            self.image_description_model = Some(effective_default.to_owned());
+            self.image_description_follows_default = true;
         }
     }
     /// Re-resolve eagerly-resolved runtime fields using the current `Config`
@@ -16181,6 +16189,65 @@ web_search = "explicit-search"
             Some("required-default")
         );
         assert!(cfg.image_description_follows_default);
+    }
+
+    #[test]
+    #[serial]
+    fn managed_auxiliary_pins_override_explicit_user_provenance() {
+        clear_runtime_env_vars();
+        let raw: toml::Value = toml::from_str(
+            r#"
+[models]
+web_search = "user-search"
+session_summary = "user-summary"
+image_description = "user-image"
+"#,
+        )
+        .unwrap();
+        let mut cfg = Config::new_from_toml_cfg(&raw).unwrap();
+        cfg.resolve_runtime_fields(&RuntimeResolutionContext {
+            raw_config: &raw,
+            remote_settings: None,
+            is_headless: false,
+            cli_subagents: None,
+            cli_web_search_model: None,
+            cli_session_summary_model: None,
+            cli_experimental_memory: false,
+            cli_no_memory: false,
+            disable_web_search: false,
+            todo_gate: false,
+            laziness_debug_log: None,
+            storage_mode: None,
+        });
+        assert!(cfg.web_search_model_explicit);
+        assert_eq!(cfg.web_search_model, "user-search");
+        assert!(cfg.session_summary_model_explicit);
+        assert_eq!(cfg.session_summary_model.as_deref(), Some("user-summary"));
+        assert!(cfg.image_description_model_explicit);
+        assert_eq!(cfg.image_description_model.as_deref(), Some("user-image"));
+
+        // A managed policy merge updates these fields after runtime provenance
+        // has already recorded the user's explicit pins.
+        cfg.models.web_search = Some("required-search".to_owned());
+        cfg.models.session_summary = Some("required-summary".to_owned());
+        cfg.models.image_description = Some("required-image".to_owned());
+        cfg.rebind_unset_auxiliary_models_to_default(Some("required-default"));
+
+        assert_eq!(cfg.web_search_model, "required-search");
+        assert!(cfg.web_search_model_explicit);
+        assert!(!cfg.web_search_follows_default);
+        assert_eq!(
+            cfg.session_summary_model.as_deref(),
+            Some("required-summary")
+        );
+        assert!(cfg.session_summary_model_explicit);
+        assert!(!cfg.session_summary_follows_default);
+        assert_eq!(
+            cfg.image_description_model.as_deref(),
+            Some("required-image")
+        );
+        assert!(cfg.image_description_model_explicit);
+        assert!(!cfg.image_description_follows_default);
     }
     #[test]
     #[serial]

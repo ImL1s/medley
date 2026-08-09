@@ -423,6 +423,10 @@ struct FinalizedTool {
     output_converter:
         Arc<dyn Fn(serde_json::Value) -> Result<ToolOutput, serde_json::Error> + Send + Sync>,
     definition: ToolDefinition,
+    /// Client-supplied replacement for `metadata.description_template()`.
+    /// Retained so live tool-topology changes can rebuild descriptions that
+    /// reference another tool through `TemplateRenderer`.
+    description_override: Option<String>,
     /// Effective params (defaults merged with client overrides).
     /// Kept for building `ProposedTool` during reminder evaluation and for
     /// params-aware finalized definition construction.
@@ -467,6 +471,7 @@ pub struct FinalizedToolset {
     /// Cloned into `ToolCallContext::extensions` on each `call()` so tools
     /// can resolve names without acquiring the `resources` mutex.
     renderer: Arc<TemplateRenderer>,
+    truncation_config: crate::types::context::TruncationConfig,
     /// Tag name for system-reminder wrappers in tool result text.
     system_reminder_tag: &'static str,
     /// Per-user feature-flag bag stamped on every dispatch ctx by
@@ -1353,6 +1358,7 @@ impl ToolRegistryBuilder {
                 metadata: Arc::from(entry.metadata),
                 output_converter: Arc::from(entry.output_converter),
                 definition,
+                description_override: tool_config.description_override.clone(),
                 effective_params,
                 input_schema: entry.input_schema,
                 reverse_params,
@@ -1452,6 +1458,7 @@ impl ToolRegistryBuilder {
             scheduler_cancel: scheduler_cancel_token,
             local_registry,
             renderer: renderer_arc,
+            truncation_config,
             system_reminder_tag: ctx.system_reminder_tag,
             workspace_viewer_ctx,
             capability_policy: self.capability_policy,
@@ -1528,6 +1535,7 @@ impl FinalizedToolset {
                 std::collections::HashMap::new(),
                 std::collections::HashMap::new(),
             )),
+            truncation_config: Default::default(),
             system_reminder_tag: "system-reminder",
             workspace_viewer_ctx: None,
             capability_policy: policy,
@@ -2267,6 +2275,7 @@ impl FinalizedToolset {
                 })
             }),
             definition,
+            description_override: Some(description),
             effective_params: serde_json::Value::Object(Default::default()),
             input_schema,
             reverse_params: HashMap::new(),
@@ -2329,6 +2338,48 @@ impl FinalizedToolset {
         }
         removed
     }
+    /// Rebuild exported definitions after a live renderer topology update.
+    fn refresh_live_tool_definitions(
+        &self,
+        tools: &mut [FinalizedTool],
+        inactive: &mut HashMap<String, FinalizedTool>,
+    ) {
+        for tool in tools.iter_mut().chain(inactive.values_mut()) {
+            let param_map = tool
+                .reverse_params
+                .iter()
+                .map(|(client, canonical)| (canonical.clone(), client.clone()))
+                .collect::<HashMap<_, _>>();
+            let mut definition = tool.metadata.versioned_definition(
+                tool.contract_version.as_deref(),
+                &tool.client_name,
+                tool.description_override.as_deref(),
+                &self.renderer,
+                &param_map,
+                &tool.input_schema,
+                &tool.effective_params,
+            );
+            if let Some(description) = &definition.function.description {
+                definition.function.description =
+                    Some(self.truncation_config.interpolate_description(
+                        description,
+                        &tool.client_name,
+                        crate::DEFAULT_TOOL_OUTPUT_BYTES,
+                        xai_tool_types::max_wait_block_ms(),
+                    ));
+            }
+            self.renderer
+                .render_schema_descriptions(&mut definition.function.parameters);
+            self.truncation_config.apply_to_schema(
+                &mut definition.function.parameters,
+                &tool.client_name,
+                crate::DEFAULT_TOOL_OUTPUT_BYTES,
+                xai_tool_types::max_wait_block_ms(),
+            );
+            tool.definition = definition;
+        }
+    }
+
     /// Toggle the built-in `web_search` definition without changing its
     /// capability identity or dropping the shared in-process handle.
     ///
@@ -2346,6 +2397,7 @@ impl FinalizedToolset {
                     .insert(tool.client_name.clone());
                 self.renderer
                     .set_web_search_enabled(Some(tool.client_name.clone()));
+                self.refresh_live_tool_definitions(&mut tools, &mut inactive);
                 return true;
             }
             let Some(tool) = inactive.remove(ID) else {
@@ -2355,6 +2407,7 @@ impl FinalizedToolset {
             tools.push(tool);
             self.enabled_native_tool_names.insert(client_name.clone());
             self.renderer.set_web_search_enabled(Some(client_name));
+            self.refresh_live_tool_definitions(&mut tools, &mut inactive);
             true
         } else {
             let Some(index) = tools.iter().position(|tool| tool.canonical_id == ID) else {
@@ -2362,12 +2415,14 @@ impl FinalizedToolset {
                 // Disabling that already-disabled capability is a successful
                 // no-op, matching `can_set_web_search_enabled(false)`.
                 self.renderer.set_web_search_enabled(None);
+                self.refresh_live_tool_definitions(&mut tools, &mut inactive);
                 return true;
             };
             let tool = tools.remove(index);
             self.enabled_native_tool_names.remove(&tool.client_name);
             inactive.insert(ID.to_owned(), tool);
             self.renderer.set_web_search_enabled(None);
+            self.refresh_live_tool_definitions(&mut tools, &mut inactive);
             true
         }
     }
@@ -5324,8 +5379,8 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn task_description_renders_with_default_agent_config() {
-        let builder = ToolRegistryBuilder::new();
+    async fn task_description_tracks_live_web_search_topology() {
+        let builder = ToolRegistryBuilder::new().with_dynamic_web_search(true);
         let config = ToolServerConfig {
             tools: vec![
                 ToolConfig {
@@ -5387,7 +5442,12 @@ mod tests {
                     params: None,
                     name_override: None,
                     params_name_overrides: None,
-                    description_override: None,
+                    // Agent construction supplies the task roster through a
+                    // description override. Keep the cross-tool reference raw
+                    // here so every live topology transition must rerender it.
+                    description_override: Some(
+                        "Task roster: ${{ tools.by_kind.web_search }}".to_owned(),
+                    ),
                     behavior_version: None,
                     kind: None,
                 },
@@ -5432,6 +5492,37 @@ mod tests {
             "rendered description must not contain raw template placeholders, got:\n{desc}"
         );
         assert!(!desc.is_empty(), "task tool description must be non-empty");
+        assert!(!desc.contains("web_search"));
+        drop(defs);
+
+        assert!(toolset.set_web_search_enabled(true));
+        let defs = toolset.tool_definitions();
+        let desc = defs
+            .iter()
+            .find(|definition| definition.function.name == "task")
+            .and_then(|definition| definition.function.description.as_deref())
+            .expect("task description after enabling web search");
+        assert!(desc.contains("web_search"));
+        drop(defs);
+
+        assert!(toolset.set_web_search_enabled(false));
+        let defs = toolset.tool_definitions();
+        let desc = defs
+            .iter()
+            .find(|definition| definition.function.name == "task")
+            .and_then(|definition| definition.function.description.as_deref())
+            .expect("task description after disabling web search");
+        assert!(!desc.contains("web_search"));
+        drop(defs);
+
+        assert!(toolset.set_web_search_enabled(true));
+        let defs = toolset.tool_definitions();
+        let desc = defs
+            .iter()
+            .find(|definition| definition.function.name == "task")
+            .and_then(|definition| definition.function.description.as_deref())
+            .expect("task description after re-enabling web search");
+        assert!(desc.contains("web_search"));
     }
     fn hashline_tool_config(id: &str) -> ToolConfig {
         ToolConfig {

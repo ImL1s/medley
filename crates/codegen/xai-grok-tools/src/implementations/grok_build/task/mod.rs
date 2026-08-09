@@ -167,10 +167,13 @@ impl crate::types::tool_metadata::ToolMetadata for TaskTool {
         // description, never a placeholder: default to the built-in roster
         // with templated tool/param names, resolved by the registry renderer
         // at finalize time.
-        /// Wrap each `${{ tools.by_kind.X }}` token in an if/else so kinds
+        /// Wrap each `${{ tools.by_kind.X }}` token in a guard. Most kinds
         /// absent from the registry render as the bare kind name instead of
         /// an empty slot ("read, , and plan"), mirroring the bare-kind
-        /// fallback of `BuiltinSubagent::render_tools`.
+        /// fallback of `BuiltinSubagent::render_tools`. Web search is the
+        /// intentional exception: it is dynamically enabled, so an absent
+        /// capability must disappear rather than advertise an unavailable
+        /// bare tool name.
         ///
         /// These guards sit inline in the roster, so they use the
         /// non-stripping `${% %}` form: `${%-` would eat the ", " before
@@ -182,10 +185,16 @@ impl crate::types::tool_metadata::ToolMetadata for TaskTool {
             TOKEN
                 .replace_all(template, |caps: &regex::Captures| {
                     let kind = &caps[1];
-                    format!(
-                        "${{% if tools.by_kind.{kind} %}}${{{{ tools.by_kind.{kind} }}}}\
-                         ${{% else %}}{kind}${{% endif %}}"
-                    )
+                    if kind == "web_search" {
+                        format!(
+                            "${{% if tools.by_kind.{kind} %}}${{{{ tools.by_kind.{kind} }}}}${{% endif %}}"
+                        )
+                    } else {
+                        format!(
+                            "${{% if tools.by_kind.{kind} %}}${{{{ tools.by_kind.{kind} }}}}\
+                             ${{% else %}}{kind}${{% endif %}}"
+                        )
+                    }
                 })
                 .into_owned()
         }
