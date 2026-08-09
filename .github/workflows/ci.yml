@@ -165,10 +165,10 @@ jobs:
           shared-key: providers-lint
           cache-targets: true
 
-      - name: Clippy sampler / shell / pager / pager-bin (all targets)
+      - name: Clippy sampler / shell / tools / pager / pager-bin (all targets)
         run: |
-          # Measured 2026-08-07 on providers (#194): `--all-targets` on these
-          # four crates is clean after fixing the handful of test/bench lints
+          # Measured 2026-08-09 on providers (#275): `--all-targets` on these
+          # five crates is clean after fixing the handful of test/bench lints
           # (see the PR). No `-A` allow-list — that would re-open the blind
           # spot this job is meant to close. Full-workspace clippy remains
           # too slow; we stay on the hot-path crates only.
@@ -177,6 +177,8 @@ jobs:
           # that is how `.err().expect()` lived green in CI since 5c8144e.
           cargo clippy --manifest-path crates/codegen/xai-grok-sampler/Cargo.toml --all-targets -- -D warnings
           cargo clippy --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --all-targets -- -D warnings
+          # Include the opt-in PI backend so its test-only environment lock is linted too.
+          cargo clippy --manifest-path crates/codegen/xai-grok-tools/Cargo.toml --all-targets --features pi -- -D warnings
           cargo clippy --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --all-targets -- -D warnings
           cargo clippy --manifest-path crates/codegen/xai-grok-pager-bin/Cargo.toml --all-targets -- -D warnings
 

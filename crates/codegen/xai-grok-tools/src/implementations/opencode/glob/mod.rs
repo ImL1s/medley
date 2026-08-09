@@ -410,8 +410,10 @@ mod tests {
     #[cfg(all(feature = "pi", unix))]
     use std::os::unix::fs::PermissionsExt;
     #[cfg(all(feature = "pi", unix))]
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::OnceLock;
     use tempfile::TempDir;
+    #[cfg(all(feature = "pi", unix))]
+    use tokio::sync::Mutex;
 
     fn test_resources(cwd: &std::path::Path) -> Resources {
         let mut resources = Resources::new();
@@ -990,7 +992,7 @@ exit 0
     #[cfg(all(feature = "pi", unix))]
     #[tokio::test]
     async fn pi_glob_fd_contract_preserves_public_glob_semantics() {
-        let _env_lock = fd_test_env_lock().lock().unwrap();
+        let _env_lock = fd_test_env_lock().lock().await;
         let tmp = TempDir::new().unwrap();
 
         xai_test_utils::git::ensure_hermetic_git_on_path();
@@ -1113,7 +1115,7 @@ rg --files --glob='!.git/*' --hidden --glob "$pattern" "$search_path"
     #[cfg(all(feature = "pi", unix))]
     #[tokio::test]
     async fn pi_glob_fd_error_falls_back_to_ripgrep() {
-        let _env_lock = fd_test_env_lock().lock().unwrap();
+        let _env_lock = fd_test_env_lock().lock().await;
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("fallback.txt"), "ok\n").unwrap();
 
