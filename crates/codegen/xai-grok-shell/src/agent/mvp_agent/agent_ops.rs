@@ -18,6 +18,17 @@ fn byok_from_models(
         .or_else(|| models.get(current).and_then(|m| m.own_credential()))
         .or_else(|| models.values().find_map(|m| m.own_credential()))
 }
+fn summary_config_or_primary(
+    primary: &SamplingConfig,
+    resolved: Option<SamplingConfig>,
+    inherited_default_missing: bool,
+) -> SamplingConfig {
+    if inherited_default_missing {
+        primary.clone()
+    } else {
+        resolved.unwrap_or_else(|| primary.clone())
+    }
+}
 struct MissingSessionCtx {
     has_session_key: bool,
     has_own_credentials: bool,
@@ -118,27 +129,54 @@ impl MvpAgent {
         }
         session_ids.len()
     }
-    pub(super) fn resolve_image_description_model(&self) -> String {
-        self.cfg
-            .borrow()
-            .image_description_model
-            .as_deref()
-            .unwrap_or(crate::models::default_image_description_model())
-            .to_owned()
+    pub(crate) fn resolve_image_description_model(&self, primary_model_id: &str) -> String {
+        let (model_id, follows_default) = {
+            let cfg = self.cfg.borrow();
+            (
+                cfg.image_description_model
+                    .as_deref()
+                    .unwrap_or(crate::models::default_image_description_model())
+                    .to_owned(),
+                cfg.image_description_follows_default,
+            )
+        };
+        crate::config::auxiliary_model_or_operative(
+            &model_id,
+            primary_model_id,
+            follows_default,
+        )
     }
-    fn resolve_session_summary_model(&self) -> String {
-        self.cfg
-            .borrow()
-            .session_summary_model
-            .as_deref()
-            .unwrap_or(crate::models::default_session_summary_model())
-            .to_owned()
+    pub(crate) fn web_search_disable_details_for_model(
+        &self,
+        model_id: &str,
+    ) -> Option<config::WebSearchDisabled> {
+        let cfg = self.cfg.borrow();
+        let models = self.models_manager.models();
+        let session = self.current_or_buffered_auth();
+        config::web_search_disable_details(
+            model_id,
+            &models,
+            session.as_ref().map(|auth| auth.key.as_str()),
+            cfg.grok_com_config.api_key_auth_disabled(),
+            cfg.endpoints.alpha_test_key.clone(),
+            cfg.client_version.clone(),
+            &cfg.endpoints,
+        )
     }
     pub(super) async fn build_summary_client(
         &self,
         primary: &SamplingConfig,
     ) -> Result<(OaiCompatClient, String), acp::Error> {
-        let slug = self.resolve_session_summary_model();
+        let (slug, follows_default) = {
+            let cfg = self.cfg.borrow();
+            (
+                cfg.session_summary_model
+                    .as_deref()
+                    .unwrap_or(crate::models::default_session_summary_model())
+                    .to_owned(),
+                cfg.session_summary_follows_default,
+            )
+        };
         let session_key = self.auth_manager.current_or_expired().map(|a| a.key.clone());
         let models = self.models_manager.models();
         let endpoints = self.models_manager.endpoints();
@@ -150,18 +188,20 @@ impl MvpAgent {
                 cfg.client_version.clone(),
             )
         };
-        let config = match crate::agent::config::resolve_aux_model_sampling_config_preflight(
-            &slug,
-            &models,
-            &endpoints,
-            session_key.as_deref(),
-            disable_api_key_auth,
-            alpha_test_key,
-            client_version,
-        )
-        .await
-        {
-            Some(mut cfg) => {
+        let resolved = if follows_default {
+            None
+        } else {
+            crate::agent::config::resolve_aux_model_sampling_config_preflight(
+                &slug,
+                &models,
+                &endpoints,
+                session_key.as_deref(),
+                disable_api_key_auth,
+                alpha_test_key,
+                client_version,
+            )
+            .await
+            .map(|mut cfg| {
                 crate::agent::config::stamp_session_local_sampler_fields(
                     &mut cfg,
                     primary,
@@ -169,13 +209,9 @@ impl MvpAgent {
                     primary.max_retries,
                 );
                 cfg
-            }
-            None => {
-                let mut fallback = primary.clone();
-                fallback.model = slug;
-                fallback
-            }
+            })
         };
+        let config = summary_config_or_primary(primary, resolved, follows_default);
         let model = config.model.clone();
         let client = OaiCompatClient::new(config).map_err(map_sampling_err_to_acp)?;
         Ok((client, model))
@@ -2560,14 +2596,16 @@ impl MvpAgent {
             tier_restricted,
         }
     }
-    pub(super) fn prepare_web_search_sampling_config(&self) -> Option<SamplingConfig> {
-        let model_id = self.cfg.borrow().web_search_model.clone();
+    pub(super) fn prepare_web_search_sampling_config_for_model(
+        &self,
+        model_id: &str,
+    ) -> Option<SamplingConfig> {
         let models = self.models_manager.models();
         let session = self.current_or_buffered_auth();
         let alpha_test_key = self.cfg.borrow().endpoints.alpha_test_key.clone();
         let client_version = self.cfg.borrow().client_version.clone();
         let mut cfg = config::resolve_web_search_sampling_config(
-            &model_id,
+            model_id,
             &models,
             session.as_ref().map(|a| a.key.as_str()),
             self.cfg.borrow().grok_com_config.api_key_auth_disabled(),
@@ -2588,14 +2626,34 @@ impl MvpAgent {
     /// different -- and wrong -- cause: an expired-but-refreshable Codex
     /// credential is deliberately `ready`, so a failed refresh came back as
     /// "auth provider has no cached token" when there was one (#57).
-    pub(super) async fn prepare_web_search_sampling_config_preflight(
+    pub(crate) async fn prepare_web_search_sampling_config_preflight(
         &self,
         disable_reason: &mut Option<config::WebSearchDisabled>,
+        operative_model_id: Option<&str>,
     ) -> Option<SamplingConfig> {
-        let (model_id, disable_api_key_auth, alpha_test_key, client_version, endpoints) = {
+        let operative_model_id = operative_model_id
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.models_manager.current_model_id().0.to_string());
+        let model_id = {
+            let cfg = self.cfg.borrow();
+            crate::config::auxiliary_model_or_operative(
+                &cfg.web_search_model,
+                &operative_model_id,
+                cfg.web_search_follows_default,
+            )
+        };
+        self.prepare_web_search_sampling_config_for_model_preflight(disable_reason, &model_id)
+            .await
+    }
+
+    pub(crate) async fn prepare_web_search_sampling_config_for_model_preflight(
+        &self,
+        disable_reason: &mut Option<config::WebSearchDisabled>,
+        model_id: &str,
+    ) -> Option<SamplingConfig> {
+        let (disable_api_key_auth, alpha_test_key, client_version, endpoints) = {
             let cfg = self.cfg.borrow();
             (
-                cfg.web_search_model.clone(),
                 cfg.grok_com_config.api_key_auth_disabled(),
                 cfg.endpoints.alpha_test_key.clone(),
                 cfg.client_version.clone(),
@@ -2605,7 +2663,7 @@ impl MvpAgent {
         let models = self.models_manager.models();
         let session = self.current_or_buffered_auth();
         let mut cfg = config::resolve_web_search_sampling_config_preflight_result(
-            &model_id,
+            model_id,
             &models,
             session.as_ref().map(|a| a.key.as_str()),
             disable_api_key_auth,
@@ -3773,7 +3831,7 @@ impl MvpAgent {
     /// Tri-state guardrail (#133): if readiness is `Unknown(CatalogUnavailable)`
     /// we cannot tell whether web search is usable, so stay silent (remove any
     /// stale map entry) rather than misreport "disabled".
-    pub(super) async fn recompute_web_search_disable_notice_for_session(
+    pub(crate) async fn recompute_web_search_disable_notice_for_session(
         &self,
         session_id: &acp::SessionId,
     ) {
@@ -3781,7 +3839,28 @@ impl MvpAgent {
             self.web_search_disabled.borrow_mut().remove(session_id);
             return;
         }
-        let model_id = self.cfg.borrow().web_search_model.clone();
+        let default_model_id = self.models_manager.current_model_id();
+        let handle = self.resident_handle(session_id);
+        let session_model_id = crate::upload::turn::lookup_session_model(
+            handle.as_ref().map(|handle| handle.model_id.clone()),
+            &default_model_id,
+        );
+        let model_id = {
+            let cfg = self.cfg.borrow();
+            let follows_default = handle
+                .as_ref()
+                .map(|handle| handle.auxiliary_model_provenance.web_search_follows_default)
+                .unwrap_or(cfg.web_search_follows_default);
+            let configured_model = handle
+                .as_ref()
+                .map(|handle| handle.auxiliary_model_provenance.web_search_model.as_str())
+                .unwrap_or(&cfg.web_search_model);
+            crate::config::auxiliary_model_or_operative(
+                configured_model,
+                session_model_id.0.as_ref(),
+                follows_default,
+            )
+        };
         let models = self.models_manager.models();
         let (facts, _) = crate::agent::config::resolve_model_auth_facts_and_provider(
             &model_id,
@@ -3804,7 +3883,10 @@ impl MvpAgent {
 
         let mut web_search_disable_reason = None;
         let web_search_sampling_config = self
-            .prepare_web_search_sampling_config_preflight(&mut web_search_disable_reason)
+            .prepare_web_search_sampling_config_for_model_preflight(
+                &mut web_search_disable_reason,
+                &model_id,
+            )
             .await;
         let needs_notice = web_search_sampling_config
             .as_ref()
@@ -3817,17 +3899,7 @@ impl MvpAgent {
         let disabled = if let Some(reason) = web_search_disable_reason {
             Some(reason)
         } else {
-            let cfg = self.cfg.borrow();
-            let session = self.current_or_buffered_auth();
-            config::web_search_disable_details(
-                &cfg.web_search_model,
-                &models,
-                session.as_ref().map(|a| a.key.as_str()),
-                cfg.grok_com_config.api_key_auth_disabled(),
-                cfg.endpoints.alpha_test_key.clone(),
-                cfg.client_version.clone(),
-                &cfg.endpoints,
-            )
+            self.web_search_disable_details_for_model(&model_id)
         };
 
         if let Some(disabled) = disabled {
@@ -3839,6 +3911,22 @@ impl MvpAgent {
                     message: disabled.user_notice(),
                 },
             );
+        } else {
+            self.web_search_disabled.borrow_mut().remove(session_id);
+        }
+    }
+
+    /// Apply the disable reason returned by the actor-owned model-switch
+    /// transaction without performing a second credential preflight.
+    pub(crate) fn set_web_search_disable_notice_for_session(
+        &self,
+        session_id: &acp::SessionId,
+        disabled: Option<crate::session::WebSearchDisabledNotice>,
+    ) {
+        if let Some(disabled) = disabled {
+            self.web_search_disabled
+                .borrow_mut()
+                .insert(session_id.clone(), disabled);
         } else {
             self.web_search_disabled.borrow_mut().remove(session_id);
         }
@@ -4983,8 +5071,19 @@ impl MvpAgent {
         let disable_web_search = self.cfg.borrow().disable_web_search;
         let mut web_search_disable_reason = None;
         let web_search_sampling_config = self
-            .prepare_web_search_sampling_config_preflight(&mut web_search_disable_reason)
+            .prepare_web_search_sampling_config_preflight(
+                &mut web_search_disable_reason,
+                Some(session_model_id.0.as_ref()),
+            )
             .await;
+        let operative_web_search_model = {
+            let cfg = self.cfg.borrow();
+            crate::config::auxiliary_model_or_operative(
+                &cfg.web_search_model,
+                session_model_id.0.as_ref(),
+                cfg.web_search_follows_default,
+            )
+        };
         // #57: silent disable is the failure mode — capture a user-visible
         // notice now (before spawn) and emit it once the session exists.
         // Skip when the user explicitly passed `--disable-web-search`.
@@ -5009,18 +5108,7 @@ impl MvpAgent {
                 // Resolution succeeded but produced no usable key, which the
                 // preflight reports as `Ok`. Only this arm needs the
                 // non-preflight describe.
-                let cfg = self.cfg.borrow();
-                let models = self.models_manager.models();
-                let session = self.current_or_buffered_auth();
-                config::web_search_disable_details(
-                    &cfg.web_search_model,
-                    &models,
-                    session.as_ref().map(|a| a.key.as_str()),
-                    cfg.grok_com_config.api_key_auth_disabled(),
-                    cfg.endpoints.alpha_test_key.clone(),
-                    cfg.client_version.clone(),
-                    &cfg.endpoints,
-                )
+                self.web_search_disable_details_for_model(&operative_web_search_model)
             }
         };
         let image_gen_config = self.prepare_image_gen_config();
@@ -5192,6 +5280,8 @@ impl MvpAgent {
                     agent_name: Some(agent_definition.name.clone()),
                     reasoning_effort: initial_reasoning_effort,
                 });
+            let image_description_model =
+                self.resolve_image_description_model(session_model_id.0.as_ref());
             let acp_mcp_servers = crate::session::acp_mcp::parse_acp_mcp_servers(
                 session_meta,
             );
@@ -5322,7 +5412,7 @@ impl MvpAgent {
                             ),
                         ),
                     ),
-                    self.resolve_image_description_model(),
+                    image_description_model,
                     agent_hook_registry_override,
                     workspace_ops.clone(),
                     {
@@ -5425,6 +5515,20 @@ impl MvpAgent {
         if handle_display_cwd.is_some() {
             handle.display_cwd = handle_display_cwd;
         }
+        handle.auxiliary_model_provenance = {
+            let cfg = self.cfg.borrow();
+            crate::session::AuxiliaryModelProvenance {
+                session_summary_follows_default: cfg.session_summary_follows_default,
+                web_search_follows_default: cfg.web_search_follows_default,
+                web_search_model: cfg.web_search_model.clone(),
+                image_description_follows_default: cfg.image_description_follows_default,
+                image_description_model: cfg
+                    .image_description_model
+                    .as_deref()
+                    .unwrap_or(crate::models::default_image_description_model())
+                    .to_owned(),
+            }
+        };
         let source = if chat_history.is_empty() { "new" } else { "load" };
         let _ = handle
             .cmd_tx
@@ -5503,5 +5607,38 @@ impl Drop for LocalWorkspaceReapGuard {
                 handle.shutdown().await;
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod summary_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn model_overrides_unresolved_summary_route_keeps_primary_model() {
+        let primary = SamplingConfig {
+            model: "operative-session-model".to_owned(),
+            ..Default::default()
+        };
+
+        let fallback = summary_config_or_primary(&primary, None, false);
+
+        assert_eq!(fallback.model, "operative-session-model");
+    }
+
+    #[test]
+    fn model_overrides_missing_inherited_default_ignores_synthetic_xai_summary_route() {
+        let primary = SamplingConfig {
+            model: "operative-session-model".to_owned(),
+            ..Default::default()
+        };
+        let synthetic_xai = SamplingConfig {
+            model: "stale-configured-default".to_owned(),
+            ..Default::default()
+        };
+
+        let fallback = summary_config_or_primary(&primary, Some(synthetic_xai), true);
+
+        assert_eq!(fallback.model, "operative-session-model");
     }
 }

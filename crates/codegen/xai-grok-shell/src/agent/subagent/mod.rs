@@ -190,6 +190,9 @@ pub(crate) struct SubagentSpawnContext {
     pub memory_config: Option<crate::config::MemoryConfig>,
     /// Resolved sampling config for web_search.
     pub web_search_sampling_config: Option<xai_grok_sampler::SamplerConfig>,
+    /// Parent session's configured web-search model at spawn time.
+    pub web_search_model: String,
+    pub web_search_follows_default: bool,
     /// Resolved config for web fetch.
     pub web_fetch_config: xai_grok_tools::implementations::grok_build::web_fetch::WebFetchConfig,
     /// Image generation config (parent-inherited).
@@ -273,6 +276,7 @@ pub(crate) struct SubagentSpawnContext {
     pub worktree_type: crate::util::config::WorktreeType,
     pub api_key_provider: Option<xai_grok_tools::types::SharedApiKeyProvider>,
     pub image_description_model: String,
+    pub image_description_follows_default: bool,
     /// Dual-mode workspace operations handle.
     pub workspace_ops: xai_grok_workspace::WorkspaceOps,
     pub auth_manager: std::sync::Arc<crate::auth::AuthManager>,

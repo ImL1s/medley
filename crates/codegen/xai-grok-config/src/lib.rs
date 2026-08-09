@@ -73,8 +73,8 @@ pub use paths::{
     user_grok_home,
 };
 pub use validation::{
-    RequirementsError, RequirementsLayer, RequirementsSource, load_merged_requirements,
-    requirements_layers, validate_requirements,
+    RequirementsError, RequirementsLayer, RequirementsLayerLoad, RequirementsSource,
+    load_merged_requirements, requirements_layers, try_requirements_layers, validate_requirements,
 };
 pub use version_overrides::{VersionOverrideError, apply_version_overrides};
 

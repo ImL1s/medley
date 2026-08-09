@@ -735,10 +735,12 @@ impl AgentBuilder {
                     .tools
                     .push((&memory::get_tool::MemoryGetImpl).into());
             }
-            if self.web_search_config.is_enabled() {
-                use xai_grok_tools::implementations::grok_build;
-                tool_config.tools.push((&grok_build::WebSearchTool).into());
-            }
+            // Feed web_search through the ordinary definition/policy pipeline
+            // even when its runtime route is currently unavailable. A
+            // surviving disabled candidate is parked as inactive at finalize;
+            // deny/allowlist/capability filters can still remove it first.
+            use xai_grok_tools::implementations::grok_build;
+            tool_config.tools.push((&grok_build::WebSearchTool).into());
             if self.web_fetch_config.is_enabled() {
                 use xai_grok_tools::implementations::grok_build;
                 tool_config.tools.push((&grok_build::WebFetchTool).into());
@@ -1053,8 +1055,11 @@ impl AgentBuilder {
         );
         let use_backend_search = self.backend_search;
         let web_search_enabled = self.web_search_config.is_enabled();
+        let dynamic_web_search = !web_search_enabled;
         let tool_bridge = ToolBridge::finalize_builder(
-            tool_bridge_builder.with_capability_policy(capability_policy),
+            tool_bridge_builder
+                .with_capability_policy(capability_policy)
+                .with_dynamic_web_search(dynamic_web_search),
             tool_config,
             SessionContext {
                 backend: self.terminal_backend,
@@ -2473,7 +2478,7 @@ mod tests {
     }
     #[tokio::test]
     async fn disallowed_web_search_strips_function_and_hosted_tools() {
-        let agent = build_with_web_search(true, true, &["web_search"], None).await;
+        let mut agent = build_with_web_search(true, true, &["web_search"], None).await;
         let hosted = agent.hosted_tools();
         assert!(
             !hosted
@@ -2496,6 +2501,16 @@ mod tests {
             !has_web_search_fn,
             "function web_search tool must be removed when disallowed"
         );
+        assert!(!agent.set_web_search_enabled(true));
+        assert!(
+            agent
+                .tool_definitions()
+                .await
+                .iter()
+                .all(|definition| short_tool_name(&definition.function.name) != "web_search"),
+            "a disallowed web-search tool must not become dynamically available"
+        );
+        assert!(agent.set_web_search_enabled(false));
     }
     /// Regression: with backend search + web search both enabled, both
     /// hosted tools appear and `backend_search_enabled()` is true.
@@ -2516,13 +2531,45 @@ mod tests {
                 .any(|t| matches!(t, xai_grok_sampling_types::HostedTool::XSearch { .. })),
             "expected XSearch hosted tool, got: {hosted:?}"
         );
+        assert_eq!(
+            agent
+                .tool_definitions()
+                .await
+                .iter()
+                .filter(|definition| short_tool_name(&definition.function.name) == "web_search")
+                .count(),
+            1,
+            "enabled web search must have exactly one function definition"
+        );
     }
     /// XSearch is added unconditionally when backend search is on;
     /// WebSearch requires the web-search config.
     #[tokio::test]
     async fn hosted_tools_only_xsearch_when_web_search_disabled() {
-        let agent = build_with_web_search(false, true, &[], None).await;
+        use xai_grok_tools::types::resources::EnabledNativeToolNames;
+
+        let mut agent = build_with_web_search(false, true, &[], None).await;
+        assert_eq!(
+            agent
+                .tool_bridge()
+                .tool_for_kind(xai_grok_tools::types::tool::ToolKind::WebSearch)
+                .await,
+            None
+        );
+        let native_names = agent
+            .tool_bridge()
+            .read_resource::<EnabledNativeToolNames>()
+            .await
+            .expect("enabled native tool names resource");
+        assert!(!native_names.contains("web_search"));
         let hosted = agent.hosted_tools();
+        assert!(
+            agent
+                .tool_definitions()
+                .await
+                .iter()
+                .all(|definition| short_tool_name(&definition.function.name) != "web_search")
+        );
         assert!(
             !hosted
                 .iter()
@@ -2534,6 +2581,90 @@ mod tests {
                 .iter()
                 .any(|t| matches!(t, xai_grok_sampling_types::HostedTool::XSearch { .. })),
             "expected XSearch hosted tool, got: {hosted:?}"
+        );
+        assert_eq!(
+            agent
+                .tool_bridge()
+                .render_prompt(
+                    "${% if tools.by_kind.web_search %}${{ tools.by_kind.web_search }}${% else %}disabled${% endif %}",
+                    &serde_json::json!({}),
+                )
+                .await
+                .as_deref(),
+            Some("disabled")
+        );
+        agent.set_web_search_enabled(true);
+        assert!(native_names.contains("web_search"));
+        assert_eq!(
+            agent
+                .tool_bridge()
+                .tool_for_kind(xai_grok_tools::types::tool::ToolKind::WebSearch)
+                .await
+                .as_deref(),
+            Some("web_search")
+        );
+        assert_eq!(
+            agent
+                .tool_bridge()
+                .render_prompt("${{ tools.by_kind.web_search }}", &serde_json::json!({}),)
+                .await
+                .as_deref(),
+            Some("web_search")
+        );
+        assert!(
+            agent
+                .hosted_tools()
+                .iter()
+                .any(|tool| matches!(tool, xai_grok_sampling_types::HostedTool::WebSearch { .. }))
+        );
+        assert!(
+            agent
+                .tool_definitions()
+                .await
+                .iter()
+                .any(|definition| definition.function.name == "web_search")
+        );
+        assert_eq!(
+            agent
+                .tool_definitions()
+                .await
+                .iter()
+                .filter(|definition| definition.function.name == "web_search")
+                .count(),
+            1
+        );
+        agent.set_web_search_enabled(false);
+        assert!(!native_names.contains("web_search"));
+        assert_eq!(
+            agent
+                .tool_bridge()
+                .tool_for_kind(xai_grok_tools::types::tool::ToolKind::WebSearch)
+                .await,
+            None
+        );
+        assert_eq!(
+            agent
+                .tool_bridge()
+                .render_prompt(
+                    "${% if tools.by_kind.web_search %}enabled${% else %}disabled${% endif %}",
+                    &serde_json::json!({}),
+                )
+                .await
+                .as_deref(),
+            Some("disabled")
+        );
+        assert!(
+            agent
+                .hosted_tools()
+                .iter()
+                .all(|tool| !matches!(tool, xai_grok_sampling_types::HostedTool::WebSearch { .. }))
+        );
+        assert!(
+            agent
+                .tool_definitions()
+                .await
+                .iter()
+                .all(|definition| definition.function.name != "web_search")
         );
     }
     /// Backend search off: gate bool false and no hosted tools, regardless

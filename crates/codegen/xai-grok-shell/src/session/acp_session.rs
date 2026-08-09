@@ -1210,7 +1210,7 @@ pub(crate) struct SessionActor {
     pub(crate) rebuild_spec: Arc<crate::session::agent_rebuild::AgentRebuildSpec>,
     /// Resolved vision model ID for auxiliary image processing.
     /// Populated from `Config.image_description_model` at spawn.
-    pub(crate) image_description_model: String,
+    pub(crate) image_description_model: std::cell::RefCell<String>,
     /// Cache auxiliary image outputs by content and prompt fingerprint.
     pub(crate) image_describe_cache: Arc<crate::session::image_describe::ImageDescribeCache>,
     /// Per-subagent token state keyed by `subagent_id`; sums into

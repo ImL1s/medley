@@ -146,6 +146,24 @@ pub struct PreparedModelSwitch {
     pub auto_compact_threshold_percent: u8,
     pub required_agent_type: String,
     pub required_definition: Option<xai_grok_agent::AgentDefinition>,
+    /// `Some` only when the summary lane inherits the operative model.
+    pub summary_sampling_config: Option<xai_grok_sampler::SamplerConfig>,
+    /// Whether the web-search lane inherits the operative model. Its sampling
+    /// config remains `None` when the inherited target is not usable.
+    pub replace_inherited_web_search: bool,
+    pub web_search_sampling_config: Option<xai_grok_sampler::SamplerConfig>,
+    /// Disable reason produced by the same preflight that prepared the client.
+    pub web_search_disable_notice: Option<crate::session::WebSearchDisabledNotice>,
+    pub web_search_alpha_test_key: Option<String>,
+    /// `Some` only when image description inherits the operative model.
+    pub image_description_model: Option<String>,
+}
+
+/// Web-search state committed as part of a model switch.
+#[derive(Debug)]
+pub struct AppliedWebSearchState {
+    pub enabled: bool,
+    pub disable_notice: Option<crate::session::WebSearchDisabledNotice>,
 }
 
 /// Receipt returned only after the actor has committed the complete switch.
@@ -155,6 +173,7 @@ pub struct AppliedModelSwitch {
     pub catalog_model_id: acp::ModelId,
     pub did_rebuild: bool,
     pub active_agent_type: Option<String>,
+    pub web_search: Option<AppliedWebSearchState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

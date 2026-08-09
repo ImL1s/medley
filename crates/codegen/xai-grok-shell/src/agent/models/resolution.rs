@@ -337,7 +337,7 @@ pub(crate) fn resolve_default_model(
 ///
 /// Shared by [`resolve_default_model`] and [`substituted_preference`] so the
 /// two can never disagree about *what* was configured.
-fn configured_preference(cfg: &config::Config) -> Option<config::Resolved<String>> {
+pub(crate) fn configured_preference(cfg: &config::Config) -> Option<config::Resolved<String>> {
     config::resolve_string_flag(
         cfg.default_model_override.as_deref(),
         "GROK_DEFAULT_MODEL",

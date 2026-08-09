@@ -50,6 +50,15 @@ impl SummaryGenerator {
         }
     }
 
+    pub(crate) fn replace_sampling_client(
+        &mut self,
+        sampling_client: OaiCompatClient,
+        model: String,
+    ) {
+        self.config.sampling_client = sampling_client;
+        self.config.model = model;
+    }
+
     /// Generate a session summary from the first content chunk.
     ///
     /// - **Idle**: checks disk for an existing summary, spawns a background
@@ -143,4 +152,33 @@ pub(crate) fn session_info_update(
             acp::SessionInfoUpdate::new().title(title.to_owned()),
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_overrides_restored_summary_sampling_client_can_be_rebound() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let original = OaiCompatClient::new(xai_grok_sampler::SamplerConfig {
+            model: "process-default".to_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+        let restored = OaiCompatClient::new(xai_grok_sampler::SamplerConfig {
+            model: "restored-session-model".to_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut summary = SummaryGenerator::new(SummaryConfig {
+            sampling_client: original,
+            model: "process-default".to_owned(),
+            persistence_tx: tx.downgrade(),
+        });
+
+        summary.replace_sampling_client(restored, "restored-session-model".to_owned());
+
+        assert_eq!(summary.config.model, "restored-session-model");
+    }
 }

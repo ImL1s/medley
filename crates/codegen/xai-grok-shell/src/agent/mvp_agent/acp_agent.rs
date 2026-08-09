@@ -2214,6 +2214,21 @@ impl acp::Agent for MvpAgent {
                 }
                 .into_acp_error());
             }
+            // `load_light` starts persistence before cold-spawn model selection is
+            // complete. Rebind only the inherited summary lane to the operative
+            // restored model before any session content can reach that actor.
+            // Explicit summary pins were resolved correctly during `load_light`.
+            if self.cfg.borrow().session_summary_follows_default {
+                let summary_sampling = self.resolve_sampling_config_for_model(
+                    &spawn_model_id,
+                    origin_client.clone(),
+                );
+                let _ = persistence.tx.send(
+                    crate::session::persistence::PersistenceMsg::ReplaceSummarySamplingConfig(
+                        summary_sampling,
+                    ),
+                );
+            }
             cold_spawn_selection = Some(spawn_selection);
             self.spawn_and_register_session(
                     init,

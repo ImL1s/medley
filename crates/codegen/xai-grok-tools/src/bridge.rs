@@ -108,12 +108,7 @@ impl ToolBridge {
     /// `Some("get_task_output")` for the grok_build agent and `None` for
     /// agents that do not register a tool of that kind.
     pub async fn tool_for_kind(&self, kind: ToolKind) -> Option<String> {
-        self.registry
-            .resources
-            .lock()
-            .await
-            .get::<TemplateRenderer>()
-            .and_then(|r| r.tool_for_kind(kind).map(str::to_string))
+        self.registry.tool_name_for_kind(kind)
     }
 
     /// [`ToolKind`] for a registered tool by client-facing name, or
@@ -184,6 +179,14 @@ impl ToolBridge {
 
     pub fn unregister_tool_by_name(&self, name: &str) -> bool {
         self.registry.unregister_tool_by_name(name)
+    }
+
+    pub fn set_web_search_enabled(&self, enabled: bool) -> bool {
+        self.registry.set_web_search_enabled(enabled)
+    }
+
+    pub fn can_set_web_search_enabled(&self, enabled: bool) -> bool {
+        self.registry.can_set_web_search_enabled(enabled)
     }
 
     pub fn reconcile_managed_gateway_identities(

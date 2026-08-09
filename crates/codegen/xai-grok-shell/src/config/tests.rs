@@ -1518,18 +1518,32 @@ fn with_model_overrides_env_full<T>(
     ps: Option<&str>,
     f: impl FnOnce() -> T,
 ) -> T {
+    with_model_overrides_and_default_env(None, ws, ss, id, ps, f)
+}
+fn with_model_overrides_and_default_env<T>(
+    default: Option<&str>,
+    ws: Option<&str>,
+    ss: Option<&str>,
+    id: Option<&str>,
+    ps: Option<&str>,
+    f: impl FnOnce() -> T,
+) -> T {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     with_env_var_opt(
-        "GROK_WEB_SEARCH_MODEL",
-        ws,
+        "GROK_DEFAULT_MODEL",
+        default,
         || with_env_var_opt(
-            "GROK_SESSION_SUMMARY_MODEL",
-            ss,
+            "GROK_WEB_SEARCH_MODEL",
+            ws,
             || with_env_var_opt(
-                "GROK_IMAGE_DESCRIPTION_MODEL",
-                id,
-                || with_env_var_opt("GROK_PROMPT_SUGGESTIONS_MODEL", ps, f),
+                "GROK_SESSION_SUMMARY_MODEL",
+                ss,
+                || with_env_var_opt(
+                    "GROK_IMAGE_DESCRIPTION_MODEL",
+                    id,
+                    || with_env_var_opt("GROK_PROMPT_SUGGESTIONS_MODEL", ps, f),
+                ),
             ),
         ),
     )
@@ -1591,6 +1605,8 @@ fn model_overrides_cli_overrides_everything() {
             );
             assert_eq!(cfg.web_search, "cli-ws");
             assert_eq!(cfg.session_summary, Some("cli-ss".to_owned()));
+            assert!(!cfg.web_search_follows_default);
+            assert!(!cfg.session_summary_follows_default);
         },
     );
 }
@@ -1667,6 +1683,178 @@ fn model_overrides_default_session_summary_is_grok_build() {
                 cfg.session_summary,
                 Some(crate::models::default_session_summary_model().to_owned())
             );
+        },
+    );
+}
+#[test]
+fn model_overrides_unset_auxiliary_lanes_follow_the_local_configured_default() {
+    with_model_overrides_env(
+        None,
+        None,
+        None,
+        || {
+            let config: toml::Value = toml::from_str(
+                    r#"
+                [models]
+                default = "gpt-5.3-codex-spark"
+                "#,
+                )
+                .unwrap();
+            let cfg = ModelOverrideConfig::resolve(None, None, &config, None);
+            // The point of the test: a Codex-only user must not have these
+            // two lanes silently resolve to the compiled xAI constant.
+            assert_eq!(cfg.session_summary, Some("gpt-5.3-codex-spark".to_owned()));
+            assert_eq!(
+                cfg.image_description,
+                Some("gpt-5.3-codex-spark".to_owned())
+            );
+            assert_eq!(cfg.web_search, "gpt-5.3-codex-spark".to_owned());
+            assert!(cfg.web_search_follows_default);
+            assert!(cfg.session_summary_follows_default);
+            assert!(cfg.image_description_follows_default);
+            assert_ne!(
+                cfg.session_summary.as_deref(),
+                Some(crate::models::default_session_summary_model()),
+                "the compiled default is xAI; following it is the bug"
+            );
+        },
+    );
+}
+#[test]
+fn model_overrides_unset_auxiliary_lanes_follow_the_env_configured_default() {
+    with_model_overrides_and_default_env(
+        Some("gpt-5.3-codex-spark"),
+        None,
+        None,
+        None,
+        None,
+        || {
+            let empty = toml::Value::Table(toml::map::Map::new());
+            let cfg = ModelOverrideConfig::resolve(None, None, &empty, None);
+            assert_eq!(cfg.web_search, "gpt-5.3-codex-spark");
+            assert_eq!(cfg.session_summary.as_deref(), Some("gpt-5.3-codex-spark"));
+            assert_eq!(cfg.image_description.as_deref(), Some("gpt-5.3-codex-spark"));
+            assert!(cfg.web_search_follows_default);
+            assert!(cfg.session_summary_follows_default);
+            assert!(cfg.image_description_follows_default);
+        },
+    );
+}
+#[test]
+fn model_overrides_cli_configured_default_wins_over_other_defaults() {
+    with_model_overrides_and_default_env(
+        Some("env-default"),
+        None,
+        None,
+        None,
+        None,
+        || {
+            let config: toml::Value = toml::from_str(
+                    r#"
+                [models]
+                default = "local-default"
+                "#,
+                )
+                .unwrap();
+            let remote = crate::util::config::RemoteSettings {
+                default_model: Some("remote-default".to_owned()),
+                ..Default::default()
+            };
+            let cfg = ModelOverrideConfig::resolve_with_default_model(
+                Some("cli-default"),
+                None,
+                None,
+                &config,
+                Some(&remote),
+            );
+            assert_eq!(cfg.web_search, "cli-default");
+            assert_eq!(cfg.session_summary.as_deref(), Some("cli-default"));
+            assert_eq!(cfg.image_description.as_deref(), Some("cli-default"));
+            assert!(cfg.web_search_follows_default);
+            assert!(cfg.session_summary_follows_default);
+            assert!(cfg.image_description_follows_default);
+        },
+    );
+}
+#[test]
+fn model_overrides_inherited_web_search_uses_operative_model() {
+    assert_eq!(
+        super::auxiliary_model_or_operative(
+            "rejected-configured-default",
+            "substituted-operative-model",
+            true,
+        ),
+        "substituted-operative-model",
+    );
+    assert_eq!(
+        super::auxiliary_model_or_operative(
+            "explicit-web-search-pin",
+            "substituted-operative-model",
+            false,
+        ),
+        "explicit-web-search-pin",
+    );
+}
+#[test]
+fn model_overrides_inherited_image_uses_child_operative_model() {
+    assert_eq!(
+        super::auxiliary_model_or_operative(
+            "configured-parent-default",
+            "child-operative-model",
+            true,
+        ),
+        "child-operative-model",
+    );
+    assert_eq!(
+        super::auxiliary_model_or_operative(
+            "explicit-image-pin",
+            "child-operative-model",
+            false,
+        ),
+        "explicit-image-pin",
+    );
+}
+#[test]
+fn model_overrides_unset_auxiliary_lanes_follow_the_remote_configured_default() {
+    with_model_overrides_env(
+        None,
+        None,
+        None,
+        || {
+            let empty = toml::Value::Table(toml::map::Map::new());
+            let remote = crate::util::config::RemoteSettings {
+                default_model: Some("remote-default".to_owned()),
+                ..Default::default()
+            };
+            let cfg = ModelOverrideConfig::resolve(None, None, &empty, Some(&remote));
+            assert_eq!(cfg.session_summary, Some("remote-default".to_owned()));
+            assert_eq!(cfg.image_description, Some("remote-default".to_owned()));
+        },
+    );
+}
+#[test]
+fn model_overrides_a_configured_default_does_not_pin_prompt_suggestion() {
+    with_model_overrides_env(
+        None,
+        None,
+        None,
+        || {
+            let config: toml::Value = toml::from_str(
+                    r#"
+                [models]
+                default = "gpt-5.3-codex-spark"
+                "#,
+                )
+                .unwrap();
+            let cfg = ModelOverrideConfig::resolve(None, None, &config, None);
+            // Deliberate exclusion, pinned so it cannot be "tidied up" into
+            // the rule later. `helpers::prompt_suggest` documents this lane
+            // as "deliberately NOT a session-model fallback", and the
+            // configured default is usually the session model — so feeding
+            // it in would break the lane's own stated contract on every
+            // turn. Its gate, `effective_suggest_model`, already drops the
+            // request when the model is absent from the catalog.
+            assert_eq!(cfg.prompt_suggestion, PromptSuggestModelPin::Unpinned);
         },
     );
 }
@@ -3169,13 +3357,13 @@ fn config_layers_system_managed_lowest_priority() {
 #[test]
 fn apply_requirements_value_overrides_user_settings() {
     let raw_config: toml::Value = toml::from_str(
-            "[cli]\nauto_update = true\nchannel = \"beta\"\n\n[features]\ntelemetry = true\nfeedback = true\nlsp_tools = true\nweb_fetch = true\nwrite_file = true\n\n[telemetry]\ntrace_upload = true\n\n[ui]\nyolo = true\n\n[models]\ndefault = \"user-model\"\nweb_search = \"user-ws-model\"\n\n[endpoints]\ncli_chat_proxy_base_url = \"https://user-proxy.example/v1\"\nxai_api_base_url = \"https://user-api.example/v1\"\nmodels_base_url = \"https://user-models.example/v1\"\nmodels_list_url = \"https://user-models.example/v1/models\"\n",
+            "[cli]\nauto_update = true\nchannel = \"beta\"\n\n[features]\ntelemetry = true\nfeedback = true\nlsp_tools = true\nweb_fetch = true\nwrite_file = true\n\n[telemetry]\ntrace_upload = true\n\n[ui]\nyolo = true\n\n[models]\ndefault = \"user-model\"\nweb_search = \"user-ws-model\"\nsession_summary = \"user-summary-model\"\nimage_description = \"user-image-model\"\n\n[endpoints]\ncli_chat_proxy_base_url = \"https://user-proxy.example/v1\"\nxai_api_base_url = \"https://user-api.example/v1\"\nmodels_base_url = \"https://user-models.example/v1\"\nmodels_list_url = \"https://user-models.example/v1/models\"\n",
         )
         .unwrap();
     let mut cfg = crate::agent::config::Config::new_from_toml_cfg(&raw_config).unwrap();
     cfg.default_yolo_mode = true;
     let requirements: toml::Value = toml::from_str(
-            "[cli]\nauto_update = false\nchannel = \"stable\"\n\n[features]\ntelemetry = false\nfeedback = false\nlsp_tools = false\nweb_fetch = false\nwrite_file = false\nremote_fetch = false\n\n[telemetry]\ntrace_upload = false\nmixpanel_enabled = false\nmixpanel_token = \"enterprise-mp-token\"\n\n[ui]\nyolo = false\n\n[models]\ndefault = \"managed-model\"\nweb_search = \"managed-ws-model\"\n\n[endpoints]\ncli_chat_proxy_base_url = \"https://managed-proxy.example/v1\"\nxai_api_base_url = \"https://managed-api.example/v1\"\nmodels_base_url = \"https://managed-models.example/v1\"\nmodels_list_url = \"https://managed-models.example/v1/models\"\ndeployment_key = \"enterprise-deploy-key-should-not-log\"\ntrace_upload_endpoint_url = \"https://s3.custom.example.com\"\ntrace_upload_credentials = '{\"aws_access_key_id\":\"AKTEST\",\"aws_secret_access_key\":\"secret\"}'\n",
+            "[cli]\nauto_update = false\nchannel = \"stable\"\n\n[features]\ntelemetry = false\nfeedback = false\nlsp_tools = false\nweb_fetch = false\nwrite_file = false\nremote_fetch = false\n\n[telemetry]\ntrace_upload = false\nmixpanel_enabled = false\nmixpanel_token = \"enterprise-mp-token\"\n\n[ui]\nyolo = false\n\n[models]\ndefault = \"managed-model\"\nweb_search = \"managed-ws-model\"\nsession_summary = \"managed-summary-model\"\nimage_description = \"managed-image-model\"\n\n[endpoints]\ncli_chat_proxy_base_url = \"https://managed-proxy.example/v1\"\nxai_api_base_url = \"https://managed-api.example/v1\"\nmodels_base_url = \"https://managed-models.example/v1\"\nmodels_list_url = \"https://managed-models.example/v1/models\"\ndeployment_key = \"enterprise-deploy-key-should-not-log\"\ntrace_upload_endpoint_url = \"https://s3.custom.example.com\"\ntrace_upload_credentials = '{\"aws_access_key_id\":\"AKTEST\",\"aws_secret_access_key\":\"secret\"}'\n",
         )
         .unwrap();
     let source = RequirementSource::Requirements {
@@ -3202,6 +3390,26 @@ fn apply_requirements_value_overrides_user_settings() {
     assert!(!cfg.default_yolo_mode);
     assert_eq!(Some("managed-model"), cfg.models.default.as_deref());
     assert_eq!(Some("managed-ws-model"), cfg.models.web_search.as_deref());
+    assert_eq!(
+        Some("managed-summary-model"),
+        cfg.models.session_summary.as_deref()
+    );
+    assert_eq!(
+        Some("managed-image-model"),
+        cfg.models.image_description.as_deref()
+    );
+    assert_eq!(
+        Some("managed-ws-model".to_owned()),
+        cfg.requirements.web_search_model.pinned()
+    );
+    assert_eq!(
+        Some("managed-summary-model".to_owned()),
+        cfg.requirements.session_summary_model.pinned()
+    );
+    assert_eq!(
+        Some("managed-image-model".to_owned()),
+        cfg.requirements.image_description_model.pinned()
+    );
     assert_eq!(Some("stable"), cfg.cli.channel.as_deref());
     assert_eq!(
             Some("https://managed-proxy.example/v1"),
@@ -3264,6 +3472,196 @@ fn apply_requirements_value_overrides_user_settings() {
                 .iter()
                 .any(|e| e.path == "telemetry.mixpanel_token" && e.value == "[redacted]")
         );
+}
+
+#[test]
+fn rejected_requirements_reload_preserves_auxiliary_pins() {
+    let mut cfg = crate::agent::config::Config::default();
+    let path = std::path::PathBuf::from("/test/requirements.toml");
+    let initial: toml::Value = toml::from_str(
+        "[models]\nweb_search = \"required-search\"\nsession_summary = \"required-summary\"\nimage_description = \"required-image\"\n",
+    )
+    .unwrap();
+    apply_loaded_requirements(
+        &mut cfg,
+        vec![RequirementsLayerLoad::Loaded(RequirementsLayer {
+            value: initial,
+            source: xai_grok_config::RequirementsSource::File(path.clone()),
+            is_system: false,
+        })],
+    );
+
+    apply_loaded_requirements(
+        &mut cfg,
+        vec![RequirementsLayerLoad::Rejected(
+            xai_grok_config::RequirementsSource::File(path),
+        )],
+    );
+
+    assert_eq!(
+        cfg.requirements.web_search_model.pinned().as_deref(),
+        Some("required-search")
+    );
+    assert_eq!(
+        cfg.requirements.session_summary_model.pinned().as_deref(),
+        Some("required-summary")
+    );
+    assert_eq!(
+        cfg.requirements.image_description_model.pinned().as_deref(),
+        Some("required-image")
+    );
+}
+
+#[test]
+fn rejected_user_requirements_still_apply_trusted_system_layer() {
+    let mut cfg = crate::agent::config::Config::default();
+    let user_path = std::path::PathBuf::from("/test/user/requirements.toml");
+    apply_loaded_requirements(
+        &mut cfg,
+        vec![RequirementsLayerLoad::Loaded(RequirementsLayer {
+            value: toml::from_str("[models]\nweb_search = \"old-user-search\"\n").unwrap(),
+            source: xai_grok_config::RequirementsSource::File(user_path.clone()),
+            is_system: false,
+        })],
+    );
+
+    let system: toml::Value = toml::from_str(
+        "[models]\nweb_search = \"required-system-search\"\n",
+    )
+    .unwrap();
+    let enforced = apply_loaded_requirements(
+        &mut cfg,
+        vec![
+            RequirementsLayerLoad::Rejected(xai_grok_config::RequirementsSource::File(
+                user_path,
+            )),
+            RequirementsLayerLoad::Loaded(RequirementsLayer {
+                value: system,
+                source: xai_grok_config::RequirementsSource::File(std::path::PathBuf::from(
+                    "/test/system/requirements.toml",
+                )),
+                is_system: true,
+            }),
+        ],
+    );
+
+    assert_eq!(
+        cfg.requirements.web_search_model.pinned().as_deref(),
+        Some("required-system-search")
+    );
+    assert!(enforced.iter().any(|field| field.path == "models.web_search"));
+}
+
+#[test]
+fn rejected_user_requirements_clear_removed_pin_from_accepted_system_layer() {
+    let mut cfg = crate::agent::config::Config::default();
+    let system_path = std::path::PathBuf::from("/test/system/requirements.toml");
+    apply_loaded_requirements(
+        &mut cfg,
+        vec![RequirementsLayerLoad::Loaded(RequirementsLayer {
+            value: toml::from_str("[models]\nweb_search = \"old-system-search\"\n").unwrap(),
+            source: xai_grok_config::RequirementsSource::File(system_path.clone()),
+            is_system: true,
+        })],
+    );
+
+    let enforced = apply_loaded_requirements(
+        &mut cfg,
+        vec![
+            RequirementsLayerLoad::Rejected(xai_grok_config::RequirementsSource::File(
+                std::path::PathBuf::from("/test/user/requirements.toml"),
+            )),
+            RequirementsLayerLoad::Loaded(RequirementsLayer {
+                value: toml::Value::Table(toml::map::Map::new()),
+                source: xai_grok_config::RequirementsSource::File(system_path),
+                is_system: true,
+            }),
+        ],
+    );
+
+    assert!(enforced.is_empty());
+    assert_eq!(cfg.requirements.web_search_model.pinned(), None);
+}
+
+#[test]
+fn rejected_system_requirements_do_not_replace_prior_pin_with_user_layer() {
+    let mut cfg = crate::agent::config::Config::default();
+    let system_path = std::path::PathBuf::from("/test/system/requirements.toml");
+    apply_loaded_requirements(
+        &mut cfg,
+        vec![RequirementsLayerLoad::Loaded(RequirementsLayer {
+            value: toml::from_str("[models]\nweb_search = \"old-system-search\"\n").unwrap(),
+            source: xai_grok_config::RequirementsSource::File(system_path.clone()),
+            is_system: true,
+        })],
+    );
+
+    let user: toml::Value =
+        toml::from_str("[models]\nweb_search = \"new-user-search\"\n").unwrap();
+    apply_loaded_requirements(
+        &mut cfg,
+        vec![
+            RequirementsLayerLoad::Loaded(RequirementsLayer {
+                value: user,
+                source: xai_grok_config::RequirementsSource::File(std::path::PathBuf::from(
+                    "/test/user/requirements.toml",
+                )),
+                is_system: false,
+            }),
+            RequirementsLayerLoad::Rejected(xai_grok_config::RequirementsSource::File(system_path)),
+        ],
+    );
+
+    assert_eq!(
+        cfg.requirements.web_search_model.pinned().as_deref(),
+        Some("old-system-search")
+    );
+}
+
+#[test]
+fn rejected_system_restores_pin_shadowed_by_removed_mdm_pin() {
+    let mut cfg = crate::agent::config::Config::default();
+    let system_path = std::path::PathBuf::from("/test/system/requirements.toml");
+    apply_loaded_requirements(
+        &mut cfg,
+        vec![
+            RequirementsLayerLoad::Loaded(RequirementsLayer {
+                value: toml::from_str("[models]\nweb_search = \"old-system-search\"\n")
+                    .unwrap(),
+                source: xai_grok_config::RequirementsSource::File(system_path.clone()),
+                is_system: true,
+            }),
+            RequirementsLayerLoad::Loaded(RequirementsLayer {
+                value: toml::from_str("[models]\nweb_search = \"old-mdm-search\"\n").unwrap(),
+                source: xai_grok_config::RequirementsSource::Mdm,
+                is_system: true,
+            }),
+        ],
+    );
+    assert_eq!(
+        cfg.requirements.web_search_model.pinned().as_deref(),
+        Some("old-mdm-search")
+    );
+
+    apply_loaded_requirements(
+        &mut cfg,
+        vec![
+            RequirementsLayerLoad::Rejected(xai_grok_config::RequirementsSource::File(
+                system_path,
+            )),
+            RequirementsLayerLoad::Loaded(RequirementsLayer {
+                value: toml::Value::Table(toml::map::Map::new()),
+                source: xai_grok_config::RequirementsSource::Mdm,
+                is_system: true,
+            }),
+        ],
+    );
+
+    assert_eq!(
+        cfg.requirements.web_search_model.pinned().as_deref(),
+        Some("old-system-search")
+    );
+    assert_eq!(cfg.models.web_search.as_deref(), Some("old-system-search"));
 }
 /// Strict precedence: requirement always wins (covers from-None and
 /// from-higher-user cases). The enforced floor lives in

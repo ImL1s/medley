@@ -609,7 +609,8 @@ fn handle_reload_models(agent: &MvpAgent) -> ExtResult {
     // flags) are preserved. Only model-related TOML fields are refreshed.
     {
         let agent_config = agent.cfg.borrow();
-        let overrides = crate::config::ModelOverrideConfig::resolve(
+        let overrides = crate::config::ModelOverrideConfig::resolve_with_default_model(
+            agent_config.default_model_override.as_deref(),
             agent_config.web_search_model_override.as_deref(),
             agent_config.session_summary_model_override.as_deref(),
             &disk_config,
@@ -620,8 +621,15 @@ fn handle_reload_models(agent: &MvpAgent) -> ExtResult {
         agent_config.models = toml_config.models.clone();
         agent_config.config_models = toml_config.config_models.clone();
         agent_config.web_search_model = overrides.web_search;
+        agent_config.web_search_model_explicit = overrides.web_search_explicit;
+        agent_config.web_search_follows_default = overrides.web_search_follows_default;
         agent_config.session_summary_model = overrides.session_summary;
+        agent_config.session_summary_model_explicit = overrides.session_summary_explicit;
+        agent_config.session_summary_follows_default = overrides.session_summary_follows_default;
         agent_config.image_description_model = overrides.image_description;
+        agent_config.image_description_model_explicit = overrides.image_description_explicit;
+        agent_config.image_description_follows_default =
+            overrides.image_description_follows_default;
         agent_config.prompt_suggest_model_pin = overrides.prompt_suggestion;
     }
     // Recompute the campaign overlay + `pre_campaign_default` (the catalog-miss
@@ -629,6 +637,9 @@ fn handle_reload_models(agent: &MvpAgent) -> ExtResult {
     {
         let mut agent_config = agent.cfg.borrow_mut();
         crate::util::config::sync_campaign_fields(&mut agent_config);
+        let effective_default = crate::agent::models::configured_preference(&agent_config)
+            .map(|preference| preference.value);
+        agent_config.rebind_unset_auxiliary_models_to_default(effective_default.as_deref());
     }
     let merged_config = agent.cfg.borrow().clone();
 

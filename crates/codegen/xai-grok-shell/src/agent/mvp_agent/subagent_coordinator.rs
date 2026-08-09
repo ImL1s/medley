@@ -61,10 +61,15 @@ impl coordinator::ChildRunner for ShellChildRunner {
             // Discarded on purpose: a subagent inherits the parent's tools and
             // has no scrollback of its own, so a disable notice here would be
             // addressed to nobody. The parent already told the user.
-            let mut ignored_disable_reason = None;
-            ctx.web_search_sampling_config = this
-                .prepare_web_search_sampling_config_preflight(&mut ignored_disable_reason)
-                .await;
+            if !ctx.web_search_follows_default {
+                let mut ignored_disable_reason = None;
+                ctx.web_search_sampling_config = this
+                    .prepare_web_search_sampling_config_for_model_preflight(
+                        &mut ignored_disable_reason,
+                        &ctx.web_search_model,
+                    )
+                    .await;
+            }
             let refreshed = match this
                 .refresh_subagent_capabilities_for_spawn(&mut ctx, &handle)
                 .await
@@ -463,6 +468,48 @@ impl MvpAgent {
             None => (None, None),
         };
         let project_trusted = crate::agent::folder_trust::project_scope_allowed(&parent_cwd);
+        let (web_search_model, web_search_follows_default) = parent_handle
+            .as_ref()
+            .map(|handle| {
+                (
+                    handle.auxiliary_model_provenance.web_search_model.clone(),
+                    handle
+                        .auxiliary_model_provenance
+                        .web_search_follows_default,
+                )
+            })
+            .unwrap_or_else(|| {
+                let cfg = self.cfg.borrow();
+                (cfg.web_search_model.clone(), cfg.web_search_follows_default)
+            });
+        let effective_web_search_model = crate::config::auxiliary_model_or_operative(
+            &web_search_model,
+            parent_model_id.0.as_ref(),
+            web_search_follows_default,
+        );
+        let (image_description_model, image_description_follows_default) = parent_handle
+            .as_ref()
+            .map(|handle| {
+                (
+                    handle
+                        .auxiliary_model_provenance
+                        .image_description_model
+                        .clone(),
+                    handle
+                        .auxiliary_model_provenance
+                        .image_description_follows_default,
+                )
+            })
+            .unwrap_or_else(|| {
+                let cfg = self.cfg.borrow();
+                (
+                    cfg.image_description_model
+                        .as_deref()
+                        .unwrap_or(crate::models::default_image_description_model())
+                        .to_owned(),
+                    cfg.image_description_follows_default,
+                )
+            });
         let (base_roles, base_personas, subagent_model_overrides, subagent_toggle) = {
             let cfg = self.cfg.borrow();
             (
@@ -517,7 +564,10 @@ impl MvpAgent {
             terminal,
             session_env,
             memory_config: self.memory_config.clone(),
-            web_search_sampling_config: self.prepare_web_search_sampling_config(),
+            web_search_sampling_config: self
+                .prepare_web_search_sampling_config_for_model(&effective_web_search_model),
+            web_search_model,
+            web_search_follows_default,
             web_fetch_config: self.prepare_web_fetch_config(),
             image_gen_config: self.prepare_image_gen_config(),
             video_gen_config: self.prepare_video_gen_config(),
@@ -567,7 +617,8 @@ impl MvpAgent {
             api_key_provider: Some(Arc::new(crate::auth::manager::SharedAuthKeyProvider(
                 am.clone(),
             ))),
-            image_description_model: self.resolve_image_description_model(),
+            image_description_model,
+            image_description_follows_default,
             workspace_ops: parent_workspace_ops.clone(),
             auth_manager: am.clone(),
             attribution_callback: parent_attribution_callback,

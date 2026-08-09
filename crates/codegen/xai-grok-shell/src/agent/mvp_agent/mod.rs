@@ -1504,7 +1504,7 @@ impl AuthRequestMeta {
 ///    (requires the optional non-production feature).
 ///
 /// Existing entries are never overwritten so callers can pre-set a value.
-fn inject_proxy_headers(
+pub(crate) fn inject_proxy_headers(
     headers: &mut indexmap::IndexMap<String, String>,
     client_version: Option<&str>,
     alpha_test_key: Option<&str>,

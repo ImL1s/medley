@@ -423,6 +423,14 @@ struct FinalizedTool {
     output_converter:
         Arc<dyn Fn(serde_json::Value) -> Result<ToolOutput, serde_json::Error> + Send + Sync>,
     definition: ToolDefinition,
+    /// Client-supplied replacement for `metadata.description_template()`.
+    /// Retained so live tool-topology changes can rebuild descriptions that
+    /// reference another tool through `TemplateRenderer`.
+    description_override: Option<String>,
+    /// Whether this definition was finalized by the built-in registry renderer
+    /// and can therefore be safely regenerated after a topology change.
+    /// Runtime MCP definitions are already client-ready and must remain opaque.
+    refresh_on_topology_change: bool,
     /// Effective params (defaults merged with client overrides).
     /// Kept for building `ProposedTool` during reminder evaluation and for
     /// params-aware finalized definition construction.
@@ -451,6 +459,11 @@ struct FinalizedTool {
 /// The read guard is held only for microsecond lookups — never across `.await`.
 pub struct FinalizedToolset {
     tools: parking_lot::RwLock<Vec<FinalizedTool>>,
+    /// Built-ins that are permitted for this session but temporarily hidden.
+    /// Web search uses this to follow live credential/model availability
+    /// without reclassifying the tool as an external MCP identity.
+    inactive_tools: parking_lot::Mutex<HashMap<String, FinalizedTool>>,
+    enabled_native_tool_names: crate::types::resources::EnabledNativeToolNames,
     reminders: Vec<Box<dyn Reminder + Send + Sync>>,
     pub resources: SharedResources,
     resources_persistence: Arc<ResourcesPersistence>,
@@ -462,6 +475,7 @@ pub struct FinalizedToolset {
     /// Cloned into `ToolCallContext::extensions` on each `call()` so tools
     /// can resolve names without acquiring the `resources` mutex.
     renderer: Arc<TemplateRenderer>,
+    truncation_config: crate::types::context::TruncationConfig,
     /// Tag name for system-reminder wrappers in tool result text.
     system_reminder_tag: &'static str,
     /// Per-user feature-flag bag stamped on every dispatch ctx by
@@ -666,6 +680,7 @@ pub struct ToolRegistryBuilder {
     /// `FinalizeToolServerConfigRequest.system_reminders_enabled`.
     system_reminders_enabled: bool,
     capability_policy: CapabilityPolicy,
+    dynamic_web_search: bool,
 }
 impl Default for ToolRegistryBuilder {
     fn default() -> Self {
@@ -807,6 +822,7 @@ impl ToolRegistryBuilder {
             shared_local_registry: None,
             system_reminders_enabled: true,
             capability_policy: CapabilityPolicy::unrestricted(),
+            dynamic_web_search: false,
         };
         b.register_with_params::<grok_build::BashTool, grok_build::bash::BashParams>();
         b.register_with_params::<grok_build::ReadFileTool, grok_build::read_file::ReadFileParams>();
@@ -899,6 +915,12 @@ impl ToolRegistryBuilder {
     }
     pub fn with_capability_policy(mut self, policy: CapabilityPolicy) -> Self {
         self.capability_policy = policy;
+        self
+    }
+    /// Finalize a permitted but currently unavailable web-search built-in into
+    /// the inactive set so a resident session can enable it later.
+    pub fn with_dynamic_web_search(mut self, enabled: bool) -> Self {
+        self.dynamic_web_search = enabled;
         self
     }
     /// Dump tools manifest as JSON for the client.
@@ -1097,6 +1119,8 @@ impl ToolRegistryBuilder {
         truncation_config: crate::types::context::TruncationConfig,
         workspace_viewer_ctx: Option<xai_tool_runtime::WorkspaceViewerContext>,
     ) -> Result<FinalizedToolset, Vec<RequirementError>> {
+        const WEB_SEARCH_ID: &str = "GrokBuild:web_search";
+        let web_search_initially_inactive = self.dynamic_web_search;
         // Serialized `kind` is untrusted input. Always replace it from the
         // registry's static taxonomy before applying the fail-closed policy;
         // unknown dynamic IDs remain unclassified.
@@ -1112,13 +1136,21 @@ impl ToolRegistryBuilder {
             return Err(errors);
         }
         let mut kind_to_name: HashMap<ToolKind, String> = HashMap::new();
-        for tool_config in &config.tools {
+        for tool_config in config
+            .tools
+            .iter()
+            .filter(|tool| !web_search_initially_inactive || tool.id != WEB_SEARCH_ID)
+        {
             let entry = &self.tools[&tool_config.id];
             let client_name = tool_config.resolve_client_name(&entry.id);
             kind_to_name.entry(entry.kind).or_insert(client_name);
         }
         let mut kind_params: HashMap<ToolKind, HashMap<String, String>> = HashMap::new();
-        for tool_config in &config.tools {
+        for tool_config in config
+            .tools
+            .iter()
+            .filter(|tool| !web_search_initially_inactive || tool.id != WEB_SEARCH_ID)
+        {
             let entry = &self.tools[&tool_config.id];
             let map = kind_params.entry(entry.kind).or_default();
             if let Some(props) = entry
@@ -1330,6 +1362,8 @@ impl ToolRegistryBuilder {
                 metadata: Arc::from(entry.metadata),
                 output_converter: Arc::from(entry.output_converter),
                 definition,
+                description_override: tool_config.description_override.clone(),
+                refresh_on_topology_change: true,
                 effective_params,
                 input_schema: entry.input_schema,
                 reverse_params,
@@ -1340,12 +1374,15 @@ impl ToolRegistryBuilder {
         }
         let native_tool_names: std::collections::HashSet<String> = tools
             .iter()
-            .filter(|t| !t.client_name.contains("__"))
+            .filter(|t| {
+                !t.client_name.contains("__")
+                    && (!web_search_initially_inactive || t.canonical_id != WEB_SEARCH_ID)
+            })
             .map(|t| t.client_name.clone())
             .collect();
-        resources.insert(crate::types::resources::EnabledNativeToolNames(
-            native_tool_names,
-        ));
+        let enabled_native_tool_names =
+            crate::types::resources::EnabledNativeToolNames::new(native_tool_names);
+        resources.insert(enabled_native_tool_names.clone());
         let proposed: Vec<ProposedTool> = tools
             .iter()
             .map(|t| ProposedTool {
@@ -1397,23 +1434,36 @@ impl ToolRegistryBuilder {
             };
             tokio::spawn(actor.run());
         }
+        let mut inactive_tools = HashMap::new();
+        if web_search_initially_inactive
+            && let Some(index) = tools
+                .iter()
+                .position(|tool| tool.canonical_id == WEB_SEARCH_ID)
+        {
+            let tool = tools.remove(index);
+            inactive_tools.insert(tool.canonical_id.clone(), tool);
+        }
         let external_tool_identities = ManagedGatewayIdentityAuthorizer::default();
         {
             let mut owners = external_tool_identities.owners.write();
             owners.extend(
                 tools
                     .iter()
+                    .chain(inactive_tools.values())
                     .map(|tool| (tool.client_name.clone(), ExternalToolIdentityOwner::Local)),
             );
         }
         Ok(FinalizedToolset {
             tools: parking_lot::RwLock::new(tools),
+            inactive_tools: parking_lot::Mutex::new(inactive_tools),
+            enabled_native_tool_names,
             reminders: active_reminders,
             resources: shared_resources,
             resources_persistence: persistence,
             scheduler_cancel: scheduler_cancel_token,
             local_registry,
             renderer: renderer_arc,
+            truncation_config,
             system_reminder_tag: ctx.system_reminder_tag,
             workspace_viewer_ctx,
             capability_policy: self.capability_policy,
@@ -1474,12 +1524,15 @@ impl FinalizedToolset {
         Self::empty_for_test_with_capability_policy(CapabilityPolicy::unrestricted())
     }
     pub fn empty_for_test_with_capability_policy(policy: CapabilityPolicy) -> Self {
+        let enabled_native_tool_names = crate::types::resources::EnabledNativeToolNames::default();
+        let mut resources = crate::types::resources::Resources::default();
+        resources.insert(enabled_native_tool_names.clone());
         Self {
             tools: parking_lot::RwLock::new(vec![]),
+            inactive_tools: parking_lot::Mutex::new(HashMap::new()),
+            enabled_native_tool_names,
             reminders: vec![],
-            resources: Arc::new(tokio::sync::Mutex::new(
-                crate::types::resources::Resources::default(),
-            )),
+            resources: resources.into_shared(),
             resources_persistence: Arc::new(ResourcesPersistence::noop()),
             scheduler_cancel: None,
             local_registry: xai_computer_hub_sdk::LocalRegistry::new(),
@@ -1487,6 +1540,7 @@ impl FinalizedToolset {
                 std::collections::HashMap::new(),
                 std::collections::HashMap::new(),
             )),
+            truncation_config: Default::default(),
             system_reminder_tag: "system-reminder",
             workspace_viewer_ctx: None,
             capability_policy: policy,
@@ -1680,7 +1734,11 @@ impl FinalizedToolset {
     /// enabled. Mirrors `${{ tools.by_kind.<kind> }}` template resolution; used
     /// e.g. to label a background task with its real creator tool name.
     pub fn tool_name_for_kind(&self, kind: ToolKind) -> Option<String> {
-        self.renderer.tool_for_kind(kind).map(str::to_owned)
+        self.tools
+            .read()
+            .iter()
+            .find(|tool| tool.metadata.kind() == kind)
+            .map(|tool| tool.client_name.clone())
     }
     /// Map of client-facing tool name → snake_case [`ToolKind`] key.
     pub fn tool_kinds(&self) -> HashMap<String, String> {
@@ -2222,6 +2280,8 @@ impl FinalizedToolset {
                 })
             }),
             definition,
+            description_override: Some(description),
+            refresh_on_topology_change: false,
             effective_params: serde_json::Value::Object(Default::default()),
             input_schema,
             reverse_params: HashMap::new(),
@@ -2283,6 +2343,110 @@ impl FinalizedToolset {
             identity_owners.remove(name);
         }
         removed
+    }
+    /// Rebuild exported definitions after a live renderer topology update.
+    fn refresh_live_tool_definitions(
+        &self,
+        tools: &mut [FinalizedTool],
+        inactive: &mut HashMap<String, FinalizedTool>,
+    ) {
+        for tool in tools
+            .iter_mut()
+            .chain(inactive.values_mut())
+            .filter(|tool| tool.refresh_on_topology_change)
+        {
+            let param_map = tool
+                .reverse_params
+                .iter()
+                .map(|(client, canonical)| (canonical.clone(), client.clone()))
+                .collect::<HashMap<_, _>>();
+            let mut definition = tool.metadata.versioned_definition(
+                tool.contract_version.as_deref(),
+                &tool.client_name,
+                tool.description_override.as_deref(),
+                &self.renderer,
+                &param_map,
+                &tool.input_schema,
+                &tool.effective_params,
+            );
+            if let Some(description) = &definition.function.description {
+                definition.function.description =
+                    Some(self.truncation_config.interpolate_description(
+                        description,
+                        &tool.client_name,
+                        crate::DEFAULT_TOOL_OUTPUT_BYTES,
+                        xai_tool_types::max_wait_block_ms(),
+                    ));
+            }
+            self.renderer
+                .render_schema_descriptions(&mut definition.function.parameters);
+            self.truncation_config.apply_to_schema(
+                &mut definition.function.parameters,
+                &tool.client_name,
+                crate::DEFAULT_TOOL_OUTPUT_BYTES,
+                xai_tool_types::max_wait_block_ms(),
+            );
+            tool.definition = definition;
+        }
+    }
+
+    /// Toggle the built-in `web_search` definition without changing its
+    /// capability identity or dropping the shared in-process handle.
+    ///
+    /// The tool is finalized once at session creation and moved between the
+    /// active and inactive collections as live model/credential availability
+    /// changes. A capability-filtered or explicitly disallowed tool is never
+    /// present in either collection and therefore cannot be enabled here.
+    pub fn set_web_search_enabled(&self, enabled: bool) -> bool {
+        const ID: &str = "GrokBuild:web_search";
+        let mut tools = self.tools.write();
+        let mut inactive = self.inactive_tools.lock();
+        if enabled {
+            if let Some(tool) = tools.iter().find(|tool| tool.canonical_id == ID) {
+                self.enabled_native_tool_names
+                    .insert(tool.client_name.clone());
+                self.renderer
+                    .set_web_search_enabled(Some(tool.client_name.clone()));
+                self.refresh_live_tool_definitions(&mut tools, &mut inactive);
+                return true;
+            }
+            let Some(tool) = inactive.remove(ID) else {
+                return false;
+            };
+            let client_name = tool.client_name.clone();
+            tools.push(tool);
+            self.enabled_native_tool_names.insert(client_name.clone());
+            self.renderer.set_web_search_enabled(Some(client_name));
+            self.refresh_live_tool_definitions(&mut tools, &mut inactive);
+            true
+        } else {
+            let Some(index) = tools.iter().position(|tool| tool.canonical_id == ID) else {
+                // A policy-filtered tool is absent from both collections.
+                // Disabling that already-disabled capability is a successful
+                // no-op, matching `can_set_web_search_enabled(false)`.
+                self.renderer.set_web_search_enabled(None);
+                self.refresh_live_tool_definitions(&mut tools, &mut inactive);
+                return true;
+            };
+            let tool = tools.remove(index);
+            self.enabled_native_tool_names.remove(&tool.client_name);
+            inactive.insert(ID.to_owned(), tool);
+            self.renderer.set_web_search_enabled(None);
+            self.refresh_live_tool_definitions(&mut tools, &mut inactive);
+            true
+        }
+    }
+    pub fn can_set_web_search_enabled(&self, enabled: bool) -> bool {
+        !enabled
+            || self
+                .tools
+                .read()
+                .iter()
+                .any(|tool| tool.canonical_id == "GrokBuild:web_search")
+            || self
+                .inactive_tools
+                .lock()
+                .contains_key("GrokBuild:web_search")
     }
     /// Flush any pending persistence writes. Call on graceful shutdown.
     pub async fn flush_persistence(&self) {
@@ -5225,8 +5389,8 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn task_description_renders_with_default_agent_config() {
-        let builder = ToolRegistryBuilder::new();
+    async fn task_description_tracks_live_web_search_topology() {
+        let builder = ToolRegistryBuilder::new().with_dynamic_web_search(true);
         let config = ToolServerConfig {
             tools: vec![
                 ToolConfig {
@@ -5288,7 +5452,12 @@ mod tests {
                     params: None,
                     name_override: None,
                     params_name_overrides: None,
-                    description_override: None,
+                    // Agent construction supplies the task roster through a
+                    // description override. Keep the cross-tool reference raw
+                    // here so every live topology transition must rerender it.
+                    description_override: Some(
+                        "Task roster: ${{ tools.by_kind.web_search }}".to_owned(),
+                    ),
                     behavior_version: None,
                     kind: None,
                 },
@@ -5318,6 +5487,29 @@ mod tests {
         let toolset = builder
             .finalize(config, ctx)
             .expect("finalize should succeed with default grok-build tools");
+        toolset
+            .register_tool(
+                "linear__topology_probe".to_owned(),
+                FakeMcpTool {
+                    id: "linear__topology_probe".to_owned(),
+                    description: "MCP ${{ tools.by_kind.web_search }}".to_owned(),
+                },
+                Some(serde_json::json!({
+                    "type": "object",
+                    "description": "Schema ${{ tools.by_kind.web_search }}",
+                    "properties": {}
+                })),
+            )
+            .expect("register topology probe MCP tool");
+        let mcp_snapshot = || {
+            let definitions = toolset.tool_definitions();
+            let definition = definitions
+                .iter()
+                .find(|definition| definition.function.name == "linear__topology_probe")
+                .expect("topology probe MCP definition");
+            serde_json::to_value(definition).expect("serialize topology probe MCP definition")
+        };
+        let original_mcp_definition = mcp_snapshot();
         let defs = toolset.tool_definitions();
         let task_def = defs
             .iter()
@@ -5333,6 +5525,40 @@ mod tests {
             "rendered description must not contain raw template placeholders, got:\n{desc}"
         );
         assert!(!desc.is_empty(), "task tool description must be non-empty");
+        assert!(!desc.contains("web_search"));
+        drop(defs);
+
+        assert!(toolset.set_web_search_enabled(true));
+        assert_eq!(mcp_snapshot(), original_mcp_definition);
+        let defs = toolset.tool_definitions();
+        let desc = defs
+            .iter()
+            .find(|definition| definition.function.name == "task")
+            .and_then(|definition| definition.function.description.as_deref())
+            .expect("task description after enabling web search");
+        assert!(desc.contains("web_search"));
+        drop(defs);
+
+        assert!(toolset.set_web_search_enabled(false));
+        assert_eq!(mcp_snapshot(), original_mcp_definition);
+        let defs = toolset.tool_definitions();
+        let desc = defs
+            .iter()
+            .find(|definition| definition.function.name == "task")
+            .and_then(|definition| definition.function.description.as_deref())
+            .expect("task description after disabling web search");
+        assert!(!desc.contains("web_search"));
+        drop(defs);
+
+        assert!(toolset.set_web_search_enabled(true));
+        assert_eq!(mcp_snapshot(), original_mcp_definition);
+        let defs = toolset.tool_definitions();
+        let desc = defs
+            .iter()
+            .find(|definition| definition.function.name == "task")
+            .and_then(|definition| definition.function.description.as_deref())
+            .expect("task description after re-enabling web search");
+        assert!(desc.contains("web_search"));
     }
     fn hashline_tool_config(id: &str) -> ToolConfig {
         ToolConfig {
