@@ -122,11 +122,7 @@ pub(crate) struct ChatState {
     pub sampling_config: SamplingConfig,
     /// Catalog identity paired with `sampling_config`, when a model switch
     /// supplied one.
-    pub catalog_model_id: Option<String>,
-    /// Routing model paired with `catalog_model_id` at commit time.
-    pub catalog_model_route: Option<String>,
-    /// Whether the committed ID was an alias for `catalog_model_route`.
-    pub catalog_model_allows_route_remap: bool,
+    pub catalog_identity: Option<crate::types::CatalogIdentity>,
     /// Current prompt index (incremented per user turn).
     pub prompt_index: usize,
     /// Cached prompt texts for rewind preview.
@@ -223,7 +219,7 @@ impl ChatState {
     pub fn new_with_catalog_identity(
         mut conversation: Vec<ConversationItem>,
         sampling_config: SamplingConfig,
-        catalog_identity: Option<(String, String, bool)>,
+        catalog_identity: Option<crate::types::CatalogIdentity>,
     ) -> Self {
         let deduped = dedup_duplicate_tool_results(&mut conversation);
         if deduped > 0 {
@@ -243,16 +239,10 @@ impl ChatState {
 
         let initial_tokens = estimate_conversation_tokens(&conversation);
 
-        let (catalog_model_id, catalog_model_route, catalog_model_allows_route_remap) =
-            catalog_identity
-                .map(|(id, route, allows_route_remap)| (Some(id), Some(route), allows_route_remap))
-                .unwrap_or_default();
         Self {
             conversation,
             sampling_config,
-            catalog_model_id,
-            catalog_model_route,
-            catalog_model_allows_route_remap,
+            catalog_identity,
             prompt_index: 0,
             prompt_texts: Vec::new(),
             total_tokens: initial_tokens,
@@ -328,21 +318,16 @@ mod tests {
         let catalog_state = ChatState::new_with_catalog_identity(
             vec![],
             test_sampling_config(),
-            Some((
-                "profile-entry".to_string(),
-                "profile-route".to_string(),
-                true,
-            )),
+            Some(crate::types::CatalogIdentity {
+                model_id: "profile-entry".to_string(),
+                route: "profile-route".to_string(),
+                lineage: crate::types::CatalogResolutionLineage::UniqueRoute,
+            }),
         );
-        assert_eq!(
-            catalog_state.catalog_model_id.as_deref(),
-            Some("profile-entry")
-        );
-        assert_eq!(
-            catalog_state.catalog_model_route.as_deref(),
-            Some("profile-route")
-        );
-        assert!(catalog_state.catalog_model_allows_route_remap);
+        let identity = catalog_state.catalog_identity.as_ref().unwrap();
+        assert_eq!(identity.model_id, "profile-entry");
+        assert_eq!(identity.route, "profile-route");
+        assert!(identity.allows_route_remap());
     }
 
     #[test]

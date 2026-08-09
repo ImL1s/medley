@@ -454,7 +454,7 @@ impl ChatStateHandle {
     /// the same actor transaction.
     pub async fn get_sampling_config_with_model_id(
         &self,
-    ) -> Option<(SamplingConfig, Option<String>, Option<String>, bool)> {
+    ) -> Option<(SamplingConfig, Option<crate::types::CatalogIdentity>)> {
         self.query("GetSamplingConfigWithModelId", |reply| {
             ChatStateCommand::GetSamplingConfigWithModelId { reply }
         })

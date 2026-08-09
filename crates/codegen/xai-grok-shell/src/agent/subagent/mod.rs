@@ -813,23 +813,20 @@ async fn read_parent_sampling_config(
     ctx: &SubagentSpawnContext,
 ) -> (xai_grok_sampler::SamplerConfig, acp::ModelId) {
     if let Some(ref chat_state) = ctx.parent_chat_state {
-        if let Some((
-            cfg,
-            committed_model_id,
-            committed_model_route,
-            catalog_model_allows_route_remap,
-        )) = chat_state.get_sampling_config_with_model_id().await
+        if let Some((cfg, catalog_identity)) = chat_state.get_sampling_config_with_model_id().await
         {
             // Copy identity and all request-shaping catalog facts under one
             // read lock before the credential await below. A refreshed exact
             // key must not shadow the routing model actually sampled.
-            let preferred_model_id = committed_model_id
-                .as_deref()
+            let preferred_model_id = catalog_identity
+                .as_ref()
+                .map(|identity| identity.model_id.as_str())
                 .unwrap_or(ctx.model_id.0.as_ref());
-            let retained_catalog_route = committed_model_route
-                .as_deref()
+            let retained_catalog_route = catalog_identity
+                .as_ref()
+                .map(|identity| identity.route.as_str())
                 .or_else(|| {
-                    (committed_model_id.is_none()
+                    (catalog_identity.is_none()
                         && preferred_model_id == ctx.sampling_config_model_id.0.as_ref())
                     .then_some(ctx.sampling_config.model.as_str())
                 })
@@ -843,12 +840,13 @@ async fn read_parent_sampling_config(
                 });
             let opaque_model_name_override =
                 retained_catalog_route.is_some_and(|route| route != cfg.model);
-            let allow_missing_preferred_remap = catalog_model_allows_route_remap
-                && committed_model_route.as_deref() == Some(cfg.model.as_str());
+            let allow_missing_preferred_remap = catalog_identity.as_ref().is_some_and(|identity| {
+                identity.allows_route_remap() && identity.route == cfg.model
+            });
             let capabilities = ctx.models_manager.capabilities_for_route(
                 Some(preferred_model_id),
                 &cfg.model,
-                committed_model_id.is_some() && !allow_missing_preferred_remap,
+                catalog_identity.is_some() && !allow_missing_preferred_remap,
                 opaque_model_name_override
                     .then_some(retained_catalog_route)
                     .flatten(),

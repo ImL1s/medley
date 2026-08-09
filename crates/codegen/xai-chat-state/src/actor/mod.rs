@@ -93,7 +93,7 @@ impl ChatStateActor {
     pub fn spawn_with_pruning_and_catalog_identity(
         initial_conversation: Vec<ConversationItem>,
         sampling_config: SamplingConfig,
-        catalog_identity: Option<(String, String, bool)>,
+        catalog_identity: Option<crate::types::CatalogIdentity>,
         pruning_config: PruningConfig,
         persistence: Box<dyn ChatPersistence>,
         event_tx: mpsc::UnboundedSender<ChatStateEvent>,
@@ -368,9 +368,7 @@ impl ChatStateActor {
             ChatStateCommand::GetSamplingConfigWithModelId { reply } => {
                 let _ = reply.send((
                     self.state.sampling_config.clone(),
-                    self.state.catalog_model_id.clone(),
-                    self.state.catalog_model_route.clone(),
-                    self.state.catalog_model_allows_route_remap,
+                    self.state.catalog_identity.clone(),
                 ));
             }
             ChatStateCommand::GetAgentEditedPaths { reply } => {

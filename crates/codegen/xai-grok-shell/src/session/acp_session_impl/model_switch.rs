@@ -50,7 +50,7 @@ impl SessionActor {
         prepared: PreparedModelSwitch,
     ) -> Result<AppliedModelSwitch, acp::Error> {
         let PreparedModelSwitch {
-            catalog_model_id,
+            catalog_identity,
             resolved_model,
             sampling_config,
             use_concise,
@@ -58,6 +58,7 @@ impl SessionActor {
             required_agent_type,
             required_definition,
         } = prepared;
+        let catalog_model_id = acp::ModelId::new(catalog_identity.model_id.clone());
         let resolved_model_slug = resolved_model.info().model.clone();
         if resolved_model_slug != sampling_config.model {
             tracing::warn!(
@@ -226,6 +227,7 @@ impl SessionActor {
         let updated_model = match self
             .handle_set_session_model_with_rollback(
                 catalog_model_id.clone(),
+                catalog_identity,
                 sampling_config,
                 use_concise,
                 !self.startup_hints.preserve_inherited_system,
@@ -299,7 +301,12 @@ impl SessionActor {
         required_agent_type: &str,
     ) -> Result<acp::ModelId, acp::Error> {
         self.handle_set_session_model_with_rollback(
-            catalog_model_id,
+            catalog_model_id.clone(),
+            xai_chat_state::CatalogIdentity {
+                model_id: catalog_model_id.0.to_string(),
+                route: sampling_config.model.clone(),
+                lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+            },
             sampling_config,
             use_concise,
             apply_prompt_override,
@@ -314,6 +321,7 @@ impl SessionActor {
     async fn handle_set_session_model_with_rollback(
         &self,
         catalog_model_id: acp::ModelId,
+        catalog_identity: xai_chat_state::CatalogIdentity,
         sampling_config: xai_grok_sampler::SamplerConfig,
         use_concise: bool,
         apply_prompt_override: bool,
@@ -356,13 +364,7 @@ impl SessionActor {
                     .expect("DEFAULT_CONTEXT_WINDOW is non-zero")
             });
         let mut committed_chat = current_chat.clone();
-        committed_chat.catalog_model_id = Some(catalog_model_id.0.to_string());
-        let (catalog_model_route, catalog_model_allows_route_remap) = self
-            .models_manager
-            .catalog_route_identity(catalog_model_id.0.as_ref())
-            .unwrap_or_else(|| (sampling_config.model.clone(), false));
-        committed_chat.catalog_model_route = Some(catalog_model_route);
-        committed_chat.catalog_model_allows_route_remap = catalog_model_allows_route_remap;
+        committed_chat.catalog_identity = Some(catalog_identity);
         committed_chat.sampling_config = xai_grok_sampling_types::SamplingConfig {
             base_url: sampling_config.base_url.clone(),
             model: sampling_config.model.clone(),
@@ -922,7 +924,11 @@ mod model_switch_transaction_tests {
         );
         resolved_model.info.model = "target-wire-model".to_owned();
         PreparedModelSwitch {
-            catalog_model_id: acp::ModelId::new("target-model"),
+            catalog_identity: xai_chat_state::CatalogIdentity {
+                model_id: "target-model".to_string(),
+                route: "target-wire-model".to_string(),
+                lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+            },
             resolved_model,
             sampling_config: switch_sampling_config("target-wire-model"),
             use_concise: false,
@@ -1268,6 +1274,20 @@ mod model_switch_transaction_tests {
                 assert_eq!(receipt.catalog_model_id.0.as_ref(), "target-model");
                 assert_eq!(receipt.active_agent_type.as_deref(), Some("grok-build"));
                 assert_eq!(catalog_model_id(&actor), "target-model");
+                let snapshot = actor
+                    .chat_state_handle
+                    .snapshot()
+                    .await
+                    .expect("chat state");
+                assert_eq!(
+                    snapshot.catalog_identity,
+                    Some(xai_chat_state::CatalogIdentity {
+                        model_id: "target-model".to_string(),
+                        route: "target-wire-model".to_string(),
+                        lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+                    }),
+                    "the actor must commit the identity prepared with the sampler"
+                );
                 assert_eq!(
                     actor.active_agent_type.lock().as_deref(),
                     Some("grok-build")

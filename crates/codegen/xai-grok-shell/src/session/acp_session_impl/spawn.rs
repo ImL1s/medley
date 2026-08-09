@@ -217,6 +217,7 @@ pub(crate) async fn spawn_session_actor(
     session_info: SessionInfo,
     gateway: GatewaySender,
     sampling_config: SamplingConfig,
+    catalog_identity: xai_chat_state::CatalogIdentity,
     credentials: xai_chat_state::Credentials,
     auth_method_id: crate::agent::auth_method::SharedAuthMethodId,
     auth_manager: Option<Arc<AuthManager>>,
@@ -584,18 +585,10 @@ pub(crate) async fn spawn_session_actor(
         hard_clear_age_turns: session_pruning_config.hard_clear_age_turns,
     };
     let (chat_state_event_tx, chat_state_event_rx) = mpsc::unbounded_channel();
-    let (initial_catalog_route, initial_catalog_allows_route_remap) = models_manager
-        .catalog_route_identity(session_model_id.0.as_ref())
-        .unwrap_or_else(|| (chat_state_sampling_config.model.clone(), false));
-    let initial_catalog_identity = Some((
-        session_model_id.0.to_string(),
-        initial_catalog_route,
-        initial_catalog_allows_route_remap,
-    ));
     let chat_state_handle = xai_chat_state::ChatStateActor::spawn_with_pruning_and_catalog_identity(
         conversation.clone(),
         chat_state_sampling_config,
-        initial_catalog_identity,
+        Some(catalog_identity),
         actor_pruning_config,
         Box::new(super::chat_persistence::ChannelChatPersistence::new(
             persistence.tx.clone(),
@@ -2219,6 +2212,7 @@ pub(crate) async fn spawn_session_on_thread(
     session_info: SessionInfo,
     gateway: GatewaySender,
     sampling_config: SamplingConfig,
+    catalog_identity: xai_chat_state::CatalogIdentity,
     credentials: xai_chat_state::Credentials,
     auth_method_id: crate::agent::auth_method::SharedAuthMethodId,
     auth_manager: Option<Arc<AuthManager>>,
@@ -2391,6 +2385,7 @@ pub(crate) async fn spawn_session_on_thread(
                         session_info,
                         gateway,
                         sampling_config,
+                        catalog_identity,
                         credentials,
                         auth_method_id,
                         auth_manager,

@@ -42,6 +42,28 @@ pub(crate) fn resolve_catalog_key(
     None
 }
 
+/// Resolve a requested id and capture the resolver lineage at the same catalog
+/// read that selected the entry. Callers must carry this identity with the
+/// prepared sampler instead of reconstructing it after a catalog refresh.
+pub(crate) fn resolve_catalog_identity(
+    models: &IndexMap<String, ModelEntry>,
+    id: &acp::ModelId,
+) -> Option<xai_chat_state::CatalogIdentity> {
+    let key = resolve_catalog_key(models, id)?;
+    let entry = models
+        .get(key.0.as_ref())
+        .expect("resolve_catalog_key returns a present key");
+    Some(xai_chat_state::CatalogIdentity {
+        model_id: key.0.to_string(),
+        route: entry.info().model.clone(),
+        lineage: if key == *id {
+            xai_chat_state::CatalogResolutionLineage::ExactKey
+        } else {
+            xai_chat_state::CatalogResolutionLineage::UniqueRoute
+        },
+    })
+}
+
 /// Persisted-model resolver constrained to selectable (`available`) entries.
 ///
 /// Unlike `resolve_catalog_key`, this reports ambiguity explicitly so restore

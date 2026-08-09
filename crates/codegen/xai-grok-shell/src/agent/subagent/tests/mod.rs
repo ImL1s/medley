@@ -2446,11 +2446,11 @@ fn spawn_test_parent_chat_state_with_catalog_identity(
     xai_chat_state::ChatStateActor::spawn_with_pruning_and_catalog_identity(
         vec![],
         test_sampling_config(model_slug),
-        Some((
-            catalog_model_id.to_string(),
-            model_slug.to_string(),
-            catalog_model_id != model_slug,
-        )),
+        Some(xai_chat_state::CatalogIdentity {
+            model_id: catalog_model_id.to_string(),
+            route: model_slug.to_string(),
+            lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+        }),
         xai_chat_state::PruningConfig::default(),
         Box::new(mock),
         event_tx,

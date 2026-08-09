@@ -2435,38 +2435,6 @@ impl MvpAgent {
             c
         }
     }
-    /// Resolve `AgentDefinition.model` override for the parent session.
-    /// Apply a profile's pinned-model override to the session's sampling config.
-    ///
-    /// `pinned_model` is resolved once by the caller (shared with harness
-    /// inheritance). `None` — no override, or model not in catalog — keeps the
-    /// session defaults.
-    fn apply_agent_model_override(
-        &self,
-        pinned_model: Option<&(acp::ModelId, ModelEntry)>,
-        default_model_id: acp::ModelId,
-        default_sampling: SamplingConfig,
-        origin_client: Option<crate::http::OriginClientInfo>,
-    ) -> (acp::ModelId, SamplingConfig) {
-        let Some((id, model)) = pinned_model else {
-            return (default_model_id, default_sampling);
-        };
-        let (ready, reason) = crate::agent::config::model_readiness(model);
-        if !ready {
-            tracing::warn!(
-                model = %id.0,
-                reason = ?reason,
-                "agent profile model override skipped: model not ready"
-            );
-            return (default_model_id, default_sampling);
-        }
-        let new_config = self.prepare_sampling_config_for_model(model, origin_client);
-        tracing::info!(
-            model = %id.0,
-            "agent profile model override applied to parent session"
-        );
-        (id.clone(), new_config)
-    }
     /// Whether the current session is a personal grok.com account on a gated
     /// tier (free / X Basic). The Imagine tools stay advertised to the model but
     /// are flagged tier-restricted so they short-circuit at call time with the
@@ -4718,8 +4686,29 @@ impl MvpAgent {
         let support_permission = self.cfg.borrow().features.support_permission;
         let telemetry_enabled = self.product_analytics_enabled();
         let origin_client = self.origin_client_info_from_meta(init.meta.as_ref());
-        let sampling_config = self
-            .resolve_sampling_config_for_model(&session_model_id, origin_client.clone());
+        // Capture entry, resolver lineage, and sampler from one immutable
+        // catalog snapshot. A refresh must not rebind the prepared sampler to
+        // a replacement entry that reused the same key.
+        let catalog = self.models_manager.models();
+        let default_catalog_identity =
+            crate::agent::models::resolve_catalog_identity(&catalog, &session_model_id);
+        let default_model = default_catalog_identity
+            .as_ref()
+            .and_then(|identity| catalog.get(identity.model_id.as_str()));
+        let sampling_config = default_model
+            .map(|model| self.prepare_sampling_config_for_model(model, origin_client.clone()))
+            .unwrap_or_else(|| {
+                let mut config = self.sampling_config.borrow().clone();
+                config.origin_client = origin_client.clone();
+                config
+            });
+        let default_catalog_identity = default_catalog_identity.unwrap_or_else(|| {
+            xai_chat_state::CatalogIdentity {
+                model_id: session_model_id.0.to_string(),
+                route: sampling_config.model.clone(),
+                lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+            }
+        });
         if self.auth_method_id.load().is_none() {
             return Err(acp::Error::auth_required().data("no auth method id provided"));
         }
@@ -4729,26 +4718,6 @@ impl MvpAgent {
             ?startup_hints,
             "startup hints"
         );
-        let auto_compact_threshold_percent = {
-            let cfg = self.cfg.borrow();
-            let models = self.models_manager.models();
-            let model = config::find_model_by_id(&models, &session_model_id.0);
-            crate::util::config::resolve_auto_compact_threshold_percent(
-                &cfg,
-                &session_model_id.0,
-                model.map(|e| &e.info),
-            )
-        };
-        let system_prompt_label = {
-            let cfg = self.cfg.borrow();
-            let models = self.models_manager.models();
-            let model = config::find_model_by_id(&models, &session_model_id.0);
-            crate::util::config::resolve_system_prompt_label(
-                &cfg,
-                &session_model_id.0,
-                model.map(|e| &e.info),
-            )
-        };
         let compaction_mode = self.cfg.borrow().resolve_compaction_mode();
         let compaction_verbatim_input = self
             .cfg
@@ -4807,14 +4776,31 @@ impl MvpAgent {
                 );
             }
         }
-        let pinned_model: Option<(acp::ModelId, ModelEntry)> = match &agent_definition
+        let pinned_model: Option<(xai_chat_state::CatalogIdentity, ModelEntry)> = match &agent_definition
             .model
         {
             xai_grok_agent::config::ModelOverride::Override(id) => {
                 let mid = acp::ModelId::new(Arc::from(id.as_str()));
-                match self.resolve_model_id(&mid) {
-                    Ok(entry) => Some((mid, entry)),
-                    Err(_) => {
+                match crate::agent::models::resolve_catalog_identity(&catalog, &mid)
+                    .and_then(|identity| {
+                        catalog
+                            .get(identity.model_id.as_str())
+                            .cloned()
+                            .map(|entry| (identity, entry))
+                    }) {
+                    Some((identity, entry)) if crate::agent::config::model_readiness(&entry).0 => {
+                        Some((identity, entry))
+                    }
+                    Some((identity, entry)) => {
+                        tracing::warn!(
+                            agent = %agent_definition.name,
+                            model = %identity.model_id,
+                            reason = ?crate::agent::config::model_readiness(&entry).1,
+                            "agent profile model override skipped: model not ready"
+                        );
+                        None
+                    }
+                    None => {
                         tracing::warn!(
                             agent = %agent_definition.name,
                             model = %id,
@@ -4837,13 +4823,37 @@ impl MvpAgent {
             );
             agent_definition.user_message_template = template;
         }
-        let (session_model_id, sampling_config) = self
-            .apply_agent_model_override(
-                pinned_model.as_ref(),
-                session_model_id,
-                sampling_config,
-                origin_client.clone(),
-            );
+        let (session_model_id, catalog_identity, sampling_config) =
+            if let Some((identity, model)) = pinned_model.as_ref() {
+                (
+                    acp::ModelId::new(identity.model_id.clone()),
+                    identity.clone(),
+                    self.prepare_sampling_config_for_model(model, origin_client.clone()),
+                )
+            } else {
+                (
+                    acp::ModelId::new(default_catalog_identity.model_id.clone()),
+                    default_catalog_identity,
+                    sampling_config,
+                )
+            };
+        let selected_model = catalog.get(catalog_identity.model_id.as_str());
+        let auto_compact_threshold_percent = {
+            let cfg = self.cfg.borrow();
+            crate::util::config::resolve_auto_compact_threshold_percent(
+                &cfg,
+                &session_model_id.0,
+                selected_model.map(|entry| &entry.info),
+            )
+        };
+        let system_prompt_label = {
+            let cfg = self.cfg.borrow();
+            crate::util::config::resolve_system_prompt_label(
+                &cfg,
+                &session_model_id.0,
+                selected_model.map(|entry| &entry.info),
+            )
+        };
         let max_turns = {
             let cfg = self.cfg.borrow();
             cfg.cli_agent_overrides
@@ -5177,6 +5187,7 @@ impl MvpAgent {
                     session_info.clone(),
                     self.gateway.clone(),
                     sampling_config,
+                    catalog_identity,
                     credentials,
                     auth_method_id,
                     auth_manager,

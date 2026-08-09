@@ -2730,7 +2730,7 @@ fn zero_turn_model_switch_fails_closed_when_required_harness_is_unresolved() {
                                 code: crate::agent::config::MODEL_SWITCH_REBUILD_FAILED.to_owned(),
                                 active_agent_type: "grok-build".to_owned(),
                                 required_agent_type: "missing-custom-harness".to_owned(),
-                                model_id: prepared.catalog_model_id.0.to_string(),
+                                model_id: prepared.catalog_identity.model_id.clone(),
                                 reason: "agent_definition_unresolved".to_owned(),
                             }
                             .into_acp_error(),
@@ -3493,7 +3493,7 @@ fn load_restore_apply_bypasses_own_marker_and_preserves_request_order() {
                             prepared,
                             responds_to,
                         } => {
-                            let model_id = prepared.catalog_model_id;
+                            let model_id = acp::ModelId::new(prepared.catalog_identity.model_id);
                             let _ = responds_to.send(Ok(crate::session::AppliedModelSwitch {
                                 previous_model_id: acp::ModelId::new("previous-model"),
                                 catalog_model_id: model_id,

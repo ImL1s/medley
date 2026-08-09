@@ -25,6 +25,35 @@ pub struct ChatStateConfig {
     pub sampling_config: SamplingConfig,
 }
 
+/// How a user/session model identifier resolved to one catalog entry.
+///
+/// This lineage is captured while the catalog entry and sampler are selected;
+/// it must never be reconstructed later from key/route string inequality.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogResolutionLineage {
+    /// The requested identifier was the exact catalog key.
+    #[default]
+    ExactKey,
+    /// A routing slug uniquely resolved to a differently named catalog key.
+    UniqueRoute,
+}
+
+/// Immutable catalog identity paired atomically with a prepared sampler.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogIdentity {
+    pub model_id: String,
+    pub route: String,
+    #[serde(default)]
+    pub lineage: CatalogResolutionLineage,
+}
+
+impl CatalogIdentity {
+    pub fn allows_route_remap(&self) -> bool {
+        self.lineage == CatalogResolutionLineage::UniqueRoute
+    }
+}
+
 /// Immutable snapshot of the actor's state (for forking, rewind).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ChatStateSnapshot {
@@ -36,15 +65,7 @@ pub struct ChatStateSnapshot {
     /// Catalog identity committed atomically with `sampling_config` during a
     /// model switch. Older persisted snapshots do not carry this field.
     #[serde(default)]
-    pub catalog_model_id: Option<String>,
-    /// Routing model owned by `catalog_model_id` when that identity was
-    /// committed. Kept stable across opaque model-name overrides.
-    #[serde(default)]
-    pub catalog_model_route: Option<String>,
-    /// Whether the committed catalog identity was an alias for its routing
-    /// model and may therefore follow a unique key remap after refresh.
-    #[serde(default)]
-    pub catalog_model_allows_route_remap: bool,
+    pub catalog_identity: Option<CatalogIdentity>,
     /// Current prompt index (incremented per user turn).
     pub prompt_index: usize,
     /// Accumulated token usage.
@@ -441,9 +462,7 @@ mod tests {
         let api_key = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
         let alpha_key = "YWQ82mKoP6sT3rH9vN5bC1xE7fJ4uL0a";
         let snapshot = ChatStateSnapshot {
-            catalog_model_id: None,
-            catalog_model_route: None,
-            catalog_model_allows_route_remap: false,
+            catalog_identity: None,
             conversation: vec![],
             sampling_config: SamplingConfig {
                 base_url: format!("https://user:{api_key}@api.example.com/?token={api_key}"),
@@ -483,9 +502,7 @@ mod tests {
         use xai_grok_sampling_types::ConversationItem;
 
         let snapshot = ChatStateSnapshot {
-            catalog_model_id: None,
-            catalog_model_route: None,
-            catalog_model_allows_route_remap: false,
+            catalog_identity: None,
             conversation: vec![
                 ConversationItem::system("You are a helpful assistant."),
                 ConversationItem::user("Hello!"),
@@ -528,9 +545,7 @@ mod tests {
         let api_key = "GB002-chat-access-Q7w5E3r1T9y7";
         let alpha_key = "GB002-chat-alpha-A7s5D3f1G9h7";
         let snapshot = ChatStateSnapshot {
-            catalog_model_id: None,
-            catalog_model_route: None,
-            catalog_model_allows_route_remap: false,
+            catalog_identity: None,
             conversation: vec![],
             sampling_config: SamplingConfig::for_test("https://api.example.com", "test-model"),
             prompt_index: 0,

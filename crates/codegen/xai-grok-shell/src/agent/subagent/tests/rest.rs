@@ -3,6 +3,18 @@ use super::*;
 use crate::test_support::lsp_runtime::{ctx_with_toggle, test_gateway};
 use crate::upload::trace::SubagentSpawnedRef;
 use xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend;
+
+fn test_catalog_identity(
+    model_id: &str,
+    route: &str,
+    lineage: xai_chat_state::CatalogResolutionLineage,
+) -> xai_chat_state::CatalogIdentity {
+    xai_chat_state::CatalogIdentity {
+        model_id: model_id.to_string(),
+        route: route.to_string(),
+        lineage,
+    }
+}
 #[test]
 fn normalize_forked_context_strips_project_layout() {
     use xai_grok_sampling_types::conversation::ConversationItem;
@@ -2497,9 +2509,11 @@ async fn read_parent_sampling_config_missing_committed_id_ignores_same_route_sur
     ctx.sampling_config.supports_backend_search = true;
     let chat = ctx.parent_chat_state.as_ref().expect("chat state");
     let mut snapshot = chat.snapshot().await.expect("chat snapshot");
-    snapshot.catalog_model_id = Some("removed-entry".to_string());
-    snapshot.catalog_model_route = Some("shared-routing-model".to_string());
-    snapshot.catalog_model_allows_route_remap = false;
+    snapshot.catalog_identity = Some(test_catalog_identity(
+        "removed-entry",
+        "shared-routing-model",
+        xai_chat_state::CatalogResolutionLineage::ExactKey,
+    ));
     chat.restore_snapshot(snapshot);
 
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
@@ -2547,16 +2561,20 @@ async fn read_parent_sampling_config_opaque_name_override_keeps_committed_capabi
 
     // The inherited child stores the catalog's original route rather than
     // its opaque sampling override, so a grandchild resolves the same entry.
-    let (catalog_route, allows_route_remap) = ctx
-        .models_manager
-        .catalog_route_identity(model_id.0.as_ref())
+    let catalog_identity = ctx
+        .parent_chat_state
+        .as_ref()
+        .expect("chat state")
+        .get_sampling_config_with_model_id()
+        .await
+        .and_then(|(_, identity)| identity)
         .expect("selected catalog identity");
     let (mock, _persistence_rx) = xai_chat_state::MockChatPersistence::new();
     let (event_tx, _event_rx) = mpsc::unbounded_channel();
     let nested_chat = xai_chat_state::ChatStateActor::spawn_with_pruning_and_catalog_identity(
         vec![],
         test_sampling_config(&config.model),
-        Some((model_id.0.to_string(), catalog_route, allows_route_remap)),
+        Some(catalog_identity),
         xai_chat_state::PruningConfig::default(),
         Box::new(mock),
         event_tx,
@@ -2597,8 +2615,11 @@ async fn read_parent_sampling_config_switched_entry_opaque_override_keeps_capabi
     let chat = ctx.parent_chat_state.as_ref().expect("chat state");
     let mut snapshot = chat.snapshot().await.expect("chat snapshot");
     snapshot.sampling_config.model = "opaque-switched-routing-hint".to_string();
-    snapshot.catalog_model_id = Some("switched-entry".to_string());
-    snapshot.catalog_model_route = Some("switched-routing-model".to_string());
+    snapshot.catalog_identity = Some(test_catalog_identity(
+        "switched-entry",
+        "switched-routing-model",
+        xai_chat_state::CatalogResolutionLineage::ExactKey,
+    ));
     chat.restore_snapshot(snapshot);
 
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
@@ -2633,8 +2654,11 @@ async fn read_parent_sampling_config_opaque_override_rejects_reused_committed_ke
     let chat = ctx.parent_chat_state.as_ref().expect("chat state");
     let mut snapshot = chat.snapshot().await.expect("chat snapshot");
     snapshot.sampling_config.model = "opaque-backend-routing-hint".to_string();
-    snapshot.catalog_model_id = Some("catalog-entry".to_string());
-    snapshot.catalog_model_route = Some("original-routing-model".to_string());
+    snapshot.catalog_identity = Some(test_catalog_identity(
+        "catalog-entry",
+        "original-routing-model",
+        xai_chat_state::CatalogResolutionLineage::ExactKey,
+    ));
     chat.restore_snapshot(snapshot);
 
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
@@ -2691,6 +2715,17 @@ async fn read_parent_sampling_config_resolves_wire_after_catalog_id_becomes_slug
     let mut ctx = ctx_with_parent_chat_state("auto", "grok-4.5", "auto", models);
     ctx.sampling_config.model = "grok-4.5".to_string();
     ctx.sampling_config.codex_wire = Some(stale_caps);
+    let mut selection_catalog = indexmap::IndexMap::new();
+    selection_catalog.insert("auto".to_string(), test_model_entry("grok-4.5"));
+    let selected_identity = crate::agent::models::resolve_catalog_identity(
+        &selection_catalog,
+        &acp::ModelId::new("grok-4.5"),
+    )
+    .expect("unique route selection");
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.catalog_identity = Some(selected_identity);
+    chat.restore_snapshot(snapshot);
 
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
 
@@ -2700,6 +2735,55 @@ async fn read_parent_sampling_config_resolves_wire_after_catalog_id_becomes_slug
         Some(refreshed_caps),
         "a retained catalog id and its refreshed routing-slug key are the same model"
     );
+}
+
+/// An exact stable key is not an alias merely because its routing slug differs.
+/// If refresh removes that key, a same-route survivor must not inherit the
+/// prepared session's auth or wire capabilities.
+#[tokio::test]
+async fn read_parent_sampling_config_exact_stable_key_never_remaps_to_same_route_survivor() {
+    let baseline_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let replacement_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut selection_catalog = indexmap::IndexMap::new();
+    selection_catalog.insert(
+        "prod-grok-build".to_string(),
+        test_model_entry("grok-4.5"),
+    );
+    let selected_identity = crate::agent::models::resolve_catalog_identity(
+        &selection_catalog,
+        &acp::ModelId::new("prod-grok-build"),
+    )
+    .expect("exact production catalog selection");
+    assert_eq!(
+        selected_identity.lineage,
+        xai_chat_state::CatalogResolutionLineage::ExactKey
+    );
+
+    let mut survivor = test_model_entry("grok-4.5");
+    survivor.info.codex_wire = Some(replacement_caps);
+    let mut refreshed_catalog = indexmap::IndexMap::new();
+    refreshed_catalog.insert("replacement".to_string(), survivor);
+    let mut ctx = ctx_with_parent_chat_state(
+        "prod-grok-build",
+        "grok-4.5",
+        "replacement",
+        refreshed_catalog,
+    );
+    ctx.sampling_config.codex_wire = Some(baseline_caps.clone());
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.catalog_identity = Some(selected_identity);
+    chat.restore_snapshot(snapshot);
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(model_id.0.as_ref(), "grok-4.5");
+    assert_eq!(config.codex_wire, Some(baseline_caps));
 }
 
 /// A present catalog entry with no wire metadata is authoritative. After a
@@ -2752,8 +2836,11 @@ async fn read_parent_sampling_config_same_entry_none_overrides_stale_baseline_wi
     ctx.sampling_config.codex_wire = Some(stale_caps);
     let chat = ctx.parent_chat_state.as_ref().expect("chat state");
     let mut snapshot = chat.snapshot().await.expect("chat snapshot");
-    snapshot.catalog_model_id = Some("same-catalog-entry".to_string());
-    snapshot.catalog_model_route = Some("same-routing-model".to_string());
+    snapshot.catalog_identity = Some(test_catalog_identity(
+        "same-catalog-entry",
+        "same-routing-model",
+        xai_chat_state::CatalogResolutionLineage::ExactKey,
+    ));
     chat.restore_snapshot(snapshot);
 
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
@@ -2792,8 +2879,11 @@ async fn read_parent_sampling_config_inflight_switch_uses_live_model_wire() {
     ctx.sampling_config.model = "shared-routing-model".to_string();
     let chat = ctx.parent_chat_state.as_ref().expect("chat state");
     let mut snapshot = chat.snapshot().await.expect("chat snapshot");
-    snapshot.catalog_model_id = Some("new-catalog-id".to_string());
-    snapshot.catalog_model_route = Some("shared-routing-model".to_string());
+    snapshot.catalog_identity = Some(test_catalog_identity(
+        "new-catalog-id",
+        "shared-routing-model",
+        xai_chat_state::CatalogResolutionLineage::ExactKey,
+    ));
     chat.restore_snapshot(snapshot);
 
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
@@ -2831,8 +2921,11 @@ async fn read_parent_sampling_config_reused_catalog_key_keeps_sampled_model_wire
     let ctx = ctx_with_parent_chat_state("auto", "old-routing-model", "auto", models);
     let chat = ctx.parent_chat_state.as_ref().expect("chat state");
     let mut snapshot = chat.snapshot().await.expect("chat snapshot");
-    snapshot.catalog_model_id = Some("auto".to_string());
-    snapshot.catalog_model_route = Some("old-routing-model".to_string());
+    snapshot.catalog_identity = Some(test_catalog_identity(
+        "auto",
+        "old-routing-model",
+        xai_chat_state::CatalogResolutionLineage::ExactKey,
+    ));
     chat.restore_snapshot(snapshot);
 
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
@@ -2842,8 +2935,7 @@ async fn read_parent_sampling_config_reused_catalog_key_keeps_sampled_model_wire
     assert_eq!(config.codex_wire, Some(old_caps));
 
     let mut baseline_snapshot = chat.snapshot().await.expect("chat snapshot");
-    baseline_snapshot.catalog_model_id = None;
-    baseline_snapshot.catalog_model_route = None;
+    baseline_snapshot.catalog_identity = None;
     chat.restore_snapshot(baseline_snapshot);
     let (baseline_config, baseline_model_id) = read_parent_sampling_config(&ctx).await;
     assert_eq!(baseline_model_id.0.as_ref(), "legacy-entry");

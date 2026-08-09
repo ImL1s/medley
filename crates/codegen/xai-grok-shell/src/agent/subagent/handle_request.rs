@@ -1190,6 +1190,14 @@ pub(crate) async fn run_shell_child(
     });
     let subagent_session_default_agent_profile = Some(definition.name.clone());
     let subagent_model_id = effective_sampling_config.model.clone();
+    let effective_catalog_identity =
+        crate::agent::models::resolve_catalog_identity(&ctx.available_models, &effective_model_id)
+            .unwrap_or_else(|| xai_chat_state::CatalogIdentity {
+                model_id: effective_model_id.0.to_string(),
+                route: effective_sampling_config.model.clone(),
+                lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+            });
+    effective_model_id = acp::ModelId::new(effective_catalog_identity.model_id.clone());
     let _ = persistence
         .tx
         .send(crate::session::persistence::PersistenceMsg::CurrentModel {
@@ -1201,6 +1209,7 @@ pub(crate) async fn run_shell_child(
         child_session_info,
         gateway.clone(),
         effective_sampling_config,
+        effective_catalog_identity,
         credentials,
         crate::agent::auth_method::new_shared_auth_method_id(Some(ctx.auth_method_id.clone())),
         Some(ctx.auth_manager.clone()),

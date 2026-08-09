@@ -171,8 +171,8 @@ async fn apply_with_load_gate(
         .filter(|(_, entry)| entry.info().model == requested_model_str)
         .map(|(key, _)| key.clone())
         .collect();
-    let Some(catalog_model_id) =
-        crate::agent::models::resolve_catalog_key(&models, &requested_model_id)
+    let Some(catalog_identity) =
+        crate::agent::models::resolve_catalog_identity(&models, &requested_model_id)
     else {
         if !models.contains_key(requested_model_str) && slug_matches.len() > 1 {
             return Err(acp::Error::invalid_params().data(format!(
@@ -184,8 +184,9 @@ async fn apply_with_load_gate(
         }
         return Err(acp::Error::invalid_params().data("unknown model id"));
     };
+    let catalog_model_id = acp::ModelId::new(catalog_identity.model_id.clone());
     let model = models
-        .get(catalog_model_id.0.as_ref())
+        .get(catalog_identity.model_id.as_str())
         .cloned()
         .expect("resolve_catalog_key returned key present in models()");
     failure_telemetry.new_model_id = catalog_model_id.0.to_string();
@@ -281,10 +282,7 @@ async fn apply_with_load_gate(
     let mut model_sampling =
         agent.prepare_sampling_config_for_model(&model, handle.origin_client.clone());
     if let Some(eff) = effort_override {
-        if agent
-            .models_manager
-            .model_supports_reasoning_effort(catalog_model_id.0.as_ref())
-        {
+        if model.info().supports_reasoning_effort {
             tracing::info!(
                 session_id = %session_id.0,
                 effort = %eff,
@@ -311,7 +309,7 @@ async fn apply_with_load_gate(
         .cmd_tx
         .send(SessionCommand::ApplyModelSwitch {
             prepared: Box::new(crate::session::PreparedModelSwitch {
-                catalog_model_id: catalog_model_id.clone(),
+                catalog_identity,
                 resolved_model: model.clone(),
                 sampling_config: model_sampling,
                 use_concise,
