@@ -584,9 +584,14 @@ pub(crate) async fn spawn_session_actor(
         hard_clear_age_turns: session_pruning_config.hard_clear_age_turns,
     };
     let (chat_state_event_tx, chat_state_event_rx) = mpsc::unbounded_channel();
+    let initial_catalog_allows_route_remap = models_manager.catalog_id_is_route_alias(
+        session_model_id.0.as_ref(),
+        &chat_state_sampling_config.model,
+    );
     let initial_catalog_identity = Some((
         session_model_id.0.to_string(),
         chat_state_sampling_config.model.clone(),
+        initial_catalog_allows_route_remap,
     ));
     let chat_state_handle = xai_chat_state::ChatStateActor::spawn_with_pruning_and_catalog_identity(
         conversation.clone(),

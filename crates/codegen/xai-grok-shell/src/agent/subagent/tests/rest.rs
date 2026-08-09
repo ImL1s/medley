@@ -1789,7 +1789,10 @@ fn ctx_with_parent_chat_state(
     ctx.model_id = acp::ModelId::new(session_model_id);
     ctx.sampling_config_model_id = acp::ModelId::new(session_model_id);
     ctx.sampling_config.model = inference_slug.to_string();
-    ctx.parent_chat_state = Some(spawn_test_parent_chat_state(inference_slug));
+    ctx.parent_chat_state = Some(spawn_test_parent_chat_state_with_catalog_identity(
+        session_model_id,
+        inference_slug,
+    ));
     ctx.models_manager = crate::agent::models::ModelsManager::new(
         None,
         available_models.clone(),
@@ -1946,6 +1949,39 @@ async fn read_parent_sampling_config_fallback_wires_bearer_resolver() {
     ctx.sampling_config.base_url = "https://api.x.ai/v1".to_string();
     let (config, _) = read_parent_sampling_config(&ctx).await;
     assert!(config.bearer_resolver.is_some());
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_fallback_binds_auth_to_selected_catalog_entry() {
+    let shared_slug = "shared-routing-slug";
+    let mut selected = test_model_entry(shared_slug);
+    selected.info.auth_scheme = xai_grok_sampler::AuthScheme::Bearer;
+    let mut shadow = test_model_entry("unrelated-routing-slug");
+    shadow.api_key = Some("shadow-byok-key".to_string());
+    shadow.info.auth_scheme = xai_grok_sampler::AuthScheme::None;
+    let mut models = indexmap::IndexMap::new();
+    models.insert("selected-entry".to_string(), selected);
+    models.insert(shared_slug.to_string(), shadow);
+    let mut ctx = ctx_with_parent_chat_state(
+        "selected-entry",
+        shared_slug,
+        "selected-entry",
+        models,
+    );
+    ctx.parent_chat_state = None;
+    ctx.auth_method_id = acp::AuthMethodId::new(
+        crate::agent::auth_method::CACHED_TOKEN_AUTH_METHOD_ID,
+    );
+    ctx.sampling_config.base_url = "https://api.x.ai/v1".to_string();
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "selected-entry");
+    assert_eq!(config.auth_scheme, xai_grok_sampler::AuthScheme::Bearer);
+    assert!(
+        config.bearer_resolver.is_some(),
+        "fallback auth must use the same selected entry as its capabilities"
+    );
 }
 /// The inherit-live path honors `would_strip_fallback_key` like the
 /// other two paths (it used to install the resolver unconditionally,
@@ -2463,6 +2499,7 @@ async fn read_parent_sampling_config_missing_committed_id_ignores_same_route_sur
     let mut snapshot = chat.snapshot().await.expect("chat snapshot");
     snapshot.catalog_model_id = Some("removed-entry".to_string());
     snapshot.catalog_model_route = Some("shared-routing-model".to_string());
+    snapshot.catalog_model_allows_route_remap = false;
     chat.restore_snapshot(snapshot);
 
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
@@ -2897,6 +2934,43 @@ async fn read_parent_sampling_config_prefers_catalog_key_over_shared_wire_slug()
         "catalog None alias must win over the shared-slug Bearer entry"
     );
 }
+
+/// Capability and auth facts must come from the same catalog entry. An exact
+/// key equal to the routing slug must not shadow the selected entry's BYOK
+/// classification and suppress its xAI session resolver.
+#[tokio::test]
+async fn read_parent_sampling_config_binds_bearer_gate_to_selected_catalog_entry() {
+    let shared_slug = "shared-routing-slug";
+    let mut selected = test_model_entry(shared_slug);
+    selected.info.auth_scheme = xai_grok_sampler::AuthScheme::Bearer;
+    let mut shadow = test_model_entry("unrelated-routing-slug");
+    shadow.api_key = Some("shadow-byok-key".to_string());
+    let mut models = indexmap::IndexMap::new();
+    models.insert("selected-entry".to_string(), selected);
+    models.insert(shared_slug.to_string(), shadow);
+    let mut ctx = ctx_with_parent_chat_state(
+        "selected-entry",
+        shared_slug,
+        "selected-entry",
+        models,
+    );
+    ctx.auth_method_id = acp::AuthMethodId::new(
+        crate::agent::auth_method::CACHED_TOKEN_AUTH_METHOD_ID,
+    );
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.sampling_config.base_url = "https://api.x.ai/v1".to_string();
+    chat.restore_snapshot(snapshot);
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "selected-entry");
+    assert!(
+        config.bearer_resolver.is_some(),
+        "the unrelated exact-key BYOK entry must not shadow selected-entry auth facts"
+    );
+}
+
 #[tokio::test]
 async fn read_parent_sampling_config_catalog_miss_respects_parent_auth_scheme_none() {
     use xai_grok_sampler::AuthScheme;

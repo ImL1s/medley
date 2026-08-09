@@ -21,6 +21,7 @@ impl ChatStateActor {
             sampling_config: self.state.sampling_config.clone(),
             catalog_model_id: self.state.catalog_model_id.clone(),
             catalog_model_route: self.state.catalog_model_route.clone(),
+            catalog_model_allows_route_remap: self.state.catalog_model_allows_route_remap,
             prompt_index: self.state.prompt_index,
             total_tokens: self.state.total_tokens,
             estimate_at_last_response: self.state.estimate_at_last_response,

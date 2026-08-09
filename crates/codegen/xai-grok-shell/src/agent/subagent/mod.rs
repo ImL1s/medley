@@ -803,22 +803,6 @@ fn session_bearer_resolver(
         crate::auth::credential_provider::WireValidBearerResolver::shared(ctx.auth_manager.clone())
     })
 }
-/// [`session_bearer_resolver`] for an inherited config, where only the model
-/// string is known: BYOK comes from the catalog memo.
-fn inherited_bearer_resolver(
-    ctx: &SubagentSpawnContext,
-    model: &str,
-    base_url: &str,
-    credential_source: Option<&xai_grok_sampler::CredentialSource>,
-) -> Option<xai_grok_sampler::SharedBearerResolver> {
-    let byok = crate::agent::config::resolve_model_auth_facts_and_provider(
-        model,
-        Some(&ctx.available_models),
-    )
-    .0
-    .byok;
-    session_bearer_resolver(ctx, byok, base_url, credential_source)
-}
 /// Read the parent session's actual current sampling config.
 ///
 /// Prefers the live state from `ChatStateHandle` (authoritative). Falls back
@@ -829,8 +813,12 @@ async fn read_parent_sampling_config(
     ctx: &SubagentSpawnContext,
 ) -> (xai_grok_sampler::SamplerConfig, acp::ModelId) {
     if let Some(ref chat_state) = ctx.parent_chat_state {
-        if let Some((cfg, committed_model_id, committed_model_route)) =
-            chat_state.get_sampling_config_with_model_id().await
+        if let Some((
+            cfg,
+            committed_model_id,
+            committed_model_route,
+            catalog_model_allows_route_remap,
+        )) = chat_state.get_sampling_config_with_model_id().await
         {
             // Copy identity and all request-shaping catalog facts under one
             // read lock before the credential await below. A refreshed exact
@@ -855,10 +843,12 @@ async fn read_parent_sampling_config(
                 });
             let opaque_model_name_override =
                 retained_catalog_route.is_some_and(|route| route != cfg.model);
+            let allow_missing_preferred_remap = catalog_model_allows_route_remap
+                && committed_model_route.as_deref() == Some(cfg.model.as_str());
             let capabilities = ctx.models_manager.capabilities_for_route(
                 Some(preferred_model_id),
                 &cfg.model,
-                committed_model_id.is_some(),
+                committed_model_id.is_some() && !allow_missing_preferred_remap,
                 opaque_model_name_override
                     .then_some(retained_catalog_route)
                     .flatten(),
@@ -876,16 +866,13 @@ async fn read_parent_sampling_config(
                 creds.alpha_test_key(),
                 &cfg.base_url,
             );
-            // Prefer the spawn-time in-memory catalog (session-selected models),
-            // then disk effective config, then parent spawn baseline. Never
-            // silent-default to Bearer on miss when the parent baseline is None.
+            // Auth belongs to the same locked catalog entry as the other
+            // request-shaping facts. On a miss, retain the parent baseline;
+            // never perform a second routing-slug lookup that a shadow entry
+            // could satisfy.
             let auth_scheme = capabilities
                 .as_ref()
                 .map(|facts| facts.auth_scheme)
-                .or_else(|| {
-                    crate::agent::config::try_resolve_model_credentials(&cfg.model, None)
-                        .map(|r| r.auth_scheme)
-                })
                 .unwrap_or(ctx.sampling_config.auth_scheme);
             let inherited_base_url = cfg.base_url.clone();
             let strip_guard = ctx.would_strip_fallback_key(creds.api_key());
@@ -948,9 +935,12 @@ async fn read_parent_sampling_config(
                 {
                     None
                 } else {
-                    inherited_bearer_resolver(
+                    session_bearer_resolver(
                         ctx,
-                        &cfg.model,
+                        capabilities
+                            .as_ref()
+                            .map(|facts| facts.byok)
+                            .unwrap_or(crate::agent::auth_method::ModelByok::Unknown),
                         &inherited_base_url,
                         credential_source.as_ref(),
                     )
@@ -1034,6 +1024,13 @@ async fn read_parent_sampling_config(
         .as_ref()
         .map(|facts| facts.model_id.clone())
         .unwrap_or_else(|| acp::ModelId::new(fallback.model.clone()));
+    if let Some(capabilities) = capabilities.as_ref() {
+        fallback.auth_scheme = capabilities.auth_scheme;
+        fallback.supports_backend_search = capabilities.supports_backend_search;
+        fallback.compactions_remaining = capabilities.compactions_remaining;
+        fallback.compaction_at_tokens = capabilities.compaction_at_tokens;
+        fallback.codex_wire = capabilities.codex_wire.clone();
+    }
     if fallback.auth_scheme == xai_grok_sampler::AuthScheme::None {
         fallback.api_key = None;
         fallback.bearer_resolver = None;
@@ -1041,22 +1038,19 @@ async fn read_parent_sampling_config(
         fallback.bearer_resolver = if ctx.would_strip_fallback_key(fallback.api_key.as_deref()) {
             None
         } else {
-            inherited_bearer_resolver(
+            session_bearer_resolver(
                 ctx,
-                &fallback.model,
+                capabilities
+                    .as_ref()
+                    .map(|facts| facts.byok)
+                    .unwrap_or(crate::agent::auth_method::ModelByok::Unknown),
                 &fallback.base_url,
                 fallback.credential_source.as_ref(),
             )
         };
     }
-    if let Some(capabilities) = capabilities {
-        fallback.supports_backend_search = capabilities.supports_backend_search;
-        fallback.compactions_remaining = capabilities.compactions_remaining;
-        fallback.compaction_at_tokens = capabilities.compaction_at_tokens;
-        fallback.codex_wire = capabilities.codex_wire;
-    }
-    // The three lines above already re-resolve catalog facts here;
-    // `codex_wire` is one too, and cloning the parent's would reintroduce
+    // The block above already re-resolves catalog facts here; `codex_wire` is
+    // one too, and cloning the parent's would reintroduce
     // #277 on the path taken whenever the parent's chat-state actor is
     // unavailable — which `try_build_subagent_spawn_context` does not bail
     // on, so a nested child outliving its parent lands here for real.

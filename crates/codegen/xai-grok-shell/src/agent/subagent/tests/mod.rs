@@ -2436,4 +2436,25 @@ fn spawn_test_parent_chat_state(model_slug: &str) -> xai_chat_state::ChatStateHa
         token,
     )
 }
+fn spawn_test_parent_chat_state_with_catalog_identity(
+    catalog_model_id: &str,
+    model_slug: &str,
+) -> xai_chat_state::ChatStateHandle {
+    let (mock, _persistence_rx) = xai_chat_state::MockChatPersistence::new();
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let token = tokio_util::sync::CancellationToken::new();
+    xai_chat_state::ChatStateActor::spawn_with_pruning_and_catalog_identity(
+        vec![],
+        test_sampling_config(model_slug),
+        Some((
+            catalog_model_id.to_string(),
+            model_slug.to_string(),
+            catalog_model_id != model_slug,
+        )),
+        xai_chat_state::PruningConfig::default(),
+        Box::new(mock),
+        event_tx,
+        token,
+    )
+}
 mod rest;

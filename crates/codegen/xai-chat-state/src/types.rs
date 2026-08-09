@@ -41,6 +41,10 @@ pub struct ChatStateSnapshot {
     /// committed. Kept stable across opaque model-name overrides.
     #[serde(default)]
     pub catalog_model_route: Option<String>,
+    /// Whether the committed catalog identity was an alias for its routing
+    /// model and may therefore follow a unique key remap after refresh.
+    #[serde(default)]
+    pub catalog_model_allows_route_remap: bool,
     /// Current prompt index (incremented per user turn).
     pub prompt_index: usize,
     /// Accumulated token usage.
@@ -439,6 +443,7 @@ mod tests {
         let snapshot = ChatStateSnapshot {
             catalog_model_id: None,
             catalog_model_route: None,
+            catalog_model_allows_route_remap: false,
             conversation: vec![],
             sampling_config: SamplingConfig {
                 base_url: format!("https://user:{api_key}@api.example.com/?token={api_key}"),
@@ -480,6 +485,7 @@ mod tests {
         let snapshot = ChatStateSnapshot {
             catalog_model_id: None,
             catalog_model_route: None,
+            catalog_model_allows_route_remap: false,
             conversation: vec![
                 ConversationItem::system("You are a helpful assistant."),
                 ConversationItem::user("Hello!"),
@@ -524,6 +530,7 @@ mod tests {
         let snapshot = ChatStateSnapshot {
             catalog_model_id: None,
             catalog_model_route: None,
+            catalog_model_allows_route_remap: false,
             conversation: vec![],
             sampling_config: SamplingConfig::for_test("https://api.example.com", "test-model"),
             prompt_index: 0,

@@ -101,6 +101,7 @@ pub struct ModelsManager {
 #[derive(Clone)]
 pub(crate) struct ResolvedModelCapabilities {
     pub model_id: acp::ModelId,
+    pub byok: crate::agent::auth_method::ModelByok,
     pub auth_scheme: xai_grok_sampler::AuthScheme,
     pub supports_backend_search: bool,
     pub compactions_remaining: Option<xai_grok_sampling_types::CompactionsRemaining>,
@@ -259,6 +260,24 @@ impl ModelsManagerBuilder {
 }
 
 impl ModelsManager {
+    /// Whether `catalog_model_id` is an exact catalog key whose entry routes
+    /// through a different model slug. This proves alias lineage before a
+    /// later refresh is allowed to remap the missing key by route.
+    pub(crate) fn catalog_id_is_route_alias(
+        &self,
+        catalog_model_id: &str,
+        routing_model: &str,
+    ) -> bool {
+        catalog_model_id != routing_model
+            && self
+                .inner
+                .catalog
+                .read()
+                .models
+                .get(catalog_model_id)
+                .is_some_and(|entry| entry.info().model == routing_model)
+    }
+
     /// Resolve one routing model and copy all request-shaping facts while
     /// holding a single catalog read lock. An exact key that routes elsewhere
     /// never shadows a unique routing-model match.
@@ -300,6 +319,11 @@ impl ModelsManager {
         let info = entry.info();
         Some(ResolvedModelCapabilities {
             model_id: acp::ModelId::new(model_id),
+            byok: if entry.has_own_credentials() {
+                crate::agent::auth_method::ModelByok::Byok
+            } else {
+                crate::agent::auth_method::ModelByok::NotByok
+            },
             auth_scheme: info.auth_scheme,
             supports_backend_search: info.supports_backend_search,
             compactions_remaining: info.compactions_remaining,
