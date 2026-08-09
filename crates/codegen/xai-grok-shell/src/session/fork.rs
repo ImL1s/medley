@@ -7,7 +7,7 @@ use crate::remote::BackendClient;
 const FORK_LOG: &str = "xai_fork";
 use crate::session::export::ExportedMetadata;
 use crate::session::info::Info;
-use crate::session::storage::{CopySessionOptions, JsonlStorageAdapter};
+use crate::session::storage::{CopySessionOptions, JsonlStorageAdapter, StorageAdapter};
 use crate::util::grok_home::grok_home;
 use agent_client_protocol as acp;
 use std::io;
@@ -106,14 +106,15 @@ pub async fn fork_session(
         ..Default::default()
     };
 
+    let target_info_for_copy = target_info.clone();
+    let storage_for_read = storage.clone();
     let result = tokio::task::spawn_blocking(move || {
-        storage.copy_session_data_sync(&source_info, &target_info, options)
+        storage.copy_session_data_sync(&source_info, &target_info_for_copy, options)
     })
     .await
     .map_err(|e| io::Error::other(format!("spawn_blocking panicked: {e}")))??;
 
     let copy_ms = t0.elapsed().as_millis() as u64;
-
     // Writeback session to backend (fire-and-forget).
     // This is telemetry-grade: the local fork works without it. All fork
     // state lives locally (session files on disk), and the caller does not
@@ -122,22 +123,27 @@ pub async fn fork_session(
     // Spawning removes the network round-trip (~200-400ms) from the
     // critical path.
     if let Some(am) = auth_manager {
-        let sid = new_session_id.clone();
-        let cwd = request.new_cwd.clone();
-        let parent = request.source_session_id.clone();
-        let model = request.new_model_id.clone();
-        let aid = agent_id.to_string();
-        tokio::spawn(async move {
-            if let Err(e) =
-                sync_forked_session_to_backend(&sid, &cwd, parent, model, &aid, am).await
-            {
-                tracing::warn!(
-                    session_id = %sid,
-                    error = %e,
-                    "Failed to register forked session with backend (background)"
-                );
+        match storage_for_read.load_summary(&target_info).await {
+            Ok(fork_summary) => {
+                let sid = new_session_id.clone();
+                let metadata = fork_registration_metadata(&fork_summary);
+                let aid = agent_id.to_string();
+                tokio::spawn(async move {
+                    if let Err(e) = sync_forked_session_to_backend(&sid, metadata, &aid, am).await {
+                        tracing::warn!(
+                            session_id = %sid,
+                            error = %e,
+                            "Failed to register forked session with backend (background)"
+                        );
+                    }
+                });
             }
-        });
+            Err(error) => tracing::warn!(
+                session_id = %new_session_id,
+                %error,
+                "Failed to read copied fork summary; skipping background backend registration"
+            ),
+        }
     }
 
     let total_ms = t0.elapsed().as_millis() as u64;
@@ -166,31 +172,11 @@ pub async fn fork_session(
 /// Sync a forked session to the backend (for writeback mode).
 async fn sync_forked_session_to_backend(
     session_id: &str,
-    cwd: &str,
-    parent_session_id: String,
-    model_id: Option<String>,
+    metadata: ExportedMetadata,
     agent_id: &str,
     auth_manager: std::sync::Arc<crate::auth::AuthManager>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = BackendClient::new().with_auth_manager(auth_manager);
-    let metadata = ExportedMetadata {
-        title: None, // Will be generated later when session runs
-        cwd: cwd.to_string(),
-        model_id,
-        catalog_identity: None,
-        agent_name: None,
-        created_at: Some(chrono::Utc::now().to_rfc3339()),
-        updated_at: Some(chrono::Utc::now().to_rfc3339()),
-        total_messages: Some(0),
-        parent_session_id: Some(parent_session_id),
-        session_kind: None,
-        subagent_type: None,
-        subagent_persona: None,
-        subagent_role: None,
-        fork_context_source: None,
-        subagent_depth: None,
-    };
-
     client
         .upsert_session(session_id, &metadata, agent_id)
         .await?;
@@ -200,6 +186,10 @@ async fn sync_forked_session_to_backend(
     );
 
     Ok(())
+}
+
+fn fork_registration_metadata(summary: &crate::session::persistence::Summary) -> ExportedMetadata {
+    ExportedMetadata::from_summary(summary)
 }
 
 #[cfg(test)]
@@ -221,6 +211,68 @@ mod tests {
             "Fork ID should be a valid UUID: {}",
             fork_id
         );
+    }
+
+    #[test]
+    fn fork_registration_remote_pull_preserves_inherited_model_identity_and_harness() {
+        let info = Info {
+            id: acp::SessionId::new("fork-target"),
+            cwd: "/tmp/fork-target".to_owned(),
+        };
+        let mut summary =
+            crate::session::persistence::Summary::new(&info, acp::ModelId::new("inherited-key"))
+                .unwrap();
+        summary.parent_session_id = Some("source-session".to_owned());
+        summary.catalog_identity = Some(xai_chat_state::CatalogIdentity {
+            model_id: "inherited-key".to_owned(),
+            route: "inherited-route".to_owned(),
+            lineage: xai_chat_state::CatalogResolutionLineage::UniqueRoute,
+            auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
+        });
+        summary.agent_name = Some("codex".to_owned());
+
+        let metadata = fork_registration_metadata(&summary);
+
+        assert_eq!(metadata.model_id.as_deref(), Some("inherited-key"));
+        assert_eq!(
+            metadata
+                .catalog_identity
+                .as_ref()
+                .map(|identity| identity.route.as_str()),
+            Some("inherited-route")
+        );
+        assert_eq!(metadata.agent_name.as_deref(), Some("codex"));
+        assert_eq!(
+            metadata.parent_session_id.as_deref(),
+            Some("source-session")
+        );
+
+        let remote = crate::remote::client::LoadDataResponse {
+            messages: None,
+            session: Some(crate::remote::client::SessionInfo {
+                session_id: "fork-target".to_owned(),
+                title: None,
+                cwd: Some("/tmp/fork-target".to_owned()),
+                status: None,
+                created_at: None,
+                updated_at: None,
+                metadata: Some(serde_json::to_value(metadata).unwrap()),
+            }),
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        crate::remote::pull::hydrate::write_to_dir(tmp.path(), &remote).unwrap();
+        let pulled: crate::session::persistence::Summary =
+            serde_json::from_slice(&std::fs::read(tmp.path().join("summary.json")).unwrap())
+                .unwrap();
+        assert_eq!(pulled.current_model_id.0.as_ref(), "inherited-key");
+        assert_eq!(
+            pulled
+                .catalog_identity
+                .as_ref()
+                .map(|identity| identity.route.as_str()),
+            Some("inherited-route")
+        );
+        assert_eq!(pulled.agent_name.as_deref(), Some("codex"));
     }
 
     #[test]

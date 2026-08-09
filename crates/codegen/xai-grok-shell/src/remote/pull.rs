@@ -65,7 +65,7 @@ pub(crate) mod hydrate {
     }
 
     /// Write all session files to `dir`.
-    pub(super) fn write_to_dir(
+    pub(crate) fn write_to_dir(
         dir: &Path,
         loaded: &LoadDataResponse,
     ) -> Result<usize, BackendError> {

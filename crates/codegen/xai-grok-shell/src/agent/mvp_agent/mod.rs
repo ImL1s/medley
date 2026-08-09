@@ -1221,10 +1221,15 @@ impl ColdSpawnModelSelection {
         &self,
         registry: &SessionRegistry,
         session_id: &acp::SessionId,
+        catalog_identity: Option<xai_chat_state::CatalogIdentity>,
     ) {
         registry.take_unavailable_model(session_id);
         if let Some(model_id) = self.unavailable_model.as_ref() {
-            registry.set_unavailable_model(session_id, model_id.clone());
+            registry.set_unavailable_model_with_identity(
+                session_id,
+                model_id.clone(),
+                catalog_identity,
+            );
         }
     }
 }
@@ -1244,6 +1249,35 @@ pub(crate) fn cold_spawn_fallback_selection(
         model_id: current_only_fallback.unwrap_or_else(|| persisted_model.clone()),
         unavailable_model: Some(persisted_model.clone()),
     }
+}
+
+pub(crate) fn should_reject_unresolved_persisted_identity(
+    models: &IndexMap<String, ModelEntry>,
+    persisted_identity: Option<&xai_chat_state::CatalogIdentity>,
+    reconciled_identity: Option<&xai_chat_state::CatalogIdentity>,
+) -> bool {
+    persisted_identity.is_some() && !models.is_empty() && reconciled_identity.is_none()
+}
+
+pub(crate) fn reconcile_latched_catalog_snapshot(
+    models: &IndexMap<String, ModelEntry>,
+    available: &IndexMap<acp::ModelId, acp::ModelInfo>,
+    identity: &xai_chat_state::CatalogIdentity,
+) -> Option<(acp::ModelId, xai_chat_state::CatalogIdentity, ModelEntry)> {
+    crate::agent::models::reconcile_persisted_catalog_identity(models, identity).and_then(
+        |reconciled| {
+            let model_id = acp::ModelId::new(reconciled.model_id.clone());
+            available
+                .contains_key(&model_id)
+                .then_some(model_id)
+                .and_then(|model_id| {
+                    models
+                        .get(reconciled.model_id.as_str())
+                        .cloned()
+                        .map(|model| (model_id, reconciled, model))
+                })
+        },
+    )
 }
 
 /// Apply the main session's authoritative CLI clamps to a freshly discovered

@@ -436,6 +436,8 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             attach_restore_blocks_exact_key_reuse_and_unique_route_ambiguity -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
+            empty_catalog_keeps_persisted_identity_pending_instead_of_rejecting_load -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
             cold_spawn_reconciled_route_rejects_incompatible_harness -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             issue39_verbatim_fork_tools_intersect_session_admission -- --nocapture
@@ -1002,6 +1004,8 @@ jobs:
             push_pull_resume_preserves_unique_route_across_key_reuse -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             model_metadata_update_keeps_id_and_identity_atomic -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            fork_registration_remote_pull_preserves_inherited_model_identity_and_harness -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             model_switch_interruption_before_intent_rename_ -- --nocapture
           run_nonzero -p xai-grok-shell --lib \

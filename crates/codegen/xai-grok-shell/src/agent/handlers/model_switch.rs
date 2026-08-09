@@ -118,6 +118,20 @@ pub(crate) async fn apply(
     apply_with_load_gate(agent, args, None, None).await
 }
 
+/// Apply a model that was reconciled from a persisted catalog identity.
+///
+/// The caller supplies the entry from the same catalog snapshot used for
+/// reconciliation, preventing a refresh between resolution and commit from
+/// replacing the endpoint or credentials behind a reused catalog key.
+pub(crate) async fn apply_catalog_snapshot(
+    agent: &MvpAgent,
+    args: acp::SetSessionModelRequest,
+    catalog_identity: xai_chat_state::CatalogIdentity,
+    model: config::ModelEntry,
+) -> Result<acp::SetSessionModelResponse, acp::Error> {
+    apply_with_load_gate(agent, args, None, Some((catalog_identity, model))).await
+}
+
 /// Apply the model restored by `session/load` while that load's guard is alive.
 ///
 /// The load owns the marker that normally gates external session requests, so

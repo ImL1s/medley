@@ -1237,7 +1237,11 @@ impl MvpAgent {
                 "Persisted catalog identity no longer resolves safely; blocking prompts"
             );
             self.session_registry
-                .set_unavailable_model(&session_id, persisted_model);
+                .set_unavailable_model_with_identity(
+                    &session_id,
+                    persisted_model,
+                    summary.catalog_identity.clone(),
+                );
             return;
         }
         let is_grok_build = persisted_model.0.starts_with("grok-build");
@@ -1318,7 +1322,11 @@ impl MvpAgent {
                     "Persisted catalog identity no longer resolves and no safe fallback exists; blocking prompts"
                 );
                 self.session_registry
-                    .set_unavailable_model(&session_id, persisted_model);
+                    .set_unavailable_model_with_identity(
+                        &session_id,
+                        persisted_model,
+                        summary.catalog_identity.clone(),
+                    );
                 return;
             };
             tracing::warn!(
@@ -1346,7 +1354,11 @@ impl MvpAgent {
             self.send_model_auto_switched(&session_id, &persisted_model, &empty_id, &reason)
                 .await;
             self.session_registry
-                .set_unavailable_model(&session_id, persisted_model.clone());
+                .set_unavailable_model_with_identity(
+                    &session_id,
+                    persisted_model.clone(),
+                    summary.catalog_identity.clone(),
+                );
             fallback
         };
         tracing::debug!(

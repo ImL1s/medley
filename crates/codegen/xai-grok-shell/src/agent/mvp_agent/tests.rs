@@ -1369,6 +1369,23 @@ fn cold_spawn_restore_preserves_unavailable_latch_without_compatible_fallback() 
 }
 
 #[test]
+fn empty_catalog_keeps_persisted_identity_pending_instead_of_rejecting_load() {
+    let models = indexmap::IndexMap::new();
+    let identity = xai_chat_state::CatalogIdentity {
+        model_id: "pending-key".to_owned(),
+        route: "pending-route".to_owned(),
+        lineage: xai_chat_state::CatalogResolutionLineage::UniqueRoute,
+        auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
+    };
+
+    assert!(!should_reject_unresolved_persisted_identity(
+        &models,
+        Some(&identity),
+        None,
+    ));
+}
+
+#[test]
 fn cold_spawn_current_only_fallback_keeps_persisted_model_latched() {
     let persisted = acp::ModelId::new("persisted-unready");
     let current = acp::ModelId::new("current-compatible-but-not-selectable");
@@ -1392,7 +1409,7 @@ fn cold_spawn_usable_fallback_clears_stale_unavailable_latch() {
         Some(acp::ModelId::new("ready-compatible")),
         None,
     );
-    selection.replace_unavailable_latch(&registry, &session_id);
+    selection.replace_unavailable_latch(&registry, &session_id, None);
 
     assert_eq!(registry.unavailable_model(&session_id), None);
 }
@@ -3646,6 +3663,24 @@ fn attach_restore_blocks_exact_key_reuse_and_unique_route_ambiguity() {
                 agent.session_registry.unavailable_model(&sid),
                 Some(acp::ModelId::new("removed-key")),
                 "{label} must latch instead of selecting any credential"
+            );
+            assert_eq!(
+                agent.session_registry.unavailable_catalog_identity(&sid),
+                summary.catalog_identity,
+                "{label} must retain identity for fail-closed prompt recovery"
+            );
+            assert!(
+                reconcile_latched_catalog_snapshot(
+                    &agent.models_manager.models(),
+                    &agent.models_manager.available(),
+                    agent
+                        .session_registry
+                        .unavailable_catalog_identity(&sid)
+                        .as_ref()
+                        .unwrap(),
+                )
+                .is_none(),
+                "{label} prompt recovery must not accept a reused key or ambiguous route"
             );
             assert!(
                 cmd_rx.try_recv().is_err(),
