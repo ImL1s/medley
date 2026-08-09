@@ -300,6 +300,7 @@ pub enum PersistenceMsg {
             tokio::sync::oneshot::Sender<Result<(), crate::session::storage::AppendUpdateError>>,
     },
     ContentChunk(PersistenceContentChunk),
+    ReplaceSummarySamplingConfig(xai_grok_sampler::SamplerConfig),
     Chat(ConversationItem),
     AppendCwdSwitchAndAck {
         item: ConversationItem,
@@ -2302,6 +2303,15 @@ impl SessionPersistence {
                         &self.info.id.to_string(),
                         &self.info.cwd,
                     );
+                }
+                PersistenceMsg::ReplaceSummarySamplingConfig(config) => {
+                    let model = config.model.clone();
+                    match crate::sampling::Client::new(config) {
+                        Ok(client) => self.summary.replace_sampling_client(client, model),
+                        Err(error) => {
+                            tracing::warn!(%error, "failed to replace session summary sampling config")
+                        }
+                    }
                 }
                 PersistenceMsg::GeneratedTitle(title) => {
                     // Auto-generated titles must never overwrite a title the
