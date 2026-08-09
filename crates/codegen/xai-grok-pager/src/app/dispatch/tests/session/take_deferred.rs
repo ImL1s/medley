@@ -33,6 +33,34 @@ fn models_with_current(supports: bool) -> ModelState {
     models
 }
 
+fn models_with_menu_less_reasoning_current() -> ModelState {
+    let id = acp::ModelId::new(Arc::from("legacy-reasoning"));
+    let info = acp::ModelInfo::new(id.clone(), "Legacy Reasoning".to_string()).meta(
+        serde_json::json!({ "supportsReasoningEffort": true })
+            .as_object()
+            .cloned(),
+    );
+    let mut models = ModelState::default();
+    models.available.insert(id.clone(), info);
+    models.current = Some(id);
+    models
+}
+
+#[test]
+fn deferred_cli_accepts_minimal_for_menu_less_reasoning_model() {
+    let models = models_with_menu_less_reasoning_current();
+    assert_eq!(
+        take_deferred_model_switch(None, &models, Some("minimal")),
+        DeferredSwitchOutcome {
+            switch: Some(switch(
+                models.current.clone().unwrap(),
+                Some(ReasoningEffort::Minimal)
+            )),
+            effort_error: None,
+        }
+    );
+}
+
 #[test]
 fn effort_only_resolves_canonical_token() {
     let models = models_with_current(true);

@@ -760,17 +760,27 @@ impl ModelsManager {
                 .is_some_and(|entry| model_offers_reasoning_effort(&entry.info, effort))
         };
         if !is_valid {
-            let mut current_effort = self.inner.current_reasoning_effort.write();
-            Self::clear_reasoning_effort_if_unchanged(&mut current_effort, effort);
+            self.clear_reasoning_effort_if_selection_unchanged(&current_model_id, effort);
         }
     }
 
-    fn clear_reasoning_effort_if_unchanged(
-        current: &mut Option<ReasoningEffort>,
-        expected: ReasoningEffort,
+    fn clear_reasoning_effort_if_selection_unchanged(
+        &self,
+        expected_model_id: &acp::ModelId,
+        expected_effort: ReasoningEffort,
     ) {
-        if *current == Some(expected) {
-            *current = None;
+        // Keep the model read guard through the conditional effort write. A
+        // concurrent A/high -> B/high switch otherwise defeats an effort-only
+        // CAS because the value is unchanged even though the selection is new.
+        // Model switching never holds the model lock while taking the effort
+        // lock, so this ordering cannot invert that path.
+        let current_model_id = self.inner.current_model_id.read();
+        if *current_model_id != *expected_model_id {
+            return;
+        }
+        let mut current_effort = self.inner.current_reasoning_effort.write();
+        if *current_effort == Some(expected_effort) {
+            *current_effort = None;
         }
     }
 

@@ -851,14 +851,21 @@ fn catalog_refresh_clears_current_effort_removed_from_model_menu() {
 
 #[test]
 fn stale_effort_revalidation_does_not_clear_newer_selection() {
-    let validated = ReasoningEffort::High;
-    let mut current = Some(ReasoningEffort::Low);
-    ModelsManager::clear_reasoning_effort_if_unchanged(&mut current, validated);
+    let mgr = test_manager();
+    let validated_model = mgr.current_model_id();
+    mgr.set_current_reasoning_effort(Some(ReasoningEffort::High));
+
+    // Deterministic interleaving: validation captured A/high, then a switch
+    // committed B/high before the invalid result attempted its conditional
+    // clear. Comparing only the effort would incorrectly clear B's selection.
+    mgr.set_current_model_id(acp::ModelId::new("grok-4"));
+    mgr.set_current_reasoning_effort(Some(ReasoningEffort::High));
+    mgr.clear_reasoning_effort_if_selection_unchanged(&validated_model, ReasoningEffort::High);
 
     assert_eq!(
-        current,
-        Some(ReasoningEffort::Low),
-        "a refresh validating an old snapshot must not clobber a newer model-switch selection"
+        mgr.current_reasoning_effort(),
+        Some(ReasoningEffort::High),
+        "a refresh validating A/high must not clobber a newer B/high selection"
     );
 }
 

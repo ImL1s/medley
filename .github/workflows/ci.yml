@@ -1532,6 +1532,10 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             stale_effort_revalidation_does_not_clear_newer_selection -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
+            menu_less_reasoning_model_accepts_minimal_but_rejects_none_in_effort_command -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            deferred_cli_accepts_minimal_for_menu_less_reasoning_model -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
             codex_catalog_effort_options_are_model_specific -- --nocapture
 
       # #36: restore fd bundling only with a public PI caller and contract.
