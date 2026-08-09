@@ -150,6 +150,11 @@ pub struct ToolRunResult {
     /// Prompt-ready text — layers can append system reminders, etc.
     /// Consumers use this for: model prompt (ConversationItem::tool_result).
     pub prompt_text: String,
+    /// Trusted suffix appended by the tool runner after rendering untrusted
+    /// tool output. Consumers that enforce output budgets must split this
+    /// exact suffix before truncating and reattach it afterwards.
+    #[serde(default)]
+    pub trusted_prompt_suffix: String,
     /// When a meta-tool dispatches to a different underlying tool (for example
     /// `use_tool` → `linear__save_issue`), this carries the effective tool name.
     /// `None` means the requested tool and executed tool are the same.
@@ -2716,9 +2721,38 @@ mod tests {
     fn sample_run_result(output: ToolOutput) -> ToolRunResult {
         ToolRunResult {
             prompt_text: "prompt".into(),
+            trusted_prompt_suffix: String::new(),
             effective_tool_name: None,
             output,
         }
+    }
+
+    #[test]
+    fn tool_result_truncation_policy_proxy_round_trip_preserves_trusted_suffix() {
+        let suffix =
+            "\n\n<system-reminder>\nBackground task completed.\n</system-reminder>".to_owned();
+        let mut run = sample_run_result(ToolOutput::Text(TextOutput::from("tool output")));
+        run.prompt_text = format!("tool output{suffix}");
+        run.trusted_prompt_suffix = suffix.clone();
+
+        let typed = run.into_typed_tool_output(xai_tool_protocol::ToolId::new("text").unwrap());
+        let decoded: ToolRunResult = serde_json::from_value(typed.value).unwrap();
+
+        assert_eq!(decoded.prompt_text, format!("tool output{suffix}"));
+        assert_eq!(decoded.trusted_prompt_suffix, suffix);
+    }
+
+    #[test]
+    fn tool_result_truncation_policy_proxy_accepts_legacy_result_without_trusted_suffix() {
+        let run = sample_run_result(ToolOutput::Text(TextOutput::from("tool output")));
+        let mut value = serde_json::to_value(run).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("trusted_prompt_suffix");
+
+        let decoded: ToolRunResult = serde_json::from_value(value).unwrap();
+        assert!(decoded.trusted_prompt_suffix.is_empty());
     }
     fn bash_tool_id() -> xai_tool_protocol::ToolId {
         xai_tool_protocol::ToolId::new("bash").unwrap()

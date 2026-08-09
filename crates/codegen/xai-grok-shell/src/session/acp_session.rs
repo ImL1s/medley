@@ -1305,6 +1305,16 @@ impl SessionActor {
         self.catalog_model_id.set(id);
         out
     }
+    /// Resolve the active model's client-side tool-result truncation policy.
+    /// This stays a live catalog lookup so model switches cannot retain the
+    /// previous model's policy (#245, #263, #277).
+    fn tool_result_truncation_policy(
+        &self,
+    ) -> Option<xai_grok_sampling_types::TruncationPolicyConfig> {
+        self.models_manager
+            .model_codex_wire(&self.catalog_model_id_str())
+            .and_then(|capabilities| capabilities.truncation_policy)
+    }
     /// Build a hook run context for dispatching hook events.
     fn session_id_string(&self) -> String {
         self.session_info.id.0.to_string()

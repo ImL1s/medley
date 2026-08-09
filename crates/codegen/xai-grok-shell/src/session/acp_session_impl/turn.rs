@@ -1787,11 +1787,13 @@ impl SessionActor {
                 .iter()
                 .filter(|tc| tc.name == STRUCTURED_OUTPUT_TOOL)
             {
-                self.chat_state_handle
-                    .push_tool_result(ConversationItem::tool_result(
+                self.chat_state_handle.push_tool_result(
+                    ConversationItem::tool_result(
                         tc.id.as_ref().to_owned(),
                         "Call StructuredOutput alone, exactly once, after all other tools finish.",
-                    ));
+                    ),
+                    self.tool_result_truncation_policy(),
+                );
             }
             tool_calls.retain(|tc| tc.name != STRUCTURED_OUTPUT_TOOL);
             return StructuredOutputStep::Proceed;
@@ -1802,21 +1804,25 @@ impl SessionActor {
             && *retries < STRUCTURED_OUTPUT_MAX_RETRIES
         {
             *retries += 1;
-            self.chat_state_handle
-                .push_tool_result(ConversationItem::tool_result(
+            self.chat_state_handle.push_tool_result(
+                ConversationItem::tool_result(
                     call_id,
                     format!("{err}\nFix the arguments and call StructuredOutput again."),
-                ));
+                ),
+                self.tool_result_truncation_policy(),
+            );
             return StructuredOutputStep::Retry;
         }
-        self.chat_state_handle
-            .push_tool_result(ConversationItem::tool_result(
+        self.chat_state_handle.push_tool_result(
+            ConversationItem::tool_result(
                 call_id,
                 match &validated {
                     Ok(_) => "Structured output accepted.".to_string(),
                     Err(err) => err.clone(),
                 },
-            ));
+            ),
+            self.tool_result_truncation_policy(),
+        );
         StructuredOutputStep::Complete(validated)
     }
     /// Single shell tool call whose parsed command is `true` (via ToolBridge).
@@ -2516,7 +2522,8 @@ impl SessionActor {
                         self.record_assistant_response(item).await;
                     }
                     _ => {
-                        self.chat_state_handle.push_tool_result(item);
+                        self.chat_state_handle
+                            .push_tool_result(item, self.tool_result_truncation_policy());
                     }
                 }
             }

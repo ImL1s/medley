@@ -83,7 +83,11 @@ pub enum ChatStateCommand {
     PushAssistantResponse { item: ConversationItem },
 
     /// Record a tool result.
-    PushToolResult { item: ConversationItem },
+    PushToolResult {
+        item: ConversationItem,
+        truncation_policy: Option<xai_grok_sampling_types::TruncationPolicyConfig>,
+        trusted_suffix: Option<String>,
+    },
 
     /// Record accumulated token usage from a streaming response.
     RecordTokenUsage { total_tokens: u64 },
@@ -416,6 +420,8 @@ mod tests {
         };
         let _ = ChatStateCommand::PushToolResult {
             item: ConversationItem::tool_result("call-1", "result"),
+            truncation_policy: None,
+            trusted_suffix: None,
         };
         let _ = ChatStateCommand::RecordTokenUsage { total_tokens: 100 };
         let _ = ChatStateCommand::IncrementPromptIndex;

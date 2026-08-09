@@ -92,8 +92,27 @@ impl ChatStateHandle {
     }
 
     /// Record a tool result.
-    pub fn push_tool_result(&self, item: ConversationItem) {
-        let _ = self.cmd_tx.send(ChatStateCommand::PushToolResult { item });
+    pub fn push_tool_result(
+        &self,
+        item: ConversationItem,
+        truncation_policy: Option<xai_grok_sampling_types::TruncationPolicyConfig>,
+    ) {
+        self.push_tool_result_with_trusted_suffix(item, truncation_policy, None);
+    }
+
+    /// Record a tool result whose trusted, internally generated suffix must be
+    /// preserved outside the untrusted tool-output truncation budget.
+    pub fn push_tool_result_with_trusted_suffix(
+        &self,
+        item: ConversationItem,
+        truncation_policy: Option<xai_grok_sampling_types::TruncationPolicyConfig>,
+        trusted_suffix: Option<String>,
+    ) {
+        let _ = self.cmd_tx.send(ChatStateCommand::PushToolResult {
+            item,
+            truncation_policy,
+            trusted_suffix,
+        });
     }
 
     /// Record accumulated token usage.

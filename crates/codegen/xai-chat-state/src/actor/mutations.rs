@@ -1,8 +1,8 @@
 //! Mutation handlers for the ChatStateActor.
 
 use xai_grok_sampling_types::{
-    ContentPart, ConversationItem, DanglingToolCallReason, dedup_duplicate_tool_results,
-    repair_dangling_tool_calls,
+    ContentPart, ConversationItem, DanglingToolCallReason, TruncationMode, TruncationPolicyConfig,
+    dedup_duplicate_tool_results, repair_dangling_tool_calls,
 };
 
 use super::ChatStateActor;
@@ -24,6 +24,28 @@ fn item_kind_str(item: &ConversationItem) -> &'static str {
 }
 
 impl ChatStateActor {
+    /// Apply the active model's catalog policy at the single tool-result
+    /// history boundary, then estimate and persist the bounded item (#263).
+    pub(super) fn push_tool_result(
+        &mut self,
+        mut item: ConversationItem,
+        truncation_policy: Option<TruncationPolicyConfig>,
+        trusted_suffix: Option<String>,
+    ) {
+        if let (ConversationItem::ToolResult(result), Some(policy)) = (&mut item, truncation_policy)
+            && let Some(max_bytes) = truncation_policy_byte_limit(policy)
+        {
+            truncate_tool_result_content(&mut result.content, max_bytes);
+        }
+        if let (ConversationItem::ToolResult(result), Some(suffix)) = (&mut item, trusted_suffix) {
+            let mut combined = String::with_capacity(result.content.len() + suffix.len());
+            combined.push_str(&result.content);
+            combined.push_str(&suffix);
+            result.content = combined.into();
+        }
+        self.push_message(item);
+    }
+
     /// Repair any dangling tool calls in the conversation and persist the fix.
     ///
     /// A "dangling" tool call is an assistant message with tool call IDs that
@@ -561,4 +583,59 @@ impl ChatStateActor {
             &[]
         })
     }
+}
+
+fn truncation_policy_byte_limit(policy: TruncationPolicyConfig) -> Option<usize> {
+    let limit = u64::try_from(policy.limit)
+        .ok()
+        .filter(|limit| *limit > 0)?;
+    // Match the reference client's 1.2x serialization allowance before it
+    // applies the configured policy to tool-result text.
+    let limit_with_serialization_budget =
+        u64::try_from(u128::from(limit).saturating_mul(6).div_ceil(5)).unwrap_or(u64::MAX);
+    let bytes = match policy.mode {
+        TruncationMode::Bytes => limit_with_serialization_budget,
+        // Despite its historical name, estimate_chars is the shared inverse
+        // of the bytes/4 estimator and therefore yields a byte budget.
+        TruncationMode::Tokens => {
+            xai_token_estimation::estimate_chars(limit_with_serialization_budget)
+        }
+    };
+    Some(usize::try_from(bytes).unwrap_or(usize::MAX))
+}
+
+fn truncate_tool_result_content(content: &mut std::sync::Arc<str>, max_bytes: usize) {
+    if content.len() <= max_bytes {
+        return;
+    }
+
+    let full_marker = format!(
+        "\n... tool output truncated: {} bytes total ...\n",
+        content.len()
+    );
+    let marker = if full_marker.len() <= max_bytes {
+        full_marker
+    } else if "[truncated]".len() <= max_bytes {
+        "[truncated]".to_owned()
+    } else {
+        ".".repeat(max_bytes.min(3))
+    };
+    let remaining = max_bytes.saturating_sub(marker.len());
+    let requested_head = remaining.div_ceil(2);
+    let requested_tail = remaining / 2;
+
+    let mut head_end = requested_head;
+    while head_end > 0 && !content.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = content.len().saturating_sub(requested_tail);
+    while tail_start < content.len() && !content.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+
+    let mut truncated = String::with_capacity(max_bytes);
+    truncated.push_str(&content[..head_end]);
+    truncated.push_str(&marker);
+    truncated.push_str(&content[tail_start..]);
+    *content = truncated.into();
 }
