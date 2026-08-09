@@ -427,6 +427,10 @@ struct FinalizedTool {
     /// Retained so live tool-topology changes can rebuild descriptions that
     /// reference another tool through `TemplateRenderer`.
     description_override: Option<String>,
+    /// Whether this definition was finalized by the built-in registry renderer
+    /// and can therefore be safely regenerated after a topology change.
+    /// Runtime MCP definitions are already client-ready and must remain opaque.
+    refresh_on_topology_change: bool,
     /// Effective params (defaults merged with client overrides).
     /// Kept for building `ProposedTool` during reminder evaluation and for
     /// params-aware finalized definition construction.
@@ -1359,6 +1363,7 @@ impl ToolRegistryBuilder {
                 output_converter: Arc::from(entry.output_converter),
                 definition,
                 description_override: tool_config.description_override.clone(),
+                refresh_on_topology_change: true,
                 effective_params,
                 input_schema: entry.input_schema,
                 reverse_params,
@@ -2276,6 +2281,7 @@ impl FinalizedToolset {
             }),
             definition,
             description_override: Some(description),
+            refresh_on_topology_change: false,
             effective_params: serde_json::Value::Object(Default::default()),
             input_schema,
             reverse_params: HashMap::new(),
@@ -2344,7 +2350,11 @@ impl FinalizedToolset {
         tools: &mut [FinalizedTool],
         inactive: &mut HashMap<String, FinalizedTool>,
     ) {
-        for tool in tools.iter_mut().chain(inactive.values_mut()) {
+        for tool in tools
+            .iter_mut()
+            .chain(inactive.values_mut())
+            .filter(|tool| tool.refresh_on_topology_change)
+        {
             let param_map = tool
                 .reverse_params
                 .iter()
@@ -5477,6 +5487,29 @@ mod tests {
         let toolset = builder
             .finalize(config, ctx)
             .expect("finalize should succeed with default grok-build tools");
+        toolset
+            .register_tool(
+                "linear__topology_probe".to_owned(),
+                FakeMcpTool {
+                    id: "linear__topology_probe".to_owned(),
+                    description: "MCP ${{ tools.by_kind.web_search }}".to_owned(),
+                },
+                Some(serde_json::json!({
+                    "type": "object",
+                    "description": "Schema ${{ tools.by_kind.web_search }}",
+                    "properties": {}
+                })),
+            )
+            .expect("register topology probe MCP tool");
+        let mcp_snapshot = || {
+            let definitions = toolset.tool_definitions();
+            let definition = definitions
+                .iter()
+                .find(|definition| definition.function.name == "linear__topology_probe")
+                .expect("topology probe MCP definition");
+            serde_json::to_value(definition).expect("serialize topology probe MCP definition")
+        };
+        let original_mcp_definition = mcp_snapshot();
         let defs = toolset.tool_definitions();
         let task_def = defs
             .iter()
@@ -5496,6 +5529,7 @@ mod tests {
         drop(defs);
 
         assert!(toolset.set_web_search_enabled(true));
+        assert_eq!(mcp_snapshot(), original_mcp_definition);
         let defs = toolset.tool_definitions();
         let desc = defs
             .iter()
@@ -5506,6 +5540,7 @@ mod tests {
         drop(defs);
 
         assert!(toolset.set_web_search_enabled(false));
+        assert_eq!(mcp_snapshot(), original_mcp_definition);
         let defs = toolset.tool_definitions();
         let desc = defs
             .iter()
@@ -5516,6 +5551,7 @@ mod tests {
         drop(defs);
 
         assert!(toolset.set_web_search_enabled(true));
+        assert_eq!(mcp_snapshot(), original_mcp_definition);
         let defs = toolset.tool_definitions();
         let desc = defs
             .iter()

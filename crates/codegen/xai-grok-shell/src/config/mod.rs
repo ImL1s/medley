@@ -1388,7 +1388,32 @@ fn apply_requirements_inner(
         };
     }
     enforce_str!("models", "default", config.models.default);
-    enforce_str!("models", "web_search", config.models.web_search);
+    macro_rules! enforce_auxiliary_model {
+        ($key:expr, $field:expr, $requirement:expr) => {
+            if let Some(val) = req_str(req, "models", $key) {
+                $requirement.pin(val.to_owned(), source.clone());
+                if $field.as_deref() != Some(val) {
+                    $field = Some(val.to_owned());
+                    push(concat!("models.", $key), val.to_owned());
+                }
+            }
+        };
+    }
+    enforce_auxiliary_model!(
+        "web_search",
+        config.models.web_search,
+        config.requirements.web_search_model
+    );
+    enforce_auxiliary_model!(
+        "session_summary",
+        config.models.session_summary,
+        config.requirements.session_summary_model
+    );
+    enforce_auxiliary_model!(
+        "image_description",
+        config.models.image_description,
+        config.requirements.image_description_model
+    );
     enforce_str!("cli", "channel", config.cli.channel);
     enforce_str!("cli", "minimum_version", config.cli.minimum_version);
     enforce_str!("cli", "maximum_version", config.cli.maximum_version);

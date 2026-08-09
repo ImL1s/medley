@@ -3357,13 +3357,13 @@ fn config_layers_system_managed_lowest_priority() {
 #[test]
 fn apply_requirements_value_overrides_user_settings() {
     let raw_config: toml::Value = toml::from_str(
-            "[cli]\nauto_update = true\nchannel = \"beta\"\n\n[features]\ntelemetry = true\nfeedback = true\nlsp_tools = true\nweb_fetch = true\nwrite_file = true\n\n[telemetry]\ntrace_upload = true\n\n[ui]\nyolo = true\n\n[models]\ndefault = \"user-model\"\nweb_search = \"user-ws-model\"\n\n[endpoints]\ncli_chat_proxy_base_url = \"https://user-proxy.example/v1\"\nxai_api_base_url = \"https://user-api.example/v1\"\nmodels_base_url = \"https://user-models.example/v1\"\nmodels_list_url = \"https://user-models.example/v1/models\"\n",
+            "[cli]\nauto_update = true\nchannel = \"beta\"\n\n[features]\ntelemetry = true\nfeedback = true\nlsp_tools = true\nweb_fetch = true\nwrite_file = true\n\n[telemetry]\ntrace_upload = true\n\n[ui]\nyolo = true\n\n[models]\ndefault = \"user-model\"\nweb_search = \"user-ws-model\"\nsession_summary = \"user-summary-model\"\nimage_description = \"user-image-model\"\n\n[endpoints]\ncli_chat_proxy_base_url = \"https://user-proxy.example/v1\"\nxai_api_base_url = \"https://user-api.example/v1\"\nmodels_base_url = \"https://user-models.example/v1\"\nmodels_list_url = \"https://user-models.example/v1/models\"\n",
         )
         .unwrap();
     let mut cfg = crate::agent::config::Config::new_from_toml_cfg(&raw_config).unwrap();
     cfg.default_yolo_mode = true;
     let requirements: toml::Value = toml::from_str(
-            "[cli]\nauto_update = false\nchannel = \"stable\"\n\n[features]\ntelemetry = false\nfeedback = false\nlsp_tools = false\nweb_fetch = false\nwrite_file = false\nremote_fetch = false\n\n[telemetry]\ntrace_upload = false\nmixpanel_enabled = false\nmixpanel_token = \"enterprise-mp-token\"\n\n[ui]\nyolo = false\n\n[models]\ndefault = \"managed-model\"\nweb_search = \"managed-ws-model\"\n\n[endpoints]\ncli_chat_proxy_base_url = \"https://managed-proxy.example/v1\"\nxai_api_base_url = \"https://managed-api.example/v1\"\nmodels_base_url = \"https://managed-models.example/v1\"\nmodels_list_url = \"https://managed-models.example/v1/models\"\ndeployment_key = \"enterprise-deploy-key-should-not-log\"\ntrace_upload_endpoint_url = \"https://s3.custom.example.com\"\ntrace_upload_credentials = '{\"aws_access_key_id\":\"AKTEST\",\"aws_secret_access_key\":\"secret\"}'\n",
+            "[cli]\nauto_update = false\nchannel = \"stable\"\n\n[features]\ntelemetry = false\nfeedback = false\nlsp_tools = false\nweb_fetch = false\nwrite_file = false\nremote_fetch = false\n\n[telemetry]\ntrace_upload = false\nmixpanel_enabled = false\nmixpanel_token = \"enterprise-mp-token\"\n\n[ui]\nyolo = false\n\n[models]\ndefault = \"managed-model\"\nweb_search = \"managed-ws-model\"\nsession_summary = \"managed-summary-model\"\nimage_description = \"managed-image-model\"\n\n[endpoints]\ncli_chat_proxy_base_url = \"https://managed-proxy.example/v1\"\nxai_api_base_url = \"https://managed-api.example/v1\"\nmodels_base_url = \"https://managed-models.example/v1\"\nmodels_list_url = \"https://managed-models.example/v1/models\"\ndeployment_key = \"enterprise-deploy-key-should-not-log\"\ntrace_upload_endpoint_url = \"https://s3.custom.example.com\"\ntrace_upload_credentials = '{\"aws_access_key_id\":\"AKTEST\",\"aws_secret_access_key\":\"secret\"}'\n",
         )
         .unwrap();
     let source = RequirementSource::Requirements {
@@ -3390,6 +3390,26 @@ fn apply_requirements_value_overrides_user_settings() {
     assert!(!cfg.default_yolo_mode);
     assert_eq!(Some("managed-model"), cfg.models.default.as_deref());
     assert_eq!(Some("managed-ws-model"), cfg.models.web_search.as_deref());
+    assert_eq!(
+        Some("managed-summary-model"),
+        cfg.models.session_summary.as_deref()
+    );
+    assert_eq!(
+        Some("managed-image-model"),
+        cfg.models.image_description.as_deref()
+    );
+    assert_eq!(
+        Some("managed-ws-model".to_owned()),
+        cfg.requirements.web_search_model.pinned()
+    );
+    assert_eq!(
+        Some("managed-summary-model".to_owned()),
+        cfg.requirements.session_summary_model.pinned()
+    );
+    assert_eq!(
+        Some("managed-image-model".to_owned()),
+        cfg.requirements.image_description_model.pinned()
+    );
     assert_eq!(Some("stable"), cfg.cli.channel.as_deref());
     assert_eq!(
             Some("https://managed-proxy.example/v1"),
