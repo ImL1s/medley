@@ -547,12 +547,11 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         // Computed after the pending insert, so a non-workflow spawn counts
         // itself; max over launches gives a session's peak concurrency.
         //
-        // `spawn_parent_session_id` is passed in rather than read from the
-        // request, because by this point `reparent_nested_spawn` has already
-        // rewritten `request.parent_session_id` to the *root*. Reading it here
-        // gave a nested child the root's session, and the fork uses this value
-        // to build the child's spawn context -- i.e. its capabilities (#271).
-        let session_running = self.session_running_count(&spawn_parent_session_id);
+        // Concurrency belongs to the lifecycle root, so nested launches must
+        // count against the reparented request. `spawn_parent_session_id`
+        // remains separate because the runner uses the immediate spawner to
+        // build the child's capability context (#271).
+        let session_running = self.session_running_count(&request.parent_session_id);
         let reporter = ChildReporter {
             subagent_id: id.clone(),
             tx: self.internal_tx.clone(),

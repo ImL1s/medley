@@ -1302,6 +1302,10 @@ async fn loop_tracking_covers_pending_active_and_nested_reparenting() {
     let observed_outer = harness.requests.recv().await.unwrap();
     assert_eq!(observed_outer.request.parent_session_id, "parent");
     assert_eq!(observed_outer.spawn_parent_session_id, "parent");
+    assert_eq!(
+        harness.queue_waits.recv().await,
+        Some(("outer".to_owned(), None, 1))
+    );
     assert!(loop_unit_active(&harness.backend, "loop-task").await);
 
     let _ = harness.start.send(());
@@ -1322,6 +1326,11 @@ async fn loop_tracking_covers_pending_active_and_nested_reparenting() {
     let observed_nested = harness.requests.recv().await.unwrap();
     assert_eq!(observed_nested.request.parent_session_id, "parent");
     assert_eq!(observed_nested.spawn_parent_session_id, "outer");
+    assert_eq!(
+        harness.queue_waits.recv().await,
+        Some(("nested".to_owned(), None, 2)),
+        "nested launch telemetry counts the lifecycle root while capability context uses the immediate parent"
+    );
     assert!(!observed_nested.request.surface_completion);
     assert_eq!(
         observed_nested
@@ -1356,6 +1365,10 @@ async fn queued_nested_spawn_keeps_immediate_parent_for_capability_context() {
     let observed_outer = harness.requests.recv().await.expect("outer started");
     assert_eq!(observed_outer.request.parent_session_id, "parent");
     assert_eq!(observed_outer.spawn_parent_session_id, "parent");
+    assert_eq!(
+        harness.queue_waits.recv().await,
+        Some(("outer".to_owned(), None, 1))
+    );
     assert_eq!(harness.started.recv().await.as_deref(), Some("outer"));
 
     let mut nested_request = request("nested-queued", true);
@@ -1385,6 +1398,13 @@ async fn queued_nested_spawn_keeps_immediate_parent_for_capability_context() {
     assert_eq!(
         observed_nested.spawn_parent_session_id, "outer",
         "capability inheritance must remain bound to the immediate spawner after dequeue"
+    );
+    let (id, queued_for, session_running) = harness.queue_waits.recv().await.expect("run metrics");
+    assert_eq!(id, "nested-queued");
+    assert!(queued_for.is_some());
+    assert_eq!(
+        session_running, 1,
+        "the dequeued nested child counts itself against the lifecycle root"
     );
     assert_eq!(
         harness.started.recv().await.as_deref(),
