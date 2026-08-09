@@ -1827,20 +1827,66 @@ async fn read_parent_sampling_config_keeps_auto_catalog_id_with_routing_slug() {
 }
 #[tokio::test]
 async fn read_parent_sampling_config_keeps_auto_when_catalog_has_slug_key_only() {
-    let mut models = indexmap::IndexMap::new();
-    models.insert("grok-4.5".to_string(), test_model_entry("grok-4.5"));
-    let ctx = ctx_with_parent_chat_state("auto", "grok-4.5", "auto", models);
-    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
-    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
-    snapshot.catalog_identity = Some(test_catalog_identity(
-        "auto",
-        "grok-4.5",
-        xai_chat_state::CatalogResolutionLineage::UniqueRoute,
-    ));
-    chat.restore_snapshot(snapshot);
-    let (config, model_id) = read_parent_sampling_config(&ctx).await;
-    assert_eq!(config.model, "grok-4.5");
-    assert_eq!(model_id.0.as_ref(), "grok-4.5");
+    use xai_grok_sampler::AuthScheme;
+
+    for (committed_auth, remapped_auth, expected_identity_auth) in [
+        (
+            xai_chat_state::CatalogAuthScheme::Bearer,
+            AuthScheme::None,
+            xai_chat_state::CatalogAuthScheme::None,
+        ),
+        (
+            xai_chat_state::CatalogAuthScheme::None,
+            AuthScheme::Bearer,
+            xai_chat_state::CatalogAuthScheme::Bearer,
+        ),
+    ] {
+        let mut models = indexmap::IndexMap::new();
+        let mut remapped = test_model_entry("grok-4.5");
+        remapped.info.auth_scheme = remapped_auth;
+        models.insert("grok-4.5".to_string(), remapped);
+        let ctx = ctx_with_parent_chat_state("auto", "grok-4.5", "auto", models);
+        let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+        let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+        snapshot.catalog_identity = Some(xai_chat_state::CatalogIdentity {
+            model_id: "auto".to_string(),
+            route: "grok-4.5".to_string(),
+            lineage: xai_chat_state::CatalogResolutionLineage::UniqueRoute,
+            auth_scheme: Some(committed_auth),
+        });
+        chat.restore_snapshot(snapshot);
+        let prepared = read_parent_prepared_model(&ctx).await;
+        assert_eq!(prepared.sampling_config.model, "grok-4.5");
+        assert_eq!(prepared.model_id.0.as_ref(), "grok-4.5");
+        assert_eq!(
+            prepared.catalog_identity.auth_scheme,
+            Some(expected_identity_auth),
+            "a UniqueRoute remap must commit the remapped entry's auth with its new id"
+        );
+
+        let mut nested = ctx_with_parent_chat_state(
+            "grok-4.5",
+            "grok-4.5",
+            "grok-4.5",
+            indexmap::IndexMap::new(),
+        );
+        nested.sampling_config.auth_scheme = match remapped_auth {
+            AuthScheme::Bearer => AuthScheme::None,
+            AuthScheme::None => AuthScheme::Bearer,
+            AuthScheme::XApiKey => unreachable!("table excludes x-api-key"),
+        };
+        let nested_chat = nested.parent_chat_state.as_ref().expect("nested chat state");
+        let mut nested_snapshot = nested_chat.snapshot().await.expect("nested chat snapshot");
+        nested_snapshot.catalog_identity = Some(prepared.catalog_identity);
+        nested_chat.restore_snapshot(nested_snapshot);
+
+        let nested_prepared = read_parent_prepared_model(&nested).await;
+        assert_eq!(
+            nested_prepared.sampling_config.auth_scheme,
+            remapped_auth,
+            "a grandchild catalog miss must retain the auth committed by the remap"
+        );
+    }
 }
 #[tokio::test]
 async fn read_parent_sampling_config_fallback_uses_session_model_id() {
@@ -2181,6 +2227,41 @@ async fn read_parent_sampling_config_fallback_no_resolver_for_api_key_method() {
     ctx.sampling_config.base_url = "https://api.x.ai/v1".to_string();
     let (config, _) = read_parent_sampling_config(&ctx).await;
     assert!(config.bearer_resolver.is_none());
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_fallback_catalog_miss_keeps_bound_byok_source_terminal() {
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.parent_chat_state = None;
+    ctx.auth_method_id = acp::AuthMethodId::new(
+        crate::agent::auth_method::CACHED_TOKEN_AUTH_METHOD_ID,
+    );
+    ctx.auth = Some(crate::auth::GrokAuth {
+        key: "session-jwt".to_string(),
+        ..crate::auth::GrokAuth::test_default()
+    });
+    ctx.sampling_config_model_id = acp::ModelId::new("removed-byok-entry");
+    ctx.sampling_config.model = "removed-byok-route".to_string();
+    ctx.sampling_config.base_url = "https://api.x.ai/v1".to_string();
+    ctx.sampling_config.api_key = Some("provider-model-key".to_string());
+    ctx.sampling_config.credential_source = Some(
+        xai_grok_sampler::CredentialSource::AuthProvider {
+            name: "removed-provider".to_string(),
+        },
+    );
+    ctx.available_models.clear();
+
+    let prepared = read_parent_prepared_model(&ctx).await;
+
+    assert_eq!(prepared.model_id.0.as_ref(), "removed-byok-entry");
+    assert_eq!(
+        prepared.sampling_config.api_key.as_deref(),
+        Some("provider-model-key")
+    );
+    assert!(
+        prepared.sampling_config.bearer_resolver.is_none(),
+        "actor-unavailable fallback must not replace bound provider auth with the session resolver"
+    );
 }
 /// The override path wires the resolver for a session key regardless of
 /// freshness. Hard-expired (the post-sleep 401 window) is the case that
@@ -2613,6 +2694,44 @@ async fn read_parent_sampling_config_missing_committed_id_ignores_same_route_sur
 }
 
 #[tokio::test]
+async fn read_parent_sampling_config_legacy_committed_identity_missing_auth_fails_closed() {
+    use xai_grok_sampler::AuthScheme;
+
+    let mut ctx = ctx_with_parent_chat_state(
+        "startup-bearer-entry",
+        "legacy-removed-route",
+        "startup-bearer-entry",
+        indexmap::IndexMap::new(),
+    );
+    ctx.sampling_config.auth_scheme = AuthScheme::Bearer;
+    ctx.sampling_config.api_key = Some("startup-bearer-key".to_string());
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    chat.update_credentials(xai_chat_state::Credentials::bound(
+        Some("legacy-committed-key".to_string()),
+        xai_chat_state::AuthType::ApiKey,
+        xai_grok_sampler::CredentialSource::ModelApiKey,
+    ));
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.catalog_identity = Some(xai_chat_state::CatalogIdentity {
+        model_id: "legacy-removed-entry".to_string(),
+        route: "legacy-removed-route".to_string(),
+        lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+        auth_scheme: None,
+    });
+    chat.restore_snapshot(snapshot);
+
+    let prepared = read_parent_prepared_model(&ctx).await;
+
+    assert_eq!(prepared.model_id.0.as_ref(), "legacy-removed-entry");
+    assert_eq!(prepared.sampling_config.auth_scheme, AuthScheme::None);
+    assert!(
+        prepared.sampling_config.api_key.is_none(),
+        "a legacy committed identity with unknown auth must not borrow startup credentials"
+    );
+    assert!(prepared.sampling_config.bearer_resolver.is_none());
+}
+
+#[tokio::test]
 async fn read_parent_sampling_config_removed_switched_bearer_ignores_none_startup_auth() {
     use xai_grok_sampler::AuthScheme;
 
@@ -2648,6 +2767,61 @@ async fn read_parent_sampling_config_removed_switched_bearer_ignores_none_startu
     assert_eq!(
         prepared.sampling_config.api_key.as_deref(),
         Some("switched-live-bearer")
+    );
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_removed_switched_byok_never_attaches_session_resolver() {
+    use xai_grok_sampler::AuthScheme;
+
+    let mut ctx = ctx_with_parent_chat_state(
+        "startup-session-entry",
+        "switched-byok-route",
+        "startup-session-entry",
+        indexmap::IndexMap::new(),
+    );
+    ctx.auth_method_id = acp::AuthMethodId::new(
+        crate::agent::auth_method::CACHED_TOKEN_AUTH_METHOD_ID,
+    );
+    ctx.auth = Some(crate::auth::GrokAuth {
+        key: "startup-session-token".to_string(),
+        ..crate::auth::GrokAuth::test_default()
+    });
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut live_config = chat
+        .get_sampling_config()
+        .await
+        .expect("test parent has sampling config");
+    live_config.base_url = "https://api.x.ai/v1".to_string();
+    chat.update_sampling_config(live_config);
+    chat.update_credentials(xai_chat_state::Credentials::bound(
+        Some("switched-model-key".to_string()),
+        xai_chat_state::AuthType::ApiKey,
+        xai_grok_sampler::CredentialSource::ModelApiKey,
+    ));
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.catalog_identity = Some(xai_chat_state::CatalogIdentity {
+        model_id: "removed-byok-entry".to_string(),
+        route: "switched-byok-route".to_string(),
+        lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+        auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
+    });
+    chat.restore_snapshot(snapshot);
+
+    let prepared = read_parent_prepared_model(&ctx).await;
+
+    assert_eq!(prepared.model_id.0.as_ref(), "removed-byok-entry");
+    assert_eq!(
+        prepared.sampling_config.api_key.as_deref(),
+        Some("switched-model-key")
+    );
+    assert_eq!(
+        prepared.sampling_config.credential_source,
+        Some(xai_grok_sampler::CredentialSource::ModelApiKey)
+    );
+    assert!(
+        prepared.sampling_config.bearer_resolver.is_none(),
+        "bound model-key provenance must remain terminal after its catalog entry disappears"
     );
 }
 

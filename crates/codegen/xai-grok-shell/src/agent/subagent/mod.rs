@@ -809,14 +809,22 @@ fn session_bearer_resolver(
     credential_source: Option<&xai_grok_sampler::CredentialSource>,
 ) -> Option<xai_grok_sampler::SharedBearerResolver> {
     use crate::agent::auth_method;
-    // #110: a credential header the user declared is terminal. Attaching a
-    // session resolver on top of one makes `SamplingClient::post` strip the
-    // header and send under the xAI session instead. The check lives here, in
-    // the one function every attach path goes through, rather than at each
-    // call site -- three of them had to be found one at a time by review.
+    // #110 / #136: a credential the user or model declared is terminal.
+    // Attaching a session resolver on top of one makes `SamplingClient::post`
+    // strip the retained key and send under the xAI session instead. The check
+    // lives here, in the one function every attach path goes through, rather
+    // than at each call site -- three of them had to be found one at a time by
+    // review. In particular, the bound `ModelApiKey` provenance remains
+    // authoritative if a catalog refresh removes the committed model and its
+    // BYOK classification can no longer be looked up.
     if matches!(
         credential_source,
-        Some(xai_grok_sampler::CredentialSource::ExplicitHeader { .. })
+        Some(
+            xai_grok_sampler::CredentialSource::ExplicitHeader { .. }
+                | xai_grok_sampler::CredentialSource::ModelApiKey
+                | xai_grok_sampler::CredentialSource::EnvKey { .. }
+                | xai_grok_sampler::CredentialSource::AuthProvider { .. }
+        )
     ) {
         return None;
     }
@@ -931,7 +939,18 @@ async fn read_parent_prepared_model(ctx: &SubagentSpawnContext) -> PreparedSubag
                         .and_then(|identity| identity.auth_scheme)
                         .map(sampler_auth_scheme)
                 })
-                .unwrap_or(ctx.sampling_config.auth_scheme);
+                .unwrap_or_else(|| {
+                    if catalog_identity.is_some() {
+                        // A legacy persisted identity predates the committed
+                        // auth field. It still identifies a model switch, so
+                        // borrowing the process-startup model's auth would
+                        // cross model boundaries. Fail closed until the exact
+                        // entry is available again.
+                        xai_grok_sampler::AuthScheme::None
+                    } else {
+                        ctx.sampling_config.auth_scheme
+                    }
+                });
             let inherited_base_url = cfg.base_url.clone();
             let strip_guard = ctx.would_strip_fallback_key(creds.api_key());
             // #110 / #136 / #180: provenance comes from parent `Credentials`
@@ -1060,6 +1079,7 @@ async fn read_parent_prepared_model(ctx: &SubagentSpawnContext) -> PreparedSubag
                 });
             if allow_missing_preferred_remap {
                 resolved_identity.model_id = model_id.0.to_string();
+                resolved_identity.auth_scheme = Some(catalog_auth_scheme(auth_scheme));
             }
             return PreparedSubagentModel {
                 sampling_config: inherited,
