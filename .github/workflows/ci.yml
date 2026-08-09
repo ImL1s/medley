@@ -789,6 +789,8 @@ jobs:
             agent::auth_method -- --nocapture
           cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
             config_model_override_parse -- --nocapture
+          cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
+            model_overrides_ -- --nocapture
           # #13: env_key trim/validate/dedupe + path-specific invalid-name warnings.
           # Unique prefixes so run_nonzero proves the new tests are selected.
           run_nonzero() {
