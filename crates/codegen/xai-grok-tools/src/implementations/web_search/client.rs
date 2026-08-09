@@ -712,11 +712,14 @@ impl CodexSseDecoder {
                 if response.status != rs::Status::Completed {
                     return Err(invalid_codex_stream());
                 }
-                if response.output.is_empty() && !self.done_output_items.is_empty() {
-                    response.output = std::mem::take(&mut self.done_output_items)
-                        .into_values()
-                        .collect();
-                }
+                let mut output_items = response
+                    .output
+                    .drain(..)
+                    .enumerate()
+                    .map(|(index, item)| (index as u32, item))
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                output_items.append(&mut self.done_output_items);
+                response.output = output_items.into_values().collect();
                 Ok(Some(response))
             }
             Some("response.failed") => {
@@ -755,6 +758,7 @@ fn extract_annotation_pairs(response: &rs::Response) -> Vec<(String, String)> {
                         if let rs::Annotation::UrlCitation(url_citation) = annotation
                             && let Ok(json) = serde_json::to_value(url_citation)
                             && let Some(url) = json.get("url").and_then(|v| v.as_str())
+                            && !url.is_empty()
                         {
                             let title = json
                                 .get("title")
@@ -783,14 +787,17 @@ fn extract_web_search_source_pairs(response: &rs::Response) -> Vec<(String, Stri
         let rs::OutputItem::WebSearchCall(call) = output_item else {
             continue;
         };
-        if let rs::WebSearchToolCallAction::Search(search) = &call.action
+        if call.status == rs::WebSearchToolCallStatus::Completed
+            && let rs::WebSearchToolCallAction::Search(search) = &call.action
             && let Some(sources) = &search.sources
         {
             pairs.extend(
                 sources
                     .iter()
                     .filter(|source| {
-                        source.url.starts_with("https://") || source.url.starts_with("http://")
+                        url::Url::parse(&source.url).is_ok_and(|url| {
+                            matches!(url.scheme(), "http" | "https") && url.host().is_some()
+                        })
                     })
                     .map(|source| (String::new(), source.url.clone())),
             );
@@ -1384,6 +1391,49 @@ mod tests {
         search_sse_from_response(successful_search_response(text))
     }
 
+    fn partial_terminal_search_sse() -> String {
+        let terminal_item =
+            successful_search_response("stale terminal result")["output"][0].clone();
+        let completed_item =
+            successful_search_response("authoritative streamed result")["output"][0].clone();
+        let search_item = serde_json::json!({
+            "type": "web_search_call",
+            "id": "ws_reconciled",
+            "status": "completed",
+            "action": {
+                "type": "search",
+                "query": "query",
+                "sources": [{"type": "url", "url": "https://example.com/reconciled"}]
+            }
+        });
+        let terminal = serde_json::json!({
+            "id": "resp_test",
+            "object": "response",
+            "created_at": 1234567890,
+            "status": "completed",
+            "model": "test-model",
+            "output": [terminal_item]
+        });
+        let done_one = serde_json::json!({
+            "type": "response.output_item.done",
+            "sequence_number": 1,
+            "output_index": 1,
+            "item": completed_item,
+        });
+        let done_zero = serde_json::json!({
+            "type": "response.output_item.done",
+            "sequence_number": 2,
+            "output_index": 0,
+            "item": search_item,
+        });
+        let completed = serde_json::json!({
+            "type": "response.completed",
+            "sequence_number": 3,
+            "response": terminal,
+        });
+        format!("data: {done_one}\r\n\r\ndata: {done_zero}\r\n\r\ndata: {completed}\r\n\r\n")
+    }
+
     #[test]
     fn codex_sse_backfills_done_items_from_empty_completed_terminal() {
         let response =
@@ -1391,6 +1441,83 @@ mod tests {
                 .expect("valid Codex SSE should decode");
         assert_eq!(response.output_text().as_deref(), Some("streamed result"));
         assert_eq!(response.output.len(), 1);
+    }
+
+    #[test]
+    fn codex_sse_reconciliation_retains_terminal_only_indices() {
+        let item = |text| successful_search_response(text)["output"][0].clone();
+        let terminal = serde_json::json!({
+            "id": "resp_test",
+            "object": "response",
+            "created_at": 1234567890,
+            "status": "completed",
+            "model": "test-model",
+            "output": [item("stale zero"), item("terminal-only one"), item("stale two")]
+        });
+        let done_two = serde_json::json!({
+            "type": "response.output_item.done",
+            "sequence_number": 1,
+            "output_index": 2,
+            "item": item("done two"),
+        });
+        let done_zero = serde_json::json!({
+            "type": "response.output_item.done",
+            "sequence_number": 2,
+            "output_index": 0,
+            "item": item("done zero"),
+        });
+        let completed = serde_json::json!({
+            "type": "response.completed",
+            "sequence_number": 3,
+            "response": terminal,
+        });
+        let body = format!("data: {done_two}\n\ndata: {done_zero}\n\ndata: {completed}\n\n");
+
+        let response = decode_codex_sse_response(body.as_bytes()).unwrap();
+        let texts = response
+            .output
+            .iter()
+            .map(|item| {
+                let rs::OutputItem::Message(message) = item else {
+                    panic!("expected output message");
+                };
+                let rs::OutputMessageContent::OutputText(text) = &message.content[0] else {
+                    panic!("expected output text");
+                };
+                text.text.clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["done zero", "terminal-only one", "done two"]);
+    }
+
+    #[tokio::test]
+    async fn codex_web_search_reconciles_partial_terminal_output_for_both_entry_points() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(partial_terminal_search_sse()),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = WebSearchClient::new(&codex_config(&server.uri()), None).unwrap();
+
+        let (content, citations) = client.search("query", None).await.unwrap();
+        assert_eq!(content, "authoritative streamed result");
+        assert_eq!(citations, vec!["https://example.com/reconciled"]);
+
+        let (content, citation_pairs) = client.search_with_titles("query", None).await.unwrap();
+        assert_eq!(content, "authoritative streamed result");
+        assert_eq!(
+            citation_pairs,
+            vec![(String::new(), "https://example.com/reconciled".to_string())]
+        );
     }
 
     #[test]
@@ -1657,6 +1784,13 @@ mod tests {
                 }
             }),
         );
+        response["output"][1]["content"][0]["annotations"] = serde_json::json!([{
+            "type": "url_citation",
+            "url": "",
+            "title": "Empty annotation must not suppress fallback",
+            "start_index": 0,
+            "end_index": 0
+        }]);
         Mock::given(method("POST"))
             .and(path("/responses"))
             .respond_with(
@@ -1714,6 +1848,56 @@ mod tests {
         assert_eq!(citations.len(), 8);
         assert_eq!(citations.first().unwrap(), "https://example.com/source-0");
         assert_eq!(citations.last().unwrap(), "https://example.com/source-7");
+    }
+
+    #[test]
+    fn codex_web_search_source_fallback_requires_completed_search_and_valid_http_url() {
+        let mut response = successful_search_response("structured fallback");
+        let output = response["output"].as_array_mut().unwrap();
+        for (id, status, url) in [
+            ("completed_https", "completed", "https://example.com/https"),
+            ("completed_http", "completed", "http://example.com/http"),
+            ("searching", "searching", "https://example.com/searching"),
+            ("failed", "failed", "https://example.com/failed"),
+            ("missing_host", "completed", "https://"),
+            ("malformed", "completed", "http://[invalid"),
+            ("non_http", "completed", "ftp://example.com/file"),
+        ] {
+            output.insert(
+                0,
+                serde_json::json!({
+                    "type": "web_search_call",
+                    "id": id,
+                    "status": status,
+                    "action": {
+                        "type": "search",
+                        "query": "query",
+                        "sources": [{"type": "url", "url": url}]
+                    }
+                }),
+            );
+        }
+        output.insert(
+            0,
+            serde_json::json!({
+                "type": "web_search_call",
+                "id": "completed_open_page",
+                "status": "completed",
+                "action": {
+                    "type": "open_page",
+                    "url": "https://example.com/opened"
+                }
+            }),
+        );
+
+        let citations = extract_citations(&response_from_json(response));
+        assert_eq!(
+            citations,
+            vec![
+                "http://example.com/http".to_string(),
+                "https://example.com/https".to_string()
+            ]
+        );
     }
 
     #[tokio::test]
