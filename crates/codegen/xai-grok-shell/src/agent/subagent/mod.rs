@@ -994,6 +994,14 @@ async fn read_parent_sampling_config(
         })),
     );
     let mut fallback = ctx.sampling_config.clone();
+    let fallback_model_id = if ctx
+        .models_manager
+        .model_id_routes_to(ctx.sampling_config_model_id.0.as_ref(), &fallback.model)
+    {
+        ctx.sampling_config_model_id.clone()
+    } else {
+        acp::ModelId::new(fallback.model.clone())
+    };
     if fallback.auth_scheme == xai_grok_sampler::AuthScheme::None {
         fallback.api_key = None;
         fallback.bearer_resolver = None;
@@ -1009,22 +1017,29 @@ async fn read_parent_sampling_config(
             )
         };
     }
-    fallback.supports_backend_search = ctx
+    if ctx
         .models_manager
-        .model_supports_backend_search(ctx.sampling_config_model_id.0.as_ref());
-    fallback.compactions_remaining = ctx
-        .models_manager
-        .model_compactions_remaining(ctx.sampling_config_model_id.0.as_ref());
-    fallback.compaction_at_tokens = ctx
-        .models_manager
-        .model_compaction_at_tokens(ctx.sampling_config_model_id.0.as_ref());
+        .model_in_catalog(fallback_model_id.0.as_ref())
+    {
+        fallback.supports_backend_search = ctx
+            .models_manager
+            .model_supports_backend_search(fallback_model_id.0.as_ref());
+        fallback.compactions_remaining = ctx
+            .models_manager
+            .model_compactions_remaining(fallback_model_id.0.as_ref());
+        fallback.compaction_at_tokens = ctx
+            .models_manager
+            .model_compaction_at_tokens(fallback_model_id.0.as_ref());
+        fallback.codex_wire = ctx
+            .models_manager
+            .model_codex_wire(fallback_model_id.0.as_ref());
+    }
     // The three lines above already re-resolve catalog facts here;
     // `codex_wire` is one too, and cloning the parent's would reintroduce
     // #277 on the path taken whenever the parent's chat-state actor is
     // unavailable — which `try_build_subagent_spawn_context` does not bail
     // on, so a nested child outliving its parent lands here for real.
-    fallback.codex_wire = subagent_codex_wire(ctx, ctx.sampling_config_model_id.0.as_ref());
-    (fallback, ctx.sampling_config_model_id.clone())
+    (fallback, fallback_model_id)
 }
 
 /// Wire capabilities for the subagent's **own** model.

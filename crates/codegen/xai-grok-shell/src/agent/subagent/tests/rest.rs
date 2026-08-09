@@ -1877,6 +1877,41 @@ async fn read_parent_sampling_config_fallback_binds_caps_to_startup_model() {
     assert_eq!(config.model, "startup-routing-model");
     assert_eq!(config.codex_wire, Some(startup_caps));
 }
+
+#[tokio::test]
+async fn read_parent_sampling_config_fallback_reused_key_keeps_baseline_wire() {
+    let baseline_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let replacement_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut replacement = test_model_entry("replacement-routing-model");
+    replacement.info.codex_wire = Some(replacement_caps);
+    let mut models = indexmap::IndexMap::new();
+    models.insert("auto".to_string(), replacement);
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.parent_chat_state = None;
+    ctx.model_id = acp::ModelId::new("auto");
+    ctx.sampling_config_model_id = acp::ModelId::new("auto");
+    ctx.sampling_config.model = "old-routing-model".to_string();
+    ctx.sampling_config.codex_wire = Some(baseline_caps.clone());
+    ctx.models_manager = crate::agent::models::ModelsManager::new(
+        None,
+        models,
+        acp::ModelId::new("auto"),
+        ctx.auth_manager.clone(),
+        crate::agent::config::Config::default(),
+    );
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "old-routing-model");
+    assert_eq!(config.model, "old-routing-model");
+    assert_eq!(config.codex_wire, Some(baseline_caps));
+}
 #[tokio::test]
 async fn read_parent_sampling_config_ignores_global_default() {
     let mut models = indexmap::IndexMap::new();
