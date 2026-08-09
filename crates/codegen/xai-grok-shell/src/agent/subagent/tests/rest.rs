@@ -2626,6 +2626,35 @@ async fn read_parent_sampling_config_present_none_never_inherits_startup_model_w
     );
 }
 
+#[tokio::test]
+async fn read_parent_sampling_config_same_entry_none_overrides_stale_baseline_wire() {
+    let stale_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut models = indexmap::IndexMap::new();
+    models.insert(
+        "same-catalog-entry".to_string(),
+        test_model_entry("same-routing-model"),
+    );
+    let mut ctx = ctx_with_parent_chat_state(
+        "same-catalog-entry",
+        "same-routing-model",
+        "same-catalog-entry",
+        models,
+    );
+    ctx.sampling_config.codex_wire = Some(stale_caps);
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.catalog_model_id = Some("same-catalog-entry".to_string());
+    chat.restore_snapshot(snapshot);
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "same-catalog-entry");
+    assert_eq!(config.codex_wire, None);
+}
+
 /// The actor commits a switch before the outer session handle. A spawn in
 /// that window must use the model identity from the live actor snapshot for
 /// both routing and wire capabilities.

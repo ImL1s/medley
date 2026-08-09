@@ -951,16 +951,16 @@ async fn read_parent_sampling_config(
                     }),
                 compactions_remaining: capabilities
                     .as_ref()
-                    .and_then(|facts| facts.compactions_remaining)
-                    .or_else(|| {
+                    .map(|facts| facts.compactions_remaining)
+                    .unwrap_or_else(|| {
                         baseline_matches_live
                             .then_some(ctx.sampling_config.compactions_remaining)
                             .flatten()
                     }),
                 compaction_at_tokens: capabilities
                     .as_ref()
-                    .and_then(|facts| facts.compaction_at_tokens)
-                    .or_else(|| {
+                    .map(|facts| facts.compaction_at_tokens)
+                    .unwrap_or_else(|| {
                         baseline_matches_live
                             .then_some(ctx.sampling_config.compaction_at_tokens)
                             .flatten()
@@ -973,8 +973,8 @@ async fn read_parent_sampling_config(
                 // parent is running (#277).
                 codex_wire: capabilities
                     .as_ref()
-                    .and_then(|facts| facts.codex_wire.clone())
-                    .or_else(|| {
+                    .map(|facts| facts.codex_wire.clone())
+                    .unwrap_or_else(|| {
                         baseline_matches_live
                             .then(|| ctx.sampling_config.codex_wire.clone())
                             .flatten()
