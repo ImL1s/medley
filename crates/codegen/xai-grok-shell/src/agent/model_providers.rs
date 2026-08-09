@@ -56,18 +56,23 @@ struct CodexCatalogCredential {
     source: xai_grok_sampler::CredentialSource,
 }
 
+struct CodexCatalogCacheIdentity {
+    account_id: Option<String>,
+    chatgpt_account_is_fedramp: bool,
+}
+
 fn codex_catalog_cache_path(
     home: &std::path::Path,
-    credential: &CodexCatalogCredential,
+    identity: &CodexCatalogCacheIdentity,
 ) -> Option<std::path::PathBuf> {
-    let account_id = credential.account_id.as_deref()?;
+    let account_id = identity.account_id.as_deref()?;
     // The filename is stable for one account and origin, but never exposes the
     // raw account id. FedRAMP is part of the identity boundary as well: the
     // same account label must not bridge those two catalog authorities.
     let identity = format!(
         "v1\0{}\0{}\0{}",
         crate::auth::openai_codex::CODEX_API_BASE_URL,
-        credential.chatgpt_account_is_fedramp,
+        identity.chatgpt_account_is_fedramp,
         account_id
     );
     let key = blake3::hash(identity.as_bytes()).to_hex();
@@ -230,8 +235,9 @@ fn codex_catalog_credential_source_is_valid(source: &xai_grok_sampler::Credentia
     )
 }
 
-fn codex_catalog_credential() -> Option<CodexCatalogCredential> {
-    let snapshot = crate::auth::openai_codex::load_snapshot(&crate::util::grok_home::grok_home())?;
+fn codex_catalog_credential_from_snapshot(
+    snapshot: crate::auth::ProviderCredentialSnapshot,
+) -> Option<CodexCatalogCredential> {
     let access_token = snapshot.access_token.trim();
     if access_token.is_empty() {
         return None;
@@ -250,6 +256,34 @@ fn codex_catalog_credential() -> Option<CodexCatalogCredential> {
             name: OPENAI_CODEX_PROVIDER_ID.to_owned(),
         },
     })
+}
+
+fn codex_catalog_access_from_manager(
+    manager: &crate::auth::AuthManager,
+) -> Option<(CodexCatalogCacheIdentity, Option<CodexCatalogCredential>)> {
+    // Retain the verified account boundary even when the bearer has entered
+    // the refresh window or expired. It is safe for cache lookup only; the
+    // live request below still requires credential_snapshot/current().
+    let retained = manager.current_or_expired()?;
+    let identity = CodexCatalogCacheIdentity {
+        account_id: retained
+            .account_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned),
+        chatgpt_account_is_fedramp: retained.chatgpt_account_is_fedramp,
+    };
+    let live = crate::auth::openai_codex::credential_snapshot(manager)
+        .and_then(codex_catalog_credential_from_snapshot);
+    Some((identity, live))
+}
+
+fn codex_catalog_access(
+    home: &std::path::Path,
+) -> Option<(CodexCatalogCacheIdentity, Option<CodexCatalogCredential>)> {
+    let manager = crate::auth::AuthManager::new_openai_codex(home);
+    codex_catalog_access_from_manager(&manager)
 }
 
 /// `GET /models` rejects a request without this query parameter — HTTP 400,
@@ -510,8 +544,12 @@ fn fetch_openai_codex_catalog_models() -> Option<IndexMap<String, ConfigModelOve
     if !crate::util::config::resolve_remote_fetch_enabled() {
         return None;
     }
-    let credential = codex_catalog_credential()?;
-    let cache_path = codex_catalog_cache_path(&crate::util::grok_home::grok_home(), &credential);
+    let home = crate::util::grok_home::grok_home();
+    let (cache_identity, credential) = codex_catalog_access(&home)?;
+    let cache_path = codex_catalog_cache_path(&home, &cache_identity);
+    let Some(credential) = credential else {
+        return Some(codex_catalog_fallback_models(cache_path.as_deref()));
+    };
     let url = format!(
         "{}/models?client_version={}",
         crate::auth::openai_codex::CODEX_API_BASE_URL,
@@ -2553,14 +2591,10 @@ mod tests {
         );
     }
 
-    fn catalog_test_credential(account_id: &str) -> CodexCatalogCredential {
-        CodexCatalogCredential {
-            access_token: "not-persisted".to_owned(),
+    fn catalog_test_identity(account_id: &str) -> CodexCatalogCacheIdentity {
+        CodexCatalogCacheIdentity {
             account_id: Some(account_id.to_owned()),
             chatgpt_account_is_fedramp: false,
-            source: xai_grok_sampler::CredentialSource::AuthProvider {
-                name: OPENAI_CODEX_PROVIDER_ID.to_owned(),
-            },
         }
     }
 
@@ -2580,8 +2614,8 @@ mod tests {
     #[test]
     fn codex_catalog_last_good_cache_is_account_keyed() {
         let home = tempfile::tempdir().expect("temporary catalog cache home");
-        let account_a = catalog_test_credential("account-a");
-        let account_b = catalog_test_credential("account-b");
+        let account_a = catalog_test_identity("account-a");
+        let account_b = catalog_test_identity("account-b");
         let path_a = codex_catalog_cache_path(home.path(), &account_a).expect("account A path");
         let path_b = codex_catalog_cache_path(home.path(), &account_b).expect("account B path");
 
@@ -2615,13 +2649,47 @@ mod tests {
         );
     }
 
+    /// #262: an expired bearer is not eligible for the live request, but its
+    /// retained verified account id must still select that account's cache.
+    #[test]
+    fn codex_catalog_expired_credential_can_read_account_cache() {
+        let home = tempfile::tempdir().expect("temporary catalog cache home");
+        let manager = crate::auth::AuthManager::new_openai_codex(home.path());
+        manager.hot_swap(crate::auth::GrokAuth {
+            key: "expired-catalog-token".to_owned(),
+            auth_mode: crate::auth::AuthMode::Oidc,
+            expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+            refresh_token: Some("retained-refresh-token".to_owned()),
+            account_id: Some("account-expired".to_owned()),
+            ..crate::auth::GrokAuth::test_default()
+        });
+
+        let (identity, live) =
+            codex_catalog_access_from_manager(&manager).expect("retained account identity");
+        assert!(
+            live.is_none(),
+            "expired bearer must not reach the live request"
+        );
+        let path = codex_catalog_cache_path(home.path(), &identity).expect("account cache path");
+        persist_codex_catalog_cache(&path, &catalog_test_payload("codex-last-good"));
+
+        let fallback = codex_catalog_fallback_models(Some(&path));
+        assert!(fallback.contains_key("codex-last-good"));
+        assert_eq!(
+            fallback["codex-last-good"]
+                .catalog_degraded_reason
+                .as_deref(),
+            Some(OPENAI_CODEX_SAVED_CATALOG_REASON)
+        );
+    }
+
     /// #262: a failed live refresh keeps the account's last-good menu and
     /// carries a structured reason through ACP instead of silently looking
     /// identical to the old single-model preset.
     #[test]
     fn codex_catalog_saved_fallback_is_visible_in_acp_metadata() {
         let home = tempfile::tempdir().expect("temporary catalog cache home");
-        let credential = catalog_test_credential("account-a");
+        let credential = catalog_test_identity("account-a");
         let path = codex_catalog_cache_path(home.path(), &credential).expect("cache path");
         persist_codex_catalog_cache(&path, &catalog_test_payload("codex-saved"));
         let fallback = codex_catalog_fallback_models(Some(&path));
