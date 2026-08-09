@@ -2072,11 +2072,16 @@ pub(crate) async fn checkout_commit_with_fetch(
             && !output.trim().is_empty()
         {
             let msg = format!("auto-stash before checkout {head_commit}");
-            if git_cli(git_root, &["stash", "push", "-m", &msg])
-                .await
-                .is_ok()
+            let stash_before = checkout_stash_tip(git_root).await;
+            if git_cli(
+                git_root,
+                &["stash", "push", "--include-untracked", "-m", &msg],
+            )
+            .await
+            .is_ok()
             {
-                stashed = true;
+                let stash_after = checkout_stash_tip(git_root).await;
+                stashed = stash_after.is_some() && stash_after != stash_before;
             }
         }
     }
@@ -2148,6 +2153,18 @@ pub(crate) async fn checkout_commit_with_fetch(
         Err(e) => pop_checkout_auto_stash(git_root, stashed, fetched, e.to_string()).await,
     }
 }
+
+async fn checkout_stash_tip(git_root: &Path) -> Option<String> {
+    git_cli(
+        git_root,
+        &["rev-parse", "--verify", "--quiet", "refs/stash"],
+    )
+    .await
+    .ok()
+    .map(|tip| tip.trim().to_owned())
+    .filter(|tip| !tip.is_empty())
+}
+
 /// Restore a pre-checkout auto-stash on failure so callers that only inspect
 /// `error` are not left on a clean tree with a hidden stash entry.
 async fn pop_checkout_auto_stash(
@@ -4587,6 +4604,42 @@ mod restore_code_tests {
         assert!(
             stash_list.trim().is_empty(),
             "no leftover stash, got: {stash_list:?}"
+        );
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn checkout_commit_with_fetch_does_not_pop_older_stash_for_untracked_only_tree() {
+        if bazel_skip("checkout_commit_with_fetch_does_not_pop_older_stash_for_untracked_only_tree")
+        {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo_with_commit(tmp.path()).await;
+        std::fs::write(tmp.path().join("README.md"), "older stashed edit\n").unwrap();
+        git_cli(tmp.path(), &["stash", "push", "-m", "older user stash"])
+            .await
+            .unwrap();
+        let older_stash = checkout_stash_tip(tmp.path()).await.expect("older stash");
+        std::fs::write(tmp.path().join("untracked.txt"), "keep me\n").unwrap();
+
+        let response = checkout_commit_with_fetch(tmp.path(), "deadbeef", true).await;
+
+        assert!(!response.checked_out);
+        assert!(!response.stashed, "checkout failure restores its own stash");
+        assert!(response.error.is_some());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("README.md")).unwrap(),
+            "hello\n",
+            "an older user stash must not be popped into the worktree"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("untracked.txt")).unwrap(),
+            "keep me\n",
+            "the checkout auto-stash must restore untracked files"
+        );
+        assert_eq!(
+            checkout_stash_tip(tmp.path()).await.as_deref(),
+            Some(older_stash.as_str()),
+            "the pre-existing stash must remain untouched"
         );
     }
     #[tokio::test]
