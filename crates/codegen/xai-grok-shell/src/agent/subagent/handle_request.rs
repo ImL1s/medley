@@ -1,4 +1,6 @@
 use super::*;
+use crate::session::storage::{StorageAdapter, jsonl::JsonlStorageAdapter};
+use xai_grok_sampling_types::ReasoningEffort;
 use xai_grok_tools::implementations::{grok_build, opencode};
 pub(super) fn inherited_web_search_model_id(
     follows_default: bool,
@@ -64,10 +66,12 @@ pub(super) fn task_model_override_error(
 struct ResumeModelLineage {
     route: Option<String>,
     agent_type: Option<String>,
+    catalog_identity: Option<xai_chat_state::CatalogIdentity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResumeModelLineageError {
+    MissingRoute,
     RouteChanged,
     HarnessChanged,
 }
@@ -77,11 +81,10 @@ fn validate_resume_model_lineage(
     current_route: &str,
     current_agent_type: &str,
 ) -> Result<(), ResumeModelLineageError> {
-    if source
-        .route
-        .as_deref()
-        .is_some_and(|route| route != current_route)
-    {
+    let Some(source_route) = source.route.as_deref() else {
+        return Err(ResumeModelLineageError::MissingRoute);
+    };
+    if source_route != current_route {
         return Err(ResumeModelLineageError::RouteChanged);
     }
     if source
@@ -92,6 +95,78 @@ fn validate_resume_model_lineage(
         return Err(ResumeModelLineageError::HarnessChanged);
     }
     Ok(())
+}
+
+async fn recover_resume_model_lineage(
+    source: &ResumeSourceData,
+    parent_session_id: &str,
+    parent_cwd: &Path,
+) -> ResumeModelLineage {
+    let parent_info = SessionInfo {
+        id: acp::SessionId::new(parent_session_id),
+        cwd: parent_cwd.to_string_lossy().into_owned(),
+    };
+    let child_dir = session::persistence::session_dir(&parent_info)
+        .join("subagents")
+        .join(&source.subagent_id);
+    recover_resume_model_lineage_at(source, child_dir).await
+}
+
+async fn recover_resume_model_lineage_at(
+    source: &ResumeSourceData,
+    child_dir: PathBuf,
+) -> ResumeModelLineage {
+    let mut lineage = ResumeModelLineage {
+        route: source.model_route.clone(),
+        agent_type: source.model_agent_type.clone(),
+        catalog_identity: None,
+    };
+    if source.model_id.is_none() {
+        return lineage;
+    }
+    let metadata_is_incomplete = lineage.route.is_none() || lineage.agent_type.is_none();
+
+    let child_info = SessionInfo {
+        id: acp::SessionId::new(source.child_session_id.clone()),
+        cwd: source.child_cwd.clone(),
+    };
+    let storage = JsonlStorageAdapter::with_explicit_session_dir(child_dir);
+    let Ok(summary) = storage.load_summary(&child_info).await else {
+        if metadata_is_incomplete {
+            tracing::warn!(
+                source_subagent_id = %source.subagent_id,
+                "Legacy resume metadata lacks complete model lineage and the child session summary could not be loaded"
+            );
+        }
+        return lineage;
+    };
+    let Some(identity) = summary.catalog_identity else {
+        if metadata_is_incomplete {
+            tracing::warn!(
+                source_subagent_id = %source.subagent_id,
+                "Legacy resume metadata lacks complete model lineage and the child session summary has no catalog identity"
+            );
+        }
+        return lineage;
+    };
+    if source.model_id.as_deref() != Some(identity.model_id.as_str())
+        || summary.current_model_id.0.as_ref() != identity.model_id
+    {
+        tracing::warn!(
+            source_subagent_id = %source.subagent_id,
+            metadata_model_id = ?source.model_id,
+            summary_model_id = %summary.current_model_id.0,
+            catalog_model_id = %identity.model_id,
+            "Refusing inconsistent legacy resume model lineage"
+        );
+        return lineage;
+    }
+
+    if lineage.route.is_none() {
+        lineage.route = Some(identity.route.clone());
+    }
+    lineage.catalog_identity = Some(identity);
+    lineage
 }
 
 fn should_preflight_model_harness(
@@ -332,10 +407,12 @@ pub(crate) async fn run_shell_child(
     } else {
         None
     };
-    let resume_model_lineage = resume_source.as_ref().map(|source| ResumeModelLineage {
-        route: source.model_route.clone(),
-        agent_type: source.model_agent_type.clone(),
-    });
+    let resume_model_lineage = match resume_source.as_ref() {
+        Some(source) => Some(
+            recover_resume_model_lineage(source, &ctx.parent_session_id, &ctx.parent_cwd).await,
+        ),
+        None => None,
+    };
     if let Some(ref source) = resume_source {
         if request.runtime_overrides.model.is_some() {
             tracing::debug!(
@@ -584,25 +661,45 @@ pub(crate) async fn run_shell_child(
     let subagent_max_turns = resolve_subagent_max_turns(definition.max_turns, ctx.parent_max_turns);
     if let Some(ref source) = resume_source
         && let Some(ref source_model) = source.model_id
-        && effective_model_id.0.as_ref() != source_model.as_str()
     {
-        if let Some(resolved) = resolve_model_override_to_prepared(source_model, &ctx) {
-            tracing::info!(
-                subagent_id = %request.id,
-                resolved_model = %effective_model_id.0,
-                source_model = source_model,
-                "Pinning resumed child to source model"
-            );
-            effective_sampling_config = resolved.sampling_config.clone();
-            effective_model_id = resolved.model_id.clone();
-            prepared_model = resolved;
-        } else {
+        let persisted_identity = resume_model_lineage
+            .as_ref()
+            .and_then(|lineage| lineage.catalog_identity.as_ref());
+        let reconciled_identity = persisted_identity.and_then(|identity| {
+            crate::agent::models::reconcile_persisted_catalog_identity(
+                &ctx.available_models,
+                identity,
+            )
+        });
+        if persisted_identity.is_some() && reconciled_identity.is_none() {
             let msg = format!(
-                "Cannot resume from subagent '{}': source model '{source_model}' \
-                 is no longer available in the model catalogue.",
+                "Cannot resume from subagent '{}': persisted source model lineage no longer matches the current catalog.",
                 source.subagent_id,
             );
             return child_run_output(failure_result(&request, &msg), completion_data, None);
+        }
+        let resume_model_id = reconciled_identity
+            .as_ref()
+            .map_or(source_model.as_str(), |identity| identity.model_id.as_str());
+        if effective_model_id.0.as_ref() != resume_model_id {
+            if let Some(resolved) = resolve_model_override_to_prepared(resume_model_id, &ctx) {
+                tracing::info!(
+                    subagent_id = %request.id,
+                    resolved_model = %effective_model_id.0,
+                    source_model = resume_model_id,
+                    "Pinning resumed child to source model"
+                );
+                effective_sampling_config = resolved.sampling_config.clone();
+                effective_model_id = resolved.model_id.clone();
+                prepared_model = resolved;
+            } else {
+                let msg = format!(
+                    "Cannot resume from subagent '{}': source model '{resume_model_id}' \
+                     is no longer available in the model catalogue.",
+                    source.subagent_id,
+                );
+                return child_run_output(failure_result(&request, &msg), completion_data, None);
+            }
         }
     }
     // A resident parent keeps its immutable sampling config across catalog
@@ -648,17 +745,63 @@ pub(crate) async fn run_shell_child(
                 &prepared_model.agent_type,
             )
         {
-            let changed = match lineage_error {
-                ResumeModelLineageError::RouteChanged => "route",
-                ResumeModelLineageError::HarnessChanged => "harness",
+            let detail = match lineage_error {
+                ResumeModelLineageError::MissingRoute => {
+                    "source model route evidence is missing; resume requires persisted route lineage"
+                }
+                ResumeModelLineageError::RouteChanged => {
+                    "source model route no longer matches the current catalog"
+                }
+                ResumeModelLineageError::HarnessChanged => {
+                    "source model harness no longer matches the current catalog"
+                }
             };
             let msg = format!(
-                "Cannot resume from subagent '{}': source model {changed} no longer matches the current catalog.",
+                "Cannot resume from subagent '{}': {detail}.",
                 resume_source
                     .as_ref()
                     .map_or("unknown", |source| source.subagent_id.as_str()),
             );
             return child_run_output(failure_result(&request, &msg), completion_data, None);
+        }
+        if resume_model_lineage
+            .as_ref()
+            .is_some_and(|lineage| lineage.agent_type.is_none())
+        {
+            let required_agent_type = prepared_model.agent_type.as_str();
+            let compatibility = if required_agent_type.is_empty() {
+                Err(SubagentModelHarnessError::Unavailable)
+            } else {
+                resolve_and_validate_subagent_model_harness(
+                    &selected_harness_definition,
+                    required_agent_type,
+                    &ctx.parent_cwd,
+                    ctx.plugin_registry.as_deref(),
+                )
+            };
+            if let Err(harness_error) = compatibility {
+                let detail = match harness_error {
+                    SubagentModelHarnessError::Unavailable => "is unavailable",
+                    SubagentModelHarnessError::Incompatible => {
+                        "is incompatible with the selected subagent harness"
+                    }
+                };
+                let msg = format!(
+                    "Cannot resume from subagent '{}': legacy metadata has no persisted harness lineage, and compatibility preflight failed because current harness '{}' {detail}. Re-run with a compatible harness or start a fresh subagent.",
+                    resume_source
+                        .as_ref()
+                        .map_or("unknown", |source| source.subagent_id.as_str()),
+                    required_agent_type,
+                );
+                return child_run_output(failure_result(&request, &msg), completion_data, None);
+            }
+            tracing::warn!(
+                source_subagent_id = %resume_source
+                    .as_ref()
+                    .map_or("unknown", |source| source.subagent_id.as_str()),
+                required_agent_type,
+                "Legacy resume metadata has no persisted harness lineage; continuing only after explicit compatibility preflight"
+            );
         }
     } else if should_preflight_model_harness(
         is_resume,
@@ -2213,6 +2356,58 @@ pub(crate) async fn run_shell_child(
 mod resume_model_lineage_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn legacy_resume_recovers_committed_route_from_child_summary() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let child_dir = temp.path().join("persisted-child");
+        let child_info = SessionInfo {
+            id: acp::SessionId::new("child-session"),
+            cwd: "/workspace".to_owned(),
+        };
+        let storage = JsonlStorageAdapter::with_explicit_session_dir(child_dir.clone());
+        storage
+            .init_session(&child_info, acp::ModelId::new("codex-key"))
+            .await
+            .expect("initialize persisted child session");
+        let identity = xai_chat_state::CatalogIdentity {
+            model_id: "codex-key".to_owned(),
+            route: "gpt-5.3-codex-spark".to_owned(),
+            lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+            auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
+        };
+        storage
+            .update_current_model_identity_and_agent(
+                &child_info,
+                &acp::ModelId::new("codex-key"),
+                Some(&identity),
+                Some("codex"),
+                None,
+            )
+            .await
+            .expect("persist child model lineage");
+        let source = ResumeSourceData {
+            subagent_id: "legacy-source".to_owned(),
+            subagent_type: "general-purpose".to_owned(),
+            persona: None,
+            model_id: Some("codex-key".to_owned()),
+            model_route: None,
+            model_agent_type: None,
+            child_cwd: child_info.cwd.clone(),
+            worktree_path: None,
+            snapshot_ref: None,
+            child_session_id: child_info.id.0.to_string(),
+        };
+
+        let recovered = recover_resume_model_lineage_at(&source, child_dir).await;
+
+        assert_eq!(recovered.route.as_deref(), Some("gpt-5.3-codex-spark"));
+        assert!(
+            recovered.agent_type.is_none(),
+            "summary.agent_name is the selected child role, not catalog harness lineage"
+        );
+        assert_eq!(recovered.catalog_identity.as_ref(), Some(&identity));
+    }
+
     #[test]
     fn inherited_codex_subagent_resume_preserves_accepted_model_harness_tuple() {
         let selected_role = xai_grok_agent::AgentDefinition::general_purpose();
@@ -2239,6 +2434,7 @@ mod resume_model_lineage_tests {
                 &ResumeModelLineage {
                     route: Some("gpt-5.3-codex-spark".to_owned()),
                     agent_type: Some("grok-build-plan".to_owned()),
+                    catalog_identity: None,
                 },
                 "gpt-5.3-codex-spark",
                 "grok-build-plan",
@@ -2262,6 +2458,7 @@ mod resume_model_lineage_tests {
         let source = ResumeModelLineage {
             route: Some("gpt-5.3-codex-spark".to_owned()),
             agent_type: Some("grok-build-plan".to_owned()),
+            catalog_identity: None,
         };
         assert_eq!(
             validate_resume_model_lineage(&source, "reused-route", "grok-build-plan"),
@@ -2274,14 +2471,14 @@ mod resume_model_lineage_tests {
     }
 
     #[test]
-    fn legacy_resume_without_lineage_fields_uses_committed_model_resolution() {
+    fn legacy_resume_without_route_lineage_fails_closed() {
         assert_eq!(
             validate_resume_model_lineage(
                 &ResumeModelLineage::default(),
                 "gpt-5.3-codex-spark",
                 "grok-build-plan",
             ),
-            Ok(()),
+            Err(ResumeModelLineageError::MissingRoute),
         );
     }
 }

@@ -468,8 +468,12 @@ jobs:
           # #300: an inherited Codex child resumes the already-admitted tuple;
           # route/harness drift still fails closed and fresh explicit overrides
           # still run the compatibility preflight.
+          run_nonzero -p xai-grok-subagent-resolution --lib \
+            resume::tests -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             resume_model_lineage_tests -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            durable_legacy_resume_ -- --nocapture
           run_nonzero -p xai-grok-tools --lib \
             completed_resume_source_carries_committed_model_lineage -- --nocapture
           run_nonzero -p xai-grok-tools --lib \

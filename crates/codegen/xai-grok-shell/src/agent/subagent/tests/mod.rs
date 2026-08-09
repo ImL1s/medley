@@ -1937,6 +1937,117 @@ async fn run_issue39_spawn(request: SubagentRequest, ctx: SubagentSpawnContext) 
     actor.abort();
     result
 }
+
+async fn run_durable_legacy_resume_rejection(
+    source_route: &str,
+    source_agent_type: Option<&str>,
+) -> SubagentResult {
+    let temp = tempfile::tempdir().expect("temp workspace");
+    let parent_id = format!("legacy-resume-parent-{}", uuid::Uuid::now_v7());
+    let source_id = format!("legacy-resume-source-{}", uuid::Uuid::now_v7());
+    let model_id = "legacy-codex-key";
+    let current_route = "current-codex-route";
+    let mut model_entry = test_model_entry(current_route);
+    model_entry.info.agent_type = "codex".to_owned();
+    let models = indexmap::IndexMap::from([(model_id.to_owned(), model_entry)]);
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.parent_session_id = parent_id.clone();
+    ctx.parent_cwd = temp.path().to_path_buf();
+    ctx.parent_session_info = Some(SessionInfo {
+        id: acp::SessionId::new(parent_id.clone()),
+        cwd: temp.path().to_string_lossy().into_owned(),
+    });
+    ctx.model_id = acp::ModelId::new(model_id);
+    ctx.sampling_config.model = current_route.to_owned();
+    ctx.available_models = models.clone();
+    ctx.models_manager = crate::agent::models::ModelsManager::new(
+        None,
+        models,
+        acp::ModelId::new(model_id),
+        ctx.auth_manager.clone(),
+        crate::agent::config::Config::default(),
+    );
+
+    let parent_info = ctx.parent_session_info.clone().expect("parent info");
+    let durable_dir = crate::session::persistence::session_dir(&parent_info)
+        .join("subagents")
+        .join(&source_id);
+    write_subagent_meta(
+        &durable_dir,
+        &SubagentMeta {
+            subagent_id: source_id.clone(),
+            parent_session_id: parent_id.clone(),
+            child_session_id: format!("child-{source_id}"),
+            subagent_type: "general-purpose".to_owned(),
+            description: "legacy source".to_owned(),
+            prompt: "source prompt".to_owned(),
+            status: "completed".to_owned(),
+            started_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
+            duration_ms: Some(1),
+            tool_calls: Some(0),
+            turns: Some(1),
+            error: None,
+            effective_context_source: Some("new".to_owned()),
+            context_normalized: false,
+            fork_copy_error: None,
+            persona: None,
+            resumed_from: None,
+            child_cwd: Some(temp.path().to_string_lossy().into_owned()),
+            worktree_path: None,
+            snapshot_ref: None,
+            effective_model_id: Some(model_id.to_owned()),
+            effective_model_route: Some(source_route.to_owned()),
+            effective_model_agent_type: source_agent_type.map(str::to_owned),
+        },
+    );
+
+    let mut request = auto_wake_test_request(&format!("resume-{source_id}"));
+    request.parent_session_id = parent_id;
+    request.resume_from = Some(source_id);
+    request.run_in_background = false;
+    request.surface_completion = false;
+    let result = run_issue39_spawn(request, ctx).await;
+    let _ = std::fs::remove_dir_all(
+        crate::session::persistence::session_dir(&parent_info),
+    );
+    result
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_legacy_resume_rejects_route_drift_through_child_runner() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let result = run_durable_legacy_resume_rejection(
+                "historical-codex-route",
+                Some("codex"),
+            )
+            .await;
+            let error = result.error.unwrap_or_default();
+            assert!(
+                error.contains("source model route no longer matches the current catalog"),
+                "durable source route drift must fail closed before child spawn: {error}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_legacy_resume_missing_harness_runs_compatibility_preflight() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let result =
+                run_durable_legacy_resume_rejection("current-codex-route", None).await;
+            let error = result.error.unwrap_or_default();
+            assert!(
+                error.contains("no persisted harness lineage")
+                    && error.contains("compatibility preflight failed")
+                    && error.contains("current harness 'codex' is incompatible"),
+                "missing legacy harness evidence must not bypass preflight: {error}"
+            );
+        })
+        .await;
+}
 #[tokio::test(flavor = "current_thread")]
 async fn issue39_harness_rejection_cleans_fresh_worktree_before_handoff() {
     xai_test_utils::require_git!();
