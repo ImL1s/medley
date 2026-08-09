@@ -546,6 +546,7 @@ impl ModelsManager {
     pub(crate) fn apply_config_reselecting_default(&self, new_config: config::Config) {
         self.apply_config(new_config.clone());
         self.reselect_default_model(&new_config);
+        self.revalidate_current_reasoning_effort();
         self.notify_models_updated();
     }
 
@@ -772,6 +773,17 @@ impl ModelsManager {
             .get(model_id)
             .map(|e| e.info().supports_reasoning_effort)
             .unwrap_or(false)
+    }
+
+    pub(crate) fn model_offers_reasoning_effort(
+        &self,
+        model_id: &str,
+        effort: ReasoningEffort,
+    ) -> bool {
+        let catalog = self.inner.catalog.read();
+        resolve_catalog_key(&catalog.models, &acp::ModelId::new(model_id))
+            .and_then(|resolved_id| catalog.models.get(resolved_id.0.as_ref()))
+            .is_some_and(|entry| model_offers_reasoning_effort(&entry.info, effort))
     }
 
     pub(crate) fn model_default_reasoning_effort(&self, model_id: &str) -> Option<ReasoningEffort> {

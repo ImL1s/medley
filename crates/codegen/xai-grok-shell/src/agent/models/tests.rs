@@ -883,6 +883,72 @@ fn config_refresh_clears_current_effort_removed_from_model_menu() {
 }
 
 #[test]
+fn unconditional_default_reselection_revalidates_current_effort() {
+    let tmp = std::env::temp_dir().join("grok-test-models-manager-default-effort-reselect");
+    let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
+    let mut cfg = config::Config::default();
+    cfg.models.default = Some("model-b".to_owned());
+    for (model, effort) in [
+        ("model-a", ReasoningEffort::High),
+        ("model-b", ReasoningEffort::Low),
+    ] {
+        cfg.config_models.insert(
+            model.to_owned(),
+            config::ConfigModelOverride {
+                model: Some(model.to_owned()),
+                supports_reasoning_effort: Some(true),
+                reasoning_effort: Some(effort),
+                reasoning_efforts: vec![ReasoningEffortOption {
+                    id: effort.to_string(),
+                    value: effort,
+                    label: effort.to_string(),
+                    description: None,
+                    default: true,
+                }],
+                ..Default::default()
+            },
+        );
+    }
+    let initial_models = resolve_model_catalog(&cfg, None);
+    let mgr = ModelsManager::new(
+        None,
+        initial_models,
+        acp::ModelId::new("model-a"),
+        auth_manager,
+        cfg.clone(),
+    );
+    mgr.set_current_reasoning_effort(Some(ReasoningEffort::High));
+
+    mgr.apply_config_reselecting_default(cfg);
+
+    assert_eq!(mgr.current_model_id(), acp::ModelId::new("model-b"));
+    assert_eq!(mgr.current_reasoning_effort(), None);
+}
+
+#[test]
+fn session_model_effort_validation_uses_requested_model_menu() {
+    let tmp = std::env::temp_dir().join("grok-test-models-manager-session-effort");
+    let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
+    let models = IndexMap::from([
+        reasoning_entry_with_menu("model-a", ReasoningEffort::Xhigh),
+        reasoning_entry_with_menu("model-b", ReasoningEffort::Low),
+    ]);
+    let mgr = ModelsManager::new(
+        None,
+        models,
+        acp::ModelId::new("model-a"),
+        auth_manager,
+        config::Config::default(),
+    );
+
+    assert!(mgr.model_offers_reasoning_effort("model-a", ReasoningEffort::Xhigh));
+    assert!(
+        !mgr.model_offers_reasoning_effort("model-b", ReasoningEffort::Xhigh),
+        "a custom session model must not inherit an effort offered only by the manager's current model"
+    );
+}
+
+#[test]
 fn default_reasoning_effort_only_stamps_supporting_model() {
     use indexmap::IndexMap;
 

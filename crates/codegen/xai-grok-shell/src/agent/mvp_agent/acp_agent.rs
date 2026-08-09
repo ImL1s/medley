@@ -1282,7 +1282,7 @@ impl acp::Agent for MvpAgent {
         if let Some(effort) = self.models_manager.current_reasoning_effort()
             && self
                 .models_manager
-                .model_supports_reasoning_effort(&session_sampling.model)
+                .model_offers_reasoning_effort(&session_sampling.model, effort)
         {
             session_sampling.reasoning_effort = Some(effort);
         }

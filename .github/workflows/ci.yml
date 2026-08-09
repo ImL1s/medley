@@ -1517,6 +1517,10 @@ jobs:
             config_refresh_clears_current_effort_removed_from_model_menu -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             model_switch_rejects_effort_outside_model_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            unconditional_default_reselection_revalidates_current_effort -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            session_model_effort_validation_uses_requested_model_menu -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             codex_catalog_effort_options_are_model_specific -- --nocapture
 
