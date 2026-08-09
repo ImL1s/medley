@@ -275,19 +275,10 @@ fn parse_openai_codex_catalog_models(
         .collect()
 }
 
-fn fetch_openai_codex_catalog_models() -> Option<IndexMap<String, ConfigModelOverride>> {
-    if cfg!(test) {
-        return None;
-    }
-    if !crate::util::config::resolve_remote_fetch_enabled() {
-        return None;
-    }
-    let credential = codex_catalog_credential()?;
-    let url = format!(
-        "{}/models?client_version={}",
-        crate::auth::openai_codex::CODEX_API_BASE_URL,
-        OPENAI_CODEX_CATALOG_CLIENT_VERSION
-    );
+fn fetch_openai_codex_catalog_models_blocking(
+    credential: CodexCatalogCredential,
+    url: String,
+) -> Option<IndexMap<String, ConfigModelOverride>> {
     let client = crate::remote::client::models_catalog_blocking_client();
     let request = apply_codex_catalog_auth_headers(client.get(url), &credential)?;
     let response = match request.send() {
@@ -317,6 +308,50 @@ fn fetch_openai_codex_catalog_models() -> Option<IndexMap<String, ConfigModelOve
         return None;
     }
     Some(models)
+}
+
+/// Run the complete reqwest blocking request outside any caller's Tokio
+/// context. Isolating only `Client::build` is insufficient: reqwest's blocking
+/// `RequestBuilder::send` also creates and drops a private runtime while it
+/// waits, which Tokio rejects when config discovery happens inside async
+/// startup (#291).
+fn fetch_openai_codex_catalog_models_on_native_thread(
+    credential: CodexCatalogCredential,
+    url: String,
+) -> Option<IndexMap<String, ConfigModelOverride>> {
+    let worker = match std::thread::Builder::new()
+        .name("codex-model-catalog".to_owned())
+        .spawn(move || fetch_openai_codex_catalog_models_blocking(credential, url))
+    {
+        Ok(worker) => worker,
+        Err(error) => {
+            tracing::warn!(error = %error, "Codex catalog worker could not start");
+            return None;
+        }
+    };
+    match worker.join() {
+        Ok(models) => models,
+        Err(_) => {
+            tracing::warn!("Codex catalog worker panicked");
+            None
+        }
+    }
+}
+
+fn fetch_openai_codex_catalog_models() -> Option<IndexMap<String, ConfigModelOverride>> {
+    if cfg!(test) {
+        return None;
+    }
+    if !crate::util::config::resolve_remote_fetch_enabled() {
+        return None;
+    }
+    let credential = codex_catalog_credential()?;
+    let url = format!(
+        "{}/models?client_version={}",
+        crate::auth::openai_codex::CODEX_API_BASE_URL,
+        OPENAI_CODEX_CATALOG_CLIENT_VERSION
+    );
+    fetch_openai_codex_catalog_models_on_native_thread(credential, url)
 }
 
 fn effective_openai_codex_presets(
@@ -725,6 +760,94 @@ impl ConfigModelOverride {
 mod tests {
     use super::*;
     use crate::agent::config::{Config, resolve_credentials, resolve_model_list};
+
+    const CODEX_CATALOG_RUNTIME_CHILD: &str = "__XAI_CODEX_CATALOG_RUNTIME_CHILD";
+    const CODEX_CATALOG_RUNTIME_PASS: &str = "codex-catalog-runtime-fetch-ok";
+
+    /// Child-process body for #291. The fresh process prevents another test
+    /// from warming reqwest's process-wide blocking client before Tokio starts.
+    #[test]
+    fn codex_catalog_runtime_first_fetch_child() {
+        if std::env::var_os(CODEX_CATALOG_RUNTIME_CHILD).is_none() {
+            return;
+        }
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind catalog server");
+        let address = listener.local_addr().expect("catalog server address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept catalog request");
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).expect("read catalog request");
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("GET /models?client_version=0.0.0 HTTP/1.1"));
+            assert!(request.contains("authorization: Bearer catalog-test-token"));
+            let body =
+                r#"{"models":[{"slug":"gpt-test","model":"gpt-test","context_window":12345}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write catalog response");
+        });
+        let credential = CodexCatalogCredential {
+            access_token: "catalog-test-token".to_owned(),
+            account_id: Some("catalog-test-account".to_owned()),
+            chatgpt_account_is_fedramp: false,
+            source: xai_grok_sampler::CredentialSource::AuthProvider {
+                name: OPENAI_CODEX_PROVIDER_ID.to_owned(),
+            },
+        };
+        let url = format!("http://{address}/models?client_version=0.0.0");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build child Tokio runtime");
+        let models = runtime
+            .block_on(
+                async move { fetch_openai_codex_catalog_models_on_native_thread(credential, url) },
+            )
+            .expect("fetch catalog inside Tokio");
+        server.join().expect("catalog server thread");
+        assert_eq!(models["gpt-test"].context_window, Some(12_345));
+        println!("{CODEX_CATALOG_RUNTIME_PASS}");
+    }
+
+    /// Launch an exact child test so both the reqwest client and its first
+    /// authenticated request are exercised from a fresh process under Tokio.
+    #[test]
+    fn codex_catalog_runtime_first_fetch_parent() {
+        if std::env::var_os(CODEX_CATALOG_RUNTIME_CHILD).is_some() {
+            return;
+        }
+        let filter = module_path!()
+            .split_once("::")
+            .map(|(_, rest)| rest)
+            .unwrap_or_default();
+        let mut command = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+        command
+            .arg("--exact")
+            .arg(format!("{filter}::codex_catalog_runtime_first_fetch_child"))
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(CODEX_CATALOG_RUNTIME_CHILD, "1")
+            .stdin(std::process::Stdio::null());
+        xai_tty_utils::detach_std_command(&mut command);
+        let output = command.output().expect("spawn catalog fetch child test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && !stderr.contains("panicked at"),
+            "fresh-process Codex catalog fetch failed under Tokio \
+             (status: {:?})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+        assert!(
+            stdout.contains(CODEX_CATALOG_RUNTIME_PASS),
+            "child did not execute the catalog fetch path\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
 
     #[test]
     fn provider_debug_is_presence_only() {
