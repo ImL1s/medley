@@ -589,7 +589,9 @@ pub fn auth_error_api_key() -> String {
 pub fn auth_error_ambient_origin_refused(origin: &str) -> String {
     format!(
         "xAI credential withheld for non-xAI origin {origin}: set api_key, env_key, or auth_provider \
-         — or auth_scheme = \"none\" for a keyless local server"
+         — or auth_scheme = \"none\" for a keyless local server — or, for a self-hosted xAI \
+         gateway you trust with that credential, declare the origin in trusted_xai_origins \
+         in your local config (#123)"
     )
 }
 

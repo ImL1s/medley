@@ -140,12 +140,28 @@ fn codex_catalog_string(
         .map(str::to_owned)
 }
 
+/// The window a session is budgeted against.
+///
+/// `context_window` is the operative one and is tried first. `max_context_window`
+/// is a ceiling the account may not have, and preferring it — which this did
+/// until #258 — makes auto-compact fire late by exactly the ratio between them.
+///
+/// Measured on the live catalog: eight of nine models report the two fields
+/// equal, and `gpt-5.4` reports `context_window: 272000` against
+/// `max_context_window: 1000000`. So the bug was invisible on every model but
+/// one, and on that one it budgets **3.7x** the real window — which does not
+/// fail early and quietly, it fails deep into a long session on the model most
+/// likely to be used for long sessions.
+///
+/// `max_context_window` stays as a fallback for an entry that reports only the
+/// ceiling, rather than being dropped: no window at all falls back to the
+/// preset constant, which is worse than a too-large one.
 fn codex_catalog_context_window(obj: &serde_json::Map<String, serde_json::Value>) -> Option<u64> {
     [
-        "max_context_window",
-        "maxContextWindow",
         "context_window",
         "contextWindow",
+        "max_context_window",
+        "maxContextWindow",
     ]
     .into_iter()
     .find_map(|key| obj.get(key).and_then(serde_json::Value::as_u64))
@@ -1628,6 +1644,7 @@ mod tests {
             None,
             None,
             None,
+            &crate::agent::trusted_origins::TrustedXaiOrigins::default(),
         );
         assert_eq!(sampler.base_url, "https://attacker.invalid/v1");
         assert_eq!(sampler.auth_scheme, xai_grok_sampler::AuthScheme::None);
@@ -2127,8 +2144,13 @@ mod tests {
     /// `data` / `id` / `name` are tolerances for shapes this endpoint does not
     /// currently return. They are kept so a server-side change does not break
     /// the fetch, and pinned so nobody mistakes them for the observed shape.
+    ///
+    /// This test was called `..._prefers_max_context_window` and asserted
+    /// exactly that, which is how the #258 bug survived review: the name read
+    /// like a contract, the assertion agreed with it, and both were wrong.
+    /// A passing test is only evidence about the thing it decided to check.
     #[test]
-    fn codex_catalog_parser_tolerates_other_shapes_and_prefers_max_context_window() {
+    fn codex_catalog_parser_tolerates_other_shapes_and_budgets_the_operative_window() {
         let payload = serde_json::json!({
             "data": [
                 {
@@ -2150,11 +2172,40 @@ mod tests {
             mini.model_provider.as_deref(),
             Some(OPENAI_CODEX_PROVIDER_ID)
         );
-        assert_eq!(mini.context_window, Some(256_000));
+        // The operative window, not the ceiling. `gpt-5.4` is the live case:
+        // 272000 against a 1000000 maximum.
+        assert_eq!(mini.context_window, Some(64_000));
         let small = presets
             .get("codex-small")
             .expect("fallback slug preset should parse");
         assert_eq!(small.context_window, Some(128_000));
+    }
+
+    /// The live shape that made this a bug rather than a preference.
+    ///
+    /// Eight of the nine models in the account catalog report `context_window`
+    /// and `max_context_window` equal, so preferring either one looked
+    /// identical. `gpt-5.4` does not, and it is the model whose sessions run
+    /// longest — budgeting it at the ceiling puts auto-compact 3.7x past the
+    /// window, which surfaces as a context-length rejection deep into a
+    /// session rather than as anything a short test would see.
+    #[test]
+    fn codex_catalog_uses_context_window_not_the_ceiling_for_gpt_5_4() {
+        let payload = serde_json::json!({
+            "models": [{
+                "slug": "gpt-5.4",
+                "display_name": "GPT-5.4",
+                "context_window": 272_000,
+                "max_context_window": 1_000_000
+            }]
+        });
+        let presets = parse_openai_codex_catalog_models(&payload);
+        let entry = presets.get("gpt-5.4").expect("slug is the catalog key");
+        assert_eq!(
+            entry.context_window,
+            Some(272_000),
+            "the operative window is what a session is budgeted against"
+        );
     }
 
     /// The query parameter is not decoration: without it the endpoint answers

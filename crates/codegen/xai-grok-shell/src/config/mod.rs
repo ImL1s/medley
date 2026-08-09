@@ -1621,10 +1621,25 @@ pub(crate) fn merge_project_model_sections(
     merged
 }
 /// Config sections a project `.grok/config.toml` still never contributes.
-/// `[models]` and `[model.*]` are loaded from trusted project configs via
-/// [`merge_project_model_sections`]; `[model_providers.*]` remains global-only.
-pub const PROJECT_INERT_MODEL_SECTIONS: [(&str, &str); 1] =
-    [("model_providers", "[model_providers.*]")];
+///
+/// `[models]` and `[model.*]` are loaded from *trusted* project configs via
+/// [`merge_project_model_sections`] (#56); `[model_providers.*]` remains
+/// global-only.
+///
+/// `trusted_xai_origins` (#123) is inert **by design, not by omission**, and
+/// folder trust is not sufficient for it. Trusting a repository enough to run
+/// its code and take its model routes is a different decision from letting it
+/// name an origin that receives your ambient xAI credential — the second is a
+/// decision only the local user tier can make, and it cannot arrive with a
+/// clone. That distinction got sharper when #56 made project model sections
+/// loadable, not weaker.
+pub const PROJECT_INERT_MODEL_SECTIONS: [(&str, &str); 2] = [
+    ("model_providers", "[model_providers.*]"),
+    (
+        crate::agent::trusted_origins::TRUSTED_XAI_ORIGINS_KEY,
+        "[trusted_xai_origins]",
+    ),
+];
 /// One entry per project `.grok/config.toml` at or above `cwd` that declares a
 /// section from [`PROJECT_INERT_MODEL_SECTIONS`], naming the sections it
 /// declares. Empty when every project config stays within the sections the

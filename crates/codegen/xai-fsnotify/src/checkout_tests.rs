@@ -49,6 +49,33 @@ fn only_an_undeclared_checkout_is_another_workspace() {
     assert!(!is_another_workspace(&root.join("crates/core")));
 }
 
+/// The prefix test in `is_declared_submodule` must resolve both sides.
+///
+/// On macOS the bug reproduces with no help at all, because `/var` links to
+/// `private/var` and so every temp dir is already symlinked — which is why
+/// `only_an_undeclared_checkout_is_another_workspace` fails there and passes
+/// on Linux. This builds the symlink explicitly so the mechanism is covered
+/// on every platform, including the ubuntu runner that is the only thing CI
+/// executes.
+#[cfg(unix)]
+#[test]
+fn a_declared_submodule_reached_through_a_symlink_stays_declared() {
+    let temp = workspace();
+    let elsewhere = TempDir::new().unwrap();
+    let link = elsewhere.path().join("link-to-root");
+    std::os::unix::fs::symlink(temp.path(), &link).unwrap();
+
+    assert!(
+        !is_another_workspace(&link.join("deps/lib")),
+        "a submodule declared in .gitmodules is still declared when the path \
+         reaching it goes through a symlink; misreading it as a foreign \
+         checkout ends watch coverage over the submodule"
+    );
+    // The same resolution must not start swallowing real foreign checkouts.
+    assert!(is_another_workspace(&link.join("vendor/upstream")));
+    assert!(is_another_workspace(&link.join("sl-repo")));
+}
+
 /// Per-dir decides at every level, so a worktree anywhere ends coverage.
 /// Fan-out watches each top-level child recursively, so only a checkout that
 /// is itself a top-level child does.

@@ -939,6 +939,12 @@ jobs:
             dashboard_confirm_worktree_refused_pick_mirrors_error_toast -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             dashboard_new_agent_button_refused_pick_toast_follows_the_view -- --nocapture
+          # `xai-fsnotify` had no filter at all, so nothing in it ran in CI --
+          # including the checkout classifier that decides where the file
+          # watcher stops. That is why #278 shipped: the test which catches it
+          # was never executed anywhere except a developer's macOS machine.
+          run_nonzero -p xai-fsnotify --lib \
+            checkout:: -- --nocapture
 
       # #159: a runtime-only model was judged absent by a config-only lookup,
       # and the turn stripped its credentials. Filters written out rather than
@@ -1206,6 +1212,56 @@ jobs:
           run_nonzero -p xai-grok-sampler --lib \
             explicit_header_label_with_separate_api_key_is_inconsistent -- --nocapture
 
+      # #123: user-declared trusted origin for ambient xAI credentials
+      # (self-hosted gateways). Unique filters so run_nonzero proves each new
+      # test is selected (#171). Written out rather than looped so the #171
+      # check can see them. Quoted name: an unquoted `#123` truncates at the
+      # comment marker.
+      - name: 'User-declared trusted xAI origins (issue #123)'
+        env:
+          PROTOC: protoc
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-sampler --lib \
+            user_declared_trust_allows_labelled_ambient_only_over_https -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            user_declared_trust_does_not_smuggle_unlabelled_material -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            user_declared_trust_keeps_external_metadata_boundary -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            trusted_xai_origins_parse_normalizes_origin -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            trusted_xai_origins_parse_rejects_non_https_and_credential_shaped_entries -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            trusted_xai_origins_rejected_rendering_strips_credential_hiding_places -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            trusted_xai_origins_ignored_in_untrusted_layers -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            trusted_xai_origins_matches_exact_origin_only -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            trusted_xai_origins_layers_union_and_dedupe -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            choke_point_declared_trusted_origin_keeps_ambient_credential -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            choke_point_declaration_matches_exact_origin_only -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            readiness_honours_declared_origin_only_where_declared -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            project_config_trusted_origins_declaration_is_reported_inert -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            a_trusted_repo_still_cannot_declare_trusted_xai_origins -- --nocapture
+
       # #160: six of the seven tests this branch originally added matched no
       # filter. The seventh, `web_search_resolves_an_env_backed_credential_header`,
       # is already selected by the existing `credential_header` filter. Written
@@ -1388,7 +1444,9 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_parser_reads_the_shape_the_endpoint_actually_returns -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
-            codex_catalog_parser_tolerates_other_shapes_and_prefers_max_context_window -- --nocapture
+            codex_catalog_parser_tolerates_other_shapes_and_budgets_the_operative_window -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_uses_context_window_not_the_ceiling_for_gpt_5_4 -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_url_carries_the_required_client_version -- --nocapture
           run_nonzero -p xai-grok-shell --lib \

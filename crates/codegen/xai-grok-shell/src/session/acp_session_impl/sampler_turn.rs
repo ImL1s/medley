@@ -91,8 +91,15 @@ impl SessionTokenAuthGate {
             // config. Otherwise derive it from the URL with the *attach-side*
             // predicate: https required and loopback refused, unlike the
             // refusal-side `is_xai_api_url` this used to call (#110).
+            // `UserDeclared` (#123) counts as attach-allowed: the user named
+            // the origin in local config precisely so the session bearer may
+            // reach it and stay refreshed.
             endpoint_is_first_party: match endpoint_trust {
-                Some(trust) => trust == xai_grok_sampler::EndpointTrustClass::FirstPartyXai,
+                Some(trust) => matches!(
+                    trust,
+                    xai_grok_sampler::EndpointTrustClass::FirstPartyXai
+                        | xai_grok_sampler::EndpointTrustClass::UserDeclared
+                ),
                 None => crate::util::is_xai_api_bearer_url(base_url),
             },
             auth_scheme,
@@ -1103,7 +1110,12 @@ impl SessionActor {
             return Ok(());
         };
         let first_party = match config.endpoint_trust {
-            Some(xai_grok_sampler::EndpointTrustClass::FirstPartyXai) => true,
+            // `UserDeclared` (#123) behaves like first-party here: the declared
+            // gateway fronts xAI for this user, so an unusable route surfaces
+            // the provider's 401 rather than a local refusal — the same
+            // behaviour `api.x.ai` gets.
+            Some(xai_grok_sampler::EndpointTrustClass::FirstPartyXai)
+            | Some(xai_grok_sampler::EndpointTrustClass::UserDeclared) => true,
             Some(_) => false,
             None => crate::util::is_xai_api_bearer_url(&config.base_url),
         };

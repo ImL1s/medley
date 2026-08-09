@@ -2413,6 +2413,7 @@ impl MvpAgent {
             client_version,
             deployment_id,
             user_id,
+            &crate::agent::trusted_origins::TrustedXaiOrigins::load(),
         );
         config.origin_client = origin_client;
         config

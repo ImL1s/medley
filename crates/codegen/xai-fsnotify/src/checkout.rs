@@ -48,7 +48,16 @@ fn is_declared_submodule(dir: &Path) -> bool {
     let Some(workdir) = superproject.workdir() else {
         return false;
     };
-    let Ok(relative) = dir.strip_prefix(workdir) else {
+    // Resolve both sides before the prefix test. git2 reports a canonical
+    // workdir, while `dir` can arrive through a symlink — every macOS temp
+    // dir does, since `/var` links to `private/var`. An unresolved mismatch
+    // makes a declared submodule look like a foreign checkout, and
+    // `is_another_workspace` then ends watch coverage over it, so edits
+    // inside the submodule go unnoticed. `canonical` falls back to the
+    // original path on error, so an unresolvable path never silently
+    // matches a different one.
+    let dir = canonical(dir);
+    let Ok(relative) = dir.strip_prefix(canonical(workdir)) else {
         return false;
     };
     // `.gitmodules` records paths with forward slashes on every platform.

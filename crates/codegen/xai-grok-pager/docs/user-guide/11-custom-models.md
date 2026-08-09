@@ -172,6 +172,54 @@ A model whose final effective URL — after `model_provider`, `base_url`, and `a
 - Talking to an external provider: set `env_key = "PROVIDER_API_KEY"`, or `api_key`, or `auth_provider`, or an explicit credential header.
 - Running a keyless local server (Ollama, LM Studio, llama.cpp): set `auth_scheme = "none"`.
 
+### Trusting a Self-Hosted xAI Gateway Origin
+
+If you run a **self-hosted gateway that terminates xAI API traffic** (your own
+TLS endpoint in front of the xAI upstream), the first-party rule above withholds
+your ambient credential from it — the origin is recomputed from the URL and is
+not `*.x.ai`, so it is treated as external. `trusted_xai_origins` is the
+supported, explicit way to declare that one such origin is yours:
+
+```toml
+# ~/.medley/config.toml  (or a system managed config) — local disk only
+trusted_xai_origins = ["https://gateway.internal.example"]
+```
+
+The constraints are the feature:
+
+- **Local and explicit.** The key is read only from config files on this
+  machine (`~/.medley/config.toml` and the system managed tiers). A
+  `trusted_xai_origins` key in a project `.grok/config.toml` loads **nowhere** —
+  a trust decision cannot arrive with a cloned repo — and Grok reports it as an
+  inert section at session start and under Config Warnings in `grok inspect`.
+  There is deliberately no environment variable for this.
+- **HTTPS only, exact origin.** Entries must be `https://host[:port]` with no
+  userinfo, query, or fragment. Matching is exact on host + effective port
+  (default 443): declaring `https://gateway.internal.example` does not trust
+  `https://gateway.internal.example:8443` or `https://evil-gateway.internal.example`.
+  Entries that fail these rules are rejected with a warning that lists them
+  (sanitized — userinfo, query, and fragment are stripped before display) and
+  are never trusted.
+- **Narrow grant.** A declared origin receives the ambient credential
+  (session token / `XAI_API_KEY`) and session-token refresh, nothing more.
+  xAI identity headers (`x-grok-user-id`, `x-grok-deployment-id`) stay off, and
+  the external metadata boundary still applies — a declared origin is not a
+  first-party origin, it is a named exception for the credential only. The
+  HTTPS floor is re-derived from the final URL at send time, so a declaration
+  can never attach the credential to a cleartext endpoint.
+- **Visible.** The first time a declaration actually changes an outcome (an
+  ambient credential is forwarded because of it), Grok prints a one-time
+  warning naming the origin, and `grok inspect` lists the declared and the
+  rejected entries under "Trusted xAI Origins (user-declared)".
+- **Revocable.** Remove the entry and the gate closes again on the next model
+  resolution; there is no cached trust.
+
+**Private CA.** A self-hosted gateway usually means an internal certificate
+authority. The declaration does not relax TLS verification — the gateway's
+certificate must still validate. Point Grok at your CA with the existing
+`GROK_EXTRA_CA_BUNDLE` environment variable (path to a PEM bundle); the bundle
+is added to the verifier, not substituted for it.
+
 ### Context Window
 
 The `context_window` value is the total the context bar shows and the basis for

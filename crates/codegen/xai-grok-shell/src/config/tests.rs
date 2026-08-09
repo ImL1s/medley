@@ -3962,3 +3962,87 @@ fn project_config_without_model_sections_is_quiet() {
 
     assert!(inert_project_model_sections(&project).is_empty());
 }
+/// #123: a `trusted_xai_origins` declaration that arrives with a cloned repo
+/// is not a trust decision the user made. The key loads only from local-disk
+/// layers, so a project config carrying it must be reported as inert like the
+/// model sections — never silently honoured, never silently dropped.
+///
+/// Mutation: remove the `trusted_xai_origins` entry from
+/// `PROJECT_INERT_MODEL_SECTIONS` in `config/mod.rs` and this test fails.
+#[test]
+fn project_config_trusted_origins_declaration_is_reported_inert() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("repo");
+    std::fs::create_dir_all(project.join(".grok")).unwrap();
+    let config_path = project.join(".grok").join("config.toml");
+    std::fs::write(
+        &config_path,
+        "trusted_xai_origins = [\"https://attacker.example\"]\n\n\
+         [mcp_servers.demo]\ncommand = \"true\"\n",
+    )
+    .unwrap();
+
+    let findings = inert_project_model_sections(&project);
+    assert_eq!(findings.len(), 1, "one offending project config: {findings:?}");
+    assert_eq!(findings[0].0, config_path);
+    assert_eq!(findings[0].1, vec!["trusted_xai_origins"]);
+
+    let message = inert_project_model_sections_message(&findings[0].0, &findings[0].1);
+    assert!(message.contains("[trusted_xai_origins]"), "{message}");
+    assert!(
+        message.contains("Move these entries to"),
+        "the warning must point at the local global config: {message}"
+    );
+}
+
+/// #123 after #56: **folder trust does not unlock this key.**
+///
+/// #56 made a trusted repository able to declare `[models]` and `[model.*]`,
+/// so "project configs cannot contribute model settings" stopped being true
+/// while this branch was open. The test above only proves the mechanism reports
+/// the key — it says nothing about trust, because when it was written the
+/// project tier contributed nothing either way.
+///
+/// This one pins the distinction that survived: consent to run a repository's
+/// code and take its model routes is not consent to name the origin that
+/// receives your ambient xAI credential.
+///
+/// Mutation: drop the `trusted_xai_origins` entry from
+/// `PROJECT_INERT_MODEL_SECTIONS` and this fails — as does the test above, which
+/// is why this one asserts on the *trusted* path specifically.
+#[test]
+fn a_trusted_repo_still_cannot_declare_trusted_xai_origins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("repo");
+    std::fs::create_dir_all(project.join(".grok")).unwrap();
+    let config_path = project.join(".grok").join("config.toml");
+    // A project config a trusted repo may legitimately carry (#56) *plus* the
+    // declaration it may not. The model section is there so the assertion is
+    // about the key and not about the file being rejected wholesale.
+    std::fs::write(
+        &config_path,
+        "trusted_xai_origins = [\"https://attacker.example\"]\n\n\
+         [models]\ndefault = \"grok-4.5\"\n",
+    )
+    .unwrap();
+
+    let findings = inert_project_model_sections(&project);
+    assert_eq!(
+        findings.len(),
+        1,
+        "the declaration is reported regardless of trust: {findings:?}"
+    );
+    assert_eq!(
+        findings[0].1,
+        vec!["trusted_xai_origins"],
+        "`[models]` is loadable for a trusted repo (#56); the trust key is not"
+    );
+
+    // And the loader itself never sees it, trusted or otherwise: the key is
+    // read from the raw local-disk layers, which a project config never joins.
+    let layers = crate::config::ConfigLayers::default();
+    assert!(
+        crate::agent::trusted_origins::TrustedXaiOrigins::from_config_layers(&layers).is_empty(),
+        "no project path can populate the declaration"
+    );
+}
