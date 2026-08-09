@@ -213,6 +213,17 @@ fn codex_catalog_fallback_models(
     )
 }
 
+fn load_codex_catalog_when_remote_fetch_disabled(
+    cache_path: Option<&std::path::Path>,
+) -> Option<IndexMap<String, ConfigModelOverride>> {
+    let models = cache_path.and_then(load_codex_catalog_cache)?;
+    tracing::info!(
+        count = models.len(),
+        "Codex catalog live refresh skipped; using account-scoped saved catalog"
+    );
+    Some(models)
+}
+
 impl std::fmt::Debug for CodexCatalogCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CodexCatalogCredential")
@@ -541,12 +552,12 @@ fn fetch_openai_codex_catalog_models() -> Option<IndexMap<String, ConfigModelOve
     if cfg!(test) {
         return None;
     }
-    if !crate::util::config::resolve_remote_fetch_enabled() {
-        return None;
-    }
     let home = crate::util::grok_home::grok_home();
     let (cache_identity, credential) = codex_catalog_access(&home)?;
     let cache_path = codex_catalog_cache_path(&home, &cache_identity);
+    if !crate::util::config::resolve_remote_fetch_enabled() {
+        return load_codex_catalog_when_remote_fetch_disabled(cache_path.as_deref());
+    }
     let Some(credential) = credential else {
         return Some(codex_catalog_fallback_models(cache_path.as_deref()));
     };
@@ -2680,6 +2691,24 @@ mod tests {
                 .catalog_degraded_reason
                 .as_deref(),
             Some(OPENAI_CODEX_SAVED_CATALOG_REASON)
+        );
+    }
+
+    /// Disabling network discovery suppresses only the live request; it must
+    /// not discard the account's already persisted model menu.
+    #[test]
+    fn codex_catalog_remote_fetch_disabled_uses_account_cache() {
+        let home = tempfile::tempdir().expect("temporary catalog cache home");
+        let identity = catalog_test_identity("account-offline");
+        let path = codex_catalog_cache_path(home.path(), &identity).expect("account cache path");
+        persist_codex_catalog_cache(&path, &catalog_test_payload("codex-offline"));
+
+        let models = load_codex_catalog_when_remote_fetch_disabled(Some(&path))
+            .expect("saved offline catalog");
+        assert!(models.contains_key("codex-offline"));
+        assert!(
+            models["codex-offline"].catalog_degraded_reason.is_none(),
+            "an intentional network policy is not a failed live refresh"
         );
     }
 
