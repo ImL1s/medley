@@ -63,7 +63,7 @@ impl coordinator::ChildRunner for ShellChildRunner {
             // addressed to nobody. The parent already told the user.
             let mut ignored_disable_reason = None;
             ctx.web_search_sampling_config = this
-                .prepare_web_search_sampling_config_preflight(&mut ignored_disable_reason)
+                .prepare_web_search_sampling_config_preflight(&mut ignored_disable_reason, None)
                 .await;
             let refreshed = match this
                 .refresh_subagent_capabilities_for_spawn(&mut ctx, &handle)
@@ -463,8 +463,16 @@ impl MvpAgent {
             None => (None, None),
         };
         let project_trusted = crate::agent::folder_trust::project_scope_allowed(&parent_cwd);
-        let image_description_model =
-            self.resolve_image_description_model(parent_model_id.0.as_ref());
+        let (image_description_model, image_description_follows_default) = {
+            let cfg = self.cfg.borrow();
+            (
+                cfg.image_description_model
+                    .as_deref()
+                    .unwrap_or(crate::models::default_image_description_model())
+                    .to_owned(),
+                cfg.image_description_follows_default,
+            )
+        };
         let (base_roles, base_personas, subagent_model_overrides, subagent_toggle) = {
             let cfg = self.cfg.borrow();
             (
@@ -570,6 +578,7 @@ impl MvpAgent {
                 am.clone(),
             ))),
             image_description_model,
+            image_description_follows_default,
             workspace_ops: parent_workspace_ops.clone(),
             auth_manager: am.clone(),
             attribution_callback: parent_attribution_callback,

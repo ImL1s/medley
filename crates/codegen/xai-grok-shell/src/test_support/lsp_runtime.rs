@@ -119,6 +119,7 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
         worktree_type: crate::util::config::WorktreeType::Linked,
         api_key_provider: None,
         image_description_model: crate::test_support::TEST_MODEL.to_owned(),
+        image_description_follows_default: false,
         workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
         auth_manager: Arc::new(crate::auth::AuthManager::new(
             std::path::Path::new("/tmp/nonexistent-grok-test"),

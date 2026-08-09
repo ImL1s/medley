@@ -273,6 +273,7 @@ pub(crate) struct SubagentSpawnContext {
     pub worktree_type: crate::util::config::WorktreeType,
     pub api_key_provider: Option<xai_grok_tools::types::SharedApiKeyProvider>,
     pub image_description_model: String,
+    pub image_description_follows_default: bool,
     /// Dual-mode workspace operations handle.
     pub workspace_ops: xai_grok_workspace::WorkspaceOps,
     pub auth_manager: std::sync::Arc<crate::auth::AuthManager>,

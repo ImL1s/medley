@@ -1605,6 +1605,8 @@ fn model_overrides_cli_overrides_everything() {
             );
             assert_eq!(cfg.web_search, "cli-ws");
             assert_eq!(cfg.session_summary, Some("cli-ss".to_owned()));
+            assert!(!cfg.web_search_follows_default);
+            assert!(!cfg.session_summary_follows_default);
         },
     );
 }
@@ -1707,6 +1709,9 @@ fn model_overrides_unset_auxiliary_lanes_follow_the_local_configured_default() {
                 Some("gpt-5.3-codex-spark".to_owned())
             );
             assert_eq!(cfg.web_search, "gpt-5.3-codex-spark".to_owned());
+            assert!(cfg.web_search_follows_default);
+            assert!(cfg.session_summary_follows_default);
+            assert!(cfg.image_description_follows_default);
             assert_ne!(
                 cfg.session_summary.as_deref(),
                 Some(crate::models::default_session_summary_model()),
@@ -1729,6 +1734,9 @@ fn model_overrides_unset_auxiliary_lanes_follow_the_env_configured_default() {
             assert_eq!(cfg.web_search, "gpt-5.3-codex-spark");
             assert_eq!(cfg.session_summary.as_deref(), Some("gpt-5.3-codex-spark"));
             assert_eq!(cfg.image_description.as_deref(), Some("gpt-5.3-codex-spark"));
+            assert!(cfg.web_search_follows_default);
+            assert!(cfg.session_summary_follows_default);
+            assert!(cfg.image_description_follows_default);
         },
     );
 }
@@ -1762,7 +1770,48 @@ fn model_overrides_cli_configured_default_wins_over_other_defaults() {
             assert_eq!(cfg.web_search, "cli-default");
             assert_eq!(cfg.session_summary.as_deref(), Some("cli-default"));
             assert_eq!(cfg.image_description.as_deref(), Some("cli-default"));
+            assert!(cfg.web_search_follows_default);
+            assert!(cfg.session_summary_follows_default);
+            assert!(cfg.image_description_follows_default);
         },
+    );
+}
+#[test]
+fn model_overrides_inherited_web_search_uses_operative_model() {
+    assert_eq!(
+        super::auxiliary_model_or_operative(
+            "rejected-configured-default",
+            "substituted-operative-model",
+            true,
+        ),
+        "substituted-operative-model",
+    );
+    assert_eq!(
+        super::auxiliary_model_or_operative(
+            "explicit-web-search-pin",
+            "substituted-operative-model",
+            false,
+        ),
+        "explicit-web-search-pin",
+    );
+}
+#[test]
+fn model_overrides_inherited_image_uses_child_operative_model() {
+    assert_eq!(
+        super::auxiliary_model_or_operative(
+            "configured-parent-default",
+            "child-operative-model",
+            true,
+        ),
+        "child-operative-model",
+    );
+    assert_eq!(
+        super::auxiliary_model_or_operative(
+            "explicit-image-pin",
+            "child-operative-model",
+            false,
+        ),
+        "explicit-image-pin",
     );
 }
 #[test]

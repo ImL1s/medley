@@ -1157,6 +1157,11 @@ pub(crate) async fn run_shell_child(
     let subagent_model_id = effective_sampling_config.model.clone();
     let effective_catalog_identity = prepared_model.catalog_identity;
     effective_model_id = acp::ModelId::new(effective_catalog_identity.model_id.clone());
+    let image_description_model = crate::config::auxiliary_model_or_operative(
+        &ctx.image_description_model,
+        effective_model_id.0.as_ref(),
+        ctx.image_description_follows_default,
+    );
     let _ = persistence
         .tx
         .send(crate::session::persistence::PersistenceMsg::CurrentModel {
@@ -1298,7 +1303,7 @@ pub(crate) async fn run_shell_child(
         parent_traceparent,
         ctx.permission_handle.clone(),
         ctx.api_key_provider.clone(),
-        ctx.image_description_model.clone(),
+        image_description_model,
         ctx.hook_registry.clone(),
         ctx.workspace_ops.clone(),
         vec![],

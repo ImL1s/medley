@@ -621,8 +621,12 @@ fn handle_reload_models(agent: &MvpAgent) -> ExtResult {
         agent_config.models = toml_config.models.clone();
         agent_config.config_models = toml_config.config_models.clone();
         agent_config.web_search_model = overrides.web_search;
+        agent_config.web_search_follows_default = overrides.web_search_follows_default;
         agent_config.session_summary_model = overrides.session_summary;
+        agent_config.session_summary_follows_default = overrides.session_summary_follows_default;
         agent_config.image_description_model = overrides.image_description;
+        agent_config.image_description_follows_default =
+            overrides.image_description_follows_default;
         agent_config.prompt_suggest_model_pin = overrides.prompt_suggestion;
     }
     // Recompute the campaign overlay + `pre_campaign_default` (the catalog-miss

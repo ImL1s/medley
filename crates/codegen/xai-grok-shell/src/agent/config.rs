@@ -1956,13 +1956,19 @@ pub struct Config {
     /// Model ID for web_search.
     #[serde(skip)]
     pub web_search_model: String,
+    #[serde(skip)]
+    pub web_search_follows_default: bool,
     /// Session title model. Resolved to the compiled default
     /// (`default_session_summary_model`) when unset; see `ModelOverrideConfig::resolve`.
     #[serde(skip)]
     pub session_summary_model: Option<String>,
+    #[serde(skip)]
+    pub session_summary_follows_default: bool,
     /// Image describe model (`grok-build` default via `ModelOverrideConfig::resolve`).
     #[serde(skip)]
     pub image_description_model: Option<String>,
+    #[serde(skip)]
+    pub image_description_follows_default: bool,
     /// Next-prompt suggestion model pin (`env > [models] prompt_suggestion >
     /// remote`), consumed catalog-guarded by `handle_suggest_prompt`; see
     /// `ModelOverrideConfig::resolve`.
@@ -2215,8 +2221,11 @@ impl Default for Config {
             compat_resolved: CompatConfig::default(),
             requirements: Requirements::default(),
             web_search_model: crate::models::default_web_search_model().to_owned(),
+            web_search_follows_default: false,
             session_summary_model: None,
+            session_summary_follows_default: false,
             image_description_model: None,
+            image_description_follows_default: false,
             prompt_suggest_model_pin: crate::config::PromptSuggestModelPin::Unpinned,
         };
         cfg.apply_env_overrides();
@@ -2499,8 +2508,12 @@ impl Config {
         let model_overrides =
             crate::config::ModelOverrideConfig::resolve(None, None, raw_config, None);
         config.web_search_model = model_overrides.web_search;
+        config.web_search_follows_default = model_overrides.web_search_follows_default;
         config.session_summary_model = model_overrides.session_summary;
+        config.session_summary_follows_default = model_overrides.session_summary_follows_default;
         config.image_description_model = model_overrides.image_description;
+        config.image_description_follows_default =
+            model_overrides.image_description_follows_default;
         config.prompt_suggest_model_pin = model_overrides.prompt_suggestion;
         config.apply_env_overrides();
         Ok(config)
@@ -2637,8 +2650,11 @@ impl Config {
             ctx.remote_settings,
         );
         self.web_search_model = models.web_search;
+        self.web_search_follows_default = models.web_search_follows_default;
         self.session_summary_model = models.session_summary;
+        self.session_summary_follows_default = models.session_summary_follows_default;
         self.image_description_model = models.image_description;
+        self.image_description_follows_default = models.image_description_follows_default;
         self.prompt_suggest_model_pin = models.prompt_suggestion;
         self.cli_experimental_memory = ctx.cli_experimental_memory;
         self.cli_no_memory = ctx.cli_no_memory;
@@ -16060,11 +16076,14 @@ hooks = true
             storage_mode: None,
         });
         assert_eq!(cfg.web_search_model, "custom-default");
+        assert!(cfg.web_search_follows_default);
         assert_eq!(cfg.session_summary_model.as_deref(), Some("custom-default"));
+        assert!(cfg.session_summary_follows_default);
         assert_eq!(
             cfg.image_description_model.as_deref(),
             Some("custom-default")
         );
+        assert!(cfg.image_description_follows_default);
     }
     #[test]
     #[serial]

@@ -717,10 +717,13 @@ impl ManagedMcpsConfig {
 #[serde(default)]
 pub(crate) struct ModelOverrideConfig {
     pub web_search: String,
+    pub web_search_follows_default: bool,
     /// `None` = current model.
     pub session_summary: Option<String>,
+    pub session_summary_follows_default: bool,
     /// Compiled default (`grok-build`) when unset locally, remotely, and via env.
     pub image_description: Option<String>,
+    pub image_description_follows_default: bool,
     /// Next-prompt suggestion model pin. Unlike the other overrides this does
     /// NOT fill a compiled default — see [`PromptSuggestModelPin`].
     #[serde(skip)]
@@ -730,8 +733,11 @@ impl Default for ModelOverrideConfig {
     fn default() -> Self {
         Self {
             web_search: crate::models::default_web_search_model().to_owned(),
+            web_search_follows_default: false,
             session_summary: None,
+            session_summary_follows_default: false,
             image_description: None,
+            image_description_follows_default: false,
             prompt_suggestion: PromptSuggestModelPin::Unpinned,
         }
     }
@@ -774,6 +780,17 @@ fn non_empty_model_override(value: Option<&str>) -> Option<String> {
             Some(trimmed.to_owned())
         }
     })
+}
+pub(crate) fn auxiliary_model_or_operative(
+    configured: &str,
+    operative: &str,
+    follows_default: bool,
+) -> String {
+    if follows_default {
+        operative.to_owned()
+    } else {
+        configured.to_owned()
+    }
 }
 impl ModelOverrideConfig {
     /// CLI flag > env var > lane-specific config.toml > lane-specific remote
@@ -892,20 +909,28 @@ impl ModelOverrideConfig {
             remote.and_then(|r| r.default_model.as_deref()),
         )
         .map(|resolved| resolved.value);
+        let web_search_follows_default = web_search.is_none() && configured_default.is_some();
+        let session_summary_follows_default =
+            session_summary.is_none() && configured_default.is_some();
+        let image_description_follows_default =
+            image_description.is_none() && configured_default.is_some();
         Self {
             web_search: web_search
                 .or_else(|| configured_default.clone())
                 .unwrap_or_else(|| crate::models::default_web_search_model().to_owned()),
+            web_search_follows_default,
             session_summary: Some(
                 session_summary
                     .or_else(|| configured_default.clone())
                     .unwrap_or_else(|| crate::models::default_session_summary_model().to_owned()),
             ),
+            session_summary_follows_default,
             image_description: Some(
                 image_description
                     .or(configured_default)
                     .unwrap_or_else(|| crate::models::default_image_description_model().to_owned()),
             ),
+            image_description_follows_default,
             prompt_suggestion,
         }
     }
