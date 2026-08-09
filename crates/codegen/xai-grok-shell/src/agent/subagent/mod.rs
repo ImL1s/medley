@@ -908,9 +908,15 @@ async fn read_parent_prepared_model(ctx: &SubagentSpawnContext) -> PreparedSubag
                 .filter(|_| allow_missing_preferred_remap && opaque_model_name_override)
                 .map(|identity| identity.route.as_str())
                 .unwrap_or(&cfg.model);
+            // A committed model id is a catalog key, not a fresh user-facing
+            // selector. Once that key disappears, do not reinterpret it as
+            // another entry's routing slug before the lineage-authorized scan.
+            let preferred_catalog_key = (!allow_missing_preferred_remap
+                || ctx.available_models.contains_key(preferred_model_id))
+            .then_some(preferred_model_id);
             let capabilities = crate::agent::models::capabilities_for_route_in(
                 &ctx.available_models,
-                Some(preferred_model_id),
+                preferred_catalog_key,
                 capability_route,
                 catalog_identity.is_some() && !allow_missing_preferred_remap,
                 opaque_model_name_override

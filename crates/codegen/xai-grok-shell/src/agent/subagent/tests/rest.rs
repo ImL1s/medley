@@ -2991,7 +2991,7 @@ async fn read_parent_sampling_config_unique_route_remaps_through_opaque_override
     let mut replacement = test_model_entry("retained-routing-model");
     replacement.info.supports_backend_search = true;
     replacement.info.codex_wire = Some(replacement_caps.clone());
-    let mut colliding = test_model_entry("opaque-backend-routing-hint");
+    let mut colliding = test_model_entry("removed-alias");
     colliding.info.codex_wire = Some(xai_grok_sampling_types::CodexWireCapabilities {
         supports_reasoning_summary_parameter: Some(true),
         ..Default::default()
@@ -3009,7 +3009,7 @@ async fn read_parent_sampling_config_unique_route_remaps_through_opaque_override
     ctx.sampling_config.model = "startup-routing-model".to_string();
     let chat = ctx.parent_chat_state.as_ref().expect("chat state");
     let mut snapshot = chat.snapshot().await.expect("chat snapshot");
-    snapshot.sampling_config.model = "opaque-backend-routing-hint".to_string();
+    snapshot.sampling_config.model = "removed-alias".to_string();
     snapshot.catalog_identity = Some(test_catalog_identity(
         "removed-alias",
         "retained-routing-model",
@@ -3022,7 +3022,7 @@ async fn read_parent_sampling_config_unique_route_remaps_through_opaque_override
     assert_eq!(prepared.model_id.0.as_ref(), "replacement-entry");
     assert_eq!(
         prepared.sampling_config.model,
-        "opaque-backend-routing-hint"
+        "removed-alias"
     );
     assert!(prepared.sampling_config.supports_backend_search);
     assert_eq!(prepared.sampling_config.codex_wire, Some(replacement_caps));
