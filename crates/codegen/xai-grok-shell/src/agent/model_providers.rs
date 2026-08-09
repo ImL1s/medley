@@ -113,6 +113,13 @@ fn persist_codex_catalog_cache(path: &std::path::Path, payload: &serde_json::Val
         tracing::warn!(error = %error, "Codex catalog cache directory creation failed");
         return;
     }
+    #[cfg(unix)]
+    if cache_directory_created
+        && let Some(home) = parent.parent()
+        && let Err(error) = std::fs::File::open(home).and_then(|directory| directory.sync_all())
+    {
+        tracing::warn!(error = %error, "Codex catalog cache parent directory sync failed");
+    }
     static CACHE_WRITE_SEQUENCE: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
     let sequence = CACHE_WRITE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -144,13 +151,6 @@ fn persist_codex_catalog_cache(path: &std::path::Path, payload: &serde_json::Val
     #[cfg(unix)]
     if let Err(error) = std::fs::File::open(parent).and_then(|directory| directory.sync_all()) {
         tracing::warn!(error = %error, "Codex catalog cache directory sync failed");
-    }
-    #[cfg(unix)]
-    if cache_directory_created
-        && let Some(home) = parent.parent()
-        && let Err(error) = std::fs::File::open(home).and_then(|directory| directory.sync_all())
-    {
-        tracing::warn!(error = %error, "Codex catalog cache parent directory sync failed");
     }
 }
 
