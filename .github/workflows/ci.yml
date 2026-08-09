@@ -1509,6 +1509,14 @@ jobs:
             current_reasoning_effort_rejects_persisted_value_outside_model_menu -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_metadata_override_can_disable_reasoning_effort -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_metadata_override_rejects_default_outside_inherited_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            catalog_refresh_clears_current_effort_removed_from_model_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            config_refresh_clears_current_effort_removed_from_model_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            model_switch_rejects_effort_outside_model_menu -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             codex_catalog_effort_options_are_model_specific -- --nocapture
 

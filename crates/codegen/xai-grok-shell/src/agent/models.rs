@@ -537,6 +537,7 @@ impl ModelsManager {
         } else {
             self.reselect_current_model_if_missing(&new_config);
         }
+        self.revalidate_current_reasoning_effort();
 
         self.notify_models_updated();
     }
@@ -744,6 +745,22 @@ impl ModelsManager {
 
     pub(crate) fn set_current_reasoning_effort(&self, effort: Option<ReasoningEffort>) {
         *self.inner.current_reasoning_effort.write() = effort;
+    }
+
+    fn revalidate_current_reasoning_effort(&self) {
+        let Some(effort) = self.current_reasoning_effort() else {
+            return;
+        };
+        let current_model_id = self.inner.current_model_id.read().clone();
+        let is_valid = {
+            let catalog = self.inner.catalog.read();
+            resolve_catalog_key(&catalog.models, &current_model_id)
+                .and_then(|model_id| catalog.models.get(model_id.0.as_ref()))
+                .is_some_and(|entry| model_offers_reasoning_effort(&entry.info, effort))
+        };
+        if !is_valid {
+            *self.inner.current_reasoning_effort.write() = None;
+        }
     }
 
     /// Whether the given model supports reasoning effort according to the catalog.
@@ -1472,6 +1489,7 @@ impl ModelsManager {
         } else {
             self.reselect_current_model_if_missing(cfg);
         }
+        self.revalidate_current_reasoning_effort();
     }
 
     fn apply_refresh_result(

@@ -817,6 +817,71 @@ fn current_reasoning_effort_rejects_persisted_value_outside_model_menu() {
     );
 }
 
+fn reasoning_entry_with_menu(model: &str, effort: ReasoningEffort) -> (String, ModelEntry) {
+    let mut entry = ModelEntry {
+        info: config::ModelInfo::fallback(model),
+        api_key: None,
+        env_key: None,
+        auth_provider: None,
+        api_base_url: None,
+        config_validation_errors: Vec::new(),
+    };
+    entry.info.supports_reasoning_effort = true;
+    entry.info.reasoning_efforts = vec![ReasoningEffortOption {
+        id: effort.to_string(),
+        value: effort,
+        label: effort.to_string(),
+        description: None,
+        default: true,
+    }];
+    entry.info.reasoning_effort = Some(effort);
+    (model.to_owned(), entry)
+}
+
+#[test]
+fn catalog_refresh_clears_current_effort_removed_from_model_menu() {
+    let mgr = test_manager();
+    mgr.set_current_reasoning_effort(Some(ReasoningEffort::High));
+    mgr.apply_catalog_for_test(IndexMap::from([reasoning_entry_with_menu(
+        "default",
+        ReasoningEffort::Low,
+    )]));
+    assert_eq!(mgr.current_reasoning_effort(), None);
+}
+
+#[test]
+fn config_refresh_clears_current_effort_removed_from_model_menu() {
+    let tmp = std::env::temp_dir().join("grok-test-models-manager-config-effort-refresh");
+    let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
+    let mgr = ModelsManager::new(
+        None,
+        IndexMap::from([reasoning_entry_with_menu("default", ReasoningEffort::High)]),
+        acp::ModelId::new("default"),
+        auth_manager,
+        config::Config::default(),
+    );
+    mgr.set_current_reasoning_effort(Some(ReasoningEffort::High));
+
+    let mut new_config = config::Config::default();
+    new_config.config_models.insert(
+        "default".to_owned(),
+        config::ConfigModelOverride {
+            supports_reasoning_effort: Some(true),
+            reasoning_effort: Some(ReasoningEffort::Low),
+            reasoning_efforts: vec![ReasoningEffortOption {
+                id: "low".into(),
+                value: ReasoningEffort::Low,
+                label: "Low".into(),
+                description: None,
+                default: true,
+            }],
+            ..Default::default()
+        },
+    );
+    mgr.apply_config(new_config);
+    assert_eq!(mgr.current_reasoning_effort(), None);
+}
+
 #[test]
 fn default_reasoning_effort_only_stamps_supporting_model() {
     use indexmap::IndexMap;

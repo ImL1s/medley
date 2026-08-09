@@ -5,6 +5,7 @@
 //! callers (`new_session`, `load_session`, prompt restore) cannot attach an
 //! unready model (e.g. invalid `auth_scheme` fail-open → ambient Bearer).
 use crate::agent::config;
+use crate::agent::models::model_offers_reasoning_effort;
 use crate::agent::mvp_agent::{
     MvpAgent, SessionLoadGuard, agent_name_after_model_switch, apply_session_cli_clamps,
     harnesses_are_compatible, resolve_required_agent_type,
@@ -12,7 +13,14 @@ use crate::agent::mvp_agent::{
 use crate::session::SessionCommand;
 use agent_client_protocol::{self as acp};
 use tokio::sync::oneshot;
-use xai_grok_sampling_types::parse_reasoning_effort_meta;
+use xai_grok_sampling_types::{ReasoningEffort, parse_reasoning_effort_meta};
+
+fn model_switch_offers_reasoning_effort(
+    model: &config::ModelEntry,
+    effort: ReasoningEffort,
+) -> bool {
+    model_offers_reasoning_effort(model.info(), effort)
+}
 
 pub(crate) struct FailureTelemetry {
     armed: bool,
@@ -307,7 +315,7 @@ async fn apply_with_load_gate(
     let mut model_sampling =
         agent.prepare_sampling_config_for_model(&model, handle.origin_client.clone());
     if let Some(eff) = effort_override {
-        if model.info().supports_reasoning_effort {
+        if model_switch_offers_reasoning_effort(&model, eff) {
             tracing::info!(
                 session_id = %session_id.0,
                 effort = %eff,
@@ -320,7 +328,7 @@ async fn apply_with_load_gate(
                 model_id = %catalog_model_id.0,
                 model_slug = %model.info().model,
                 effort = %eff,
-                "set_session_model: ignoring reasoning_effort override — model does not support it"
+                "set_session_model: ignoring reasoning_effort override — model does not offer it"
             );
         }
     }
@@ -483,6 +491,30 @@ fn broadcast_model_changed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xai_grok_sampling_types::ReasoningEffortOption;
+
+    #[test]
+    fn model_switch_rejects_effort_outside_model_menu() {
+        let mut model =
+            config::ModelEntry::fallback("catalog-model", &config::EndpointsConfig::default());
+        model.info.supports_reasoning_effort = true;
+        model.info.reasoning_efforts = vec![ReasoningEffortOption {
+            id: "low".into(),
+            value: ReasoningEffort::Low,
+            label: "Low".into(),
+            description: None,
+            default: true,
+        }];
+
+        assert!(model_switch_offers_reasoning_effort(
+            &model,
+            ReasoningEffort::Low
+        ));
+        assert!(
+            !model_switch_offers_reasoning_effort(&model, ReasoningEffort::Xhigh),
+            "set_session_model metadata must not bypass the model-specific catalog menu"
+        );
+    }
 
     #[test]
     fn failure_telemetry_uses_structured_actor_phase_without_guessing() {

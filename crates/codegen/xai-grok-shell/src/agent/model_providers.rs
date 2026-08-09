@@ -823,6 +823,13 @@ fn merge_openai_codex_preset_entries(
         if user_entry.reasoning_efforts.is_empty()
             && user_entry.supports_reasoning_effort != Some(false)
         {
+            if user_entry.reasoning_effort.is_some_and(|effort| {
+                !reasoning_efforts
+                    .iter()
+                    .any(|option| option.value == effort)
+            }) {
+                user_entry.reasoning_effort = reasoning_effort;
+            }
             user_entry.reasoning_efforts = reasoning_efforts;
         }
         if user_entry.codex_wire.is_none() {
@@ -2824,6 +2831,42 @@ mod tests {
         let info = &resolved[key].info;
         assert!(!info.supports_reasoning_effort);
         assert!(info.reasoning_efforts.is_empty());
+    }
+
+    #[test]
+    fn codex_catalog_metadata_override_rejects_default_outside_inherited_menu() {
+        let key = "gpt-codex-limited";
+        let mut models = IndexMap::from([(
+            key.to_owned(),
+            ConfigModelOverride {
+                reasoning_effort: Some(xai_grok_sampling_types::ReasoningEffort::Xhigh),
+                ..ConfigModelOverride::default()
+            },
+        )]);
+        let presets = parse_openai_codex_catalog_models(&serde_json::json!({
+            "models": [{
+                "slug": key,
+                "default_reasoning_level": "high",
+                "supported_reasoning_levels": [
+                    { "effort": "low" },
+                    { "effort": "high" }
+                ]
+            }]
+        }));
+        merge_openai_codex_preset_entries(&mut models, presets);
+
+        let merged = models.get(key).expect("merged metadata override");
+        assert_eq!(
+            merged.reasoning_effort,
+            Some(xai_grok_sampling_types::ReasoningEffort::High),
+            "a scalar outside the inherited menu must fall back to the catalog default"
+        );
+        assert!(
+            merged
+                .reasoning_efforts
+                .iter()
+                .all(|option| option.value != xai_grok_sampling_types::ReasoningEffort::Xhigh)
+        );
     }
 
     /// `data` / `id` / `name` are tolerances for shapes this endpoint does not

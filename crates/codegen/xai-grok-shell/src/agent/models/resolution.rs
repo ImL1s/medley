@@ -646,7 +646,7 @@ pub(crate) fn resolve_model_catalog(
 }
 
 /// Whether `effort` is a value this model will accept on the wire.
-pub(super) fn model_offers_reasoning_effort(
+pub(crate) fn model_offers_reasoning_effort(
     info: &config::ModelInfo,
     effort: ReasoningEffort,
 ) -> bool {
