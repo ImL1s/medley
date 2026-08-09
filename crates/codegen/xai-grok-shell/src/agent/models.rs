@@ -267,7 +267,7 @@ impl ModelsManager {
         preferred_id: Option<&str>,
         routing_model: &str,
         preferred_id_must_exist: bool,
-        allow_preferred_route_mismatch: bool,
+        alternate_preferred_route: Option<&str>,
     ) -> Option<ResolvedModelCapabilities> {
         let catalog = self.inner.catalog.read();
         let models = &catalog.models;
@@ -280,7 +280,8 @@ impl ModelsManager {
                 models
                     .get(key.0.as_ref())
                     .filter(|entry| {
-                        allow_preferred_route_mismatch || entry.info().model == routing_model
+                        entry.info().model == routing_model
+                            || alternate_preferred_route == Some(entry.info().model.as_str())
                     })
                     .map(|entry| (key.0.to_string(), entry))
             });

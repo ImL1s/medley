@@ -847,7 +847,7 @@ async fn read_parent_sampling_config(
                 Some(preferred_model_id),
                 &cfg.model,
                 committed_model_id.is_some(),
-                opaque_model_name_override,
+                opaque_model_name_override.then_some(ctx.sampling_config.model.as_str()),
             );
             let model_id = capabilities
                 .as_ref()
@@ -1015,8 +1015,8 @@ async fn read_parent_sampling_config(
     let capabilities = ctx.models_manager.capabilities_for_route(
         Some(ctx.sampling_config_model_id.0.as_ref()),
         &fallback.model,
-        false,
-        false,
+        true,
+        None,
     );
     let fallback_model_id = capabilities
         .as_ref()

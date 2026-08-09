@@ -2361,6 +2361,7 @@ async fn read_parent_sampling_config_fallback_resolves_codex_wire_from_catalog()
     models.insert("composer-2-fast".to_string(), entry);
     let mut ctx = ctx_with_toggle(HashMap::new());
     ctx.model_id = acp::ModelId::new("composer-2-fast");
+    ctx.sampling_config_model_id = acp::ModelId::new("composer-2-fast");
     ctx.parent_chat_state = None;
     ctx.sampling_config.model = "composer-2-fast".to_string();
     ctx.sampling_config.codex_wire = Some(parent_caps);
@@ -2500,6 +2501,68 @@ async fn read_parent_sampling_config_opaque_name_override_keeps_committed_capabi
     assert_eq!(config.model, "opaque-backend-routing-hint");
     assert!(config.supports_backend_search);
     assert_eq!(config.codex_wire, Some(committed_caps));
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_opaque_override_rejects_reused_committed_key() {
+    let baseline_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let replacement_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut replacement = test_model_entry("replacement-routing-model");
+    replacement.info.codex_wire = Some(replacement_caps);
+    let mut models = indexmap::IndexMap::new();
+    models.insert("catalog-entry".to_string(), replacement);
+    let mut ctx = ctx_with_parent_chat_state(
+        "catalog-entry",
+        "original-routing-model",
+        "catalog-entry",
+        models,
+    );
+    ctx.sampling_config.model = "original-routing-model".to_string();
+    ctx.sampling_config.codex_wire = Some(baseline_caps.clone());
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.sampling_config.model = "opaque-backend-routing-hint".to_string();
+    snapshot.catalog_model_id = Some("catalog-entry".to_string());
+    chat.restore_snapshot(snapshot);
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "opaque-backend-routing-hint");
+    assert_eq!(config.codex_wire, Some(baseline_caps));
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_fallback_missing_id_ignores_same_route_survivor() {
+    let baseline_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let mut survivor = test_model_entry("shared-routing-model");
+    survivor.info.codex_wire = Some(xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    });
+    let mut models = indexmap::IndexMap::new();
+    models.insert("surviving-entry".to_string(), survivor);
+    let mut ctx = ctx_with_parent_chat_state(
+        "removed-entry",
+        "shared-routing-model",
+        "surviving-entry",
+        models,
+    );
+    ctx.parent_chat_state = None;
+    ctx.sampling_config.codex_wire = Some(baseline_caps.clone());
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "shared-routing-model");
+    assert_eq!(config.codex_wire, Some(baseline_caps));
 }
 
 /// A refreshed catalog can replace a retained catalog id (`auto`) with the
