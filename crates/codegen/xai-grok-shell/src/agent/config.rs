@@ -4634,6 +4634,10 @@ pub struct ConfigModelOverride {
     /// parse fills it. Skipped in serde so unknown user keys stay ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_wire: Option<xai_grok_sampling_types::CodexWireCapabilities>,
+    /// Runtime-only state from the Codex catalog refresh. Kept separate from
+    /// `description` so a metadata-only user override cannot erase it.
+    #[serde(skip)]
+    pub(crate) catalog_degraded_reason: Option<String>,
     /// Raw `auth_scheme` string when TOML parsing failed. Not persisted; used to
     /// fail-closed at resolve time instead of defaulting to Bearer.
     #[serde(skip)]
@@ -4690,6 +4694,10 @@ impl std::fmt::Debug for ConfigModelOverride {
             .field("show_model_fingerprint", &self.show_model_fingerprint)
             .field("stream_tool_calls", &self.stream_tool_calls)
             .field("codex_wire", &self.codex_wire)
+            .field(
+                "catalog_degraded_reason_present",
+                &self.catalog_degraded_reason.is_some(),
+            )
             .field(
                 "invalid_auth_scheme_present",
                 &self.invalid_auth_scheme.is_some(),
@@ -4796,6 +4804,21 @@ impl ConfigModelOverride {
         if self.codex_wire.is_some() {
             entry.info.codex_wire.clone_from(&self.codex_wire);
         }
+        entry
+            .info
+            .catalog_degraded_reason
+            .clone_from(&self.catalog_degraded_reason);
+        if let Some(reason) = self.catalog_degraded_reason.as_deref() {
+            let description = entry
+                .info
+                .description
+                .take()
+                .unwrap_or_else(|| "OpenAI Codex via a ChatGPT subscription".to_owned());
+            entry.info.description = Some(format!(
+                "{description} — {}{reason}",
+                super::model_providers::OPENAI_CODEX_CATALOG_DEGRADED_MARKER
+            ));
+        }
         if self.api_key.is_some() {
             entry.api_key.clone_from(&self.api_key);
         }
@@ -4899,6 +4922,10 @@ pub struct ModelInfo {
     /// not each tax SamplingConfig.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_wire: Option<xai_grok_sampling_types::CodexWireCapabilities>,
+    /// Runtime-only operational state for an account-scoped Codex catalog.
+    /// Never infer this from user-controlled display text.
+    #[serde(skip)]
+    pub(crate) catalog_degraded_reason: Option<String>,
 }
 
 impl std::fmt::Debug for ModelInfo {
@@ -4946,6 +4973,10 @@ impl std::fmt::Debug for ModelInfo {
             .field("stream_tool_calls", &self.stream_tool_calls)
             .field("laziness_detector", &self.laziness_detector)
             .field("codex_wire", &self.codex_wire)
+            .field(
+                "catalog_degraded_reason_present",
+                &self.catalog_degraded_reason.is_some(),
+            )
             .finish()
     }
 }
@@ -4987,6 +5018,7 @@ impl ModelInfo {
             stream_tool_calls: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
             codex_wire: None,
+            catalog_degraded_reason: None,
         }
     }
     /// Extract shared model metadata from a flat config entry.
@@ -5025,6 +5057,7 @@ impl ModelInfo {
             stream_tool_calls: entry.stream_tool_calls,
             laziness_detector: entry.laziness_detector.clone(),
             codex_wire: None,
+            catalog_degraded_reason: None,
         }
     }
     /// Derive the legacy effort gate/default from `reasoning_efforts` so the
@@ -5975,6 +6008,7 @@ pub(crate) fn resolve_aux_model_sampling_config(
                 stream_tool_calls: None,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
                 codex_wire: None,
+                catalog_degraded_reason: None,
             },
             api_key: Some(bearer),
             env_key: None,
@@ -6604,6 +6638,7 @@ fn resolve_hidden_default_web_search_sampling_config(
             stream_tool_calls: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
             codex_wire: None,
+            catalog_degraded_reason: None,
         },
         api_key: None,
         env_key: None,
@@ -7185,6 +7220,12 @@ pub(crate) fn to_acp_model_info(
                     map.insert(
                         "readinessReason".to_string(),
                         serde_json::Value::String(reason),
+                    );
+                }
+                if let Some(reason) = info.catalog_degraded_reason.as_deref() {
+                    map.insert(
+                        "catalogDegradedReason".to_string(),
+                        serde_json::Value::String(reason.to_owned()),
                     );
                 }
                 map.insert(
@@ -9238,6 +9279,7 @@ reasoning_effort = "low"
                 stream_tool_calls: None,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
                 codex_wire: None,
+                catalog_degraded_reason: None,
             },
             api_key: api_key.map(|s| s.to_string()),
             env_key: env_key.map(EnvKeys::single),
@@ -16781,6 +16823,7 @@ default = "grok-4.5"
                 auto_compact_threshold_percent: None,
                 system_prompt_label: None,
                 codex_wire: None,
+                catalog_degraded_reason: None,
             },
             api_key: None,
             env_key: None,

@@ -35,12 +35,207 @@ pub const OPENAI_CODEX_PRESET_MODEL_ID: &str = "gpt-5.6-sol";
 /// re-stated.
 const OPENAI_CODEX_PRESET_CONTEXT_WINDOW: u64 = 200_000;
 const OPENAI_CODEX_MODELS_CATALOG_DESCRIPTION: &str = "OpenAI Codex via a ChatGPT subscription";
+const OPENAI_CODEX_CATALOG_CACHE_DIR: &str = "codex-model-catalog";
+const OPENAI_CODEX_CATALOG_CACHE_SCHEMA: u32 = 1;
+pub(crate) const OPENAI_CODEX_CATALOG_DEGRADED_MARKER: &str = "Catalog degraded: ";
+const OPENAI_CODEX_SAVED_CATALOG_REASON: &str =
+    "live refresh failed; using the last saved catalog for this account";
+const OPENAI_CODEX_BUILTIN_FALLBACK_REASON: &str =
+    "live refresh failed and no saved catalog exists for this account; using the built-in fallback";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CodexCatalogCache {
+    schema: u32,
+    payload: serde_json::Value,
+}
 
 struct CodexCatalogCredential {
     access_token: String,
     account_id: Option<String>,
     chatgpt_account_is_fedramp: bool,
     source: xai_grok_sampler::CredentialSource,
+}
+
+struct CodexCatalogCacheIdentity {
+    account_id: Option<String>,
+    chatgpt_account_is_fedramp: bool,
+}
+
+fn codex_catalog_cache_path(
+    home: &std::path::Path,
+    identity: &CodexCatalogCacheIdentity,
+) -> Option<std::path::PathBuf> {
+    let account_id = identity.account_id.as_deref()?;
+    // The filename is stable for one account and origin, but never exposes the
+    // raw account id. FedRAMP is part of the identity boundary as well: the
+    // same account label must not bridge those two catalog authorities.
+    let identity = format!(
+        "v1\0{}\0{}\0{}",
+        crate::auth::openai_codex::CODEX_API_BASE_URL,
+        identity.chatgpt_account_is_fedramp,
+        account_id
+    );
+    let key = blake3::hash(identity.as_bytes()).to_hex();
+    Some(
+        home.join(OPENAI_CODEX_CATALOG_CACHE_DIR)
+            .join(format!("{key}.json")),
+    )
+}
+
+fn load_codex_catalog_cache(
+    path: &std::path::Path,
+) -> Option<IndexMap<String, ConfigModelOverride>> {
+    let bytes = std::fs::read(path).ok()?;
+    let cache: CodexCatalogCache = serde_json::from_slice(&bytes).ok()?;
+    if cache.schema != OPENAI_CODEX_CATALOG_CACHE_SCHEMA {
+        tracing::debug!(path = %path.display(), "Codex catalog cache schema mismatch");
+        return None;
+    }
+    let models = parse_openai_codex_catalog_models(&cache.payload);
+    (!models.is_empty()).then_some(models)
+}
+
+fn persist_codex_catalog_cache(path: &std::path::Path, payload: &serde_json::Value) {
+    let cache = CodexCatalogCache {
+        schema: OPENAI_CODEX_CATALOG_CACHE_SCHEMA,
+        payload: payload.clone(),
+    };
+    let Ok(bytes) = serde_json::to_vec_pretty(&cache) else {
+        tracing::warn!("Codex catalog cache serialization failed");
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    #[cfg(unix)]
+    let cache_directory_created = !parent.exists();
+    if let Err(error) = std::fs::create_dir_all(parent) {
+        tracing::warn!(error = %error, "Codex catalog cache directory creation failed");
+        return;
+    }
+    #[cfg(unix)]
+    if cache_directory_created
+        && let Some(home) = parent.parent()
+        && let Err(error) = std::fs::File::open(home).and_then(|directory| directory.sync_all())
+    {
+        tracing::warn!(error = %error, "Codex catalog cache parent directory sync failed");
+    }
+    static CACHE_WRITE_SEQUENCE: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let sequence = CACHE_WRITE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.tmp.{}.{sequence}", std::process::id()));
+    if let Err(error) = write_codex_catalog_cache_tmp(&tmp, &bytes) {
+        tracing::warn!(error = %error, "Codex catalog cache write failed");
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    if let Err(error) = replace_codex_catalog_cache(&tmp, path) {
+        tracing::warn!(error = %error, "Codex catalog cache publish failed");
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    #[cfg(unix)]
+    if let Err(error) = std::fs::File::open(parent).and_then(|directory| directory.sync_all()) {
+        tracing::warn!(error = %error, "Codex catalog cache directory sync failed");
+    }
+}
+
+fn write_codex_catalog_cache_tmp(tmp: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let open = || {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        options.open(tmp)
+    };
+    let mut file = match open() {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(tmp)?;
+            open()?
+        }
+        Err(error) => return Err(error),
+    };
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+fn replace_codex_catalog_cache(
+    tmp: &std::path::Path,
+    path: &std::path::Path,
+) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        if !path.exists() {
+            return std::fs::rename(tmp, path);
+        }
+
+        use std::iter::once;
+        use std::os::windows::ffi::OsStrExt as _;
+        use windows::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        };
+        use windows::core::PCWSTR;
+
+        let from: Vec<u16> = tmp.as_os_str().encode_wide().chain(once(0)).collect();
+        let to: Vec<u16> = path.as_os_str().encode_wide().chain(once(0)).collect();
+        unsafe {
+            MoveFileExW(
+                PCWSTR::from_raw(from.as_ptr()),
+                PCWSTR::from_raw(to.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }
+        .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(tmp, path)
+    }
+}
+
+fn mark_codex_catalog_degraded(
+    mut models: IndexMap<String, ConfigModelOverride>,
+    reason: &str,
+) -> IndexMap<String, ConfigModelOverride> {
+    for model in models.values_mut() {
+        model.catalog_degraded_reason = Some(reason.to_owned());
+    }
+    models
+}
+
+fn codex_catalog_fallback_models(
+    cache_path: Option<&std::path::Path>,
+) -> IndexMap<String, ConfigModelOverride> {
+    if let Some(models) = cache_path.and_then(load_codex_catalog_cache) {
+        tracing::warn!(
+            count = models.len(),
+            "Codex catalog live refresh failed; using account-scoped last-good cache"
+        );
+        return mark_codex_catalog_degraded(models, OPENAI_CODEX_SAVED_CATALOG_REASON);
+    }
+    tracing::warn!("Codex catalog live refresh failed; using visible built-in fallback");
+    mark_codex_catalog_degraded(
+        openai_codex_preset_models(),
+        OPENAI_CODEX_BUILTIN_FALLBACK_REASON,
+    )
+}
+
+fn load_codex_catalog_when_remote_fetch_disabled(
+    cache_path: Option<&std::path::Path>,
+) -> Option<IndexMap<String, ConfigModelOverride>> {
+    let models = cache_path.and_then(load_codex_catalog_cache)?;
+    tracing::info!(
+        count = models.len(),
+        "Codex catalog live refresh skipped; using account-scoped saved catalog"
+    );
+    Some(models)
 }
 
 impl std::fmt::Debug for CodexCatalogCredential {
@@ -65,8 +260,9 @@ fn codex_catalog_credential_source_is_valid(source: &xai_grok_sampler::Credentia
     )
 }
 
-fn codex_catalog_credential() -> Option<CodexCatalogCredential> {
-    let snapshot = crate::auth::openai_codex::load_snapshot(&crate::util::grok_home::grok_home())?;
+fn codex_catalog_credential_from_snapshot(
+    snapshot: crate::auth::ProviderCredentialSnapshot,
+) -> Option<CodexCatalogCredential> {
     let access_token = snapshot.access_token.trim();
     if access_token.is_empty() {
         return None;
@@ -85,6 +281,34 @@ fn codex_catalog_credential() -> Option<CodexCatalogCredential> {
             name: OPENAI_CODEX_PROVIDER_ID.to_owned(),
         },
     })
+}
+
+fn codex_catalog_access_from_manager(
+    manager: &crate::auth::AuthManager,
+) -> Option<(CodexCatalogCacheIdentity, Option<CodexCatalogCredential>)> {
+    // Retain the verified account boundary even when the bearer has entered
+    // the refresh window or expired. It is safe for cache lookup only; the
+    // live request below still requires credential_snapshot/current().
+    let retained = manager.current_or_expired()?;
+    let identity = CodexCatalogCacheIdentity {
+        account_id: retained
+            .account_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned),
+        chatgpt_account_is_fedramp: retained.chatgpt_account_is_fedramp,
+    };
+    let live = crate::auth::openai_codex::credential_snapshot(manager)
+        .and_then(codex_catalog_credential_from_snapshot);
+    Some((identity, live))
+}
+
+fn codex_catalog_access(
+    home: &std::path::Path,
+) -> Option<(CodexCatalogCacheIdentity, Option<CodexCatalogCredential>)> {
+    let manager = crate::auth::AuthManager::new_openai_codex(home);
+    codex_catalog_access_from_manager(&manager)
 }
 
 /// `GET /models` rejects a request without this query parameter — HTTP 400,
@@ -302,7 +526,7 @@ fn parse_openai_codex_catalog_models(
 fn fetch_openai_codex_catalog_models_blocking(
     credential: CodexCatalogCredential,
     url: String,
-) -> Option<IndexMap<String, ConfigModelOverride>> {
+) -> Option<(serde_json::Value, IndexMap<String, ConfigModelOverride>)> {
     let client = crate::remote::client::models_catalog_blocking_client();
     let request = apply_codex_catalog_auth_headers(client.get(url), &credential)?;
     let response = match request.send() {
@@ -331,7 +555,7 @@ fn fetch_openai_codex_catalog_models_blocking(
         tracing::warn!("Codex catalog fetch returned no usable models");
         return None;
     }
-    Some(models)
+    Some((payload, models))
 }
 
 /// Run the complete reqwest blocking request outside any caller's Tokio
@@ -342,7 +566,7 @@ fn fetch_openai_codex_catalog_models_blocking(
 fn fetch_openai_codex_catalog_models_on_native_thread(
     credential: CodexCatalogCredential,
     url: String,
-) -> Option<IndexMap<String, ConfigModelOverride>> {
+) -> Option<(serde_json::Value, IndexMap<String, ConfigModelOverride>)> {
     let worker = match std::thread::Builder::new()
         .name("codex-model-catalog".to_owned())
         .spawn(move || fetch_openai_codex_catalog_models_blocking(credential, url))
@@ -366,16 +590,33 @@ fn fetch_openai_codex_catalog_models() -> Option<IndexMap<String, ConfigModelOve
     if cfg!(test) {
         return None;
     }
+    let home = crate::util::grok_home::grok_home();
+    let (cache_identity, credential) = codex_catalog_access(&home)?;
+    let cache_path = codex_catalog_cache_path(&home, &cache_identity);
     if !crate::util::config::resolve_remote_fetch_enabled() {
-        return None;
+        return load_codex_catalog_when_remote_fetch_disabled(cache_path.as_deref());
     }
-    let credential = codex_catalog_credential()?;
+    let Some(credential) = credential else {
+        return Some(codex_catalog_fallback_models(cache_path.as_deref()));
+    };
     let url = format!(
         "{}/models?client_version={}",
         crate::auth::openai_codex::CODEX_API_BASE_URL,
         OPENAI_CODEX_CATALOG_CLIENT_VERSION
     );
-    fetch_openai_codex_catalog_models_on_native_thread(credential, url)
+    match fetch_openai_codex_catalog_models_on_native_thread(credential, url) {
+        Some((payload, models)) => {
+            if let Some(path) = cache_path.as_deref() {
+                persist_codex_catalog_cache(path, &payload);
+            } else {
+                tracing::warn!(
+                    "Codex catalog has no verified account id; not persisting account-scoped cache"
+                );
+            }
+            Some(models)
+        }
+        None => Some(codex_catalog_fallback_models(cache_path.as_deref())),
+    }
 }
 
 fn effective_openai_codex_presets(
@@ -451,7 +692,17 @@ impl ConfigModelOverride {
 pub(crate) fn merge_openai_codex_presets(
     config_models: &mut IndexMap<String, ConfigModelOverride>,
 ) {
-    for (key, preset) in effective_openai_codex_presets(fetch_openai_codex_catalog_models()) {
+    merge_openai_codex_preset_entries(
+        config_models,
+        effective_openai_codex_presets(fetch_openai_codex_catalog_models()),
+    );
+}
+
+fn merge_openai_codex_preset_entries(
+    config_models: &mut IndexMap<String, ConfigModelOverride>,
+    presets: IndexMap<String, ConfigModelOverride>,
+) {
+    for (key, preset) in presets {
         let Some(user_entry) = config_models.get_mut(&key) else {
             config_models.insert(key, preset);
             continue;
@@ -471,6 +722,7 @@ pub(crate) fn merge_openai_codex_presets(
             reasoning_effort,
             supports_reasoning_effort,
             codex_wire,
+            catalog_degraded_reason,
             ..
         } = preset;
         user_entry.model_provider = model_provider;
@@ -493,6 +745,7 @@ pub(crate) fn merge_openai_codex_presets(
         if user_entry.codex_wire.is_none() {
             user_entry.codex_wire = codex_wire;
         }
+        user_entry.catalog_degraded_reason = catalog_degraded_reason;
     }
 }
 
@@ -782,6 +1035,8 @@ impl ConfigModelOverride {
 
 #[cfg(test)]
 mod tests {
+    use agent_client_protocol as acp;
+
     use super::*;
     use crate::agent::config::{Config, resolve_credentials, resolve_model_list};
 
@@ -828,7 +1083,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("build child Tokio runtime");
-        let models = runtime
+        let (_, models) = runtime
             .block_on(
                 async move { fetch_openai_codex_catalog_models_on_native_thread(credential, url) },
             )
@@ -2425,6 +2680,259 @@ mod tests {
         assert_eq!(
             preset.context_window,
             Some(OPENAI_CODEX_PRESET_CONTEXT_WINDOW)
+        );
+    }
+
+    fn catalog_test_identity(account_id: &str) -> CodexCatalogCacheIdentity {
+        CodexCatalogCacheIdentity {
+            account_id: Some(account_id.to_owned()),
+            chatgpt_account_is_fedramp: false,
+        }
+    }
+
+    fn catalog_test_payload(model: &str) -> serde_json::Value {
+        serde_json::json!({
+            "models": [{
+                "slug": model,
+                "display_name": model,
+                "context_window": 123_456
+            }]
+        })
+    }
+
+    /// #262: the cache identity includes the verified account id. A cache hit
+    /// for account A must remain a miss for account B even though both use the
+    /// same endpoint and auth provider.
+    #[test]
+    fn codex_catalog_last_good_cache_is_account_keyed() {
+        let home = tempfile::tempdir().expect("temporary catalog cache home");
+        let account_a = catalog_test_identity("account-a");
+        let account_b = catalog_test_identity("account-b");
+        let path_a = codex_catalog_cache_path(home.path(), &account_a).expect("account A path");
+        let path_b = codex_catalog_cache_path(home.path(), &account_b).expect("account B path");
+
+        assert_ne!(path_a, path_b);
+        assert!(!path_a.to_string_lossy().contains("account-a"));
+        persist_codex_catalog_cache(&path_a, &catalog_test_payload("codex-a"));
+        assert!(load_codex_catalog_cache(&path_a).is_some());
+        assert!(
+            load_codex_catalog_cache(&path_b).is_none(),
+            "account B must not read account A's entitlements"
+        );
+
+        persist_codex_catalog_cache(&path_a, &catalog_test_payload("codex-a-new"));
+        let refreshed_a = load_codex_catalog_cache(&path_a).expect("refreshed account A cache");
+        assert!(refreshed_a.contains_key("codex-a-new"));
+        assert!(
+            !refreshed_a.contains_key("codex-a"),
+            "a later successful refresh must replace the account's last-good snapshot"
+        );
+
+        persist_codex_catalog_cache(&path_b, &catalog_test_payload("codex-b"));
+        assert!(
+            load_codex_catalog_cache(&path_a)
+                .unwrap()
+                .contains_key("codex-a-new")
+        );
+        assert!(
+            load_codex_catalog_cache(&path_b)
+                .unwrap()
+                .contains_key("codex-b")
+        );
+    }
+
+    /// A crash may leave the deterministic PID/sequence temp path behind.
+    /// The next refresh must clean that stale file and still persist bytes.
+    #[test]
+    fn codex_catalog_cache_temp_write_retries_stale_path() {
+        let home = tempfile::tempdir().expect("temporary catalog cache home");
+        let tmp = home.path().join("catalog.json.tmp.reused");
+        std::fs::write(&tmp, b"stale partial catalog").expect("seed stale temp file");
+
+        write_codex_catalog_cache_tmp(&tmp, b"fresh complete catalog")
+            .expect("replace stale temp file");
+        assert_eq!(
+            std::fs::read(&tmp).expect("read refreshed temp file"),
+            b"fresh complete catalog"
+        );
+    }
+
+    /// #262: an expired bearer is not eligible for the live request, but its
+    /// retained verified account id must still select that account's cache.
+    #[test]
+    fn codex_catalog_expired_credential_can_read_account_cache() {
+        let home = tempfile::tempdir().expect("temporary catalog cache home");
+        let manager = crate::auth::AuthManager::new_openai_codex(home.path());
+        manager.hot_swap(crate::auth::GrokAuth {
+            key: "expired-catalog-token".to_owned(),
+            auth_mode: crate::auth::AuthMode::Oidc,
+            expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+            refresh_token: Some("retained-refresh-token".to_owned()),
+            account_id: Some("account-expired".to_owned()),
+            ..crate::auth::GrokAuth::test_default()
+        });
+
+        let (identity, live) =
+            codex_catalog_access_from_manager(&manager).expect("retained account identity");
+        assert!(
+            live.is_none(),
+            "expired bearer must not reach the live request"
+        );
+        let path = codex_catalog_cache_path(home.path(), &identity).expect("account cache path");
+        persist_codex_catalog_cache(&path, &catalog_test_payload("codex-last-good"));
+
+        let fallback = codex_catalog_fallback_models(Some(&path));
+        assert!(fallback.contains_key("codex-last-good"));
+        assert_eq!(
+            fallback["codex-last-good"]
+                .catalog_degraded_reason
+                .as_deref(),
+            Some(OPENAI_CODEX_SAVED_CATALOG_REASON)
+        );
+    }
+
+    /// Disabling network discovery suppresses only the live request; it must
+    /// not discard the account's already persisted model menu.
+    #[test]
+    fn codex_catalog_remote_fetch_disabled_uses_account_cache() {
+        let home = tempfile::tempdir().expect("temporary catalog cache home");
+        let identity = catalog_test_identity("account-offline");
+        let path = codex_catalog_cache_path(home.path(), &identity).expect("account cache path");
+        persist_codex_catalog_cache(&path, &catalog_test_payload("codex-offline"));
+
+        let models = load_codex_catalog_when_remote_fetch_disabled(Some(&path))
+            .expect("saved offline catalog");
+        assert!(models.contains_key("codex-offline"));
+        assert!(
+            models["codex-offline"].catalog_degraded_reason.is_none(),
+            "an intentional network policy is not a failed live refresh"
+        );
+    }
+
+    /// #262: a failed live refresh keeps the account's last-good menu and
+    /// carries a structured reason through ACP instead of silently looking
+    /// identical to the old single-model preset.
+    #[test]
+    fn codex_catalog_saved_fallback_is_visible_in_acp_metadata() {
+        let home = tempfile::tempdir().expect("temporary catalog cache home");
+        let credential = catalog_test_identity("account-a");
+        let path = codex_catalog_cache_path(home.path(), &credential).expect("cache path");
+        persist_codex_catalog_cache(&path, &catalog_test_payload("codex-saved"));
+        let fallback = codex_catalog_fallback_models(Some(&path));
+        assert!(fallback.contains_key("codex-saved"));
+
+        let mut cfg = Config::new_from_toml_cfg(&toml::Value::Table(toml::map::Map::new()))
+            .expect("empty config");
+        cfg.config_models = fallback;
+        let resolved = resolve_model_list(&cfg, None);
+        let meta = crate::agent::config::to_acp_model_info(&resolved)
+            .get(&acp::ModelId::new("codex-saved"))
+            .and_then(|model| model.meta.as_ref())
+            .cloned()
+            .expect("saved model ACP metadata");
+        assert_eq!(
+            meta.get("catalogDegradedReason")
+                .and_then(serde_json::Value::as_str),
+            Some(OPENAI_CODEX_SAVED_CATALOG_REASON)
+        );
+    }
+
+    /// A user's display-text override must not erase operational fallback
+    /// state while the built-in preset supplies the routing underneath it.
+    #[test]
+    fn codex_catalog_degraded_state_survives_description_override() {
+        let presets = mark_codex_catalog_degraded(
+            openai_codex_preset_models(),
+            OPENAI_CODEX_SAVED_CATALOG_REASON,
+        );
+        let mut models = IndexMap::from([(
+            OPENAI_CODEX_PRESET_MODEL_ID.to_owned(),
+            ConfigModelOverride {
+                description: Some("My Codex model".to_owned()),
+                ..ConfigModelOverride::default()
+            },
+        )]);
+        merge_openai_codex_preset_entries(&mut models, presets);
+        assert_eq!(
+            models[OPENAI_CODEX_PRESET_MODEL_ID]
+                .catalog_degraded_reason
+                .as_deref(),
+            Some(OPENAI_CODEX_SAVED_CATALOG_REASON)
+        );
+
+        let mut cfg = Config::new_from_toml_cfg(&toml::Value::Table(toml::map::Map::new()))
+            .expect("empty config");
+        cfg.config_models = models;
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved
+            .get(OPENAI_CODEX_PRESET_MODEL_ID)
+            .expect("merged Codex model");
+        assert_eq!(
+            model.info.catalog_degraded_reason.as_deref(),
+            Some(OPENAI_CODEX_SAVED_CATALOG_REASON)
+        );
+        assert!(
+            model
+                .info
+                .description
+                .as_deref()
+                .is_some_and(|description| description.starts_with("My Codex model — "))
+        );
+        let acp_models = crate::agent::config::to_acp_model_info(&resolved);
+        let meta = acp_models
+            .get(&acp::ModelId::new(OPENAI_CODEX_PRESET_MODEL_ID))
+            .and_then(|model| model.meta.as_ref())
+            .expect("Codex ACP metadata");
+        assert_eq!(
+            meta.get("catalogDegradedReason")
+                .and_then(serde_json::Value::as_str),
+            Some(OPENAI_CODEX_SAVED_CATALOG_REASON)
+        );
+
+        let healthy = ConfigModelOverride {
+            description: Some(format!(
+                "User-authored text containing {}but no runtime failure",
+                OPENAI_CODEX_CATALOG_DEGRADED_MARKER
+            )),
+            ..ConfigModelOverride::default()
+        }
+        .apply(
+            "healthy-custom",
+            None,
+            &crate::agent::config::EndpointsConfig::default(),
+        );
+        let healthy_models = IndexMap::from([("healthy-custom".to_owned(), healthy)]);
+        let healthy_acp = crate::agent::config::to_acp_model_info(&healthy_models);
+        assert!(
+            healthy_acp[&acp::ModelId::new("healthy-custom")]
+                .meta
+                .as_ref()
+                .is_none_or(|meta| !meta.contains_key("catalogDegradedReason")),
+            "display text alone must not synthesize operational degraded state"
+        );
+    }
+
+    /// #262's persisted-default criterion is already enforced by #131's
+    /// substitution wire field. Pin the interaction with the built-in fallback
+    /// so a missing saved/default model cannot become a silent model change.
+    #[test]
+    fn codex_catalog_builtin_fallback_reports_absent_persisted_default() {
+        let fallback = codex_catalog_fallback_models(None);
+        let mut cfg = Config::new_from_toml_cfg(&toml::Value::Table(toml::map::Map::new()))
+            .expect("empty config");
+        cfg.config_models = fallback;
+        cfg.models.default = Some("gpt-5.4".to_owned());
+        let resolved = resolve_model_list(&cfg, None);
+        let (_key, _entry, source, _reason) =
+            crate::agent::models::resolve_default_model(&cfg, &resolved, true);
+        let substitution = crate::agent::models::substituted_preference(&cfg, source)
+            .expect("absent persisted default must be reported");
+        assert_eq!(
+            substitution.to_meta_value(),
+            serde_json::json!({
+                "configuredModelId": "gpt-5.4",
+                "source": "config"
+            })
         );
     }
 
