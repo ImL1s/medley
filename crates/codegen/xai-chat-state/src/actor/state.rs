@@ -120,6 +120,9 @@ pub(crate) struct ChatState {
     pub conversation: Vec<ConversationItem>,
     /// Current sampling configuration (model, context window, etc.).
     pub sampling_config: SamplingConfig,
+    /// Catalog identity paired with `sampling_config`, when a model switch
+    /// supplied one.
+    pub catalog_identity: Option<crate::types::CatalogIdentity>,
     /// Current prompt index (incremented per user turn).
     pub prompt_index: usize,
     /// Cached prompt texts for rewind preview.
@@ -207,7 +210,17 @@ impl ChatState {
     /// `chat_history.jsonl` has an assistant message with tool call IDs that
     /// lack matching `ToolResult` entries. Without this, the in-memory state
     /// would carry broken conversation history until the next `build_request`.
-    pub fn new(mut conversation: Vec<ConversationItem>, sampling_config: SamplingConfig) -> Self {
+    pub fn new(conversation: Vec<ConversationItem>, sampling_config: SamplingConfig) -> Self {
+        Self::new_with_catalog_identity(conversation, sampling_config, None)
+    }
+
+    /// Create state with a catalog identity bound atomically to the initial
+    /// sampling config.
+    pub fn new_with_catalog_identity(
+        mut conversation: Vec<ConversationItem>,
+        sampling_config: SamplingConfig,
+        catalog_identity: Option<crate::types::CatalogIdentity>,
+    ) -> Self {
         let deduped = dedup_duplicate_tool_results(&mut conversation);
         if deduped > 0 {
             tracing::info!(
@@ -229,6 +242,7 @@ impl ChatState {
         Self {
             conversation,
             sampling_config,
+            catalog_identity,
             prompt_index: 0,
             prompt_texts: Vec::new(),
             total_tokens: initial_tokens,
@@ -300,6 +314,21 @@ mod tests {
         assert!(state.stream_start_ms.is_none());
         assert!(state.turn_start_ms.is_none());
         assert!(state.last_compaction_prompt_index.is_none());
+
+        let catalog_state = ChatState::new_with_catalog_identity(
+            vec![],
+            test_sampling_config(),
+            Some(crate::types::CatalogIdentity {
+                model_id: "profile-entry".to_string(),
+                route: "profile-route".to_string(),
+                lineage: crate::types::CatalogResolutionLineage::UniqueRoute,
+                auth_scheme: None,
+            }),
+        );
+        let identity = catalog_state.catalog_identity.as_ref().unwrap();
+        assert_eq!(identity.model_id, "profile-entry");
+        assert_eq!(identity.route, "profile-route");
+        assert!(identity.allows_route_remap());
     }
 
     #[test]

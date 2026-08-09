@@ -56,6 +56,7 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
             header_injector: None,
             codex_wire: None,
         },
+        sampling_config_model_id: acp::ModelId::new("test"),
         alpha_test_key: None,
         auth_method_id: acp::AuthMethodId::new("test"),
         model_id: acp::ModelId::new("test"),

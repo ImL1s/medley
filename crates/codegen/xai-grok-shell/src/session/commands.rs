@@ -139,7 +139,7 @@ pub struct TaskWakeAdmission {
 /// switch transaction. The actor revalidates harness compatibility and all
 /// zero-turn prerequisites before mutating either harness or model state.
 pub struct PreparedModelSwitch {
-    pub catalog_model_id: acp::ModelId,
+    pub catalog_identity: xai_chat_state::CatalogIdentity,
     pub resolved_model: crate::agent::config::ModelEntry,
     pub sampling_config: xai_grok_sampler::SamplerConfig,
     pub use_concise: bool,

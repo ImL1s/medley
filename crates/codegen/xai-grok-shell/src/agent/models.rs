@@ -70,9 +70,20 @@ pub(crate) fn task_model_error_for_catalog(
     let is_available = |entry: &ModelEntry| {
         entry.info.user_selectable && entry.info.visible_for_auth(is_session_auth)
     };
-    if config::find_model_by_id(available, requested).is_some_and(&is_available) {
+    if resolve_catalog_identity(available, &acp::ModelId::new(requested))
+        .and_then(|identity| available.get(identity.model_id.as_str()))
+        .is_some_and(&is_available)
+    {
         return None;
     }
+
+    let ambiguous_route = !available.contains_key(requested)
+        && available
+            .values()
+            .filter(|entry| entry.info().model == requested)
+            .take(2)
+            .count()
+            > 1;
 
     let mut slugs = available
         .iter()
@@ -89,13 +100,33 @@ pub(crate) fn task_model_error_for_catalog(
             slugs.join(", ")
         )
     };
-    Some(format!("Unknown Task.model slug '{requested}'. {guidance}"))
+    if ambiguous_route {
+        Some(format!(
+            "Ambiguous Task.model slug '{requested}'. Use an exact catalog key. {guidance}"
+        ))
+    } else {
+        Some(format!("Unknown Task.model slug '{requested}'. {guidance}"))
+    }
 }
 
 /// Thread-safe model manager.
 #[derive(Clone)]
 pub struct ModelsManager {
     inner: Arc<Inner>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ResolvedModelCapabilities {
+    pub model_id: acp::ModelId,
+    pub byok: crate::agent::auth_method::ModelByok,
+    pub agent_type: String,
+    pub auth_scheme: xai_grok_sampler::AuthScheme,
+    pub supports_reasoning_effort: bool,
+    pub supports_backend_search: bool,
+    pub auto_compact_threshold_percent: Option<u8>,
+    pub compactions_remaining: Option<xai_grok_sampling_types::CompactionsRemaining>,
+    pub compaction_at_tokens: Option<xai_grok_sampling_types::CompactionAtTokens>,
+    pub codex_wire: Option<xai_grok_sampling_types::CodexWireCapabilities>,
 }
 
 /// Catalog fields written together under one lock, so readers never see a torn mix.
@@ -248,7 +279,81 @@ impl ModelsManagerBuilder {
     }
 }
 
+pub(crate) fn capabilities_for_route_in(
+    models: &IndexMap<String, ModelEntry>,
+    preferred_id: Option<&str>,
+    routing_model: &str,
+    preferred_id_must_exist: bool,
+    alternate_preferred_route: Option<&str>,
+) -> Option<ResolvedModelCapabilities> {
+    if preferred_id_must_exist && preferred_id.is_some_and(|id| !models.contains_key(id)) {
+        return None;
+    }
+    let preferred = preferred_id
+        .filter(|id| models.contains_key(*id))
+        .map(acp::ModelId::new)
+        .and_then(|key| {
+            models
+                .get(key.0.as_ref())
+                .filter(|entry| {
+                    entry.info().model == routing_model
+                        || alternate_preferred_route == Some(entry.info().model.as_str())
+                })
+                .map(|entry| (key.0.to_string(), entry))
+        });
+    let (model_id, entry) = if preferred_id_must_exist {
+        preferred?
+    } else if let Some(preferred) = preferred {
+        preferred
+    } else {
+        let mut matches = models
+            .iter()
+            .filter(|(_, entry)| entry.info().model == routing_model);
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        (first.0.clone(), first.1)
+    };
+    let info = entry.info();
+    Some(ResolvedModelCapabilities {
+        model_id: acp::ModelId::new(model_id),
+        byok: if entry.has_own_credentials() {
+            crate::agent::auth_method::ModelByok::Byok
+        } else {
+            crate::agent::auth_method::ModelByok::NotByok
+        },
+        agent_type: info.agent_type.clone(),
+        auth_scheme: info.auth_scheme,
+        supports_reasoning_effort: info.supports_reasoning_effort,
+        supports_backend_search: info.supports_backend_search,
+        auto_compact_threshold_percent: info.auto_compact_threshold_percent,
+        compactions_remaining: info.compactions_remaining,
+        compaction_at_tokens: info.compaction_at_tokens,
+        codex_wire: info.codex_wire.clone(),
+    })
+}
+
 impl ModelsManager {
+    /// Resolve one routing model and copy all request-shaping facts while
+    /// holding a single catalog read lock. An exact key that routes elsewhere
+    /// never shadows a unique routing-model match.
+    pub(crate) fn capabilities_for_route(
+        &self,
+        preferred_id: Option<&str>,
+        routing_model: &str,
+        preferred_id_must_exist: bool,
+        alternate_preferred_route: Option<&str>,
+    ) -> Option<ResolvedModelCapabilities> {
+        let catalog = self.inner.catalog.read();
+        capabilities_for_route_in(
+            &catalog.models,
+            preferred_id,
+            routing_model,
+            preferred_id_must_exist,
+            alternate_preferred_route,
+        )
+    }
     pub(crate) fn new(
         prefetched: Option<IndexMap<String, ModelEntry>>,
         models: IndexMap<String, ModelEntry>,
@@ -445,6 +550,26 @@ impl ModelsManager {
         self.inner.catalog.read().models.clone()
     }
 
+    /// Return the complete catalog and its ACP-selectable projection from one
+    /// catalog generation. Callers that authorize a persisted model must not
+    /// combine independently captured `models()` and `available()` snapshots.
+    pub(crate) fn models_and_available(
+        &self,
+    ) -> (
+        IndexMap<String, ModelEntry>,
+        IndexMap<acp::ModelId, acp::ModelInfo>,
+    ) {
+        let is_session_auth = self.is_session_auth();
+        let models = self.inner.catalog.read().models.clone();
+        let selectable = models
+            .iter()
+            .filter(|(_, entry)| entry.info.user_selectable)
+            .map(|(key, entry)| (key.clone(), entry.clone()))
+            .collect();
+        let available = available_models(&selectable, is_session_auth);
+        (models, available)
+    }
+
     pub fn endpoints(&self) -> config::EndpointsConfig {
         self.inner.cfg.read().endpoints.clone()
     }
@@ -481,18 +606,7 @@ impl ModelsManager {
 
     /// ACP-visible (non-hidden) projection of the catalog.
     pub fn available(&self) -> IndexMap<acp::ModelId, acp::ModelInfo> {
-        let snapshot = {
-            let cat = self.inner.catalog.read();
-            let models = &cat.models;
-            models.clone()
-        };
-
-        let selectable: IndexMap<_, _> = snapshot
-            .into_iter()
-            .filter(|(_, e)| e.info.user_selectable)
-            .collect();
-
-        available_models(&selectable, self.is_session_auth())
+        self.models_and_available().1
     }
 
     pub(crate) fn task_model_error(&self, requested: &str) -> Option<String> {
@@ -660,24 +774,54 @@ impl ModelsManager {
     }
 
     pub(crate) fn model_supports_backend_search(&self, model_id: &str) -> bool {
-        self.inner
-            .catalog
-            .read()
-            .models
-            .get(model_id)
+        let catalog = self.inner.catalog.read();
+        let models = &catalog.models;
+        resolve_catalog_key(models, &acp::ModelId::new(model_id))
+            .and_then(|key| models.get(key.0.as_ref()))
             .map(|e| e.info().supports_backend_search)
             .unwrap_or(false)
+    }
+
+    /// Catalog wire capabilities for one model.
+    ///
+    /// Read this instead of copying `codex_wire` off a `SamplingConfig`: the
+    /// config's copy belongs to whichever model was selected when it was
+    /// built, which is not necessarily the model about to be sampled (#245,
+    /// #277).
+    pub(crate) fn model_codex_wire(
+        &self,
+        model_id: &str,
+    ) -> Option<xai_grok_sampling_types::CodexWireCapabilities> {
+        let catalog = self.inner.catalog.read();
+        let models = &catalog.models;
+        resolve_catalog_key(models, &acp::ModelId::new(model_id))
+            .and_then(|key| models.get(key.0.as_ref()))
+            .and_then(|e| e.info().codex_wire.clone())
+    }
+
+    /// Whether two model identities resolve to the same catalog entry.
+    ///
+    /// Exact equality intentionally succeeds even on a catalog miss: runtime
+    /// models can be absent from the config-derived catalog (#159).
+    pub(crate) fn model_ids_refer_to_same_entry(&self, left: &str, right: &str) -> bool {
+        if left == right {
+            return true;
+        }
+        let catalog = self.inner.catalog.read();
+        let models = &catalog.models;
+        let left = resolve_catalog_key(models, &acp::ModelId::new(left));
+        let right = resolve_catalog_key(models, &acp::ModelId::new(right));
+        left.is_some() && left == right
     }
 
     pub(crate) fn model_compactions_remaining(
         &self,
         model_id: &str,
     ) -> Option<xai_grok_sampling_types::CompactionsRemaining> {
-        self.inner
-            .catalog
-            .read()
-            .models
-            .get(model_id)
+        let catalog = self.inner.catalog.read();
+        let models = &catalog.models;
+        resolve_catalog_key(models, &acp::ModelId::new(model_id))
+            .and_then(|key| models.get(key.0.as_ref()))
             .and_then(|e| e.info().compactions_remaining)
     }
 
@@ -685,11 +829,10 @@ impl ModelsManager {
         &self,
         model_id: &str,
     ) -> Option<xai_grok_sampling_types::CompactionAtTokens> {
-        self.inner
-            .catalog
-            .read()
-            .models
-            .get(model_id)
+        let catalog = self.inner.catalog.read();
+        let models = &catalog.models;
+        resolve_catalog_key(models, &acp::ModelId::new(model_id))
+            .and_then(|key| models.get(key.0.as_ref()))
             .and_then(|e| e.info().compaction_at_tokens)
     }
 

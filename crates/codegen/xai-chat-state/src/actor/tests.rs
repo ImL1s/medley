@@ -1173,6 +1173,46 @@ async fn update_sampling_config_is_queryable() {
 }
 
 #[tokio::test]
+async fn prepared_model_state_never_tears_routing_from_credentials() {
+    let h = TestHarness::new();
+    let writer = h.handle.clone();
+    let reader = h.handle.clone();
+
+    let write_task = tokio::spawn(async move {
+        for index in 0..500 {
+            let marker = if index % 2 == 0 { "model-a" } else { "model-b" };
+            writer.update_sampling_config_and_credentials(
+                SamplingConfig::for_test("https://api.example.com", marker),
+                crate::types::Credentials::bound(
+                    Some(format!("key-{marker}")),
+                    crate::types::AuthType::ApiKey,
+                    xai_grok_sampling_types::CredentialSource::ModelApiKey,
+                ),
+            );
+            tokio::task::yield_now().await;
+        }
+    });
+    let read_task = tokio::spawn(async move {
+        for _ in 0..500 {
+            let (config, _identity, credentials) = reader
+                .get_prepared_model_state()
+                .await
+                .expect("actor is alive");
+            match config.model.as_str() {
+                "test-model" => assert!(credentials.api_key().is_none()),
+                "model-a" => assert_eq!(credentials.api_key(), Some("key-model-a")),
+                "model-b" => assert_eq!(credentials.api_key(), Some("key-model-b")),
+                other => panic!("unexpected model {other}"),
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+
+    write_task.await.expect("writer task");
+    read_task.await.expect("reader task");
+}
+
+#[tokio::test]
 async fn notification_meta_reflects_timing() {
     let h = TestHarness::new();
     h.handle.record_stream_start(1000);

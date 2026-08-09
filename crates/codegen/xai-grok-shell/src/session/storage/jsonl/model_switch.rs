@@ -18,6 +18,8 @@ struct ModelSwitchIntent {
     version: u8,
     messages: Vec<ConversationItem>,
     model_id: acp::ModelId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    catalog_identity: Option<xai_chat_state::CatalogIdentity>,
     agent_name: Option<String>,
     reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
 }
@@ -35,6 +37,25 @@ impl JsonlStorageAdapter {
         agent_name: Option<&str>,
         reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
     ) -> Result<(), ModelSwitchCommitError> {
+        self.commit_model_switch_with_identity_sync(
+            info,
+            messages,
+            model_id,
+            None,
+            agent_name,
+            reasoning_effort,
+        )
+    }
+
+    pub(super) fn commit_model_switch_with_identity_sync(
+        &self,
+        info: &Info,
+        messages: &[ConversationItem],
+        model_id: &acp::ModelId,
+        catalog_identity: Option<&xai_chat_state::CatalogIdentity>,
+        agent_name: Option<&str>,
+        reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
+    ) -> Result<(), ModelSwitchCommitError> {
         let session_dir = self.session_dir(info);
         let lock = self
             .open_model_switch_lock(&session_dir)
@@ -49,6 +70,7 @@ impl JsonlStorageAdapter {
             version: 1,
             messages: messages.to_vec(),
             model_id: model_id.clone(),
+            catalog_identity: catalog_identity.cloned(),
             agent_name: agent_name.map(str::to_owned),
             reasoning_effort,
         };
@@ -165,6 +187,7 @@ impl JsonlStorageAdapter {
                 cwd_switch_bookkeeping_generation: Some(cwd_switch_bookkeeping_generation),
                 model: Some(super::super::summary_write::ModelPatch {
                     model_id: intent.model_id.clone(),
+                    catalog_identity: intent.catalog_identity.clone(),
                     agent_name: intent.agent_name.clone(),
                     reasoning_effort: Some(intent.reasoning_effort),
                 }),

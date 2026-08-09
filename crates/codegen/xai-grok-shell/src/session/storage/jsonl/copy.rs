@@ -492,7 +492,12 @@ fn fork_summary(
             .new_model_id
             .clone()
             .map(acp::ModelId::new)
-            .unwrap_or(source.current_model_id),
+            .unwrap_or_else(|| source.current_model_id.clone()),
+        catalog_identity: options
+            .new_model_id
+            .is_none()
+            .then_some(source.catalog_identity)
+            .flatten(),
         parent_session_id: options.parent_session_id.clone(),
         forked_at: Some(chrono::Utc::now()),
         collection_id: None,
@@ -522,7 +527,11 @@ fn fork_summary(
         // A fork keeps the parent's title, so its manual-ness rides along.
         title_is_manual: source.title_is_manual,
         worktree_label: source.worktree_label,
-        agent_name: source.agent_name,
+        agent_name: options
+            .new_model_id
+            .is_none()
+            .then_some(source.agent_name)
+            .flatten(),
         sandbox_profile: source.sandbox_profile,
         reasoning_effort: source.reasoning_effort,
         // Full forks keep the parent's last turn. Partial forks

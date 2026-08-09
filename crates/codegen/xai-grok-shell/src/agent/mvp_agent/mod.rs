@@ -285,6 +285,7 @@ pub(crate) struct SessionSpawnOptions<'a> {
     pub managed_mcp_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub model_agent_type: Option<&'a str>,
     pub session_model_id: acp::ModelId,
+    pub persisted_catalog_identity: Option<xai_chat_state::CatalogIdentity>,
     pub session_yolo_mode: bool,
     pub session_auto_mode: bool,
     pub prompt_display_cwd: Option<String>,
@@ -465,6 +466,7 @@ pub(crate) fn chat_session_spawn_options<'a>(
         managed_mcp_expires_at: None,
         model_agent_type,
         session_model_id,
+        persisted_catalog_identity: None,
         session_yolo_mode,
         session_auto_mode: false,
         prompt_display_cwd: None,
@@ -772,6 +774,11 @@ pub struct MvpAgent {
     /// only api_key is written here (same for all clients). Per-session base_url
     /// is resolved at session creation time in `new_session` / `load_session`.
     pub(crate) sampling_config: RefCell<SamplingConfig>,
+    /// Catalog identity that owns `sampling_config`. Unlike
+    /// `ModelsManager::current_model_id`, this does not change when a session
+    /// switches models, so fallback consumers cannot attach the startup
+    /// config's capabilities to the switched model.
+    pub(crate) sampling_config_model_id: acp::ModelId,
     pub(crate) auth_manager: Arc<AuthManager>,
     pub(crate) models_manager: crate::agent::models::ModelsManager,
     /// grok.com chat-product catalog (`/rest/modes`) for chat sessions; distinct
@@ -1214,10 +1221,17 @@ impl ColdSpawnModelSelection {
         &self,
         registry: &SessionRegistry,
         session_id: &acp::SessionId,
+        catalog_identity: Option<xai_chat_state::CatalogIdentity>,
+        agent_name: Option<String>,
     ) {
         registry.take_unavailable_model(session_id);
         if let Some(model_id) = self.unavailable_model.as_ref() {
-            registry.set_unavailable_model(session_id, model_id.clone());
+            registry.set_unavailable_model_with_identity(
+                session_id,
+                model_id.clone(),
+                catalog_identity,
+                agent_name,
+            );
         }
     }
 }
@@ -1237,6 +1251,54 @@ pub(crate) fn cold_spawn_fallback_selection(
         model_id: current_only_fallback.unwrap_or_else(|| persisted_model.clone()),
         unavailable_model: Some(persisted_model.clone()),
     }
+}
+
+pub(crate) fn should_reject_unresolved_persisted_identity(
+    models: &IndexMap<String, ModelEntry>,
+    persisted_identity: Option<&xai_chat_state::CatalogIdentity>,
+    reconciled_identity: Option<&xai_chat_state::CatalogIdentity>,
+) -> bool {
+    persisted_identity.is_some() && !models.is_empty() && reconciled_identity.is_none()
+}
+
+pub(crate) fn reconcile_latched_catalog_snapshot(
+    models: &IndexMap<String, ModelEntry>,
+    available: &IndexMap<acp::ModelId, acp::ModelInfo>,
+    identity: &xai_chat_state::CatalogIdentity,
+) -> Option<(acp::ModelId, xai_chat_state::CatalogIdentity, ModelEntry)> {
+    crate::agent::models::reconcile_persisted_catalog_identity(models, identity).and_then(
+        |reconciled| {
+            let model_id = acp::ModelId::new(reconciled.model_id.clone());
+            available
+                .contains_key(&model_id)
+                .then_some(model_id)
+                .and_then(|model_id| {
+                    models
+                        .get(reconciled.model_id.as_str())
+                        .cloned()
+                        .map(|model| (model_id, reconciled, model))
+                })
+        },
+    )
+}
+
+pub(crate) fn recovered_model_harness_is_compatible(
+    active_definition: &xai_grok_agent::AgentDefinition,
+    model: &ModelEntry,
+    required_definition: Option<&xai_grok_agent::AgentDefinition>,
+) -> bool {
+    harnesses_are_compatible(
+        active_definition,
+        model.info().agent_type.as_str(),
+        required_definition,
+    )
+}
+
+pub(crate) fn latched_recovery_has_required_harness(
+    identity: Option<&xai_chat_state::CatalogIdentity>,
+    agent_name: Option<&str>,
+) -> bool {
+    identity.is_none() || agent_name.is_some()
 }
 
 /// Apply the main session's authoritative CLI clamps to a freshly discovered

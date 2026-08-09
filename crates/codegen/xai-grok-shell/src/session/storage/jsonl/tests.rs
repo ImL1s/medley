@@ -8,6 +8,76 @@ use agent_client_protocol as acp;
 use tempfile::TempDir;
 
 #[tokio::test]
+async fn restart_preserves_unique_route_identity_against_removed_key_reuse() {
+    let temp_dir = TempDir::new().unwrap();
+    let info = create_test_info();
+    let writer = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    writer
+        .init_session(&info, acp::ModelId::new("removed-key"))
+        .await
+        .unwrap();
+    let identity = xai_chat_state::CatalogIdentity {
+        model_id: "removed-key".to_string(),
+        route: "retained-route".to_string(),
+        lineage: xai_chat_state::CatalogResolutionLineage::UniqueRoute,
+        auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
+    };
+    writer
+        .commit_model_switch_with_identity(
+            &info,
+            &[ConversationItem::user("persist identity")],
+            &acp::ModelId::new("removed-key"),
+            Some(&identity),
+            Some("default"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Simulate a new process loading the JSONL session after the original key
+    // disappeared and was reused for an unrelated route.
+    let reader = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let loaded = reader.load_session(&info).await.unwrap();
+    let restored = loaded
+        .summary
+        .catalog_identity
+        .expect("catalog identity must survive restart");
+    assert_eq!(restored, identity);
+
+    let endpoints = crate::agent::config::EndpointsConfig::default();
+    let mut reused = crate::agent::config::ModelEntry::fallback("attacker-route", &endpoints);
+    reused.info.model = "attacker-route".to_string();
+    let mut replacement =
+        crate::agent::config::ModelEntry::fallback("retained-route", &endpoints);
+    replacement.info.model = "retained-route".to_string();
+    let mut catalog = indexmap::IndexMap::from([
+        ("removed-key".to_string(), reused),
+        ("replacement-key".to_string(), replacement),
+    ]);
+    let resolved = crate::agent::models::reconcile_persisted_catalog_identity(
+        &catalog, &restored,
+    )
+    .expect("UniqueRoute lineage should remap by the retained route");
+    assert_eq!(resolved.model_id, "replacement-key");
+    assert_eq!(resolved.route, "retained-route");
+
+    let mut exact = restored.clone();
+    exact.lineage = xai_chat_state::CatalogResolutionLineage::ExactKey;
+    assert!(
+        crate::agent::models::reconcile_persisted_catalog_identity(&catalog, &exact).is_none(),
+        "ExactKey lineage must not follow a reused key or remap by route"
+    );
+    catalog.insert(
+        "second-replacement".to_string(),
+        crate::agent::config::ModelEntry::fallback("retained-route", &endpoints),
+    );
+    assert!(
+        crate::agent::models::reconcile_persisted_catalog_identity(&catalog, &restored).is_none(),
+        "UniqueRoute lineage must fail closed once the retained route is ambiguous"
+    );
+}
+
+#[tokio::test]
 async fn model_switch_recovers_new_generation_after_durable_intent_only() {
     let temp_dir = TempDir::new().unwrap();
     let info = create_test_info();
@@ -1911,6 +1981,7 @@ fn write_test_summary(
         num_messages: 1,
         num_chat_messages: 1,
         current_model_id: default_model_id(),
+        catalog_identity: None,
         parent_session_id: None,
         forked_at: None,
         collection_id: None,

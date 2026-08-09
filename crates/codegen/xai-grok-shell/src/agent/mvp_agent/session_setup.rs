@@ -483,6 +483,7 @@ impl MvpAgent {
                     session_meta: arguments.meta.as_ref(),
                     managed_mcp_expires_at,
                     model_agent_type: model_agent_type.as_deref(),
+                    persisted_catalog_identity: None,
                     session_model_id,
                     session_yolo_mode,
                     session_auto_mode: session_auto_mode && !session_yolo_mode,
@@ -875,6 +876,10 @@ impl MvpAgent {
                     session_meta: request_meta.as_ref(),
                     managed_mcp_expires_at,
                     model_agent_type: persisted_agent_name.as_deref(),
+                    persisted_catalog_identity: summary
+                        .catalog_identity
+                        .clone()
+                        .filter(|identity| identity.model_id == summary.current_model_id.0.as_ref()),
                     session_model_id: summary.current_model_id.clone(),
                     session_yolo_mode,
                     session_auto_mode: session_auto_mode && !session_yolo_mode,
@@ -1191,7 +1196,7 @@ impl MvpAgent {
     /// Model-restore phase: point the actor at the persisted model without
     /// writing the global `current_model_id` (shared across leader clients).
     /// A vanished model falls back within its family, or blocks prompts.
-    async fn restore_persisted_model(
+    pub(super) async fn restore_persisted_model(
         &self,
         session_id: &acp::SessionId,
         summary: &crate::session::persistence::Summary,
@@ -1199,10 +1204,22 @@ impl MvpAgent {
     ) {
         let session_id = session_id.clone();
         let persisted_model = summary.current_model_id.clone();
-        let models = self.models_manager.models();
-        let available = self.models_manager.available();
+        let (models, available) = self.models_manager.models_and_available();
         self.session_registry.take_unavailable_model(&session_id);
-        let resolved_catalog_key = resolve_catalog_key(&models, &persisted_model);
+        let persisted_catalog_identity = summary
+            .catalog_identity
+            .as_ref()
+            .filter(|identity| identity.model_id == persisted_model.0.as_ref());
+        let reconciled_catalog_identity = persisted_catalog_identity.and_then(|identity| {
+            crate::agent::models::reconcile_persisted_catalog_identity(&models, identity)
+        });
+        let resolved_catalog_key = if persisted_catalog_identity.is_some() {
+            reconciled_catalog_identity
+                .as_ref()
+                .map(|identity| acp::ModelId::new(identity.model_id.clone()))
+        } else {
+            resolve_catalog_key(&models, &persisted_model)
+        };
         tracing::debug!(
             session_id = %session_id.0,
             persisted = %persisted_model.0,
@@ -1212,6 +1229,24 @@ impl MvpAgent {
             available_keys = ?available.keys().take(10).collect::<Vec<_>>(),
             "load_session: restoring persisted model (debug)"
         );
+        if persisted_catalog_identity.is_some() && reconciled_catalog_identity.is_none() {
+            tracing::warn!(
+                session_id = %session_id.0,
+                persisted = %persisted_model.0,
+                "Persisted catalog identity no longer resolves safely; blocking prompts"
+            );
+            self.session_registry
+                .set_unavailable_model_with_identity(
+                    &session_id,
+                    persisted_model,
+                    summary.catalog_identity.clone(),
+                    summary.agent_name.clone().or_else(|| {
+                        self.resident_handle(&session_id)
+                            .map(|handle| handle.agent_name)
+                    }),
+                );
+            return;
+        }
         let is_grok_build = persisted_model.0.starts_with("grok-build");
         let same_family_fallback = if is_grok_build {
             available
@@ -1224,8 +1259,14 @@ impl MvpAgent {
                 .find(|id| !id.0.starts_with("grok-build"))
                 .cloned()
         };
-        let selectable_catalog_key =
-            selectable_catalog_key_for_persisted(&models, &available, &persisted_model);
+        let selectable_catalog_key = if persisted_catalog_identity.is_some() {
+            reconciled_catalog_identity
+                .as_ref()
+                .map(|identity| acp::ModelId::new(identity.model_id.clone()))
+                .filter(|id| available.contains_key(id))
+        } else {
+            selectable_catalog_key_for_persisted(&models, &available, &persisted_model)
+        };
         let model_id = if let Some(catalog_key) = selectable_catalog_key {
             if catalog_key != persisted_model {
                 tracing::info!(
@@ -1276,8 +1317,25 @@ impl MvpAgent {
             let fallback = available
                 .keys()
                 .next()
-                .cloned()
-                .unwrap_or_else(|| persisted_model.clone());
+                .cloned();
+            let Some(fallback) = fallback else {
+                tracing::warn!(
+                    session_id = %session_id.0,
+                    persisted = %persisted_model.0,
+                    "Persisted catalog identity no longer resolves and no safe fallback exists; blocking prompts"
+                );
+                self.session_registry
+                    .set_unavailable_model_with_identity(
+                        &session_id,
+                        persisted_model,
+                        summary.catalog_identity.clone(),
+                        summary.agent_name.clone().or_else(|| {
+                            self.resident_handle(&session_id)
+                                .map(|handle| handle.agent_name)
+                        }),
+                    );
+                return;
+            };
             tracing::warn!(
                 session_id = %session_id.0,
                 previous = %persisted_model.0,
@@ -1303,7 +1361,15 @@ impl MvpAgent {
             self.send_model_auto_switched(&session_id, &persisted_model, &empty_id, &reason)
                 .await;
             self.session_registry
-                .set_unavailable_model(&session_id, persisted_model.clone());
+                .set_unavailable_model_with_identity(
+                    &session_id,
+                    persisted_model.clone(),
+                    summary.catalog_identity.clone(),
+                    summary.agent_name.clone().or_else(|| {
+                        self.resident_handle(&session_id)
+                            .map(|handle| handle.agent_name)
+                    }),
+                );
             fallback
         };
         tracing::debug!(
@@ -1311,6 +1377,14 @@ impl MvpAgent {
             final_model_id = %model_id.0,
             "load_session: resolved final model_id for set_session_model"
         );
+        let restored_model = reconciled_catalog_identity
+            .filter(|identity| identity.model_id == model_id.0.as_ref())
+            .and_then(|identity| {
+                models
+                    .get(identity.model_id.as_str())
+                    .cloned()
+                    .map(|model| (identity, model))
+            });
         {
             let _timer = crate::instrumentation_timer!("session.restore_model");
             let restore_meta = summary.reasoning_effort.map(|effort| {
@@ -1326,6 +1400,7 @@ impl MvpAgent {
                 acp::SetSessionModelRequest::new(session_id.to_owned(), model_id)
                     .meta(restore_meta),
                 load_guard,
+                restored_model,
             )
             .await;
         }

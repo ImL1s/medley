@@ -518,52 +518,31 @@ pub(crate) async fn run_shell_child(
             )
         });
     }
-    if request.fork_context {
-        effective_runtime.model = Some(ctx.model_id.0.to_string());
-    }
-    let (mut effective_sampling_config, mut effective_model_id) = resolve_effective_model_config(
+    let mut prepared_model = resolve_request_prepared_model(
+        request.fork_context,
         effective_runtime.model.as_deref(),
         &request.subagent_type,
         &definition.model,
         &ctx,
     )
     .await;
+    let mut effective_sampling_config = prepared_model.sampling_config.clone();
+    let mut effective_model_id = prepared_model.model_id.clone();
     let subagent_max_turns = resolve_subagent_max_turns(definition.max_turns, ctx.parent_max_turns);
-    {
-        let model_str = &effective_sampling_config.model;
-        let model_unknown = !model_str.is_empty()
-            && !ctx.available_models.is_empty()
-            && !ctx.available_models.contains_key(model_str)
-            && !ctx
-                .available_models
-                .values()
-                .any(|e| e.info().model == *model_str);
-        if model_unknown {
-            let (parent_config, parent_mid) = read_parent_sampling_config(&ctx).await;
-            tracing::warn!(
-                subagent_id = %request.id,
-                resolved_model = %model_str,
-                parent_model = %parent_config.model,
-                "Resolved subagent model not found in available models — \
-                 falling back to parent model"
-            );
-            effective_sampling_config = parent_config;
-            effective_model_id = parent_mid;
-        }
-    }
     if let Some(ref source) = resume_source
         && let Some(ref source_model) = source.model_id
         && effective_model_id.0.as_ref() != source_model.as_str()
     {
-        if let Some(resolved) = resolve_model_override_to_config(source_model, &ctx) {
+        if let Some(resolved) = resolve_model_override_to_prepared(source_model, &ctx) {
             tracing::info!(
                 subagent_id = %request.id,
                 resolved_model = %effective_model_id.0,
                 source_model = source_model,
                 "Pinning resumed child to source model"
             );
-            effective_sampling_config = resolved.0;
-            effective_model_id = resolved.1;
+            effective_sampling_config = resolved.sampling_config.clone();
+            effective_model_id = resolved.model_id.clone();
+            prepared_model = resolved;
         } else {
             let msg = format!(
                 "Cannot resume from subagent '{}': source model '{source_model}' \
@@ -574,26 +553,21 @@ pub(crate) async fn run_shell_child(
         }
     }
     let requested_model_matches_effective = |requested: &str| {
-        crate::agent::config::find_model_by_id(&ctx.available_models, requested).is_some_and(
-            |entry| {
-                let resolved_id = if ctx.available_models.contains_key(requested) {
-                    requested
-                } else {
-                    entry.info().model.as_str()
-                };
-                effective_model_id.0.as_ref() == resolved_id
-            },
+        crate::agent::models::resolve_catalog_identity(
+            &ctx.available_models,
+            &acp::ModelId::new(requested),
         )
+        .is_some_and(|identity| identity.model_id == effective_model_id.0.as_ref())
     };
-    let explicit_model_selection = resume_source
-        .as_ref()
-        .and_then(|source| source.model_id.as_deref())
-        .is_some_and(&requested_model_matches_effective)
-        || (!request.fork_context
-            && effective_runtime
-                .model
-                .as_deref()
-                .is_some_and(&requested_model_matches_effective))
+    let explicit_model_selection = request.fork_context
+        || resume_source
+            .as_ref()
+            .and_then(|source| source.model_id.as_deref())
+            .is_some_and(&requested_model_matches_effective)
+        || effective_runtime
+            .model
+            .as_deref()
+            .is_some_and(&requested_model_matches_effective)
         || ctx
             .subagent_model_overrides
             .get(&request.subagent_type)
@@ -605,17 +579,14 @@ pub(crate) async fn run_shell_child(
             xai_grok_agent::config::ModelOverride::Inherit => false,
         };
     if explicit_model_selection {
-        let Some(effective_model_entry) = crate::agent::config::find_model_by_id(
-            &ctx.available_models,
-            effective_model_id.0.as_ref(),
-        ) else {
+        if prepared_model.agent_type.is_empty() {
             let msg = format!(
                 "Cannot spawn subagent '{}': resolved model '{}' is no longer in the model catalog.",
                 request.subagent_type, effective_model_id.0,
             );
             return child_run_output(failure_result(&request, &msg), completion_data, None);
-        };
-        let required_agent_type = effective_model_entry.info().agent_type.as_str();
+        }
+        let required_agent_type = prepared_model.agent_type.as_str();
         if let Err(harness_error) = resolve_and_validate_subagent_model_harness(
             &selected_harness_definition,
             required_agent_type,
@@ -644,9 +615,7 @@ pub(crate) async fn run_shell_child(
         }
     }
     if let Some(raw) = effective_runtime.reasoning_effort.as_deref()
-        && ctx
-            .models_manager
-            .model_supports_reasoning_effort(effective_model_id.0.as_ref())
+        && prepared_model.supports_reasoning_effort
     {
         match raw.parse::<ReasoningEffort>() {
             Ok(eff) => effective_sampling_config.reasoning_effort = Some(eff),
@@ -897,12 +866,8 @@ pub(crate) async fn run_shell_child(
     let tracker_child_cwd = child_session_info.cwd.clone();
     let tracker_model_id = effective_model_id.0.to_string();
     let initial_child_tokens = xai_chat_state::estimate_conversation_tokens(&forked_conversation);
-    let model_entry = crate::agent::config::find_model_by_id(
-        &ctx.available_models,
-        effective_model_id.0.as_ref(),
-    );
-    let model_has_own_creds = model_entry.is_some_and(|entry| entry.has_own_credentials());
-    let inherited_auth_type = subagent_auth_type(model_entry, &ctx.auth_method_id);
+    let model_has_own_creds = prepared_model.model_has_own_credentials;
+    let inherited_auth_type = prepared_model.auth_type;
     // `read_parent_sampling_config` sets `credential_source` only when the
     // parent declared a credential header, so it is `None` for the ordinary
     // case -- while `api_key` here is the parent's live session token. Falling
@@ -1190,10 +1155,13 @@ pub(crate) async fn run_shell_child(
     });
     let subagent_session_default_agent_profile = Some(definition.name.clone());
     let subagent_model_id = effective_sampling_config.model.clone();
+    let effective_catalog_identity = prepared_model.catalog_identity;
+    effective_model_id = acp::ModelId::new(effective_catalog_identity.model_id.clone());
     let _ = persistence
         .tx
         .send(crate::session::persistence::PersistenceMsg::CurrentModel {
             model_id: effective_model_id.clone(),
+            catalog_identity: Some(effective_catalog_identity.clone()),
             agent_name: Some(definition.name.clone()),
             reasoning_effort: Some(effective_sampling_config.reasoning_effort),
         });
@@ -1201,6 +1169,7 @@ pub(crate) async fn run_shell_child(
         child_session_info,
         gateway.clone(),
         effective_sampling_config,
+        effective_catalog_identity,
         credentials,
         crate::agent::auth_method::new_shared_auth_method_id(Some(ctx.auth_method_id.clone())),
         Some(ctx.auth_manager.clone()),
@@ -1228,7 +1197,10 @@ pub(crate) async fn run_shell_child(
             ..Default::default()
         },
         xai_grok_workspace::permission::ClientType::Generic,
-        ctx.resolve_auto_compact_threshold_percent(&subagent_model_id),
+        ctx.resolve_auto_compact_threshold_percent(
+            &subagent_model_id,
+            prepared_model.auto_compact_threshold_percent,
+        ),
         xai_grok_agent::DEFAULT_SYSTEM_PROMPT_LABEL.to_string(),
         xai_chat_state::CompactionMode::Summary,
         ctx.resolve_compaction_verbatim_input(),

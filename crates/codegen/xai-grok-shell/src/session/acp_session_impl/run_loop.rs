@@ -13,6 +13,89 @@ use super::*;
 pub(super) fn yolo_toggle_report(was: bool, actual: bool) -> Option<bool> {
     (was != actual).then_some(actual)
 }
+
+async fn apply_opaque_model_name_override(
+    chat_state: &xai_chat_state::ChatStateHandle,
+    model_name: String,
+    extra_headers: indexmap::IndexMap<String, String>,
+    context_window: Option<std::num::NonZeroU64>,
+    context_window_is_pinned: bool,
+) -> Option<xai_grok_sampling_types::SamplingConfig> {
+    let (mut config, _catalog_identity, credentials) =
+        chat_state.get_prepared_model_state().await?;
+    let previous = config.clone();
+    config.model = model_name;
+    config.extra_headers.extend(extra_headers);
+    if let Some(context_window) = context_window
+        && !context_window_is_pinned
+    {
+        config.context_window = context_window;
+    }
+    // An opaque name override changes only wire routing. In particular, do not
+    // resolve credentials by the new name: a configured catalog key with the
+    // same string may belong to another endpoint/origin.
+    chat_state.update_sampling_config_and_credentials(config, credentials);
+    Some(previous)
+}
+
+#[cfg(test)]
+mod opaque_model_name_override_tests {
+    use super::apply_opaque_model_name_override;
+
+    #[tokio::test]
+    async fn keeps_endpoint_and_bound_secret_when_name_collides_with_an_external_model() {
+        let config = xai_grok_sampling_types::SamplingConfig::for_test(
+            "https://old.example.test/v1",
+            "old-route",
+        );
+        let credentials = xai_chat_state::Credentials::bound(
+            Some("old-origin-key".to_string()),
+            xai_chat_state::AuthType::ApiKey,
+            xai_grok_sampling_types::CredentialSource::ModelApiKey,
+        );
+        let mut colliding_entry = crate::agent::config::ModelEntry::fallback(
+            "configured-external-model",
+            &crate::agent::config::EndpointsConfig::default(),
+        );
+        colliding_entry.api_key = Some("foreign-model-key".to_string());
+        let foreign = crate::agent::config::resolve_credentials(&colliding_entry, None);
+        assert_eq!(foreign.api_key.as_deref(), Some("foreign-model-key"));
+
+        let (mock, _persistence_rx) = xai_chat_state::MockChatPersistence::new();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let chat_state = xai_chat_state::ChatStateActor::spawn(
+            vec![],
+            config,
+            Box::new(mock),
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        chat_state.update_sampling_config_and_credentials(
+            xai_grok_sampling_types::SamplingConfig::for_test(
+                "https://old.example.test/v1",
+                "old-route",
+            ),
+            credentials,
+        );
+        apply_opaque_model_name_override(
+            &chat_state,
+            "configured-external-model".to_string(),
+            indexmap::IndexMap::from([("x-route-key".to_string(), "route-scoped-key".to_string())]),
+            None,
+            false,
+        )
+        .await
+        .expect("live chat state");
+        let (config, _, credentials) = chat_state
+            .get_prepared_model_state()
+            .await
+            .expect("live chat state");
+
+        assert_eq!(config.base_url, "https://old.example.test/v1");
+        assert_eq!(credentials.api_key(), Some("old-origin-key"));
+        assert_ne!(credentials.api_key(), Some("foreign-model-key"));
+    }
+}
 #[cfg(test)]
 mod yolo_toggle_report_tests {
     use super::yolo_toggle_report;
@@ -716,14 +799,21 @@ pub(super) async fn run_session(
                         }
                         SessionCommand::OverrideModelName { model_name, extra_headers, context_window } => {
                             // Update the actor's SamplingConfig model + headers + context window.
-                            if let Some(mut cfg) = session.chat_state_handle.get_sampling_config().await {
+                            let extra_header_count = extra_headers.len();
+                            if let Some(previous) = apply_opaque_model_name_override(
+                                &session.chat_state_handle,
+                                model_name.clone(),
+                                extra_headers,
+                                context_window,
+                                session.compaction.context_window_override.is_some(),
+                            ).await {
                                 tracing::info!(
                                     target: SESSION_LOG,
                                     session_id = %session.session_info.id,
-                                    old_model = %cfg.model,
+                                    old_model = %previous.model,
                                     new_model = %model_name,
-                                    extra_header_count = extra_headers.len(),
-                                    old_context_window = cfg.context_window.get(),
+                                    extra_header_count,
+                                    old_context_window = previous.context_window.get(),
                                     new_context_window = ?context_window.map(|cw| cw.get()),
                                     "OVERRIDE_MODEL: changing model name in sampling config"
                                 );
@@ -732,37 +822,7 @@ pub(super) async fn run_session(
                                 // the agent-level default (e.g. "grok-4.5").
                                 // set_primary_model also adds to models_used.
                                 session.signals_handle().set_primary_model(&model_name);
-                                cfg.model = model_name.clone();
-                                cfg.extra_headers.extend(extra_headers);
-                                if let Some(cw) = context_window
-                                    && session.compaction.context_window_override.is_none()
-                                {
-                                    cfg.context_window = cw;
-                                }
-                                session.chat_state_handle.update_sampling_config(cfg);
-
-                                let existing = session.chat_state_handle.get_credentials().await;
-                                // `session_key` may only be passed when the
-                                // stored credential really is a session token
-                                // -- `try_resolve_model_credentials` documents
-                                // that and says callers must guard it. Passing
-                                // it unconditionally re-labels whatever the
-                                // previous model left behind as
-                                // `AuthType::SessionToken` and carries it to the
-                                // new one: a BYOK key becomes a "session token",
-                                // and a real session token reaches a model that
-                                // may point anywhere, with no origin strip on
-                                // this path (#136).
-                                let session_key = (existing.auth_type()
-                                    == xai_chat_state::AuthType::SessionToken)
-                                    .then_some(existing.api_key())
-                                    .flatten();
-                                if let Some((r, source)) = crate::agent::config::try_resolve_model_credentials_with_source(model_name.as_str(), session_key) {
-                                    session.chat_state_handle.update_credentials(
-                                        existing.rebind(r.api_key, r.auth_type, source),
-                                    );
-                                }
-                                // Credentials changed under a possibly-unchanged model id.
+                                // Route headers changed under a possibly-unchanged model id.
                                 session.invalidate_model_auth_memo();
                             }
                         }

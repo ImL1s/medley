@@ -50,7 +50,7 @@ impl SessionActor {
         prepared: PreparedModelSwitch,
     ) -> Result<AppliedModelSwitch, acp::Error> {
         let PreparedModelSwitch {
-            catalog_model_id,
+            catalog_identity,
             resolved_model,
             sampling_config,
             use_concise,
@@ -58,6 +58,7 @@ impl SessionActor {
             required_agent_type,
             required_definition,
         } = prepared;
+        let catalog_model_id = acp::ModelId::new(catalog_identity.model_id.clone());
         let resolved_model_slug = resolved_model.info().model.clone();
         if resolved_model_slug != sampling_config.model {
             tracing::warn!(
@@ -226,6 +227,7 @@ impl SessionActor {
         let updated_model = match self
             .handle_set_session_model_with_rollback(
                 catalog_model_id.clone(),
+                catalog_identity,
                 sampling_config,
                 use_concise,
                 !self.startup_hints.preserve_inherited_system,
@@ -299,7 +301,21 @@ impl SessionActor {
         required_agent_type: &str,
     ) -> Result<acp::ModelId, acp::Error> {
         self.handle_set_session_model_with_rollback(
-            catalog_model_id,
+            catalog_model_id.clone(),
+            xai_chat_state::CatalogIdentity {
+                model_id: catalog_model_id.0.to_string(),
+                route: sampling_config.model.clone(),
+                lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+                auth_scheme: Some(match sampling_config.auth_scheme {
+                    xai_grok_sampler::AuthScheme::Bearer => {
+                        xai_chat_state::CatalogAuthScheme::Bearer
+                    }
+                    xai_grok_sampler::AuthScheme::XApiKey => {
+                        xai_chat_state::CatalogAuthScheme::XApiKey
+                    }
+                    xai_grok_sampler::AuthScheme::None => xai_chat_state::CatalogAuthScheme::None,
+                }),
+            },
             sampling_config,
             use_concise,
             apply_prompt_override,
@@ -314,6 +330,7 @@ impl SessionActor {
     async fn handle_set_session_model_with_rollback(
         &self,
         catalog_model_id: acp::ModelId,
+        catalog_identity: xai_chat_state::CatalogIdentity,
         sampling_config: xai_grok_sampler::SamplerConfig,
         use_concise: bool,
         apply_prompt_override: bool,
@@ -356,6 +373,7 @@ impl SessionActor {
                     .expect("DEFAULT_CONTEXT_WINDOW is non-zero")
             });
         let mut committed_chat = current_chat.clone();
+        committed_chat.catalog_identity = Some(catalog_identity);
         committed_chat.sampling_config = xai_grok_sampling_types::SamplingConfig {
             base_url: sampling_config.base_url.clone(),
             model: sampling_config.model.clone(),
@@ -446,6 +464,7 @@ impl SessionActor {
             .persist_model_switch_transaction(
                 committed_chat.conversation,
                 &catalog_model_id,
+                committed_chat.catalog_identity.as_ref(),
                 &active_agent_type,
                 sampling_config.reasoning_effort,
             )
@@ -503,6 +522,7 @@ impl SessionActor {
         &self,
         conversation: Vec<ConversationItem>,
         model_id: &acp::ModelId,
+        catalog_identity: Option<&xai_chat_state::CatalogIdentity>,
         agent_type: &str,
         reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
     ) -> Result<(), &'static str> {
@@ -515,6 +535,7 @@ impl SessionActor {
             .send(PersistenceMsg::ModelSwitchAndAck {
                 messages: conversation,
                 model_id: model_id.clone(),
+                catalog_identity: catalog_identity.cloned(),
                 agent_name: Some(agent_type.to_owned()),
                 reasoning_effort,
                 respond_to,
@@ -915,7 +936,12 @@ mod model_switch_transaction_tests {
         );
         resolved_model.info.model = "target-wire-model".to_owned();
         PreparedModelSwitch {
-            catalog_model_id: acp::ModelId::new("target-model"),
+            catalog_identity: xai_chat_state::CatalogIdentity {
+                model_id: "target-model".to_string(),
+                route: "target-wire-model".to_string(),
+                lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+                auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
+            },
             resolved_model,
             sampling_config: switch_sampling_config("target-wire-model"),
             use_concise: false,
@@ -1261,6 +1287,21 @@ mod model_switch_transaction_tests {
                 assert_eq!(receipt.catalog_model_id.0.as_ref(), "target-model");
                 assert_eq!(receipt.active_agent_type.as_deref(), Some("grok-build"));
                 assert_eq!(catalog_model_id(&actor), "target-model");
+                let snapshot = actor
+                    .chat_state_handle
+                    .snapshot()
+                    .await
+                    .expect("chat state");
+                assert_eq!(
+                    snapshot.catalog_identity,
+                    Some(xai_chat_state::CatalogIdentity {
+                        model_id: "target-model".to_string(),
+                        route: "target-wire-model".to_string(),
+                        lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+                        auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
+                    }),
+                    "the actor must commit the identity prepared with the sampler"
+                );
                 assert_eq!(
                     actor.active_agent_type.lock().as_deref(),
                     Some("grok-build")
@@ -1334,6 +1375,7 @@ mod model_switch_transaction_tests {
                         .persist_model_switch_transaction(
                             previous_chat.conversation.clone(),
                             &acp::ModelId::new("test"),
+                            None,
                             "grok-build",
                             previous_chat.sampling_config.reasoning_effort,
                         )

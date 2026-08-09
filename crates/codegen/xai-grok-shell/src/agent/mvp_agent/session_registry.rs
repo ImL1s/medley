@@ -214,6 +214,8 @@ struct SessionResources {
     resident: Option<ResidentResources>,
     presence: Option<SessionPresence>,
     unavailable_model: Option<acp::ModelId>,
+    unavailable_catalog_identity: Option<xai_chat_state::CatalogIdentity>,
+    unavailable_agent_name: Option<String>,
 }
 #[derive(Default)]
 pub(super) struct SessionCounts {
@@ -254,6 +256,8 @@ impl SessionRegistry {
                     retained: None,
                     resident: None,
                     unavailable_model: None,
+                    unavailable_catalog_identity: None,
+                    unavailable_agent_name: None,
                 },
             );
         }
@@ -701,17 +705,48 @@ impl SessionRegistry {
         self.clear(id, |e| e.resident = None);
     }
     pub(super) fn set_unavailable_model(&self, id: &acp::SessionId, model: acp::ModelId) {
-        self.edit(id, |e| e.unavailable_model = Some(model));
+        self.edit(id, |e| {
+            e.unavailable_model = Some(model);
+            e.unavailable_catalog_identity = None;
+            e.unavailable_agent_name = None;
+        });
+    }
+    pub(super) fn set_unavailable_model_with_identity(
+        &self,
+        id: &acp::SessionId,
+        model: acp::ModelId,
+        catalog_identity: Option<xai_chat_state::CatalogIdentity>,
+        agent_name: Option<String>,
+    ) {
+        self.edit(id, |e| {
+            e.unavailable_model = Some(model);
+            e.unavailable_catalog_identity = catalog_identity;
+            e.unavailable_agent_name = agent_name;
+        });
     }
     pub(super) fn unavailable_model(&self, id: &acp::SessionId) -> Option<acp::ModelId> {
         self.with(id, |e| e.unavailable_model.clone()).flatten()
+    }
+    pub(super) fn unavailable_catalog_identity(
+        &self,
+        id: &acp::SessionId,
+    ) -> Option<xai_chat_state::CatalogIdentity> {
+        self.with(id, |e| e.unavailable_catalog_identity.clone())
+            .flatten()
+    }
+    pub(super) fn unavailable_agent_name(&self, id: &acp::SessionId) -> Option<String> {
+        self.with(id, |e| e.unavailable_agent_name.clone()).flatten()
     }
     pub(super) fn take_unavailable_model(&self, id: &acp::SessionId) -> Option<acp::ModelId> {
         let model = self
             .sessions
             .borrow_mut()
             .get_mut(id)
-            .and_then(|e| e.unavailable_model.take());
+            .and_then(|e| {
+                e.unavailable_catalog_identity = None;
+                e.unavailable_agent_name = None;
+                e.unavailable_model.take()
+            });
         self.drop_if_empty(id);
         model
     }
@@ -781,6 +816,8 @@ impl SessionRegistry {
                 resident,
                 presence,
                 unavailable_model,
+                unavailable_catalog_identity: _,
+                unavailable_agent_name: _,
             } = entry;
             counts.retained_resources += usize::from(retained.is_some());
             counts.resident_resources += usize::from(resident.is_some());
@@ -836,6 +873,8 @@ impl SessionResources {
             resident,
             presence,
             unavailable_model,
+            unavailable_catalog_identity: _,
+            unavailable_agent_name: _,
         } = self;
         let chat_vacant = true;
         let presence_vacant = match presence {

@@ -318,6 +318,7 @@ pub enum PersistenceMsg {
     },
     CurrentModel {
         model_id: acp::ModelId,
+        catalog_identity: Option<xai_chat_state::CatalogIdentity>,
         /// The active agent definition name (e.g. `"grok-build"`).
         /// Persisted in `summary.agent_name` so session resume doesn't depend
         /// on the mutable model catalog.
@@ -329,6 +330,7 @@ pub enum PersistenceMsg {
     /// `ModelSwitchAndAck` below.
     CurrentModelAndAck {
         model_id: acp::ModelId,
+        catalog_identity: Option<xai_chat_state::CatalogIdentity>,
         agent_name: Option<String>,
         reasoning_effort: Option<Option<ReasoningEffort>>,
         respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
@@ -337,6 +339,7 @@ pub enum PersistenceMsg {
     ModelSwitchAndAck {
         messages: Vec<ConversationItem>,
         model_id: acp::ModelId,
+        catalog_identity: Option<xai_chat_state::CatalogIdentity>,
         agent_name: Option<String>,
         reasoning_effort: Option<ReasoningEffort>,
         respond_to: tokio::sync::oneshot::Sender<
@@ -891,6 +894,9 @@ pub struct Summary {
     #[serde(default)]
     pub num_chat_messages: usize,
     pub current_model_id: acp::ModelId,
+    /// Canonical catalog selection lineage. Absent in legacy summaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_identity: Option<xai_chat_state::CatalogIdentity>,
     /// Parent session ID if this session was forked from another session
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
@@ -1028,6 +1034,7 @@ impl Summary {
             num_messages: 0,
             num_chat_messages: 0,
             current_model_id: model_id,
+            catalog_identity: None,
             parent_session_id: None,
             forked_at: None,
             collection_id: None,
@@ -2154,14 +2161,16 @@ impl SessionPersistence {
                 }
                 PersistenceMsg::CurrentModel {
                     model_id,
+                    catalog_identity,
                     agent_name,
                     reasoning_effort,
                 } => {
                     if let Err(e) = self
                         .storage
-                        .update_current_model_and_agent(
+                        .update_current_model_identity_and_agent(
                             &self.info,
                             &model_id,
+                            catalog_identity.as_ref(),
                             agent_name.as_deref(),
                             reasoning_effort,
                         )
@@ -2170,20 +2179,22 @@ impl SessionPersistence {
                         tracing::warn!(?e, "failed to update current model");
                     }
                     if let Some(sync) = &self.remote_sync {
-                        sync.set_model_id(model_id.0.to_string());
+                        sync.set_model(model_id.0.to_string(), catalog_identity, agent_name);
                     }
                 }
                 PersistenceMsg::CurrentModelAndAck {
                     model_id,
+                    catalog_identity,
                     agent_name,
                     reasoning_effort,
                     respond_to,
                 } => {
                     let result = self
                         .storage
-                        .update_current_model_and_agent(
+                        .update_current_model_identity_and_agent(
                             &self.info,
                             &model_id,
+                            catalog_identity.as_ref(),
                             agent_name.as_deref(),
                             reasoning_effort,
                         )
@@ -2191,23 +2202,25 @@ impl SessionPersistence {
                     if result.is_ok()
                         && let Some(sync) = &self.remote_sync
                     {
-                        sync.set_model_id(model_id.0.to_string());
+                        sync.set_model(model_id.0.to_string(), catalog_identity, agent_name);
                     }
                     let _ = respond_to.send(result);
                 }
                 PersistenceMsg::ModelSwitchAndAck {
                     messages,
                     model_id,
+                    catalog_identity,
                     agent_name,
                     reasoning_effort,
                     respond_to,
                 } => {
                     let result = self
                         .storage
-                        .commit_model_switch(
+                        .commit_model_switch_with_identity(
                             &self.info,
                             &messages,
                             &model_id,
+                            catalog_identity.as_ref(),
                             agent_name.as_deref(),
                             reasoning_effort,
                         )
@@ -2215,7 +2228,7 @@ impl SessionPersistence {
                     if (result.is_ok() || result.as_ref().is_err_and(|error| error.is_committed()))
                         && let Some(sync) = &self.remote_sync
                     {
-                        sync.set_model_id(model_id.0.to_string());
+                        sync.set_model(model_id.0.to_string(), catalog_identity, agent_name);
                     }
                     let _ = respond_to.send(result);
                 }

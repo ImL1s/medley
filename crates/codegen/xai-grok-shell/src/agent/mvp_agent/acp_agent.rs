@@ -15,9 +15,18 @@ pub(super) async fn restore_registered_session_model(
     agent: &MvpAgent,
     request: acp::SetSessionModelRequest,
     load_guard: &SessionLoadGuard<'_>,
+    restored_model: Option<(
+        xai_chat_state::CatalogIdentity,
+        crate::agent::config::ModelEntry,
+    )>,
 ) -> Result<acp::SetSessionModelResponse, acp::Error> {
-    crate::agent::handlers::model_switch::apply_during_session_load(agent, request, load_guard)
-        .await
+    crate::agent::handlers::model_switch::apply_during_session_load(
+        agent,
+        request,
+        load_guard,
+        restored_model,
+    )
+    .await
 }
 
 /// Which `x_search` sub-tools enforce the date cutoff, sent in `initialize`. `x_user_search` and
@@ -1377,6 +1386,7 @@ impl acp::Agent for MvpAgent {
                         session_meta: arguments.meta.as_ref(),
                         managed_mcp_expires_at,
                         model_agent_type: model_agent_type.as_deref(),
+                        persisted_catalog_identity: None,
                         session_model_id: session_model_id.clone(),
                         session_yolo_mode,
                         session_auto_mode: session_auto_mode && !session_yolo_mode,
@@ -1957,13 +1967,39 @@ impl acp::Agent for MvpAgent {
             );
             let mut spawn_timer = crate::instrumentation_timer!("session.spawn_and_register_session");
             spawn_timer.with_field("session_id", session_id.0.as_ref());
-            let available = self.models_manager.available();
-            let models = self.models_manager.models();
-            let persisted_resolution = crate::agent::models::selectable_catalog_resolution_for_persisted(
-                &models,
-                &available,
-                &summary.current_model_id,
-            );
+            let (models, available) = self.models_manager.models_and_available();
+            let persisted_catalog_identity = summary
+                .catalog_identity
+                .as_ref()
+                .filter(|identity| identity.model_id == summary.current_model_id.0.as_ref());
+            let reconciled_catalog_identity = persisted_catalog_identity.and_then(|identity| {
+                crate::agent::models::reconcile_persisted_catalog_identity(&models, identity)
+            });
+            let persisted_identity_unresolved =
+                should_reject_unresolved_persisted_identity(
+                    &models,
+                    persisted_catalog_identity,
+                    reconciled_catalog_identity.as_ref(),
+                );
+            let persisted_resolution = if persisted_catalog_identity.is_some() {
+                reconciled_catalog_identity
+                    .as_ref()
+                    .filter(|identity| {
+                        available.contains_key(&acp::ModelId::new(identity.model_id.clone()))
+                    })
+                    .map(|identity| {
+                        crate::agent::models::PersistedCatalogKeyResolution::Resolved(
+                            acp::ModelId::new(identity.model_id.clone()),
+                        )
+                    })
+                    .unwrap_or(crate::agent::models::PersistedCatalogKeyResolution::Missing)
+            } else {
+                crate::agent::models::selectable_catalog_resolution_for_persisted(
+                    &models,
+                    &available,
+                    &summary.current_model_id,
+                )
+            };
             let resolved_persisted_catalog_id = match &persisted_resolution {
                 crate::agent::models::PersistedCatalogKeyResolution::Resolved(id) => {
                     Some(id.clone())
@@ -2014,7 +2050,22 @@ impl acp::Agent for MvpAgent {
                     },
                 )
             };
-            let spawn_selection = if let Some(matches) = ambiguous_persisted_slug_matches.as_ref() {
+            if persisted_catalog_identity.is_some()
+                && persisted_model_for_spawn != summary.current_model_id
+                && ready_compatible_fallback(vec![persisted_model_for_spawn.clone()]).is_none()
+            {
+                return Err(acp::Error::invalid_params().data(format!(
+                    "reconciled model '{}' is not ready or is incompatible with persisted harness '{}'",
+                    persisted_model_for_spawn.0,
+                    active_definition.name
+                )));
+            }
+            let spawn_selection = if persisted_identity_unresolved {
+                return Err(acp::Error::invalid_params().data(format!(
+                    "persisted model '{}' no longer resolves to its committed catalog route",
+                    summary.current_model_id.0
+                )));
+            } else if let Some(matches) = ambiguous_persisted_slug_matches.as_ref() {
                 tracing::warn!(
                     session_id = %session_id.0,
                     persisted = %summary.current_model_id.0,
@@ -2190,6 +2241,7 @@ impl acp::Agent for MvpAgent {
                         session_meta: request_meta.as_ref(),
                         managed_mcp_expires_at,
                         model_agent_type: persisted_agent_name.as_deref(),
+                        persisted_catalog_identity: reconciled_catalog_identity,
                         session_model_id: spawn_model_id,
                         session_yolo_mode,
                         session_auto_mode: session_auto_mode && !session_yolo_mode,
@@ -2200,7 +2252,12 @@ impl acp::Agent for MvpAgent {
                 .await?;
             if latch_persisted_unready {
                 self.session_registry
-                    .set_unavailable_model(&session_id, summary.current_model_id.clone());
+                    .set_unavailable_model_with_identity(
+                        &session_id,
+                        summary.current_model_id.clone(),
+                        summary.catalog_identity.clone(),
+                        persisted_agent_name.clone(),
+                    );
             }
             drop(spawn_timer);
         } else {
@@ -2303,8 +2360,7 @@ impl acp::Agent for MvpAgent {
                 .await;
         }
         let persisted_model = summary.current_model_id.clone();
-        let models = self.models_manager.models();
-        let available = self.models_manager.available();
+        let (models, available) = self.models_manager.models_and_available();
         if cold_spawn_selection.is_none() {
             self.session_registry.take_unavailable_model(&session_id);
         }
@@ -2331,7 +2387,15 @@ impl acp::Agent for MvpAgent {
             available.keys().find(|id| !id.0.starts_with("grok-build")).cloned()
         };
         let model_id = if let Some(preflight) = cold_spawn_selection.as_ref() {
-            preflight.replace_unavailable_latch(&self.session_registry, &session_id);
+            preflight.replace_unavailable_latch(
+                &self.session_registry,
+                &session_id,
+                summary.catalog_identity.clone(),
+                summary.agent_name.clone().or_else(|| {
+                    self.resident_handle(&session_id)
+                        .map(|handle| handle.agent_name)
+                }),
+            );
             if preflight.unavailable_model.is_some() {
                 let reason = if let Some(matches) = ambiguous_persisted_slug_matches.as_ref() {
                     let options = matches
@@ -2428,7 +2492,15 @@ impl acp::Agent for MvpAgent {
                         )
                         .await;
                     self.session_registry
-                        .set_unavailable_model(&session_id, persisted_model.clone());
+                        .set_unavailable_model_with_identity(
+                            &session_id,
+                            persisted_model.clone(),
+                            summary.catalog_identity.clone(),
+                            summary.agent_name.clone().or_else(|| {
+                                self.resident_handle(&session_id)
+                                    .map(|handle| handle.agent_name)
+                            }),
+                        );
                     fallback
                 }
                 crate::agent::models::PersistedCatalogKeyResolution::Missing => {
@@ -2505,7 +2577,15 @@ impl acp::Agent for MvpAgent {
                             )
                             .await;
                         self.session_registry
-                            .set_unavailable_model(&session_id, persisted_model.clone());
+                            .set_unavailable_model_with_identity(
+                                &session_id,
+                                persisted_model.clone(),
+                                summary.catalog_identity.clone(),
+                                summary.agent_name.clone().or_else(|| {
+                                    self.resident_handle(&session_id)
+                                        .map(|handle| handle.agent_name)
+                                }),
+                            );
                         fallback
                     }
                 }
@@ -2574,7 +2654,17 @@ impl acp::Agent for MvpAgent {
                             )
                             .await;
                         self.session_registry
-                            .set_unavailable_model(&session_id, model_id.clone());
+                            .set_unavailable_model_with_identity(
+                                &session_id,
+                                model_id.clone(),
+                                summary.catalog_identity.clone().filter(|identity| {
+                                    identity.model_id == model_id.0.as_ref()
+                                }),
+                                summary.agent_name.clone().or_else(|| {
+                                    self.resident_handle(&session_id)
+                                        .map(|handle| handle.agent_name)
+                                }),
+                            );
                         model_id
                     }
                 }
@@ -2586,6 +2676,21 @@ impl acp::Agent for MvpAgent {
             final_model_id = %model_id.0,
             "load_session: resolved final model_id for set_session_model"
         );
+        let persisted_restore_identity = summary
+            .catalog_identity
+            .as_ref()
+            .filter(|identity| identity.model_id == summary.current_model_id.0.as_ref());
+        let restored_model = persisted_restore_identity
+            .and_then(|identity| {
+                crate::agent::models::reconcile_persisted_catalog_identity(&models, identity)
+            })
+            .filter(|identity| identity.model_id == model_id.0.as_ref())
+            .and_then(|identity| {
+                models
+                    .get(identity.model_id.as_str())
+                    .cloned()
+                    .map(|model| (identity, model))
+            });
         {
             let _timer = crate::instrumentation_timer!("session.restore_model");
             let restore_meta = summary
@@ -2598,13 +2703,19 @@ impl acp::Agent for MvpAgent {
                     );
                     map
                 });
-            let apply_result = restore_registered_session_model(
-                self,
-                acp::SetSessionModelRequest::new(session_id.to_owned(), model_id.clone())
-                    .meta(restore_meta),
-                &load_guard,
-            )
-            .await;
+            let apply_result = if persisted_restore_identity.is_some() && restored_model.is_none() {
+                Err(acp::Error::invalid_params()
+                    .data("persisted catalog identity changed before model restore"))
+            } else {
+                restore_registered_session_model(
+                    self,
+                    acp::SetSessionModelRequest::new(session_id.to_owned(), model_id.clone())
+                        .meta(restore_meta),
+                    &load_guard,
+                    restored_model,
+                )
+                .await
+            };
             if let Err(e) = apply_result {
                 tracing::warn!(
                     session_id = %session_id.0,
@@ -2613,7 +2724,17 @@ impl acp::Agent for MvpAgent {
                     "load_session: model restore apply failed; latching prompts"
                 );
                 self.session_registry
-                    .set_unavailable_model(&session_id, model_id.clone());
+                    .set_unavailable_model_with_identity(
+                        &session_id,
+                        model_id.clone(),
+                        summary.catalog_identity.clone().filter(|identity| {
+                            identity.model_id == model_id.0.as_ref()
+                        }),
+                        summary.agent_name.clone().or_else(|| {
+                            self.resident_handle(&session_id)
+                                .map(|handle| handle.agent_name)
+                        }),
+                    );
             }
         }
         let mut response_meta_map = serde_json::Map::new();
@@ -2806,18 +2927,87 @@ impl acp::Agent for MvpAgent {
             .session_registry
             .unavailable_model(&arguments.session_id);
         if let Some(unavailable_model) = latched_model {
-            let models = self.models_manager.models();
-            let available = self.models_manager.available();
-            match crate::agent::models::selectable_catalog_resolution_for_persisted(
-                &models,
-                &available,
-                &unavailable_model,
+            let (models, available) = self.models_manager.models_and_available();
+            let latched_identity = self
+                .session_registry
+                .unavailable_catalog_identity(&arguments.session_id);
+            let mut reconciled_snapshot = latched_identity.as_ref().and_then(|identity| {
+                reconcile_latched_catalog_snapshot(&models, &available, identity)
+            });
+            let persisted_agent_name = self
+                .session_registry
+                .unavailable_agent_name(&arguments.session_id);
+            if !latched_recovery_has_required_harness(
+                latched_identity.as_ref(),
+                persisted_agent_name.as_deref(),
             ) {
+                tracing::warn!(
+                    session_id = %arguments.session_id.0,
+                    "prompt: identity-backed recovery lacks a persisted harness; keeping block"
+                );
+                reconciled_snapshot = None;
+            } else if let (Some(persisted_agent_name), Some((_, _, model))) =
+                (persisted_agent_name, reconciled_snapshot.as_ref())
+            {
+                let plugin_registry = self.plugin_registry_handle.snapshot();
+                let active_definition = {
+                    let cfg = self.cfg.borrow();
+                    Self::resolve_agent_definition_with_plugins(
+                        std::path::Path::new(&handle.info.cwd),
+                        cfg.agent_profile_path.as_deref(),
+                        &cfg.agent,
+                        None,
+                        Some(&persisted_agent_name),
+                        plugin_registry.as_deref(),
+                    )
+                };
+                let required_agent_type = model.info().agent_type.as_str();
+                let required_definition =
+                    xai_grok_agent::discovery::by_name_in_cwd_with_plugins(
+                        required_agent_type,
+                        std::path::Path::new(&handle.info.cwd),
+                        plugin_registry.as_deref(),
+                    );
+                if !recovered_model_harness_is_compatible(
+                    &active_definition,
+                    model,
+                    required_definition.as_ref(),
+                ) {
+                    tracing::warn!(
+                        session_id = %arguments.session_id.0,
+                        persisted_agent_name,
+                        required_agent_type,
+                        "prompt: recovered model requires an incompatible persisted harness; keeping block"
+                    );
+                    reconciled_snapshot = None;
+                }
+            }
+            let resolution = if latched_identity.is_some() {
+                reconciled_snapshot
+                    .as_ref()
+                    .map(|(model_id, _, _)| {
+                        crate::agent::models::PersistedCatalogKeyResolution::Resolved(
+                            model_id.clone(),
+                        )
+                    })
+                    .unwrap_or(crate::agent::models::PersistedCatalogKeyResolution::Missing)
+            } else {
+                crate::agent::models::selectable_catalog_resolution_for_persisted(
+                    &models,
+                    &available,
+                    &unavailable_model,
+                )
+            };
+            match resolution {
                 crate::agent::models::PersistedCatalogKeyResolution::Resolved(restore_model_id) => {
-                    let restore_ready = self
-                        .resolve_model_id(&restore_model_id)
-                        .ok()
-                        .is_some_and(|m| crate::agent::config::model_readiness(&m).0);
+                    let restore_ready = reconciled_snapshot
+                        .as_ref()
+                        .map(|(_, _, model)| crate::agent::config::model_readiness(model).0)
+                        .unwrap_or_else(|| {
+                            self.resolve_model_id(&restore_model_id)
+                                .ok()
+                                .is_some_and(|m| crate::agent::config::model_readiness(&m).0)
+                        });
                     if !restore_ready {
                         tracing::warn!(
                             session_id = %arguments.session_id.0,
@@ -2847,15 +3037,19 @@ impl acp::Agent for MvpAgent {
                         }),
                         ),
                     );
-                    if let Err(e) = crate::agent::handlers::model_switch::apply(
-                            self,
-                            acp::SetSessionModelRequest::new(
-                                arguments.session_id.clone(),
-                                restore_model_id.clone(),
-                            ),
+                    let request = acp::SetSessionModelRequest::new(
+                        arguments.session_id.clone(),
+                        restore_model_id.clone(),
+                    );
+                    let apply_result = if let Some((_, identity, model)) = reconciled_snapshot {
+                        crate::agent::handlers::model_switch::apply_catalog_snapshot(
+                            self, request, identity, model,
                         )
                         .await
-                    {
+                    } else {
+                        crate::agent::handlers::model_switch::apply(self, request).await
+                    };
+                    if let Err(e) = apply_result {
                         tracing::warn!(
                             session_id = %arguments.session_id.0,
                             model_id = %restore_model_id.0,

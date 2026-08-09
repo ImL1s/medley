@@ -487,6 +487,7 @@ impl MvpAgent {
             process_scope: parent_process_scope,
             client_hooks: Default::default(),
             sampling_config: self.sampling_config.borrow().clone(),
+            sampling_config_model_id: self.sampling_config_model_id.clone(),
             managed_mcp_proxy_base_url: parent_managed_mcp_proxy_base_url
                 .unwrap_or_else(|| self.cli_chat_proxy_base_url()),
             alpha_test_key: self.alpha_test_key(),
