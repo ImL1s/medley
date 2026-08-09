@@ -1255,15 +1255,46 @@ fn apply_loaded_requirements(
     config: &mut crate::agent::config::Config,
     loads: Vec<RequirementsLayerLoad>,
 ) -> Vec<EnforcedField> {
-    let rejected_sources: Vec<_> = loads
-        .iter()
-        .filter_map(|load| match load {
-            RequirementsLayerLoad::Rejected(source) => Some(RequirementSource::Requirements {
-                path: std::path::PathBuf::from(source.label().as_ref()),
-            }),
-            RequirementsLayerLoad::Loaded(_) => None,
-        })
-        .collect();
+    use crate::agent::config::AuxiliaryModelPins;
+
+    fn requirement_source(source: &RequirementsSource) -> RequirementSource {
+        RequirementSource::Requirements {
+            path: std::path::PathBuf::from(source.label().as_ref()),
+        }
+    }
+    fn auxiliary_pins(layer: &RequirementsLayer) -> AuxiliaryModelPins {
+        let model = |key| {
+            layer
+                .value
+                .get("models")?
+                .get(key)?
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        };
+        AuxiliaryModelPins {
+            source: requirement_source(&layer.source),
+            web_search: model("web_search"),
+            session_summary: model("session_summary"),
+            image_description: model("image_description"),
+        }
+    }
+
+    let previous_layers = config.requirements.auxiliary_model_layers.clone();
+    let mut next_layers = Vec::new();
+    for load in &loads {
+        match load {
+            RequirementsLayerLoad::Absent(_) => {}
+            RequirementsLayerLoad::Loaded(layer) => next_layers.push(auxiliary_pins(layer)),
+            RequirementsLayerLoad::Rejected(source) => {
+                let source = requirement_source(source);
+                if let Some(previous) = previous_layers.iter().find(|pins| pins.source == source) {
+                    next_layers.push(previous.clone());
+                }
+            }
+        }
+    }
     let last_rejection = loads
         .iter()
         .rposition(|load| matches!(load, RequirementsLayerLoad::Rejected(_)));
@@ -1272,16 +1303,9 @@ fn apply_loaded_requirements(
             "requirements reload partially rejected; preserving last-known-good auxiliary model \
              pins and applying only higher-priority accepted layers"
         );
-        config
-            .requirements
-            .clear_auxiliary_model_pins_except_sources(&rejected_sources);
-    } else {
-        // Refresh replaces the active requirement layers. Clear pins that may have
-        // disappeared before applying the current layers so removed policy cannot
-        // survive in this reused Config.
-        config.requirements.clear_auxiliary_model_pins();
     }
-    loads
+    config.requirements.clear_auxiliary_model_pins();
+    let mut enforced: Vec<_> = loads
         .into_iter()
         .enumerate()
         .filter_map(|(index, load)| {
@@ -1290,7 +1314,7 @@ fn apply_loaded_requirements(
             }
             match load {
                 RequirementsLayerLoad::Loaded(layer) => Some(layer),
-                RequirementsLayerLoad::Rejected(_) => None,
+                RequirementsLayerLoad::Absent(_) | RequirementsLayerLoad::Rejected(_) => None,
             }
         })
         .flat_map(|layer| {
@@ -1302,7 +1326,52 @@ fn apply_loaded_requirements(
                 },
             )
         })
-        .collect()
+        .collect();
+
+    // Recompute the winning auxiliary pins from the per-layer cache. This can
+    // reveal a retained lower layer that was previously shadowed by a higher
+    // layer which has now removed its pin.
+    config.requirements.clear_auxiliary_model_pins();
+    for pins in &next_layers {
+        macro_rules! restore_auxiliary_pin {
+            ($value:ident, $requirement:ident, $model:ident, $path:literal) => {
+                if let Some(value) = &pins.$value {
+                    config
+                        .requirements
+                        .$requirement
+                        .pin(value.clone(), pins.source.clone());
+                    if config.models.$model.as_deref() != Some(value) {
+                        config.models.$model = Some(value.clone());
+                        enforced.push(EnforcedField {
+                            path: $path,
+                            value: value.clone(),
+                            source: pins.source.clone(),
+                        });
+                    }
+                }
+            };
+        }
+        restore_auxiliary_pin!(
+            web_search,
+            web_search_model,
+            web_search,
+            "models.web_search"
+        );
+        restore_auxiliary_pin!(
+            session_summary,
+            session_summary_model,
+            session_summary,
+            "models.session_summary"
+        );
+        restore_auxiliary_pin!(
+            image_description,
+            image_description_model,
+            image_description,
+            "models.image_description"
+        );
+    }
+    config.requirements.auxiliary_model_layers = next_layers;
+    enforced
 }
 fn apply_requirements_inner(
     config: &mut crate::agent::config::Config,

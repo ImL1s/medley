@@ -773,16 +773,14 @@ impl<T: Clone> Constrained<T> {
         self.pin = None;
         self.source = None;
     }
+}
 
-    fn clear_unless_source_in(&mut self, retained: &[crate::config::RequirementSource]) {
-        if self
-            .source
-            .as_ref()
-            .is_none_or(|source| !retained.contains(source))
-        {
-            self.clear();
-        }
-    }
+#[derive(Debug, Clone)]
+pub(crate) struct AuxiliaryModelPins {
+    pub source: crate::config::RequirementSource,
+    pub web_search: Option<String>,
+    pub session_summary: Option<String>,
+    pub image_description: Option<String>,
 }
 /// Enforced requirements from `requirements.toml`. Pinned values win over all other sources.
 #[derive(Debug, Clone, Default)]
@@ -806,22 +804,13 @@ pub struct Requirements {
     pub web_search_model: Constrained<String>,
     pub session_summary_model: Constrained<String>,
     pub image_description_model: Constrained<String>,
+    pub(crate) auxiliary_model_layers: Vec<AuxiliaryModelPins>,
 }
 impl Requirements {
     pub(crate) fn clear_auxiliary_model_pins(&mut self) {
         self.web_search_model.clear();
         self.session_summary_model.clear();
         self.image_description_model.clear();
-    }
-
-    pub(crate) fn clear_auxiliary_model_pins_except_sources(
-        &mut self,
-        retained: &[crate::config::RequirementSource],
-    ) {
-        self.web_search_model.clear_unless_source_in(retained);
-        self.session_summary_model.clear_unless_source_in(retained);
-        self.image_description_model
-            .clear_unless_source_in(retained);
     }
 }
 /// Inputs for resolving `#[serde(skip)]` runtime fields after `new_from_toml_cfg()`.

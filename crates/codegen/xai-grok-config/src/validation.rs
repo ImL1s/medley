@@ -65,6 +65,7 @@ pub struct RequirementsLayer {
 /// can preserve prior state without blocking higher-priority layers.
 #[derive(Debug, Clone)]
 pub enum RequirementsLayerLoad {
+    Absent(RequirementsSource),
     Loaded(RequirementsLayer),
     Rejected(RequirementsSource),
 }
@@ -86,7 +87,9 @@ pub fn requirements_layers() -> Vec<RequirementsLayer> {
             {
                 Some(layer)
             }
-            RequirementsLayerLoad::Loaded(_) | RequirementsLayerLoad::Rejected(_) => None,
+            RequirementsLayerLoad::Absent(_)
+            | RequirementsLayerLoad::Loaded(_)
+            | RequirementsLayerLoad::Rejected(_) => None,
         })
         .collect()
 }
@@ -106,7 +109,9 @@ pub fn try_requirements_layers() -> Vec<RequirementsLayerLoad> {
                     is_system: false,
                 }))
             }
-            RequirementsLayerStatus::Absent => {}
+            RequirementsLayerStatus::Absent => out.push(RequirementsLayerLoad::Absent(
+                RequirementsSource::File(user_path),
+            )),
             RequirementsLayerStatus::Rejected => out.push(RequirementsLayerLoad::Rejected(
                 RequirementsSource::File(user_path),
             )),
@@ -122,7 +127,9 @@ pub fn try_requirements_layers() -> Vec<RequirementsLayerLoad> {
                     is_system: true,
                 }))
             }
-            RequirementsLayerStatus::Absent => {}
+            RequirementsLayerStatus::Absent => out.push(RequirementsLayerLoad::Absent(
+                RequirementsSource::File(sys_path),
+            )),
             RequirementsLayerStatus::Rejected => out.push(RequirementsLayerLoad::Rejected(
                 RequirementsSource::File(sys_path),
             )),
@@ -131,15 +138,18 @@ pub fn try_requirements_layers() -> Vec<RequirementsLayerLoad> {
     // macOS MDM: OS-protected admin layer (forced values only). Pushed last so it
     // wins the deep-merge over the system file and cloud cache; `is_system` so
     // security decisions trust it like the root-owned layer.
-    if let Some(raw) = crate::macos_managed::managed_preferences_requirements() {
-        match normalize_requirements_value(raw, crate::macos_managed::MDM_REQUIREMENTS_SOURCE) {
-            Some(value) => out.push(RequirementsLayerLoad::Loaded(RequirementsLayer {
-                value,
-                source: RequirementsSource::Mdm,
-                is_system: true,
-            })),
-            None => out.push(RequirementsLayerLoad::Rejected(RequirementsSource::Mdm)),
+    match crate::macos_managed::managed_preferences_requirements() {
+        Some(raw) => {
+            match normalize_requirements_value(raw, crate::macos_managed::MDM_REQUIREMENTS_SOURCE) {
+                Some(value) => out.push(RequirementsLayerLoad::Loaded(RequirementsLayer {
+                    value,
+                    source: RequirementsSource::Mdm,
+                    is_system: true,
+                })),
+                None => out.push(RequirementsLayerLoad::Rejected(RequirementsSource::Mdm)),
+            }
         }
+        None => out.push(RequirementsLayerLoad::Absent(RequirementsSource::Mdm)),
     }
     out
 }
