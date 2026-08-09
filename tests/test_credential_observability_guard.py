@@ -20,6 +20,7 @@ RAW_STRING_START = re.compile(r'r(#+)?"')
 CHAR_LITERAL = re.compile(r"'(?:\\.|[^\\'\n])'")
 
 LEGACY_FRAGMENT_IDENTIFIERS = {
+    "key_suffix",
     "token_suffix",
     "bearer_tail_fragment",
     "StampedBearerSuffix",
@@ -46,6 +47,7 @@ LEGACY_FRAGMENT_IDENTIFIERS = {
     "parent_key_prefix",
 }
 FORBIDDEN_APIS = {
+    "key_suffix",
     "attempt_bearer",
     "wire_bearer",
     "failed_bearer",
@@ -1964,6 +1966,23 @@ class CredentialObservabilityGuardTests(unittest.TestCase):
         '''
         messages = [violation.message for violation in scan_source(source)]
         self.assertTrue(any("refresh_credential_suffix" in message for message in messages))
+
+    def test_api_key_suffix_helper_is_forbidden_even_through_function_log_sinks(self):
+        source = '''
+            fn key_suffix(key: &str) -> &str {
+                &key[key.len().saturating_sub(12)..]
+            }
+
+            fn unsafe_probe_log(key: &str) {
+                xai_grok_telemetry::unified_log::info(
+                    "probe",
+                    None,
+                    Some(serde_json::json!({"key_suffix": key_suffix(key)})),
+                );
+            }
+        '''
+        messages = [violation.message for violation in scan_source(source)]
+        self.assertTrue(any("forbidden API key_suffix" in message for message in messages))
 
     def test_derived_debug_secret_carriers_report_violations_without_crashing(self):
         source = (FIXTURES / "unsafe_debug_carriers.rs").read_text(encoding="utf-8")
