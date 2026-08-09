@@ -2596,23 +2596,16 @@ impl MvpAgent {
             tier_restricted,
         }
     }
-    pub(super) fn prepare_web_search_sampling_config(&self) -> Option<SamplingConfig> {
-        let (configured_model_id, follows_default) = {
-            let cfg = self.cfg.borrow();
-            (cfg.web_search_model.clone(), cfg.web_search_follows_default)
-        };
-        let operative_model_id = self.models_manager.current_model_id();
-        let model_id = crate::config::auxiliary_model_or_operative(
-            &configured_model_id,
-            operative_model_id.0.as_ref(),
-            follows_default,
-        );
+    pub(super) fn prepare_web_search_sampling_config_for_model(
+        &self,
+        model_id: &str,
+    ) -> Option<SamplingConfig> {
         let models = self.models_manager.models();
         let session = self.current_or_buffered_auth();
         let alpha_test_key = self.cfg.borrow().endpoints.alpha_test_key.clone();
         let client_version = self.cfg.borrow().client_version.clone();
         let mut cfg = config::resolve_web_search_sampling_config(
-            &model_id,
+            model_id,
             &models,
             session.as_ref().map(|a| a.key.as_str()),
             self.cfg.borrow().grok_com_config.api_key_auth_disabled(),

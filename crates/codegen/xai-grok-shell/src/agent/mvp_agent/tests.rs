@@ -7227,6 +7227,29 @@ fn folder_trust_on() -> crate::util::config::RemoteSettings {
     }
 }
 #[test]
+fn subagent_spawn_context_uses_parent_auxiliary_provenance_after_config_reload() {
+    run_local_for_bridge_test(|| async {
+        let (agent, _rx) = build_agent_with_gateway_rx();
+        let sid = acp::SessionId::new("subagent-parent-auxiliary-provenance");
+        let (mut handle, _tx, _cmd_rx) = make_live_session_handle(&sid, None);
+        handle.auxiliary_model_provenance = crate::session::AuxiliaryModelProvenance {
+            web_search_follows_default: true,
+            web_search_model: "spawn-default-search".to_owned(),
+            ..Default::default()
+        };
+        agent.insert_resident(&sid, handle);
+        {
+            let mut cfg = agent.cfg.borrow_mut();
+            cfg.web_search_follows_default = false;
+            cfg.web_search_model = "reloaded-explicit-search".to_owned();
+        }
+
+        let ctx = agent.build_subagent_spawn_context(sid.0.as_ref());
+        assert!(ctx.web_search_follows_default);
+        assert_eq!(ctx.web_search_model, "spawn-default-search");
+    });
+}
+#[test]
 #[serial_test::serial]
 fn subagent_spawn_context_reloads_project_definitions_after_trust_changes() {
     let repo = tempfile::tempdir().unwrap();
