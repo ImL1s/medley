@@ -1077,9 +1077,15 @@ async fn read_parent_prepared_model(ctx: &SubagentSpawnContext) -> PreparedSubag
                     lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
                     auth_scheme: Some(catalog_auth_scheme(auth_scheme)),
                 });
+            if capabilities.is_some() {
+                // The resolved entry is authoritative for every catalog fact,
+                // including auth. This also upgrades a legacy identity whose
+                // persisted auth field was absent so a later descendant can
+                // retain the recovered scheme across another catalog miss.
+                resolved_identity.auth_scheme = Some(catalog_auth_scheme(auth_scheme));
+            }
             if allow_missing_preferred_remap {
                 resolved_identity.model_id = model_id.0.to_string();
-                resolved_identity.auth_scheme = Some(catalog_auth_scheme(auth_scheme));
             }
             return PreparedSubagentModel {
                 sampling_config: inherited,

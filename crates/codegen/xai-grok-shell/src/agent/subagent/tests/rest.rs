@@ -2732,6 +2732,58 @@ async fn read_parent_sampling_config_legacy_committed_identity_missing_auth_fail
 }
 
 #[tokio::test]
+async fn read_parent_sampling_config_legacy_identity_recovers_exact_auth_for_nested_miss() {
+    use xai_grok_sampler::AuthScheme;
+
+    let mut recovered = test_model_entry("legacy-route");
+    recovered.info.auth_scheme = AuthScheme::XApiKey;
+    let mut models = indexmap::IndexMap::new();
+    models.insert("legacy-entry".to_string(), recovered);
+    let ctx = ctx_with_parent_chat_state(
+        "legacy-entry",
+        "legacy-route",
+        "legacy-entry",
+        models,
+    );
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.catalog_identity = Some(xai_chat_state::CatalogIdentity {
+        model_id: "legacy-entry".to_string(),
+        route: "legacy-route".to_string(),
+        lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+        auth_scheme: None,
+    });
+    chat.restore_snapshot(snapshot);
+
+    let recovered_prepared = read_parent_prepared_model(&ctx).await;
+    assert_eq!(recovered_prepared.sampling_config.auth_scheme, AuthScheme::XApiKey);
+    assert_eq!(
+        recovered_prepared.catalog_identity.auth_scheme,
+        Some(xai_chat_state::CatalogAuthScheme::XApiKey),
+        "an exact catalog hit must upgrade a legacy identity with the authoritative auth"
+    );
+
+    let mut nested = ctx_with_parent_chat_state(
+        "legacy-entry",
+        "legacy-route",
+        "legacy-entry",
+        indexmap::IndexMap::new(),
+    );
+    nested.sampling_config.auth_scheme = AuthScheme::None;
+    let nested_chat = nested.parent_chat_state.as_ref().expect("nested chat state");
+    let mut nested_snapshot = nested_chat.snapshot().await.expect("nested chat snapshot");
+    nested_snapshot.catalog_identity = Some(recovered_prepared.catalog_identity);
+    nested_chat.restore_snapshot(nested_snapshot);
+
+    let nested_prepared = read_parent_prepared_model(&nested).await;
+    assert_eq!(nested_prepared.sampling_config.auth_scheme, AuthScheme::XApiKey);
+    assert_eq!(
+        nested_prepared.catalog_identity.auth_scheme,
+        Some(xai_chat_state::CatalogAuthScheme::XApiKey)
+    );
+}
+
+#[tokio::test]
 async fn read_parent_sampling_config_removed_switched_bearer_ignores_none_startup_auth() {
     use xai_grok_sampler::AuthScheme;
 
