@@ -483,6 +483,12 @@ impl SessionActor {
 
         let prev_threshold = self.compaction.threshold_percent.get();
         self.catalog_model_id.set(catalog_model_id.0.to_string());
+        self.committed_tool_result_truncation_policy.set(
+            sampling_config
+                .codex_wire
+                .as_ref()
+                .and_then(|capabilities| capabilities.truncation_policy),
+        );
         self.compaction
             .threshold_percent
             .set(auto_compact_threshold_percent);
@@ -957,6 +963,13 @@ mod model_switch_transaction_tests {
         value
     }
 
+    fn byte_truncation_policy(limit: i64) -> xai_grok_sampling_types::TruncationPolicyConfig {
+        xai_grok_sampling_types::TruncationPolicyConfig {
+            mode: xai_grok_sampling_types::TruncationMode::Bytes,
+            limit,
+        }
+    }
+
     fn assert_model_switch_phase(error: &acp::Error, code: &'static str, reason: &str) {
         assert_eq!(config::model_switch_error_code(error), Some(code));
         assert_eq!(
@@ -1358,6 +1371,82 @@ mod model_switch_transaction_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn tool_result_truncation_policy_catalog_refresh_cannot_replace_committed_tuple() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let persistence = crate::session::persistence::PersistenceHandle::noop();
+                let (mut actor, _event_rx) =
+                    create_test_actor_ex(0, 256_000, 85, gateway_tx, persistence.tx.clone()).await;
+                actor.notifications.persistence_is_noop = persistence.is_noop();
+                *actor.active_agent_type.lock() = Some("grok-build".to_owned());
+
+                let frozen = byte_truncation_policy(111);
+                actor
+                    .committed_tool_result_truncation_policy
+                    .set(Some(frozen));
+
+                let refreshed = byte_truncation_policy(222);
+                let mut refreshed_entry = crate::agent::config::ModelEntry::fallback(
+                    "test",
+                    &crate::agent::config::EndpointsConfig::default(),
+                );
+                refreshed_entry.info.codex_wire =
+                    Some(xai_grok_sampling_types::CodexWireCapabilities {
+                        truncation_policy: Some(refreshed),
+                        ..Default::default()
+                    });
+                actor
+                    .models_manager
+                    .insert_test_entry("test", refreshed_entry);
+
+                assert_eq!(
+                    actor.tool_result_truncation_policy(),
+                    Some(frozen),
+                    "same-key catalog churn must not replace the session's committed capability"
+                );
+                actor
+                    .models_manager
+                    .apply_catalog_for_test(indexmap::IndexMap::new());
+                assert_eq!(
+                    actor.tool_result_truncation_policy(),
+                    Some(frozen),
+                    "catalog removal must not erase the session's committed capability"
+                );
+
+                let switched = byte_truncation_policy(333);
+                let mut prepared = prepared_switch("grok-build", None);
+                prepared.sampling_config.codex_wire =
+                    Some(xai_grok_sampling_types::CodexWireCapabilities {
+                        truncation_policy: Some(switched),
+                        ..Default::default()
+                    });
+                actor
+                    .handle_apply_model_switch(prepared)
+                    .await
+                    .expect("successful model switch");
+
+                assert_eq!(
+                    actor.tool_result_truncation_policy(),
+                    Some(switched),
+                    "a committed model switch must replace the policy with the new model's tuple"
+                );
+
+                actor
+                    .handle_apply_model_switch(prepared_switch("grok-build", None))
+                    .await
+                    .expect("successful switch to a model without a policy");
+                assert_eq!(
+                    actor.tool_result_truncation_policy(),
+                    None,
+                    "a committed model switch must clear a policy absent from the new tuple"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn closed_real_persistence_channel_still_rejects_live_model_switch() {
         let local = tokio::task::LocalSet::new();
         local
@@ -1368,6 +1457,10 @@ mod model_switch_transaction_tests {
                 let (actor, _event_rx) =
                     create_test_actor_ex(0, 256_000, 85, gateway_tx, persistence_tx).await;
                 *actor.active_agent_type.lock() = Some("grok-build".to_owned());
+                let previous_policy = byte_truncation_policy(444);
+                actor
+                    .committed_tool_result_truncation_policy
+                    .set(Some(previous_policy));
                 let previous_chat = actor.chat_state_handle.snapshot().await.expect("snapshot");
 
                 assert_eq!(
@@ -1398,6 +1491,11 @@ mod model_switch_transaction_tests {
                 assert_eq!(payload.reason, "persistence_channel_closed");
                 assert!(config::ModelSwitchHarnessError::from_acp_error(&error).is_none());
                 assert_eq!(catalog_model_id(&actor), "test");
+                assert_eq!(
+                    actor.tool_result_truncation_policy(),
+                    Some(previous_policy),
+                    "a failed commit must retain the previous model's policy"
+                );
                 assert_eq!(
                     actor
                         .chat_state_handle

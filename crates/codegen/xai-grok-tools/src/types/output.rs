@@ -150,9 +150,10 @@ pub struct ToolRunResult {
     /// Prompt-ready text — layers can append system reminders, etc.
     /// Consumers use this for: model prompt (ConversationItem::tool_result).
     pub prompt_text: String,
-    /// Trusted suffix appended by the tool runner after rendering untrusted
+    /// Internally rendered reminder suffix appended by the tool runner after
     /// tool output. Consumers that enforce output budgets must split this
-    /// exact suffix before truncating and reattach it afterwards.
+    /// exact suffix and reserve it a bounded share; reminder bodies can embed
+    /// arbitrary task or subagent output and are not exempt from the limit.
     #[serde(default)]
     pub trusted_prompt_suffix: String,
     /// When a meta-tool dispatches to a different underlying tool (for example

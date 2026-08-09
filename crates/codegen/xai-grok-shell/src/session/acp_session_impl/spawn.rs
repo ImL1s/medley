@@ -1619,6 +1619,12 @@ pub(crate) async fn spawn_session_actor(
         telemetry_enabled,
         supports_backend_search: std::cell::Cell::new(sampling_config.supports_backend_search),
         catalog_model_id: std::cell::Cell::new(session_model_id.0.to_string()),
+        committed_tool_result_truncation_policy: std::cell::Cell::new(
+            sampling_config
+                .codex_wire
+                .as_ref()
+                .and_then(|capabilities| capabilities.truncation_policy),
+        ),
         tool_overrides: std::cell::RefCell::new(None),
         resolved_tool_overrides: resolved_tool_overrides.clone(),
         compactions_remaining: std::cell::Cell::new(sampling_config.compactions_remaining),

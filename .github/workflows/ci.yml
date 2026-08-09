@@ -262,6 +262,8 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_parser_reads_and_validates_truncation_policy -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
+            tool_result_truncation_policy_catalog_refresh_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
             trusted_reminder_suffix_ -- --nocapture
           run_nonzero -p xai-chat-state --lib \
             tool_result_truncation_policy -- --nocapture

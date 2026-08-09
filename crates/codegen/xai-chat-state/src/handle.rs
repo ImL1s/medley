@@ -100,8 +100,12 @@ impl ChatStateHandle {
         self.push_tool_result_with_trusted_suffix(item, truncation_policy, None);
     }
 
-    /// Record a tool result whose trusted, internally generated suffix must be
-    /// preserved outside the untrusted tool-output truncation budget.
+    /// Record a tool result with an internally appended reminder suffix.
+    ///
+    /// The suffix gets a reserved share of the active truncation budget so raw
+    /// output cannot consume its entire one-shot signal. Its body remains
+    /// bounded because it can contain arbitrary task or subagent output;
+    /// pathologically small budgets may preserve only a truncation marker.
     pub fn push_tool_result_with_trusted_suffix(
         &self,
         item: ConversationItem,

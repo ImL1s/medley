@@ -2343,6 +2343,7 @@ mod inline_auto_compact_flow_tests {
             telemetry_enabled: false,
             supports_backend_search: std::cell::Cell::new(false),
             catalog_model_id: std::cell::Cell::new("test".to_string()),
+            committed_tool_result_truncation_policy: std::cell::Cell::new(None),
             tool_overrides: std::cell::RefCell::new(None),
             resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             compactions_remaining: std::cell::Cell::new(None),

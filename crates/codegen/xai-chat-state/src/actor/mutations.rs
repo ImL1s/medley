@@ -32,16 +32,40 @@ impl ChatStateActor {
         truncation_policy: Option<TruncationPolicyConfig>,
         trusted_suffix: Option<String>,
     ) {
-        if let (ConversationItem::ToolResult(result), Some(policy)) = (&mut item, truncation_policy)
-            && let Some(max_bytes) = truncation_policy_byte_limit(policy)
-        {
-            truncate_tool_result_content(&mut result.content, max_bytes);
-        }
-        if let (ConversationItem::ToolResult(result), Some(suffix)) = (&mut item, trusted_suffix) {
-            let mut combined = String::with_capacity(result.content.len() + suffix.len());
-            combined.push_str(&result.content);
-            combined.push_str(&suffix);
-            result.content = combined.into();
+        if let ConversationItem::ToolResult(result) = &mut item {
+            match (
+                truncation_policy.and_then(truncation_policy_byte_limit),
+                trusted_suffix,
+            ) {
+                (Some(max_bytes), Some(mut suffix)) => {
+                    // The runner proves only that this suffix was appended by
+                    // framework code; reminder bodies can still contain
+                    // arbitrary subagent/task output. Give the reminder a
+                    // reserved share so raw output cannot consume its entire
+                    // one-shot signal, but keep the complete persisted item
+                    // inside one policy budget. Extremely small budgets can
+                    // preserve only a truncation marker, not XML framing
+                    // (#263).
+                    let suffix_budget = if result.content.is_empty() {
+                        max_bytes
+                    } else {
+                        max_bytes.div_ceil(2)
+                    };
+                    truncate_owned_text(&mut suffix, suffix_budget);
+                    truncate_tool_result_content(
+                        &mut result.content,
+                        max_bytes.saturating_sub(suffix.len()),
+                    );
+                    append_tool_result_suffix(&mut result.content, &suffix);
+                }
+                (Some(max_bytes), None) => {
+                    truncate_tool_result_content(&mut result.content, max_bytes);
+                }
+                (None, Some(suffix)) => {
+                    append_tool_result_suffix(&mut result.content, &suffix);
+                }
+                (None, None) => {}
+            }
         }
         self.push_message(item);
     }
@@ -608,13 +632,30 @@ fn truncate_tool_result_content(content: &mut std::sync::Arc<str>, max_bytes: us
     if content.len() <= max_bytes {
         return;
     }
-
-    let full_marker = format!(
+    let marker = format!(
         "\n... tool output truncated: {} bytes total ...\n",
         content.len()
     );
-    let marker = if full_marker.len() <= max_bytes {
-        full_marker
+    if let Some(truncated) = truncate_text(content, max_bytes, &marker) {
+        *content = truncated.into();
+    }
+}
+
+fn truncate_owned_text(content: &mut String, max_bytes: usize) {
+    // Keep reminder framing useful at modest budgets. The raw-output marker
+    // includes the original byte count, but that metadata is not worth
+    // consuming most of a reminder's reserved share.
+    if let Some(truncated) = truncate_text(content, max_bytes, "[truncated]") {
+        *content = truncated;
+    }
+}
+
+fn truncate_text(content: &str, max_bytes: usize, preferred_marker: &str) -> Option<String> {
+    if content.len() <= max_bytes {
+        return None;
+    }
+    let marker = if preferred_marker.len() <= max_bytes {
+        preferred_marker.to_owned()
     } else if "[truncated]".len() <= max_bytes {
         "[truncated]".to_owned()
     } else {
@@ -637,5 +678,12 @@ fn truncate_tool_result_content(content: &mut std::sync::Arc<str>, max_bytes: us
     truncated.push_str(&content[..head_end]);
     truncated.push_str(&marker);
     truncated.push_str(&content[tail_start..]);
-    *content = truncated.into();
+    Some(truncated)
+}
+
+fn append_tool_result_suffix(content: &mut std::sync::Arc<str>, suffix: &str) {
+    let mut combined = String::with_capacity(content.len() + suffix.len());
+    combined.push_str(content);
+    combined.push_str(suffix);
+    *content = combined.into();
 }

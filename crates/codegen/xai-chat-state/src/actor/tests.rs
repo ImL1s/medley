@@ -511,10 +511,10 @@ async fn tool_result_truncation_policy_preserves_one_shot_reminder_suffix() {
     let reminder = "\n\n<system-reminder>\nBackground task bg-1 completed.\n</system-reminder>";
 
     h.handle.push_tool_result_with_trusted_suffix(
-        ConversationItem::tool_result("call-1", "0123456789"),
+        ConversationItem::tool_result("call-1", "x".repeat(400)),
         Some(TruncationPolicyConfig {
             mode: TruncationMode::Bytes,
-            limit: 4,
+            limit: 120,
         }),
         Some(reminder.to_owned()),
     );
@@ -523,7 +523,9 @@ async fn tool_result_truncation_policy_preserves_one_shot_reminder_suffix() {
     let ConversationItem::ToolResult(result) = &conv[0] else {
         panic!("expected tool result");
     };
-    assert_eq!(result.content.as_ref(), format!("0...9{reminder}"));
+    assert!(result.content.contains("tool output truncated"));
+    assert!(result.content.ends_with(reminder));
+    assert!(result.content.len() <= 144, "one shared 1.2x budget");
 }
 
 #[tokio::test]
@@ -535,7 +537,7 @@ async fn tool_result_truncation_policy_preserves_reminder_only_result() {
         ConversationItem::tool_result("call-1", ""),
         Some(TruncationPolicyConfig {
             mode: TruncationMode::Bytes,
-            limit: 1,
+            limit: 100,
         }),
         Some(reminder.to_owned()),
     );
@@ -545,6 +547,85 @@ async fn tool_result_truncation_policy_preserves_reminder_only_result() {
         panic!("expected tool result");
     };
     assert_eq!(result.content.as_ref(), reminder);
+}
+
+#[tokio::test]
+async fn tool_result_truncation_policy_bounds_large_internal_reminder_payload() {
+    let h = TestHarness::new();
+    let reminder = format!(
+        "\n\n<system-reminder>\nBackground subagent completed.\nresponse:\n{}\n</system-reminder>",
+        "untrusted-subagent-output".repeat(400)
+    );
+
+    h.handle.push_tool_result_with_trusted_suffix(
+        ConversationItem::tool_result("call-1", "raw-tool-output".repeat(400)),
+        Some(TruncationPolicyConfig {
+            mode: TruncationMode::Bytes,
+            limit: 400,
+        }),
+        Some(reminder),
+    );
+
+    let conv = h.handle.get_conversation().await;
+    let ConversationItem::ToolResult(result) = &conv[0] else {
+        panic!("expected tool result");
+    };
+    assert!(result.content.contains("tool output truncated"));
+    assert!(result.content.contains("<system-reminder>"));
+    assert!(result.content.ends_with("</system-reminder>"));
+    assert!(
+        result.content.len() <= 480,
+        "runner provenance must not exempt embedded output from the shared 1.2x budget"
+    );
+}
+
+#[tokio::test]
+async fn tool_result_truncation_policy_bounds_large_reminder_after_short_raw_output() {
+    let h = TestHarness::new();
+    let reminder = format!(
+        "<system-reminder>\n{}\n</system-reminder>",
+        "untrusted".repeat(1_000)
+    );
+
+    h.handle.push_tool_result_with_trusted_suffix(
+        ConversationItem::tool_result("call-1", "ok"),
+        Some(TruncationPolicyConfig {
+            mode: TruncationMode::Bytes,
+            limit: 100,
+        }),
+        Some(reminder),
+    );
+
+    let conv = h.handle.get_conversation().await;
+    let ConversationItem::ToolResult(result) = &conv[0] else {
+        panic!("expected tool result");
+    };
+    assert!(result.content.starts_with("ok<system-reminder>"));
+    assert!(result.content.contains("[truncated]"));
+    assert!(result.content.ends_with("</system-reminder>"));
+    assert!(result.content.len() <= 120, "one shared 1.2x budget");
+}
+
+#[tokio::test]
+async fn tool_result_truncation_policy_tiny_budget_keeps_utf8_suffix_valid_and_bounded() {
+    let h = TestHarness::new();
+
+    h.handle.push_tool_result_with_trusted_suffix(
+        ConversationItem::tool_result("call-1", "a"),
+        Some(TruncationPolicyConfig {
+            mode: TruncationMode::Bytes,
+            limit: 1,
+        }),
+        Some("界".repeat(20)),
+    );
+
+    let conv = h.handle.get_conversation().await;
+    let ConversationItem::ToolResult(result) = &conv[0] else {
+        panic!("expected tool result");
+    };
+    assert_eq!(result.content.as_ref(), "a.");
+    assert!(result.content.is_char_boundary(result.content.len()));
+    assert!(result.content.len() <= 2, "ceil(1.2 byte allowance)");
 }
 
 #[tokio::test]
