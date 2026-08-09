@@ -61,6 +61,11 @@ pub(crate) fn resolve_catalog_identity(
         } else {
             xai_chat_state::CatalogResolutionLineage::UniqueRoute
         },
+        auth_scheme: Some(match entry.info().auth_scheme {
+            xai_grok_sampler::AuthScheme::Bearer => xai_chat_state::CatalogAuthScheme::Bearer,
+            xai_grok_sampler::AuthScheme::XApiKey => xai_chat_state::CatalogAuthScheme::XApiKey,
+            xai_grok_sampler::AuthScheme::None => xai_chat_state::CatalogAuthScheme::None,
+        }),
     })
 }
 

@@ -2451,6 +2451,7 @@ fn spawn_test_parent_chat_state_with_catalog_identity(
             model_id: catalog_model_id.to_string(),
             route: model_slug.to_string(),
             lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+            auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
         }),
         xai_chat_state::PruningConfig::default(),
         Box::new(mock),

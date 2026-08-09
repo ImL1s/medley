@@ -322,6 +322,7 @@ mod tests {
                 model_id: "profile-entry".to_string(),
                 route: "profile-route".to_string(),
                 lineage: crate::types::CatalogResolutionLineage::UniqueRoute,
+                auth_scheme: None,
             }),
         );
         let identity = catalog_state.catalog_identity.as_ref().unwrap();

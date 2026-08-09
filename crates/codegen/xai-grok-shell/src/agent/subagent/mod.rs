@@ -843,6 +843,26 @@ struct PreparedSubagentModel {
     catalog_identity: xai_chat_state::CatalogIdentity,
 }
 
+fn catalog_auth_scheme(
+    auth_scheme: xai_grok_sampler::AuthScheme,
+) -> xai_chat_state::CatalogAuthScheme {
+    match auth_scheme {
+        xai_grok_sampler::AuthScheme::Bearer => xai_chat_state::CatalogAuthScheme::Bearer,
+        xai_grok_sampler::AuthScheme::XApiKey => xai_chat_state::CatalogAuthScheme::XApiKey,
+        xai_grok_sampler::AuthScheme::None => xai_chat_state::CatalogAuthScheme::None,
+    }
+}
+
+fn sampler_auth_scheme(
+    auth_scheme: xai_chat_state::CatalogAuthScheme,
+) -> xai_grok_sampler::AuthScheme {
+    match auth_scheme {
+        xai_chat_state::CatalogAuthScheme::Bearer => xai_grok_sampler::AuthScheme::Bearer,
+        xai_chat_state::CatalogAuthScheme::XApiKey => xai_grok_sampler::AuthScheme::XApiKey,
+        xai_chat_state::CatalogAuthScheme::None => xai_grok_sampler::AuthScheme::None,
+    }
+}
+
 async fn read_parent_prepared_model(ctx: &SubagentSpawnContext) -> PreparedSubagentModel {
     if let Some(ref chat_state) = ctx.parent_chat_state {
         if let Some((cfg, catalog_identity)) = chat_state.get_sampling_config_with_model_id().await
@@ -905,6 +925,12 @@ async fn read_parent_prepared_model(ctx: &SubagentSpawnContext) -> PreparedSubag
             let auth_scheme = capabilities
                 .as_ref()
                 .map(|facts| facts.auth_scheme)
+                .or_else(|| {
+                    catalog_identity
+                        .as_ref()
+                        .and_then(|identity| identity.auth_scheme)
+                        .map(sampler_auth_scheme)
+                })
                 .unwrap_or(ctx.sampling_config.auth_scheme);
             let inherited_base_url = cfg.base_url.clone();
             let strip_guard = ctx.would_strip_fallback_key(creds.api_key());
@@ -1030,6 +1056,7 @@ async fn read_parent_prepared_model(ctx: &SubagentSpawnContext) -> PreparedSubag
                     model_id: model_id.0.to_string(),
                     route: inherited.model.clone(),
                     lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+                    auth_scheme: Some(catalog_auth_scheme(auth_scheme)),
                 });
             if allow_missing_preferred_remap {
                 resolved_identity.model_id = model_id.0.to_string();
@@ -1102,6 +1129,7 @@ async fn read_parent_prepared_model(ctx: &SubagentSpawnContext) -> PreparedSubag
         model_id: ctx.sampling_config_model_id.0.to_string(),
         route: fallback.model.clone(),
         lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+        auth_scheme: Some(catalog_auth_scheme(fallback.auth_scheme)),
     };
     PreparedSubagentModel {
         catalog_identity,

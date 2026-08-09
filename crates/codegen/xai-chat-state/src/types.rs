@@ -39,6 +39,14 @@ pub enum CatalogResolutionLineage {
     UniqueRoute,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogAuthScheme {
+    Bearer,
+    XApiKey,
+    None,
+}
+
 /// Immutable catalog identity paired atomically with a prepared sampler.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogIdentity {
@@ -46,6 +54,8 @@ pub struct CatalogIdentity {
     pub route: String,
     #[serde(default)]
     pub lineage: CatalogResolutionLineage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_scheme: Option<CatalogAuthScheme>,
 }
 
 impl CatalogIdentity {

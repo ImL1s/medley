@@ -306,6 +306,15 @@ impl SessionActor {
                 model_id: catalog_model_id.0.to_string(),
                 route: sampling_config.model.clone(),
                 lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+                auth_scheme: Some(match sampling_config.auth_scheme {
+                    xai_grok_sampler::AuthScheme::Bearer => {
+                        xai_chat_state::CatalogAuthScheme::Bearer
+                    }
+                    xai_grok_sampler::AuthScheme::XApiKey => {
+                        xai_chat_state::CatalogAuthScheme::XApiKey
+                    }
+                    xai_grok_sampler::AuthScheme::None => xai_chat_state::CatalogAuthScheme::None,
+                }),
             },
             sampling_config,
             use_concise,
@@ -928,6 +937,7 @@ mod model_switch_transaction_tests {
                 model_id: "target-model".to_string(),
                 route: "target-wire-model".to_string(),
                 lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+                auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
             },
             resolved_model,
             sampling_config: switch_sampling_config("target-wire-model"),
@@ -1285,6 +1295,7 @@ mod model_switch_transaction_tests {
                         model_id: "target-model".to_string(),
                         route: "target-wire-model".to_string(),
                         lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+                        auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
                     }),
                     "the actor must commit the identity prepared with the sampler"
                 );

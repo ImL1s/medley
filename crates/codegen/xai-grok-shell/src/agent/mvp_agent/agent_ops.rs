@@ -4707,6 +4707,17 @@ impl MvpAgent {
                 model_id: session_model_id.0.to_string(),
                 route: sampling_config.model.clone(),
                 lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+                auth_scheme: Some(match sampling_config.auth_scheme {
+                    xai_grok_sampler::AuthScheme::Bearer => {
+                        xai_chat_state::CatalogAuthScheme::Bearer
+                    }
+                    xai_grok_sampler::AuthScheme::XApiKey => {
+                        xai_chat_state::CatalogAuthScheme::XApiKey
+                    }
+                    xai_grok_sampler::AuthScheme::None => {
+                        xai_chat_state::CatalogAuthScheme::None
+                    }
+                }),
             }
         });
         if self.auth_method_id.load().is_none() {

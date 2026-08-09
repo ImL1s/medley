@@ -13,6 +13,7 @@ fn test_catalog_identity(
         model_id: model_id.to_string(),
         route: route.to_string(),
         lineage,
+        auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
     }
 }
 #[test]
@@ -2595,14 +2596,59 @@ async fn read_parent_sampling_config_missing_committed_id_ignores_same_route_sur
         "shared-routing-model",
         xai_chat_state::CatalogResolutionLineage::ExactKey,
     ));
+    snapshot
+        .catalog_identity
+        .as_mut()
+        .expect("catalog identity")
+        .auth_scheme = Some(xai_chat_state::CatalogAuthScheme::None);
     chat.restore_snapshot(snapshot);
 
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
 
     assert_eq!(model_id.0.as_ref(), "removed-entry");
-    assert_eq!(config.auth_scheme, AuthScheme::Bearer);
+    assert_eq!(config.auth_scheme, AuthScheme::None);
+    assert!(config.api_key.is_none());
     assert!(!config.supports_backend_search);
     assert_eq!(config.codex_wire, None);
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_removed_switched_bearer_ignores_none_startup_auth() {
+    use xai_grok_sampler::AuthScheme;
+
+    let mut ctx = ctx_with_parent_chat_state(
+        "startup-none-entry",
+        "switched-bearer-route",
+        "startup-none-entry",
+        indexmap::IndexMap::new(),
+    );
+    ctx.sampling_config_model_id = acp::ModelId::new("startup-none-entry");
+    ctx.sampling_config.auth_scheme = AuthScheme::None;
+    ctx.sampling_config.api_key = None;
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    chat.update_credentials(xai_chat_state::Credentials::bound(
+        Some("switched-live-bearer".to_string()),
+        xai_chat_state::AuthType::SessionToken,
+        xai_grok_sampler::CredentialSource::XaiSession,
+    ));
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.catalog_identity = Some(xai_chat_state::CatalogIdentity {
+        model_id: "removed-bearer-entry".to_string(),
+        route: "switched-bearer-route".to_string(),
+        lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+        auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
+    });
+    chat.restore_snapshot(snapshot);
+
+    let prepared = read_parent_prepared_model(&ctx).await;
+
+    assert_eq!(prepared.model_id.0.as_ref(), "removed-bearer-entry");
+    assert_eq!(prepared.catalog_identity.model_id, "removed-bearer-entry");
+    assert_eq!(prepared.sampling_config.auth_scheme, AuthScheme::Bearer);
+    assert_eq!(
+        prepared.sampling_config.api_key.as_deref(),
+        Some("switched-live-bearer")
+    );
 }
 
 #[tokio::test]
