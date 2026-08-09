@@ -106,10 +106,20 @@ pub(crate) mod hydrate {
         let meta = remote.metadata.as_ref();
 
         let model_id = meta
-            .and_then(|m| m.get("modelId"))
+            .and_then(|m| m.get("modelId").or_else(|| m.get("model_id")))
             .and_then(|v| v.as_str())
             .map(agent_client_protocol::ModelId::new)
             .unwrap_or_else(default_model_id);
+        let catalog_identity = meta
+            .and_then(|m| {
+                m.get("catalogIdentity")
+                    .or_else(|| m.get("catalog_identity"))
+            })
+            .cloned()
+            .and_then(|value| serde_json::from_value::<xai_chat_state::CatalogIdentity>(value).ok())
+            .filter(|identity| {
+                identity.model_id == model_id.0.as_ref() && !identity.route.trim().is_empty()
+            });
 
         let parent_session_id = meta
             .and_then(|m| m.get("parentSessionId"))
@@ -128,7 +138,7 @@ pub(crate) mod hydrate {
             num_messages,
             num_chat_messages,
             current_model_id: model_id,
-            catalog_identity: None,
+            catalog_identity,
             parent_session_id,
             forked_at: None,
             collection_id: None,
@@ -236,6 +246,98 @@ pub(crate) mod hydrate {
 #[cfg(test)]
 mod tests {
     use crate::remote::client::LoadedMessage;
+
+    #[test]
+    fn push_pull_resume_preserves_unique_route_across_key_reuse() {
+        let info = crate::session::info::Info {
+            id: agent_client_protocol::SessionId::new("remote-lineage"),
+            cwd: "/tmp/remote-lineage".to_owned(),
+        };
+        let mut source = crate::session::persistence::Summary::new(
+            &info,
+            agent_client_protocol::ModelId::new("removed-key"),
+        )
+        .unwrap();
+        source.catalog_identity = Some(xai_chat_state::CatalogIdentity {
+            model_id: "removed-key".to_owned(),
+            route: "retained-route".to_owned(),
+            lineage: xai_chat_state::CatalogResolutionLineage::UniqueRoute,
+            auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
+        });
+        let pushed = crate::session::export::ExportedMetadata::from_summary(&source);
+        let data = crate::remote::client::LoadDataResponse {
+            messages: None,
+            session: Some(crate::remote::client::SessionInfo {
+                session_id: "remote-lineage".to_owned(),
+                title: None,
+                cwd: Some("/tmp/remote-lineage".to_owned()),
+                status: None,
+                created_at: None,
+                updated_at: None,
+                metadata: Some(serde_json::to_value(pushed).unwrap()),
+            }),
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        super::hydrate::write_to_dir(tmp.path(), &data).unwrap();
+        let pulled: crate::session::persistence::Summary =
+            serde_json::from_slice(&std::fs::read(tmp.path().join("summary.json")).unwrap())
+                .unwrap();
+        let restored = pulled
+            .catalog_identity
+            .expect("remote lineage must round-trip");
+
+        let mut invalid_metadata = serde_json::to_value(
+            crate::session::export::ExportedMetadata::from_summary(&source),
+        )
+        .unwrap();
+        invalid_metadata["catalog_identity"]["model_id"] = serde_json::json!("other-key");
+        let invalid = crate::remote::client::LoadDataResponse {
+            messages: None,
+            session: Some(crate::remote::client::SessionInfo {
+                session_id: "remote-lineage-invalid".to_owned(),
+                title: None,
+                cwd: Some("/tmp/remote-lineage".to_owned()),
+                status: None,
+                created_at: None,
+                updated_at: None,
+                metadata: Some(invalid_metadata),
+            }),
+        };
+        let invalid_tmp = tempfile::TempDir::new().unwrap();
+        super::hydrate::write_to_dir(invalid_tmp.path(), &invalid).unwrap();
+        let invalid_pulled: crate::session::persistence::Summary = serde_json::from_slice(
+            &std::fs::read(invalid_tmp.path().join("summary.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            invalid_pulled.catalog_identity.is_none(),
+            "pull must reject identity metadata that disagrees with model_id"
+        );
+
+        let endpoints = crate::agent::config::EndpointsConfig::default();
+        let mut reused = crate::agent::config::ModelEntry::fallback("foreign-route", &endpoints);
+        reused.info.base_url = "https://foreign.example/v1".to_owned();
+        reused.api_key = Some("foreign-secret".to_owned());
+        reused.info.auth_scheme = xai_grok_sampler::AuthScheme::Bearer;
+        let mut replacement =
+            crate::agent::config::ModelEntry::fallback("retained-route", &endpoints);
+        replacement.info.base_url = "https://retained.example/v1".to_owned();
+        replacement.api_key = Some("retained-secret".to_owned());
+        replacement.info.auth_scheme = xai_grok_sampler::AuthScheme::Bearer;
+        let catalog = indexmap::IndexMap::from([
+            ("removed-key".to_owned(), reused),
+            ("replacement-key".to_owned(), replacement),
+        ]);
+        let resolved =
+            crate::agent::models::reconcile_persisted_catalog_identity(&catalog, &restored)
+                .expect("retained route should resolve uniquely after pull");
+        let entry = &catalog[resolved.model_id.as_str()];
+        let credentials = crate::agent::config::resolve_credentials(entry, None);
+        assert_eq!(resolved.model_id, "replacement-key");
+        assert_eq!(credentials.base_url, "https://retained.example/v1");
+        assert_eq!(credentials.api_key.as_deref(), Some("retained-secret"));
+        assert_ne!(credentials.api_key.as_deref(), Some("foreign-secret"));
+    }
 
     #[test]
     fn hydrate_writes_valid_updates_jsonl() {

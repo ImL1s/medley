@@ -14,17 +14,16 @@ pub(super) fn yolo_toggle_report(was: bool, actual: bool) -> Option<bool> {
     (was != actual).then_some(actual)
 }
 
-fn apply_opaque_model_name_override(
-    mut config: xai_grok_sampling_types::SamplingConfig,
-    credentials: xai_chat_state::Credentials,
+async fn apply_opaque_model_name_override(
+    chat_state: &xai_chat_state::ChatStateHandle,
     model_name: String,
     extra_headers: indexmap::IndexMap<String, String>,
     context_window: Option<std::num::NonZeroU64>,
     context_window_is_pinned: bool,
-) -> (
-    xai_grok_sampling_types::SamplingConfig,
-    xai_chat_state::Credentials,
-) {
+) -> Option<xai_grok_sampling_types::SamplingConfig> {
+    let (mut config, _catalog_identity, credentials) =
+        chat_state.get_prepared_model_state().await?;
+    let previous = config.clone();
     config.model = model_name;
     config.extra_headers.extend(extra_headers);
     if let Some(context_window) = context_window
@@ -35,16 +34,17 @@ fn apply_opaque_model_name_override(
     // An opaque name override changes only wire routing. In particular, do not
     // resolve credentials by the new name: a configured catalog key with the
     // same string may belong to another endpoint/origin.
-    (config, credentials)
+    chat_state.update_sampling_config_and_credentials(config, credentials);
+    Some(previous)
 }
 
 #[cfg(test)]
 mod opaque_model_name_override_tests {
     use super::apply_opaque_model_name_override;
 
-    #[test]
-    fn keeps_endpoint_and_bound_secret_when_name_collides_with_an_external_model() {
-        let mut config = xai_grok_sampling_types::SamplingConfig::for_test(
+    #[tokio::test]
+    async fn keeps_endpoint_and_bound_secret_when_name_collides_with_an_external_model() {
+        let config = xai_grok_sampling_types::SamplingConfig::for_test(
             "https://old.example.test/v1",
             "old-route",
         );
@@ -61,14 +61,35 @@ mod opaque_model_name_override_tests {
         let foreign = crate::agent::config::resolve_credentials(&colliding_entry, None);
         assert_eq!(foreign.api_key.as_deref(), Some("foreign-model-key"));
 
-        let (config, credentials) = apply_opaque_model_name_override(
+        let (mock, _persistence_rx) = xai_chat_state::MockChatPersistence::new();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let chat_state = xai_chat_state::ChatStateActor::spawn(
+            vec![],
             config,
+            Box::new(mock),
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        chat_state.update_sampling_config_and_credentials(
+            xai_grok_sampling_types::SamplingConfig::for_test(
+                "https://old.example.test/v1",
+                "old-route",
+            ),
             credentials,
+        );
+        apply_opaque_model_name_override(
+            &chat_state,
             "configured-external-model".to_string(),
             indexmap::IndexMap::from([("x-route-key".to_string(), "route-scoped-key".to_string())]),
             None,
             false,
-        );
+        )
+        .await
+        .expect("live chat state");
+        let (config, _, credentials) = chat_state
+            .get_prepared_model_state()
+            .await
+            .expect("live chat state");
 
         assert_eq!(config.base_url, "https://old.example.test/v1");
         assert_eq!(credentials.api_key(), Some("old-origin-key"));
@@ -778,18 +799,21 @@ pub(super) async fn run_session(
                         }
                         SessionCommand::OverrideModelName { model_name, extra_headers, context_window } => {
                             // Update the actor's SamplingConfig model + headers + context window.
-                            if let Some((cfg, _catalog_identity, existing)) = session
-                                .chat_state_handle
-                                .get_prepared_model_state()
-                                .await
-                            {
+                            let extra_header_count = extra_headers.len();
+                            if let Some(previous) = apply_opaque_model_name_override(
+                                &session.chat_state_handle,
+                                model_name.clone(),
+                                extra_headers,
+                                context_window,
+                                session.compaction.context_window_override.is_some(),
+                            ).await {
                                 tracing::info!(
                                     target: SESSION_LOG,
                                     session_id = %session.session_info.id,
-                                    old_model = %cfg.model,
+                                    old_model = %previous.model,
                                     new_model = %model_name,
-                                    extra_header_count = extra_headers.len(),
-                                    old_context_window = cfg.context_window.get(),
+                                    extra_header_count,
+                                    old_context_window = previous.context_window.get(),
                                     new_context_window = ?context_window.map(|cw| cw.get()),
                                     "OVERRIDE_MODEL: changing model name in sampling config"
                                 );
@@ -798,17 +822,6 @@ pub(super) async fn run_session(
                                 // the agent-level default (e.g. "grok-4.5").
                                 // set_primary_model also adds to models_used.
                                 session.signals_handle().set_primary_model(&model_name);
-                                let (cfg, existing) = apply_opaque_model_name_override(
-                                    cfg,
-                                    existing,
-                                    model_name,
-                                    extra_headers,
-                                    context_window,
-                                    session.compaction.context_window_override.is_some(),
-                                );
-                                session
-                                    .chat_state_handle
-                                    .update_sampling_config_and_credentials(cfg, existing);
                                 // Route headers changed under a possibly-unchanged model id.
                                 session.invalidate_model_auth_memo();
                             }

@@ -3445,6 +3445,165 @@ async fn registered_session_stays_gated_until_restored_model_is_final() {
     );
 }
 
+#[test]
+fn attach_restore_unique_route_ignores_reused_key_endpoint_and_secret() {
+    run_local_for_bridge_test(|| async {
+        let agent = build_agent_with_model_for_tests("removed-key", "grok-build");
+        let mut reused = agent.models_manager.models()["removed-key"].clone();
+        reused.info.model = "foreign-route".to_owned();
+        reused.info.base_url = "https://foreign.example/v1".to_owned();
+        reused.api_key = Some("foreign-secret".to_owned());
+        reused.info.auth_scheme = xai_grok_sampler::AuthScheme::Bearer;
+        agent
+            .models_manager
+            .insert_test_entry("removed-key", reused);
+        let mut replacement = agent.models_manager.models()["removed-key"].clone();
+        replacement.info.model = "retained-route".to_owned();
+        replacement.info.base_url = "https://retained.example/v1".to_owned();
+        replacement.api_key = Some("retained-secret".to_owned());
+        agent
+            .models_manager
+            .insert_test_entry("replacement-key", replacement);
+
+        let sid = acp::SessionId::new("resume-catalog-lineage");
+        let mut handle = make_test_handle("removed-key", false, None);
+        handle.info.id = sid.clone();
+        handle.agent_name = "grok-build".to_owned();
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        handle.cmd_tx = cmd_tx;
+        agent.session_registry.put_resident(&sid, handle);
+        tokio::task::spawn_local(async move {
+            while let Some(command) = cmd_rx.recv().await {
+                match command {
+                    TestSessionCommand::GetActiveAgent { responds_to } => {
+                        let _ = responds_to.send(Some("grok-build".to_owned()));
+                    }
+                    TestSessionCommand::ApplyModelSwitch {
+                        prepared,
+                        responds_to,
+                    } => {
+                        assert_eq!(prepared.catalog_identity.model_id, "replacement-key");
+                        assert_eq!(prepared.catalog_identity.route, "retained-route");
+                        assert_eq!(
+                            prepared.sampling_config.base_url,
+                            "https://retained.example/v1"
+                        );
+                        assert_eq!(
+                            prepared.sampling_config.api_key.as_deref(),
+                            Some("retained-secret")
+                        );
+                        assert_ne!(
+                            prepared.sampling_config.api_key.as_deref(),
+                            Some("foreign-secret")
+                        );
+                        let _ = responds_to.send(Ok(crate::session::AppliedModelSwitch {
+                            previous_model_id: acp::ModelId::new("removed-key"),
+                            catalog_model_id: acp::ModelId::new("replacement-key"),
+                            did_rebuild: false,
+                            active_agent_type: Some("grok-build".to_owned()),
+                        }));
+                    }
+                    _ => panic!("unexpected command during persisted model restore"),
+                }
+            }
+        });
+
+        let info = crate::session::info::Info {
+            id: sid.clone(),
+            cwd: "/tmp/resume-catalog-lineage".to_owned(),
+        };
+        let mut summary = crate::session::persistence::Summary::new(
+            &info,
+            acp::ModelId::new("removed-key"),
+        )
+        .unwrap();
+        summary.catalog_identity = Some(xai_chat_state::CatalogIdentity {
+            model_id: "removed-key".to_owned(),
+            route: "retained-route".to_owned(),
+            lineage: xai_chat_state::CatalogResolutionLineage::UniqueRoute,
+            auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
+        });
+        let guard = agent.begin_session_load(&sid);
+        agent.restore_persisted_model(&sid, &summary, &guard).await;
+        assert_eq!(
+            agent.resident_handle(&sid).unwrap().model_id.0.as_ref(),
+            "replacement-key"
+        );
+        drop(guard);
+    });
+}
+
+#[test]
+fn attach_restore_blocks_exact_key_reuse_and_unique_route_ambiguity() {
+    run_local_for_bridge_test(|| async {
+        for (label, lineage, replacement_count) in [
+            (
+                "exact-reuse",
+                xai_chat_state::CatalogResolutionLineage::ExactKey,
+                1usize,
+            ),
+            (
+                "unique-route-ambiguity",
+                xai_chat_state::CatalogResolutionLineage::UniqueRoute,
+                2usize,
+            ),
+        ] {
+            let agent = build_agent_with_model_for_tests("removed-key", "grok-build");
+            let mut reused = agent.models_manager.models()["removed-key"].clone();
+            reused.info.model = "foreign-route".to_owned();
+            reused.info.base_url = "https://foreign.example/v1".to_owned();
+            reused.api_key = Some("foreign-secret".to_owned());
+            reused.info.auth_scheme = xai_grok_sampler::AuthScheme::Bearer;
+            agent
+                .models_manager
+                .insert_test_entry("removed-key", reused.clone());
+            for index in 0..replacement_count {
+                let mut replacement = reused.clone();
+                replacement.info.model = "retained-route".to_owned();
+                replacement.info.base_url = format!("https://retained-{index}.example/v1");
+                replacement.api_key = Some(format!("retained-secret-{index}"));
+                agent
+                    .models_manager
+                    .insert_test_entry(format!("replacement-{index}"), replacement);
+            }
+
+            let sid = acp::SessionId::new(format!("resume-{label}"));
+            let mut handle = make_test_handle("removed-key", false, None);
+            handle.info.id = sid.clone();
+            let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+            handle.cmd_tx = cmd_tx;
+            agent.session_registry.put_resident(&sid, handle);
+            let info = crate::session::info::Info {
+                id: sid.clone(),
+                cwd: format!("/tmp/{label}"),
+            };
+            let mut summary = crate::session::persistence::Summary::new(
+                &info,
+                acp::ModelId::new("removed-key"),
+            )
+            .unwrap();
+            summary.catalog_identity = Some(xai_chat_state::CatalogIdentity {
+                model_id: "removed-key".to_owned(),
+                route: "retained-route".to_owned(),
+                lineage,
+                auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
+            });
+            let guard = agent.begin_session_load(&sid);
+            agent.restore_persisted_model(&sid, &summary, &guard).await;
+            assert_eq!(
+                agent.session_registry.unavailable_model(&sid),
+                Some(acp::ModelId::new("removed-key")),
+                "{label} must latch instead of selecting any credential"
+            );
+            assert!(
+                cmd_rx.try_recv().is_err(),
+                "{label} must not send a model switch that could attach a secret"
+            );
+            drop(guard);
+        }
+    });
+}
+
 /// The production `session/load` restore entry point must bypass only its own
 /// load marker. A real registered session is restored while an ordinary model
 /// switch remains gated; after the guard drops, that later request commits last.

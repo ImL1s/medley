@@ -2039,34 +2039,10 @@ impl acp::Agent for MvpAgent {
                 )
             };
             let spawn_selection = if persisted_identity_unresolved {
-                let unsafe_reused_key = persisted_catalog_identity
-                    .expect("unresolved flag requires a persisted identity")
-                    .model_id
-                    .as_str();
-                let fallback = ready_compatible_fallback(
-                    available
-                        .keys()
-                        .filter(|id| id.0.as_ref() != unsafe_reused_key)
-                        .cloned()
-                        .collect(),
-                )
-                .ok_or_else(|| {
-                    acp::Error::invalid_params().data(format!(
-                        "persisted model '{}' no longer resolves to its committed catalog route",
-                        summary.current_model_id.0
-                    ))
-                })?;
-                tracing::warn!(
-                    session_id = %session_id.0,
-                    previous = %summary.current_model_id.0,
-                    new = %fallback.0,
-                    "load_session: persisted catalog identity no longer resolves; using safe fallback"
-                );
-                cold_spawn_fallback_selection(
-                    &summary.current_model_id,
-                    Some(fallback),
-                    None,
-                )
+                return Err(acp::Error::invalid_params().data(format!(
+                    "persisted model '{}' no longer resolves to its committed catalog route",
+                    summary.current_model_id.0
+                )));
             } else if let Some(matches) = ambiguous_persisted_slug_matches.as_ref() {
                 tracing::warn!(
                     session_id = %session_id.0,

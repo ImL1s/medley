@@ -47,6 +47,7 @@ mod tests {
             title: Some(test_title.into()),
             cwd: test_cwd.clone(),
             model_id: Some("grok-3".into()),
+            catalog_identity: None,
             created_at: Some(chrono::Utc::now().to_rfc3339()),
             updated_at: Some(chrono::Utc::now().to_rfc3339()),
             total_messages: None,
