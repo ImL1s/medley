@@ -654,13 +654,7 @@ pub(crate) fn model_offers_reasoning_effort(
         return false;
     }
     if info.reasoning_efforts.is_empty() {
-        matches!(
-            effort,
-            ReasoningEffort::Low
-                | ReasoningEffort::Medium
-                | ReasoningEffort::High
-                | ReasoningEffort::Xhigh
-        )
+        crate::agent::session_config::SELECTABLE_REASONING_EFFORTS.contains(&effort)
     } else {
         info.reasoning_efforts.iter().any(|opt| opt.value == effort)
     }

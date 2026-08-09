@@ -922,6 +922,7 @@ impl ModelsManager {
         // dropped its subject (#159 F1).
         self.inner.catalog.write().models = resolve_model_catalog(cfg, prefetched);
         self.bump_catalog_generation();
+        self.revalidate_current_reasoning_effort();
     }
 
     /// Refresh models when the etag changes.
@@ -1218,6 +1219,9 @@ impl ModelsManager {
     /// Wipe in-memory state so a previous identity's catalog doesn't leak.
     fn clear(&self) {
         *self.inner.catalog.write() = CatalogState::default();
+        // The previous identity's model capability must not remain a future
+        // session default while the replacement catalog is still loading.
+        *self.inner.current_reasoning_effort.write() = None;
         // A new identity starts fresh: drop the prior user's pick so its
         // first catalog reselects that identity's default.
         self.inner

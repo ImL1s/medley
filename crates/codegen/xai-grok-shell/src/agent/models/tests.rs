@@ -962,6 +962,63 @@ fn session_model_effort_validation_uses_requested_model_menu() {
 }
 
 #[test]
+fn menu_less_reasoning_model_accepts_legacy_minimal_effort() {
+    let tmp = std::env::temp_dir().join("grok-test-models-manager-minimal-effort");
+    let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
+    let mut entry = ModelEntry {
+        info: config::ModelInfo::fallback("legacy-reasoning"),
+        api_key: None,
+        env_key: None,
+        auth_provider: None,
+        api_base_url: None,
+        config_validation_errors: Vec::new(),
+    };
+    entry.info.supports_reasoning_effort = true;
+    entry.info.reasoning_efforts.clear();
+    let mut cfg = config::Config::default();
+    cfg.models.default_reasoning_effort = Some(ReasoningEffort::Minimal);
+    let mgr = ModelsManager::new(
+        None,
+        IndexMap::from([("legacy-reasoning".to_string(), entry)]),
+        acp::ModelId::new("legacy-reasoning"),
+        auth_manager,
+        cfg,
+    );
+
+    assert!(mgr.model_offers_reasoning_effort("legacy-reasoning", ReasoningEffort::Minimal));
+    assert_eq!(
+        mgr.current_reasoning_effort(),
+        Some(ReasoningEffort::Minimal)
+    );
+}
+
+#[test]
+fn rebuild_revalidates_current_reasoning_effort() {
+    let mut cfg = config::Config::default();
+    cfg.config_models.insert(
+        "default".to_string(),
+        config::ConfigModelOverride {
+            model: Some("default".to_string()),
+            supports_reasoning_effort: Some(true),
+            reasoning_efforts: vec![ReasoningEffortOption {
+                id: "low".to_string(),
+                value: ReasoningEffort::Low,
+                label: "Low".to_string(),
+                description: None,
+                default: true,
+            }],
+            ..Default::default()
+        },
+    );
+    let mgr = test_manager();
+    mgr.set_current_reasoning_effort(Some(ReasoningEffort::High));
+
+    mgr.rebuild(&cfg, None);
+
+    assert_eq!(mgr.current_reasoning_effort(), None);
+}
+
+#[test]
 fn default_reasoning_effort_only_stamps_supporting_model() {
     use indexmap::IndexMap;
 
@@ -1710,9 +1767,11 @@ fn clear_resets_has_fetched_real_catalog() {
     let prefetched = make_prefetched(&["grok-3", "grok-4"]);
     mgr.apply_refresh_result(&cfg, Some(prefetched), None);
     assert!(mgr.has_fetched_real_catalog());
+    mgr.set_current_reasoning_effort(Some(ReasoningEffort::High));
 
     mgr.clear();
     assert!(!mgr.has_fetched_real_catalog());
+    assert_eq!(mgr.current_reasoning_effort(), None);
 
     let prefetched = make_prefetched(&["grok-4.5", "grok-4.3"]);
     mgr.apply_refresh_result(&cfg, Some(prefetched), None);
