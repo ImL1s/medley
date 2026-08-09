@@ -2685,6 +2685,91 @@ async fn read_parent_sampling_config_uses_live_catalog_after_same_route_refresh(
 }
 
 #[tokio::test]
+async fn inherited_subagent_effort_reconciles_after_catalog_refresh() {
+    use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption};
+
+    let mut frozen = test_model_entry("stable-routing-model");
+    frozen.info.supports_reasoning_effort = true;
+    frozen.info.reasoning_effort = Some(ReasoningEffort::High);
+    frozen.info.reasoning_efforts = vec![ReasoningEffortOption {
+        id: "high".into(),
+        value: ReasoningEffort::High,
+        label: "High".into(),
+        description: None,
+        default: true,
+    }];
+    let ctx = ctx_with_parent_chat_state(
+        "stable-entry",
+        "stable-routing-model",
+        "stable-entry",
+        indexmap::IndexMap::from([("stable-entry".to_string(), frozen)]),
+    );
+    let chat = ctx.parent_chat_state.as_ref().expect("parent chat state");
+    let mut snapshot = chat.snapshot().await.expect("parent snapshot");
+    snapshot.sampling_config.reasoning_effort = Some(ReasoningEffort::High);
+    chat.restore_snapshot(snapshot);
+
+    let mut refreshed = test_model_entry("stable-routing-model");
+    refreshed.info.supports_reasoning_effort = true;
+    refreshed.info.reasoning_effort = Some(ReasoningEffort::Low);
+    refreshed.info.reasoning_efforts = vec![ReasoningEffortOption {
+        id: "low".into(),
+        value: ReasoningEffort::Low,
+        label: "Low".into(),
+        description: None,
+        default: true,
+    }];
+    ctx.models_manager.insert_test_entry("stable-entry", refreshed);
+
+    let prepared = read_parent_prepared_model(&ctx).await;
+    assert_eq!(
+        prepared.sampling_config.reasoning_effort,
+        Some(ReasoningEffort::High),
+        "the resident parent remains immutable after catalog refresh"
+    );
+    assert_eq!(prepared.reasoning_efforts.len(), 1);
+    assert_eq!(prepared.reasoning_efforts[0].value, ReasoningEffort::Low);
+
+    let mut child = prepared.sampling_config.clone();
+    reconcile_inherited_subagent_reasoning_effort(
+        &mut child,
+        prepared.supports_reasoning_effort,
+        &prepared.reasoning_efforts,
+    );
+    assert_eq!(child.reasoning_effort, Some(ReasoningEffort::Low));
+    assert_eq!(
+        chat.snapshot()
+            .await
+            .expect("parent snapshot after child preparation")
+            .sampling_config
+            .reasoning_effort,
+        Some(ReasoningEffort::High),
+        "child reconciliation must not mutate the resident parent"
+    );
+
+    let mut legacy_minimal = prepared.sampling_config.clone();
+    legacy_minimal.reasoning_effort = Some(ReasoningEffort::Minimal);
+    reconcile_inherited_subagent_reasoning_effort(&mut legacy_minimal, true, &[]);
+    assert_eq!(
+        legacy_minimal.reasoning_effort,
+        Some(ReasoningEffort::Minimal),
+        "menu-less legacy models still offer minimal"
+    );
+
+    let none_menu = [ReasoningEffortOption {
+        id: "none".into(),
+        value: ReasoningEffort::None,
+        label: "None".into(),
+        description: None,
+        default: true,
+    }];
+    let mut explicit_none = prepared.sampling_config.clone();
+    explicit_none.reasoning_effort = Some(ReasoningEffort::None);
+    reconcile_inherited_subagent_reasoning_effort(&mut explicit_none, true, &none_menu);
+    assert_eq!(explicit_none.reasoning_effort, Some(ReasoningEffort::None));
+}
+
+#[tokio::test]
 async fn read_parent_sampling_config_missing_committed_id_ignores_same_route_survivor() {
     use xai_grok_sampler::AuthScheme;
 

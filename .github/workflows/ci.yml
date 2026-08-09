@@ -1528,13 +1528,21 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_metadata_override_keeps_default_without_inherited_menu -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_metadata_narrower_menu_reconciles_scalar_end_to_end -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_explicit_empty_reasoning_menu_disables_unclaimed_scalar_end_to_end -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
             model_state_prefers_session_reasoning_effort_over_global -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            active_none_effort_is_preserved_as_stale_session_mode -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             stale_effort_revalidation_does_not_clear_newer_selection -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             subagent_reasoning_override_obeys_authoritative_model_menu -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             subagent_reasoning_override_uses_legacy_menu_when_catalog_menu_is_absent -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            inherited_subagent_effort_reconciles_after_catalog_refresh -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             resolve_model_override_prepared_carries_authoritative_reasoning_menu -- --nocapture
           run_nonzero -p xai-grok-shell --lib \

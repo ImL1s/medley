@@ -899,6 +899,32 @@ fn resolve_subagent_reasoning_effort_override(
     .then_some(effort)
 }
 
+fn reconcile_inherited_subagent_reasoning_effort(
+    sampling_config: &mut xai_grok_sampler::SamplerConfig,
+    supports_reasoning_effort: bool,
+    reasoning_efforts: &[xai_grok_sampling_types::ReasoningEffortOption],
+) {
+    let Some(inherited) = sampling_config.reasoning_effort else {
+        return;
+    };
+    if crate::agent::models::reasoning_effort_is_offered(
+        supports_reasoning_effort,
+        reasoning_efforts,
+        inherited,
+    ) {
+        return;
+    }
+    sampling_config.reasoning_effort = if supports_reasoning_effort {
+        reasoning_efforts
+            .iter()
+            .find(|option| option.default)
+            .or_else(|| reasoning_efforts.first())
+            .map(|option| option.value)
+    } else {
+        None
+    };
+}
+
 fn catalog_auth_scheme(
     auth_scheme: xai_grok_sampler::AuthScheme,
 ) -> xai_chat_state::CatalogAuthScheme {

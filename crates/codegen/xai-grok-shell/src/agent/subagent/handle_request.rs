@@ -557,6 +557,14 @@ pub(crate) async fn run_shell_child(
             return child_run_output(failure_result(&request, &msg), completion_data, None);
         }
     }
+    // A resident parent keeps its immutable sampling config across catalog
+    // refreshes. A new child must instead honor the fresh prepared menu, or a
+    // narrowed model can inherit a now-invalid effort and send it on the wire.
+    reconcile_inherited_subagent_reasoning_effort(
+        &mut effective_sampling_config,
+        prepared_model.supports_reasoning_effort,
+        &prepared_model.reasoning_efforts,
+    );
     let requested_model_matches_effective = |requested: &str| {
         crate::agent::models::resolve_catalog_identity(
             &ctx.available_models,
