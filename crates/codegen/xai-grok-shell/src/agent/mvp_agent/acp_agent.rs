@@ -1967,8 +1967,7 @@ impl acp::Agent for MvpAgent {
             );
             let mut spawn_timer = crate::instrumentation_timer!("session.spawn_and_register_session");
             spawn_timer.with_field("session_id", session_id.0.as_ref());
-            let available = self.models_manager.available();
-            let models = self.models_manager.models();
+            let (models, available) = self.models_manager.models_and_available();
             let persisted_catalog_identity = summary
                 .catalog_identity
                 .as_ref()
@@ -2361,8 +2360,7 @@ impl acp::Agent for MvpAgent {
                 .await;
         }
         let persisted_model = summary.current_model_id.clone();
-        let models = self.models_manager.models();
-        let available = self.models_manager.available();
+        let (models, available) = self.models_manager.models_and_available();
         if cold_spawn_selection.is_none() {
             self.session_registry.take_unavailable_model(&session_id);
         }

@@ -1204,8 +1204,7 @@ impl MvpAgent {
     ) {
         let session_id = session_id.clone();
         let persisted_model = summary.current_model_id.clone();
-        let models = self.models_manager.models();
-        let available = self.models_manager.available();
+        let (models, available) = self.models_manager.models_and_available();
         self.session_registry.take_unavailable_model(&session_id);
         let persisted_catalog_identity = summary
             .catalog_identity
