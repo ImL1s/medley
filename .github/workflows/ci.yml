@@ -563,6 +563,8 @@ jobs:
           # otherwise credential-origin hardening correctly makes them unready.
           run_nonzero -p xai-grok-test-support --lib \
             mock_model_emits_explicit_auth_scheme -- --nocapture
+          run_nonzero -p xai-grok-pager-pty-harness --lib \
+            replacement_models_keep_keyless_loopback_default -- --nocapture
           run_nonzero -p xai-grok-tools --lib \
             implementations:: -- --nocapture
           run_nonzero -p xai-grok-tools --lib \
