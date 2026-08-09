@@ -413,6 +413,56 @@ fn codex_catalog_string_list(
         .unwrap_or_default()
 }
 
+/// Parse the catalog's model-specific reasoning menu. The observed endpoint
+/// shape is an array of `{ "effort": "...", "description": "..." }`
+/// objects, matching the reference Codex client's `ReasoningEffortPreset`.
+/// Unknown future effort tiers are skipped rather than widened into values our
+/// wire enum cannot represent.
+fn codex_catalog_reasoning_efforts(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<Vec<xai_grok_sampling_types::ReasoningEffortOption>> {
+    let raw = obj.get("supported_reasoning_levels")?;
+    let Some(levels) = raw.as_array() else {
+        tracing::warn!(value = %raw, "Codex catalog supported_reasoning_levels was not an array");
+        return Some(Vec::new());
+    };
+    Some(
+        levels
+            .iter()
+            .filter_map(|level| {
+                let Some(level) = level.as_object() else {
+                    tracing::warn!(value = %level, "Codex catalog reasoning level was not an object");
+                    return None;
+                };
+                let Some(effort) = codex_catalog_string(level, "effort") else {
+                    tracing::warn!("Codex catalog reasoning level omitted effort");
+                    return None;
+                };
+                let Ok(value) = effort.parse::<xai_grok_sampling_types::ReasoningEffort>() else {
+                    tracing::warn!(effort = %effort, "Codex catalog reasoning level is not supported by this client");
+                    return None;
+                };
+                Some(xai_grok_sampling_types::ReasoningEffortOption {
+                    id: value.as_str().to_owned(),
+                    value,
+                    label: match value {
+                        xai_grok_sampling_types::ReasoningEffort::Xhigh => "Xhigh".to_owned(),
+                        _ => {
+                            let mut chars = value.as_str().chars();
+                            chars
+                                .next()
+                                .map(|first| first.to_uppercase().chain(chars).collect())
+                                .unwrap_or_default()
+                        }
+                    },
+                    description: codex_catalog_string(level, "description"),
+                    default: false,
+                })
+            })
+            .collect(),
+    )
+}
+
 /// Read the load-bearing per-model wire flags from a live catalog entry.
 ///
 /// The preset (`openai_codex_provider`) was written for one model; catalog
@@ -471,20 +521,46 @@ fn parse_openai_codex_catalog_entry(
     let context_window =
         codex_catalog_context_window(obj).unwrap_or(OPENAI_CODEX_PRESET_CONTEXT_WINDOW);
     let codex_wire = codex_catalog_wire_capabilities(obj);
-    // Apply catalog default effort when the entry names one we understand.
-    let reasoning_effort = codex_wire
+    let advertised_reasoning_efforts = codex_catalog_reasoning_efforts(obj);
+    let has_advertised_reasoning_efforts = advertised_reasoning_efforts.is_some();
+    let mut reasoning_efforts = advertised_reasoning_efforts.unwrap_or_default();
+    let advertised_default = codex_wire
         .default_reasoning_level
         .as_deref()
-        .and_then(|level| match level {
-            "none" => Some(xai_grok_sampling_types::ReasoningEffort::None),
-            "minimal" => Some(xai_grok_sampling_types::ReasoningEffort::Minimal),
-            "low" => Some(xai_grok_sampling_types::ReasoningEffort::Low),
-            "medium" => Some(xai_grok_sampling_types::ReasoningEffort::Medium),
-            "high" => Some(xai_grok_sampling_types::ReasoningEffort::High),
-            "xhigh" => Some(xai_grok_sampling_types::ReasoningEffort::Xhigh),
-            "max" => Some(xai_grok_sampling_types::ReasoningEffort::Max),
-            _ => None,
+        .and_then(|level| {
+            level
+                .parse::<xai_grok_sampling_types::ReasoningEffort>()
+                .ok()
         });
+    // A catalog default is only usable when the same entry advertises it. If a
+    // malformed catalog points outside its own menu, select the first supported
+    // tier instead of sending a value the model says it rejects.
+    let reasoning_effort = if has_advertised_reasoning_efforts {
+        let default_index = advertised_default.and_then(|default| {
+            reasoning_efforts
+                .iter()
+                .position(|option| option.value == default)
+        });
+        let selected_index = default_index.or_else(|| (!reasoning_efforts.is_empty()).then_some(0));
+        if advertised_default.is_some() && default_index.is_none() {
+            tracing::warn!(
+                model = %model,
+                default_reasoning_level = ?codex_wire.default_reasoning_level,
+                "Codex catalog default reasoning level is not in supported_reasoning_levels; using the first supported level"
+            );
+        }
+        selected_index.map(|index| {
+            reasoning_efforts[index].default = true;
+            reasoning_efforts[index].value
+        })
+    } else {
+        advertised_default
+    };
+    let supports_reasoning_effort = if has_advertised_reasoning_efforts {
+        !reasoning_efforts.is_empty()
+    } else {
+        reasoning_effort.is_some()
+    };
     Some((
         key,
         ConfigModelOverride {
@@ -497,7 +573,8 @@ fn parse_openai_codex_catalog_entry(
                 .or(Some(OPENAI_CODEX_MODELS_CATALOG_DESCRIPTION.to_owned())),
             context_window: Some(context_window),
             reasoning_effort,
-            supports_reasoning_effort: reasoning_effort.map(|_| true),
+            supports_reasoning_effort: Some(supports_reasoning_effort),
+            reasoning_efforts,
             codex_wire: Some(codex_wire),
             ..ConfigModelOverride::default()
         },
@@ -721,6 +798,7 @@ fn merge_openai_codex_preset_entries(
             context_window,
             reasoning_effort,
             supports_reasoning_effort,
+            reasoning_efforts,
             codex_wire,
             catalog_degraded_reason,
             ..
@@ -741,6 +819,9 @@ fn merge_openai_codex_preset_entries(
         }
         if user_entry.supports_reasoning_effort.is_none() {
             user_entry.supports_reasoning_effort = supports_reasoning_effort;
+        }
+        if user_entry.reasoning_efforts.is_empty() {
+            user_entry.reasoning_efforts = reasoning_efforts;
         }
         if user_entry.codex_wire.is_none() {
             user_entry.codex_wire = codex_wire;
@@ -2584,6 +2665,121 @@ mod tests {
                 "invalid units and non-positive limits must fail closed"
             );
         }
+    }
+
+    /// #261: the catalog's per-model list must survive through resolved
+    /// model metadata and ACP so the TUI does not offer the legacy full menu to
+    /// models that accept only a subset.
+    #[test]
+    fn codex_catalog_supported_reasoning_levels_drive_acp_effort_options() {
+        let payload = serde_json::json!({
+            "models": [
+                {
+                    "slug": "gpt-codex-a",
+                    "default_reasoning_level": "low",
+                    "supported_reasoning_levels": [
+                        { "effort": "low", "description": "Fast" },
+                        { "effort": "high", "description": "Deep" }
+                    ]
+                },
+                {
+                    "slug": "gpt-codex-b",
+                    "default_reasoning_level": "xhigh",
+                    "supported_reasoning_levels": [
+                        { "effort": "medium", "description": "Balanced" },
+                        { "effort": "xhigh", "description": "Maximum" }
+                    ]
+                }
+            ]
+        });
+        let presets = parse_openai_codex_catalog_models(&payload);
+        let a = presets.get("gpt-codex-a").expect("model a");
+        let b = presets.get("gpt-codex-b").expect("model b");
+        assert_eq!(
+            a.reasoning_efforts
+                .iter()
+                .map(|option| option.value)
+                .collect::<Vec<_>>(),
+            vec![
+                xai_grok_sampling_types::ReasoningEffort::Low,
+                xai_grok_sampling_types::ReasoningEffort::High,
+            ]
+        );
+        assert_eq!(a.reasoning_efforts[0].description.as_deref(), Some("Fast"));
+        assert!(a.reasoning_efforts[0].default);
+        assert_eq!(
+            a.reasoning_effort,
+            Some(xai_grok_sampling_types::ReasoningEffort::Low)
+        );
+        assert!(!a.reasoning_efforts[1].default);
+        assert_eq!(
+            b.reasoning_effort,
+            Some(xai_grok_sampling_types::ReasoningEffort::Xhigh)
+        );
+        assert!(b.reasoning_efforts[1].default);
+
+        let cfg = Config::default();
+        let prefetched = presets
+            .into_iter()
+            .map(|(key, model)| {
+                let entry = model.apply(&key, None, &cfg.endpoints);
+                (key, entry)
+            })
+            .collect();
+        let resolved = resolve_model_list(&cfg, Some(prefetched));
+        let acp_models = crate::agent::config::to_acp_model_info(&resolved);
+        let a_meta = acp_models
+            .get(&acp::ModelId::new("gpt-codex-a"))
+            .and_then(|model| model.meta.as_ref())
+            .expect("model a ACP metadata");
+        let b_meta = acp_models
+            .get(&acp::ModelId::new("gpt-codex-b"))
+            .and_then(|model| model.meta.as_ref())
+            .expect("model b ACP metadata");
+        assert_eq!(a_meta["reasoningEfforts"][0]["value"], "low");
+        assert_eq!(a_meta["reasoningEfforts"][1]["value"], "high");
+        assert_eq!(a_meta["reasoningEffort"], "low");
+        assert_eq!(b_meta["reasoningEfforts"][0]["value"], "medium");
+        assert_eq!(b_meta["reasoningEfforts"][1]["value"], "xhigh");
+        assert_eq!(b_meta["reasoningEffort"], "xhigh");
+    }
+
+    #[test]
+    fn codex_catalog_default_reasoning_level_must_belong_to_supported_levels() {
+        let payload = serde_json::json!({
+            "models": [
+                {
+                    "slug": "gpt-codex-mismatch",
+                    "default_reasoning_level": "high",
+                    "supported_reasoning_levels": [
+                        { "effort": "low", "description": "Fast" },
+                        { "effort": "medium", "description": "Balanced" },
+                        { "effort": "future", "description": "Unknown to this client" },
+                        "not-an-object"
+                    ]
+                },
+                {
+                    "slug": "gpt-codex-no-efforts",
+                    "default_reasoning_level": "high",
+                    "supported_reasoning_levels": []
+                }
+            ]
+        });
+        let presets = parse_openai_codex_catalog_models(&payload);
+        let mismatch = presets.get("gpt-codex-mismatch").expect("mismatch model");
+        assert_eq!(mismatch.reasoning_efforts.len(), 2);
+        assert_eq!(
+            mismatch.reasoning_effort,
+            Some(xai_grok_sampling_types::ReasoningEffort::Low),
+            "an out-of-menu catalog default must not reach the wire"
+        );
+        assert!(mismatch.reasoning_efforts[0].default);
+        assert_eq!(mismatch.supports_reasoning_effort, Some(true));
+
+        let empty = presets.get("gpt-codex-no-efforts").expect("empty model");
+        assert!(empty.reasoning_efforts.is_empty());
+        assert_eq!(empty.reasoning_effort, None);
+        assert_eq!(empty.supports_reasoning_effort, Some(false));
     }
 
     /// `data` / `id` / `name` are tolerances for shapes this endpoint does not

@@ -488,6 +488,60 @@ mod tests {
     }
 
     #[test]
+    fn codex_catalog_effort_options_are_model_specific() {
+        let id_a = acp::ModelId::new(Arc::from("gpt-codex-a"));
+        let id_b = acp::ModelId::new(Arc::from("gpt-codex-b"));
+        let mut state = ModelState::default();
+        state.available.insert(
+            id_a.clone(),
+            acp::ModelInfo::new(id_a.clone(), "Codex A".to_owned()).meta(Some(
+                serde_json::json!({
+                    "supportsReasoningEffort": true,
+                    "reasoningEfforts": [
+                        { "id": "low", "value": "low", "label": "Low", "default": true },
+                        { "id": "high", "value": "high", "label": "High", "default": false }
+                    ]
+                })
+                .as_object()
+                .expect("object")
+                .clone(),
+            )),
+        );
+        state.available.insert(
+            id_b.clone(),
+            acp::ModelInfo::new(id_b.clone(), "Codex B".to_owned()).meta(Some(
+                serde_json::json!({
+                    "supportsReasoningEffort": true,
+                    "reasoningEfforts": [
+                        { "id": "medium", "value": "medium", "label": "Medium", "default": false },
+                        { "id": "xhigh", "value": "xhigh", "label": "Xhigh", "default": true }
+                    ]
+                })
+                .as_object()
+                .expect("object")
+                .clone(),
+            )),
+        );
+
+        assert_eq!(
+            state
+                .reasoning_effort_options_for(&id_a)
+                .iter()
+                .map(|option| option.value)
+                .collect::<Vec<_>>(),
+            vec![ReasoningEffort::Low, ReasoningEffort::High]
+        );
+        assert_eq!(
+            state
+                .reasoning_effort_options_for(&id_b)
+                .iter()
+                .map(|option| option.value)
+                .collect::<Vec<_>>(),
+            vec![ReasoningEffort::Medium, ReasoningEffort::Xhigh]
+        );
+    }
+
+    #[test]
     fn unsupported_effort_message_names_config_switch() {
         let msg = EffortTokenError::Unsupported.message();
         assert!(

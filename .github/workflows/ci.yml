@@ -1500,6 +1500,13 @@ jobs:
           # #245: catalog wire flags that differ from the Sol preset must parse.
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_parser_reads_wire_capabilities_that_differ_from_the_preset -- --nocapture
+          # #261: catalog reasoning menus must reach ACP and remain model-specific in the TUI.
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_supported_reasoning_levels_drive_acp_effort_options -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_default_reasoning_level_must_belong_to_supported_levels -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            codex_catalog_effort_options_are_model_specific -- --nocapture
 
       # #36: restore fd bundling only with a public PI caller and contract.
       # The tests are split by build mode: override-path bundle and release
