@@ -823,11 +823,13 @@ fn merge_openai_codex_preset_entries(
         if user_entry.reasoning_efforts.is_empty()
             && user_entry.supports_reasoning_effort != Some(false)
         {
-            if user_entry.reasoning_effort.is_some_and(|effort| {
-                !reasoning_efforts
-                    .iter()
-                    .any(|option| option.value == effort)
-            }) {
+            if !reasoning_efforts.is_empty()
+                && user_entry.reasoning_effort.is_some_and(|effort| {
+                    !reasoning_efforts
+                        .iter()
+                        .any(|option| option.value == effort)
+                })
+            {
                 user_entry.reasoning_effort = reasoning_effort;
             }
             user_entry.reasoning_efforts = reasoning_efforts;
@@ -2867,6 +2869,38 @@ mod tests {
                 .iter()
                 .all(|option| option.value != xai_grok_sampling_types::ReasoningEffort::Xhigh)
         );
+    }
+
+    #[test]
+    fn codex_catalog_metadata_override_keeps_default_without_inherited_menu() {
+        let key = "gpt-codex-legacy";
+        let mut models = IndexMap::from([(
+            key.to_owned(),
+            ConfigModelOverride {
+                reasoning_effort: Some(xai_grok_sampling_types::ReasoningEffort::Xhigh),
+                ..ConfigModelOverride::default()
+            },
+        )]);
+        let presets = IndexMap::from([(
+            key.to_owned(),
+            ConfigModelOverride {
+                model: Some(key.to_owned()),
+                supports_reasoning_effort: Some(true),
+                reasoning_effort: None,
+                reasoning_efforts: Vec::new(),
+                ..ConfigModelOverride::default()
+            },
+        )]);
+
+        merge_openai_codex_preset_entries(&mut models, presets);
+
+        let merged = models.get(key).expect("merged metadata override");
+        assert_eq!(
+            merged.reasoning_effort,
+            Some(xai_grok_sampling_types::ReasoningEffort::Xhigh),
+            "without a restrictive catalog menu there is no evidence that the explicit tier is invalid"
+        );
+        assert!(merged.reasoning_efforts.is_empty());
     }
 
     /// `data` / `id` / `name` are tolerances for shapes this endpoint does not

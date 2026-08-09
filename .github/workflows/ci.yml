@@ -1521,6 +1521,10 @@ jobs:
             unconditional_default_reselection_revalidates_current_effort -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             session_model_effort_validation_uses_requested_model_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_metadata_override_keeps_default_without_inherited_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            model_state_prefers_session_reasoning_effort_over_global -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             codex_catalog_effort_options_are_model_specific -- --nocapture
 

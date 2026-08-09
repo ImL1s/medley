@@ -1892,10 +1892,19 @@ async fn unresolved_empty_current_model_uses_live_fail_closed_sampling_config() 
 #[tokio::test]
 async fn model_state_prefers_session_reasoning_effort_over_global() {
     use crate::agent::config::{EndpointsConfig, ModelEntry};
-    use xai_grok_sampling_types::{REASONING_EFFORT_META_KEY, ReasoningEffort};
+    use xai_grok_sampling_types::{
+        REASONING_EFFORT_META_KEY, ReasoningEffort, ReasoningEffortOption,
+    };
     let agent = build_minimal_agent_for_tests();
     let mut entry = ModelEntry::fallback("effort-model", &EndpointsConfig::default());
     entry.info.supports_reasoning_effort = true;
+    entry.info.reasoning_efforts = vec![ReasoningEffortOption {
+        id: "low".into(),
+        value: ReasoningEffort::Low,
+        label: "Low".into(),
+        description: None,
+        default: true,
+    }];
     agent
         .models_manager
         .insert_test_entry("effort-model", entry);
@@ -1919,7 +1928,7 @@ async fn model_state_prefers_session_reasoning_effort_over_global() {
     assert_eq!(
         read_effort(&agent.model_state(Some(&pinned))).as_deref(),
         Some("xhigh"),
-        "model_state must report the session's own restored effort",
+        "model_state must report the running session's actual effort even after the catalog menu removes it",
     );
     let unset = acp::SessionId::new("sess-unset");
     agent.insert_resident(&unset, make_test_handle("effort-model", false, None));
