@@ -2501,7 +2501,7 @@ mod tests {
             !has_web_search_fn,
             "function web_search tool must be removed when disallowed"
         );
-        agent.set_web_search_enabled(true);
+        assert!(!agent.set_web_search_enabled(true));
         assert!(
             agent
                 .tool_definitions()
@@ -2510,6 +2510,7 @@ mod tests {
                 .all(|definition| short_tool_name(&definition.function.name) != "web_search"),
             "a disallowed web-search tool must not become dynamically available"
         );
+        assert!(agent.set_web_search_enabled(false));
     }
     /// Regression: with backend search + web search both enabled, both
     /// hosted tools appear and `backend_search_enabled()` is true.

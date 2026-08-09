@@ -3922,6 +3922,22 @@ impl MvpAgent {
             self.web_search_disabled.borrow_mut().remove(session_id);
         }
     }
+
+    /// Apply the disable reason returned by the actor-owned model-switch
+    /// transaction without performing a second credential preflight.
+    pub(crate) fn set_web_search_disable_notice_for_session(
+        &self,
+        session_id: &acp::SessionId,
+        disabled: Option<crate::session::WebSearchDisabledNotice>,
+    ) {
+        if let Some(disabled) = disabled {
+            self.web_search_disabled
+                .borrow_mut()
+                .insert(session_id.clone(), disabled);
+        } else {
+            self.web_search_disabled.borrow_mut().remove(session_id);
+        }
+    }
     /// Insert the per-session `_meta` keys (`x.ai/sessionConfig`,
     /// `x.ai/sessionDetail`, `x.ai/schedulerBackgroundLoops`) shared by
     /// `new_session` and `load_session`. Keeping both response paths on this one

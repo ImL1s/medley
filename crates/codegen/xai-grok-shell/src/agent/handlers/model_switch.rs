@@ -328,22 +328,38 @@ async fn apply_with_load_gate(
     let summary_follows_default = handle
         .auxiliary_model_provenance
         .session_summary_follows_default;
-    let web_search_follows_default = handle.auxiliary_model_provenance.web_search_follows_default;
+    let web_search_follows_default = handle.auxiliary_model_provenance.web_search_follows_default
+        && !agent.cfg.borrow().disable_web_search;
     let image_description_follows_default = handle
         .auxiliary_model_provenance
         .image_description_follows_default;
     let summary_sampling_config = summary_follows_default.then(|| model_sampling.clone());
+    let mut web_search_disable_reason = None;
     let web_search_sampling_config = if web_search_follows_default {
-        let mut ignored_disable_reason = None;
         agent
             .prepare_web_search_sampling_config_for_model_preflight(
-                &mut ignored_disable_reason,
+                &mut web_search_disable_reason,
                 catalog_model_id.0.as_ref(),
             )
             .await
     } else {
         None
     };
+    if web_search_follows_default
+        && web_search_sampling_config
+            .as_ref()
+            .is_none_or(|config| !crate::agent::config::has_usable_credential(config))
+        && web_search_disable_reason.is_none()
+    {
+        web_search_disable_reason =
+            agent.web_search_disable_details_for_model(catalog_model_id.0.as_ref());
+    }
+    let web_search_disable_notice =
+        web_search_disable_reason.map(|disabled| crate::session::WebSearchDisabledNotice {
+            model_id: disabled.model_id.clone(),
+            reason: disabled.reason.clone(),
+            message: disabled.user_notice(),
+        });
     let image_description_model =
         image_description_follows_default.then(|| catalog_model_id.0.to_string());
     let new_threshold = {
@@ -365,6 +381,7 @@ async fn apply_with_load_gate(
                 summary_sampling_config,
                 replace_inherited_web_search: web_search_follows_default,
                 web_search_sampling_config,
+                web_search_disable_notice,
                 web_search_alpha_test_key: agent.alpha_test_key(),
                 image_description_model,
             }),
@@ -395,9 +412,9 @@ async fn apply_with_load_gate(
         handle.agent_name =
             agent_name_after_model_switch(did_rebuild, &required_agent_type, &handle.agent_name);
     });
-    agent
-        .recompute_web_search_disable_notice_for_session(&session_id)
-        .await;
+    if let Some(web_search) = receipt.web_search {
+        agent.set_web_search_disable_notice_for_session(&session_id, web_search.disable_notice);
+    }
     broadcast_model_changed(
         agent,
         &session_id,

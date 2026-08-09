@@ -2340,7 +2340,10 @@ impl FinalizedToolset {
             true
         } else {
             let Some(index) = tools.iter().position(|tool| tool.canonical_id == ID) else {
-                return inactive.contains_key(ID);
+                // A policy-filtered tool is absent from both collections.
+                // Disabling that already-disabled capability is a successful
+                // no-op, matching `can_set_web_search_enabled(false)`.
+                return true;
             };
             let tool = tools.remove(index);
             inactive.insert(ID.to_owned(), tool);

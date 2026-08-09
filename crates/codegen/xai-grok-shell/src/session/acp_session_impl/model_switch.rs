@@ -2,7 +2,7 @@ use super::*;
 use crate::agent::config;
 use crate::agent::mvp_agent::harnesses_are_compatible;
 use crate::remote::DEFAULT_CONTEXT_WINDOW;
-use crate::session::{AppliedModelSwitch, PreparedModelSwitch};
+use crate::session::{AppliedModelSwitch, AppliedWebSearchState, PreparedModelSwitch};
 use xai_chat_state::conversation_util::replace_or_insert_system_head;
 
 fn prepare_web_search_client(
@@ -106,6 +106,7 @@ impl SessionActor {
             summary_sampling_config,
             replace_inherited_web_search,
             web_search_sampling_config,
+            web_search_disable_notice,
             web_search_alpha_test_key,
             image_description_model,
         } = prepared;
@@ -119,19 +120,6 @@ impl SessionActor {
             )?)
         } else {
             None
-        };
-        let web_search_client = match web_search_client {
-            Some(Some(client)) if self.agent.borrow().can_set_web_search_enabled(true) => {
-                Some(Some(client))
-            }
-            Some(Some(_)) => {
-                tracing::debug!(
-                    session_id = %self.session_info.id.0,
-                    "model switch left web search disabled because the active agent policy has no eligible built-in topology"
-                );
-                None
-            }
-            other => other,
         };
         let resolved_model_slug = resolved_model.info().model.clone();
         if resolved_model_slug != sampling_config.model {
@@ -297,6 +285,22 @@ impl SessionActor {
             None
         };
         let did_rebuild = installed_rebuild.is_some();
+        // Eligibility belongs to the harness that will own the committed
+        // session. A zero-turn rebuild may replace a policy-filtered old
+        // harness with one that permits web search (or vice versa).
+        let web_search_client = match web_search_client {
+            Some(Some(client)) if self.agent.borrow().can_set_web_search_enabled(true) => {
+                Some(Some(client))
+            }
+            Some(Some(_)) => {
+                tracing::debug!(
+                    session_id = %self.session_info.id.0,
+                    "model switch left web search disabled because the candidate agent policy has no eligible built-in topology"
+                );
+                None
+            }
+            other => other,
+        };
 
         let updated_model = match self
             .handle_set_session_model_with_rollback(
@@ -351,6 +355,16 @@ impl SessionActor {
             self.image_description_model
                 .replace(image_description_model);
         }
+        let applied_web_search = web_search_client
+            .as_ref()
+            .map(|client| AppliedWebSearchState {
+                enabled: client.is_some(),
+                disable_notice: if client.is_none() {
+                    web_search_disable_notice
+                } else {
+                    None
+                },
+            });
         if let Some(web_search_client) = web_search_client {
             let web_search_enabled = web_search_client.is_some();
             let bridge = self.agent.borrow().tool_bridge().clone();
@@ -385,6 +399,7 @@ impl SessionActor {
             catalog_model_id: updated_model,
             did_rebuild,
             active_agent_type: self.active_agent_type.lock().clone(),
+            web_search: applied_web_search,
         })
     }
 
@@ -1054,6 +1069,7 @@ mod model_switch_transaction_tests {
             summary_sampling_config: None,
             replace_inherited_web_search: false,
             web_search_sampling_config: None,
+            web_search_disable_notice: None,
             web_search_alpha_test_key: None,
             image_description_model: None,
         }
@@ -1457,8 +1473,14 @@ mod model_switch_transaction_tests {
                         }
                     }
                 });
-                let (actor, _event_rx) =
+                let (mut actor, _event_rx) =
                     create_test_actor_ex(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                std::sync::Arc::get_mut(&mut actor.rebuild_spec)
+                    .expect("test actor owns rebuild spec")
+                    .backend_search = true;
+                let mut old_definition = xai_grok_agent::AgentDefinition::default_grok_build();
+                old_definition.name = "old-policy-filtered".to_owned();
+                old_definition.disallowed_tools = vec!["web_search".to_owned()];
                 let dynamic_agent = xai_grok_agent::AgentBuilder::new(
                     std::env::temp_dir(),
                     std::sync::Arc::new(
@@ -1466,7 +1488,7 @@ mod model_switch_transaction_tests {
                     ),
                     xai_grok_tools::notification::ToolNotificationHandle::noop(),
                 )
-                .from_definition(xai_grok_agent::AgentDefinition::default_grok_build())
+                .from_definition(old_definition)
                 .with_web_search_config(xai_grok_tools::implementations::WebSearchConfig::Disabled)
                 .with_backend_search(true)
                 .build()
@@ -1474,7 +1496,7 @@ mod model_switch_transaction_tests {
                 .expect("dynamic web-search test agent");
                 *actor.agent.borrow_mut() = dynamic_agent;
                 actor.supports_backend_search.set(true);
-                *actor.active_agent_type.lock() = Some("grok-build".to_owned());
+                *actor.active_agent_type.lock() = Some("codex".to_owned());
                 assert!(
                     actor
                         .agent
@@ -1499,7 +1521,10 @@ mod model_switch_transaction_tests {
                     tool,
                     xai_grok_sampling_types::HostedTool::WebSearch { .. }
                 )));
-                let mut prepared = prepared_switch("grok-build", None);
+                let mut prepared = prepared_switch(
+                    "grok-build",
+                    Some(xai_grok_agent::AgentDefinition::default_grok_build()),
+                );
                 prepared.summary_sampling_config = Some(prepared.sampling_config.clone());
                 prepared.replace_inherited_web_search = true;
                 let mut web_search_sampling = prepared.sampling_config.clone();
@@ -1507,10 +1532,17 @@ mod model_switch_transaction_tests {
                 prepared.web_search_sampling_config = Some(web_search_sampling);
                 prepared.image_description_model = Some("target-provider".to_owned());
 
-                actor
+                let enabled_receipt = actor
                     .handle_apply_model_switch(prepared)
                     .await
                     .expect("inherited auxiliary lanes must commit with the model switch");
+                assert!(matches!(
+                    enabled_receipt.web_search,
+                    Some(AppliedWebSearchState {
+                        enabled: true,
+                        disable_notice: None,
+                    })
+                ));
 
                 assert_eq!(
                     actor.image_description_model.borrow().as_str(),
@@ -1543,10 +1575,26 @@ mod model_switch_transaction_tests {
                 prepared.summary_sampling_config = Some(prepared.sampling_config.clone());
                 prepared.replace_inherited_web_search = true;
                 prepared.web_search_sampling_config = None;
-                actor
+                prepared.web_search_disable_notice =
+                    Some(crate::session::WebSearchDisabledNotice {
+                        model_id: "target-model".to_owned(),
+                        reason: "missing test credential".to_owned(),
+                        message: "web_search is unavailable in test".to_owned(),
+                    });
+                let disabled_receipt = actor
                     .handle_apply_model_switch(prepared)
                     .await
                     .expect("unavailable inherited web search must commit as disabled");
+                assert!(matches!(
+                    disabled_receipt.web_search,
+                    Some(AppliedWebSearchState {
+                        enabled: false,
+                        disable_notice: Some(crate::session::WebSearchDisabledNotice {
+                            ref model_id,
+                            ..
+                        }),
+                    }) if model_id == "target-model"
+                ));
                 assert!(
                     bridge
                         .read_resource::<

@@ -2796,6 +2796,14 @@ fn model_overrides_live_cross_provider_switch_rebuilds_inherited_auxiliary_lanes
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         handle.cmd_tx = cmd_tx;
         agent.sessions.borrow_mut().insert(sid.clone(), handle);
+        agent.web_search_disabled.borrow_mut().insert(
+            sid.clone(),
+            crate::session::WebSearchDisabledNotice {
+                model_id: "source-provider".to_owned(),
+                reason: "stale test reason".to_owned(),
+                message: "stale test notice".to_owned(),
+            },
+        );
         {
             // A config refresh after spawn must not rewrite this resident
             // session's inheritance provenance.
@@ -2831,6 +2839,7 @@ fn model_overrides_live_cross_provider_switch_rebuilds_inherited_auxiliary_lanes
                                 .map(|config| config.model.as_str()),
                             Some("target-wire-model")
                         );
+                        assert!(prepared.web_search_disable_notice.is_none());
                         assert_eq!(
                             prepared.image_description_model.as_deref(),
                             Some("target-provider")
@@ -2840,6 +2849,10 @@ fn model_overrides_live_cross_provider_switch_rebuilds_inherited_auxiliary_lanes
                             catalog_model_id: prepared.catalog_model_id,
                             did_rebuild: false,
                             active_agent_type: Some("grok-build".to_owned()),
+                            web_search: Some(crate::session::AppliedWebSearchState {
+                                enabled: true,
+                                disable_notice: None,
+                            }),
                         }));
                     }
                     _ => panic!("unexpected cross-provider model-switch command"),
@@ -2857,6 +2870,64 @@ fn model_overrides_live_cross_provider_switch_rebuilds_inherited_auxiliary_lanes
         .await
         .expect("cross-provider model switch");
         assert_eq!(agent.sessions.borrow()[&sid].model_id.0.as_ref(), "target-provider");
+        assert!(
+            !agent.web_search_disabled.borrow().contains_key(&sid),
+            "the applied usable state must clear the prior notice without a second preflight"
+        );
+    });
+}
+
+#[test]
+fn model_overrides_global_web_search_disable_skips_live_replacement() {
+    run_local_for_bridge_test(|| async {
+        let agent = build_cross_provider_agent_for_tests(Some("target-test-key"));
+        agent.cfg.borrow_mut().disable_web_search = true;
+        let sid = acp::SessionId::new("globally-disabled-web-search-switch");
+        let mut handle = make_test_handle("source-provider", false, None);
+        handle.info.id = sid.clone();
+        handle.agent_name = "grok-build".to_owned();
+        handle.auxiliary_model_provenance = crate::session::AuxiliaryModelProvenance {
+            session_summary_follows_default: true,
+            web_search_follows_default: true,
+            web_search_model: "source-provider".to_owned(),
+            image_description_follows_default: true,
+        };
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        handle.cmd_tx = cmd_tx;
+        agent.sessions.borrow_mut().insert(sid.clone(), handle);
+
+        tokio::task::spawn_local(async move {
+            while let Some(command) = cmd_rx.recv().await {
+                match command {
+                    TestSessionCommand::GetActiveAgent { responds_to } => {
+                        let _ = responds_to.send(Some("grok-build".to_owned()));
+                    }
+                    TestSessionCommand::ApplyModelSwitch {
+                        prepared,
+                        responds_to,
+                    } => {
+                        assert!(!prepared.replace_inherited_web_search);
+                        assert!(prepared.web_search_sampling_config.is_none());
+                        assert!(prepared.web_search_disable_notice.is_none());
+                        let _ = responds_to.send(Ok(crate::session::AppliedModelSwitch {
+                            previous_model_id: acp::ModelId::new("source-provider"),
+                            catalog_model_id: prepared.catalog_model_id,
+                            did_rebuild: false,
+                            active_agent_type: Some("grok-build".to_owned()),
+                            web_search: None,
+                        }));
+                    }
+                    _ => panic!("unexpected globally-disabled model-switch command"),
+                }
+            }
+        });
+
+        crate::agent::handlers::model_switch::apply(
+            &agent,
+            acp::SetSessionModelRequest::new(sid, acp::ModelId::new("target-provider")),
+        )
+        .await
+        .expect("global disable must not prevent the primary model switch");
     });
 }
 
@@ -2872,6 +2943,70 @@ fn model_overrides_cold_web_search_notice_describes_operative_session_model() {
         assert_eq!(disabled.model_id, "target-provider");
         assert!(disabled.user_notice().contains("target-provider"));
         assert!(!disabled.user_notice().contains("source-provider"));
+
+        // The handler must trust the actor receipt rather than re-preflighting.
+        // Use a locally usable target, then return a disabled applied outcome;
+        // a second preflight would incorrectly clear this notice.
+        let agent = build_cross_provider_agent_for_tests(Some("target-test-key"));
+        let sid = acp::SessionId::new("cross-provider-disabled-auxiliary-switch");
+        let mut handle = make_test_handle("source-provider", false, None);
+        handle.info.id = sid.clone();
+        handle.agent_name = "grok-build".to_owned();
+        handle.auxiliary_model_provenance = crate::session::AuxiliaryModelProvenance {
+            session_summary_follows_default: true,
+            web_search_follows_default: true,
+            web_search_model: "source-provider".to_owned(),
+            image_description_follows_default: true,
+        };
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        handle.cmd_tx = cmd_tx;
+        agent.sessions.borrow_mut().insert(sid.clone(), handle);
+
+        tokio::task::spawn_local(async move {
+            while let Some(command) = cmd_rx.recv().await {
+                match command {
+                    TestSessionCommand::GetActiveAgent { responds_to } => {
+                        let _ = responds_to.send(Some("grok-build".to_owned()));
+                    }
+                    TestSessionCommand::ApplyModelSwitch {
+                        prepared,
+                        responds_to,
+                    } => {
+                        assert!(prepared.web_search_sampling_config.is_some());
+                        assert!(prepared.web_search_disable_notice.is_none());
+                        let disable_notice = crate::session::WebSearchDisabledNotice {
+                            model_id: "target-provider".to_owned(),
+                            reason: "actor-applied unavailable state".to_owned(),
+                            message:
+                                "web_search target-provider is unavailable after actor commit"
+                                    .to_owned(),
+                        };
+                        let _ = responds_to.send(Ok(crate::session::AppliedModelSwitch {
+                            previous_model_id: acp::ModelId::new("source-provider"),
+                            catalog_model_id: prepared.catalog_model_id,
+                            did_rebuild: false,
+                            active_agent_type: Some("grok-build".to_owned()),
+                            web_search: Some(crate::session::AppliedWebSearchState {
+                                enabled: false,
+                                disable_notice: Some(disable_notice),
+                            }),
+                        }));
+                    }
+                    _ => panic!("unexpected disabled model-switch command"),
+                }
+            }
+        });
+
+        crate::agent::handlers::model_switch::apply(
+            &agent,
+            acp::SetSessionModelRequest::new(sid.clone(), acp::ModelId::new("target-provider")),
+        )
+        .await
+        .expect("disabled cross-provider model switch");
+        let notice = &agent.web_search_disabled.borrow()[&sid];
+        assert_eq!(notice.model_id, "target-provider");
+        assert!(notice.message.contains("target-provider"));
+        assert!(!notice.message.contains("source-provider"));
     });
 }
 
@@ -3930,6 +4065,7 @@ fn load_restore_apply_bypasses_own_marker_and_preserves_request_order() {
                                 catalog_model_id: model_id,
                                 did_rebuild: false,
                                 active_agent_type: Some("grok-build".to_owned()),
+                                web_search: None,
                             }));
                         }
                         _ => panic!("unexpected command during model restore"),
