@@ -1925,10 +1925,18 @@ async fn model_state_prefers_session_reasoning_effort_over_global() {
     let mut handle = make_test_handle("effort-model", false, None);
     handle.reasoning_effort = Some(ReasoningEffort::Xhigh);
     agent.insert_resident(&pinned, handle);
+    let pinned_state = agent.model_state(Some(&pinned));
     assert_eq!(
-        read_effort(&agent.model_state(Some(&pinned))).as_deref(),
+        read_effort(&pinned_state).as_deref(),
         Some("xhigh"),
         "model_state must report the running session's actual effort even after the catalog menu removes it",
+    );
+    let pinned_options = agent.session_config_options(Some(&pinned), &pinned_state);
+    assert!(
+        pinned_options
+            .iter()
+            .any(|option| option.category == "mode" && option.id == "xhigh" && option.selected),
+        "session config must synthesize a selected option for the immutable actor's active tier"
     );
     let unset = acp::SessionId::new("sess-unset");
     agent.insert_resident(&unset, make_test_handle("effort-model", false, None));

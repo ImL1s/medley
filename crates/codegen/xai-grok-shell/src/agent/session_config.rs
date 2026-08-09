@@ -112,6 +112,22 @@ pub(crate) fn build_session_config_options(
         });
     }
 
+    if let Some(active) = current_effort
+        && active != ReasoningEffort::None
+        && !effort_options.iter().any(|option| option.value == active)
+    {
+        options.push(SessionConfigOption {
+            id: active.to_string(),
+            category: "mode".to_string(),
+            label: effort_label(active),
+            description: Some(
+                "Active for this running session; no longer offered by the current model catalog"
+                    .to_string(),
+            ),
+            selected: true,
+        });
+    }
+
     options
 }
 

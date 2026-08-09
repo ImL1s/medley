@@ -1525,6 +1525,8 @@ jobs:
             codex_catalog_metadata_override_keeps_default_without_inherited_menu -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             model_state_prefers_session_reasoning_effort_over_global -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            stale_effort_revalidation_does_not_clear_newer_selection -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             codex_catalog_effort_options_are_model_specific -- --nocapture
 

@@ -760,7 +760,17 @@ impl ModelsManager {
                 .is_some_and(|entry| model_offers_reasoning_effort(&entry.info, effort))
         };
         if !is_valid {
-            *self.inner.current_reasoning_effort.write() = None;
+            let mut current_effort = self.inner.current_reasoning_effort.write();
+            Self::clear_reasoning_effort_if_unchanged(&mut current_effort, effort);
+        }
+    }
+
+    fn clear_reasoning_effort_if_unchanged(
+        current: &mut Option<ReasoningEffort>,
+        expected: ReasoningEffort,
+    ) {
+        if *current == Some(expected) {
+            *current = None;
         }
     }
 

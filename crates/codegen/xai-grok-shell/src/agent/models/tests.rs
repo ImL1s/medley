@@ -850,6 +850,19 @@ fn catalog_refresh_clears_current_effort_removed_from_model_menu() {
 }
 
 #[test]
+fn stale_effort_revalidation_does_not_clear_newer_selection() {
+    let validated = ReasoningEffort::High;
+    let mut current = Some(ReasoningEffort::Low);
+    ModelsManager::clear_reasoning_effort_if_unchanged(&mut current, validated);
+
+    assert_eq!(
+        current,
+        Some(ReasoningEffort::Low),
+        "a refresh validating an old snapshot must not clobber a newer model-switch selection"
+    );
+}
+
+#[test]
 fn config_refresh_clears_current_effort_removed_from_model_menu() {
     let tmp = std::env::temp_dir().join("grok-test-models-manager-config-effort-refresh");
     let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
