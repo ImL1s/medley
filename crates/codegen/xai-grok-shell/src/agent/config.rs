@@ -768,6 +768,11 @@ impl<T: Clone> Constrained<T> {
     pub fn source(&self) -> Option<&crate::config::RequirementSource> {
         self.source.as_ref()
     }
+
+    fn clear(&mut self) {
+        self.pin = None;
+        self.source = None;
+    }
 }
 /// Enforced requirements from `requirements.toml`. Pinned values win over all other sources.
 #[derive(Debug, Clone, Default)]
@@ -791,6 +796,13 @@ pub struct Requirements {
     pub web_search_model: Constrained<String>,
     pub session_summary_model: Constrained<String>,
     pub image_description_model: Constrained<String>,
+}
+impl Requirements {
+    pub(crate) fn clear_auxiliary_model_pins(&mut self) {
+        self.web_search_model.clear();
+        self.session_summary_model.clear();
+        self.image_description_model.clear();
+    }
 }
 /// Inputs for resolving `#[serde(skip)]` runtime fields after `new_from_toml_cfg()`.
 ///
@@ -2749,6 +2761,16 @@ impl Config {
     ///
     /// Integration test coverage: `tests/test_settings_refresh.rs`.
     pub(crate) fn re_resolve_runtime_fields(&mut self, raw_config: &toml::Value) {
+        let configured_model = |key: &str| {
+            raw_config
+                .get("models")
+                .and_then(|models| models.get(key))
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned)
+        };
+        self.models.web_search = configured_model("web_search");
+        self.models.session_summary = configured_model("session_summary");
+        self.models.image_description = configured_model("image_description");
         let remote_settings = self.remote_settings.clone();
         let cli_web_search_model = self.web_search_model_override.clone();
         let cli_session_summary_model = self.session_summary_model_override.clone();
@@ -16264,6 +16286,75 @@ image_description = "user-image"
         );
         assert!(cfg.image_description_model_explicit);
         assert!(!cfg.image_description_follows_default);
+    }
+
+    #[test]
+    #[serial]
+    fn removed_auxiliary_requirement_pins_do_not_survive_runtime_refresh() {
+        clear_runtime_env_vars();
+        let raw: toml::Value = toml::from_str(
+            r#"
+[models]
+default = "fresh-default"
+"#,
+        )
+        .unwrap();
+        let mut cfg = Config::new_from_toml_cfg(&raw).unwrap();
+        cfg.resolve_runtime_fields(&RuntimeResolutionContext {
+            raw_config: &raw,
+            remote_settings: None,
+            is_headless: false,
+            cli_subagents: None,
+            cli_web_search_model: None,
+            cli_session_summary_model: None,
+            cli_experimental_memory: false,
+            cli_no_memory: false,
+            disable_web_search: false,
+            todo_gate: false,
+            laziness_debug_log: None,
+            storage_mode: None,
+        });
+        let source = crate::config::RequirementSource::Requirements {
+            path: PathBuf::from("/test/requirements.toml"),
+        };
+        for (model, requirement) in [
+            (
+                &mut cfg.models.web_search,
+                &mut cfg.requirements.web_search_model,
+            ),
+            (
+                &mut cfg.models.session_summary,
+                &mut cfg.requirements.session_summary_model,
+            ),
+            (
+                &mut cfg.models.image_description,
+                &mut cfg.requirements.image_description_model,
+            ),
+        ] {
+            *model = Some("removed-policy-model".to_owned());
+            requirement.pin("removed-policy-model".to_owned(), source.clone());
+        }
+        cfg.rebind_unset_auxiliary_models_to_default(Some("fresh-default"));
+        assert_eq!(cfg.web_search_model, "removed-policy-model");
+
+        cfg.requirements.clear_auxiliary_model_pins();
+        cfg.re_resolve_runtime_fields(&raw);
+
+        assert_eq!(cfg.web_search_model, "fresh-default");
+        assert_eq!(cfg.session_summary_model.as_deref(), Some("fresh-default"));
+        assert_eq!(
+            cfg.image_description_model.as_deref(),
+            Some("fresh-default")
+        );
+        assert!(cfg.web_search_follows_default);
+        assert!(cfg.session_summary_follows_default);
+        assert!(cfg.image_description_follows_default);
+        assert!(!cfg.web_search_model_explicit);
+        assert!(!cfg.session_summary_model_explicit);
+        assert!(!cfg.image_description_model_explicit);
+        assert!(cfg.models.web_search.is_none());
+        assert!(cfg.models.session_summary.is_none());
+        assert!(cfg.models.image_description.is_none());
     }
 
     #[test]

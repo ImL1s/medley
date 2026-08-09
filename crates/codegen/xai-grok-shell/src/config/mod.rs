@@ -1247,6 +1247,10 @@ fn apply_managed_settings_features_inner(
 /// Clamp `AgentConfig` fields per `requirements.toml`. No-op if absent.
 /// System pins win over user pins on conflict.
 pub(crate) fn apply_requirements(config: &mut crate::agent::config::Config) -> Vec<EnforcedField> {
+    // Refresh replaces the active requirement layers. Clear pins that may have
+    // disappeared before applying the current layers so removed policy cannot
+    // survive in this reused Config.
+    config.requirements.clear_auxiliary_model_pins();
     requirements_layers()
         .into_iter()
         .flat_map(|layer| {
