@@ -900,13 +900,18 @@ async fn read_parent_prepared_model(ctx: &SubagentSpawnContext) -> PreparedSubag
                 });
             let opaque_model_name_override =
                 retained_catalog_route.is_some_and(|route| route != cfg.model);
-            let allow_missing_preferred_remap = catalog_identity.as_ref().is_some_and(|identity| {
-                identity.allows_route_remap() && identity.route == cfg.model
-            });
+            let allow_missing_preferred_remap = catalog_identity
+                .as_ref()
+                .is_some_and(|identity| identity.allows_route_remap());
+            let capability_route = catalog_identity
+                .as_ref()
+                .filter(|_| allow_missing_preferred_remap && opaque_model_name_override)
+                .map(|identity| identity.route.as_str())
+                .unwrap_or(&cfg.model);
             let capabilities = crate::agent::models::capabilities_for_route_in(
                 &ctx.available_models,
                 Some(preferred_model_id),
-                &cfg.model,
+                capability_route,
                 catalog_identity.is_some() && !allow_missing_preferred_remap,
                 opaque_model_name_override
                     .then_some(retained_catalog_route)

@@ -2983,6 +2983,57 @@ async fn read_parent_sampling_config_switched_entry_opaque_override_keeps_capabi
 }
 
 #[tokio::test]
+async fn read_parent_sampling_config_unique_route_remaps_through_opaque_override() {
+    let replacement_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let mut replacement = test_model_entry("retained-routing-model");
+    replacement.info.supports_backend_search = true;
+    replacement.info.codex_wire = Some(replacement_caps.clone());
+    let mut colliding = test_model_entry("opaque-backend-routing-hint");
+    colliding.info.codex_wire = Some(xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    });
+    let mut models = indexmap::IndexMap::new();
+    models.insert("replacement-entry".to_string(), replacement);
+    models.insert("colliding-entry".to_string(), colliding);
+    let mut ctx = ctx_with_parent_chat_state(
+        "removed-alias",
+        "retained-routing-model",
+        "startup-entry",
+        models,
+    );
+    ctx.sampling_config_model_id = acp::ModelId::new("startup-entry");
+    ctx.sampling_config.model = "startup-routing-model".to_string();
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.sampling_config.model = "opaque-backend-routing-hint".to_string();
+    snapshot.catalog_identity = Some(test_catalog_identity(
+        "removed-alias",
+        "retained-routing-model",
+        xai_chat_state::CatalogResolutionLineage::UniqueRoute,
+    ));
+    chat.restore_snapshot(snapshot);
+
+    let prepared = read_parent_prepared_model(&ctx).await;
+
+    assert_eq!(prepared.model_id.0.as_ref(), "replacement-entry");
+    assert_eq!(
+        prepared.sampling_config.model,
+        "opaque-backend-routing-hint"
+    );
+    assert!(prepared.sampling_config.supports_backend_search);
+    assert_eq!(prepared.sampling_config.codex_wire, Some(replacement_caps));
+    assert_eq!(prepared.catalog_identity.model_id, "replacement-entry");
+    assert_eq!(
+        prepared.catalog_identity.route,
+        "retained-routing-model"
+    );
+}
+
+#[tokio::test]
 async fn read_parent_sampling_config_opaque_override_rejects_reused_committed_key() {
     let baseline_caps = xai_grok_sampling_types::CodexWireCapabilities {
         supports_reasoning_summary_parameter: Some(false),
