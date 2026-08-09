@@ -1776,6 +1776,7 @@ fn make_test_handle(
             std::sync::Arc::new(crate::terminal::LocalTerminalRunner),
         ),
         model_id: acp::ModelId::new(model),
+        auxiliary_model_provenance: crate::session::AuxiliaryModelProvenance::default(),
         scheduler_background_loops: true,
         reasoning_effort: None,
         yolo_mode: yolo,
@@ -2786,9 +2787,24 @@ fn model_overrides_live_cross_provider_switch_rebuilds_inherited_auxiliary_lanes
         let mut handle = make_test_handle("source-provider", false, None);
         handle.info.id = sid.clone();
         handle.agent_name = "grok-build".to_owned();
+        handle.auxiliary_model_provenance = crate::session::AuxiliaryModelProvenance {
+            session_summary_follows_default: true,
+            web_search_follows_default: true,
+            web_search_model: "source-provider".to_owned(),
+            image_description_follows_default: true,
+        };
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         handle.cmd_tx = cmd_tx;
         agent.sessions.borrow_mut().insert(sid.clone(), handle);
+        {
+            // A config refresh after spawn must not rewrite this resident
+            // session's inheritance provenance.
+            let mut cfg = agent.cfg.borrow_mut();
+            cfg.session_summary_follows_default = false;
+            cfg.web_search_follows_default = false;
+            cfg.web_search_model = "source-provider".to_owned();
+            cfg.image_description_follows_default = false;
+        }
 
         tokio::task::spawn_local(async move {
             while let Some(command) = cmd_rx.recv().await {

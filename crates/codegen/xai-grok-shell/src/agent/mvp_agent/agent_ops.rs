@@ -2641,14 +2641,26 @@ impl MvpAgent {
         let operative_model_id = operative_model_id
             .map(str::to_owned)
             .unwrap_or_else(|| self.models_manager.current_model_id().0.to_string());
-        let (model_id, disable_api_key_auth, alpha_test_key, client_version, endpoints) = {
+        let model_id = {
+            let cfg = self.cfg.borrow();
+            crate::config::auxiliary_model_or_operative(
+                &cfg.web_search_model,
+                &operative_model_id,
+                cfg.web_search_follows_default,
+            )
+        };
+        self.prepare_web_search_sampling_config_for_model_preflight(disable_reason, &model_id)
+            .await
+    }
+
+    pub(crate) async fn prepare_web_search_sampling_config_for_model_preflight(
+        &self,
+        disable_reason: &mut Option<config::WebSearchDisabled>,
+        model_id: &str,
+    ) -> Option<SamplingConfig> {
+        let (disable_api_key_auth, alpha_test_key, client_version, endpoints) = {
             let cfg = self.cfg.borrow();
             (
-                crate::config::auxiliary_model_or_operative(
-                    &cfg.web_search_model,
-                    &operative_model_id,
-                    cfg.web_search_follows_default,
-                ),
                 cfg.grok_com_config.api_key_auth_disabled(),
                 cfg.endpoints.alpha_test_key.clone(),
                 cfg.client_version.clone(),
@@ -2658,7 +2670,7 @@ impl MvpAgent {
         let models = self.models_manager.models();
         let session = self.current_or_buffered_auth();
         let mut cfg = config::resolve_web_search_sampling_config_preflight_result(
-            &model_id,
+            model_id,
             &models,
             session.as_ref().map(|a| a.key.as_str()),
             disable_api_key_auth,
@@ -3841,11 +3853,19 @@ impl MvpAgent {
             &default_model_id,
         );
         let model_id = {
+            let sessions = self.sessions.borrow();
+            let handle = sessions.get(session_id);
             let cfg = self.cfg.borrow();
+            let follows_default = handle
+                .map(|handle| handle.auxiliary_model_provenance.web_search_follows_default)
+                .unwrap_or(cfg.web_search_follows_default);
+            let configured_model = handle
+                .map(|handle| handle.auxiliary_model_provenance.web_search_model.as_str())
+                .unwrap_or(&cfg.web_search_model);
             crate::config::auxiliary_model_or_operative(
-                &cfg.web_search_model,
+                configured_model,
                 session_model_id.0.as_ref(),
-                cfg.web_search_follows_default,
+                follows_default,
             )
         };
         let models = self.models_manager.models();
@@ -3870,9 +3890,9 @@ impl MvpAgent {
 
         let mut web_search_disable_reason = None;
         let web_search_sampling_config = self
-            .prepare_web_search_sampling_config_preflight(
+            .prepare_web_search_sampling_config_for_model_preflight(
                 &mut web_search_disable_reason,
-                Some(session_model_id.0.as_ref()),
+                &model_id,
             )
             .await;
         let needs_notice = web_search_sampling_config
@@ -5486,6 +5506,15 @@ impl MvpAgent {
         if handle_display_cwd.is_some() {
             handle.display_cwd = handle_display_cwd;
         }
+        handle.auxiliary_model_provenance = {
+            let cfg = self.cfg.borrow();
+            crate::session::AuxiliaryModelProvenance {
+                session_summary_follows_default: cfg.session_summary_follows_default,
+                web_search_follows_default: cfg.web_search_follows_default,
+                web_search_model: cfg.web_search_model.clone(),
+                image_description_follows_default: cfg.image_description_follows_default,
+            }
+        };
         let source = if chat_history.is_empty() { "new" } else { "load" };
         let _ = handle
             .cmd_tx

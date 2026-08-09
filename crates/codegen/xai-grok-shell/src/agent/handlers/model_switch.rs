@@ -325,28 +325,27 @@ async fn apply_with_load_gate(
         }
     }
     let applied_effort = model_sampling.reasoning_effort;
-    let (summary_follows_default, web_search_follows_default, image_description_follows_default) = {
-        let cfg = agent.cfg.borrow();
-        (
-            cfg.session_summary_follows_default,
-            cfg.web_search_follows_default,
-            cfg.image_description_follows_default,
-        )
-    };
+    let summary_follows_default = handle
+        .auxiliary_model_provenance
+        .session_summary_follows_default;
+    let web_search_follows_default = handle.auxiliary_model_provenance.web_search_follows_default;
+    let image_description_follows_default = handle
+        .auxiliary_model_provenance
+        .image_description_follows_default;
     let summary_sampling_config = summary_follows_default.then(|| model_sampling.clone());
     let web_search_sampling_config = if web_search_follows_default {
         let mut ignored_disable_reason = None;
         agent
-            .prepare_web_search_sampling_config_preflight(
+            .prepare_web_search_sampling_config_for_model_preflight(
                 &mut ignored_disable_reason,
-                Some(catalog_model_id.0.as_ref()),
+                catalog_model_id.0.as_ref(),
             )
             .await
     } else {
         None
     };
-    let image_description_model = image_description_follows_default
-        .then(|| agent.resolve_image_description_model(catalog_model_id.0.as_ref()));
+    let image_description_model =
+        image_description_follows_default.then(|| catalog_model_id.0.to_string());
     let new_threshold = {
         let cfg = agent.cfg.borrow();
         resolve_model_switch_auto_compact_threshold_percent(&cfg, &catalog_model_id, &model)

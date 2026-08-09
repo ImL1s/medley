@@ -63,6 +63,19 @@ pub struct WebSearchDisabledNotice {
     /// One-line user-facing notice naming the model and the reason.
     pub message: String,
 }
+/// Spawn-time provenance for auxiliary model lanes.
+///
+/// Config reloads update the process-wide defaults, but an already-resident
+/// session must keep the inheritance policy with which its resources were
+/// created. Model switches consult this snapshot instead of the latest global
+/// config.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct AuxiliaryModelProvenance {
+    pub session_summary_follows_default: bool,
+    pub web_search_follows_default: bool,
+    pub web_search_model: String,
+    pub image_description_follows_default: bool,
+}
 /// Handle for interacting with a session actor.
 /// Note: Permission event receivers are returned separately from `spawn_session_actor`
 /// and should be stored/managed by the caller.
@@ -142,6 +155,9 @@ pub struct SessionHandle {
     /// Per-session tracking prevents cross-client contamination in leader mode
     /// where `MvpAgent.current_model_id` is shared mutable state.
     pub model_id: acp::ModelId,
+    /// Spawn-time auxiliary lane inheritance policy and explicit web-search
+    /// pin. This remains stable across process-wide config reloads.
+    pub(crate) auxiliary_model_provenance: AuxiliaryModelProvenance,
     /// Whether this session's scheduled fires run as detached background
     /// subagents. Copied from the value the spawn resolved for the session's
     /// [`AgentRebuildSpec`](crate::session::agent_rebuild::AgentRebuildSpec), so
