@@ -830,6 +830,27 @@ async fn read_parent_sampling_config(
 ) -> (xai_grok_sampler::SamplerConfig, acp::ModelId) {
     if let Some(ref chat_state) = ctx.parent_chat_state {
         if let Some(cfg) = chat_state.get_sampling_config().await {
+            // A model switch commits the actor config before the outer session
+            // handle. Bind every catalog fact to the model observed in this
+            // same live snapshot, while preserving a matching catalog id such
+            // as `auto` when it still names that routing model.
+            let captured_model_matches = crate::agent::config::find_model_by_id(
+                &ctx.available_models,
+                ctx.model_id.0.as_ref(),
+            )
+            .is_some_and(|entry| entry.info.model == cfg.model)
+                || ctx
+                    .models_manager
+                    .model_ids_refer_to_same_entry(ctx.model_id.0.as_ref(), &cfg.model)
+                || (ctx.models_manager.model_ids_refer_to_same_entry(
+                    ctx.model_id.0.as_ref(),
+                    ctx.sampling_config_model_id.0.as_ref(),
+                ) && ctx.sampling_config.model == cfg.model);
+            let model_id = if captured_model_matches {
+                ctx.model_id.clone()
+            } else {
+                acp::ModelId::new(cfg.model.clone())
+            };
             let creds = chat_state.get_credentials().await;
             let mut extra_headers = cfg.extra_headers;
             crate::agent::config::inject_url_derived_headers(
@@ -840,16 +861,14 @@ async fn read_parent_sampling_config(
             // Prefer the spawn-time in-memory catalog (session-selected models),
             // then disk effective config, then parent spawn baseline. Never
             // silent-default to Bearer on miss when the parent baseline is None.
-            let auth_scheme = crate::agent::config::find_model_by_id(
-                &ctx.available_models,
-                ctx.model_id.0.as_ref(),
-            )
-            .map(|e| e.info.auth_scheme)
-            .or_else(|| {
-                crate::agent::config::try_resolve_model_credentials(&cfg.model, None)
-                    .map(|r| r.auth_scheme)
-            })
-            .unwrap_or(ctx.sampling_config.auth_scheme);
+            let auth_scheme =
+                crate::agent::config::find_model_by_id(&ctx.available_models, model_id.0.as_ref())
+                    .map(|e| e.info.auth_scheme)
+                    .or_else(|| {
+                        crate::agent::config::try_resolve_model_credentials(&cfg.model, None)
+                            .map(|r| r.auth_scheme)
+                    })
+                    .unwrap_or(ctx.sampling_config.auth_scheme);
             let inherited_base_url = cfg.base_url.clone();
             let strip_guard = ctx.would_strip_fallback_key(creds.api_key());
             // #110 / #136 / #180: provenance comes from parent `Credentials`
@@ -920,22 +939,21 @@ async fn read_parent_sampling_config(
                 },
                 supports_backend_search: ctx
                     .models_manager
-                    .model_supports_backend_search(ctx.model_id.0.as_ref()),
+                    .model_supports_backend_search(model_id.0.as_ref()),
                 compactions_remaining: ctx
                     .models_manager
-                    .model_compactions_remaining(ctx.model_id.0.as_ref()),
+                    .model_compactions_remaining(model_id.0.as_ref()),
                 compaction_at_tokens: ctx
                     .models_manager
-                    .model_compaction_at_tokens(ctx.model_id.0.as_ref()),
+                    .model_compaction_at_tokens(model_id.0.as_ref()),
                 doom_loop_recovery: ctx.sampling_config.doom_loop_recovery,
                 header_injector: ctx.sampling_config.header_injector.clone(),
                 // Resolved from the subagent's own model, like the three
                 // catalog lookups above — not copied from the parent's
                 // config, whose `codex_wire` belongs to whatever model the
                 // parent is running (#277).
-                codex_wire: subagent_codex_wire(ctx),
+                codex_wire: subagent_codex_wire(ctx, model_id.0.as_ref()),
             };
-            let model_id = ctx.model_id.clone();
             let global_model_id = ctx.models_manager.current_model_id();
             xai_grok_telemetry::unified_log::debug(
                 "subagent read parent config (live)",
@@ -997,7 +1015,7 @@ async fn read_parent_sampling_config(
     // #277 on the path taken whenever the parent's chat-state actor is
     // unavailable — which `try_build_subagent_spawn_context` does not bail
     // on, so a nested child outliving its parent lands here for real.
-    fallback.codex_wire = subagent_codex_wire(ctx);
+    fallback.codex_wire = subagent_codex_wire(ctx, ctx.model_id.0.as_ref());
     (fallback, ctx.model_id.clone())
 }
 
@@ -1012,8 +1030,8 @@ async fn read_parent_sampling_config(
 /// not to use, so there is no fallback.
 fn subagent_codex_wire(
     ctx: &SubagentSpawnContext,
+    model_id: &str,
 ) -> Option<xai_grok_sampling_types::CodexWireCapabilities> {
-    let model_id = ctx.model_id.0.as_ref();
     let resolved = ctx.models_manager.model_codex_wire(model_id);
     if resolved.is_some() || ctx.models_manager.model_in_catalog(model_id) {
         // `None` on a present entry is authoritative metadata, not a catalog

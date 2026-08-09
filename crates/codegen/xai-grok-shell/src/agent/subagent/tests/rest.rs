@@ -1788,6 +1788,7 @@ fn ctx_with_parent_chat_state(
     let mut ctx = ctx_with_toggle(HashMap::new());
     ctx.model_id = acp::ModelId::new(session_model_id);
     ctx.sampling_config_model_id = acp::ModelId::new(session_model_id);
+    ctx.sampling_config.model = inference_slug.to_string();
     ctx.parent_chat_state = Some(spawn_test_parent_chat_state(inference_slug));
     ctx.models_manager = crate::agent::models::ModelsManager::new(
         None,
@@ -2422,6 +2423,45 @@ async fn read_parent_sampling_config_present_none_never_inherits_startup_model_w
     assert_eq!(
         config.codex_wire, None,
         "a present entry with no wire metadata must not inherit the startup model's flags"
+    );
+}
+
+/// The actor commits a switch before the outer session handle. A spawn in
+/// that window must use the model identity from the live actor snapshot for
+/// both routing and wire capabilities.
+#[tokio::test]
+async fn read_parent_sampling_config_inflight_switch_uses_live_model_wire() {
+    let old_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let new_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let mut old_entry = test_model_entry("old-routing-model");
+    old_entry.info.codex_wire = Some(old_caps);
+    let mut new_entry = test_model_entry("new-routing-model");
+    new_entry.info.codex_wire = Some(new_caps.clone());
+    let mut models = indexmap::IndexMap::new();
+    models.insert("old-catalog-id".to_string(), old_entry);
+    models.insert("new-catalog-id".to_string(), new_entry);
+    let mut ctx = ctx_with_parent_chat_state(
+        "old-catalog-id",
+        "new-routing-model",
+        "old-catalog-id",
+        models,
+    );
+    ctx.sampling_config.model = "old-routing-model".to_string();
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(config.model, "new-routing-model");
+    assert_eq!(model_id.0.as_ref(), "new-routing-model");
+    assert_eq!(
+        config.codex_wire,
+        Some(new_caps),
+        "wire flags must be resolved from the live model snapshot, not the stale session handle"
     );
 }
 
