@@ -178,6 +178,7 @@ async fn sync_forked_session_to_backend(
         cwd: cwd.to_string(),
         model_id,
         catalog_identity: None,
+        agent_name: None,
         created_at: Some(chrono::Utc::now().to_rfc3339()),
         updated_at: Some(chrono::Utc::now().to_rfc3339()),
         total_messages: Some(0),

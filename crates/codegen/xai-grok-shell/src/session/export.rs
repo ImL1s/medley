@@ -80,6 +80,8 @@ pub struct ExportedMetadata {
     pub model_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_identity: Option<xai_chat_state::CatalogIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -119,6 +121,7 @@ impl ExportedMetadata {
             cwd: summary.info.cwd.clone(),
             model_id: Some(summary.current_model_id.0.to_string()),
             catalog_identity: summary.catalog_identity.clone(),
+            agent_name: summary.agent_name.clone(),
             created_at: Some(summary.created_at.to_rfc3339()),
             updated_at: Some(summary.updated_at.to_rfc3339()),
             total_messages: Some(summary.num_messages),

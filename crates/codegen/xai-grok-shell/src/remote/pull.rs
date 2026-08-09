@@ -120,6 +120,12 @@ pub(crate) mod hydrate {
             .filter(|identity| {
                 identity.model_id == model_id.0.as_ref() && !identity.route.trim().is_empty()
             });
+        let agent_name = meta
+            .and_then(|m| m.get("agentName").or_else(|| m.get("agent_name")))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
 
         let parent_session_id = meta
             .and_then(|m| m.get("parentSessionId"))
@@ -163,7 +169,7 @@ pub(crate) mod hydrate {
             generated_title: None,
             title_is_manual: false,
             worktree_label: None,
-            agent_name: None,
+            agent_name,
             // Hydrated locally — record the profile this process runs under.
             sandbox_profile: xai_grok_sandbox::configured_profile_name().map(String::from),
             reasoning_effort: None,
@@ -264,6 +270,7 @@ mod tests {
             lineage: xai_chat_state::CatalogResolutionLineage::UniqueRoute,
             auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
         });
+        source.agent_name = Some("codex".to_owned());
         let pushed = crate::session::export::ExportedMetadata::from_summary(&source);
         let data = crate::remote::client::LoadDataResponse {
             messages: None,
@@ -285,6 +292,7 @@ mod tests {
         let restored = pulled
             .catalog_identity
             .expect("remote lineage must round-trip");
+        assert_eq!(pulled.agent_name.as_deref(), Some("codex"));
 
         let mut invalid_metadata = serde_json::to_value(
             crate::session::export::ExportedMetadata::from_summary(&source),
@@ -337,6 +345,35 @@ mod tests {
         assert_eq!(credentials.base_url, "https://retained.example/v1");
         assert_eq!(credentials.api_key.as_deref(), Some("retained-secret"));
         assert_ne!(credentials.api_key.as_deref(), Some("foreign-secret"));
+
+        let mut incompatible = catalog["replacement-key"].clone();
+        incompatible.info.agent_type = "cursor".to_owned();
+        let incompatible_catalog =
+            indexmap::IndexMap::from([("replacement-key".to_owned(), incompatible)]);
+        let incompatible_resolved = crate::agent::models::reconcile_persisted_catalog_identity(
+            &incompatible_catalog,
+            &restored,
+        )
+        .expect("the retained route still resolves by wire identity");
+        let active = xai_grok_agent::discovery::by_name_in_cwd(
+            pulled.agent_name.as_deref().unwrap(),
+            std::path::Path::new("."),
+        )
+        .expect("persisted codex harness");
+        let compatible = crate::agent::mvp_agent::first_ready_compatible_model(
+            [agent_client_protocol::ModelId::new(
+                incompatible_resolved.model_id,
+            )],
+            &active,
+            |id| incompatible_catalog.get(id.0.as_ref()).cloned(),
+            |agent_type| {
+                xai_grok_agent::discovery::by_name_in_cwd(agent_type, std::path::Path::new("."))
+            },
+        );
+        assert!(
+            compatible.is_none(),
+            "remote resume must validate a remap against the persisted harness"
+        );
     }
 
     #[test]

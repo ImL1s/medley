@@ -2179,7 +2179,7 @@ impl SessionPersistence {
                         tracing::warn!(?e, "failed to update current model");
                     }
                     if let Some(sync) = &self.remote_sync {
-                        sync.set_model(model_id.0.to_string(), catalog_identity);
+                        sync.set_model(model_id.0.to_string(), catalog_identity, agent_name);
                     }
                 }
                 PersistenceMsg::CurrentModelAndAck {
@@ -2202,7 +2202,7 @@ impl SessionPersistence {
                     if result.is_ok()
                         && let Some(sync) = &self.remote_sync
                     {
-                        sync.set_model(model_id.0.to_string(), catalog_identity);
+                        sync.set_model(model_id.0.to_string(), catalog_identity, agent_name);
                     }
                     let _ = respond_to.send(result);
                 }
@@ -2228,7 +2228,7 @@ impl SessionPersistence {
                     if (result.is_ok() || result.as_ref().is_err_and(|error| error.is_committed()))
                         && let Some(sync) = &self.remote_sync
                     {
-                        sync.set_model(model_id.0.to_string(), catalog_identity);
+                        sync.set_model(model_id.0.to_string(), catalog_identity, agent_name);
                     }
                     let _ = respond_to.send(result);
                 }
