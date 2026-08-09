@@ -3369,6 +3369,11 @@ async fn session_load_recompute_updates_web_search_notice_for_ready_unusable_and
     let sid = acp::SessionId::new("ws-warm-201");
     let mut handle = make_test_handle("test-model", false, None);
     handle.info.id = sid.clone();
+    handle.auxiliary_model_provenance = crate::session::AuxiliaryModelProvenance {
+        web_search_follows_default: false,
+        web_search_model: WS_MODEL.to_owned(),
+        ..Default::default()
+    };
     agent.session_registry.put_resident(&sid, handle);
 
     // Ready route: web_search remains available, so `_meta` must stay silent.
