@@ -359,13 +359,23 @@ fn resumed_from_field_in_meta_roundtrips() {
         child_cwd: None,
         worktree_path: None,
         snapshot_ref: None,
-        effective_model_id: None,
+        effective_model_id: Some("gpt-5.3-codex-spark".into()),
+        effective_model_route: Some("gpt-5.3-codex-spark".into()),
+        effective_model_agent_type: Some("grok-build-plan".into()),
     };
     let json = serde_json::to_string(&meta).unwrap();
     assert!(json.contains("resumed_from"));
     assert!(json.contains("prev-subagent-id"));
     let parsed: SubagentMeta = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.resumed_from.as_deref(), Some("prev-subagent-id"));
+    assert_eq!(
+        parsed.effective_model_route.as_deref(),
+        Some("gpt-5.3-codex-spark"),
+    );
+    assert_eq!(
+        parsed.effective_model_agent_type.as_deref(),
+        Some("grok-build-plan"),
+    );
     let gcs = SubagentSessionMetadata::from_meta(
         &meta,
         None,
@@ -379,8 +389,15 @@ fn resumed_from_field_in_meta_roundtrips() {
         0,
     );
     assert_eq!(gcs.resumed_from.as_deref(), Some("prev-subagent-id"));
+    assert_eq!(
+        gcs.model_route.as_deref(),
+        Some("gpt-5.3-codex-spark"),
+    );
+    assert_eq!(gcs.model_agent_type.as_deref(), Some("grok-build-plan"));
     let gcs_json = serde_json::to_string(&gcs).unwrap();
     assert!(gcs_json.contains("resumedFrom"));
+    assert!(gcs_json.contains("modelRoute"));
+    assert!(gcs_json.contains("modelAgentType"));
 }
 #[test]
 fn resumed_from_none_not_serialized_in_meta() {
@@ -407,6 +424,8 @@ fn resumed_from_none_not_serialized_in_meta() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        effective_model_route: None,
+        effective_model_agent_type: None,
     };
     let json = serde_json::to_string(&meta).unwrap();
     assert!(
@@ -428,6 +447,8 @@ fn backward_compat_meta_without_resumed_from() {
         }"#;
     let meta: SubagentMeta = serde_json::from_str(json).unwrap();
     assert!(meta.resumed_from.is_none());
+    assert!(meta.effective_model_route.is_none());
+    assert!(meta.effective_model_agent_type.is_none());
 }
 #[test]
 fn snapshot_ref_field_in_meta_roundtrips() {
@@ -454,6 +475,8 @@ fn snapshot_ref_field_in_meta_roundtrips() {
         worktree_path: Some("/tmp/grok-wt/sa-snap".into()),
         snapshot_ref: Some("refs/grok/subagent-snapshots/sa-snap".into()),
         effective_model_id: None,
+        effective_model_route: None,
+        effective_model_agent_type: None,
     };
     let json = serde_json::to_string(&meta).unwrap();
     assert!(json.contains("snapshot_ref"));
@@ -504,6 +527,8 @@ fn snapshot_test_meta(id: &str) -> SubagentMeta {
         worktree_path: Some("/tmp/grok-wt/subagent-x".into()),
         snapshot_ref: None,
         effective_model_id: None,
+        effective_model_route: None,
+        effective_model_agent_type: None,
     }
 }
 /// The follow-up writer persists `snapshot_ref` into an already-finalized
@@ -699,6 +724,8 @@ fn subagent_session_metadata_roundtrip() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        effective_model_route: None,
+        effective_model_agent_type: None,
     };
     let session_meta = SubagentSessionMetadata::from_meta(
         &meta,
@@ -759,6 +786,8 @@ fn subagent_session_metadata_non_forked() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        effective_model_route: None,
+        effective_model_agent_type: None,
     };
     let session_meta = SubagentSessionMetadata::from_meta(
         &meta,
@@ -823,6 +852,8 @@ fn upload_lifecycle_spawn_then_completion_preserves_fields() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        effective_model_route: None,
+        effective_model_agent_type: None,
     };
     let spawn_gcs = SubagentSessionMetadata::from_meta(
         &spawn_meta,
@@ -906,6 +937,8 @@ fn upload_lifecycle_failure_preserves_error() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        effective_model_route: None,
+        effective_model_agent_type: None,
     };
     let gcs = SubagentSessionMetadata::from_meta(
         &meta,
@@ -954,6 +987,8 @@ fn session_metadata_session_kind_for_resumed() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        effective_model_route: None,
+        effective_model_agent_type: None,
     };
     let gcs = SubagentSessionMetadata::from_meta(
         &meta,
@@ -1247,6 +1282,8 @@ fn durable_fallback_roundtrips_child_cwd_and_worktree() {
         worktree_path: Some("/tmp/grok-wt/sa-dur".into()),
         snapshot_ref: None,
         effective_model_id: Some("grok-3".into()),
+        effective_model_route: None,
+        effective_model_agent_type: None,
     };
     write_subagent_meta(&dir, &meta);
     let data = std::fs::read_to_string(dir.join("meta.json")).unwrap();
@@ -1286,6 +1323,8 @@ fn durable_fallback_rejects_running_status() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        effective_model_route: None,
+        effective_model_agent_type: None,
     };
     write_subagent_meta(&parent_dir, &meta);
     let data = std::fs::read_to_string(parent_dir.join("meta.json")).unwrap();
@@ -1368,6 +1407,8 @@ fn running_test_meta(id: &str, parent_session_id: &str) -> SubagentMeta {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        effective_model_route: None,
+        effective_model_agent_type: None,
     }
 }
 fn inspection(id: &str, status: SubagentSnapshotStatus) -> SubagentInspection {
@@ -1644,6 +1685,8 @@ fn durable_meta_roundtrips_effective_model_id() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: Some("grok-3".into()),
+        effective_model_route: None,
+        effective_model_agent_type: None,
     };
     write_subagent_meta(&dir, &meta);
     let data = std::fs::read_to_string(dir.join("meta.json")).unwrap();

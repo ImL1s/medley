@@ -1875,6 +1875,30 @@ fn durable_resume_source_for(
         model_id: meta.effective_model_id,
     })
 }
+
+fn durable_resume_model_lineage_for(
+    id: &str,
+    parent_session_id: &str,
+    parent_cwd: &Path,
+) -> Option<handle_request::ResumeModelLineage> {
+    let parent_info = SessionInfo {
+        id: acp::SessionId::new(parent_session_id),
+        cwd: parent_cwd.to_string_lossy().into_owned(),
+    };
+    let meta_path = session::persistence::session_dir(&parent_info)
+        .join("subagents")
+        .join(id)
+        .join("meta.json");
+    let data = std::fs::read_to_string(meta_path).ok()?;
+    let meta: SubagentMeta = serde_json::from_str(&data).ok()?;
+    if meta.parent_session_id != parent_session_id || meta.subagent_id != id {
+        return None;
+    }
+    Some(handle_request::ResumeModelLineage {
+        route: meta.effective_model_route,
+        agent_type: meta.effective_model_agent_type,
+    })
+}
 /// Resolve the MCP pool a child subagent should import from its parent.
 ///
 /// Inheritance applies to **every** agent source (built-in, user, project,
@@ -2775,6 +2799,16 @@ pub(crate) struct SubagentMeta {
     /// durable `resume_from` identity validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_model_id: Option<String>,
+    /// Routing model committed with `effective_model_id`. This is model
+    /// lineage, not the subagent role stored in `subagent_type`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_model_route: Option<String>,
+    /// Catalog harness committed with `effective_model_id`. This is kept
+    /// separate from the selected subagent role so resume compares harness
+    /// identity with harness identity instead of treating `general-purpose`
+    /// as a model harness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_model_agent_type: Option<String>,
 }
 /// Canonical subagent metadata for GCS persistence (`subagent.json`).
 ///
@@ -2812,6 +2846,13 @@ pub(crate) struct SubagentSessionMetadata {
     pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
+    /// Routing model committed with `model_id` for durable resume identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_route: Option<String>,
+    /// Catalog sampling harness committed with `model_id`. This is distinct
+    /// from the selected subagent role stored in `subagent_type`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_agent_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2875,6 +2916,8 @@ impl SubagentSessionMetadata {
             capability_mode: capability_mode.map(str::to_string),
             reasoning_effort: reasoning_effort.map(str::to_string),
             model_id: model_id.map(str::to_string),
+            model_route: meta.effective_model_route.clone(),
+            model_agent_type: meta.effective_model_agent_type.clone(),
             cwd: cwd.map(str::to_string),
             worktree_path: worktree_path.map(str::to_string),
             isolation_mode: isolation_mode.map(str::to_string),

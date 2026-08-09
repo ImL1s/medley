@@ -59,6 +59,44 @@ pub(super) fn task_model_override_error(
     let requested = requested?;
     crate::agent::models::task_model_error_for_catalog(requested, available, is_session_auth)
 }
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct ResumeModelLineage {
+    pub(super) route: Option<String>,
+    pub(super) agent_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeModelLineageError {
+    RouteChanged,
+    HarnessChanged,
+}
+
+fn validate_resume_model_lineage(
+    source: &ResumeModelLineage,
+    current_route: &str,
+    current_agent_type: &str,
+) -> Result<(), ResumeModelLineageError> {
+    if source
+        .route
+        .as_deref()
+        .is_some_and(|route| route != current_route)
+    {
+        return Err(ResumeModelLineageError::RouteChanged);
+    }
+    if source
+        .agent_type
+        .as_deref()
+        .is_some_and(|agent_type| agent_type != current_agent_type)
+    {
+        return Err(ResumeModelLineageError::HarnessChanged);
+    }
+    Ok(())
+}
+
+fn should_preflight_model_harness(is_resume: bool, has_fresh_model_selection: bool) -> bool {
+    !is_resume && has_fresh_model_selection
+}
 /// Lifecycle guard that keeps managed-gateway refresh barriers aware of live
 /// child sessions until this spawn path exits.
 struct ManagedGatewayChildSessionRegistration {
@@ -288,6 +326,13 @@ pub(crate) async fn run_shell_child(
     } else {
         None
     };
+    let resume_model_lineage = request
+        .resume_from
+        .as_deref()
+        .filter(|resume_id| is_valid_resume_id(resume_id))
+        .and_then(|resume_id| {
+            durable_resume_model_lineage_for(resume_id, &ctx.parent_session_id, &ctx.parent_cwd)
+        });
     if let Some(ref source) = resume_source {
         if request.runtime_overrides.model.is_some() {
             tracing::debug!(
@@ -573,10 +618,6 @@ pub(crate) async fn run_shell_child(
         .is_some_and(|identity| identity.model_id == effective_model_id.0.as_ref())
     };
     let explicit_model_selection = request.fork_context
-        || resume_source
-            .as_ref()
-            .and_then(|source| source.model_id.as_deref())
-            .is_some_and(&requested_model_matches_effective)
         || effective_runtime
             .model
             .as_deref()
@@ -591,7 +632,28 @@ pub(crate) async fn run_shell_child(
             }
             xai_grok_agent::config::ModelOverride::Inherit => false,
         };
-    if explicit_model_selection {
+    let is_resume = resume_source.is_some();
+    if is_resume {
+        if let Some(source_lineage) = resume_model_lineage.as_ref()
+            && let Err(lineage_error) = validate_resume_model_lineage(
+                source_lineage,
+                &prepared_model.catalog_identity.route,
+                &prepared_model.agent_type,
+            )
+        {
+            let changed = match lineage_error {
+                ResumeModelLineageError::RouteChanged => "route",
+                ResumeModelLineageError::HarnessChanged => "harness",
+            };
+            let msg = format!(
+                "Cannot resume from subagent '{}': source model {changed} no longer matches the current catalog.",
+                resume_source
+                    .as_ref()
+                    .map_or("unknown", |source| source.subagent_id.as_str()),
+            );
+            return child_run_output(failure_result(&request, &msg), completion_data, None);
+        }
+    } else if should_preflight_model_harness(is_resume, explicit_model_selection) {
         if prepared_model.agent_type.is_empty() {
             let msg = format!(
                 "Cannot spawn subagent '{}': resolved model '{}' is no longer in the model catalog.",
@@ -731,6 +793,9 @@ pub(crate) async fn run_shell_child(
             .map(|p| p.to_string_lossy().to_string()),
         snapshot_ref: None,
         effective_model_id: Some(effective_model_id.0.to_string()),
+        effective_model_route: Some(prepared_model.catalog_identity.route.clone()),
+        effective_model_agent_type: (!prepared_model.agent_type.is_empty())
+            .then(|| prepared_model.agent_type.clone()),
     };
     write_subagent_meta(&subagent_meta_dir, &subagent_meta);
     if let (Some(bucket_url), Some(upload_method)) = (&ctx.gcs_bucket_url, &ctx.gcs_upload_method) {
@@ -2126,4 +2191,76 @@ pub(crate) async fn run_shell_child(
         })),
     );
     child_run_output(result, completion_data, disposed_snapshot_ref)
+}
+
+#[cfg(test)]
+mod resume_model_lineage_tests {
+    use super::*;
+
+    #[test]
+    fn inherited_codex_subagent_resume_preserves_accepted_model_harness_tuple() {
+        let selected_role = xai_grok_agent::AgentDefinition::general_purpose();
+        let catalog_harness = xai_grok_agent::AgentDefinition::grok_build_plan();
+        assert_eq!(
+            super::super::validate_subagent_model_harness(
+                &selected_role,
+                "grok-build-plan",
+                Some(&catalog_harness),
+            ),
+            Err(super::super::SubagentModelHarnessError::Incompatible),
+            "the regression requires role and catalog harness to differ",
+        );
+        assert!(
+            !should_preflight_model_harness(false, false),
+            "a fresh inherited model is not a model override",
+        );
+        assert!(
+            !should_preflight_model_harness(true, true),
+            "resume continues an accepted tuple instead of selecting a new model",
+        );
+        assert_eq!(
+            validate_resume_model_lineage(
+                &ResumeModelLineage {
+                    route: Some("gpt-5.3-codex-spark".to_owned()),
+                    agent_type: Some("grok-build-plan".to_owned()),
+                },
+                "gpt-5.3-codex-spark",
+                "grok-build-plan",
+            ),
+            Ok(()),
+        );
+    }
+
+    #[test]
+    fn fresh_explicit_incompatible_model_still_requires_harness_preflight() {
+        assert!(should_preflight_model_harness(false, true));
+    }
+
+    #[test]
+    fn resume_model_lineage_fails_closed_when_route_or_harness_changes() {
+        let source = ResumeModelLineage {
+            route: Some("gpt-5.3-codex-spark".to_owned()),
+            agent_type: Some("grok-build-plan".to_owned()),
+        };
+        assert_eq!(
+            validate_resume_model_lineage(&source, "reused-route", "grok-build-plan"),
+            Err(ResumeModelLineageError::RouteChanged),
+        );
+        assert_eq!(
+            validate_resume_model_lineage(&source, "gpt-5.3-codex-spark", "codex"),
+            Err(ResumeModelLineageError::HarnessChanged),
+        );
+    }
+
+    #[test]
+    fn legacy_resume_without_lineage_fields_uses_committed_model_resolution() {
+        assert_eq!(
+            validate_resume_model_lineage(
+                &ResumeModelLineage::default(),
+                "gpt-5.3-codex-spark",
+                "grok-build-plan",
+            ),
+            Ok(()),
+        );
+    }
 }

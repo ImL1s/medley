@@ -465,6 +465,11 @@ jobs:
             identity_backed_prompt_recovery_requires_persisted_harness_evidence -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             cold_spawn_reconciled_route_rejects_incompatible_harness -- --nocapture
+          # #300: an inherited Codex child resumes the already-admitted tuple;
+          # route/harness drift still fails closed and fresh explicit overrides
+          # still run the compatibility preflight.
+          run_nonzero -p xai-grok-shell --lib \
+            resume_model_lineage_tests -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             issue39_verbatim_fork_tools_intersect_session_admission -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
