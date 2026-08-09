@@ -649,7 +649,7 @@ impl MvpAgent {
         arguments: acp::LoadSessionRequest,
         op: AttachOperation,
     ) -> Result<acp::LoadSessionResponse, acp::Error> {
-        let _load_guard = self.begin_session_load(&arguments.session_id);
+        let load_guard = self.begin_session_load(&arguments.session_id);
         reject_chat_kind_without_feature(arguments.meta.as_ref())?;
         self.sweep_dead_sessions();
         if !self.is_resident(&arguments.session_id) {
@@ -938,7 +938,8 @@ impl MvpAgent {
         );
         self.heal_orphaned_subagents(&session_id, &unfinished_subagents)
             .await;
-        self.restore_persisted_model(&session_id, &summary).await;
+        self.restore_persisted_model(&session_id, &summary, &load_guard)
+            .await;
         let (model_state, response_meta) = self
             .build_attach_response_meta(&session_id, &summary, persist_data, code_restore_info)
             .await;
@@ -1194,6 +1195,7 @@ impl MvpAgent {
         &self,
         session_id: &acp::SessionId,
         summary: &crate::session::persistence::Summary,
+        load_guard: &SessionLoadGuard<'_>,
     ) {
         let session_id = session_id.clone();
         let persisted_model = summary.current_model_id.clone();
@@ -1319,10 +1321,11 @@ impl MvpAgent {
                 );
                 map
             });
-            let _ = crate::agent::handlers::model_switch::apply(
+            let _ = super::acp_agent::restore_registered_session_model(
                 self,
                 acp::SetSessionModelRequest::new(session_id.to_owned(), model_id)
                     .meta(restore_meta),
+                load_guard,
             )
             .await;
         }

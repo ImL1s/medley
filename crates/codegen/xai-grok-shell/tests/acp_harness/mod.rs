@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::{self as acp, Agent as _};
+use futures::FutureExt as _;
 use serde_json::json;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use xai_acp_lib::{
@@ -56,11 +57,29 @@ pub fn allow_once(args: &acp::RequestPermissionRequest) -> acp::RequestPermissio
 pub async fn connect_and_auth<C>(
     client: C,
     client_type: &str,
+    inference_base_url: &str,
 ) -> (acp::ClientSideConnection, acp::InitializeResponse)
 where
     C: acp::Client + 'static,
 {
-    let agent_config = AgentConfig::default();
+    // The harness constructs `MvpAgent` directly, bypassing production's
+    // config-file loader. Declare the fixture model here so both catalog
+    // discovery and inference remain pinned to the same mock origin.
+    let raw_config: toml::Value = toml::from_str(&format!(
+        r#"[model.test-model]
+model = "test-model"
+base_url = {inference_base_url:?}
+api_backend = "responses"
+env_key = "XAI_API_KEY"
+
+[models]
+default = "test-model"
+session_summary = "test-model"
+"#
+    ))
+    .expect("parse hermetic ACP model config");
+    let agent_config =
+        AgentConfig::new_from_toml_cfg(&raw_config).expect("valid hermetic ACP model config");
     let auth_manager = Arc::new(agent_config.create_auth_manager());
     let (gw_tx, gw_rx) = tokio::sync::mpsc::unbounded_channel();
     let agent = MvpAgent::new(GatewaySender::new(gw_tx), &agent_config, auth_manager, None)
@@ -239,8 +258,20 @@ where
         .build()
         .expect("agent runtime");
     let local = tokio::task::LocalSet::new();
-    agent_rt.block_on(local.run_until(body(
-        workdir.path().to_path_buf(),
-        std::rc::Rc::clone(&server),
-    )));
+    let outcome = agent_rt.block_on(
+        local.run_until(
+            std::panic::AssertUnwindSafe(body(
+                workdir.path().to_path_buf(),
+                std::rc::Rc::clone(&server),
+            ))
+            .catch_unwind(),
+        ),
+    );
+    if let Err(payload) = outcome {
+        eprintln!(
+            "mock inference request log:\n{}",
+            server.request_log_summary()
+        );
+        std::panic::resume_unwind(payload);
+    }
 }
