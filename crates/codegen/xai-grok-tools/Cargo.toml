@@ -16,6 +16,7 @@ fs2 = { workspace = true }
 educe = { workspace = true, features = ["Debug"] }
 async-openai = { workspace = true }
 xai-tty-utils = { workspace = true }
+xai-grok-auth = { workspace = true }
 xai-grok-config = { path = "../xai-grok-config" }
 xai-grok-extra-ca = { workspace = true }
 xai-grok-tools-api = { path = "../xai-grok-tools-api" }
@@ -80,7 +81,6 @@ url = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 wildmatch = { workspace = true }
 xai-grok-env = { workspace = true }
-xai-grok-auth = { path = "../xai-grok-auth" }
 serde_yaml = { workspace = true }
 shellexpand = "3.1"
 tempfile = { workspace = true }

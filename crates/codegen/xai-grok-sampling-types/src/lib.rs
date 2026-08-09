@@ -10,6 +10,7 @@ pub mod conversation;
 pub mod doom_loop;
 pub mod error;
 pub mod messages;
+pub mod provider_error;
 pub mod serde_helpers;
 pub mod tool_overrides;
 pub mod types;
@@ -21,8 +22,8 @@ pub use self::doom_loop::{
 };
 pub use self::error::{
     EmptyReason, EmptyResponseContext, PROVIDER_ERROR_BODY_PREVIEW_MAX, ResponseModelMetadata,
-    Result, SamplingError, SentCredential, is_context_length_error, provider_error_body_preview,
-    status_user_message, user_facing_api_error_message,
+    Result, SamplingError, SentCredential, is_context_length_error, is_retryable_api_status,
+    provider_error_body_preview, status_user_message, user_facing_api_error_message,
 };
 pub use self::tool_overrides::{
     ClearableField, SearchDateBound, SearchDateBoundError, ToolOverrides, ToolOverridesUpdate,

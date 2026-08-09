@@ -405,7 +405,7 @@ pub(crate) fn substituted_preference(
 }
 
 /// Filter hidden and auth-gated entries out of `catalog` and convert to ACP wire format.
-pub fn available_models(
+pub(crate) fn available_models(
     catalog: &IndexMap<String, ModelEntry>,
     is_session_auth: bool,
 ) -> IndexMap<acp::ModelId, acp::ModelInfo> {

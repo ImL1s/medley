@@ -41,6 +41,7 @@ async fn create_test_actor(
         pending_notifications: Vec::new(),
         notifications_suppressed: false,
         rewindable: false,
+        front_message_committed: false,
         nudges_used_this_session: 0,
     });
     let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -84,6 +85,7 @@ async fn create_test_actor(
             gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             persistence_tx,
             persistence_is_noop: false,
+            disk_full: crate::session::notifications::idle_disk_full_rx(),
         },
         permissions: PermissionHandle::allow_all(),
         tool_context,
@@ -238,6 +240,9 @@ async fn create_test_actor(
         last_recap_main_turn: std::cell::Cell::new(0),
         recap_in_flight: std::cell::Cell::new(false),
         recap_epoch: std::cell::Cell::new(0),
+        turn_summary_task: std::cell::RefCell::new(None),
+        turn_summary_generation: std::cell::Cell::new(0),
+        turn_summary_enabled: false,
         session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
         turn_stream_drained: parking_lot::Mutex::new(None),
@@ -485,6 +490,7 @@ async fn create_test_actor_with_memory(
         pending_notifications: Vec::new(),
         notifications_suppressed: false,
         rewindable: false,
+        front_message_committed: false,
         nudges_used_this_session: 0,
     });
     let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -532,6 +538,7 @@ async fn create_test_actor_with_memory(
             gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             persistence_tx,
             persistence_is_noop: false,
+            disk_full: crate::session::notifications::idle_disk_full_rx(),
         },
         permissions: PermissionHandle::allow_all(),
         tool_context,
@@ -696,6 +703,9 @@ async fn create_test_actor_with_memory(
         last_recap_main_turn: std::cell::Cell::new(0),
         recap_in_flight: std::cell::Cell::new(false),
         recap_epoch: std::cell::Cell::new(0),
+        turn_summary_task: std::cell::RefCell::new(None),
+        turn_summary_generation: std::cell::Cell::new(0),
+        turn_summary_enabled: false,
         session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
         turn_stream_drained: parking_lot::Mutex::new(None),
@@ -1200,11 +1210,6 @@ async fn test_compact_on_error_no_trigger_when_tokens_within_new_window() {
             assert!(!actor.should_compact_on_error(&err).await);
         })
         .await;
-}
-/// Verify `maybe_refresh_model_metadata_on_resume` is a no-op when idle < 10 min.
-#[tokio::test(flavor = "current_thread")]
-async fn test_idle_resume_noop_when_not_idle_enough() {
-    let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             let (gateway_tx, _) = mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();

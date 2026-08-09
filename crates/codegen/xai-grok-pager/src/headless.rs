@@ -678,8 +678,8 @@ async fn open_session(
                 .meta({
                     let mut m = acp::Meta::new();
                     m.insert("noReplay".into(), serde_json::Value::Bool(true));
-                    if let Some(true) = restore_code {
-                        m.insert("x.ai/restore_code".into(), serde_json::Value::Bool(true));
+                    if let Some(rc) = restore_code {
+                        m.insert("x.ai/restore_code".into(), serde_json::Value::Bool(rc));
                     }
                     Some(m)
                 }),
@@ -877,12 +877,14 @@ async fn apply_headless_model_and_effort(
 }
 
 /// Startup-materialization context for headless (`-p`) runs; never chat mode.
+/// `--worktree` is ignored here: headless never creates a worktree, so remote
+/// miss must not take `DeferToWorktree`.
 fn headless_materialize_ctx(
-    has_worktree: bool,
     resume_title_pinned: bool,
+    restore_code: bool,
 ) -> crate::app::session_startup::MaterializeCtx {
     crate::app::session_startup::MaterializeCtx {
-        has_worktree,
+        has_worktree: false,
         allow_remote_restore:
             crate::app::session_startup::MaterializeCtx::default_allow_remote_restore(),
         chat_mode: false,
@@ -891,6 +893,8 @@ fn headless_materialize_ctx(
         } else {
             crate::app::session_startup::TitleResolution::Allowed
         },
+        restore_code,
+        restore_progress_on_stdout: false,
     }
 }
 
@@ -985,9 +989,20 @@ pub async fn run_single_turn(
 
     let cancel = CancellationToken::new();
     let memory_config = agent_config.memory_config.clone();
+    let timer = xai_grok_telemetry::startup::begin(crate::acp::Owner::Client);
+    let report_startup_failure = |timer: &crate::acp::StartupTimer| {
+        timer.emit_telemetry(
+            crate::acp::AgentKind::Embedded,
+            crate::acp::StartupOutcome::Error,
+            None,
+            false,
+        );
+        xai_grok_telemetry::startup::report_total(crate::acp::StartupOutcome::Error);
+    };
     let spawned = match spawn_grok_shell(agent_config, &cancel, memory_config).await {
         Ok(s) => s,
         Err(e) => {
+            report_startup_failure(&timer);
             let msg = format!("Couldn't start session: {e}");
             emitter.on_error(&msg, None);
             anyhow::bail!("{msg}");
@@ -1007,9 +1022,11 @@ pub async fn run_single_turn(
         options.rules.as_deref(),
         options.system_prompt_override.as_deref(),
     );
+    xai_grok_telemetry::startup::enter(crate::acp::StartupPhase::AcpInitialize);
     let init_resp: acp::InitializeResponse = match acp_send(init_req, &acp_tx).await {
         Ok(r) => r,
         Err(e) => {
+            report_startup_failure(&timer);
             let msg = format!("Couldn't initialize: {e}");
             emitter.on_error(&msg, None);
             anyhow::bail!("{msg}");
@@ -1021,6 +1038,7 @@ pub async fn run_single_turn(
     );
 
     let t_auth = Instant::now();
+    xai_grok_telemetry::startup::enter(crate::acp::StartupPhase::EagerAuth);
     let default_auth_method_id = crate::acp::parse_default_auth_method_id(init_resp.meta.as_ref());
     let is_api_key_auth = match authenticate(
         &acp_tx,
@@ -1034,6 +1052,7 @@ pub async fn run_single_turn(
     {
         Ok(is_api_key) => is_api_key,
         Err(e) => {
+            report_startup_failure(&timer);
             emitter.on_error(&e.to_string(), None);
             return Err(e);
         }
@@ -1041,6 +1060,13 @@ pub async fn run_single_turn(
     tracing::debug!(
         elapsed_ms = t_auth.elapsed().as_millis() as u64,
         "headless: authenticate complete"
+    );
+    // Connect ends here; session phases stay out of the phase histogram.
+    timer.emit_telemetry(
+        crate::acp::AgentKind::Embedded,
+        crate::acp::StartupOutcome::Ok,
+        None,
+        false,
     );
 
     use crate::app::session_startup::{self, MaterializedStartup, SessionStartupFlags};
@@ -1052,20 +1078,35 @@ pub async fn run_single_turn(
         resume_most_recent,
         continue_last_session: options.continue_last_session,
         fork_session: options.fork_session,
-        has_worktree: options.worktree.is_some(),
+        // Headless never creates a worktree from `-w`.
+        has_worktree: false,
     })
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let cwd_str = cwd.to_string_lossy().to_string();
     let materialized = session_startup::materialize_startup_for_cwd(
-        headless_materialize_ctx(options.worktree.is_some(), options.resume_title_pinned),
+        headless_materialize_ctx(options.resume_title_pinned, options.restore_code),
         intent,
         &cwd_str,
     )
-    .await?;
+    .await
+    .inspect_err(|_| {
+        xai_grok_telemetry::startup::report_total(crate::acp::StartupOutcome::Error)
+    })?;
 
-    let restore_code = options.restore_code.then_some(true);
+    let restore_code = match &materialized {
+        MaterializedStartup::Resume {
+            suppress_code_restore: true,
+            ..
+        }
+        | MaterializedStartup::Fork {
+            suppress_code_restore: true,
+            ..
+        } => Some(false),
+        _ => options.restore_code.then_some(true),
+    };
     let t_session = Instant::now();
+    xai_grok_telemetry::startup::enter(crate::acp::StartupPhase::SessionCreate);
     let opened = match materialized {
         MaterializedStartup::NewAuto => open_session(&acp_tx, &cwd, None, None).await,
         MaterializedStartup::NewWithId { session_id } => {
@@ -1104,6 +1145,7 @@ pub async fn run_single_turn(
     } = match opened {
         Ok(v) => v,
         Err(e) => {
+            xai_grok_telemetry::startup::report_total(crate::acp::StartupOutcome::Error);
             let msg = format!("Couldn't create session: {e}");
             emitter.on_error(&msg, None);
             anyhow::bail!("{msg}");
@@ -1116,6 +1158,7 @@ pub async fn run_single_turn(
     if let Some(notice) = &web_search_disabled {
         eprintln!("{notice}");
     }
+    xai_grok_telemetry::startup::report_total(crate::acp::StartupOutcome::Ok);
     tracing::debug!(
         elapsed_ms = t_session.elapsed().as_millis() as u64,
         session_id = %session_id.0,

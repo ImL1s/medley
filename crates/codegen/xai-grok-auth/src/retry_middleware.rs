@@ -526,7 +526,6 @@ mod tests {
         ));
         assert!(req.headers().get(reqwest::header::AUTHORIZATION).is_none());
     }
-
     #[tokio::test]
     async fn test_max_retries_bounds_attempts() {
         let mut server = mockito::Server::new_async().await;

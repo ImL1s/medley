@@ -1794,7 +1794,7 @@ async fn cancel_pending_shell_child_presents_one_cancelled_finish() {
         .await;
     assert!(matches!(
             child_cmd_rx.try_recv(),
-            Ok(SessionCommand::Shutdown)
+            Ok(SessionCommand::Shutdown(_))
         ));
     assert!(result.cancelled);
     assert!(!result.success);
@@ -1862,7 +1862,7 @@ async fn run_promote_cancel_with_worktree(
         .await;
     assert!(matches!(
             child_cmd_rx.try_recv(),
-            Ok(SessionCommand::Shutdown)
+            Ok(SessionCommand::Shutdown(_))
         ));
     assert!(result.cancelled);
 }
@@ -1884,13 +1884,7 @@ impl ChildRunner for Issue39ShellChildRunner {
             .expect("runner context should be consumed once");
         let gateway = self.gateway.clone();
         Box::pin(async move {
-            let ChildRunRequest {
-                request,
-                cancellation,
-                reporter,
-                ..
-            } = run;
-            super::run_shell_child(request, ctx, cancellation, reporter, &gateway).await
+            super::run_shell_child(run, ctx, &gateway).await
         })
     }
     fn validate_type(
