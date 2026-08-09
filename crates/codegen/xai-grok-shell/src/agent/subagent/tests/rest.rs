@@ -2449,7 +2449,7 @@ async fn read_parent_sampling_config_missing_committed_id_ignores_same_route_sur
     let mut models = indexmap::IndexMap::new();
     models.insert("surviving-entry".to_string(), survivor);
     let mut ctx = ctx_with_parent_chat_state(
-        "removed-entry",
+        "startup-entry",
         "shared-routing-model",
         "surviving-entry",
         models,
@@ -2457,6 +2457,7 @@ async fn read_parent_sampling_config_missing_committed_id_ignores_same_route_sur
     ctx.sampling_config.model = "shared-routing-model".to_string();
     ctx.sampling_config.auth_scheme = AuthScheme::Bearer;
     ctx.sampling_config.codex_wire = Some(committed_caps.clone());
+    ctx.sampling_config.supports_backend_search = true;
     let chat = ctx.parent_chat_state.as_ref().expect("chat state");
     let mut snapshot = chat.snapshot().await.expect("chat snapshot");
     snapshot.catalog_model_id = Some("removed-entry".to_string());
@@ -2466,7 +2467,8 @@ async fn read_parent_sampling_config_missing_committed_id_ignores_same_route_sur
 
     assert_eq!(model_id.0.as_ref(), "shared-routing-model");
     assert_eq!(config.auth_scheme, AuthScheme::Bearer);
-    assert_eq!(config.codex_wire, Some(committed_caps));
+    assert!(!config.supports_backend_search);
+    assert_eq!(config.codex_wire, None);
 }
 
 /// A refreshed catalog can replace a retained catalog id (`auto`) with the

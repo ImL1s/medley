@@ -847,7 +847,10 @@ async fn read_parent_sampling_config(
                 .as_ref()
                 .map(|facts| facts.model_id.clone())
                 .unwrap_or_else(|| acp::ModelId::new(cfg.model.clone()));
-            let baseline_matches_live = ctx.sampling_config.model == cfg.model;
+            let baseline_matches_live = ctx.sampling_config.model == cfg.model
+                && committed_model_id.as_deref().is_none_or(|committed_id| {
+                    committed_id == ctx.sampling_config_model_id.0.as_ref()
+                });
             let creds = chat_state.get_credentials().await;
             let mut extra_headers = cfg.extra_headers;
             crate::agent::config::inject_url_derived_headers(
