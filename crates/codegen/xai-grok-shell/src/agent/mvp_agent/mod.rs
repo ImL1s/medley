@@ -1222,6 +1222,7 @@ impl ColdSpawnModelSelection {
         registry: &SessionRegistry,
         session_id: &acp::SessionId,
         catalog_identity: Option<xai_chat_state::CatalogIdentity>,
+        agent_name: Option<String>,
     ) {
         registry.take_unavailable_model(session_id);
         if let Some(model_id) = self.unavailable_model.as_ref() {
@@ -1229,6 +1230,7 @@ impl ColdSpawnModelSelection {
                 session_id,
                 model_id.clone(),
                 catalog_identity,
+                agent_name,
             );
         }
     }
@@ -1277,6 +1279,18 @@ pub(crate) fn reconcile_latched_catalog_snapshot(
                         .map(|model| (model_id, reconciled, model))
                 })
         },
+    )
+}
+
+pub(crate) fn recovered_model_harness_is_compatible(
+    active_definition: &xai_grok_agent::AgentDefinition,
+    model: &ModelEntry,
+    required_definition: Option<&xai_grok_agent::AgentDefinition>,
+) -> bool {
+    harnesses_are_compatible(
+        active_definition,
+        model.info().agent_type.as_str(),
+        required_definition,
     )
 }
 

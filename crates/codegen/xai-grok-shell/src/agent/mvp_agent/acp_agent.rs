@@ -2257,6 +2257,7 @@ impl acp::Agent for MvpAgent {
                         &session_id,
                         summary.current_model_id.clone(),
                         summary.catalog_identity.clone(),
+                        summary.agent_name.clone(),
                     );
             }
             drop(spawn_timer);
@@ -2392,6 +2393,7 @@ impl acp::Agent for MvpAgent {
                 &self.session_registry,
                 &session_id,
                 summary.catalog_identity.clone(),
+                summary.agent_name.clone(),
             );
             if preflight.unavailable_model.is_some() {
                 let reason = if let Some(matches) = ambiguous_persisted_slug_matches.as_ref() {
@@ -2493,6 +2495,7 @@ impl acp::Agent for MvpAgent {
                             &session_id,
                             persisted_model.clone(),
                             summary.catalog_identity.clone(),
+                            summary.agent_name.clone(),
                         );
                     fallback
                 }
@@ -2574,6 +2577,7 @@ impl acp::Agent for MvpAgent {
                                 &session_id,
                                 persisted_model.clone(),
                                 summary.catalog_identity.clone(),
+                                summary.agent_name.clone(),
                             );
                         fallback
                     }
@@ -2649,6 +2653,7 @@ impl acp::Agent for MvpAgent {
                                 summary.catalog_identity.clone().filter(|identity| {
                                     identity.model_id == model_id.0.as_ref()
                                 }),
+                                summary.agent_name.clone(),
                             );
                         model_id
                     }
@@ -2715,6 +2720,7 @@ impl acp::Agent for MvpAgent {
                         summary.catalog_identity.clone().filter(|identity| {
                             identity.model_id == model_id.0.as_ref()
                         }),
+                        summary.agent_name.clone(),
                     );
             }
         }
@@ -2908,14 +2914,51 @@ impl acp::Agent for MvpAgent {
             .session_registry
             .unavailable_model(&arguments.session_id);
         if let Some(unavailable_model) = latched_model {
-            let models = self.models_manager.models();
-            let available = self.models_manager.available();
+            let (models, available) = self.models_manager.models_and_available();
             let latched_identity = self
                 .session_registry
                 .unavailable_catalog_identity(&arguments.session_id);
-            let reconciled_snapshot = latched_identity.as_ref().and_then(|identity| {
+            let mut reconciled_snapshot = latched_identity.as_ref().and_then(|identity| {
                 reconcile_latched_catalog_snapshot(&models, &available, identity)
             });
+            if let (Some(persisted_agent_name), Some((_, _, model))) = (
+                self.session_registry
+                    .unavailable_agent_name(&arguments.session_id),
+                reconciled_snapshot.as_ref(),
+            ) {
+                let plugin_registry = self.plugin_registry_handle.snapshot();
+                let active_definition = {
+                    let cfg = self.cfg.borrow();
+                    Self::resolve_agent_definition_with_plugins(
+                        std::path::Path::new(&handle.info.cwd),
+                        cfg.agent_profile_path.as_deref(),
+                        &cfg.agent,
+                        None,
+                        Some(&persisted_agent_name),
+                        plugin_registry.as_deref(),
+                    )
+                };
+                let required_agent_type = model.info().agent_type.as_str();
+                let required_definition =
+                    xai_grok_agent::discovery::by_name_in_cwd_with_plugins(
+                        required_agent_type,
+                        std::path::Path::new(&handle.info.cwd),
+                        plugin_registry.as_deref(),
+                    );
+                if !recovered_model_harness_is_compatible(
+                    &active_definition,
+                    model,
+                    required_definition.as_ref(),
+                ) {
+                    tracing::warn!(
+                        session_id = %arguments.session_id.0,
+                        persisted_agent_name,
+                        required_agent_type,
+                        "prompt: recovered model requires an incompatible persisted harness; keeping block"
+                    );
+                    reconciled_snapshot = None;
+                }
+            }
             let resolution = if latched_identity.is_some() {
                 reconciled_snapshot
                     .as_ref()

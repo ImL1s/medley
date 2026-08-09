@@ -1386,6 +1386,23 @@ fn empty_catalog_keeps_persisted_identity_pending_instead_of_rejecting_load() {
 }
 
 #[test]
+fn prompt_recovery_rejects_a_remapped_model_with_an_incompatible_harness() {
+    run_local_for_bridge_test(|| async {
+        let agent = build_agent_with_model_for_tests("replacement", "replacement-route");
+        let mut model = agent.models_manager.models()["replacement"].clone();
+        model.info.agent_type = "codex".to_owned();
+        let active = xai_grok_agent::AgentDefinition::default_grok_build();
+        let required = xai_grok_agent::AgentDefinition::codex();
+
+        assert!(!recovered_model_harness_is_compatible(
+            &active,
+            &model,
+            Some(&required),
+        ));
+    });
+}
+
+#[test]
 fn cold_spawn_current_only_fallback_keeps_persisted_model_latched() {
     let persisted = acp::ModelId::new("persisted-unready");
     let current = acp::ModelId::new("current-compatible-but-not-selectable");
@@ -1409,7 +1426,7 @@ fn cold_spawn_usable_fallback_clears_stale_unavailable_latch() {
         Some(acp::ModelId::new("ready-compatible")),
         None,
     );
-    selection.replace_unavailable_latch(&registry, &session_id, None);
+    selection.replace_unavailable_latch(&registry, &session_id, None, None);
 
     assert_eq!(registry.unavailable_model(&session_id), None);
 }
@@ -3657,6 +3674,7 @@ fn attach_restore_blocks_exact_key_reuse_and_unique_route_ambiguity() {
                 lineage,
                 auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
             });
+            summary.agent_name = Some("grok-build".to_owned());
             let guard = agent.begin_session_load(&sid);
             agent.restore_persisted_model(&sid, &summary, &guard).await;
             assert_eq!(
@@ -3668,6 +3686,11 @@ fn attach_restore_blocks_exact_key_reuse_and_unique_route_ambiguity() {
                 agent.session_registry.unavailable_catalog_identity(&sid),
                 summary.catalog_identity,
                 "{label} must retain identity for fail-closed prompt recovery"
+            );
+            assert_eq!(
+                agent.session_registry.unavailable_agent_name(&sid),
+                summary.agent_name,
+                "{label} must retain the persisted harness for prompt recovery"
             );
             assert!(
                 reconcile_latched_catalog_snapshot(

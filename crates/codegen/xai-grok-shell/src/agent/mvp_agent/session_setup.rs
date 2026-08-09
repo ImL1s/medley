@@ -1241,6 +1241,7 @@ impl MvpAgent {
                     &session_id,
                     persisted_model,
                     summary.catalog_identity.clone(),
+                    summary.agent_name.clone(),
                 );
             return;
         }
@@ -1326,6 +1327,7 @@ impl MvpAgent {
                         &session_id,
                         persisted_model,
                         summary.catalog_identity.clone(),
+                        summary.agent_name.clone(),
                     );
                 return;
             };
@@ -1358,6 +1360,7 @@ impl MvpAgent {
                     &session_id,
                     persisted_model.clone(),
                     summary.catalog_identity.clone(),
+                    summary.agent_name.clone(),
                 );
             fallback
         };

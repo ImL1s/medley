@@ -550,6 +550,26 @@ impl ModelsManager {
         self.inner.catalog.read().models.clone()
     }
 
+    /// Return the complete catalog and its ACP-selectable projection from one
+    /// catalog generation. Callers that authorize a persisted model must not
+    /// combine independently captured `models()` and `available()` snapshots.
+    pub(crate) fn models_and_available(
+        &self,
+    ) -> (
+        IndexMap<String, ModelEntry>,
+        IndexMap<acp::ModelId, acp::ModelInfo>,
+    ) {
+        let is_session_auth = self.is_session_auth();
+        let models = self.inner.catalog.read().models.clone();
+        let selectable = models
+            .iter()
+            .filter(|(_, entry)| entry.info.user_selectable)
+            .map(|(key, entry)| (key.clone(), entry.clone()))
+            .collect();
+        let available = available_models(&selectable, is_session_auth);
+        (models, available)
+    }
+
     pub fn endpoints(&self) -> config::EndpointsConfig {
         self.inner.cfg.read().endpoints.clone()
     }
@@ -586,18 +606,7 @@ impl ModelsManager {
 
     /// ACP-visible (non-hidden) projection of the catalog.
     pub fn available(&self) -> IndexMap<acp::ModelId, acp::ModelInfo> {
-        let snapshot = {
-            let cat = self.inner.catalog.read();
-            let models = &cat.models;
-            models.clone()
-        };
-
-        let selectable: IndexMap<_, _> = snapshot
-            .into_iter()
-            .filter(|(_, e)| e.info.user_selectable)
-            .collect();
-
-        available_models(&selectable, self.is_session_auth())
+        self.models_and_available().1
     }
 
     pub(crate) fn task_model_error(&self, requested: &str) -> Option<String> {
