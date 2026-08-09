@@ -15643,6 +15643,7 @@ agent_type = "cursor"
             std::env::remove_var("GROK_RESPECT_GITIGNORE");
             std::env::remove_var("GROK_WEB_SEARCH_MODEL");
             std::env::remove_var("GROK_SESSION_SUMMARY_MODEL");
+            std::env::remove_var("GROK_IMAGE_DESCRIPTION_MODEL");
             std::env::remove_var("GROK_CURSOR_SKILLS_ENABLED");
             std::env::remove_var("GROK_CURSOR_RULES_ENABLED");
             std::env::remove_var("GROK_CURSOR_AGENTS_ENABLED");
@@ -16305,11 +16306,9 @@ image_description = "config-image"
     #[serial]
     fn env_auxiliary_pins_survive_default_rebind() {
         clear_runtime_env_vars();
-        unsafe {
-            std::env::set_var("GROK_WEB_SEARCH_MODEL", "env-search");
-            std::env::set_var("GROK_SESSION_SUMMARY_MODEL", "env-summary");
-            std::env::set_var("GROK_IMAGE_DESCRIPTION_MODEL", "env-image");
-        }
+        let _web_search = EnvGuard::set("GROK_WEB_SEARCH_MODEL", "env-search");
+        let _session_summary = EnvGuard::set("GROK_SESSION_SUMMARY_MODEL", "env-summary");
+        let _image_description = EnvGuard::set("GROK_IMAGE_DESCRIPTION_MODEL", "env-image");
         let raw: toml::Value = toml::from_str(
             r#"
 [models]
@@ -16340,7 +16339,6 @@ image_description = "config-image"
         assert_eq!(cfg.web_search_model, "env-search");
         assert_eq!(cfg.session_summary_model.as_deref(), Some("env-summary"));
         assert_eq!(cfg.image_description_model.as_deref(), Some("env-image"));
-        clear_runtime_env_vars();
     }
 
     #[test]
