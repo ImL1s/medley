@@ -61,10 +61,12 @@ impl coordinator::ChildRunner for ShellChildRunner {
             // Discarded on purpose: a subagent inherits the parent's tools and
             // has no scrollback of its own, so a disable notice here would be
             // addressed to nobody. The parent already told the user.
-            let mut ignored_disable_reason = None;
-            ctx.web_search_sampling_config = this
-                .prepare_web_search_sampling_config_preflight(&mut ignored_disable_reason, None)
-                .await;
+            if !ctx.web_search_follows_default {
+                let mut ignored_disable_reason = None;
+                ctx.web_search_sampling_config = this
+                    .prepare_web_search_sampling_config_preflight(&mut ignored_disable_reason, None)
+                    .await;
+            }
             let refreshed = match this
                 .refresh_subagent_capabilities_for_spawn(&mut ctx, &handle)
                 .await
@@ -528,6 +530,7 @@ impl MvpAgent {
             session_env,
             memory_config: self.memory_config.clone(),
             web_search_sampling_config: self.prepare_web_search_sampling_config(),
+            web_search_follows_default: self.cfg.borrow().web_search_follows_default,
             web_fetch_config: self.prepare_web_fetch_config(),
             image_gen_config: self.prepare_image_gen_config(),
             video_gen_config: self.prepare_video_gen_config(),

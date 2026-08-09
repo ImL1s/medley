@@ -1,7 +1,8 @@
 #![cfg_attr(rustfmt, rustfmt::skip)]
 use super::*;
 use super::handle_request::{
-    canonical_total_tokens, record_subagent_usage, usage_is_incomplete,
+    canonical_total_tokens, inherited_web_search_model_id, record_subagent_usage,
+    usage_is_incomplete,
 };
 use crate::test_support::lsp_runtime::{
     DummyLspDispatch, ctx_with_toggle, test_gateway, test_gateway_with_receiver,
@@ -12,6 +13,17 @@ use xai_grok_tools::implementations::grok_build::task::coordinator::{
     ChildCompletion, ChildRunOutput, ChildRunRequest, ChildRunner, CompletionDisposition,
     CoordinatorConfig, LocalBoxFuture, SubagentCoordinator,
 };
+#[test]
+fn model_overrides_inherited_subagent_web_search_uses_child_operative_model() {
+    assert_eq!(
+        inherited_web_search_model_id(true, "child-operative-model"),
+        Some("child-operative-model")
+    );
+    assert_eq!(
+        inherited_web_search_model_id(false, "child-operative-model"),
+        None
+    );
+}
 #[test]
 fn canonical_total_tokens_does_not_double_count_reasoning() {
     let totals = xai_chat_state::UsageTotals {
