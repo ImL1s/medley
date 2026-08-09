@@ -186,6 +186,14 @@ impl ToolBridge {
         self.registry.unregister_tool_by_name(name)
     }
 
+    pub fn set_web_search_enabled(&self, enabled: bool) -> bool {
+        self.registry.set_web_search_enabled(enabled)
+    }
+
+    pub fn can_set_web_search_enabled(&self, enabled: bool) -> bool {
+        self.registry.can_set_web_search_enabled(enabled)
+    }
+
     pub fn reconcile_managed_gateway_identities(
         &self,
         bindings: &[(String, String)],

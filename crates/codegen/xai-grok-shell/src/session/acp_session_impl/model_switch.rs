@@ -120,6 +120,19 @@ impl SessionActor {
         } else {
             None
         };
+        let web_search_client = match web_search_client {
+            Some(Some(client)) if self.agent.borrow().can_set_web_search_enabled(true) => {
+                Some(Some(client))
+            }
+            Some(Some(_)) => {
+                tracing::debug!(
+                    session_id = %self.session_info.id.0,
+                    "model switch left web search disabled because the active agent policy has no eligible built-in topology"
+                );
+                None
+            }
+            other => other,
+        };
         let resolved_model_slug = resolved_model.info().model.clone();
         if resolved_model_slug != sampling_config.model {
             tracing::warn!(
@@ -339,6 +352,7 @@ impl SessionActor {
                 .replace(image_description_model);
         }
         if let Some(web_search_client) = web_search_client {
+            let web_search_enabled = web_search_client.is_some();
             let bridge = self.agent.borrow().tool_bridge().clone();
             let resources = bridge.shared_resources().await;
             let mut resources = resources.lock().await;
@@ -349,6 +363,12 @@ impl SessionActor {
                     .remove::<xai_grok_tools::implementations::web_search::client::WebSearchClient>(
                     );
             }
+            drop(resources);
+            let topology_updated = self
+                .agent
+                .borrow_mut()
+                .set_web_search_enabled(web_search_enabled);
+            debug_assert!(topology_updated, "web-search topology was preflighted");
         }
         if let Some(rebuild) = installed_rebuild {
             self.commit_rebuilt_harness_side_effects().await;
@@ -1439,6 +1459,21 @@ mod model_switch_transaction_tests {
                 });
                 let (actor, _event_rx) =
                     create_test_actor_ex(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                let dynamic_agent = xai_grok_agent::AgentBuilder::new(
+                    std::env::temp_dir(),
+                    std::sync::Arc::new(
+                        xai_grok_tools::computer::local::LocalTerminalBackend::new(),
+                    ),
+                    xai_grok_tools::notification::ToolNotificationHandle::noop(),
+                )
+                .from_definition(xai_grok_agent::AgentDefinition::default_grok_build())
+                .with_web_search_config(xai_grok_tools::implementations::WebSearchConfig::Disabled)
+                .with_backend_search(true)
+                .build()
+                .await
+                .expect("dynamic web-search test agent");
+                *actor.agent.borrow_mut() = dynamic_agent;
+                actor.supports_backend_search.set(true);
                 *actor.active_agent_type.lock() = Some("grok-build".to_owned());
                 assert!(
                     actor
@@ -1451,6 +1486,19 @@ mod model_switch_transaction_tests {
                         .await
                         .is_none()
                 );
+                assert!(
+                    actor
+                        .agent
+                        .borrow()
+                        .tool_definitions()
+                        .await
+                        .iter()
+                        .all(|definition| definition.function.name != "web_search")
+                );
+                assert!(actor.hosted_tools_for_turn().iter().all(|tool| !matches!(
+                    tool,
+                    xai_grok_sampling_types::HostedTool::WebSearch { .. }
+                )));
                 let mut prepared = prepared_switch("grok-build", None);
                 prepared.summary_sampling_config = Some(prepared.sampling_config.clone());
                 prepared.replace_inherited_web_search = true;
@@ -1477,6 +1525,53 @@ mod model_switch_transaction_tests {
                         .await
                         .is_some()
                 );
+                assert!(
+                    actor
+                        .agent
+                        .borrow()
+                        .tool_definitions()
+                        .await
+                        .iter()
+                        .any(|definition| definition.function.name == "web_search")
+                );
+                assert!(actor.hosted_tools_for_turn().iter().any(|tool| matches!(
+                    tool,
+                    xai_grok_sampling_types::HostedTool::WebSearch { .. }
+                )));
+
+                let mut prepared = prepared_switch("grok-build", None);
+                prepared.summary_sampling_config = Some(prepared.sampling_config.clone());
+                prepared.replace_inherited_web_search = true;
+                prepared.web_search_sampling_config = None;
+                actor
+                    .handle_apply_model_switch(prepared)
+                    .await
+                    .expect("unavailable inherited web search must commit as disabled");
+                assert!(
+                    bridge
+                        .read_resource::<
+                            xai_grok_tools::implementations::web_search::client::WebSearchClient,
+                        >()
+                        .await
+                        .is_none()
+                );
+                assert!(
+                    actor
+                        .agent
+                        .borrow()
+                        .tool_definitions()
+                        .await
+                        .iter()
+                        .all(|definition| definition.function.name != "web_search")
+                );
+                assert!(actor.hosted_tools_for_turn().iter().all(|tool| !matches!(
+                    tool,
+                    xai_grok_sampling_types::HostedTool::WebSearch { .. }
+                )));
+                assert!(actor.hosted_tools_for_turn().iter().any(|tool| matches!(
+                    tool,
+                    xai_grok_sampling_types::HostedTool::XSearch { .. }
+                )));
             })
             .await;
     }

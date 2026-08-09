@@ -451,6 +451,10 @@ struct FinalizedTool {
 /// The read guard is held only for microsecond lookups — never across `.await`.
 pub struct FinalizedToolset {
     tools: parking_lot::RwLock<Vec<FinalizedTool>>,
+    /// Built-ins that are permitted for this session but temporarily hidden.
+    /// Web search uses this to follow live credential/model availability
+    /// without reclassifying the tool as an external MCP identity.
+    inactive_tools: parking_lot::Mutex<HashMap<String, FinalizedTool>>,
     reminders: Vec<Box<dyn Reminder + Send + Sync>>,
     pub resources: SharedResources,
     resources_persistence: Arc<ResourcesPersistence>,
@@ -666,6 +670,7 @@ pub struct ToolRegistryBuilder {
     /// `FinalizeToolServerConfigRequest.system_reminders_enabled`.
     system_reminders_enabled: bool,
     capability_policy: CapabilityPolicy,
+    dynamic_web_search: bool,
 }
 impl Default for ToolRegistryBuilder {
     fn default() -> Self {
@@ -807,6 +812,7 @@ impl ToolRegistryBuilder {
             shared_local_registry: None,
             system_reminders_enabled: true,
             capability_policy: CapabilityPolicy::unrestricted(),
+            dynamic_web_search: false,
         };
         b.register_with_params::<grok_build::BashTool, grok_build::bash::BashParams>();
         b.register_with_params::<grok_build::ReadFileTool, grok_build::read_file::ReadFileParams>();
@@ -899,6 +905,12 @@ impl ToolRegistryBuilder {
     }
     pub fn with_capability_policy(mut self, policy: CapabilityPolicy) -> Self {
         self.capability_policy = policy;
+        self
+    }
+    /// Finalize a permitted but currently unavailable web-search built-in into
+    /// the inactive set so a resident session can enable it later.
+    pub fn with_dynamic_web_search(mut self, enabled: bool) -> Self {
+        self.dynamic_web_search = enabled;
         self
     }
     /// Dump tools manifest as JSON for the client.
@@ -1097,6 +1109,8 @@ impl ToolRegistryBuilder {
         truncation_config: crate::types::context::TruncationConfig,
         workspace_viewer_ctx: Option<xai_tool_runtime::WorkspaceViewerContext>,
     ) -> Result<FinalizedToolset, Vec<RequirementError>> {
+        const WEB_SEARCH_ID: &str = "GrokBuild:web_search";
+        let web_search_initially_inactive = self.dynamic_web_search;
         // Serialized `kind` is untrusted input. Always replace it from the
         // registry's static taxonomy before applying the fail-closed policy;
         // unknown dynamic IDs remain unclassified.
@@ -1112,13 +1126,21 @@ impl ToolRegistryBuilder {
             return Err(errors);
         }
         let mut kind_to_name: HashMap<ToolKind, String> = HashMap::new();
-        for tool_config in &config.tools {
+        for tool_config in config
+            .tools
+            .iter()
+            .filter(|tool| !web_search_initially_inactive || tool.id != WEB_SEARCH_ID)
+        {
             let entry = &self.tools[&tool_config.id];
             let client_name = tool_config.resolve_client_name(&entry.id);
             kind_to_name.entry(entry.kind).or_insert(client_name);
         }
         let mut kind_params: HashMap<ToolKind, HashMap<String, String>> = HashMap::new();
-        for tool_config in &config.tools {
+        for tool_config in config
+            .tools
+            .iter()
+            .filter(|tool| !web_search_initially_inactive || tool.id != WEB_SEARCH_ID)
+        {
             let entry = &self.tools[&tool_config.id];
             let map = kind_params.entry(entry.kind).or_default();
             if let Some(props) = entry
@@ -1397,17 +1419,28 @@ impl ToolRegistryBuilder {
             };
             tokio::spawn(actor.run());
         }
+        let mut inactive_tools = HashMap::new();
+        if web_search_initially_inactive
+            && let Some(index) = tools
+                .iter()
+                .position(|tool| tool.canonical_id == WEB_SEARCH_ID)
+        {
+            let tool = tools.remove(index);
+            inactive_tools.insert(tool.canonical_id.clone(), tool);
+        }
         let external_tool_identities = ManagedGatewayIdentityAuthorizer::default();
         {
             let mut owners = external_tool_identities.owners.write();
             owners.extend(
                 tools
                     .iter()
+                    .chain(inactive_tools.values())
                     .map(|tool| (tool.client_name.clone(), ExternalToolIdentityOwner::Local)),
             );
         }
         Ok(FinalizedToolset {
             tools: parking_lot::RwLock::new(tools),
+            inactive_tools: parking_lot::Mutex::new(inactive_tools),
             reminders: active_reminders,
             resources: shared_resources,
             resources_persistence: persistence,
@@ -1476,6 +1509,7 @@ impl FinalizedToolset {
     pub fn empty_for_test_with_capability_policy(policy: CapabilityPolicy) -> Self {
         Self {
             tools: parking_lot::RwLock::new(vec![]),
+            inactive_tools: parking_lot::Mutex::new(HashMap::new()),
             reminders: vec![],
             resources: Arc::new(tokio::sync::Mutex::new(
                 crate::types::resources::Resources::default(),
@@ -2283,6 +2317,47 @@ impl FinalizedToolset {
             identity_owners.remove(name);
         }
         removed
+    }
+    /// Toggle the built-in `web_search` definition without changing its
+    /// capability identity or dropping the shared in-process handle.
+    ///
+    /// The tool is finalized once at session creation and moved between the
+    /// active and inactive collections as live model/credential availability
+    /// changes. A capability-filtered or explicitly disallowed tool is never
+    /// present in either collection and therefore cannot be enabled here.
+    pub fn set_web_search_enabled(&self, enabled: bool) -> bool {
+        const ID: &str = "GrokBuild:web_search";
+        let mut tools = self.tools.write();
+        let mut inactive = self.inactive_tools.lock();
+        if enabled {
+            if tools.iter().any(|tool| tool.canonical_id == ID) {
+                return true;
+            }
+            let Some(tool) = inactive.remove(ID) else {
+                return false;
+            };
+            tools.push(tool);
+            true
+        } else {
+            let Some(index) = tools.iter().position(|tool| tool.canonical_id == ID) else {
+                return inactive.contains_key(ID);
+            };
+            let tool = tools.remove(index);
+            inactive.insert(ID.to_owned(), tool);
+            true
+        }
+    }
+    pub fn can_set_web_search_enabled(&self, enabled: bool) -> bool {
+        !enabled
+            || self
+                .tools
+                .read()
+                .iter()
+                .any(|tool| tool.canonical_id == "GrokBuild:web_search")
+            || self
+                .inactive_tools
+                .lock()
+                .contains_key("GrokBuild:web_search")
     }
     /// Flush any pending persistence writes. Call on graceful shutdown.
     pub async fn flush_persistence(&self) {
