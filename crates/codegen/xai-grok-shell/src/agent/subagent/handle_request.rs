@@ -521,13 +521,15 @@ pub(crate) async fn run_shell_child(
     if request.fork_context {
         effective_runtime.model = Some(ctx.model_id.0.to_string());
     }
-    let (mut effective_sampling_config, mut effective_model_id) = resolve_effective_model_config(
+    let mut prepared_model = resolve_effective_prepared_model(
         effective_runtime.model.as_deref(),
         &request.subagent_type,
         &definition.model,
         &ctx,
     )
     .await;
+    let mut effective_sampling_config = prepared_model.sampling_config.clone();
+    let mut effective_model_id = prepared_model.model_id.clone();
     let subagent_max_turns = resolve_subagent_max_turns(definition.max_turns, ctx.parent_max_turns);
     {
         let model_str = &effective_sampling_config.model;
@@ -539,31 +541,33 @@ pub(crate) async fn run_shell_child(
                 .values()
                 .any(|e| e.info().model == *model_str);
         if model_unknown {
-            let (parent_config, parent_mid) = read_parent_sampling_config(&ctx).await;
+            let parent = read_parent_prepared_model(&ctx).await;
             tracing::warn!(
                 subagent_id = %request.id,
                 resolved_model = %model_str,
-                parent_model = %parent_config.model,
+                parent_model = %parent.sampling_config.model,
                 "Resolved subagent model not found in available models — \
                  falling back to parent model"
             );
-            effective_sampling_config = parent_config;
-            effective_model_id = parent_mid;
+            effective_sampling_config = parent.sampling_config.clone();
+            effective_model_id = parent.model_id.clone();
+            prepared_model = parent;
         }
     }
     if let Some(ref source) = resume_source
         && let Some(ref source_model) = source.model_id
         && effective_model_id.0.as_ref() != source_model.as_str()
     {
-        if let Some(resolved) = resolve_model_override_to_config(source_model, &ctx) {
+        if let Some(resolved) = resolve_model_override_to_prepared(source_model, &ctx) {
             tracing::info!(
                 subagent_id = %request.id,
                 resolved_model = %effective_model_id.0,
                 source_model = source_model,
                 "Pinning resumed child to source model"
             );
-            effective_sampling_config = resolved.0;
-            effective_model_id = resolved.1;
+            effective_sampling_config = resolved.sampling_config.clone();
+            effective_model_id = resolved.model_id.clone();
+            prepared_model = resolved;
         } else {
             let msg = format!(
                 "Cannot resume from subagent '{}': source model '{source_model}' \
@@ -644,9 +648,9 @@ pub(crate) async fn run_shell_child(
         }
     }
     if let Some(raw) = effective_runtime.reasoning_effort.as_deref()
-        && ctx
-            .models_manager
-            .model_supports_reasoning_effort(effective_model_id.0.as_ref())
+        && crate::agent::models::resolve_catalog_key(&ctx.available_models, &effective_model_id)
+            .and_then(|key| ctx.available_models.get(key.0.as_ref()))
+            .is_some_and(|entry| entry.info().supports_reasoning_effort)
     {
         match raw.parse::<ReasoningEffort>() {
             Ok(eff) => effective_sampling_config.reasoning_effort = Some(eff),
@@ -1190,13 +1194,7 @@ pub(crate) async fn run_shell_child(
     });
     let subagent_session_default_agent_profile = Some(definition.name.clone());
     let subagent_model_id = effective_sampling_config.model.clone();
-    let effective_catalog_identity =
-        crate::agent::models::resolve_catalog_identity(&ctx.available_models, &effective_model_id)
-            .unwrap_or_else(|| xai_chat_state::CatalogIdentity {
-                model_id: effective_model_id.0.to_string(),
-                route: effective_sampling_config.model.clone(),
-                lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
-            });
+    let effective_catalog_identity = prepared_model.catalog_identity;
     effective_model_id = acp::ModelId::new(effective_catalog_identity.model_id.clone());
     let _ = persistence
         .tx

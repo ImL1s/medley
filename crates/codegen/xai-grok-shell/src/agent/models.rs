@@ -259,6 +259,55 @@ impl ModelsManagerBuilder {
     }
 }
 
+pub(crate) fn capabilities_for_route_in(
+    models: &IndexMap<String, ModelEntry>,
+    preferred_id: Option<&str>,
+    routing_model: &str,
+    preferred_id_must_exist: bool,
+    alternate_preferred_route: Option<&str>,
+) -> Option<ResolvedModelCapabilities> {
+    if preferred_id_must_exist && preferred_id.is_some_and(|id| !models.contains_key(id)) {
+        return None;
+    }
+    let preferred = preferred_id
+        .and_then(|id| resolve_catalog_key(models, &acp::ModelId::new(id)))
+        .and_then(|key| {
+            models
+                .get(key.0.as_ref())
+                .filter(|entry| {
+                    entry.info().model == routing_model
+                        || alternate_preferred_route == Some(entry.info().model.as_str())
+                })
+                .map(|entry| (key.0.to_string(), entry))
+        });
+    let (model_id, entry) = if let Some(preferred) = preferred {
+        preferred
+    } else {
+        let mut matches = models
+            .iter()
+            .filter(|(_, entry)| entry.info().model == routing_model);
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        (first.0.clone(), first.1)
+    };
+    let info = entry.info();
+    Some(ResolvedModelCapabilities {
+        model_id: acp::ModelId::new(model_id),
+        byok: if entry.has_own_credentials() {
+            crate::agent::auth_method::ModelByok::Byok
+        } else {
+            crate::agent::auth_method::ModelByok::NotByok
+        },
+        auth_scheme: info.auth_scheme,
+        supports_backend_search: info.supports_backend_search,
+        compactions_remaining: info.compactions_remaining,
+        compaction_at_tokens: info.compaction_at_tokens,
+        codex_wire: info.codex_wire.clone(),
+    })
+}
+
 impl ModelsManager {
     /// Resolve one routing model and copy all request-shaping facts while
     /// holding a single catalog read lock. An exact key that routes elsewhere
@@ -271,47 +320,13 @@ impl ModelsManager {
         alternate_preferred_route: Option<&str>,
     ) -> Option<ResolvedModelCapabilities> {
         let catalog = self.inner.catalog.read();
-        let models = &catalog.models;
-        if preferred_id_must_exist && preferred_id.is_some_and(|id| !models.contains_key(id)) {
-            return None;
-        }
-        let preferred = preferred_id
-            .and_then(|id| resolve_catalog_key(models, &acp::ModelId::new(id)))
-            .and_then(|key| {
-                models
-                    .get(key.0.as_ref())
-                    .filter(|entry| {
-                        entry.info().model == routing_model
-                            || alternate_preferred_route == Some(entry.info().model.as_str())
-                    })
-                    .map(|entry| (key.0.to_string(), entry))
-            });
-        let (model_id, entry) = if let Some(preferred) = preferred {
-            preferred
-        } else {
-            let mut matches = models
-                .iter()
-                .filter(|(_, entry)| entry.info().model == routing_model);
-            let first = matches.next()?;
-            if matches.next().is_some() {
-                return None;
-            }
-            (first.0.clone(), first.1)
-        };
-        let info = entry.info();
-        Some(ResolvedModelCapabilities {
-            model_id: acp::ModelId::new(model_id),
-            byok: if entry.has_own_credentials() {
-                crate::agent::auth_method::ModelByok::Byok
-            } else {
-                crate::agent::auth_method::ModelByok::NotByok
-            },
-            auth_scheme: info.auth_scheme,
-            supports_backend_search: info.supports_backend_search,
-            compactions_remaining: info.compactions_remaining,
-            compaction_at_tokens: info.compaction_at_tokens,
-            codex_wire: info.codex_wire.clone(),
-        })
+        capabilities_for_route_in(
+            &catalog.models,
+            preferred_id,
+            routing_model,
+            preferred_id_must_exist,
+            alternate_preferred_route,
+        )
     }
     pub(crate) fn new(
         prefetched: Option<IndexMap<String, ModelEntry>>,

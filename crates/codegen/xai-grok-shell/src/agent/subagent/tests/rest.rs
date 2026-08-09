@@ -1878,6 +1878,7 @@ async fn read_parent_sampling_config_fallback_binds_caps_to_startup_model() {
     ctx.model_id = acp::ModelId::new("switched-model");
     ctx.sampling_config_model_id = acp::ModelId::new("startup-model");
     ctx.sampling_config.model = "startup-routing-model".to_string();
+    ctx.available_models = models.clone();
     ctx.models_manager = crate::agent::models::ModelsManager::new(
         None,
         models,
@@ -2376,6 +2377,7 @@ async fn read_parent_sampling_config_fallback_resolves_backend_search_from_catal
     ctx.parent_chat_state = None;
     ctx.sampling_config.model = "composer-2-fast".to_string();
     ctx.sampling_config.supports_backend_search = false;
+    ctx.available_models = models.clone();
     ctx.models_manager = crate::agent::models::ModelsManager::new(
         None,
         models,
@@ -2413,6 +2415,7 @@ async fn read_parent_sampling_config_fallback_resolves_codex_wire_from_catalog()
     ctx.parent_chat_state = None;
     ctx.sampling_config.model = "composer-2-fast".to_string();
     ctx.sampling_config.codex_wire = Some(parent_caps);
+    ctx.available_models = models.clone();
     ctx.models_manager = crate::agent::models::ModelsManager::new(
         None,
         models,
@@ -2478,6 +2481,76 @@ async fn read_parent_sampling_config_live_catalog_miss_keeps_same_model_baseline
 
     assert_eq!(model_id.0.as_ref(), "runtime-only-model");
     assert_eq!(config.codex_wire, Some(baseline_caps));
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_reused_startup_key_different_route_rejects_baseline_wire() {
+    let baseline_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut ctx = ctx_with_parent_chat_state(
+        "reused-key",
+        "startup-routing-model",
+        "reused-key",
+        indexmap::IndexMap::new(),
+    );
+    ctx.sampling_config.model = "startup-routing-model".to_string();
+    ctx.sampling_config.supports_backend_search = true;
+    ctx.sampling_config.codex_wire = Some(baseline_caps);
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.sampling_config.model = "switched-routing-model".to_string();
+    snapshot.catalog_identity = Some(test_catalog_identity(
+        "reused-key",
+        "switched-routing-model",
+        xai_chat_state::CatalogResolutionLineage::ExactKey,
+    ));
+    chat.restore_snapshot(snapshot);
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "switched-routing-model");
+    assert_eq!(config.model, "switched-routing-model");
+    assert!(!config.supports_backend_search);
+    assert_eq!(config.codex_wire, None);
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_uses_spawn_snapshot_after_same_route_live_refresh() {
+    use xai_grok_sampler::AuthScheme;
+
+    let frozen_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let mut frozen = test_model_entry("stable-routing-model");
+    frozen.info.auth_scheme = AuthScheme::Bearer;
+    frozen.info.codex_wire = Some(frozen_caps.clone());
+    let mut models = indexmap::IndexMap::new();
+    models.insert("stable-entry".to_string(), frozen);
+    let ctx = ctx_with_parent_chat_state(
+        "stable-entry",
+        "stable-routing-model",
+        "stable-entry",
+        models,
+    );
+
+    let mut refreshed = test_model_entry("stable-routing-model");
+    refreshed.info.auth_scheme = AuthScheme::None;
+    refreshed.info.supports_backend_search = true;
+    refreshed.info.codex_wire = Some(xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    });
+    ctx.models_manager.insert_test_entry("stable-entry", refreshed);
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "stable-entry");
+    assert_eq!(config.auth_scheme, AuthScheme::Bearer);
+    assert!(!config.supports_backend_search);
+    assert_eq!(config.codex_wire, Some(frozen_caps));
 }
 
 #[tokio::test]
@@ -2971,6 +3044,7 @@ async fn read_parent_sampling_config_fallback_resolves_compactions_remaining_fro
     ctx.parent_chat_state = None;
     ctx.sampling_config.model = "composer-2-fast".to_string();
     ctx.sampling_config.compactions_remaining = None;
+    ctx.available_models = models.clone();
     ctx.models_manager = crate::agent::models::ModelsManager::new(
         None,
         models,
