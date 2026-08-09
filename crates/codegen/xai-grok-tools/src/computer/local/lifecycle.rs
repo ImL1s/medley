@@ -178,6 +178,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_collection_claim_requires_the_child_to_have_been_waited_on() {
+        #[allow(clippy::disallowed_methods)] // test fixture; the test waits for and reaps it
         let mut child = tokio::process::Command::new("true")
             .spawn()
             .expect("spawn `true`");
