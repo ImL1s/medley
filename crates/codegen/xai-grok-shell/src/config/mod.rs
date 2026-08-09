@@ -1255,6 +1255,15 @@ fn apply_loaded_requirements(
     config: &mut crate::agent::config::Config,
     loads: Vec<RequirementsLayerLoad>,
 ) -> Vec<EnforcedField> {
+    let rejected_sources: Vec<_> = loads
+        .iter()
+        .filter_map(|load| match load {
+            RequirementsLayerLoad::Rejected(source) => Some(RequirementSource::Requirements {
+                path: std::path::PathBuf::from(source.label().as_ref()),
+            }),
+            RequirementsLayerLoad::Loaded(_) => None,
+        })
+        .collect();
     let last_rejection = loads
         .iter()
         .rposition(|load| matches!(load, RequirementsLayerLoad::Rejected(_)));
@@ -1263,6 +1272,9 @@ fn apply_loaded_requirements(
             "requirements reload partially rejected; preserving last-known-good auxiliary model \
              pins and applying only higher-priority accepted layers"
         );
+        config
+            .requirements
+            .clear_auxiliary_model_pins_except_sources(&rejected_sources);
     } else {
         // Refresh replaces the active requirement layers. Clear pins that may have
         // disappeared before applying the current layers so removed policy cannot

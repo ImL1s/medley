@@ -3552,6 +3552,36 @@ fn rejected_user_requirements_still_apply_trusted_system_layer() {
 }
 
 #[test]
+fn rejected_user_requirements_clear_removed_pin_from_accepted_system_layer() {
+    let mut cfg = crate::agent::config::Config::default();
+    cfg.requirements.web_search_model.pin(
+        "old-system-search".to_owned(),
+        RequirementSource::Requirements {
+            path: std::path::PathBuf::from("/test/system/requirements.toml"),
+        },
+    );
+
+    let enforced = apply_loaded_requirements(
+        &mut cfg,
+        vec![
+            RequirementsLayerLoad::Rejected(xai_grok_config::RequirementsSource::File(
+                std::path::PathBuf::from("/test/user/requirements.toml"),
+            )),
+            RequirementsLayerLoad::Loaded(RequirementsLayer {
+                value: toml::Value::Table(toml::map::Map::new()),
+                source: xai_grok_config::RequirementsSource::File(std::path::PathBuf::from(
+                    "/test/system/requirements.toml",
+                )),
+                is_system: true,
+            }),
+        ],
+    );
+
+    assert!(enforced.is_empty());
+    assert_eq!(cfg.requirements.web_search_model.pinned(), None);
+}
+
+#[test]
 fn rejected_system_requirements_do_not_replace_prior_pin_with_user_layer() {
     let mut cfg = crate::agent::config::Config::default();
     let system_path = std::path::PathBuf::from("/test/system/requirements.toml");
