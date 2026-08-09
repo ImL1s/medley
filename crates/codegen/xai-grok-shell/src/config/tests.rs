@@ -3473,6 +3473,39 @@ fn apply_requirements_value_overrides_user_settings() {
                 .any(|e| e.path == "telemetry.mixpanel_token" && e.value == "[redacted]")
         );
 }
+
+#[test]
+fn rejected_requirements_reload_preserves_auxiliary_pins() {
+    let mut cfg = crate::agent::config::Config::default();
+    let source = RequirementSource::Requirements {
+        path: std::path::PathBuf::from("/test/requirements.toml"),
+    };
+    cfg.requirements
+        .web_search_model
+        .pin("required-search".to_owned(), source.clone());
+    cfg.requirements
+        .session_summary_model
+        .pin("required-summary".to_owned(), source.clone());
+    cfg.requirements
+        .image_description_model
+        .pin("required-image".to_owned(), source);
+
+    let enforced = apply_loaded_requirements(&mut cfg, None);
+
+    assert!(enforced.is_empty());
+    assert_eq!(
+        cfg.requirements.web_search_model.pinned().as_deref(),
+        Some("required-search")
+    );
+    assert_eq!(
+        cfg.requirements.session_summary_model.pinned().as_deref(),
+        Some("required-summary")
+    );
+    assert_eq!(
+        cfg.requirements.image_description_model.pinned().as_deref(),
+        Some("required-image")
+    );
+}
 /// Strict precedence: requirement always wins (covers from-None and
 /// from-higher-user cases). The enforced floor lives in
 /// `VersionPolicy`, not this field.

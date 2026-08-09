@@ -1099,7 +1099,8 @@ pub use xai_grok_config::{
     load_from_disk, load_managed_config, load_merged_requirements, load_system_managed_config,
     load_toml_file, managed_config_identity_changed_at, managed_deployment_id,
     managed_policy_compromised_for, mark_managed_config_synced, mark_managed_config_synced_at,
-    normalize_identity, requirements_layers, system_config_dir, user_grok_home,
+    normalize_identity, requirements_layers, system_config_dir, try_requirements_layers,
+    user_grok_home,
 };
 /// Map of "dotted.path" to which config file the value came from.
 pub(crate) fn config_origins(
@@ -1247,11 +1248,24 @@ fn apply_managed_settings_features_inner(
 /// Clamp `AgentConfig` fields per `requirements.toml`. No-op if absent.
 /// System pins win over user pins on conflict.
 pub(crate) fn apply_requirements(config: &mut crate::agent::config::Config) -> Vec<EnforcedField> {
+    apply_loaded_requirements(config, try_requirements_layers())
+}
+
+fn apply_loaded_requirements(
+    config: &mut crate::agent::config::Config,
+    layers: Option<Vec<RequirementsLayer>>,
+) -> Vec<EnforcedField> {
+    let Some(layers) = layers else {
+        tracing::warn!(
+            "requirements reload rejected; preserving last-known-good auxiliary model pins"
+        );
+        return Vec::new();
+    };
     // Refresh replaces the active requirement layers. Clear pins that may have
     // disappeared before applying the current layers so removed policy cannot
     // survive in this reused Config.
     config.requirements.clear_auxiliary_model_pins();
-    requirements_layers()
+    layers
         .into_iter()
         .flat_map(|layer| {
             apply_requirements_inner(

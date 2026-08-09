@@ -64,24 +64,37 @@ pub struct RequirementsLayer {
 /// Use when you need per-layer source attribution; otherwise use
 /// [`load_merged_requirements`].
 pub fn requirements_layers() -> Vec<RequirementsLayer> {
+    try_requirements_layers().unwrap_or_default()
+}
+
+/// All requirements layers, or `None` when a configured file was rejected.
+///
+/// Callers that replace live policy state use this to distinguish a valid
+/// absence (empty vector) from a transient unreadable/malformed layer and keep
+/// their last-known-good constraints on the latter.
+pub fn try_requirements_layers() -> Option<Vec<RequirementsLayer>> {
     let mut out = Vec::new();
-    if let Some(user_path) = user_grok_home().map(|g| g.join("requirements.toml"))
-        && let Some(value) = load_requirements_layer(&user_path)
-    {
-        out.push(RequirementsLayer {
-            value,
-            source: RequirementsSource::File(user_path),
-            is_system: false,
-        });
+    if let Some(user_path) = user_grok_home().map(|g| g.join("requirements.toml")) {
+        match load_requirements_layer_status(&user_path) {
+            RequirementsLayerStatus::Loaded(value) => out.push(RequirementsLayer {
+                value,
+                source: RequirementsSource::File(user_path),
+                is_system: false,
+            }),
+            RequirementsLayerStatus::Absent => {}
+            RequirementsLayerStatus::Rejected => return None,
+        }
     }
     if let Some(dir) = system_config_dir() {
         let sys_path = dir.join("requirements.toml");
-        if let Some(value) = load_requirements_layer(&sys_path) {
-            out.push(RequirementsLayer {
+        match load_requirements_layer_status(&sys_path) {
+            RequirementsLayerStatus::Loaded(value) => out.push(RequirementsLayer {
                 value,
                 source: RequirementsSource::File(sys_path),
                 is_system: true,
-            });
+            }),
+            RequirementsLayerStatus::Absent => {}
+            RequirementsLayerStatus::Rejected => return None,
         }
     }
     // macOS MDM: OS-protected admin layer (forced values only). Pushed last so it
@@ -94,7 +107,7 @@ pub fn requirements_layers() -> Vec<RequirementsLayer> {
             is_system: true,
         });
     }
-    out
+    Some(out)
 }
 
 /// User + system requirements deep-merged, system wins on conflict.
@@ -126,11 +139,28 @@ pub(crate) fn load_system_requirements() -> Option<toml::Value> {
 /// Soft-fails on errors; fail-closed enforcement lives in
 /// [`validate_requirements`].
 pub(crate) fn load_requirements_layer(path: &Path) -> Option<toml::Value> {
-    let v = match load_toml_file(path) {
-        Ok(v) if v.as_table().is_some_and(|t| !t.is_empty()) => v,
-        _ => return None,
+    match load_requirements_layer_status(path) {
+        RequirementsLayerStatus::Loaded(value) => Some(value),
+        RequirementsLayerStatus::Absent | RequirementsLayerStatus::Rejected => None,
+    }
+}
+
+enum RequirementsLayerStatus {
+    Absent,
+    Loaded(toml::Value),
+    Rejected,
+}
+
+fn load_requirements_layer_status(path: &Path) -> RequirementsLayerStatus {
+    let value = match load_toml_file(path) {
+        Ok(value) if value.as_table().is_some_and(|table| !table.is_empty()) => value,
+        Ok(_) => return RequirementsLayerStatus::Absent,
+        Err(_) => return RequirementsLayerStatus::Rejected,
     };
-    normalize_requirements_value(v, &path.display().to_string())
+    match normalize_requirements_value(value, &path.display().to_string()) {
+        Some(value) => RequirementsLayerStatus::Loaded(value),
+        None => RequirementsLayerStatus::Rejected,
+    }
 }
 
 /// Strip `fail_closed` and apply `[[version_overrides]]` for a parsed
@@ -271,6 +301,22 @@ telemetry = true
 
         assert!(load_requirements_layer(&path).is_none());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn checked_requirements_layer_distinguishes_rejection_from_absence() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("requirements.toml");
+        assert!(matches!(
+            load_requirements_layer_status(&path),
+            RequirementsLayerStatus::Absent
+        ));
+
+        std::fs::write(&path, "[models\ndefault = \"broken\"").unwrap();
+        assert!(matches!(
+            load_requirements_layer_status(&path),
+            RequirementsLayerStatus::Rejected
+        ));
     }
 
     #[test]

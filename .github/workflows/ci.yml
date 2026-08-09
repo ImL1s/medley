@@ -648,6 +648,8 @@ jobs:
           # regression here that this crate's own tests could not report.
           run_nonzero -p xai-grok-config --lib \
             display:: -- --nocapture
+          run_nonzero -p xai-grok-config --lib \
+            validation:: -- --nocapture
           # Same `#[path]` move as `restore_fetch::` above, and stopped one
           # segment short for the same reason: the file is `fs_size_tests.rs`,
           # the module is `fs_size::tests`, and only `fs_size::` is a substring

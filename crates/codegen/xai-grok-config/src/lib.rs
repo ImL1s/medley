@@ -74,7 +74,7 @@ pub use paths::{
 };
 pub use validation::{
     RequirementsError, RequirementsLayer, RequirementsSource, load_merged_requirements,
-    requirements_layers, validate_requirements,
+    requirements_layers, try_requirements_layers, validate_requirements,
 };
 pub use version_overrides::{VersionOverrideError, apply_version_overrides};
 
