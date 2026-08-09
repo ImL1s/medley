@@ -463,6 +463,8 @@ impl MvpAgent {
             None => (None, None),
         };
         let project_trusted = crate::agent::folder_trust::project_scope_allowed(&parent_cwd);
+        let image_description_model =
+            self.resolve_image_description_model(parent_model_id.0.as_ref());
         let (base_roles, base_personas, subagent_model_overrides, subagent_toggle) = {
             let cfg = self.cfg.borrow();
             (
@@ -567,7 +569,7 @@ impl MvpAgent {
             api_key_provider: Some(Arc::new(crate::auth::manager::SharedAuthKeyProvider(
                 am.clone(),
             ))),
-            image_description_model: self.resolve_image_description_model(),
+            image_description_model,
             workspace_ops: parent_workspace_ops.clone(),
             auth_manager: am.clone(),
             attribution_callback: parent_attribution_callback,

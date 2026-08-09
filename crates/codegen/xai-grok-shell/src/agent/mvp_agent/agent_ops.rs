@@ -21,8 +21,21 @@ fn byok_from_models(
 fn summary_config_or_primary(
     primary: &SamplingConfig,
     resolved: Option<SamplingConfig>,
+    inherited_default_missing: bool,
 ) -> SamplingConfig {
-    resolved.unwrap_or_else(|| primary.clone())
+    if inherited_default_missing {
+        primary.clone()
+    } else {
+        resolved.unwrap_or_else(|| primary.clone())
+    }
+}
+fn inherited_default_missing_from_catalog(
+    model_id: &str,
+    configured_default: Option<&str>,
+    models: &indexmap::IndexMap<String, ModelEntry>,
+) -> bool {
+    configured_default == Some(model_id)
+        && crate::agent::config::find_model_by_id(models, model_id).is_none()
 }
 struct MissingSessionCtx {
     has_session_key: bool,
@@ -124,29 +137,49 @@ impl MvpAgent {
         }
         session_ids.len()
     }
-    pub(super) fn resolve_image_description_model(&self) -> String {
-        self.cfg
-            .borrow()
-            .image_description_model
-            .as_deref()
-            .unwrap_or(crate::models::default_image_description_model())
-            .to_owned()
-    }
-    fn resolve_session_summary_model(&self) -> String {
-        self.cfg
-            .borrow()
-            .session_summary_model
-            .as_deref()
-            .unwrap_or(crate::models::default_session_summary_model())
-            .to_owned()
+    pub(super) fn resolve_image_description_model(&self, primary_model_id: &str) -> String {
+        let (model_id, configured_default) = {
+            let cfg = self.cfg.borrow();
+            (
+                cfg.image_description_model
+                    .as_deref()
+                    .unwrap_or(crate::models::default_image_description_model())
+                    .to_owned(),
+                crate::agent::models::configured_preference(&cfg).map(|pref| pref.value),
+            )
+        };
+        let models = self.models_manager.models();
+        if inherited_default_missing_from_catalog(
+            &model_id,
+            configured_default.as_deref(),
+            &models,
+        ) {
+            primary_model_id.to_owned()
+        } else {
+            model_id
+        }
     }
     pub(super) async fn build_summary_client(
         &self,
         primary: &SamplingConfig,
     ) -> Result<(OaiCompatClient, String), acp::Error> {
-        let slug = self.resolve_session_summary_model();
+        let (slug, configured_default) = {
+            let cfg = self.cfg.borrow();
+            (
+                cfg.session_summary_model
+                    .as_deref()
+                    .unwrap_or(crate::models::default_session_summary_model())
+                    .to_owned(),
+                crate::agent::models::configured_preference(&cfg).map(|pref| pref.value),
+            )
+        };
         let session_key = self.auth_manager.current_or_expired().map(|a| a.key.clone());
         let models = self.models_manager.models();
+        let inherited_default_missing = inherited_default_missing_from_catalog(
+            &slug,
+            configured_default.as_deref(),
+            &models,
+        );
         let endpoints = self.models_manager.endpoints();
         let (disable_api_key_auth, alpha_test_key, client_version) = {
             let cfg = self.cfg.borrow();
@@ -156,26 +189,30 @@ impl MvpAgent {
                 cfg.client_version.clone(),
             )
         };
-        let resolved = crate::agent::config::resolve_aux_model_sampling_config_preflight(
-            &slug,
-            &models,
-            &endpoints,
-            session_key.as_deref(),
-            disable_api_key_auth,
-            alpha_test_key,
-            client_version,
-        )
-        .await
-        .map(|mut cfg| {
-            crate::agent::config::stamp_session_local_sampler_fields(
-                &mut cfg,
-                primary,
-                primary.client_identifier.clone(),
-                primary.max_retries,
-            );
-            cfg
-        });
-        let config = summary_config_or_primary(primary, resolved);
+        let resolved = if inherited_default_missing {
+            None
+        } else {
+            crate::agent::config::resolve_aux_model_sampling_config_preflight(
+                &slug,
+                &models,
+                &endpoints,
+                session_key.as_deref(),
+                disable_api_key_auth,
+                alpha_test_key,
+                client_version,
+            )
+            .await
+            .map(|mut cfg| {
+                crate::agent::config::stamp_session_local_sampler_fields(
+                    &mut cfg,
+                    primary,
+                    primary.client_identifier.clone(),
+                    primary.max_retries,
+                );
+                cfg
+            })
+        };
+        let config = summary_config_or_primary(primary, resolved, inherited_default_missing);
         let model = config.model.clone();
         let client = OaiCompatClient::new(config).map_err(map_sampling_err_to_acp)?;
         Ok((client, model))
@@ -5192,6 +5229,8 @@ impl MvpAgent {
                     agent_name: Some(agent_definition.name.clone()),
                     reasoning_effort: initial_reasoning_effort,
                 });
+            let image_description_model =
+                self.resolve_image_description_model(session_model_id.0.as_ref());
             let acp_mcp_servers = crate::session::acp_mcp::parse_acp_mcp_servers(
                 session_meta,
             );
@@ -5322,7 +5361,7 @@ impl MvpAgent {
                             ),
                         ),
                     ),
-                    self.resolve_image_description_model(),
+                    image_description_model,
                     agent_hook_registry_override,
                     workspace_ops.clone(),
                     {
@@ -5517,8 +5556,40 @@ mod summary_fallback_tests {
             ..Default::default()
         };
 
-        let fallback = summary_config_or_primary(&primary, None);
+        let fallback = summary_config_or_primary(&primary, None, false);
 
         assert_eq!(fallback.model, "operative-session-model");
+    }
+
+    #[test]
+    fn model_overrides_missing_inherited_default_ignores_synthetic_xai_summary_route() {
+        let primary = SamplingConfig {
+            model: "operative-session-model".to_owned(),
+            ..Default::default()
+        };
+        let synthetic_xai = SamplingConfig {
+            model: "stale-configured-default".to_owned(),
+            ..Default::default()
+        };
+
+        let fallback = summary_config_or_primary(&primary, Some(synthetic_xai), true);
+
+        assert_eq!(fallback.model, "operative-session-model");
+    }
+
+    #[test]
+    fn model_overrides_detects_missing_inherited_default_before_aux_resolution() {
+        let models = indexmap::IndexMap::new();
+
+        assert!(inherited_default_missing_from_catalog(
+            "stale-configured-default",
+            Some("stale-configured-default"),
+            &models,
+        ));
+        assert!(!inherited_default_missing_from_catalog(
+            "explicit-summary-pin",
+            Some("stale-configured-default"),
+            &models,
+        ));
     }
 }
