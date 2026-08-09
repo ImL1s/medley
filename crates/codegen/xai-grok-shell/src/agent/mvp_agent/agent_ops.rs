@@ -3847,19 +3847,19 @@ impl MvpAgent {
             return;
         }
         let default_model_id = self.models_manager.current_model_id();
+        let handle = self.resident_handle(session_id);
         let session_model_id = crate::upload::turn::lookup_session_model(
-            &self.sessions.borrow(),
-            Some(session_id),
+            handle.as_ref().map(|handle| handle.model_id.clone()),
             &default_model_id,
         );
         let model_id = {
-            let sessions = self.sessions.borrow();
-            let handle = sessions.get(session_id);
             let cfg = self.cfg.borrow();
             let follows_default = handle
+                .as_ref()
                 .map(|handle| handle.auxiliary_model_provenance.web_search_follows_default)
                 .unwrap_or(cfg.web_search_follows_default);
             let configured_model = handle
+                .as_ref()
                 .map(|handle| handle.auxiliary_model_provenance.web_search_model.as_str())
                 .unwrap_or(&cfg.web_search_model);
             crate::config::auxiliary_model_or_operative(

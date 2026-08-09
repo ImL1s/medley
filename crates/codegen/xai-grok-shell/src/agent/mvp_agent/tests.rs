@@ -2795,7 +2795,7 @@ fn model_overrides_live_cross_provider_switch_rebuilds_inherited_auxiliary_lanes
         };
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         handle.cmd_tx = cmd_tx;
-        agent.sessions.borrow_mut().insert(sid.clone(), handle);
+        agent.insert_resident(&sid, handle);
         agent.web_search_disabled.borrow_mut().insert(
             sid.clone(),
             crate::session::WebSearchDisabledNotice {
@@ -2869,7 +2869,7 @@ fn model_overrides_live_cross_provider_switch_rebuilds_inherited_auxiliary_lanes
         )
         .await
         .expect("cross-provider model switch");
-        assert_eq!(agent.sessions.borrow()[&sid].model_id.0.as_ref(), "target-provider");
+        assert_eq!(agent.resident_handle(&sid).unwrap().model_id.0.as_ref(), "target-provider");
         assert!(
             !agent.web_search_disabled.borrow().contains_key(&sid),
             "an applied policy-disabled state must clear the prior availability notice"
@@ -2894,7 +2894,7 @@ fn model_overrides_global_web_search_disable_skips_live_replacement() {
         };
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         handle.cmd_tx = cmd_tx;
-        agent.sessions.borrow_mut().insert(sid.clone(), handle);
+        agent.insert_resident(&sid, handle);
 
         tokio::task::spawn_local(async move {
             while let Some(command) = cmd_rx.recv().await {
@@ -2960,7 +2960,7 @@ fn model_overrides_cold_web_search_notice_describes_operative_session_model() {
         };
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         handle.cmd_tx = cmd_tx;
-        agent.sessions.borrow_mut().insert(sid.clone(), handle);
+        agent.insert_resident(&sid, handle);
 
         tokio::task::spawn_local(async move {
             while let Some(command) = cmd_rx.recv().await {

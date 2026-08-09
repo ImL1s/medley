@@ -820,7 +820,7 @@ impl ModelOverrideConfig {
         )
     }
 
-    pub fn resolve_with_default_model(
+    pub(crate) fn resolve_with_default_model(
         cli_default_model: Option<&str>,
         cli_web_search_model: Option<&str>,
         cli_session_summary_model: Option<&str>,
