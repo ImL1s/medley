@@ -69,6 +69,48 @@ pub(crate) fn resolve_catalog_identity(
     })
 }
 
+/// Reconcile a persisted catalog identity with one current catalog snapshot.
+///
+/// Exact-key lineage never follows a reused key to a different route. A
+/// unique-route identity may move to the one current entry that still carries
+/// its committed route, but ambiguity fails closed.
+pub(crate) fn reconcile_persisted_catalog_identity(
+    models: &IndexMap<String, ModelEntry>,
+    persisted: &xai_chat_state::CatalogIdentity,
+) -> Option<xai_chat_state::CatalogIdentity> {
+    let matching_key = models
+        .get(persisted.model_id.as_str())
+        .filter(|entry| entry.info().model == persisted.route)
+        .map(|entry| (persisted.model_id.clone(), entry));
+    let (model_id, entry) = match persisted.lineage {
+        xai_chat_state::CatalogResolutionLineage::ExactKey => matching_key?,
+        xai_chat_state::CatalogResolutionLineage::UniqueRoute => {
+            if let Some(matching_key) = matching_key {
+                matching_key
+            } else {
+                let mut matches = models
+                    .iter()
+                    .filter(|(_, entry)| entry.info().model == persisted.route);
+                let first = matches.next()?;
+                if matches.next().is_some() {
+                    return None;
+                }
+                (first.0.clone(), first.1)
+            }
+        }
+    };
+    Some(xai_chat_state::CatalogIdentity {
+        model_id,
+        route: persisted.route.clone(),
+        lineage: persisted.lineage,
+        auth_scheme: Some(match entry.info().auth_scheme {
+            xai_grok_sampler::AuthScheme::Bearer => xai_chat_state::CatalogAuthScheme::Bearer,
+            xai_grok_sampler::AuthScheme::XApiKey => xai_chat_state::CatalogAuthScheme::XApiKey,
+            xai_grok_sampler::AuthScheme::None => xai_chat_state::CatalogAuthScheme::None,
+        }),
+    })
+}
+
 /// Persisted-model resolver constrained to selectable (`available`) entries.
 ///
 /// Unlike `resolve_catalog_key`, this reports ambiguity explicitly so restore

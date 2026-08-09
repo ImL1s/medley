@@ -46,6 +46,7 @@ impl CounterOp {
 #[derive(Debug, Clone)]
 pub(crate) struct ModelPatch {
     pub model_id: acp::ModelId,
+    pub catalog_identity: Option<xai_chat_state::CatalogIdentity>,
     pub agent_name: Option<String>,
     pub reasoning_effort: Option<Option<ReasoningEffort>>,
 }
@@ -147,6 +148,7 @@ impl Summary {
         }
         if let Some(model) = &patch.model {
             self.current_model_id = model.model_id.clone();
+            self.catalog_identity = model.catalog_identity.clone();
             if let Some(agent_name) = &model.agent_name {
                 self.agent_name = Some(agent_name.clone());
             }

@@ -464,6 +464,7 @@ impl SessionActor {
             .persist_model_switch_transaction(
                 committed_chat.conversation,
                 &catalog_model_id,
+                committed_chat.catalog_identity.as_ref(),
                 &active_agent_type,
                 sampling_config.reasoning_effort,
             )
@@ -521,6 +522,7 @@ impl SessionActor {
         &self,
         conversation: Vec<ConversationItem>,
         model_id: &acp::ModelId,
+        catalog_identity: Option<&xai_chat_state::CatalogIdentity>,
         agent_type: &str,
         reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
     ) -> Result<(), &'static str> {
@@ -533,6 +535,7 @@ impl SessionActor {
             .send(PersistenceMsg::ModelSwitchAndAck {
                 messages: conversation,
                 model_id: model_id.clone(),
+                catalog_identity: catalog_identity.cloned(),
                 agent_name: Some(agent_type.to_owned()),
                 reasoning_effort,
                 respond_to,
@@ -1372,6 +1375,7 @@ mod model_switch_transaction_tests {
                         .persist_model_switch_transaction(
                             previous_chat.conversation.clone(),
                             &acp::ModelId::new("test"),
+                            None,
                             "grok-build",
                             previous_chat.sampling_config.reasoning_effort,
                         )

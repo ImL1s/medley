@@ -492,7 +492,12 @@ fn fork_summary(
             .new_model_id
             .clone()
             .map(acp::ModelId::new)
-            .unwrap_or(source.current_model_id),
+            .unwrap_or_else(|| source.current_model_id.clone()),
+        catalog_identity: options
+            .new_model_id
+            .is_none()
+            .then_some(source.catalog_identity)
+            .flatten(),
         parent_session_id: options.parent_session_id.clone(),
         forked_at: Some(chrono::Utc::now()),
         collection_id: None,

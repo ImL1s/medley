@@ -430,6 +430,8 @@ jobs:
           run_nonzero -p xai-chat-state --lib \
             prepared_model_state_never_tears_routing_from_credentials -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
+            keeps_endpoint_and_bound_secret_when_name_collides_with_an_external_model -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
             issue39_verbatim_fork_tools_intersect_session_admission -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             issue39_rebuild_respects_capability_mode_ceiling -- --nocapture
@@ -988,6 +990,8 @@ jobs:
             dropped_model_switch_ack_preserves_live_candidate_generation -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             model_switch_recovers_new_generation_after_summary_materialization -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            restart_preserves_unique_route_identity_against_removed_key_reuse -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             model_switch_interruption_before_intent_rename_ -- --nocapture
           run_nonzero -p xai-grok-shell --lib \

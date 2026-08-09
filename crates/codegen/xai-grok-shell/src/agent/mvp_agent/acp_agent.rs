@@ -1377,6 +1377,7 @@ impl acp::Agent for MvpAgent {
                         session_meta: arguments.meta.as_ref(),
                         managed_mcp_expires_at,
                         model_agent_type: model_agent_type.as_deref(),
+                        persisted_catalog_identity: None,
                         session_model_id: session_model_id.clone(),
                         session_yolo_mode,
                         session_auto_mode: session_auto_mode && !session_yolo_mode,
@@ -1959,11 +1960,34 @@ impl acp::Agent for MvpAgent {
             spawn_timer.with_field("session_id", session_id.0.as_ref());
             let available = self.models_manager.available();
             let models = self.models_manager.models();
-            let persisted_resolution = crate::agent::models::selectable_catalog_resolution_for_persisted(
-                &models,
-                &available,
-                &summary.current_model_id,
-            );
+            let persisted_catalog_identity = summary
+                .catalog_identity
+                .as_ref()
+                .filter(|identity| identity.model_id == summary.current_model_id.0.as_ref());
+            let reconciled_catalog_identity = persisted_catalog_identity.and_then(|identity| {
+                crate::agent::models::reconcile_persisted_catalog_identity(&models, identity)
+            });
+            let persisted_identity_unresolved =
+                persisted_catalog_identity.is_some() && reconciled_catalog_identity.is_none();
+            let persisted_resolution = if persisted_catalog_identity.is_some() {
+                reconciled_catalog_identity
+                    .as_ref()
+                    .filter(|identity| {
+                        available.contains_key(&acp::ModelId::new(identity.model_id.clone()))
+                    })
+                    .map(|identity| {
+                        crate::agent::models::PersistedCatalogKeyResolution::Resolved(
+                            acp::ModelId::new(identity.model_id.clone()),
+                        )
+                    })
+                    .unwrap_or(crate::agent::models::PersistedCatalogKeyResolution::Missing)
+            } else {
+                crate::agent::models::selectable_catalog_resolution_for_persisted(
+                    &models,
+                    &available,
+                    &summary.current_model_id,
+                )
+            };
             let resolved_persisted_catalog_id = match &persisted_resolution {
                 crate::agent::models::PersistedCatalogKeyResolution::Resolved(id) => {
                     Some(id.clone())
@@ -2014,7 +2038,36 @@ impl acp::Agent for MvpAgent {
                     },
                 )
             };
-            let spawn_selection = if let Some(matches) = ambiguous_persisted_slug_matches.as_ref() {
+            let spawn_selection = if persisted_identity_unresolved {
+                let unsafe_reused_key = persisted_catalog_identity
+                    .expect("unresolved flag requires a persisted identity")
+                    .model_id
+                    .as_str();
+                let fallback = ready_compatible_fallback(
+                    available
+                        .keys()
+                        .filter(|id| id.0.as_ref() != unsafe_reused_key)
+                        .cloned()
+                        .collect(),
+                )
+                .ok_or_else(|| {
+                    acp::Error::invalid_params().data(format!(
+                        "persisted model '{}' no longer resolves to its committed catalog route",
+                        summary.current_model_id.0
+                    ))
+                })?;
+                tracing::warn!(
+                    session_id = %session_id.0,
+                    previous = %summary.current_model_id.0,
+                    new = %fallback.0,
+                    "load_session: persisted catalog identity no longer resolves; using safe fallback"
+                );
+                cold_spawn_fallback_selection(
+                    &summary.current_model_id,
+                    Some(fallback),
+                    None,
+                )
+            } else if let Some(matches) = ambiguous_persisted_slug_matches.as_ref() {
                 tracing::warn!(
                     session_id = %session_id.0,
                     persisted = %summary.current_model_id.0,
@@ -2190,6 +2243,7 @@ impl acp::Agent for MvpAgent {
                         session_meta: request_meta.as_ref(),
                         managed_mcp_expires_at,
                         model_agent_type: persisted_agent_name.as_deref(),
+                        persisted_catalog_identity: reconciled_catalog_identity,
                         session_model_id: spawn_model_id,
                         session_yolo_mode,
                         session_auto_mode: session_auto_mode && !session_yolo_mode,

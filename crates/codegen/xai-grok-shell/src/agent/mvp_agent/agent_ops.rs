@@ -4452,6 +4452,7 @@ impl MvpAgent {
             managed_mcp_expires_at,
             model_agent_type,
             session_model_id,
+            persisted_catalog_identity,
             session_yolo_mode,
             session_auto_mode,
             prompt_display_cwd,
@@ -4690,11 +4691,23 @@ impl MvpAgent {
         // catalog snapshot. A refresh must not rebind the prepared sampler to
         // a replacement entry that reused the same key.
         let catalog = self.models_manager.models();
-        let default_catalog_identity =
-            crate::agent::models::resolve_catalog_identity(&catalog, &session_model_id);
+        let default_catalog_identity = match persisted_catalog_identity
+            .filter(|identity| identity.model_id == session_model_id.0.as_ref())
+        {
+            Some(identity) => crate::agent::models::reconcile_persisted_catalog_identity(
+                &catalog, &identity,
+            )
+            .or(Some(identity)),
+            None => crate::agent::models::resolve_catalog_identity(&catalog, &session_model_id),
+        };
         let default_model = default_catalog_identity
             .as_ref()
-            .and_then(|identity| catalog.get(identity.model_id.as_str()));
+            .and_then(|identity| catalog.get(identity.model_id.as_str()))
+            .filter(|entry| {
+                default_catalog_identity
+                    .as_ref()
+                    .is_some_and(|identity| entry.info().model == identity.route)
+            });
         let sampling_config = default_model
             .map(|model| self.prepare_sampling_config_for_model(model, origin_client.clone()))
             .unwrap_or_else(|| {
@@ -5175,6 +5188,7 @@ impl MvpAgent {
                 .tx
                 .send(crate::session::persistence::PersistenceMsg::CurrentModel {
                     model_id: session_model_id.clone(),
+                    catalog_identity: Some(catalog_identity.clone()),
                     agent_name: Some(agent_definition.name.clone()),
                     reasoning_effort: initial_reasoning_effort,
                 });

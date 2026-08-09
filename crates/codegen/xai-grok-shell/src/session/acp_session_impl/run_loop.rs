@@ -13,6 +13,68 @@ use super::*;
 pub(super) fn yolo_toggle_report(was: bool, actual: bool) -> Option<bool> {
     (was != actual).then_some(actual)
 }
+
+fn apply_opaque_model_name_override(
+    mut config: xai_grok_sampling_types::SamplingConfig,
+    credentials: xai_chat_state::Credentials,
+    model_name: String,
+    extra_headers: indexmap::IndexMap<String, String>,
+    context_window: Option<std::num::NonZeroU64>,
+    context_window_is_pinned: bool,
+) -> (
+    xai_grok_sampling_types::SamplingConfig,
+    xai_chat_state::Credentials,
+) {
+    config.model = model_name;
+    config.extra_headers.extend(extra_headers);
+    if let Some(context_window) = context_window
+        && !context_window_is_pinned
+    {
+        config.context_window = context_window;
+    }
+    // An opaque name override changes only wire routing. In particular, do not
+    // resolve credentials by the new name: a configured catalog key with the
+    // same string may belong to another endpoint/origin.
+    (config, credentials)
+}
+
+#[cfg(test)]
+mod opaque_model_name_override_tests {
+    use super::apply_opaque_model_name_override;
+
+    #[test]
+    fn keeps_endpoint_and_bound_secret_when_name_collides_with_an_external_model() {
+        let mut config = xai_grok_sampling_types::SamplingConfig::for_test(
+            "https://old.example.test/v1",
+            "old-route",
+        );
+        let credentials = xai_chat_state::Credentials::bound(
+            Some("old-origin-key".to_string()),
+            xai_chat_state::AuthType::ApiKey,
+            xai_grok_sampling_types::CredentialSource::ModelApiKey,
+        );
+        let mut colliding_entry = crate::agent::config::ModelEntry::fallback(
+            "configured-external-model",
+            &crate::agent::config::EndpointsConfig::default(),
+        );
+        colliding_entry.api_key = Some("foreign-model-key".to_string());
+        let foreign = crate::agent::config::resolve_credentials(&colliding_entry, None);
+        assert_eq!(foreign.api_key.as_deref(), Some("foreign-model-key"));
+
+        let (config, credentials) = apply_opaque_model_name_override(
+            config,
+            credentials,
+            "configured-external-model".to_string(),
+            indexmap::IndexMap::from([("x-route-key".to_string(), "route-scoped-key".to_string())]),
+            None,
+            false,
+        );
+
+        assert_eq!(config.base_url, "https://old.example.test/v1");
+        assert_eq!(credentials.api_key(), Some("old-origin-key"));
+        assert_ne!(credentials.api_key(), Some("foreign-model-key"));
+    }
+}
 #[cfg(test)]
 mod yolo_toggle_report_tests {
     use super::yolo_toggle_report;
@@ -716,7 +778,7 @@ pub(super) async fn run_session(
                         }
                         SessionCommand::OverrideModelName { model_name, extra_headers, context_window } => {
                             // Update the actor's SamplingConfig model + headers + context window.
-                            if let Some((mut cfg, _catalog_identity, existing)) = session
+                            if let Some((cfg, _catalog_identity, existing)) = session
                                 .chat_state_handle
                                 .get_prepared_model_state()
                                 .await
@@ -736,35 +798,18 @@ pub(super) async fn run_session(
                                 // the agent-level default (e.g. "grok-4.5").
                                 // set_primary_model also adds to models_used.
                                 session.signals_handle().set_primary_model(&model_name);
-                                cfg.model = model_name.clone();
-                                cfg.extra_headers.extend(extra_headers);
-                                if let Some(cw) = context_window
-                                    && session.compaction.context_window_override.is_none()
-                                {
-                                    cfg.context_window = cw;
-                                }
-                                // `session_key` may only be passed when the
-                                // stored credential really is a session token
-                                // -- `try_resolve_model_credentials` documents
-                                // that and says callers must guard it. Passing
-                                // it unconditionally re-labels whatever the
-                                // previous model left behind as
-                                // `AuthType::SessionToken` and carries it to the
-                                // new one: a BYOK key becomes a "session token",
-                                // and a real session token reaches a model that
-                                // may point anywhere, with no origin strip on
-                                // this path (#136).
-                                let session_key = (existing.auth_type()
-                                    == xai_chat_state::AuthType::SessionToken)
-                                    .then_some(existing.api_key())
-                                    .flatten();
-                                let credentials = crate::agent::config::try_resolve_model_credentials_with_source(model_name.as_str(), session_key)
-                                    .map(|(r, source)| existing.clone().rebind(r.api_key, r.auth_type, source))
-                                    .unwrap_or(existing);
+                                let (cfg, existing) = apply_opaque_model_name_override(
+                                    cfg,
+                                    existing,
+                                    model_name,
+                                    extra_headers,
+                                    context_window,
+                                    session.compaction.context_window_override.is_some(),
+                                );
                                 session
                                     .chat_state_handle
-                                    .update_sampling_config_and_credentials(cfg, credentials);
-                                // Credentials changed under a possibly-unchanged model id.
+                                    .update_sampling_config_and_credentials(cfg, existing);
+                                // Route headers changed under a possibly-unchanged model id.
                                 session.invalidate_model_auth_memo();
                             }
                         }

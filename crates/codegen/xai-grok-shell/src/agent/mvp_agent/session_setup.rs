@@ -483,6 +483,7 @@ impl MvpAgent {
                     session_meta: arguments.meta.as_ref(),
                     managed_mcp_expires_at,
                     model_agent_type: model_agent_type.as_deref(),
+                    persisted_catalog_identity: None,
                     session_model_id,
                     session_yolo_mode,
                     session_auto_mode: session_auto_mode && !session_yolo_mode,
@@ -875,6 +876,10 @@ impl MvpAgent {
                     session_meta: request_meta.as_ref(),
                     managed_mcp_expires_at,
                     model_agent_type: persisted_agent_name.as_deref(),
+                    persisted_catalog_identity: summary
+                        .catalog_identity
+                        .clone()
+                        .filter(|identity| identity.model_id == summary.current_model_id.0.as_ref()),
                     session_model_id: summary.current_model_id.clone(),
                     session_yolo_mode,
                     session_auto_mode: session_auto_mode && !session_yolo_mode,
