@@ -838,25 +838,31 @@ async fn read_parent_sampling_config(
             let preferred_model_id = committed_model_id
                 .as_deref()
                 .unwrap_or(ctx.model_id.0.as_ref());
-            let committed_matches_baseline = committed_model_id
-                .as_deref()
-                .is_some_and(|id| id == ctx.sampling_config_model_id.0.as_ref());
-            let opaque_model_name_override =
-                committed_matches_baseline && ctx.sampling_config.model != cfg.model;
+            let retained_catalog_route = crate::agent::models::resolve_catalog_key(
+                &ctx.available_models,
+                &acp::ModelId::new(preferred_model_id),
+            )
+            .and_then(|key| ctx.available_models.get(key.0.as_ref()))
+            .map(|entry| entry.info().model.as_str());
+            let opaque_model_name_override = retained_catalog_route.is_some()
+                && !ctx
+                    .available_models
+                    .values()
+                    .any(|entry| entry.info().model == cfg.model);
             let capabilities = ctx.models_manager.capabilities_for_route(
                 Some(preferred_model_id),
                 &cfg.model,
                 committed_model_id.is_some(),
-                opaque_model_name_override.then_some(ctx.sampling_config.model.as_str()),
+                opaque_model_name_override
+                    .then_some(retained_catalog_route)
+                    .flatten(),
             );
             let model_id = capabilities
                 .as_ref()
                 .map(|facts| facts.model_id.clone())
                 .unwrap_or_else(|| acp::ModelId::new(cfg.model.clone()));
-            let baseline_matches_live = committed_model_id.as_deref().map_or_else(
-                || ctx.sampling_config.model == cfg.model,
-                |committed_id| committed_id == ctx.sampling_config_model_id.0.as_ref(),
-            );
+            let baseline_matches_live =
+                preferred_model_id == ctx.sampling_config_model_id.0.as_ref();
             let creds = chat_state.get_credentials().await;
             let mut extra_headers = cfg.extra_headers;
             crate::agent::config::inject_url_derived_headers(

@@ -2492,7 +2492,6 @@ async fn read_parent_sampling_config_opaque_name_override_keeps_committed_capabi
     let chat = ctx.parent_chat_state.as_ref().expect("chat state");
     let mut snapshot = chat.snapshot().await.expect("chat snapshot");
     snapshot.sampling_config.model = "opaque-backend-routing-hint".to_string();
-    snapshot.catalog_model_id = Some("catalog-entry".to_string());
     chat.restore_snapshot(snapshot);
 
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
@@ -2501,6 +2500,37 @@ async fn read_parent_sampling_config_opaque_name_override_keeps_committed_capabi
     assert_eq!(config.model, "opaque-backend-routing-hint");
     assert!(config.supports_backend_search);
     assert_eq!(config.codex_wire, Some(committed_caps));
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_switched_entry_opaque_override_keeps_capabilities() {
+    let switched_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let mut switched = test_model_entry("switched-routing-model");
+    switched.info.codex_wire = Some(switched_caps.clone());
+    let mut models = indexmap::IndexMap::new();
+    models.insert("switched-entry".to_string(), switched);
+    let mut ctx = ctx_with_parent_chat_state(
+        "switched-entry",
+        "switched-routing-model",
+        "switched-entry",
+        models,
+    );
+    ctx.sampling_config_model_id = acp::ModelId::new("startup-entry");
+    ctx.sampling_config.model = "startup-routing-model".to_string();
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.sampling_config.model = "opaque-switched-routing-hint".to_string();
+    snapshot.catalog_model_id = Some("switched-entry".to_string());
+    chat.restore_snapshot(snapshot);
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "switched-entry");
+    assert_eq!(config.model, "opaque-switched-routing-hint");
+    assert_eq!(config.codex_wire, Some(switched_caps));
 }
 
 #[tokio::test]
@@ -2523,6 +2553,12 @@ async fn read_parent_sampling_config_opaque_override_rejects_reused_committed_ke
         "catalog-entry",
         models,
     );
+    let mut retained_models = indexmap::IndexMap::new();
+    retained_models.insert(
+        "catalog-entry".to_string(),
+        test_model_entry("original-routing-model"),
+    );
+    ctx.available_models = retained_models;
     ctx.sampling_config.model = "original-routing-model".to_string();
     ctx.sampling_config.codex_wire = Some(baseline_caps.clone());
     let chat = ctx.parent_chat_state.as_ref().expect("chat state");
