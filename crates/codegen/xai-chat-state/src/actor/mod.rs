@@ -77,10 +77,41 @@ impl ChatStateActor {
         event_tx: mpsc::UnboundedSender<ChatStateEvent>,
         cancellation_token: tokio_util::sync::CancellationToken,
     ) -> ChatStateHandle {
+        Self::spawn_with_pruning_and_catalog_identity(
+            initial_conversation,
+            sampling_config,
+            None,
+            pruning_config,
+            persistence,
+            event_tx,
+            cancellation_token,
+        )
+    }
+
+    /// Spawn with an initial catalog identity committed atomically with the
+    /// sampling config.
+    pub fn spawn_with_pruning_and_catalog_identity(
+        initial_conversation: Vec<ConversationItem>,
+        sampling_config: SamplingConfig,
+        catalog_identity: Option<(String, String)>,
+        pruning_config: PruningConfig,
+        persistence: Box<dyn ChatPersistence>,
+        event_tx: mpsc::UnboundedSender<ChatStateEvent>,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> ChatStateHandle {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
+        let state = match catalog_identity {
+            Some(catalog_identity) => ChatState::new_with_catalog_identity(
+                initial_conversation,
+                sampling_config,
+                Some(catalog_identity),
+            ),
+            None => ChatState::new(initial_conversation, sampling_config),
+        };
+
         let actor = ChatStateActor {
-            state: ChatState::new(initial_conversation, sampling_config),
+            state,
             pruning_config,
             persistence,
             cmd_rx,

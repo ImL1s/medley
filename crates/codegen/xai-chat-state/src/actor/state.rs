@@ -212,7 +212,17 @@ impl ChatState {
     /// `chat_history.jsonl` has an assistant message with tool call IDs that
     /// lack matching `ToolResult` entries. Without this, the in-memory state
     /// would carry broken conversation history until the next `build_request`.
-    pub fn new(mut conversation: Vec<ConversationItem>, sampling_config: SamplingConfig) -> Self {
+    pub fn new(conversation: Vec<ConversationItem>, sampling_config: SamplingConfig) -> Self {
+        Self::new_with_catalog_identity(conversation, sampling_config, None)
+    }
+
+    /// Create state with a catalog identity bound atomically to the initial
+    /// sampling config.
+    pub fn new_with_catalog_identity(
+        mut conversation: Vec<ConversationItem>,
+        sampling_config: SamplingConfig,
+        catalog_identity: Option<(String, String)>,
+    ) -> Self {
         let deduped = dedup_duplicate_tool_results(&mut conversation);
         if deduped > 0 {
             tracing::info!(
@@ -231,11 +241,14 @@ impl ChatState {
 
         let initial_tokens = estimate_conversation_tokens(&conversation);
 
+        let (catalog_model_id, catalog_model_route) = catalog_identity
+            .map(|(id, route)| (Some(id), Some(route)))
+            .unwrap_or_default();
         Self {
             conversation,
             sampling_config,
-            catalog_model_id: None,
-            catalog_model_route: None,
+            catalog_model_id,
+            catalog_model_route,
             prompt_index: 0,
             prompt_texts: Vec::new(),
             total_tokens: initial_tokens,
@@ -307,6 +320,20 @@ mod tests {
         assert!(state.stream_start_ms.is_none());
         assert!(state.turn_start_ms.is_none());
         assert!(state.last_compaction_prompt_index.is_none());
+
+        let catalog_state = ChatState::new_with_catalog_identity(
+            vec![],
+            test_sampling_config(),
+            Some(("profile-entry".to_string(), "profile-route".to_string())),
+        );
+        assert_eq!(
+            catalog_state.catalog_model_id.as_deref(),
+            Some("profile-entry")
+        );
+        assert_eq!(
+            catalog_state.catalog_model_route.as_deref(),
+            Some("profile-route")
+        );
     }
 
     #[test]

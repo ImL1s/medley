@@ -584,9 +584,14 @@ pub(crate) async fn spawn_session_actor(
         hard_clear_age_turns: session_pruning_config.hard_clear_age_turns,
     };
     let (chat_state_event_tx, chat_state_event_rx) = mpsc::unbounded_channel();
-    let chat_state_handle = xai_chat_state::ChatStateActor::spawn_with_pruning(
+    let initial_catalog_identity = Some((
+        session_model_id.0.to_string(),
+        chat_state_sampling_config.model.clone(),
+    ));
+    let chat_state_handle = xai_chat_state::ChatStateActor::spawn_with_pruning_and_catalog_identity(
         conversation.clone(),
         chat_state_sampling_config,
+        initial_catalog_identity,
         actor_pruning_config,
         Box::new(super::chat_persistence::ChannelChatPersistence::new(
             persistence.tx.clone(),
