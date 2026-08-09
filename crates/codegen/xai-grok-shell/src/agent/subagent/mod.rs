@@ -1009,20 +1009,20 @@ async fn read_parent_sampling_config(
     }
     fallback.supports_backend_search = ctx
         .models_manager
-        .model_supports_backend_search(ctx.model_id.0.as_ref());
+        .model_supports_backend_search(ctx.sampling_config_model_id.0.as_ref());
     fallback.compactions_remaining = ctx
         .models_manager
-        .model_compactions_remaining(ctx.model_id.0.as_ref());
+        .model_compactions_remaining(ctx.sampling_config_model_id.0.as_ref());
     fallback.compaction_at_tokens = ctx
         .models_manager
-        .model_compaction_at_tokens(ctx.model_id.0.as_ref());
+        .model_compaction_at_tokens(ctx.sampling_config_model_id.0.as_ref());
     // The three lines above already re-resolve catalog facts here;
     // `codex_wire` is one too, and cloning the parent's would reintroduce
     // #277 on the path taken whenever the parent's chat-state actor is
     // unavailable — which `try_build_subagent_spawn_context` does not bail
     // on, so a nested child outliving its parent lands here for real.
-    fallback.codex_wire = subagent_codex_wire(ctx, ctx.model_id.0.as_ref());
-    (fallback, ctx.model_id.clone())
+    fallback.codex_wire = subagent_codex_wire(ctx, ctx.sampling_config_model_id.0.as_ref());
+    (fallback, ctx.sampling_config_model_id.clone())
 }
 
 /// Wire capabilities for the subagent's **own** model.

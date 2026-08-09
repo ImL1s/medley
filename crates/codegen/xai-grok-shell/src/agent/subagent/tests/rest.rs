@@ -1824,6 +1824,7 @@ async fn read_parent_sampling_config_fallback_uses_session_model_id() {
     models.insert("composer-2-fast".to_string(), test_model_entry("composer-2-fast"));
     let mut ctx = ctx_with_toggle(HashMap::new());
     ctx.model_id = acp::ModelId::new("composer-2-fast");
+    ctx.sampling_config_model_id = acp::ModelId::new("composer-2-fast");
     ctx.parent_chat_state = None;
     ctx.sampling_config.model = "composer-2-fast".to_string();
     ctx.available_models = models;
@@ -1838,6 +1839,43 @@ async fn read_parent_sampling_config_fallback_uses_session_model_id() {
     assert_eq!(config.model, "composer-2-fast");
     assert_eq!(model_id.0.as_ref(), "composer-2-fast");
     assert_ne!(model_id.0.as_ref(), "auto");
+}
+
+#[tokio::test]
+async fn read_parent_sampling_config_fallback_binds_caps_to_startup_model() {
+    let startup_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let switched_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut startup = test_model_entry("startup-routing-model");
+    startup.info.codex_wire = Some(startup_caps.clone());
+    let mut switched = test_model_entry("switched-routing-model");
+    switched.info.codex_wire = Some(switched_caps);
+    let mut models = indexmap::IndexMap::new();
+    models.insert("startup-model".to_string(), startup);
+    models.insert("switched-model".to_string(), switched);
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.parent_chat_state = None;
+    ctx.model_id = acp::ModelId::new("switched-model");
+    ctx.sampling_config_model_id = acp::ModelId::new("startup-model");
+    ctx.sampling_config.model = "startup-routing-model".to_string();
+    ctx.models_manager = crate::agent::models::ModelsManager::new(
+        None,
+        models,
+        acp::ModelId::new("switched-model"),
+        ctx.auth_manager.clone(),
+        crate::agent::config::Config::default(),
+    );
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "startup-model");
+    assert_eq!(config.model, "startup-routing-model");
+    assert_eq!(config.codex_wire, Some(startup_caps));
 }
 #[tokio::test]
 async fn read_parent_sampling_config_ignores_global_default() {
@@ -2251,6 +2289,7 @@ async fn read_parent_sampling_config_fallback_resolves_backend_search_from_catal
     models.insert("composer-2-fast".to_string(), entry);
     let mut ctx = ctx_with_toggle(HashMap::new());
     ctx.model_id = acp::ModelId::new("composer-2-fast");
+    ctx.sampling_config_model_id = acp::ModelId::new("composer-2-fast");
     ctx.parent_chat_state = None;
     ctx.sampling_config.model = "composer-2-fast".to_string();
     ctx.sampling_config.supports_backend_search = false;
@@ -2333,35 +2372,6 @@ async fn read_parent_sampling_config_catalog_miss_keeps_parent_wire_for_the_same
         config.codex_wire,
         Some(parent_caps),
         "same model, catalog miss: the parent's value is the right one"
-    );
-}
-
-/// ...but that fallback must not become a back door to #277. When the
-/// models differ, a catalog miss yields `None` rather than the parent's
-/// capabilities, which are exactly what must not be inherited.
-#[tokio::test]
-async fn read_parent_sampling_config_catalog_miss_never_inherits_wire_across_models() {
-    let parent_caps = xai_grok_sampling_types::CodexWireCapabilities {
-        supports_reasoning_summary_parameter: Some(true),
-        ..Default::default()
-    };
-    let mut ctx = ctx_with_toggle(HashMap::new());
-    ctx.model_id = acp::ModelId::new("a-different-model");
-    ctx.sampling_config_model_id = acp::ModelId::new("the-parents-model");
-    ctx.parent_chat_state = None;
-    ctx.sampling_config.model = "the-parents-model".to_string();
-    ctx.sampling_config.codex_wire = Some(parent_caps);
-    ctx.models_manager = crate::agent::models::ModelsManager::new(
-        None,
-        indexmap::IndexMap::new(),
-        acp::ModelId::new("the-parents-model"),
-        ctx.auth_manager.clone(),
-        crate::agent::config::Config::default(),
-    );
-    let (config, _model_id) = read_parent_sampling_config(&ctx).await;
-    assert_eq!(
-        config.codex_wire, None,
-        "different model: no capabilities beats the wrong model's capabilities"
     );
 }
 
@@ -2496,6 +2506,7 @@ async fn read_parent_sampling_config_fallback_resolves_compactions_remaining_fro
     models.insert("composer-2-fast".to_string(), entry);
     let mut ctx = ctx_with_toggle(HashMap::new());
     ctx.model_id = acp::ModelId::new("composer-2-fast");
+    ctx.sampling_config_model_id = acp::ModelId::new("composer-2-fast");
     ctx.parent_chat_state = None;
     ctx.sampling_config.model = "composer-2-fast".to_string();
     ctx.sampling_config.compactions_remaining = None;
