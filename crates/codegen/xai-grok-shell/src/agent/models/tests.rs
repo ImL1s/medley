@@ -612,6 +612,97 @@ fn reselect_missing_current_model_bumps_watch() {
     );
 }
 
+/// #296: once a non-empty runtime catalog is authoritative, the manager must
+/// never retain or synthesize a current id that is absent from that catalog.
+/// Even an all-unready catalog has more truthful identities than the bundled
+/// pre-catalog sentinel: seating a real entry lets the UI surface its concrete
+/// readiness reason and keeps the session catalog id aligned with its route.
+#[test]
+fn authoritative_all_unready_catalog_seats_a_present_model_id() {
+    let mgr = test_manager();
+    let cfg = config::Config::default();
+    let mut entry = make_model_entry("unready-runtime-model");
+    entry
+        .config_validation_errors
+        .push("fixture intentionally unready".to_string());
+    let catalog = IndexMap::from([("unready-runtime-model".to_string(), entry)]);
+
+    mgr.apply_refresh_result(&cfg, Some(catalog), None);
+
+    let current = mgr.current_model_id();
+    assert_eq!(current.0.as_ref(), "unready-runtime-model");
+    assert!(
+        mgr.models().contains_key(current.0.as_ref()),
+        "an authoritative catalog must never publish an absent current id"
+    );
+    let listed = mgr
+        .available()
+        .get(&current)
+        .cloned()
+        .expect("the seated runtime model must remain visible to the client");
+    let meta = listed
+        .meta
+        .expect("an unready model must expose readiness meta");
+    assert_eq!(meta.get("ready"), Some(&serde_json::json!(false)));
+    assert_eq!(
+        meta.get("readinessReason"),
+        Some(&serde_json::json!("fixture intentionally unready")),
+        "the TUI must receive the concrete reason instead of rendering an unknown model"
+    );
+}
+
+/// A non-empty catalog can still have no entry the current credential is
+/// allowed to select (for example, an API-key session receiving only
+/// OAuth-only entries). That state must not seat or sample an auth-hidden
+/// model merely to keep the internal id inside the raw catalog.
+#[test]
+fn authoritative_catalog_without_auth_visible_model_fails_closed() {
+    let mgr = test_manager();
+    let cfg = config::Config::default();
+    let mut oauth_only = make_model_entry("oauth-only");
+    oauth_only.info.supported_in_api = false;
+
+    mgr.apply_refresh_result(
+        &cfg,
+        Some(IndexMap::from([("oauth-only".to_string(), oauth_only)])),
+        None,
+    );
+
+    assert!(mgr.available().is_empty());
+    assert!(
+        mgr.current_model_id().0.is_empty(),
+        "an auth-hidden catalog entry must not become the current model"
+    );
+    let sampling = mgr.sampling_config();
+    assert!(
+        sampling.base_url.is_empty(),
+        "an auth-hidden catalog must fail before any provider request"
+    );
+    assert_eq!(sampling.api_key, None);
+}
+
+#[test]
+fn authoritative_catalog_without_user_selectable_model_fails_closed() {
+    let mgr = test_manager();
+    let cfg = config_from_toml("[models]\nallowed_models = [\"allowed-*\"]");
+    let hidden_from_picker = make_model_entry("not-selectable");
+
+    mgr.apply_refresh_result(
+        &cfg,
+        Some(IndexMap::from([(
+            "not-selectable".to_string(),
+            hidden_from_picker,
+        )])),
+        None,
+    );
+
+    assert!(mgr.available().is_empty());
+    assert!(mgr.current_model_id().0.is_empty());
+    let sampling = mgr.sampling_config();
+    assert!(sampling.base_url.is_empty());
+    assert_eq!(sampling.api_key, None);
+}
+
 #[test]
 fn rebuild_updates_models_and_available() {
     let mgr = test_manager();

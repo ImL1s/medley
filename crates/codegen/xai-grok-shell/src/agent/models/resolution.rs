@@ -332,6 +332,69 @@ pub(crate) fn resolve_default_model(
     }
 }
 
+/// Resolve the default while preserving the authoritative-catalog identity
+/// invariant.
+///
+/// Before a real catalog arrives, [`resolve_default_model`] may synthesize the
+/// bundled default as a safe startup sentinel when every locally known entry
+/// is unready. Once a non-empty runtime catalog is authoritative, that same
+/// sentinel would be absent from `catalog`: session setup could then persist
+/// the synthetic id while sampling independently falls back to a real route.
+/// Keep the pre-catalog safety behavior, but seat an actual catalog entry once
+/// the caller says the snapshot is authoritative and at least one entry is
+/// selectable for the current auth mode (#296). An authoritative catalog with
+/// no auth-visible entry publishes the established empty-current state rather
+/// than seating a model the picker deliberately hides.
+pub(crate) fn resolve_default_model_for_catalog(
+    cfg: &config::Config,
+    catalog: &IndexMap<String, ModelEntry>,
+    is_session_auth: bool,
+    authoritative: bool,
+) -> (String, ModelEntry, config::ConfigSource, Option<String>) {
+    let resolved = resolve_default_model(cfg, catalog, is_session_auth);
+    if !authoritative || catalog.is_empty() {
+        return resolved;
+    }
+
+    if catalog.get(&resolved.0).is_some_and(|entry| {
+        entry.info.user_selectable && entry.info.visible_for_auth(is_session_auth)
+    }) {
+        return resolved;
+    }
+
+    let Some((key, entry)) = catalog.iter().find(|(_, entry)| {
+        entry.info.user_selectable && entry.info.visible_for_auth(is_session_auth)
+    }) else {
+        let reason = "no model is selectable for the current authentication mode".to_owned();
+        let mut sentinel = ModelEntry::fallback("", &cfg.endpoints);
+        sentinel.info.user_selectable = false;
+        sentinel.config_validation_errors.push(reason.clone());
+        tracing::error!(
+            synthetic_model_id = %resolved.0,
+            "authoritative catalog has no auth-visible selectable model; publishing an empty current model"
+        );
+        return (
+            String::new(),
+            sentinel,
+            config::ConfigSource::Default,
+            Some(reason),
+        );
+    };
+    let (ready, reason) = crate::agent::config::model_readiness(entry);
+    let reason = (!ready).then(|| reason.unwrap_or_else(|| "model is not ready".to_owned()));
+    tracing::warn!(
+        synthetic_model_id = %resolved.0,
+        selected_model_id = %key,
+        "authoritative catalog has no ready default; seating a present model so identity and readiness stay observable"
+    );
+    (
+        key.clone(),
+        entry.clone(),
+        config::ConfigSource::Default,
+        reason,
+    )
+}
+
 /// The default-model preference the user configured, in precedence order
 /// (`--model` override, `GROK_DEFAULT_MODEL`, `[models] default`, remote).
 ///

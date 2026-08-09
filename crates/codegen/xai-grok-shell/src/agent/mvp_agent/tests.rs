@@ -1862,6 +1862,34 @@ async fn set_session_model_does_not_cross_contaminate() {
     );
 }
 #[tokio::test]
+async fn unresolved_empty_current_model_uses_live_fail_closed_sampling_config() {
+    use crate::agent::config::{EndpointsConfig, ModelEntry};
+
+    let agent = build_minimal_agent_for_tests();
+    assert!(
+        !agent.sampling_config.borrow().base_url.is_empty(),
+        "the fixture must retain a usable startup route to expose a stale fallback"
+    );
+
+    let mut oauth_only = ModelEntry::fallback("oauth-only", &EndpointsConfig::default());
+    oauth_only.info.supported_in_api = false;
+    agent
+        .models_manager
+        .apply_catalog_for_test(indexmap::IndexMap::from([(
+            "oauth-only".to_owned(),
+            oauth_only,
+        )]));
+
+    let current = agent.models_manager.current_model_id();
+    assert!(current.0.is_empty());
+    let sampling = agent.resolve_sampling_config_for_model(&current, None);
+    assert!(
+        sampling.base_url.is_empty(),
+        "an empty current id must not fall back to the stale startup endpoint"
+    );
+    assert_eq!(sampling.api_key, None);
+}
+#[tokio::test]
 async fn model_state_prefers_session_reasoning_effort_over_global() {
     use crate::agent::config::{EndpointsConfig, ModelEntry};
     use xai_grok_sampling_types::{REASONING_EFFORT_META_KEY, ReasoningEffort};

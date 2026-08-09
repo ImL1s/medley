@@ -111,6 +111,19 @@ pub struct ContentController {
 }
 
 impl ContentController {
+    fn keyless_loopback_models(models: Vec<MockModel>) -> Vec<MockModel> {
+        models
+            .into_iter()
+            .map(|model| {
+                if model.auth_scheme.is_some() {
+                    model
+                } else {
+                    model.with_auth_scheme("none")
+                }
+            })
+            .collect()
+    }
+
     /// Start the mock inference server on a random local port.
     ///
     /// Must be called from within a tokio runtime.
@@ -122,6 +135,10 @@ impl ContentController {
     /// `GET /v1/models`. Use [`MockModel::with_agent_type`] to configure
     /// models with different harness types for agent-type-mismatch tests.
     pub async fn start_with_models(models: Vec<MockModel>) -> Result<Self> {
+        // The loopback fixture is deliberately keyless. Declare that on every
+        // model that did not opt into another scheme so credential-origin
+        // hardening never has to trust localhost or forward the fake xAI key.
+        let models = Self::keyless_loopback_models(models);
         let server = MockInferenceServer::start_with_models(models)
             .await
             .context("start mock inference server")?;
@@ -159,6 +176,14 @@ impl ContentController {
     /// requests will stream this text word-by-word.
     pub fn set_response(&self, text: impl Into<String>) {
         self.server.set_response(text);
+    }
+
+    /// Replace the mocked model catalog while preserving the controller's
+    /// keyless-loopback default for entries that do not opt into another auth
+    /// scheme.
+    pub fn set_models(&self, models: Vec<MockModel>) {
+        self.server
+            .set_models(Self::keyless_loopback_models(models));
     }
 
     /// Queue a compatibility response for the next request on `path`.
@@ -372,6 +397,24 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body, serde_json::json!({ "allow_access": true }));
+    }
+
+    #[tokio::test]
+    async fn replacement_models_keep_keyless_loopback_default() {
+        let content = ContentController::start().await.unwrap();
+        content.set_models(vec![
+            MockModel::new("implicit-keyless"),
+            MockModel::new("explicit-bearer").with_auth_scheme("bearer"),
+        ]);
+
+        let body: serde_json::Value = reqwest::get(format!("{}/models", content.url()))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["data"][0]["authScheme"], "none");
+        assert_eq!(body["data"][1]["authScheme"], "bearer");
     }
 
     /// The pre-delegation mock streamed a fixed default text to every

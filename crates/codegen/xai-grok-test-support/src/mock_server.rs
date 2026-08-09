@@ -108,6 +108,7 @@ pub struct MockModelEntry {
     pub id: String,
     pub agent_type: Option<String>,
     pub api_backend: Option<String>,
+    pub auth_scheme: Option<String>,
     pub supports_backend_search: bool,
     pub supports_reasoning_effort: bool,
     pub reasoning_effort: Option<String>,
@@ -122,6 +123,7 @@ impl MockModelEntry {
             id: id.into(),
             agent_type: None,
             api_backend: None,
+            auth_scheme: None,
             supports_backend_search: false,
             supports_reasoning_effort: false,
             reasoning_effort: None,
@@ -138,6 +140,11 @@ impl MockModelEntry {
 
     pub fn with_api_backend(mut self, api_backend: impl Into<String>) -> Self {
         self.api_backend = Some(api_backend.into());
+        self
+    }
+
+    pub fn with_auth_scheme(mut self, auth_scheme: impl Into<String>) -> Self {
+        self.auth_scheme = Some(auth_scheme.into());
         self
     }
 
@@ -173,6 +180,9 @@ impl MockModelEntry {
         }
         if let Some(ref backend) = self.api_backend {
             obj["apiBackend"] = json!(backend);
+        }
+        if let Some(ref auth_scheme) = self.auth_scheme {
+            obj["authScheme"] = json!(auth_scheme);
         }
         if self.supports_backend_search {
             obj["supportsBackendSearch"] = json!(true);
@@ -1054,6 +1064,12 @@ mod tests {
 
     const MERMAID_TEXT: &str =
         "Here is a flow:\n\n```mermaid\nflowchart TD\n  A --> B\n```\n\nDone.\n";
+
+    #[test]
+    fn mock_model_emits_explicit_auth_scheme() {
+        let model = MockModelEntry::new("local-model").with_auth_scheme("none");
+        assert_eq!(model.to_json()["authScheme"], "none");
+    }
 
     /// Payloads of all `data:` lines in an SSE body, minus the `[DONE]` marker.
     fn sse_data_payloads(body: &str) -> Vec<String> {
