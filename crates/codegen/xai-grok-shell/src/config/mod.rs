@@ -1093,14 +1093,14 @@ impl StorageMode {
 }
 pub use xai_grok_config::ConfigLayers;
 pub use xai_grok_config::{
-    MDM_REQUIREMENTS_SOURCE, RequirementsLayer, RequirementsSource, ServingIdentity, SyncMarker,
-    claude_managed_settings_probe_path, confirmed_team_switch, confirmed_team_switch_at,
-    is_managed_config_hard_stale_for, is_managed_config_stale_for, load_config_file,
-    load_from_disk, load_managed_config, load_merged_requirements, load_system_managed_config,
-    load_toml_file, managed_config_identity_changed_at, managed_deployment_id,
-    managed_policy_compromised_for, mark_managed_config_synced, mark_managed_config_synced_at,
-    normalize_identity, requirements_layers, system_config_dir, try_requirements_layers,
-    user_grok_home,
+    MDM_REQUIREMENTS_SOURCE, RequirementsLayer, RequirementsLayerLoad, RequirementsSource,
+    ServingIdentity, SyncMarker, claude_managed_settings_probe_path, confirmed_team_switch,
+    confirmed_team_switch_at, is_managed_config_hard_stale_for, is_managed_config_stale_for,
+    load_config_file, load_from_disk, load_managed_config, load_merged_requirements,
+    load_system_managed_config, load_toml_file, managed_config_identity_changed_at,
+    managed_deployment_id, managed_policy_compromised_for, mark_managed_config_synced,
+    mark_managed_config_synced_at, normalize_identity, requirements_layers, system_config_dir,
+    try_requirements_layers, user_grok_home,
 };
 /// Map of "dotted.path" to which config file the value came from.
 pub(crate) fn config_origins(
@@ -1253,20 +1253,34 @@ pub(crate) fn apply_requirements(config: &mut crate::agent::config::Config) -> V
 
 fn apply_loaded_requirements(
     config: &mut crate::agent::config::Config,
-    layers: Option<Vec<RequirementsLayer>>,
+    loads: Vec<RequirementsLayerLoad>,
 ) -> Vec<EnforcedField> {
-    let Some(layers) = layers else {
+    let last_rejection = loads
+        .iter()
+        .rposition(|load| matches!(load, RequirementsLayerLoad::Rejected(_)));
+    if last_rejection.is_some() {
         tracing::warn!(
-            "requirements reload rejected; preserving last-known-good auxiliary model pins"
+            "requirements reload partially rejected; preserving last-known-good auxiliary model \
+             pins and applying only higher-priority accepted layers"
         );
-        return Vec::new();
-    };
-    // Refresh replaces the active requirement layers. Clear pins that may have
-    // disappeared before applying the current layers so removed policy cannot
-    // survive in this reused Config.
-    config.requirements.clear_auxiliary_model_pins();
-    layers
+    } else {
+        // Refresh replaces the active requirement layers. Clear pins that may have
+        // disappeared before applying the current layers so removed policy cannot
+        // survive in this reused Config.
+        config.requirements.clear_auxiliary_model_pins();
+    }
+    loads
         .into_iter()
+        .enumerate()
+        .filter_map(|(index, load)| {
+            if last_rejection.is_some_and(|rejected| index <= rejected) {
+                return None;
+            }
+            match load {
+                RequirementsLayerLoad::Loaded(layer) => Some(layer),
+                RequirementsLayerLoad::Rejected(_) => None,
+            }
+        })
         .flat_map(|layer| {
             apply_requirements_inner(
                 config,

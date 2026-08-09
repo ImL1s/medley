@@ -3490,7 +3490,14 @@ fn rejected_requirements_reload_preserves_auxiliary_pins() {
         .image_description_model
         .pin("required-image".to_owned(), source);
 
-    let enforced = apply_loaded_requirements(&mut cfg, None);
+    let enforced = apply_loaded_requirements(
+        &mut cfg,
+        vec![RequirementsLayerLoad::Rejected(
+            xai_grok_config::RequirementsSource::File(std::path::PathBuf::from(
+                "/test/requirements.toml",
+            )),
+        )],
+    );
 
     assert!(enforced.is_empty());
     assert_eq!(
@@ -3504,6 +3511,79 @@ fn rejected_requirements_reload_preserves_auxiliary_pins() {
     assert_eq!(
         cfg.requirements.image_description_model.pinned().as_deref(),
         Some("required-image")
+    );
+}
+
+#[test]
+fn rejected_user_requirements_still_apply_trusted_system_layer() {
+    let mut cfg = crate::agent::config::Config::default();
+    let old_source = RequirementSource::Requirements {
+        path: std::path::PathBuf::from("/test/user/requirements.toml"),
+    };
+    cfg.requirements
+        .web_search_model
+        .pin("old-user-search".to_owned(), old_source);
+
+    let system: toml::Value = toml::from_str(
+        "[models]\nweb_search = \"required-system-search\"\n",
+    )
+    .unwrap();
+    let enforced = apply_loaded_requirements(
+        &mut cfg,
+        vec![
+            RequirementsLayerLoad::Rejected(xai_grok_config::RequirementsSource::File(
+                std::path::PathBuf::from("/test/user/requirements.toml"),
+            )),
+            RequirementsLayerLoad::Loaded(RequirementsLayer {
+                value: system,
+                source: xai_grok_config::RequirementsSource::File(std::path::PathBuf::from(
+                    "/test/system/requirements.toml",
+                )),
+                is_system: true,
+            }),
+        ],
+    );
+
+    assert_eq!(
+        cfg.requirements.web_search_model.pinned().as_deref(),
+        Some("required-system-search")
+    );
+    assert!(enforced.iter().any(|field| field.path == "models.web_search"));
+}
+
+#[test]
+fn rejected_system_requirements_do_not_replace_prior_pin_with_user_layer() {
+    let mut cfg = crate::agent::config::Config::default();
+    let system_path = std::path::PathBuf::from("/test/system/requirements.toml");
+    cfg.requirements.web_search_model.pin(
+        "old-system-search".to_owned(),
+        RequirementSource::Requirements {
+            path: system_path.clone(),
+        },
+    );
+
+    let user: toml::Value =
+        toml::from_str("[models]\nweb_search = \"new-user-search\"\n").unwrap();
+    let enforced = apply_loaded_requirements(
+        &mut cfg,
+        vec![
+            RequirementsLayerLoad::Loaded(RequirementsLayer {
+                value: user,
+                source: xai_grok_config::RequirementsSource::File(std::path::PathBuf::from(
+                    "/test/user/requirements.toml",
+                )),
+                is_system: false,
+            }),
+            RequirementsLayerLoad::Rejected(xai_grok_config::RequirementsSource::File(
+                system_path,
+            )),
+        ],
+    );
+
+    assert!(enforced.is_empty());
+    assert_eq!(
+        cfg.requirements.web_search_model.pinned().as_deref(),
+        Some("old-system-search")
     );
 }
 /// Strict precedence: requirement always wins (covers from-None and
