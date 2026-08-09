@@ -18,6 +18,12 @@ fn byok_from_models(
         .or_else(|| models.get(current).and_then(|m| m.own_credential()))
         .or_else(|| models.values().find_map(|m| m.own_credential()))
 }
+fn summary_config_or_primary(
+    primary: &SamplingConfig,
+    resolved: Option<SamplingConfig>,
+) -> SamplingConfig {
+    resolved.unwrap_or_else(|| primary.clone())
+}
 struct MissingSessionCtx {
     has_session_key: bool,
     has_own_credentials: bool,
@@ -150,7 +156,7 @@ impl MvpAgent {
                 cfg.client_version.clone(),
             )
         };
-        let config = match crate::agent::config::resolve_aux_model_sampling_config_preflight(
+        let resolved = crate::agent::config::resolve_aux_model_sampling_config_preflight(
             &slug,
             &models,
             &endpoints,
@@ -160,22 +166,16 @@ impl MvpAgent {
             client_version,
         )
         .await
-        {
-            Some(mut cfg) => {
-                crate::agent::config::stamp_session_local_sampler_fields(
-                    &mut cfg,
-                    primary,
-                    primary.client_identifier.clone(),
-                    primary.max_retries,
-                );
-                cfg
-            }
-            None => {
-                let mut fallback = primary.clone();
-                fallback.model = slug;
-                fallback
-            }
-        };
+        .map(|mut cfg| {
+            crate::agent::config::stamp_session_local_sampler_fields(
+                &mut cfg,
+                primary,
+                primary.client_identifier.clone(),
+                primary.max_retries,
+            );
+            cfg
+        });
+        let config = summary_config_or_primary(primary, resolved);
         let model = config.model.clone();
         let client = OaiCompatClient::new(config).map_err(map_sampling_err_to_acp)?;
         Ok((client, model))
@@ -5503,5 +5503,22 @@ impl Drop for LocalWorkspaceReapGuard {
                 handle.shutdown().await;
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod summary_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn model_overrides_unresolved_summary_route_keeps_primary_model() {
+        let primary = SamplingConfig {
+            model: "operative-session-model".to_owned(),
+            ..Default::default()
+        };
+
+        let fallback = summary_config_or_primary(&primary, None);
+
+        assert_eq!(fallback.model, "operative-session-model");
     }
 }
