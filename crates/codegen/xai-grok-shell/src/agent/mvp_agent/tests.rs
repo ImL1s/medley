@@ -3500,6 +3500,10 @@ fn attach_restore_unique_route_ignores_reused_key_endpoint_and_secret() {
         replacement.info.model = "retained-route".to_owned();
         replacement.info.base_url = "https://retained.example/v1".to_owned();
         replacement.api_key = Some("retained-secret".to_owned());
+        let mut refreshed_reuse = replacement.clone();
+        refreshed_reuse.info.model = "refreshed-foreign-route".to_owned();
+        refreshed_reuse.info.base_url = "https://refreshed-foreign.example/v1".to_owned();
+        refreshed_reuse.api_key = Some("refreshed-foreign-secret".to_owned());
         agent
             .models_manager
             .insert_test_entry("replacement-key", replacement);
@@ -3511,10 +3515,15 @@ fn attach_restore_unique_route_ignores_reused_key_endpoint_and_secret() {
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         handle.cmd_tx = cmd_tx;
         agent.session_registry.put_resident(&sid, handle);
+        let models_manager = agent.models_manager.clone();
         tokio::task::spawn_local(async move {
             while let Some(command) = cmd_rx.recv().await {
                 match command {
                     TestSessionCommand::GetActiveAgent { responds_to } => {
+                        // Simulate an etag refresh after restore reconciled the
+                        // persisted route but before the actor switch commits.
+                        models_manager
+                            .insert_test_entry("replacement-key", refreshed_reuse.clone());
                         let _ = responds_to.send(Some("grok-build".to_owned()));
                     }
                     TestSessionCommand::ApplyModelSwitch {
@@ -3534,6 +3543,10 @@ fn attach_restore_unique_route_ignores_reused_key_endpoint_and_secret() {
                         assert_ne!(
                             prepared.sampling_config.api_key.as_deref(),
                             Some("foreign-secret")
+                        );
+                        assert_ne!(
+                            prepared.sampling_config.api_key.as_deref(),
+                            Some("refreshed-foreign-secret")
                         );
                         let _ = responds_to.send(Ok(crate::session::AppliedModelSwitch {
                             previous_model_id: acp::ModelId::new("removed-key"),
@@ -3717,6 +3730,7 @@ fn load_restore_apply_bypasses_own_marker_and_preserves_request_order() {
                 &agent,
                 acp::SetSessionModelRequest::new(sid.clone(), acp::ModelId::new(restored_model)),
                 &guard,
+                None,
             )
             .await
             .expect("session/load restore must not wait on its own marker");

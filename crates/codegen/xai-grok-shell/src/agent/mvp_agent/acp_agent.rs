@@ -15,9 +15,18 @@ pub(super) async fn restore_registered_session_model(
     agent: &MvpAgent,
     request: acp::SetSessionModelRequest,
     load_guard: &SessionLoadGuard<'_>,
+    restored_model: Option<(
+        xai_chat_state::CatalogIdentity,
+        crate::agent::config::ModelEntry,
+    )>,
 ) -> Result<acp::SetSessionModelResponse, acp::Error> {
-    crate::agent::handlers::model_switch::apply_during_session_load(agent, request, load_guard)
-        .await
+    crate::agent::handlers::model_switch::apply_during_session_load(
+        agent,
+        request,
+        load_guard,
+        restored_model,
+    )
+    .await
 }
 
 /// Which `x_search` sub-tools enforce the date cutoff, sent in `initialize`. `x_user_search` and
@@ -2626,6 +2635,21 @@ impl acp::Agent for MvpAgent {
             final_model_id = %model_id.0,
             "load_session: resolved final model_id for set_session_model"
         );
+        let persisted_restore_identity = summary
+            .catalog_identity
+            .as_ref()
+            .filter(|identity| identity.model_id == summary.current_model_id.0.as_ref());
+        let restored_model = persisted_restore_identity
+            .and_then(|identity| {
+                crate::agent::models::reconcile_persisted_catalog_identity(&models, identity)
+            })
+            .filter(|identity| identity.model_id == model_id.0.as_ref())
+            .and_then(|identity| {
+                models
+                    .get(identity.model_id.as_str())
+                    .cloned()
+                    .map(|model| (identity, model))
+            });
         {
             let _timer = crate::instrumentation_timer!("session.restore_model");
             let restore_meta = summary
@@ -2638,13 +2662,19 @@ impl acp::Agent for MvpAgent {
                     );
                     map
                 });
-            let apply_result = restore_registered_session_model(
-                self,
-                acp::SetSessionModelRequest::new(session_id.to_owned(), model_id.clone())
-                    .meta(restore_meta),
-                &load_guard,
-            )
-            .await;
+            let apply_result = if persisted_restore_identity.is_some() && restored_model.is_none() {
+                Err(acp::Error::invalid_params()
+                    .data("persisted catalog identity changed before model restore"))
+            } else {
+                restore_registered_session_model(
+                    self,
+                    acp::SetSessionModelRequest::new(session_id.to_owned(), model_id.clone())
+                        .meta(restore_meta),
+                    &load_guard,
+                    restored_model,
+                )
+                .await
+            };
             if let Err(e) = apply_result {
                 tracing::warn!(
                     session_id = %session_id.0,

@@ -115,7 +115,7 @@ pub(crate) async fn apply(
     agent: &MvpAgent,
     args: acp::SetSessionModelRequest,
 ) -> Result<acp::SetSessionModelResponse, acp::Error> {
-    apply_with_load_gate(agent, args, None).await
+    apply_with_load_gate(agent, args, None, None).await
 }
 
 /// Apply the model restored by `session/load` while that load's guard is alive.
@@ -130,14 +130,16 @@ pub(crate) async fn apply_during_session_load(
     agent: &MvpAgent,
     args: acp::SetSessionModelRequest,
     load_guard: &SessionLoadGuard<'_>,
+    restored_model: Option<(xai_chat_state::CatalogIdentity, config::ModelEntry)>,
 ) -> Result<acp::SetSessionModelResponse, acp::Error> {
-    apply_with_load_gate(agent, args, Some(load_guard)).await
+    apply_with_load_gate(agent, args, Some(load_guard), restored_model).await
 }
 
 async fn apply_with_load_gate(
     agent: &MvpAgent,
     args: acp::SetSessionModelRequest,
     load_guard: Option<&SessionLoadGuard<'_>>,
+    restored_model: Option<(xai_chat_state::CatalogIdentity, config::ModelEntry)>,
 ) -> Result<acp::SetSessionModelResponse, acp::Error> {
     tracing::info!("Received set session model request {args:?}");
     tracing::debug!("session_session_model::mvp_agent: {:?}", &args);
@@ -164,31 +166,40 @@ async fn apply_with_load_gate(
     // outer-handle sequence with prompt intake and other model switches.
     let dispatch_lock = agent.dispatch_lock(&session_id);
     let _dispatch_guard = dispatch_lock.lock().await;
-    let models = agent.models_manager.models();
     let requested_model_str = requested_model_id.0.as_ref();
-    let slug_matches: Vec<String> = models
-        .iter()
-        .filter(|(_, entry)| entry.info().model == requested_model_str)
-        .map(|(key, _)| key.clone())
-        .collect();
-    let Some(catalog_identity) =
-        crate::agent::models::resolve_catalog_identity(&models, &requested_model_id)
-    else {
-        if !models.contains_key(requested_model_str) && slug_matches.len() > 1 {
-            return Err(acp::Error::invalid_params().data(format!(
-                "model slug '{}' matches multiple catalog ids: {}. \
-                 Choose an explicit catalog id.",
-                requested_model_str,
-                slug_matches.join(", ")
-            )));
+    let (catalog_identity, model) = if let Some((identity, model)) = restored_model {
+        if identity.model_id != requested_model_str || identity.route != model.info().model {
+            return Err(acp::Error::invalid_params()
+                .data("restored model no longer matches its committed catalog identity"));
         }
-        return Err(acp::Error::invalid_params().data("unknown model id"));
+        (identity, model)
+    } else {
+        let models = agent.models_manager.models();
+        let slug_matches: Vec<String> = models
+            .iter()
+            .filter(|(_, entry)| entry.info().model == requested_model_str)
+            .map(|(key, _)| key.clone())
+            .collect();
+        let Some(identity) =
+            crate::agent::models::resolve_catalog_identity(&models, &requested_model_id)
+        else {
+            if !models.contains_key(requested_model_str) && slug_matches.len() > 1 {
+                return Err(acp::Error::invalid_params().data(format!(
+                    "model slug '{}' matches multiple catalog ids: {}. \
+                     Choose an explicit catalog id.",
+                    requested_model_str,
+                    slug_matches.join(", ")
+                )));
+            }
+            return Err(acp::Error::invalid_params().data("unknown model id"));
+        };
+        let model = models
+            .get(identity.model_id.as_str())
+            .cloned()
+            .expect("resolve_catalog_key returned key present in models()");
+        (identity, model)
     };
     let catalog_model_id = acp::ModelId::new(catalog_identity.model_id.clone());
-    let model = models
-        .get(catalog_identity.model_id.as_str())
-        .cloned()
-        .expect("resolve_catalog_key returned key present in models()");
     failure_telemetry.new_model_id = catalog_model_id.0.to_string();
     let (ready, reason) = config::model_readiness(&model);
     if !ready {

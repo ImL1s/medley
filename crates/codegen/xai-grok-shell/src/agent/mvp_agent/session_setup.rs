@@ -1354,6 +1354,14 @@ impl MvpAgent {
             final_model_id = %model_id.0,
             "load_session: resolved final model_id for set_session_model"
         );
+        let restored_model = reconciled_catalog_identity
+            .filter(|identity| identity.model_id == model_id.0.as_ref())
+            .and_then(|identity| {
+                models
+                    .get(identity.model_id.as_str())
+                    .cloned()
+                    .map(|model| (identity, model))
+            });
         {
             let _timer = crate::instrumentation_timer!("session.restore_model");
             let restore_meta = summary.reasoning_effort.map(|effort| {
@@ -1369,6 +1377,7 @@ impl MvpAgent {
                 acp::SetSessionModelRequest::new(session_id.to_owned(), model_id)
                     .meta(restore_meta),
                 load_guard,
+                restored_model,
             )
             .await;
         }
