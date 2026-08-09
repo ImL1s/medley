@@ -1957,16 +1957,22 @@ pub struct Config {
     #[serde(skip)]
     pub web_search_model: String,
     #[serde(skip)]
+    pub web_search_model_explicit: bool,
+    #[serde(skip)]
     pub web_search_follows_default: bool,
     /// Session title model. Resolved to the compiled default
     /// (`default_session_summary_model`) when unset; see `ModelOverrideConfig::resolve`.
     #[serde(skip)]
     pub session_summary_model: Option<String>,
     #[serde(skip)]
+    pub session_summary_model_explicit: bool,
+    #[serde(skip)]
     pub session_summary_follows_default: bool,
     /// Image describe model (`grok-build` default via `ModelOverrideConfig::resolve`).
     #[serde(skip)]
     pub image_description_model: Option<String>,
+    #[serde(skip)]
+    pub image_description_model_explicit: bool,
     #[serde(skip)]
     pub image_description_follows_default: bool,
     /// Next-prompt suggestion model pin (`env > [models] prompt_suggestion >
@@ -2221,10 +2227,13 @@ impl Default for Config {
             compat_resolved: CompatConfig::default(),
             requirements: Requirements::default(),
             web_search_model: crate::models::default_web_search_model().to_owned(),
+            web_search_model_explicit: false,
             web_search_follows_default: false,
             session_summary_model: None,
+            session_summary_model_explicit: false,
             session_summary_follows_default: false,
             image_description_model: None,
+            image_description_model_explicit: false,
             image_description_follows_default: false,
             prompt_suggest_model_pin: crate::config::PromptSuggestModelPin::Unpinned,
         };
@@ -2508,10 +2517,13 @@ impl Config {
         let model_overrides =
             crate::config::ModelOverrideConfig::resolve(None, None, raw_config, None);
         config.web_search_model = model_overrides.web_search;
+        config.web_search_model_explicit = model_overrides.web_search_explicit;
         config.web_search_follows_default = model_overrides.web_search_follows_default;
         config.session_summary_model = model_overrides.session_summary;
+        config.session_summary_model_explicit = model_overrides.session_summary_explicit;
         config.session_summary_follows_default = model_overrides.session_summary_follows_default;
         config.image_description_model = model_overrides.image_description;
+        config.image_description_model_explicit = model_overrides.image_description_explicit;
         config.image_description_follows_default =
             model_overrides.image_description_follows_default;
         config.prompt_suggest_model_pin = model_overrides.prompt_suggestion;
@@ -2650,10 +2662,13 @@ impl Config {
             ctx.remote_settings,
         );
         self.web_search_model = models.web_search;
+        self.web_search_model_explicit = models.web_search_explicit;
         self.web_search_follows_default = models.web_search_follows_default;
         self.session_summary_model = models.session_summary;
+        self.session_summary_model_explicit = models.session_summary_explicit;
         self.session_summary_follows_default = models.session_summary_follows_default;
         self.image_description_model = models.image_description;
+        self.image_description_model_explicit = models.image_description_explicit;
         self.image_description_follows_default = models.image_description_follows_default;
         self.prompt_suggest_model_pin = models.prompt_suggestion;
         self.cli_experimental_memory = ctx.cli_experimental_memory;
@@ -2681,6 +2696,42 @@ impl Config {
             .value;
         self.compat_resolved = resolve_compat_config(&self.compat, ctx.remote_settings);
     }
+
+    pub(crate) fn rebind_unset_auxiliary_models_to_default(
+        &mut self,
+        effective_default: Option<&str>,
+    ) {
+        if !self.web_search_model_explicit {
+            if let Some(policy_model) = self.models.web_search.as_deref() {
+                self.web_search_model = policy_model.to_owned();
+                self.web_search_model_explicit = true;
+                self.web_search_follows_default = false;
+            } else if let Some(effective_default) = effective_default {
+                self.web_search_model = effective_default.to_owned();
+                self.web_search_follows_default = true;
+            }
+        }
+        if !self.session_summary_model_explicit {
+            if let Some(policy_model) = self.models.session_summary.as_deref() {
+                self.session_summary_model = Some(policy_model.to_owned());
+                self.session_summary_model_explicit = true;
+                self.session_summary_follows_default = false;
+            } else if let Some(effective_default) = effective_default {
+                self.session_summary_model = Some(effective_default.to_owned());
+                self.session_summary_follows_default = true;
+            }
+        }
+        if !self.image_description_model_explicit {
+            if let Some(policy_model) = self.models.image_description.as_deref() {
+                self.image_description_model = Some(policy_model.to_owned());
+                self.image_description_model_explicit = true;
+                self.image_description_follows_default = false;
+            } else if let Some(effective_default) = effective_default {
+                self.image_description_model = Some(effective_default.to_owned());
+                self.image_description_follows_default = true;
+            }
+        }
+    }
     /// Re-resolve eagerly-resolved runtime fields using the current `Config`
     /// state and fresh `raw_config`. Builds a [`RuntimeResolutionContext`] from
     /// the CLI flags already stored on this `Config`.
@@ -2706,6 +2757,9 @@ impl Config {
             storage_mode: None,
         };
         self.resolve_runtime_fields(&ctx);
+        let effective_default =
+            crate::agent::models::configured_preference(self).map(|preference| preference.value);
+        self.rebind_unset_auxiliary_models_to_default(effective_default.as_deref());
         crate::util::config::set_remote_campaigns_from_settings(self.remote_settings.as_ref());
     }
     /// If the TOML contains `[auth]`, copy its contents under `[grok_com_config]`.
@@ -16082,6 +16136,49 @@ hooks = true
         assert_eq!(
             cfg.image_description_model.as_deref(),
             Some("custom-default")
+        );
+        assert!(cfg.image_description_follows_default);
+    }
+    #[test]
+    #[serial]
+    fn model_overrides_policy_default_rebinds_only_unset_auxiliary_lanes() {
+        clear_runtime_env_vars();
+        let raw: toml::Value = toml::from_str(
+            r#"
+[models]
+web_search = "explicit-search"
+"#,
+        )
+        .unwrap();
+        let mut cfg = Config::new_from_toml_cfg(&raw).unwrap();
+        cfg.resolve_runtime_fields(&RuntimeResolutionContext {
+            raw_config: &raw,
+            remote_settings: None,
+            is_headless: false,
+            cli_subagents: None,
+            cli_web_search_model: None,
+            cli_session_summary_model: None,
+            cli_experimental_memory: false,
+            cli_no_memory: false,
+            disable_web_search: false,
+            todo_gate: false,
+            laziness_debug_log: None,
+            storage_mode: None,
+        });
+        cfg.models.session_summary = Some("required-summary".to_owned());
+
+        cfg.rebind_unset_auxiliary_models_to_default(Some("required-default"));
+
+        assert_eq!(cfg.web_search_model, "explicit-search");
+        assert!(!cfg.web_search_follows_default);
+        assert_eq!(
+            cfg.session_summary_model.as_deref(),
+            Some("required-summary")
+        );
+        assert!(!cfg.session_summary_follows_default);
+        assert_eq!(
+            cfg.image_description_model.as_deref(),
+            Some("required-default")
         );
         assert!(cfg.image_description_follows_default);
     }

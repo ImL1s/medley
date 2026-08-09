@@ -132,6 +132,9 @@ fn resolve_config(cfg: &AgentConfig, auth_manager: &AuthManager) -> AgentConfig 
     // Full prefetch (with managed-config sync when stale) is allowed after the gate.
     ensure_remote_settings_side_effects(&mut cfg, true);
     crate::util::config::sync_campaign_fields(&mut cfg);
+    let effective_default =
+        crate::agent::models::configured_preference(&cfg).map(|value| value.value);
+    cfg.rebind_unset_auxiliary_models_to_default(effective_default.as_deref());
 
     // env var > remote settings > Local. Skip remote settings for Generic (grok -p, subagents).
     let has_xai_auth = auth_manager.current().is_some_and(|a| a.is_xai_auth());

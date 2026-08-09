@@ -3817,11 +3817,17 @@ impl MvpAgent {
             self.web_search_disabled.borrow_mut().remove(session_id);
             return;
         }
+        let default_model_id = self.models_manager.current_model_id();
+        let session_model_id = crate::upload::turn::lookup_session_model(
+            &self.sessions.borrow(),
+            Some(session_id),
+            &default_model_id,
+        );
         let model_id = {
             let cfg = self.cfg.borrow();
             crate::config::auxiliary_model_or_operative(
                 &cfg.web_search_model,
-                self.models_manager.current_model_id().0.as_ref(),
+                session_model_id.0.as_ref(),
                 cfg.web_search_follows_default,
             )
         };
@@ -3847,7 +3853,10 @@ impl MvpAgent {
 
         let mut web_search_disable_reason = None;
         let web_search_sampling_config = self
-            .prepare_web_search_sampling_config_preflight(&mut web_search_disable_reason, None)
+            .prepare_web_search_sampling_config_preflight(
+                &mut web_search_disable_reason,
+                Some(session_model_id.0.as_ref()),
+            )
             .await;
         let needs_notice = web_search_sampling_config
             .as_ref()
