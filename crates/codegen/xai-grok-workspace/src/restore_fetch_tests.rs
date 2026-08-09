@@ -434,6 +434,15 @@ fn targeted_fetch_args_exact_for_shallow_and_full() {
         ]
     );
     assert_eq!(
+        targeted_fetch_args("refs/heads/feature", false),
+        vec![
+            "fetch".to_owned(),
+            "--no-tags".to_owned(),
+            "origin".to_owned(),
+            "refs/heads/feature:refs/heads/feature".to_owned(),
+        ]
+    );
+    assert_eq!(
         targeted_fetch_args("main", false),
         vec![
             "fetch".to_owned(),

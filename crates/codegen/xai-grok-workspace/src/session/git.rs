@@ -4415,6 +4415,54 @@ mod restore_code_tests {
         let on_head = git_cli(&repo, &["rev-parse", "HEAD"]).await.unwrap();
         assert_eq!(on_head.trim(), second);
     }
+    #[tokio::test(flavor = "current_thread")]
+    async fn checkout_commit_with_fetch_materializes_fully_qualified_branch_ref() {
+        if bazel_skip("checkout_commit_with_fetch_materializes_fully_qualified_branch_ref") {
+            return;
+        }
+        let upstream = tempfile::tempdir().unwrap();
+        init_repo_with_commit(upstream.path()).await;
+        let dest_root = tempfile::tempdir().unwrap();
+        let repo = dest_root.path().join("repo");
+        git_cli(
+            dest_root.path(),
+            &[
+                "clone",
+                "-q",
+                &upstream.path().to_string_lossy(),
+                &repo.to_string_lossy(),
+            ],
+        )
+        .await
+        .unwrap();
+        git_cli(upstream.path(), &["checkout", "-q", "-b", "feature"])
+            .await
+            .unwrap();
+        std::fs::write(upstream.path().join("two.txt"), "two\n").unwrap();
+        git_cli(upstream.path(), &["add", "."]).await.unwrap();
+        git_cli(upstream.path(), &["commit", "-q", "-m", "two"])
+            .await
+            .unwrap();
+        let second = git_cli(upstream.path(), &["rev-parse", "HEAD"])
+            .await
+            .unwrap();
+        let second = second.trim().to_owned();
+
+        assert!(
+            git_cli(&repo, &["rev-parse", "refs/heads/feature"])
+                .await
+                .is_err()
+        );
+        let response = checkout_commit_with_fetch(&repo, "refs/heads/feature", false).await;
+        assert!(response.fetched, "error={:?}", response.error);
+        assert!(response.checked_out, "error={:?}", response.error);
+        let local_branch = git_cli(&repo, &["rev-parse", "refs/heads/feature"])
+            .await
+            .unwrap();
+        assert_eq!(local_branch.trim(), second);
+        let on_head = git_cli(&repo, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_eq!(on_head.trim(), second);
+    }
     #[tokio::test]
     async fn checkout_commit_with_fetch_fetches_origin_tracking_ref() {
         if bazel_skip("checkout_commit_with_fetch_fetches_origin_tracking_ref") {

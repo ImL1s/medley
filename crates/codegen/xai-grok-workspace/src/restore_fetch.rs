@@ -294,9 +294,12 @@ pub(crate) fn targeted_fetch_args(spec: &str, is_shallow: bool) -> Vec<String> {
         args.push("--depth=1".to_owned());
     }
     args.push("origin".to_owned());
-    // `--no-tags` still fetches the object into FETCH_HEAD only. A dst
-    // refspec materializes the local tag so `git checkout refs/tags/…` works.
-    if spec.starts_with("refs/tags/") && is_safe_git_ref(spec) {
+    // Without a dst refspec, a fully qualified source can land only in
+    // FETCH_HEAD (or the configured remote-tracking ref). Materialize the
+    // exact local ref so the subsequent `git checkout refs/{heads,tags}/…`
+    // retry resolves the same target the caller requested.
+    if (spec.starts_with("refs/heads/") || spec.starts_with("refs/tags/")) && is_safe_git_ref(spec)
+    {
         args.push(format!("{spec}:{spec}"));
     } else {
         args.push(spec.to_owned());
