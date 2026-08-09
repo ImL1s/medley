@@ -679,12 +679,26 @@ impl ModelsManager {
         &self,
         model_id: &str,
     ) -> Option<xai_grok_sampling_types::CodexWireCapabilities> {
-        self.inner
-            .catalog
-            .read()
-            .models
-            .get(model_id)
+        let catalog = self.inner.catalog.read();
+        let models = &catalog.models;
+        resolve_catalog_key(models, &acp::ModelId::new(model_id))
+            .and_then(|key| models.get(key.0.as_ref()))
             .and_then(|e| e.info().codex_wire.clone())
+    }
+
+    /// Whether two model identities resolve to the same catalog entry.
+    ///
+    /// Exact equality intentionally succeeds even on a catalog miss: runtime
+    /// models can be absent from the config-derived catalog (#159).
+    pub(crate) fn model_ids_refer_to_same_entry(&self, left: &str, right: &str) -> bool {
+        if left == right {
+            return true;
+        }
+        let catalog = self.inner.catalog.read();
+        let models = &catalog.models;
+        let left = resolve_catalog_key(models, &acp::ModelId::new(left));
+        let right = resolve_catalog_key(models, &acp::ModelId::new(right));
+        left.is_some() && left == right
     }
 
     pub(crate) fn model_compactions_remaining(

@@ -1013,11 +1013,23 @@ fn subagent_codex_wire(
     ctx.models_manager
         .model_codex_wire(ctx.model_id.0.as_ref())
         .or_else(|| {
-            (ctx.sampling_config.model.as_str() == ctx.model_id.0.as_ref())
-                .then(|| ctx.sampling_config.codex_wire.clone())
-                .flatten()
+            let current_model_id = ctx.models_manager.current_model_id();
+            if !ctx
+                .models_manager
+                .model_ids_refer_to_same_entry(ctx.model_id.0.as_ref(), current_model_id.0.as_ref())
+            {
+                return None;
+            }
+            // The session can retain a catalog id (for example `auto`) after
+            // a refresh republishes the same model only under its routing
+            // slug. Prefer the refreshed entry; fall back to the baseline
+            // only for a true catalog miss.
+            ctx.models_manager
+                .model_codex_wire(&ctx.sampling_config.model)
+                .or_else(|| ctx.sampling_config.codex_wire.clone())
         })
 }
+
 /// `AuthType` for a subagent: BYOK ⇒ `ApiKey` (don't overwrite the BYOK
 /// key); session-based ACP method ⇒ `SessionToken` (keep refresh wired);
 /// otherwise `ApiKey`.

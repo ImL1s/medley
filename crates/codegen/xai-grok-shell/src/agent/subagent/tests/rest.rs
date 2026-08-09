@@ -2350,7 +2350,7 @@ async fn read_parent_sampling_config_catalog_miss_never_inherits_wire_across_mod
     ctx.models_manager = crate::agent::models::ModelsManager::new(
         None,
         indexmap::IndexMap::new(),
-        acp::ModelId::new("a-different-model"),
+        acp::ModelId::new("the-parents-model"),
         ctx.auth_manager.clone(),
         crate::agent::config::Config::default(),
     );
@@ -2358,6 +2358,37 @@ async fn read_parent_sampling_config_catalog_miss_never_inherits_wire_across_mod
     assert_eq!(
         config.codex_wire, None,
         "different model: no capabilities beats the wrong model's capabilities"
+    );
+}
+
+/// A refreshed catalog can replace a retained catalog id (`auto`) with the
+/// routing slug key. That is still the same inherited model, and the child
+/// must use the refreshed entry's capabilities rather than losing them.
+#[tokio::test]
+async fn read_parent_sampling_config_resolves_wire_after_catalog_id_becomes_slug_key() {
+    let refreshed_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let stale_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut entry = test_model_entry("grok-4.5");
+    entry.info.codex_wire = Some(refreshed_caps.clone());
+    let mut models = indexmap::IndexMap::new();
+    models.insert("grok-4.5".to_string(), entry);
+    let mut ctx = ctx_with_parent_chat_state("auto", "grok-4.5", "auto", models);
+    ctx.sampling_config.model = "grok-4.5".to_string();
+    ctx.sampling_config.codex_wire = Some(stale_caps);
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "auto");
+    assert_eq!(
+        config.codex_wire,
+        Some(refreshed_caps),
+        "a retained catalog id and its refreshed routing-slug key are the same model"
     );
 }
 
