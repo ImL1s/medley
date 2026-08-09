@@ -260,22 +260,19 @@ impl ModelsManagerBuilder {
 }
 
 impl ModelsManager {
-    /// Whether `catalog_model_id` is an exact catalog key whose entry routes
-    /// through a different model slug. This proves alias lineage before a
-    /// later refresh is allowed to remap the missing key by route.
-    pub(crate) fn catalog_id_is_route_alias(
-        &self,
-        catalog_model_id: &str,
-        routing_model: &str,
-    ) -> bool {
-        catalog_model_id != routing_model
-            && self
-                .inner
-                .catalog
-                .read()
-                .models
-                .get(catalog_model_id)
-                .is_some_and(|entry| entry.info().model == routing_model)
+    /// Original routing model and alias lineage for one exact catalog key.
+    /// Opaque sampling-config model overrides must not replace this identity.
+    pub(crate) fn catalog_route_identity(&self, catalog_model_id: &str) -> Option<(String, bool)> {
+        self.inner
+            .catalog
+            .read()
+            .models
+            .get(catalog_model_id)
+            .map(|entry| {
+                let route = entry.info().model.clone();
+                let allows_route_remap = catalog_model_id != route;
+                (route, allows_route_remap)
+            })
     }
 
     /// Resolve one routing model and copy all request-shaping facts while

@@ -2543,7 +2543,37 @@ async fn read_parent_sampling_config_opaque_name_override_keeps_committed_capabi
     assert_eq!(model_id.0.as_ref(), "catalog-entry");
     assert_eq!(config.model, "opaque-backend-routing-hint");
     assert!(config.supports_backend_search);
-    assert_eq!(config.codex_wire, Some(committed_caps));
+    assert_eq!(config.codex_wire, Some(committed_caps.clone()));
+
+    // The inherited child stores the catalog's original route rather than
+    // its opaque sampling override, so a grandchild resolves the same entry.
+    let (catalog_route, allows_route_remap) = ctx
+        .models_manager
+        .catalog_route_identity(model_id.0.as_ref())
+        .expect("selected catalog identity");
+    let (mock, _persistence_rx) = xai_chat_state::MockChatPersistence::new();
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let nested_chat = xai_chat_state::ChatStateActor::spawn_with_pruning_and_catalog_identity(
+        vec![],
+        test_sampling_config(&config.model),
+        Some((model_id.0.to_string(), catalog_route, allows_route_remap)),
+        xai_chat_state::PruningConfig::default(),
+        Box::new(mock),
+        event_tx,
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let mut nested_ctx = ctx;
+    nested_ctx.model_id = model_id.clone();
+    nested_ctx.sampling_config_model_id = model_id;
+    nested_ctx.sampling_config = config;
+    nested_ctx.parent_chat_state = Some(nested_chat);
+
+    let (nested_config, nested_model_id) = read_parent_sampling_config(&nested_ctx).await;
+
+    assert_eq!(nested_model_id.0.as_ref(), "catalog-entry");
+    assert_eq!(nested_config.model, "opaque-backend-routing-hint");
+    assert!(nested_config.supports_backend_search);
+    assert_eq!(nested_config.codex_wire, Some(committed_caps));
 }
 
 #[tokio::test]

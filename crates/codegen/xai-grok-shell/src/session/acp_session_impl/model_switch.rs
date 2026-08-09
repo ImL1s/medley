@@ -357,10 +357,12 @@ impl SessionActor {
             });
         let mut committed_chat = current_chat.clone();
         committed_chat.catalog_model_id = Some(catalog_model_id.0.to_string());
-        committed_chat.catalog_model_route = Some(sampling_config.model.clone());
-        committed_chat.catalog_model_allows_route_remap = self
+        let (catalog_model_route, catalog_model_allows_route_remap) = self
             .models_manager
-            .catalog_id_is_route_alias(catalog_model_id.0.as_ref(), &sampling_config.model);
+            .catalog_route_identity(catalog_model_id.0.as_ref())
+            .unwrap_or_else(|| (sampling_config.model.clone(), false));
+        committed_chat.catalog_model_route = Some(catalog_model_route);
+        committed_chat.catalog_model_allows_route_remap = catalog_model_allows_route_remap;
         committed_chat.sampling_config = xai_grok_sampling_types::SamplingConfig {
             base_url: sampling_config.base_url.clone(),
             model: sampling_config.model.clone(),
