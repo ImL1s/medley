@@ -267,6 +267,7 @@ impl ModelsManager {
         preferred_id: Option<&str>,
         routing_model: &str,
         preferred_id_must_exist: bool,
+        allow_preferred_route_mismatch: bool,
     ) -> Option<ResolvedModelCapabilities> {
         let catalog = self.inner.catalog.read();
         let models = &catalog.models;
@@ -278,7 +279,9 @@ impl ModelsManager {
             .and_then(|key| {
                 models
                     .get(key.0.as_ref())
-                    .filter(|entry| entry.info().model == routing_model)
+                    .filter(|entry| {
+                        allow_preferred_route_mismatch || entry.info().model == routing_model
+                    })
                     .map(|entry| (key.0.to_string(), entry))
             });
         let (model_id, entry) = if let Some(preferred) = preferred {

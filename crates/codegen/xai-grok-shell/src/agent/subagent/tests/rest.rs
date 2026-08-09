@@ -2471,6 +2471,37 @@ async fn read_parent_sampling_config_missing_committed_id_ignores_same_route_sur
     assert_eq!(config.codex_wire, None);
 }
 
+#[tokio::test]
+async fn read_parent_sampling_config_opaque_name_override_keeps_committed_capabilities() {
+    let committed_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let mut entry = test_model_entry("catalog-routing-model");
+    entry.info.supports_backend_search = true;
+    entry.info.codex_wire = Some(committed_caps.clone());
+    let mut models = indexmap::IndexMap::new();
+    models.insert("catalog-entry".to_string(), entry);
+    let ctx = ctx_with_parent_chat_state(
+        "catalog-entry",
+        "catalog-routing-model",
+        "catalog-entry",
+        models,
+    );
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.sampling_config.model = "opaque-backend-routing-hint".to_string();
+    snapshot.catalog_model_id = Some("catalog-entry".to_string());
+    chat.restore_snapshot(snapshot);
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "catalog-entry");
+    assert_eq!(config.model, "opaque-backend-routing-hint");
+    assert!(config.supports_backend_search);
+    assert_eq!(config.codex_wire, Some(committed_caps));
+}
+
 /// A refreshed catalog can replace a retained catalog id (`auto`) with the
 /// routing slug key. That is still the same inherited model, and the child
 /// must use the refreshed entry's capabilities rather than losing them.

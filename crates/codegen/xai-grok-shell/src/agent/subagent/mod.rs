@@ -838,19 +838,25 @@ async fn read_parent_sampling_config(
             let preferred_model_id = committed_model_id
                 .as_deref()
                 .unwrap_or(ctx.model_id.0.as_ref());
+            let committed_matches_baseline = committed_model_id
+                .as_deref()
+                .is_some_and(|id| id == ctx.sampling_config_model_id.0.as_ref());
+            let opaque_model_name_override =
+                committed_matches_baseline && ctx.sampling_config.model != cfg.model;
             let capabilities = ctx.models_manager.capabilities_for_route(
                 Some(preferred_model_id),
                 &cfg.model,
                 committed_model_id.is_some(),
+                opaque_model_name_override,
             );
             let model_id = capabilities
                 .as_ref()
                 .map(|facts| facts.model_id.clone())
                 .unwrap_or_else(|| acp::ModelId::new(cfg.model.clone()));
-            let baseline_matches_live = ctx.sampling_config.model == cfg.model
-                && committed_model_id.as_deref().is_none_or(|committed_id| {
-                    committed_id == ctx.sampling_config_model_id.0.as_ref()
-                });
+            let baseline_matches_live = committed_model_id.as_deref().map_or_else(
+                || ctx.sampling_config.model == cfg.model,
+                |committed_id| committed_id == ctx.sampling_config_model_id.0.as_ref(),
+            );
             let creds = chat_state.get_credentials().await;
             let mut extra_headers = cfg.extra_headers;
             crate::agent::config::inject_url_derived_headers(
@@ -1009,6 +1015,7 @@ async fn read_parent_sampling_config(
     let capabilities = ctx.models_manager.capabilities_for_route(
         Some(ctx.sampling_config_model_id.0.as_ref()),
         &fallback.model,
+        false,
         false,
     );
     let fallback_model_id = capabilities
