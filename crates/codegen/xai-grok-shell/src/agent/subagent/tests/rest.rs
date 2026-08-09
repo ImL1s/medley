@@ -2531,8 +2531,11 @@ async fn read_parent_sampling_config_reused_catalog_key_keeps_sampled_model_wire
     let mut old = test_model_entry("old-routing-model");
     old.info.codex_wire = Some(old_caps.clone());
     let mut models = indexmap::IndexMap::new();
-    models.insert("auto".to_string(), replacement);
-    models.insert("old-routing-model".to_string(), old);
+    models.insert("auto".to_string(), replacement.clone());
+    // Exact-key shadow: the sampled routing slug is itself a key for an
+    // unrelated entry. Route resolution must find `legacy-entry` instead.
+    models.insert("old-routing-model".to_string(), replacement);
+    models.insert("legacy-entry".to_string(), old);
     let ctx = ctx_with_parent_chat_state("auto", "old-routing-model", "auto", models);
     let chat = ctx.parent_chat_state.as_ref().expect("chat state");
     let mut snapshot = chat.snapshot().await.expect("chat snapshot");
@@ -2541,7 +2544,7 @@ async fn read_parent_sampling_config_reused_catalog_key_keeps_sampled_model_wire
 
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
 
-    assert_eq!(model_id.0.as_ref(), "old-routing-model");
+    assert_eq!(model_id.0.as_ref(), "legacy-entry");
     assert_eq!(config.model, "old-routing-model");
     assert_eq!(config.codex_wire, Some(old_caps));
 
@@ -2549,7 +2552,7 @@ async fn read_parent_sampling_config_reused_catalog_key_keeps_sampled_model_wire
     baseline_snapshot.catalog_model_id = None;
     chat.restore_snapshot(baseline_snapshot);
     let (baseline_config, baseline_model_id) = read_parent_sampling_config(&ctx).await;
-    assert_eq!(baseline_model_id.0.as_ref(), "old-routing-model");
+    assert_eq!(baseline_model_id.0.as_ref(), "legacy-entry");
     assert_eq!(baseline_config.codex_wire, config.codex_wire);
 }
 

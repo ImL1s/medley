@@ -98,6 +98,16 @@ pub struct ModelsManager {
     inner: Arc<Inner>,
 }
 
+#[derive(Clone)]
+pub(crate) struct ResolvedModelCapabilities {
+    pub model_id: acp::ModelId,
+    pub auth_scheme: xai_grok_sampler::AuthScheme,
+    pub supports_backend_search: bool,
+    pub compactions_remaining: Option<xai_grok_sampling_types::CompactionsRemaining>,
+    pub compaction_at_tokens: Option<xai_grok_sampling_types::CompactionAtTokens>,
+    pub codex_wire: Option<xai_grok_sampling_types::CodexWireCapabilities>,
+}
+
 /// Catalog fields written together under one lock, so readers never see a torn mix.
 #[derive(Default)]
 struct CatalogState {
@@ -249,6 +259,46 @@ impl ModelsManagerBuilder {
 }
 
 impl ModelsManager {
+    /// Resolve one routing model and copy all request-shaping facts while
+    /// holding a single catalog read lock. An exact key that routes elsewhere
+    /// never shadows a unique routing-model match.
+    pub(crate) fn capabilities_for_route(
+        &self,
+        preferred_id: Option<&str>,
+        routing_model: &str,
+    ) -> Option<ResolvedModelCapabilities> {
+        let catalog = self.inner.catalog.read();
+        let models = &catalog.models;
+        let preferred = preferred_id
+            .and_then(|id| resolve_catalog_key(models, &acp::ModelId::new(id)))
+            .and_then(|key| {
+                models
+                    .get(key.0.as_ref())
+                    .filter(|entry| entry.info().model == routing_model)
+                    .map(|entry| (key.0.to_string(), entry))
+            });
+        let (model_id, entry) = if let Some(preferred) = preferred {
+            preferred
+        } else {
+            let mut matches = models
+                .iter()
+                .filter(|(_, entry)| entry.info().model == routing_model);
+            let first = matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            (first.0.clone(), first.1)
+        };
+        let info = entry.info();
+        Some(ResolvedModelCapabilities {
+            model_id: acp::ModelId::new(model_id),
+            auth_scheme: info.auth_scheme,
+            supports_backend_search: info.supports_backend_search,
+            compactions_remaining: info.compactions_remaining,
+            compaction_at_tokens: info.compaction_at_tokens,
+            codex_wire: info.codex_wire.clone(),
+        })
+    }
     pub(crate) fn new(
         prefetched: Option<IndexMap<String, ModelEntry>>,
         models: IndexMap<String, ModelEntry>,
@@ -698,16 +748,6 @@ impl ModelsManager {
         let left = resolve_catalog_key(models, &acp::ModelId::new(left));
         let right = resolve_catalog_key(models, &acp::ModelId::new(right));
         left.is_some() && left == right
-    }
-
-    /// Whether `model_id` currently resolves to an entry whose wire routing
-    /// model matches `routing_model`.
-    pub(crate) fn model_id_routes_to(&self, model_id: &str, routing_model: &str) -> bool {
-        let catalog = self.inner.catalog.read();
-        let models = &catalog.models;
-        resolve_catalog_key(models, &acp::ModelId::new(model_id))
-            .and_then(|key| models.get(key.0.as_ref()))
-            .is_some_and(|entry| entry.info().model == routing_model)
     }
 
     pub(crate) fn model_compactions_remaining(

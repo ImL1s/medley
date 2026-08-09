@@ -832,33 +832,19 @@ async fn read_parent_sampling_config(
         if let Some((cfg, committed_model_id)) =
             chat_state.get_sampling_config_with_model_id().await
         {
-            // A model switch commits the actor config before the outer session
-            // handle. Bind every catalog fact to the model observed in this
-            // same live snapshot, while preserving a matching catalog id such
-            // as `auto` when it still names that routing model.
-            let captured_model_matches = ctx
+            // Copy identity and all request-shaping catalog facts under one
+            // read lock before the credential await below. A refreshed exact
+            // key must not shadow the routing model actually sampled.
+            let preferred_model_id = committed_model_id
+                .as_deref()
+                .unwrap_or(ctx.model_id.0.as_ref());
+            let capabilities = ctx
                 .models_manager
-                .model_id_routes_to(ctx.model_id.0.as_ref(), &cfg.model);
-            let model_id = match committed_model_id {
-                Some(committed)
-                    if ctx
-                        .models_manager
-                        .model_id_routes_to(&committed, &cfg.model) =>
-                {
-                    acp::ModelId::new(committed)
-                }
-                // Catalog refresh can reuse a retained key for a different
-                // routing model. Resolve from the sampled model instead of
-                // attaching the replacement entry's capabilities.
-                Some(_) => acp::ModelId::new(cfg.model.clone()),
-                None => {
-                    if captured_model_matches {
-                        ctx.model_id.clone()
-                    } else {
-                        acp::ModelId::new(cfg.model.clone())
-                    }
-                }
-            };
+                .capabilities_for_route(Some(preferred_model_id), &cfg.model);
+            let model_id = capabilities
+                .as_ref()
+                .map(|facts| facts.model_id.clone())
+                .unwrap_or_else(|| acp::ModelId::new(cfg.model.clone()));
             let creds = chat_state.get_credentials().await;
             let mut extra_headers = cfg.extra_headers;
             crate::agent::config::inject_url_derived_headers(
@@ -869,14 +855,14 @@ async fn read_parent_sampling_config(
             // Prefer the spawn-time in-memory catalog (session-selected models),
             // then disk effective config, then parent spawn baseline. Never
             // silent-default to Bearer on miss when the parent baseline is None.
-            let auth_scheme =
-                crate::agent::config::find_model_by_id(&ctx.available_models, model_id.0.as_ref())
-                    .map(|e| e.info.auth_scheme)
-                    .or_else(|| {
-                        crate::agent::config::try_resolve_model_credentials(&cfg.model, None)
-                            .map(|r| r.auth_scheme)
-                    })
-                    .unwrap_or(ctx.sampling_config.auth_scheme);
+            let auth_scheme = capabilities
+                .as_ref()
+                .map(|facts| facts.auth_scheme)
+                .or_else(|| {
+                    crate::agent::config::try_resolve_model_credentials(&cfg.model, None)
+                        .map(|r| r.auth_scheme)
+                })
+                .unwrap_or(ctx.sampling_config.auth_scheme);
             let inherited_base_url = cfg.base_url.clone();
             let strip_guard = ctx.would_strip_fallback_key(creds.api_key());
             // #110 / #136 / #180: provenance comes from parent `Credentials`
@@ -945,22 +931,24 @@ async fn read_parent_sampling_config(
                         credential_source.as_ref(),
                     )
                 },
-                supports_backend_search: ctx
-                    .models_manager
-                    .model_supports_backend_search(model_id.0.as_ref()),
-                compactions_remaining: ctx
-                    .models_manager
-                    .model_compactions_remaining(model_id.0.as_ref()),
-                compaction_at_tokens: ctx
-                    .models_manager
-                    .model_compaction_at_tokens(model_id.0.as_ref()),
+                supports_backend_search: capabilities
+                    .as_ref()
+                    .is_some_and(|facts| facts.supports_backend_search),
+                compactions_remaining: capabilities
+                    .as_ref()
+                    .and_then(|facts| facts.compactions_remaining),
+                compaction_at_tokens: capabilities
+                    .as_ref()
+                    .and_then(|facts| facts.compaction_at_tokens),
                 doom_loop_recovery: ctx.sampling_config.doom_loop_recovery,
                 header_injector: ctx.sampling_config.header_injector.clone(),
                 // Resolved from the subagent's own model, like the three
                 // catalog lookups above — not copied from the parent's
                 // config, whose `codex_wire` belongs to whatever model the
                 // parent is running (#277).
-                codex_wire: subagent_codex_wire(ctx, model_id.0.as_ref()),
+                codex_wire: capabilities
+                    .as_ref()
+                    .and_then(|facts| facts.codex_wire.clone()),
             };
             let global_model_id = ctx.models_manager.current_model_id();
             xai_grok_telemetry::unified_log::debug(
@@ -994,14 +982,14 @@ async fn read_parent_sampling_config(
         })),
     );
     let mut fallback = ctx.sampling_config.clone();
-    let fallback_model_id = if ctx
-        .models_manager
-        .model_id_routes_to(ctx.sampling_config_model_id.0.as_ref(), &fallback.model)
-    {
-        ctx.sampling_config_model_id.clone()
-    } else {
-        acp::ModelId::new(fallback.model.clone())
-    };
+    let capabilities = ctx.models_manager.capabilities_for_route(
+        Some(ctx.sampling_config_model_id.0.as_ref()),
+        &fallback.model,
+    );
+    let fallback_model_id = capabilities
+        .as_ref()
+        .map(|facts| facts.model_id.clone())
+        .unwrap_or_else(|| acp::ModelId::new(fallback.model.clone()));
     if fallback.auth_scheme == xai_grok_sampler::AuthScheme::None {
         fallback.api_key = None;
         fallback.bearer_resolver = None;
@@ -1017,22 +1005,11 @@ async fn read_parent_sampling_config(
             )
         };
     }
-    if ctx
-        .models_manager
-        .model_in_catalog(fallback_model_id.0.as_ref())
-    {
-        fallback.supports_backend_search = ctx
-            .models_manager
-            .model_supports_backend_search(fallback_model_id.0.as_ref());
-        fallback.compactions_remaining = ctx
-            .models_manager
-            .model_compactions_remaining(fallback_model_id.0.as_ref());
-        fallback.compaction_at_tokens = ctx
-            .models_manager
-            .model_compaction_at_tokens(fallback_model_id.0.as_ref());
-        fallback.codex_wire = ctx
-            .models_manager
-            .model_codex_wire(fallback_model_id.0.as_ref());
+    if let Some(capabilities) = capabilities {
+        fallback.supports_backend_search = capabilities.supports_backend_search;
+        fallback.compactions_remaining = capabilities.compactions_remaining;
+        fallback.compaction_at_tokens = capabilities.compaction_at_tokens;
+        fallback.codex_wire = capabilities.codex_wire;
     }
     // The three lines above already re-resolve catalog facts here;
     // `codex_wire` is one too, and cloning the parent's would reintroduce
@@ -1040,40 +1017,6 @@ async fn read_parent_sampling_config(
     // unavailable — which `try_build_subagent_spawn_context` does not bail
     // on, so a nested child outliving its parent lands here for real.
     (fallback, fallback_model_id)
-}
-
-/// Wire capabilities for the subagent's **own** model.
-///
-/// Falls back to the parent's value only when the subagent is running the
-/// same model. A catalog miss is not always "no capabilities": a
-/// runtime-only model (#159) can be absent from the config-derived catalog
-/// while the subagent inherits the parent's model, and returning `None`
-/// there would silently strip capabilities the parent legitimately had.
-/// When the models differ, the parent's value is precisely what #277 says
-/// not to use, so there is no fallback.
-fn subagent_codex_wire(
-    ctx: &SubagentSpawnContext,
-    model_id: &str,
-) -> Option<xai_grok_sampling_types::CodexWireCapabilities> {
-    let resolved = ctx.models_manager.model_codex_wire(model_id);
-    if resolved.is_some() || ctx.models_manager.model_in_catalog(model_id) {
-        // `None` on a present entry is authoritative metadata, not a catalog
-        // miss. Falling through would attach another model's flags.
-        return resolved;
-    }
-    if !ctx
-        .models_manager
-        .model_ids_refer_to_same_entry(model_id, ctx.sampling_config_model_id.0.as_ref())
-    {
-        return None;
-    }
-    // The session can retain a catalog id (for example `auto`) after a
-    // refresh republishes the same model only under its routing slug. Prefer
-    // the refreshed entry; fall back to the baseline only for a true miss on
-    // the exact model that owns that baseline.
-    ctx.models_manager
-        .model_codex_wire(&ctx.sampling_config.model)
-        .or_else(|| ctx.sampling_config.codex_wire.clone())
 }
 
 /// `AuthType` for a subagent: BYOK ⇒ `ApiKey` (don't overwrite the BYOK
