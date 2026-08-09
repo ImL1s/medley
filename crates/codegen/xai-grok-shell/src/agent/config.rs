@@ -2629,7 +2629,8 @@ impl Config {
         );
         self.managed_mcps_enabled = mcps.enabled;
         self.managed_mcp_gateway_tools_enabled = mcps.gateway_tools_enabled;
-        let models = crate::config::ModelOverrideConfig::resolve(
+        let models = crate::config::ModelOverrideConfig::resolve_with_default_model(
+            self.default_model_override.as_deref(),
             ctx.cli_web_search_model,
             ctx.cli_session_summary_model,
             ctx.raw_config,
@@ -16036,6 +16037,34 @@ hooks = true
         });
         assert_eq!(cfg.web_search_model, "custom-ws");
         assert_eq!(cfg.session_summary_model, Some("custom-ss".to_owned()));
+    }
+    #[test]
+    #[serial]
+    fn resolve_runtime_fields_model_overrides_follow_cli_default() {
+        clear_runtime_env_vars();
+        let raw = empty_config();
+        let mut cfg = Config::new_from_toml_cfg(&raw).unwrap();
+        cfg.default_model_override = Some("custom-default".to_owned());
+        cfg.resolve_runtime_fields(&RuntimeResolutionContext {
+            raw_config: &raw,
+            remote_settings: None,
+            is_headless: false,
+            cli_subagents: None,
+            cli_web_search_model: None,
+            cli_session_summary_model: None,
+            cli_experimental_memory: false,
+            cli_no_memory: false,
+            disable_web_search: false,
+            todo_gate: false,
+            laziness_debug_log: None,
+            storage_mode: None,
+        });
+        assert_eq!(cfg.web_search_model, "custom-default");
+        assert_eq!(cfg.session_summary_model.as_deref(), Some("custom-default"));
+        assert_eq!(
+            cfg.image_description_model.as_deref(),
+            Some("custom-default")
+        );
     }
     #[test]
     #[serial]

@@ -609,7 +609,8 @@ fn handle_reload_models(agent: &MvpAgent) -> ExtResult {
     // flags) are preserved. Only model-related TOML fields are refreshed.
     {
         let agent_config = agent.cfg.borrow();
-        let overrides = crate::config::ModelOverrideConfig::resolve(
+        let overrides = crate::config::ModelOverrideConfig::resolve_with_default_model(
+            agent_config.default_model_override.as_deref(),
             agent_config.web_search_model_override.as_deref(),
             agent_config.session_summary_model_override.as_deref(),
             &disk_config,

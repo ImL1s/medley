@@ -788,23 +788,36 @@ impl ModelOverrideConfig {
         config: &toml::Value,
         remote: Option<&crate::util::config::RemoteSettings>,
     ) -> Self {
+        Self::resolve_with_default_model(
+            None,
+            cli_web_search_model,
+            cli_session_summary_model,
+            config,
+            remote,
+        )
+    }
+
+    pub fn resolve_with_default_model(
+        cli_default_model: Option<&str>,
+        cli_web_search_model: Option<&str>,
+        cli_session_summary_model: Option<&str>,
+        config: &toml::Value,
+        remote: Option<&crate::util::config::RemoteSettings>,
+    ) -> Self {
         let models_table = config.get("models");
         let parsed_models: crate::agent::config::ModelsConfig = models_table
             .and_then(|v| v.clone().try_into().ok())
             .unwrap_or_default();
-        let local_default = non_empty_model_override(parsed_models.default.as_deref());
-        let mut result = Self {
-            web_search: non_empty_model_override(parsed_models.web_search.as_deref())
-                .or_else(|| local_default.clone())
-                .unwrap_or_else(|| crate::models::default_web_search_model().to_owned()),
-            session_summary: non_empty_model_override(parsed_models.session_summary.as_deref()),
-            image_description: non_empty_model_override(parsed_models.image_description.as_deref()),
-            prompt_suggestion: non_empty_model_override(parsed_models.prompt_suggestion.as_deref())
+        let mut web_search = non_empty_model_override(parsed_models.web_search.as_deref());
+        let mut session_summary =
+            non_empty_model_override(parsed_models.session_summary.as_deref());
+        let mut image_description =
+            non_empty_model_override(parsed_models.image_description.as_deref());
+        let mut prompt_suggestion =
+            non_empty_model_override(parsed_models.prompt_suggestion.as_deref())
                 .map(PromptSuggestModelPin::Pinned)
-                .unwrap_or_default(),
-        };
+                .unwrap_or_default();
         let has_local_ws = models_table.and_then(|m| m.get("web_search")).is_some();
-        let has_local_default = models_table.and_then(|m| m.get("default")).is_some();
         let has_local_ss = models_table
             .and_then(|m| m.get("session_summary"))
             .is_some();
@@ -813,50 +826,43 @@ impl ModelOverrideConfig {
             .is_some();
         if let Some(remote) = remote {
             if !has_local_ws {
-                if let Some(v) = non_empty_model_override(remote.web_search_model.as_deref()) {
-                    result.web_search = v;
-                } else if !has_local_default
-                    && let Some(v) = non_empty_model_override(remote.default_model.as_deref())
-                {
-                    result.web_search = v;
-                }
+                web_search = non_empty_model_override(remote.web_search_model.as_deref());
             }
             if !has_local_ss {
-                result.session_summary =
-                    non_empty_model_override(remote.session_summary_model.as_deref());
+                session_summary = non_empty_model_override(remote.session_summary_model.as_deref());
             }
             if !has_local_id {
-                result.image_description =
+                image_description =
                     non_empty_model_override(remote.image_description_model.as_deref());
             }
-            if result.prompt_suggestion == PromptSuggestModelPin::Unpinned
+            if prompt_suggestion == PromptSuggestModelPin::Unpinned
                 && let Some(v) = non_empty_model_override(remote.prompt_suggestion_model.as_deref())
             {
-                result.prompt_suggestion = PromptSuggestModelPin::Pinned(v);
+                prompt_suggestion = PromptSuggestModelPin::Pinned(v);
             }
         }
         if let Ok(v) = std::env::var("GROK_WEB_SEARCH_MODEL") {
             let v = v.trim();
             if !v.is_empty() {
-                result.web_search = v.to_owned();
+                web_search = Some(v.to_owned());
             }
         }
         if let Ok(v) = std::env::var("GROK_SESSION_SUMMARY_MODEL") {
-            result.session_summary = non_empty_model_override(Some(v.as_str()));
+            session_summary = non_empty_model_override(Some(v.as_str()));
         }
         if let Ok(v) = std::env::var("GROK_IMAGE_DESCRIPTION_MODEL") {
-            result.image_description = non_empty_model_override(Some(v.as_str()));
+            image_description = non_empty_model_override(Some(v.as_str()));
         }
         if let Ok(v) = std::env::var("GROK_PROMPT_SUGGESTIONS_MODEL")
             && let Some(v) = non_empty_model_override(Some(v.as_str()))
         {
-            result.prompt_suggestion = PromptSuggestModelPin::Env(v);
+            prompt_suggestion = PromptSuggestModelPin::Env(v);
         }
         if let Some(v) = cli_web_search_model {
-            result.web_search = v.to_owned();
+            web_search = non_empty_model_override(Some(v));
         }
         if let Some(v) = cli_session_summary_model {
-            result.session_summary = non_empty_model_override(Some(v));
+            session_summary = non_empty_model_override(Some(v));
         }
         // One rule for every auxiliary lane: an unset lane follows the
         // configured default model before it falls back to a compiled
@@ -879,19 +885,29 @@ impl ModelOverrideConfig {
         // `grok-build-0.1` only reaches the catalog through the xAI
         // prefetch — which a user without xAI credentials never runs. So a
         // Codex-only user is already silent here rather than misrouted.
-        let configured_default = local_default
-            .clone()
-            .or_else(|| remote.and_then(|r| non_empty_model_override(r.default_model.as_deref())));
-        if result.session_summary.is_none() {
-            result.session_summary = configured_default
-                .clone()
-                .or_else(|| Some(crate::models::default_session_summary_model().to_owned()));
+        let configured_default = crate::agent::config::resolve_string_flag(
+            cli_default_model,
+            "GROK_DEFAULT_MODEL",
+            parsed_models.default.as_deref(),
+            remote.and_then(|r| r.default_model.as_deref()),
+        )
+        .map(|resolved| resolved.value);
+        Self {
+            web_search: web_search
+                .or_else(|| configured_default.clone())
+                .unwrap_or_else(|| crate::models::default_web_search_model().to_owned()),
+            session_summary: Some(
+                session_summary
+                    .or_else(|| configured_default.clone())
+                    .unwrap_or_else(|| crate::models::default_session_summary_model().to_owned()),
+            ),
+            image_description: Some(
+                image_description
+                    .or(configured_default)
+                    .unwrap_or_else(|| crate::models::default_image_description_model().to_owned()),
+            ),
+            prompt_suggestion,
         }
-        if result.image_description.is_none() {
-            result.image_description = configured_default
-                .or_else(|| Some(crate::models::default_image_description_model().to_owned()));
-        }
-        result
     }
 }
 /// Tool behavior configuration (`[tools]` in config.toml).

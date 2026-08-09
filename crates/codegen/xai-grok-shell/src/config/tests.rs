@@ -1518,18 +1518,32 @@ fn with_model_overrides_env_full<T>(
     ps: Option<&str>,
     f: impl FnOnce() -> T,
 ) -> T {
+    with_model_overrides_and_default_env(None, ws, ss, id, ps, f)
+}
+fn with_model_overrides_and_default_env<T>(
+    default: Option<&str>,
+    ws: Option<&str>,
+    ss: Option<&str>,
+    id: Option<&str>,
+    ps: Option<&str>,
+    f: impl FnOnce() -> T,
+) -> T {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     with_env_var_opt(
-        "GROK_WEB_SEARCH_MODEL",
-        ws,
+        "GROK_DEFAULT_MODEL",
+        default,
         || with_env_var_opt(
-            "GROK_SESSION_SUMMARY_MODEL",
-            ss,
+            "GROK_WEB_SEARCH_MODEL",
+            ws,
             || with_env_var_opt(
-                "GROK_IMAGE_DESCRIPTION_MODEL",
-                id,
-                || with_env_var_opt("GROK_PROMPT_SUGGESTIONS_MODEL", ps, f),
+                "GROK_SESSION_SUMMARY_MODEL",
+                ss,
+                || with_env_var_opt(
+                    "GROK_IMAGE_DESCRIPTION_MODEL",
+                    id,
+                    || with_env_var_opt("GROK_PROMPT_SUGGESTIONS_MODEL", ps, f),
+                ),
             ),
         ),
     )
@@ -1698,6 +1712,56 @@ fn model_overrides_unset_auxiliary_lanes_follow_the_local_configured_default() {
                 Some(crate::models::default_session_summary_model()),
                 "the compiled default is xAI; following it is the bug"
             );
+        },
+    );
+}
+#[test]
+fn model_overrides_unset_auxiliary_lanes_follow_the_env_configured_default() {
+    with_model_overrides_and_default_env(
+        Some("gpt-5.3-codex-spark"),
+        None,
+        None,
+        None,
+        None,
+        || {
+            let empty = toml::Value::Table(toml::map::Map::new());
+            let cfg = ModelOverrideConfig::resolve(None, None, &empty, None);
+            assert_eq!(cfg.web_search, "gpt-5.3-codex-spark");
+            assert_eq!(cfg.session_summary.as_deref(), Some("gpt-5.3-codex-spark"));
+            assert_eq!(cfg.image_description.as_deref(), Some("gpt-5.3-codex-spark"));
+        },
+    );
+}
+#[test]
+fn model_overrides_cli_configured_default_wins_over_other_defaults() {
+    with_model_overrides_and_default_env(
+        Some("env-default"),
+        None,
+        None,
+        None,
+        None,
+        || {
+            let config: toml::Value = toml::from_str(
+                    r#"
+                [models]
+                default = "local-default"
+                "#,
+                )
+                .unwrap();
+            let remote = crate::util::config::RemoteSettings {
+                default_model: Some("remote-default".to_owned()),
+                ..Default::default()
+            };
+            let cfg = ModelOverrideConfig::resolve_with_default_model(
+                Some("cli-default"),
+                None,
+                None,
+                &config,
+                Some(&remote),
+            );
+            assert_eq!(cfg.web_search, "cli-default");
+            assert_eq!(cfg.session_summary.as_deref(), Some("cli-default"));
+            assert_eq!(cfg.image_description.as_deref(), Some("cli-default"));
         },
     );
 }
