@@ -124,21 +124,7 @@ fn persist_codex_catalog_cache(path: &std::path::Path, payload: &serde_json::Val
         std::sync::atomic::AtomicU64::new(0);
     let sequence = CACHE_WRITE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = path.with_extension(format!("json.tmp.{}.{sequence}", std::process::id()));
-    let write_result = (|| -> std::io::Result<()> {
-        use std::io::Write as _;
-
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&tmp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()
-    })();
-    if let Err(error) = write_result {
+    if let Err(error) = write_codex_catalog_cache_tmp(&tmp, &bytes) {
         tracing::warn!(error = %error, "Codex catalog cache write failed");
         let _ = std::fs::remove_file(&tmp);
         return;
@@ -152,6 +138,31 @@ fn persist_codex_catalog_cache(path: &std::path::Path, payload: &serde_json::Val
     if let Err(error) = std::fs::File::open(parent).and_then(|directory| directory.sync_all()) {
         tracing::warn!(error = %error, "Codex catalog cache directory sync failed");
     }
+}
+
+fn write_codex_catalog_cache_tmp(tmp: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let open = || {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        options.open(tmp)
+    };
+    let mut file = match open() {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(tmp)?;
+            open()?
+        }
+        Err(error) => return Err(error),
+    };
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 fn replace_codex_catalog_cache(
@@ -2660,6 +2671,22 @@ mod tests {
             load_codex_catalog_cache(&path_b)
                 .unwrap()
                 .contains_key("codex-b")
+        );
+    }
+
+    /// A crash may leave the deterministic PID/sequence temp path behind.
+    /// The next refresh must clean that stale file and still persist bytes.
+    #[test]
+    fn codex_catalog_cache_temp_write_retries_stale_path() {
+        let home = tempfile::tempdir().expect("temporary catalog cache home");
+        let tmp = home.path().join("catalog.json.tmp.reused");
+        std::fs::write(&tmp, b"stale partial catalog").expect("seed stale temp file");
+
+        write_codex_catalog_cache_tmp(&tmp, b"fresh complete catalog")
+            .expect("replace stale temp file");
+        assert_eq!(
+            std::fs::read(&tmp).expect("read refreshed temp file"),
+            b"fresh complete catalog"
         );
     }
 
