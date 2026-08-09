@@ -5,6 +5,52 @@ use crate::remote::DEFAULT_CONTEXT_WINDOW;
 use crate::session::{AppliedModelSwitch, PreparedModelSwitch};
 use xai_chat_state::conversation_util::replace_or_insert_system_head;
 
+fn prepare_web_search_client(
+    sampling_config: Option<xai_grok_sampler::SamplerConfig>,
+    alpha_test_key: Option<String>,
+    default_api_key_provider: Option<xai_grok_tools::types::SharedApiKeyProvider>,
+    attribution_callback: Option<xai_grok_tools::SharedAttributionCallback>,
+) -> Result<Option<xai_grok_tools::implementations::web_search::client::WebSearchClient>, acp::Error>
+{
+    let Some(cfg) = sampling_config else {
+        return Ok(None);
+    };
+    if !config::has_usable_credential(&cfg) {
+        return Ok(None);
+    }
+    let transport_profile = match cfg.api_backend {
+        xai_grok_sampling_types::ApiBackend::CodexResponses => {
+            xai_grok_tools::types::ApiTransportProfile::CodexResponses
+        }
+        _ => xai_grok_tools::types::ApiTransportProfile::GenericResponses,
+    };
+    let provider_scoped = cfg.bearer_resolver.clone().map(|resolver| {
+        crate::auth::credential_provider::ProviderScopedToolKeyProvider::shared(
+            resolver,
+            transport_profile,
+        )
+    });
+    let tool_config = xai_grok_tools::implementations::WebSearchConfig::Enabled {
+        api_key: cfg.api_key,
+        base_url: cfg.base_url,
+        model: cfg.model,
+        extra_headers: cfg.extra_headers,
+        env_http_headers: cfg.env_http_headers,
+        alpha_test_key,
+        api_key_provider: provider_scoped,
+    };
+    xai_grok_tools::implementations::web_search::client::WebSearchClient::new(
+        &tool_config,
+        default_api_key_provider,
+    )
+    .map(|client| Some(client.with_attribution_callback(attribution_callback)))
+    .map_err(|error| {
+        acp::Error::invalid_params().data(format!(
+            "model switch web-search configuration is invalid: {error}"
+        ))
+    })
+}
+
 #[derive(Clone)]
 struct ModelSwitchRollbackState {
     chat: xai_chat_state::ChatStateSnapshot,
@@ -57,8 +103,23 @@ impl SessionActor {
             auto_compact_threshold_percent,
             required_agent_type,
             required_definition,
+            summary_sampling_config,
+            replace_inherited_web_search,
+            web_search_sampling_config,
+            web_search_alpha_test_key,
+            image_description_model,
         } = prepared;
         let catalog_model_id = acp::ModelId::new(catalog_identity.model_id.clone());
+        let web_search_client = if replace_inherited_web_search {
+            Some(prepare_web_search_client(
+                web_search_sampling_config,
+                web_search_alpha_test_key,
+                self.rebuild_spec.api_key_provider.clone(),
+                self.rebuild_spec.attribution_callback.clone(),
+            )?)
+        } else {
+            None
+        };
         let resolved_model_slug = resolved_model.info().model.clone();
         if resolved_model_slug != sampling_config.model {
             tracing::warn!(
@@ -235,6 +296,7 @@ impl SessionActor {
                 auto_compact_threshold_percent,
                 &required_agent_type,
                 Some(rollback.clone()),
+                summary_sampling_config,
             )
             .await
         {
@@ -272,6 +334,22 @@ impl SessionActor {
             }
         };
         self.invalidate_prefire_after_model_switch().await;
+        if let Some(image_description_model) = image_description_model {
+            self.image_description_model
+                .replace(image_description_model);
+        }
+        if let Some(web_search_client) = web_search_client {
+            let bridge = self.agent.borrow().tool_bridge().clone();
+            let resources = bridge.shared_resources().await;
+            let mut resources = resources.lock().await;
+            if let Some(client) = web_search_client {
+                resources.insert(client);
+            } else {
+                resources
+                    .remove::<xai_grok_tools::implementations::web_search::client::WebSearchClient>(
+                    );
+            }
+        }
         if let Some(rebuild) = installed_rebuild {
             self.commit_rebuilt_harness_side_effects().await;
             save_prompt_context(&self.session_info, &rebuild.prompt_context);
@@ -323,6 +401,7 @@ impl SessionActor {
             auto_compact_threshold_percent,
             required_agent_type,
             None,
+            None,
         )
         .await
     }
@@ -338,6 +417,7 @@ impl SessionActor {
         auto_compact_threshold_percent: u8,
         required_agent_type: &str,
         rollback: Option<ModelSwitchRollbackState>,
+        summary_sampling_config: Option<xai_grok_sampler::SamplerConfig>,
     ) -> Result<acp::ModelId, acp::Error> {
         let active_agent_type = self
             .active_agent_type
@@ -467,6 +547,7 @@ impl SessionActor {
                 committed_chat.catalog_identity.as_ref(),
                 &active_agent_type,
                 sampling_config.reasoning_effort,
+                summary_sampling_config,
             )
             .await
         {
@@ -525,6 +606,7 @@ impl SessionActor {
         catalog_identity: Option<&xai_chat_state::CatalogIdentity>,
         agent_type: &str,
         reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
+        summary_sampling_config: Option<xai_grok_sampler::SamplerConfig>,
     ) -> Result<(), &'static str> {
         if self.notifications.persistence_is_noop {
             return Ok(());
@@ -538,6 +620,7 @@ impl SessionActor {
                 catalog_identity: catalog_identity.cloned(),
                 agent_name: Some(agent_type.to_owned()),
                 reasoning_effort,
+                summary_sampling_config,
                 respond_to,
             })
             .map_err(|_| "persistence_channel_closed")?;
@@ -948,6 +1031,11 @@ mod model_switch_transaction_tests {
             auto_compact_threshold_percent: 73,
             required_agent_type: required_agent_type.to_owned(),
             required_definition: definition,
+            summary_sampling_config: None,
+            replace_inherited_web_search: false,
+            web_search_sampling_config: None,
+            web_search_alpha_test_key: None,
+            image_description_model: None,
         }
     }
 
@@ -1325,6 +1413,75 @@ mod model_switch_transaction_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn model_overrides_successful_switch_commits_inherited_auxiliary_lanes() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (persistence_tx, mut persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+                tokio::task::spawn_local(async move {
+                    while let Some(message) = persistence_rx.recv().await {
+                        if let PersistenceMsg::ModelSwitchAndAck {
+                            summary_sampling_config,
+                            respond_to,
+                            ..
+                        } = message
+                        {
+                            assert_eq!(
+                                summary_sampling_config
+                                    .as_ref()
+                                    .map(|config| config.model.as_str()),
+                                Some("target-wire-model")
+                            );
+                            let _ = respond_to.send(Ok(()));
+                        }
+                    }
+                });
+                let (actor, _event_rx) =
+                    create_test_actor_ex(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                *actor.active_agent_type.lock() = Some("grok-build".to_owned());
+                assert!(
+                    actor
+                        .agent
+                        .borrow()
+                        .tool_bridge()
+                        .read_resource::<
+                            xai_grok_tools::implementations::web_search::client::WebSearchClient,
+                        >()
+                        .await
+                        .is_none()
+                );
+                let mut prepared = prepared_switch("grok-build", None);
+                prepared.summary_sampling_config = Some(prepared.sampling_config.clone());
+                prepared.replace_inherited_web_search = true;
+                let mut web_search_sampling = prepared.sampling_config.clone();
+                web_search_sampling.api_key = Some("target-test-key".to_owned());
+                prepared.web_search_sampling_config = Some(web_search_sampling);
+                prepared.image_description_model = Some("target-provider".to_owned());
+
+                actor
+                    .handle_apply_model_switch(prepared)
+                    .await
+                    .expect("inherited auxiliary lanes must commit with the model switch");
+
+                assert_eq!(
+                    actor.image_description_model.borrow().as_str(),
+                    "target-provider"
+                );
+                let bridge = actor.agent.borrow().tool_bridge().clone();
+                assert!(
+                    bridge
+                        .read_resource::<
+                            xai_grok_tools::implementations::web_search::client::WebSearchClient,
+                        >()
+                        .await
+                        .is_some()
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn noop_persistence_allows_live_model_switch_without_durable_writes() {
         let local = tokio::task::LocalSet::new();
         local
@@ -1378,6 +1535,7 @@ mod model_switch_transaction_tests {
                             None,
                             "grok-build",
                             previous_chat.sampling_config.reasoning_effort,
+                            None,
                         )
                         .await,
                     Err("persistence_channel_closed"),

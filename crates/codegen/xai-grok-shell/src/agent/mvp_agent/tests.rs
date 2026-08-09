@@ -2733,6 +2733,132 @@ fn build_agent_with_model_for_tests(
     agent
 }
 
+fn build_cross_provider_agent_for_tests(target_api_key: Option<&str>) -> MvpAgent {
+    use crate::agent::config::{Config as AgentConfig, ConfigModelOverride};
+    use crate::auth::{AuthManager, GrokComConfig};
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let auth_manager =
+        std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let gateway = GatewaySender::new(tx);
+    let mut cfg = AgentConfig::default();
+    cfg.models.default = Some("source-provider".to_owned());
+    for (id, wire_model, base_url, api_key) in [
+        (
+            "source-provider",
+            "source-wire-model",
+            "https://source.invalid/v1",
+            Some("source-test-key"),
+        ),
+        (
+            "target-provider",
+            "target-wire-model",
+            "https://target.invalid/v1",
+            target_api_key,
+        ),
+    ] {
+        cfg.config_models.insert(
+            id.to_owned(),
+            ConfigModelOverride {
+                model: Some(wire_model.to_owned()),
+                base_url: Some(base_url.to_owned()),
+                api_key: api_key.map(str::to_owned),
+                api_backend: Some(xai_grok_sampling_types::ApiBackend::Responses),
+                auth_scheme: Some(xai_grok_sampler::AuthScheme::Bearer),
+                agent_type: Some("grok-build".to_owned()),
+                ..Default::default()
+            },
+        );
+    }
+    let agent = MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config");
+    agent
+        .models_manager
+        .set_current_model_id(acp::ModelId::new("source-provider"));
+    agent
+}
+
+#[test]
+fn model_overrides_live_cross_provider_switch_rebuilds_inherited_auxiliary_lanes() {
+    run_local_for_bridge_test(|| async {
+        let agent = build_cross_provider_agent_for_tests(Some("target-test-key"));
+        let sid = acp::SessionId::new("cross-provider-auxiliary-switch");
+        let mut handle = make_test_handle("source-provider", false, None);
+        handle.info.id = sid.clone();
+        handle.agent_name = "grok-build".to_owned();
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        handle.cmd_tx = cmd_tx;
+        agent.sessions.borrow_mut().insert(sid.clone(), handle);
+
+        tokio::task::spawn_local(async move {
+            while let Some(command) = cmd_rx.recv().await {
+                match command {
+                    TestSessionCommand::GetActiveAgent { responds_to } => {
+                        let _ = responds_to.send(Some("grok-build".to_owned()));
+                    }
+                    TestSessionCommand::ApplyModelSwitch {
+                        prepared,
+                        responds_to,
+                    } => {
+                        assert_eq!(
+                            prepared
+                                .summary_sampling_config
+                                .as_ref()
+                                .map(|config| config.model.as_str()),
+                            Some("target-wire-model")
+                        );
+                        assert!(prepared.replace_inherited_web_search);
+                        assert_eq!(
+                            prepared
+                                .web_search_sampling_config
+                                .as_ref()
+                                .map(|config| config.model.as_str()),
+                            Some("target-wire-model")
+                        );
+                        assert_eq!(
+                            prepared.image_description_model.as_deref(),
+                            Some("target-provider")
+                        );
+                        let _ = responds_to.send(Ok(crate::session::AppliedModelSwitch {
+                            previous_model_id: acp::ModelId::new("source-provider"),
+                            catalog_model_id: prepared.catalog_model_id,
+                            did_rebuild: false,
+                            active_agent_type: Some("grok-build".to_owned()),
+                        }));
+                    }
+                    _ => panic!("unexpected cross-provider model-switch command"),
+                }
+            }
+        });
+
+        crate::agent::handlers::model_switch::apply(
+            &agent,
+            acp::SetSessionModelRequest::new(
+                sid.clone(),
+                acp::ModelId::new("target-provider"),
+            ),
+        )
+        .await
+        .expect("cross-provider model switch");
+        assert_eq!(agent.sessions.borrow()[&sid].model_id.0.as_ref(), "target-provider");
+    });
+}
+
+#[test]
+fn model_overrides_cold_web_search_notice_describes_operative_session_model() {
+    run_local_for_bridge_test(|| async {
+        let agent = build_cross_provider_agent_for_tests(None);
+
+        let disabled = agent
+            .web_search_disable_details_for_model("target-provider")
+            .expect("missing target credential must be described");
+
+        assert_eq!(disabled.model_id, "target-provider");
+        assert!(disabled.user_notice().contains("target-provider"));
+        assert!(!disabled.user_notice().contains("source-provider"));
+    });
+}
+
 #[test]
 fn acp_model_switch_validation_and_apply_handoff_emit_one_failure_event() {
     run_local_for_bridge_test(|| async {

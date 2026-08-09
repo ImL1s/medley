@@ -816,8 +816,9 @@ impl SessionActor {
             &xai_chat_state::compaction_utils::extract_user_query(&original_user_message),
         );
         let active_session_config = self.reconstruct_full_config().await;
+        let image_description_model = self.image_description_model.borrow().clone();
         let resolved_describe = self
-            .resolve_aux_sampler_config(&self.image_description_model)
+            .resolve_aux_sampler_config(&image_description_model)
             .await;
         let (describe_model, sampler_config) =
             crate::agent::config::finalize_image_describe_sampler_config(

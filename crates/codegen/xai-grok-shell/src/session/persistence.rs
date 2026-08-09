@@ -343,6 +343,7 @@ pub enum PersistenceMsg {
         catalog_identity: Option<xai_chat_state::CatalogIdentity>,
         agent_name: Option<String>,
         reasoning_effort: Option<ReasoningEffort>,
+        summary_sampling_config: Option<xai_grok_sampler::SamplerConfig>,
         respond_to: tokio::sync::oneshot::Sender<
             Result<(), crate::session::storage::ModelSwitchCommitError>,
         >,
@@ -2213,6 +2214,7 @@ impl SessionPersistence {
                     catalog_identity,
                     agent_name,
                     reasoning_effort,
+                    summary_sampling_config,
                     respond_to,
                 } => {
                     let result = self
@@ -2226,10 +2228,24 @@ impl SessionPersistence {
                             reasoning_effort,
                         )
                         .await;
-                    if (result.is_ok() || result.as_ref().is_err_and(|error| error.is_committed()))
-                        && let Some(sync) = &self.remote_sync
-                    {
-                        sync.set_model(model_id.0.to_string(), catalog_identity, agent_name);
+                    if result.is_ok() || result.as_ref().is_err_and(|error| error.is_committed()) {
+                        if let Some(sync) = &self.remote_sync {
+                            sync.set_model(
+                                model_id.0.to_string(),
+                                catalog_identity,
+                                agent_name,
+                            );
+                        }
+                        if let Some(config) = summary_sampling_config {
+                            let model = config.model.clone();
+                            match crate::sampling::Client::new(config) {
+                                Ok(client) => self.summary.replace_sampling_client(client, model),
+                                Err(error) => tracing::warn!(
+                                    %error,
+                                    "failed to replace inherited session summary sampling config"
+                                ),
+                            }
+                    }
                     }
                     let _ = respond_to.send(result);
                 }

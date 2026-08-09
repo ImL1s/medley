@@ -1809,7 +1809,7 @@ pub(crate) async fn spawn_session_actor(
         turn_stream_drained: parking_lot::Mutex::new(None),
         sampler_handle,
         rebuild_spec: rebuild_spec.clone(),
-        image_description_model,
+        image_description_model: std::cell::RefCell::new(image_description_model),
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
         subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
         workspace_ops: workspace_ops.clone(),

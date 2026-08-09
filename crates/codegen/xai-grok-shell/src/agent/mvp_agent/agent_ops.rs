@@ -129,7 +129,7 @@ impl MvpAgent {
         }
         session_ids.len()
     }
-    pub(super) fn resolve_image_description_model(&self, primary_model_id: &str) -> String {
+    pub(crate) fn resolve_image_description_model(&self, primary_model_id: &str) -> String {
         let (model_id, follows_default) = {
             let cfg = self.cfg.borrow();
             (
@@ -144,6 +144,23 @@ impl MvpAgent {
             &model_id,
             primary_model_id,
             follows_default,
+        )
+    }
+    pub(crate) fn web_search_disable_details_for_model(
+        &self,
+        model_id: &str,
+    ) -> Option<config::WebSearchDisabled> {
+        let cfg = self.cfg.borrow();
+        let models = self.models_manager.models();
+        let session = self.current_or_buffered_auth();
+        config::web_search_disable_details(
+            model_id,
+            &models,
+            session.as_ref().map(|auth| auth.key.as_str()),
+            cfg.grok_com_config.api_key_auth_disabled(),
+            cfg.endpoints.alpha_test_key.clone(),
+            cfg.client_version.clone(),
+            &cfg.endpoints,
         )
     }
     pub(super) async fn build_summary_client(
@@ -2616,7 +2633,7 @@ impl MvpAgent {
     /// different -- and wrong -- cause: an expired-but-refreshable Codex
     /// credential is deliberately `ready`, so a failed refresh came back as
     /// "auth provider has no cached token" when there was one (#57).
-    pub(super) async fn prepare_web_search_sampling_config_preflight(
+    pub(crate) async fn prepare_web_search_sampling_config_preflight(
         &self,
         disable_reason: &mut Option<config::WebSearchDisabled>,
         operative_model_id: Option<&str>,
@@ -3809,7 +3826,7 @@ impl MvpAgent {
     /// Tri-state guardrail (#133): if readiness is `Unknown(CatalogUnavailable)`
     /// we cannot tell whether web search is usable, so stay silent (remove any
     /// stale map entry) rather than misreport "disabled".
-    pub(super) async fn recompute_web_search_disable_notice_for_session(
+    pub(crate) async fn recompute_web_search_disable_notice_for_session(
         &self,
         session_id: &acp::SessionId,
     ) {
@@ -3869,17 +3886,7 @@ impl MvpAgent {
         let disabled = if let Some(reason) = web_search_disable_reason {
             Some(reason)
         } else {
-            let cfg = self.cfg.borrow();
-            let session = self.current_or_buffered_auth();
-            config::web_search_disable_details(
-                &model_id,
-                &models,
-                session.as_ref().map(|a| a.key.as_str()),
-                cfg.grok_com_config.api_key_auth_disabled(),
-                cfg.endpoints.alpha_test_key.clone(),
-                cfg.client_version.clone(),
-                &cfg.endpoints,
-            )
+            self.web_search_disable_details_for_model(&model_id)
         };
 
         if let Some(disabled) = disabled {
@@ -5040,6 +5047,14 @@ impl MvpAgent {
                 Some(session_model_id.0.as_ref()),
             )
             .await;
+        let operative_web_search_model = {
+            let cfg = self.cfg.borrow();
+            crate::config::auxiliary_model_or_operative(
+                &cfg.web_search_model,
+                session_model_id.0.as_ref(),
+                cfg.web_search_follows_default,
+            )
+        };
         // #57: silent disable is the failure mode — capture a user-visible
         // notice now (before spawn) and emit it once the session exists.
         // Skip when the user explicitly passed `--disable-web-search`.
@@ -5064,18 +5079,7 @@ impl MvpAgent {
                 // Resolution succeeded but produced no usable key, which the
                 // preflight reports as `Ok`. Only this arm needs the
                 // non-preflight describe.
-                let cfg = self.cfg.borrow();
-                let models = self.models_manager.models();
-                let session = self.current_or_buffered_auth();
-                config::web_search_disable_details(
-                    &cfg.web_search_model,
-                    &models,
-                    session.as_ref().map(|a| a.key.as_str()),
-                    cfg.grok_com_config.api_key_auth_disabled(),
-                    cfg.endpoints.alpha_test_key.clone(),
-                    cfg.client_version.clone(),
-                    &cfg.endpoints,
-                )
+                self.web_search_disable_details_for_model(&operative_web_search_model)
             }
         };
         let image_gen_config = self.prepare_image_gen_config();
