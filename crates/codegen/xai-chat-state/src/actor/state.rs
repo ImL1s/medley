@@ -123,6 +123,8 @@ pub(crate) struct ChatState {
     /// Catalog identity paired with `sampling_config`, when a model switch
     /// supplied one.
     pub catalog_model_id: Option<String>,
+    /// Routing model paired with `catalog_model_id` at commit time.
+    pub catalog_model_route: Option<String>,
     /// Current prompt index (incremented per user turn).
     pub prompt_index: usize,
     /// Cached prompt texts for rewind preview.
@@ -233,6 +235,7 @@ impl ChatState {
             conversation,
             sampling_config,
             catalog_model_id: None,
+            catalog_model_route: None,
             prompt_index: 0,
             prompt_texts: Vec::new(),
             total_tokens: initial_tokens,

@@ -829,7 +829,7 @@ async fn read_parent_sampling_config(
     ctx: &SubagentSpawnContext,
 ) -> (xai_grok_sampler::SamplerConfig, acp::ModelId) {
     if let Some(ref chat_state) = ctx.parent_chat_state {
-        if let Some((cfg, committed_model_id)) =
+        if let Some((cfg, committed_model_id, committed_model_route)) =
             chat_state.get_sampling_config_with_model_id().await
         {
             // Copy identity and all request-shaping catalog facts under one
@@ -838,12 +838,14 @@ async fn read_parent_sampling_config(
             let preferred_model_id = committed_model_id
                 .as_deref()
                 .unwrap_or(ctx.model_id.0.as_ref());
-            let retained_catalog_route = crate::agent::models::resolve_catalog_key(
-                &ctx.available_models,
-                &acp::ModelId::new(preferred_model_id),
-            )
-            .and_then(|key| ctx.available_models.get(key.0.as_ref()))
-            .map(|entry| entry.info().model.as_str());
+            let retained_catalog_route = committed_model_route.as_deref().or_else(|| {
+                crate::agent::models::resolve_catalog_key(
+                    &ctx.available_models,
+                    &acp::ModelId::new(preferred_model_id),
+                )
+                .and_then(|key| ctx.available_models.get(key.0.as_ref()))
+                .map(|entry| entry.info().model.as_str())
+            });
             let opaque_model_name_override = retained_catalog_route.is_some()
                 && !ctx
                     .available_models

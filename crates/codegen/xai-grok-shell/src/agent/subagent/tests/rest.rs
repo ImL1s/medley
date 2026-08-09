@@ -2462,6 +2462,7 @@ async fn read_parent_sampling_config_missing_committed_id_ignores_same_route_sur
     let chat = ctx.parent_chat_state.as_ref().expect("chat state");
     let mut snapshot = chat.snapshot().await.expect("chat snapshot");
     snapshot.catalog_model_id = Some("removed-entry".to_string());
+    snapshot.catalog_model_route = Some("shared-routing-model".to_string());
     chat.restore_snapshot(snapshot);
 
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
@@ -2524,6 +2525,7 @@ async fn read_parent_sampling_config_switched_entry_opaque_override_keeps_capabi
     let mut snapshot = chat.snapshot().await.expect("chat snapshot");
     snapshot.sampling_config.model = "opaque-switched-routing-hint".to_string();
     snapshot.catalog_model_id = Some("switched-entry".to_string());
+    snapshot.catalog_model_route = Some("switched-routing-model".to_string());
     chat.restore_snapshot(snapshot);
 
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
@@ -2553,18 +2555,13 @@ async fn read_parent_sampling_config_opaque_override_rejects_reused_committed_ke
         "catalog-entry",
         models,
     );
-    let mut retained_models = indexmap::IndexMap::new();
-    retained_models.insert(
-        "catalog-entry".to_string(),
-        test_model_entry("original-routing-model"),
-    );
-    ctx.available_models = retained_models;
     ctx.sampling_config.model = "original-routing-model".to_string();
     ctx.sampling_config.codex_wire = Some(baseline_caps.clone());
     let chat = ctx.parent_chat_state.as_ref().expect("chat state");
     let mut snapshot = chat.snapshot().await.expect("chat snapshot");
     snapshot.sampling_config.model = "opaque-backend-routing-hint".to_string();
     snapshot.catalog_model_id = Some("catalog-entry".to_string());
+    snapshot.catalog_model_route = Some("original-routing-model".to_string());
     chat.restore_snapshot(snapshot);
 
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
@@ -2683,6 +2680,7 @@ async fn read_parent_sampling_config_same_entry_none_overrides_stale_baseline_wi
     let chat = ctx.parent_chat_state.as_ref().expect("chat state");
     let mut snapshot = chat.snapshot().await.expect("chat snapshot");
     snapshot.catalog_model_id = Some("same-catalog-entry".to_string());
+    snapshot.catalog_model_route = Some("same-routing-model".to_string());
     chat.restore_snapshot(snapshot);
 
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
@@ -2722,6 +2720,7 @@ async fn read_parent_sampling_config_inflight_switch_uses_live_model_wire() {
     let chat = ctx.parent_chat_state.as_ref().expect("chat state");
     let mut snapshot = chat.snapshot().await.expect("chat snapshot");
     snapshot.catalog_model_id = Some("new-catalog-id".to_string());
+    snapshot.catalog_model_route = Some("shared-routing-model".to_string());
     chat.restore_snapshot(snapshot);
 
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
@@ -2760,6 +2759,7 @@ async fn read_parent_sampling_config_reused_catalog_key_keeps_sampled_model_wire
     let chat = ctx.parent_chat_state.as_ref().expect("chat state");
     let mut snapshot = chat.snapshot().await.expect("chat snapshot");
     snapshot.catalog_model_id = Some("auto".to_string());
+    snapshot.catalog_model_route = Some("old-routing-model".to_string());
     chat.restore_snapshot(snapshot);
 
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
@@ -2770,6 +2770,7 @@ async fn read_parent_sampling_config_reused_catalog_key_keeps_sampled_model_wire
 
     let mut baseline_snapshot = chat.snapshot().await.expect("chat snapshot");
     baseline_snapshot.catalog_model_id = None;
+    baseline_snapshot.catalog_model_route = None;
     chat.restore_snapshot(baseline_snapshot);
     let (baseline_config, baseline_model_id) = read_parent_sampling_config(&ctx).await;
     assert_eq!(baseline_model_id.0.as_ref(), "legacy-entry");

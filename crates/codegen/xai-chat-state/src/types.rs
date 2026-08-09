@@ -37,6 +37,10 @@ pub struct ChatStateSnapshot {
     /// model switch. Older persisted snapshots do not carry this field.
     #[serde(default)]
     pub catalog_model_id: Option<String>,
+    /// Routing model owned by `catalog_model_id` when that identity was
+    /// committed. Kept stable across opaque model-name overrides.
+    #[serde(default)]
+    pub catalog_model_route: Option<String>,
     /// Current prompt index (incremented per user turn).
     pub prompt_index: usize,
     /// Accumulated token usage.
@@ -434,6 +438,7 @@ mod tests {
         let alpha_key = "YWQ82mKoP6sT3rH9vN5bC1xE7fJ4uL0a";
         let snapshot = ChatStateSnapshot {
             catalog_model_id: None,
+            catalog_model_route: None,
             conversation: vec![],
             sampling_config: SamplingConfig {
                 base_url: format!("https://user:{api_key}@api.example.com/?token={api_key}"),
@@ -474,6 +479,7 @@ mod tests {
 
         let snapshot = ChatStateSnapshot {
             catalog_model_id: None,
+            catalog_model_route: None,
             conversation: vec![
                 ConversationItem::system("You are a helpful assistant."),
                 ConversationItem::user("Hello!"),
@@ -517,6 +523,7 @@ mod tests {
         let alpha_key = "GB002-chat-alpha-A7s5D3f1G9h7";
         let snapshot = ChatStateSnapshot {
             catalog_model_id: None,
+            catalog_model_route: None,
             conversation: vec![],
             sampling_config: SamplingConfig::for_test("https://api.example.com", "test-model"),
             prompt_index: 0,

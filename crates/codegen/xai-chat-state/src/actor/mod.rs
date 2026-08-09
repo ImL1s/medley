@@ -338,6 +338,7 @@ impl ChatStateActor {
                 let _ = reply.send((
                     self.state.sampling_config.clone(),
                     self.state.catalog_model_id.clone(),
+                    self.state.catalog_model_route.clone(),
                 ));
             }
             ChatStateCommand::GetAgentEditedPaths { reply } => {

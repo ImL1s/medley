@@ -501,6 +501,7 @@ impl ChatStateActor {
         self.rebase_turn_capture_offset();
         self.state.sampling_config = snap.sampling_config;
         self.state.catalog_model_id = snap.catalog_model_id;
+        self.state.catalog_model_route = snap.catalog_model_route;
         self.state.prompt_index = snap.prompt_index;
         self.state.total_tokens = snap.total_tokens;
         self.state.estimated_tokens_since_model = 0;
