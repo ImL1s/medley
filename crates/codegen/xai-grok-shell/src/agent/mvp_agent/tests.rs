@@ -2847,7 +2847,9 @@ fn model_overrides_live_cross_provider_switch_rebuilds_inherited_auxiliary_lanes
                         );
                         let _ = responds_to.send(Ok(crate::session::AppliedModelSwitch {
                             previous_model_id: acp::ModelId::new("source-provider"),
-                            catalog_model_id: prepared.catalog_model_id,
+                            catalog_model_id: acp::ModelId::new(
+                                prepared.catalog_identity.model_id.clone(),
+                            ),
                             did_rebuild: false,
                             active_agent_type: Some("grok-build".to_owned()),
                             web_search: Some(crate::session::AppliedWebSearchState {
@@ -2913,7 +2915,9 @@ fn model_overrides_global_web_search_disable_skips_live_replacement() {
                         assert!(prepared.web_search_disable_notice.is_none());
                         let _ = responds_to.send(Ok(crate::session::AppliedModelSwitch {
                             previous_model_id: acp::ModelId::new("source-provider"),
-                            catalog_model_id: prepared.catalog_model_id,
+                            catalog_model_id: acp::ModelId::new(
+                                prepared.catalog_identity.model_id.clone(),
+                            ),
                             did_rebuild: false,
                             active_agent_type: Some("grok-build".to_owned()),
                             web_search: None,
@@ -2986,7 +2990,9 @@ fn model_overrides_cold_web_search_notice_describes_operative_session_model() {
                         };
                         let _ = responds_to.send(Ok(crate::session::AppliedModelSwitch {
                             previous_model_id: acp::ModelId::new("source-provider"),
-                            catalog_model_id: prepared.catalog_model_id,
+                            catalog_model_id: acp::ModelId::new(
+                                prepared.catalog_identity.model_id.clone(),
+                            ),
                             did_rebuild: false,
                             active_agent_type: Some("grok-build".to_owned()),
                             web_search: Some(crate::session::AppliedWebSearchState {
@@ -3891,6 +3897,7 @@ fn attach_restore_unique_route_ignores_reused_key_endpoint_and_secret() {
                             catalog_model_id: acp::ModelId::new("replacement-key"),
                             did_rebuild: false,
                             active_agent_type: Some("grok-build".to_owned()),
+                            web_search: None,
                         }));
                     }
                     _ => panic!("unexpected command during persisted model restore"),
