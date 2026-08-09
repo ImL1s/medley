@@ -237,6 +237,13 @@ impl ChatStateActor {
             ChatStateCommand::UpdateSamplingConfig { config } => {
                 self.state.sampling_config = config;
             }
+            ChatStateCommand::UpdateSamplingConfigAndCredentials {
+                config,
+                credentials,
+            } => {
+                self.state.sampling_config = config;
+                self.state.credentials = credentials;
+            }
             ChatStateCommand::RecordAgentEditedPath { path } => {
                 self.state.agent_edited_paths.insert(path);
             }
@@ -369,6 +376,13 @@ impl ChatStateActor {
                 let _ = reply.send((
                     self.state.sampling_config.clone(),
                     self.state.catalog_identity.clone(),
+                ));
+            }
+            ChatStateCommand::GetPreparedModelState { reply } => {
+                let _ = reply.send((
+                    self.state.sampling_config.clone(),
+                    self.state.catalog_identity.clone(),
+                    self.state.credentials.clone(),
                 ));
             }
             ChatStateCommand::GetAgentEditedPaths { reply } => {

@@ -170,6 +170,20 @@ impl ChatStateHandle {
             .send(ChatStateCommand::UpdateSamplingConfig { config });
     }
 
+    /// Atomically update the sampling config and its bound credentials.
+    pub fn update_sampling_config_and_credentials(
+        &self,
+        config: SamplingConfig,
+        credentials: Credentials,
+    ) {
+        let _ = self
+            .cmd_tx
+            .send(ChatStateCommand::UpdateSamplingConfigAndCredentials {
+                config,
+                credentials,
+            });
+    }
+
     /// Track that the agent edited a file path.
     pub fn record_agent_edited_path(&self, path: String) {
         let _ = self
@@ -457,6 +471,20 @@ impl ChatStateHandle {
     ) -> Option<(SamplingConfig, Option<crate::types::CatalogIdentity>)> {
         self.query("GetSamplingConfigWithModelId", |reply| {
             ChatStateCommand::GetSamplingConfigWithModelId { reply }
+        })
+        .await
+    }
+
+    /// Get routing identity and credentials from one actor transaction.
+    pub async fn get_prepared_model_state(
+        &self,
+    ) -> Option<(
+        SamplingConfig,
+        Option<crate::types::CatalogIdentity>,
+        Credentials,
+    )> {
+        self.query("GetPreparedModelState", |reply| {
+            ChatStateCommand::GetPreparedModelState { reply }
         })
         .await
     }

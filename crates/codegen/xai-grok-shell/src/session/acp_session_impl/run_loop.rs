@@ -716,7 +716,11 @@ pub(super) async fn run_session(
                         }
                         SessionCommand::OverrideModelName { model_name, extra_headers, context_window } => {
                             // Update the actor's SamplingConfig model + headers + context window.
-                            if let Some(mut cfg) = session.chat_state_handle.get_sampling_config().await {
+                            if let Some((mut cfg, _catalog_identity, existing)) = session
+                                .chat_state_handle
+                                .get_prepared_model_state()
+                                .await
+                            {
                                 tracing::info!(
                                     target: SESSION_LOG,
                                     session_id = %session.session_info.id,
@@ -739,9 +743,6 @@ pub(super) async fn run_session(
                                 {
                                     cfg.context_window = cw;
                                 }
-                                session.chat_state_handle.update_sampling_config(cfg);
-
-                                let existing = session.chat_state_handle.get_credentials().await;
                                 // `session_key` may only be passed when the
                                 // stored credential really is a session token
                                 // -- `try_resolve_model_credentials` documents
@@ -757,11 +758,12 @@ pub(super) async fn run_session(
                                     == xai_chat_state::AuthType::SessionToken)
                                     .then_some(existing.api_key())
                                     .flatten();
-                                if let Some((r, source)) = crate::agent::config::try_resolve_model_credentials_with_source(model_name.as_str(), session_key) {
-                                    session.chat_state_handle.update_credentials(
-                                        existing.rebind(r.api_key, r.auth_type, source),
-                                    );
-                                }
+                                let credentials = crate::agent::config::try_resolve_model_credentials_with_source(model_name.as_str(), session_key)
+                                    .map(|(r, source)| existing.clone().rebind(r.api_key, r.auth_type, source))
+                                    .unwrap_or(existing);
+                                session
+                                    .chat_state_handle
+                                    .update_sampling_config_and_credentials(cfg, credentials);
                                 // Credentials changed under a possibly-unchanged model id.
                                 session.invalidate_model_auth_memo();
                             }

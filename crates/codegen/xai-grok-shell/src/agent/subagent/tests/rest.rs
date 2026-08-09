@@ -2615,7 +2615,11 @@ async fn read_parent_sampling_config_uses_live_catalog_after_same_route_refresh(
         ..Default::default()
     };
     let mut frozen = test_model_entry("stable-routing-model");
+    frozen.api_key = Some("stale-model-key".to_string());
+    frozen.info.agent_type = "stale-harness".to_string();
     frozen.info.auth_scheme = AuthScheme::Bearer;
+    frozen.info.supports_reasoning_effort = true;
+    frozen.info.auto_compact_threshold_percent = Some(70);
     frozen.info.codex_wire = Some(frozen_caps.clone());
     let mut models = indexmap::IndexMap::new();
     models.insert("stable-entry".to_string(), frozen);
@@ -2627,7 +2631,10 @@ async fn read_parent_sampling_config_uses_live_catalog_after_same_route_refresh(
     );
 
     let mut refreshed = test_model_entry("stable-routing-model");
+    refreshed.info.agent_type = "live-harness".to_string();
     refreshed.info.auth_scheme = AuthScheme::None;
+    refreshed.info.supports_reasoning_effort = false;
+    refreshed.info.auto_compact_threshold_percent = Some(90);
     refreshed.info.supports_backend_search = true;
     let refreshed_caps = xai_grok_sampling_types::CodexWireCapabilities {
         supports_reasoning_summary_parameter: Some(true),
@@ -2636,13 +2643,22 @@ async fn read_parent_sampling_config_uses_live_catalog_after_same_route_refresh(
     refreshed.info.codex_wire = Some(refreshed_caps.clone());
     ctx.models_manager.insert_test_entry("stable-entry", refreshed);
 
-    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+    let prepared = read_parent_prepared_model(&ctx).await;
+    let config = prepared.sampling_config;
+    let model_id = prepared.model_id;
 
     assert_eq!(model_id.0.as_ref(), "stable-entry");
     assert_eq!(config.auth_scheme, AuthScheme::None);
     assert!(config.supports_backend_search);
     assert_eq!(config.codex_wire, Some(refreshed_caps));
     assert_ne!(config.codex_wire, Some(frozen_caps));
+    assert!(
+        !prepared.supports_reasoning_effort,
+        "reasoning overrides must follow the live prepared catalog snapshot"
+    );
+    assert!(!prepared.model_has_own_credentials);
+    assert_eq!(prepared.agent_type, "live-harness");
+    assert_eq!(prepared.auto_compact_threshold_percent, Some(90));
 }
 
 #[tokio::test]
@@ -3717,6 +3733,50 @@ async fn runtime_override_wins_over_subagents_models_pin_in_precedence_path() {
             config.model, "pinned-model",
             "an unknown override falls through to the pin",
         );
+}
+
+#[tokio::test]
+async fn forked_request_never_falls_through_missing_parent_key_to_model_pins() {
+    use xai_grok_agent::config::ModelOverride;
+
+    let mut models = indexmap::IndexMap::new();
+    for key in ["runtime-pin", "config-pin", "definition-pin"] {
+        models.insert(key.to_string(), test_model_entry(key));
+    }
+    let mut ctx = ctx_with_parent_chat_state(
+        "removed-parent-key",
+        "parent-routing-model",
+        "runtime-pin",
+        models,
+    );
+    ctx.subagent_model_overrides
+        .insert("explore".to_string(), "config-pin".to_string());
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    chat.update_credentials(xai_chat_state::Credentials::bound(
+        Some("parent-model-key".to_string()),
+        xai_chat_state::AuthType::ApiKey,
+        xai_grok_sampler::CredentialSource::ModelApiKey,
+    ));
+
+    let prepared = resolve_request_prepared_model(
+        true,
+        Some("runtime-pin"),
+        "explore",
+        &ModelOverride::Override("definition-pin".to_string()),
+        &ctx,
+    )
+    .await;
+
+    assert_eq!(prepared.model_id.0.as_ref(), "removed-parent-key");
+    assert_eq!(prepared.sampling_config.model, "parent-routing-model");
+    assert_eq!(
+        prepared.sampling_config.api_key.as_deref(),
+        Some("parent-model-key")
+    );
+    assert!(
+        prepared.agent_type.is_empty(),
+        "the spawn path must fail closed when the removed parent key has no live harness facts"
+    );
 }
 /// A `fork_context = true` spawn must infer on the parent session model
 /// (`ctx.model_id`) for per-model radix reuse, even when a

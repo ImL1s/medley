@@ -350,14 +350,14 @@ impl SubagentSpawnContext {
     /// resolver: env > user [model.<id>] > user [session] > GB per-model
     /// > GB global > 85.
     ///
-    /// The GB per-model tier is read from `available_models` (the same
-    /// catalog used to pick the subagent's `SamplerConfig`); user TOML and
-    /// GB global tiers are sourced from the parent's snapshot captured at
-    /// spawn-context build time.
-    pub(crate) fn resolve_auto_compact_threshold_percent(&self, subagent_model_id: &str) -> u8 {
-        let gb_per_model =
-            crate::agent::config::find_model_by_id(&self.available_models, subagent_model_id)
-                .and_then(|e| e.info.auto_compact_threshold_percent);
+    /// The caller supplies the GB per-model tier from the same prepared
+    /// catalog snapshot as the subagent's `SamplerConfig`; user TOML and GB
+    /// global tiers remain sourced from the parent's spawn-context snapshot.
+    pub(crate) fn resolve_auto_compact_threshold_percent(
+        &self,
+        subagent_model_id: &str,
+        gb_per_model: Option<u8>,
+    ) -> u8 {
         crate::util::config::resolve_auto_compact_threshold_percent_from_tiers(
             self.auto_compact_threshold_tiers
                 .user_per_model
@@ -710,6 +710,30 @@ async fn resolve_effective_prepared_model(
     resolve_subagent_prepared_model(subagent_type, definition_model, ctx).await
 }
 
+async fn resolve_request_prepared_model(
+    fork_context: bool,
+    runtime_override_model: Option<&str>,
+    subagent_type: &str,
+    definition_model: &xai_grok_agent::config::ModelOverride,
+    ctx: &SubagentSpawnContext,
+) -> PreparedSubagentModel {
+    if fork_context {
+        // Forked history is model-bound. Keep the committed parent tuple even
+        // when its exact catalog key disappears; the caller can then fail
+        // closed on missing harness facts instead of falling through to a
+        // lower-priority model pin.
+        read_parent_prepared_model(ctx).await
+    } else {
+        resolve_effective_prepared_model(
+            runtime_override_model,
+            subagent_type,
+            definition_model,
+            ctx,
+        )
+        .await
+    }
+}
+
 async fn resolve_effective_model_config(
     runtime_override_model: Option<&str>,
     subagent_type: &str,
@@ -849,6 +873,11 @@ struct PreparedSubagentModel {
     sampling_config: xai_grok_sampler::SamplerConfig,
     model_id: acp::ModelId,
     catalog_identity: xai_chat_state::CatalogIdentity,
+    supports_reasoning_effort: bool,
+    model_has_own_credentials: bool,
+    auth_type: xai_chat_state::AuthType,
+    agent_type: String,
+    auto_compact_threshold_percent: Option<u8>,
 }
 
 fn catalog_auth_scheme(
@@ -873,11 +902,10 @@ fn sampler_auth_scheme(
 
 async fn read_parent_prepared_model(ctx: &SubagentSpawnContext) -> PreparedSubagentModel {
     if let Some(ref chat_state) = ctx.parent_chat_state {
-        if let Some((cfg, catalog_identity)) = chat_state.get_sampling_config_with_model_id().await
-        {
-            // Copy identity and all request-shaping catalog facts under one
-            // read lock before the credential await below. A refreshed exact
-            // key must not shadow the routing model actually sampled.
+        if let Some((cfg, catalog_identity, creds)) = chat_state.get_prepared_model_state().await {
+            // Copy identity, routing config, and credentials in one actor
+            // query. A concurrent model switch must not pair one model's
+            // endpoint/wire facts with another model's credential.
             let preferred_model_id = catalog_identity
                 .as_ref()
                 .map(|identity| identity.model_id.as_str())
@@ -923,7 +951,6 @@ async fn read_parent_prepared_model(ctx: &SubagentSpawnContext) -> PreparedSubag
             let baseline_matches_live = preferred_model_id
                 == ctx.sampling_config_model_id.0.as_ref()
                 && retained_catalog_route.is_some_and(|route| route == ctx.sampling_config.model);
-            let creds = chat_state.get_credentials().await;
             let mut extra_headers = cfg.extra_headers;
             crate::agent::config::inject_url_derived_headers(
                 &mut extra_headers,
@@ -1095,6 +1122,20 @@ async fn read_parent_prepared_model(ctx: &SubagentSpawnContext) -> PreparedSubag
                 sampling_config: inherited,
                 model_id,
                 catalog_identity: resolved_identity,
+                supports_reasoning_effort: capabilities
+                    .as_ref()
+                    .is_some_and(|facts| facts.supports_reasoning_effort),
+                model_has_own_credentials: capabilities
+                    .as_ref()
+                    .is_some_and(|facts| facts.byok == crate::agent::auth_method::ModelByok::Byok),
+                auth_type: creds.auth_type(),
+                agent_type: capabilities
+                    .as_ref()
+                    .map(|facts| facts.agent_type.clone())
+                    .unwrap_or_default(),
+                auto_compact_threshold_percent: capabilities
+                    .as_ref()
+                    .and_then(|facts| facts.auto_compact_threshold_percent),
             };
         }
         tracing::warn!(
@@ -1165,6 +1206,25 @@ async fn read_parent_prepared_model(ctx: &SubagentSpawnContext) -> PreparedSubag
         catalog_identity,
         sampling_config: fallback,
         model_id: fallback_model_id,
+        supports_reasoning_effort: capabilities
+            .as_ref()
+            .is_some_and(|facts| facts.supports_reasoning_effort),
+        model_has_own_credentials: capabilities
+            .as_ref()
+            .is_some_and(|facts| facts.byok == crate::agent::auth_method::ModelByok::Byok),
+        auth_type: subagent_auth_type(
+            capabilities
+                .as_ref()
+                .and_then(|facts| ctx.available_models.get(facts.model_id.0.as_ref())),
+            &ctx.auth_method_id,
+        ),
+        agent_type: capabilities
+            .as_ref()
+            .map(|facts| facts.agent_type.clone())
+            .unwrap_or_default(),
+        auto_compact_threshold_percent: capabilities
+            .as_ref()
+            .and_then(|facts| facts.auto_compact_threshold_percent),
     }
 }
 
@@ -1260,6 +1320,11 @@ fn resolve_model_override_to_prepared(
         sampling_config: config,
         model_id: canonical_model_id,
         catalog_identity,
+        supports_reasoning_effort: entry.info().supports_reasoning_effort,
+        model_has_own_credentials: entry.has_own_credentials(),
+        auth_type: resolved_auth_type,
+        agent_type: entry.info().agent_type.clone(),
+        auto_compact_threshold_percent: entry.info().auto_compact_threshold_percent,
     })
 }
 

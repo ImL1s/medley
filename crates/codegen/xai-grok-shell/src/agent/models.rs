@@ -119,8 +119,11 @@ pub struct ModelsManager {
 pub(crate) struct ResolvedModelCapabilities {
     pub model_id: acp::ModelId,
     pub byok: crate::agent::auth_method::ModelByok,
+    pub agent_type: String,
     pub auth_scheme: xai_grok_sampler::AuthScheme,
+    pub supports_reasoning_effort: bool,
     pub supports_backend_search: bool,
+    pub auto_compact_threshold_percent: Option<u8>,
     pub compactions_remaining: Option<xai_grok_sampling_types::CompactionsRemaining>,
     pub compaction_at_tokens: Option<xai_grok_sampling_types::CompactionAtTokens>,
     pub codex_wire: Option<xai_grok_sampling_types::CodexWireCapabilities>,
@@ -320,8 +323,11 @@ pub(crate) fn capabilities_for_route_in(
         } else {
             crate::agent::auth_method::ModelByok::NotByok
         },
+        agent_type: info.agent_type.clone(),
         auth_scheme: info.auth_scheme,
+        supports_reasoning_effort: info.supports_reasoning_effort,
         supports_backend_search: info.supports_backend_search,
+        auto_compact_threshold_percent: info.auto_compact_threshold_percent,
         compactions_remaining: info.compactions_remaining,
         compaction_at_tokens: info.compaction_at_tokens,
         codex_wire: info.codex_wire.clone(),

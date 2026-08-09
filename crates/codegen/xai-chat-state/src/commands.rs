@@ -121,6 +121,12 @@ pub enum ChatStateCommand {
     /// Update the sampling config (e.g., model switch).
     UpdateSamplingConfig { config: SamplingConfig },
 
+    /// Atomically update request routing and the credential bound to it.
+    UpdateSamplingConfigAndCredentials {
+        config: SamplingConfig,
+        credentials: Credentials,
+    },
+
     /// Track that the agent edited a file path.
     RecordAgentEditedPath { path: String },
 
@@ -259,6 +265,15 @@ pub enum ChatStateCommand {
     /// Get sampling config and its atomically committed catalog identity.
     GetSamplingConfigWithModelId {
         reply: oneshot::Sender<(SamplingConfig, Option<crate::types::CatalogIdentity>)>,
+    },
+    /// Get every model/credential fact needed to prepare a child request from
+    /// one actor snapshot.
+    GetPreparedModelState {
+        reply: oneshot::Sender<(
+            SamplingConfig,
+            Option<crate::types::CatalogIdentity>,
+            Credentials,
+        )>,
     },
 
     /// Get the set of agent-edited file paths.
