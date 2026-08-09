@@ -121,6 +121,9 @@ pub(crate) struct SubagentSpawnContext {
     /// context is built (an async snapshot from the parent session actor).
     pub client_hooks: crate::extensions::hooks::ClientHooks,
     pub sampling_config: xai_grok_sampler::SamplerConfig,
+    /// Catalog identity that owns the process-level `sampling_config`
+    /// baseline. It stays fixed when a session switches models.
+    pub sampling_config_model_id: acp::ModelId,
     pub managed_mcp_proxy_base_url: String,
     /// The staging auth header value propagated from the parent. Used
     /// when materialising subagent `SamplerConfig`s for auth-flow tracking
@@ -1010,24 +1013,26 @@ async fn read_parent_sampling_config(
 fn subagent_codex_wire(
     ctx: &SubagentSpawnContext,
 ) -> Option<xai_grok_sampling_types::CodexWireCapabilities> {
+    let model_id = ctx.model_id.0.as_ref();
+    let resolved = ctx.models_manager.model_codex_wire(model_id);
+    if resolved.is_some() || ctx.models_manager.model_in_catalog(model_id) {
+        // `None` on a present entry is authoritative metadata, not a catalog
+        // miss. Falling through would attach another model's flags.
+        return resolved;
+    }
+    if !ctx
+        .models_manager
+        .model_ids_refer_to_same_entry(model_id, ctx.sampling_config_model_id.0.as_ref())
+    {
+        return None;
+    }
+    // The session can retain a catalog id (for example `auto`) after a
+    // refresh republishes the same model only under its routing slug. Prefer
+    // the refreshed entry; fall back to the baseline only for a true miss on
+    // the exact model that owns that baseline.
     ctx.models_manager
-        .model_codex_wire(ctx.model_id.0.as_ref())
-        .or_else(|| {
-            let current_model_id = ctx.models_manager.current_model_id();
-            if !ctx
-                .models_manager
-                .model_ids_refer_to_same_entry(ctx.model_id.0.as_ref(), current_model_id.0.as_ref())
-            {
-                return None;
-            }
-            // The session can retain a catalog id (for example `auto`) after
-            // a refresh republishes the same model only under its routing
-            // slug. Prefer the refreshed entry; fall back to the baseline
-            // only for a true catalog miss.
-            ctx.models_manager
-                .model_codex_wire(&ctx.sampling_config.model)
-                .or_else(|| ctx.sampling_config.codex_wire.clone())
-        })
+        .model_codex_wire(&ctx.sampling_config.model)
+        .or_else(|| ctx.sampling_config.codex_wire.clone())
 }
 
 /// `AuthType` for a subagent: BYOK ⇒ `ApiKey` (don't overwrite the BYOK

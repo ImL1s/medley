@@ -1787,6 +1787,7 @@ fn ctx_with_parent_chat_state(
 ) -> SubagentSpawnContext {
     let mut ctx = ctx_with_toggle(HashMap::new());
     ctx.model_id = acp::ModelId::new(session_model_id);
+    ctx.sampling_config_model_id = acp::ModelId::new(session_model_id);
     ctx.parent_chat_state = Some(spawn_test_parent_chat_state(inference_slug));
     ctx.models_manager = crate::agent::models::ModelsManager::new(
         None,
@@ -2315,6 +2316,7 @@ async fn read_parent_sampling_config_catalog_miss_keeps_parent_wire_for_the_same
     };
     let mut ctx = ctx_with_toggle(HashMap::new());
     ctx.model_id = acp::ModelId::new("runtime-only-model");
+    ctx.sampling_config_model_id = acp::ModelId::new("runtime-only-model");
     ctx.parent_chat_state = None;
     ctx.sampling_config.model = "runtime-only-model".to_string();
     ctx.sampling_config.codex_wire = Some(parent_caps.clone());
@@ -2344,6 +2346,7 @@ async fn read_parent_sampling_config_catalog_miss_never_inherits_wire_across_mod
     };
     let mut ctx = ctx_with_toggle(HashMap::new());
     ctx.model_id = acp::ModelId::new("a-different-model");
+    ctx.sampling_config_model_id = acp::ModelId::new("the-parents-model");
     ctx.parent_chat_state = None;
     ctx.sampling_config.model = "the-parents-model".to_string();
     ctx.sampling_config.codex_wire = Some(parent_caps);
@@ -2389,6 +2392,36 @@ async fn read_parent_sampling_config_resolves_wire_after_catalog_id_becomes_slug
         config.codex_wire,
         Some(refreshed_caps),
         "a retained catalog id and its refreshed routing-slug key are the same model"
+    );
+}
+
+/// A present catalog entry with no wire metadata is authoritative. After a
+/// session switch it must not fall through to the process startup model's
+/// baseline capabilities.
+#[tokio::test]
+async fn read_parent_sampling_config_present_none_never_inherits_startup_model_wire() {
+    let startup_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut models = indexmap::IndexMap::new();
+    models.insert("switched-model".to_string(), test_model_entry("switched-model"));
+    let mut ctx = ctx_with_parent_chat_state(
+        "switched-model",
+        "switched-model",
+        "switched-model",
+        models,
+    );
+    ctx.sampling_config_model_id = acp::ModelId::new("startup-model");
+    ctx.sampling_config.model = "startup-model".to_string();
+    ctx.sampling_config.codex_wire = Some(startup_caps);
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "switched-model");
+    assert_eq!(
+        config.codex_wire, None,
+        "a present entry with no wire metadata must not inherit the startup model's flags"
     );
 }
 

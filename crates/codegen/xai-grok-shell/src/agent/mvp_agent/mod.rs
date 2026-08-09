@@ -772,6 +772,11 @@ pub struct MvpAgent {
     /// only api_key is written here (same for all clients). Per-session base_url
     /// is resolved at session creation time in `new_session` / `load_session`.
     pub(crate) sampling_config: RefCell<SamplingConfig>,
+    /// Catalog identity that owns `sampling_config`. Unlike
+    /// `ModelsManager::current_model_id`, this does not change when a session
+    /// switches models, so fallback consumers cannot attach the startup
+    /// config's capabilities to the switched model.
+    pub(crate) sampling_config_model_id: acp::ModelId,
     pub(crate) auth_manager: Arc<AuthManager>,
     pub(crate) models_manager: crate::agent::models::ModelsManager,
     /// grok.com chat-product catalog (`/rest/modes`) for chat sessions; distinct

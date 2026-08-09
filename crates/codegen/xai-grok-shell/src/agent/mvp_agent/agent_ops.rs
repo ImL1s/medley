@@ -2719,6 +2719,7 @@ impl MvpAgent {
     ) -> Self {
         models_manager.set_gateway(gateway.clone());
         let sampling_config = models_manager.sampling_config();
+        let sampling_config_model_id = models_manager.current_model_id();
         if !cfg.grok_com_config.api_key_auth_disabled() {
             let models = models_manager.models();
             let current = models_manager.current_model_id();
@@ -2807,6 +2808,7 @@ impl MvpAgent {
             cfg: RefCell::new(cfg.clone()),
             auth_method_id: crate::agent::auth_method::new_shared_auth_method_id(None),
             sampling_config: RefCell::new(sampling_config),
+            sampling_config_model_id,
             auth_manager,
             interactive_auth: Default::default(),
             client_type: RefCell::new(ClientType::default()),
