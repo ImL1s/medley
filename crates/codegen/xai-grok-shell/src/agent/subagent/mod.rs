@@ -838,9 +838,11 @@ async fn read_parent_sampling_config(
             let preferred_model_id = committed_model_id
                 .as_deref()
                 .unwrap_or(ctx.model_id.0.as_ref());
-            let capabilities = ctx
-                .models_manager
-                .capabilities_for_route(Some(preferred_model_id), &cfg.model);
+            let capabilities = ctx.models_manager.capabilities_for_route(
+                Some(preferred_model_id),
+                &cfg.model,
+                committed_model_id.is_some(),
+            );
             let model_id = capabilities
                 .as_ref()
                 .map(|facts| facts.model_id.clone())
@@ -1004,6 +1006,7 @@ async fn read_parent_sampling_config(
     let capabilities = ctx.models_manager.capabilities_for_route(
         Some(ctx.sampling_config_model_id.0.as_ref()),
         &fallback.model,
+        false,
     );
     let fallback_model_id = capabilities
         .as_ref()

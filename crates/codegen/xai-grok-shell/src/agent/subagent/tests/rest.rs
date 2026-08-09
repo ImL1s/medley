@@ -2431,6 +2431,44 @@ async fn read_parent_sampling_config_live_catalog_miss_keeps_same_model_baseline
     assert_eq!(config.codex_wire, Some(baseline_caps));
 }
 
+#[tokio::test]
+async fn read_parent_sampling_config_missing_committed_id_ignores_same_route_survivor() {
+    use xai_grok_sampler::AuthScheme;
+
+    let committed_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let survivor_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut survivor = test_model_entry("shared-routing-model");
+    survivor.info.auth_scheme = AuthScheme::None;
+    survivor.info.codex_wire = Some(survivor_caps);
+    let mut models = indexmap::IndexMap::new();
+    models.insert("surviving-entry".to_string(), survivor);
+    let mut ctx = ctx_with_parent_chat_state(
+        "removed-entry",
+        "shared-routing-model",
+        "surviving-entry",
+        models,
+    );
+    ctx.sampling_config.model = "shared-routing-model".to_string();
+    ctx.sampling_config.auth_scheme = AuthScheme::Bearer;
+    ctx.sampling_config.codex_wire = Some(committed_caps.clone());
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.catalog_model_id = Some("removed-entry".to_string());
+    chat.restore_snapshot(snapshot);
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "shared-routing-model");
+    assert_eq!(config.auth_scheme, AuthScheme::Bearer);
+    assert_eq!(config.codex_wire, Some(committed_caps));
+}
+
 /// A refreshed catalog can replace a retained catalog id (`auto`) with the
 /// routing slug key. That is still the same inherited model, and the child
 /// must use the refreshed entry's capabilities rather than losing them.

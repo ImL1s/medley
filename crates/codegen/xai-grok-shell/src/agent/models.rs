@@ -266,9 +266,13 @@ impl ModelsManager {
         &self,
         preferred_id: Option<&str>,
         routing_model: &str,
+        preferred_id_must_exist: bool,
     ) -> Option<ResolvedModelCapabilities> {
         let catalog = self.inner.catalog.read();
         let models = &catalog.models;
+        if preferred_id_must_exist && preferred_id.is_some_and(|id| !models.contains_key(id)) {
+            return None;
+        }
         let preferred = preferred_id
             .and_then(|id| resolve_catalog_key(models, &acp::ModelId::new(id)))
             .and_then(|key| {
