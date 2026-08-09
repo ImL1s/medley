@@ -836,18 +836,9 @@ async fn read_parent_sampling_config(
             // handle. Bind every catalog fact to the model observed in this
             // same live snapshot, while preserving a matching catalog id such
             // as `auto` when it still names that routing model.
-            let captured_model_matches = crate::agent::config::find_model_by_id(
-                &ctx.available_models,
-                ctx.model_id.0.as_ref(),
-            )
-            .is_some_and(|entry| entry.info.model == cfg.model)
-                || ctx
-                    .models_manager
-                    .model_ids_refer_to_same_entry(ctx.model_id.0.as_ref(), &cfg.model)
-                || (ctx.models_manager.model_ids_refer_to_same_entry(
-                    ctx.model_id.0.as_ref(),
-                    ctx.sampling_config_model_id.0.as_ref(),
-                ) && ctx.sampling_config.model == cfg.model);
+            let captured_model_matches = ctx
+                .models_manager
+                .model_id_routes_to(ctx.model_id.0.as_ref(), &cfg.model);
             let model_id = match committed_model_id {
                 Some(committed)
                     if ctx

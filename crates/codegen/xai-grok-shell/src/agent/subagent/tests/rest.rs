@@ -1816,7 +1816,7 @@ async fn read_parent_sampling_config_keeps_auto_when_catalog_has_slug_key_only()
     let ctx = ctx_with_parent_chat_state("auto", "grok-4.5", "auto", models);
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
     assert_eq!(config.model, "grok-4.5");
-    assert_eq!(model_id.0.as_ref(), "auto");
+    assert_eq!(model_id.0.as_ref(), "grok-4.5");
 }
 #[tokio::test]
 async fn read_parent_sampling_config_fallback_uses_session_model_id() {
@@ -2398,7 +2398,7 @@ async fn read_parent_sampling_config_resolves_wire_after_catalog_id_becomes_slug
 
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
 
-    assert_eq!(model_id.0.as_ref(), "auto");
+    assert_eq!(model_id.0.as_ref(), "grok-4.5");
     assert_eq!(
         config.codex_wire,
         Some(refreshed_caps),
@@ -2509,6 +2509,13 @@ async fn read_parent_sampling_config_reused_catalog_key_keeps_sampled_model_wire
     assert_eq!(model_id.0.as_ref(), "old-routing-model");
     assert_eq!(config.model, "old-routing-model");
     assert_eq!(config.codex_wire, Some(old_caps));
+
+    let mut baseline_snapshot = chat.snapshot().await.expect("chat snapshot");
+    baseline_snapshot.catalog_model_id = None;
+    chat.restore_snapshot(baseline_snapshot);
+    let (baseline_config, baseline_model_id) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(baseline_model_id.0.as_ref(), "old-routing-model");
+    assert_eq!(baseline_config.codex_wire, config.codex_wire);
 }
 
 #[tokio::test]
