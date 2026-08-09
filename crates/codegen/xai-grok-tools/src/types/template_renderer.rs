@@ -179,8 +179,8 @@ pub fn strip_template_markers(raw: &str) -> String {
 /// Created once at finalize time and available to all tools and reminders
 /// via `resources.get::<TemplateRenderer>()`. Uses MiniJinja with custom
 /// `${{ }}` / `${%  %}` delimiters to avoid collisions with literal `{{ }}`
-/// in tool descriptions and error messages. Context is baked in at
-/// construction and cannot be modified afterwards.
+/// in tool descriptions and error messages. The finalized context is immutable
+/// except for the built-in web-search availability shared by all clones.
 #[derive(Clone)]
 pub struct TemplateRenderer {
     ctx: TemplateContext,
@@ -188,8 +188,13 @@ pub struct TemplateRenderer {
     /// without rebuilding the finalized toolset. Clones share this state so
     /// the renderer stored in resources and the dispatch snapshot stay in
     /// sync with model-switch topology updates.
-    web_search_override: std::sync::Arc<parking_lot::RwLock<Option<Option<String>>>>,
+    web_search_client_name: std::sync::Arc<std::sync::OnceLock<String>>,
+    web_search_override: std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
+
+const WEB_SEARCH_INHERIT: u8 = 0;
+const WEB_SEARCH_ENABLED: u8 = 1;
+const WEB_SEARCH_DISABLED: u8 = 2;
 
 impl TemplateRenderer {
     /// Create a new renderer from the finalized kind → name mappings.
@@ -203,6 +208,10 @@ impl TemplateRenderer {
         tools: HashMap<ToolKind, String>,
         params: HashMap<ToolKind, HashMap<String, String>>,
     ) -> Self {
+        let web_search_client_name = std::sync::Arc::new(std::sync::OnceLock::new());
+        if let Some(client_name) = tools.get(&ToolKind::WebSearch) {
+            let _ = web_search_client_name.set(client_name.clone());
+        }
         // ToolKind keys → snake_case strings so templates can write
         // `${{ params.edit.old_string }}`.
         let params = params
@@ -224,19 +233,40 @@ impl TemplateRenderer {
                 has_unix_utilities: xai_grok_config::shell::has_unix_utilities(),
                 system_reminders_enabled: true,
             },
+            web_search_client_name,
             web_search_override: Default::default(),
         }
     }
 
     pub(crate) fn set_web_search_enabled(&self, client_name: Option<String>) {
-        *self.web_search_override.write() = Some(client_name);
+        let state = if let Some(client_name) = client_name {
+            if let Some(existing) = self.web_search_client_name.get() {
+                debug_assert_eq!(existing, &client_name, "web-search client name changed");
+            } else {
+                let _ = self.web_search_client_name.set(client_name);
+            }
+            WEB_SEARCH_ENABLED
+        } else {
+            WEB_SEARCH_DISABLED
+        };
+        self.web_search_override
+            .store(state, std::sync::atomic::Ordering::Release);
     }
 
     fn context_with_live_tools(&self) -> Option<TemplateContext> {
-        let web_search = self.web_search_override.read().clone()?;
+        let state = self
+            .web_search_override
+            .load(std::sync::atomic::Ordering::Acquire);
+        if state == WEB_SEARCH_INHERIT {
+            return None;
+        }
         let mut ctx = self.ctx.clone();
-        if let Some(client_name) = web_search {
-            ctx.tools.by_kind.insert(ToolKind::WebSearch, client_name);
+        if state == WEB_SEARCH_ENABLED {
+            if let Some(client_name) = self.web_search_client_name.get() {
+                ctx.tools
+                    .by_kind
+                    .insert(ToolKind::WebSearch, client_name.clone());
+            }
         } else {
             ctx.tools.by_kind.remove(&ToolKind::WebSearch);
         }
@@ -330,6 +360,16 @@ impl TemplateRenderer {
     /// single source of truth, populated at `FinalizedToolset` build time
     /// from each tool's `kind()`.
     pub fn tool_for_kind(&self, kind: ToolKind) -> Option<&str> {
+        if kind == ToolKind::WebSearch {
+            return match self
+                .web_search_override
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                WEB_SEARCH_ENABLED => self.web_search_client_name.get().map(String::as_str),
+                WEB_SEARCH_DISABLED => None,
+                _ => self.ctx.tools.by_kind.get(&kind).map(String::as_str),
+            };
+        }
         self.ctx.tools.by_kind.get(&kind).map(String::as_str)
     }
 
@@ -464,6 +504,38 @@ mod tests {
             })
             .collect();
         TemplateRenderer::new(tool_map, param_map)
+    }
+
+    #[tokio::test]
+    async fn live_web_search_override_updates_structural_lookups_and_clones() {
+        let renderer = make_renderer(&[], &[]);
+        let clone = renderer.clone();
+        let mut resources = crate::types::resources::Resources::new();
+        resources.insert(clone);
+        let shared = resources.into_shared();
+
+        assert_eq!(renderer.tool_for_kind(ToolKind::WebSearch), None);
+        assert_eq!(
+            TemplateRenderer::resolve_tool_name(&shared, ToolKind::WebSearch).await,
+            None
+        );
+
+        renderer.set_web_search_enabled(Some("provider_web_search".to_owned()));
+        assert_eq!(
+            renderer.tool_for_kind(ToolKind::WebSearch),
+            Some("provider_web_search")
+        );
+        assert_eq!(
+            TemplateRenderer::resolve_tool_name(&shared, ToolKind::WebSearch).await,
+            Some("provider_web_search".to_owned())
+        );
+
+        renderer.set_web_search_enabled(None);
+        assert_eq!(renderer.tool_for_kind(ToolKind::WebSearch), None);
+        assert_eq!(
+            TemplateRenderer::resolve_tool_name(&shared, ToolKind::WebSearch).await,
+            None
+        );
     }
 
     #[test]
