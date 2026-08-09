@@ -771,6 +771,7 @@ mod tests {
             show_model_fingerprint: Some(true),
             stream_tool_calls: Some(false),
             codex_wire: None,
+            catalog_degraded_reason: None,
             invalid_auth_scheme: None,
         }
     }

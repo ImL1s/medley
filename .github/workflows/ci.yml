@@ -1426,6 +1426,17 @@ jobs:
             codex_catalog_fallback_uses_builtin_preset_when_fetch_is_empty -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_credential_source_must_be_openai_codex_provider -- --nocapture
+          # #262: last-good catalogs are account-isolated and degraded state is visible.
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_last_good_cache_is_account_keyed -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_saved_fallback_is_visible_in_acp_metadata -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_degraded_state_survives_description_override -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_builtin_fallback_reports_absent_persisted_default -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            codex_catalog_degraded_state_is_visible_in_model_picker -- --nocapture
           # #245: catalog wire flags that differ from the Sol preset must parse.
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_parser_reads_wire_capabilities_that_differ_from_the_preset -- --nocapture

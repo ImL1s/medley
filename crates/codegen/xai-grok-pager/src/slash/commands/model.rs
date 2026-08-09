@@ -127,6 +127,7 @@ struct ModelReadinessMeta {
     ready: bool,
     readiness_reason: String,
     provider_hint: String,
+    catalog_degraded_reason: String,
 }
 
 fn parse_model_readiness(
@@ -148,6 +149,7 @@ fn parse_model_readiness(
         ready,
         readiness_reason: get_str("readinessReason"),
         provider_hint: get_str("providerHint"),
+        catalog_degraded_reason: get_str("catalogDegradedReason"),
     }
 }
 
@@ -264,10 +266,16 @@ fn build_model_items(models: &ModelState) -> Vec<ArgItem> {
         } else {
             readiness.auth_scheme.clone()
         };
-        let description = format!("{hint} · {scheme}");
+        let description = if readiness.catalog_degraded_reason.is_empty() {
+            format!("{hint} · {scheme}")
+        } else {
+            format!("{hint} · {scheme} · {}", readiness.catalog_degraded_reason)
+        };
 
         let badge = if !readiness.ready {
             "missing".to_string()
+        } else if !readiness.catalog_degraded_reason.is_empty() {
+            "degraded".to_string()
         } else if readiness.auth_scheme == "none" || readiness.auth_class == "none" {
             "none".to_string()
         } else {
@@ -693,6 +701,30 @@ mod tests {
         assert_eq!(none.badge, "none");
         assert!(!none.non_selectable);
         assert_eq!(none.description, "local · none");
+    }
+
+    #[test]
+    fn codex_catalog_degraded_state_is_visible_in_model_picker() {
+        let mut state = ModelState::default();
+        let reason = "live refresh failed; using the last saved catalog for this account";
+        let (id, info) = model_with_meta(
+            "codex-saved",
+            "Codex Saved",
+            serde_json::Map::from_iter([
+                ("authScheme".into(), serde_json::json!("bearer")),
+                ("authClass".into(), serde_json::json!("session")),
+                ("ready".into(), serde_json::json!(true)),
+                ("providerHint".into(), serde_json::json!("chatgpt.com")),
+                ("catalogDegradedReason".into(), serde_json::json!(reason)),
+            ]),
+        );
+        state.available.insert(id, info);
+
+        let item = build_model_items(&state).pop().expect("Codex model row");
+        assert_eq!(item.badge, "degraded");
+        assert!(!item.dimmed);
+        assert!(!item.non_selectable);
+        assert!(item.description.contains(reason));
     }
 
     #[test]

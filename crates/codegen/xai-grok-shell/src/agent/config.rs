@@ -4521,6 +4521,10 @@ pub struct ConfigModelOverride {
     /// parse fills it. Skipped in serde so unknown user keys stay ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_wire: Option<xai_grok_sampling_types::CodexWireCapabilities>,
+    /// Runtime-only state from the Codex catalog refresh. Kept separate from
+    /// `description` so a metadata-only user override cannot erase it.
+    #[serde(skip)]
+    pub(crate) catalog_degraded_reason: Option<String>,
     /// Raw `auth_scheme` string when TOML parsing failed. Not persisted; used to
     /// fail-closed at resolve time instead of defaulting to Bearer.
     #[serde(skip)]
@@ -4577,6 +4581,10 @@ impl std::fmt::Debug for ConfigModelOverride {
             .field("show_model_fingerprint", &self.show_model_fingerprint)
             .field("stream_tool_calls", &self.stream_tool_calls)
             .field("codex_wire", &self.codex_wire)
+            .field(
+                "catalog_degraded_reason_present",
+                &self.catalog_degraded_reason.is_some(),
+            )
             .field(
                 "invalid_auth_scheme_present",
                 &self.invalid_auth_scheme.is_some(),
@@ -4682,6 +4690,17 @@ impl ConfigModelOverride {
         }
         if self.codex_wire.is_some() {
             entry.info.codex_wire.clone_from(&self.codex_wire);
+        }
+        if let Some(reason) = self.catalog_degraded_reason.as_deref() {
+            let description = entry
+                .info
+                .description
+                .take()
+                .unwrap_or_else(|| "OpenAI Codex via a ChatGPT subscription".to_owned());
+            entry.info.description = Some(format!(
+                "{description} — {}{reason}",
+                super::model_providers::OPENAI_CODEX_CATALOG_DEGRADED_MARKER
+            ));
         }
         if self.api_key.is_some() {
             entry.api_key.clone_from(&self.api_key);
@@ -7072,6 +7091,14 @@ pub(crate) fn to_acp_model_info(
                     map.insert(
                         "readinessReason".to_string(),
                         serde_json::Value::String(reason),
+                    );
+                }
+                if let Some(reason) = super::model_providers::codex_catalog_degraded_reason(
+                    info.description.as_deref(),
+                ) {
+                    map.insert(
+                        "catalogDegradedReason".to_string(),
+                        serde_json::Value::String(reason.to_owned()),
                     );
                 }
                 map.insert(
