@@ -33,6 +33,10 @@ pub struct ChatStateSnapshot {
     /// Current sampling configuration.
     #[serde(with = "snapshot_sampling_config")]
     pub sampling_config: SamplingConfig,
+    /// Catalog identity committed atomically with `sampling_config` during a
+    /// model switch. Older persisted snapshots do not carry this field.
+    #[serde(default)]
+    pub catalog_model_id: Option<String>,
     /// Current prompt index (incremented per user turn).
     pub prompt_index: usize,
     /// Accumulated token usage.
@@ -429,6 +433,7 @@ mod tests {
         let api_key = "ZXQ91vLmN7pR4tK8sW2cY6hF0aD3uB5e";
         let alpha_key = "YWQ82mKoP6sT3rH9vN5bC1xE7fJ4uL0a";
         let snapshot = ChatStateSnapshot {
+            catalog_model_id: None,
             conversation: vec![],
             sampling_config: SamplingConfig {
                 base_url: format!("https://user:{api_key}@api.example.com/?token={api_key}"),
@@ -468,6 +473,7 @@ mod tests {
         use xai_grok_sampling_types::ConversationItem;
 
         let snapshot = ChatStateSnapshot {
+            catalog_model_id: None,
             conversation: vec![
                 ConversationItem::system("You are a helpful assistant."),
                 ConversationItem::user("Hello!"),
@@ -510,6 +516,7 @@ mod tests {
         let api_key = "GB002-chat-access-Q7w5E3r1T9y7";
         let alpha_key = "GB002-chat-alpha-A7s5D3f1G9h7";
         let snapshot = ChatStateSnapshot {
+            catalog_model_id: None,
             conversation: vec![],
             sampling_config: SamplingConfig::for_test("https://api.example.com", "test-model"),
             prompt_index: 0,

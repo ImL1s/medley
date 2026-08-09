@@ -334,6 +334,12 @@ impl ChatStateActor {
             ChatStateCommand::GetSamplingConfig { reply } => {
                 let _ = reply.send(self.state.sampling_config.clone());
             }
+            ChatStateCommand::GetSamplingConfigWithModelId { reply } => {
+                let _ = reply.send((
+                    self.state.sampling_config.clone(),
+                    self.state.catalog_model_id.clone(),
+                ));
+            }
             ChatStateCommand::GetAgentEditedPaths { reply } => {
                 let _ = reply.send(self.state.agent_edited_paths.clone());
             }

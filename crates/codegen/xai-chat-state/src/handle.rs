@@ -450,6 +450,17 @@ impl ChatStateHandle {
         .await
     }
 
+    /// Get sampling config together with the catalog identity committed in
+    /// the same actor transaction.
+    pub async fn get_sampling_config_with_model_id(
+        &self,
+    ) -> Option<(SamplingConfig, Option<String>)> {
+        self.query("GetSamplingConfigWithModelId", |reply| {
+            ChatStateCommand::GetSamplingConfigWithModelId { reply }
+        })
+        .await
+    }
+
     /// Get the set of agent-edited file paths.
     pub async fn get_agent_edited_paths(&self) -> BTreeSet<String> {
         self.query("GetAgentEditedPaths", |reply| {

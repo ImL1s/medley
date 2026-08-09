@@ -120,6 +120,9 @@ pub(crate) struct ChatState {
     pub conversation: Vec<ConversationItem>,
     /// Current sampling configuration (model, context window, etc.).
     pub sampling_config: SamplingConfig,
+    /// Catalog identity paired with `sampling_config`, when a model switch
+    /// supplied one.
+    pub catalog_model_id: Option<String>,
     /// Current prompt index (incremented per user turn).
     pub prompt_index: usize,
     /// Cached prompt texts for rewind preview.
@@ -229,6 +232,7 @@ impl ChatState {
         Self {
             conversation,
             sampling_config,
+            catalog_model_id: None,
             prompt_index: 0,
             prompt_texts: Vec::new(),
             total_tokens: initial_tokens,

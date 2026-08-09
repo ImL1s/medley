@@ -829,7 +829,9 @@ async fn read_parent_sampling_config(
     ctx: &SubagentSpawnContext,
 ) -> (xai_grok_sampler::SamplerConfig, acp::ModelId) {
     if let Some(ref chat_state) = ctx.parent_chat_state {
-        if let Some(cfg) = chat_state.get_sampling_config().await {
+        if let Some((cfg, committed_model_id)) =
+            chat_state.get_sampling_config_with_model_id().await
+        {
             // A model switch commits the actor config before the outer session
             // handle. Bind every catalog fact to the model observed in this
             // same live snapshot, while preserving a matching catalog id such
@@ -846,11 +848,15 @@ async fn read_parent_sampling_config(
                     ctx.model_id.0.as_ref(),
                     ctx.sampling_config_model_id.0.as_ref(),
                 ) && ctx.sampling_config.model == cfg.model);
-            let model_id = if captured_model_matches {
-                ctx.model_id.clone()
-            } else {
-                acp::ModelId::new(cfg.model.clone())
-            };
+            let model_id = committed_model_id
+                .map(acp::ModelId::new)
+                .unwrap_or_else(|| {
+                    if captured_model_matches {
+                        ctx.model_id.clone()
+                    } else {
+                        acp::ModelId::new(cfg.model.clone())
+                    }
+                });
             let creds = chat_state.get_credentials().await;
             let mut extra_headers = cfg.extra_headers;
             crate::agent::config::inject_url_derived_headers(

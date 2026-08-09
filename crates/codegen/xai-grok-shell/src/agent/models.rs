@@ -660,11 +660,10 @@ impl ModelsManager {
     }
 
     pub(crate) fn model_supports_backend_search(&self, model_id: &str) -> bool {
-        self.inner
-            .catalog
-            .read()
-            .models
-            .get(model_id)
+        let catalog = self.inner.catalog.read();
+        let models = &catalog.models;
+        resolve_catalog_key(models, &acp::ModelId::new(model_id))
+            .and_then(|key| models.get(key.0.as_ref()))
             .map(|e| e.info().supports_backend_search)
             .unwrap_or(false)
     }
@@ -705,11 +704,10 @@ impl ModelsManager {
         &self,
         model_id: &str,
     ) -> Option<xai_grok_sampling_types::CompactionsRemaining> {
-        self.inner
-            .catalog
-            .read()
-            .models
-            .get(model_id)
+        let catalog = self.inner.catalog.read();
+        let models = &catalog.models;
+        resolve_catalog_key(models, &acp::ModelId::new(model_id))
+            .and_then(|key| models.get(key.0.as_ref()))
             .and_then(|e| e.info().compactions_remaining)
     }
 
@@ -717,11 +715,10 @@ impl ModelsManager {
         &self,
         model_id: &str,
     ) -> Option<xai_grok_sampling_types::CompactionAtTokens> {
-        self.inner
-            .catalog
-            .read()
-            .models
-            .get(model_id)
+        let catalog = self.inner.catalog.read();
+        let models = &catalog.models;
+        resolve_catalog_key(models, &acp::ModelId::new(model_id))
+            .and_then(|key| models.get(key.0.as_ref()))
             .and_then(|e| e.info().compaction_at_tokens)
     }
 

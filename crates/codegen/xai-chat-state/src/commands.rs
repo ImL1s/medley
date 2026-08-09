@@ -256,6 +256,10 @@ pub enum ChatStateCommand {
     GetSamplingConfig {
         reply: oneshot::Sender<SamplingConfig>,
     },
+    /// Get sampling config and its atomically committed catalog identity.
+    GetSamplingConfigWithModelId {
+        reply: oneshot::Sender<(SamplingConfig, Option<String>)>,
+    },
 
     /// Get the set of agent-edited file paths.
     GetAgentEditedPaths {

@@ -2439,30 +2439,36 @@ async fn read_parent_sampling_config_inflight_switch_uses_live_model_wire() {
         supports_reasoning_summary_parameter: Some(false),
         ..Default::default()
     };
-    let mut old_entry = test_model_entry("old-routing-model");
+    let mut old_entry = test_model_entry("shared-routing-model");
     old_entry.info.codex_wire = Some(old_caps);
-    let mut new_entry = test_model_entry("new-routing-model");
+    let mut new_entry = test_model_entry("shared-routing-model");
     new_entry.info.codex_wire = Some(new_caps.clone());
+    new_entry.info.supports_backend_search = true;
     let mut models = indexmap::IndexMap::new();
     models.insert("old-catalog-id".to_string(), old_entry);
     models.insert("new-catalog-id".to_string(), new_entry);
     let mut ctx = ctx_with_parent_chat_state(
         "old-catalog-id",
-        "new-routing-model",
+        "shared-routing-model",
         "old-catalog-id",
         models,
     );
-    ctx.sampling_config.model = "old-routing-model".to_string();
+    ctx.sampling_config.model = "shared-routing-model".to_string();
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.catalog_model_id = Some("new-catalog-id".to_string());
+    chat.restore_snapshot(snapshot);
 
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
 
-    assert_eq!(config.model, "new-routing-model");
-    assert_eq!(model_id.0.as_ref(), "new-routing-model");
+    assert_eq!(config.model, "shared-routing-model");
+    assert_eq!(model_id.0.as_ref(), "new-catalog-id");
     assert_eq!(
         config.codex_wire,
         Some(new_caps),
         "wire flags must be resolved from the live model snapshot, not the stale session handle"
     );
+    assert!(config.supports_backend_search);
 }
 
 #[tokio::test]

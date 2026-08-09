@@ -19,6 +19,7 @@ impl ChatStateActor {
         ChatStateSnapshot {
             conversation: self.state.conversation.clone(),
             sampling_config: self.state.sampling_config.clone(),
+            catalog_model_id: self.state.catalog_model_id.clone(),
             prompt_index: self.state.prompt_index,
             total_tokens: self.state.total_tokens,
             estimate_at_last_response: self.state.estimate_at_last_response,
