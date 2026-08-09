@@ -102,15 +102,31 @@ impl ChatStateHandle {
 
     /// Record a tool result with an internally appended reminder suffix.
     ///
-    /// The suffix gets a reserved share of the active truncation budget so raw
-    /// output cannot consume its entire one-shot signal. Its body remains
-    /// bounded because it can contain arbitrary task or subagent output;
-    /// pathologically small budgets may preserve only a truncation marker.
+    /// This compatibility entry point carries only the exact suffix boundary.
+    /// New producers should use [`Self::push_tool_result_with_structured_suffix`]
+    /// so completion IDs remain independently retainable under a hard budget.
     pub fn push_tool_result_with_trusted_suffix(
         &self,
         item: ConversationItem,
         truncation_policy: Option<xai_grok_sampling_types::TruncationPolicyConfig>,
         trusted_suffix: Option<String>,
+    ) {
+        self.push_tool_result_with_structured_suffix(
+            item,
+            truncation_policy,
+            trusted_suffix.map(|exact| crate::types::TrustedPromptSuffix {
+                exact,
+                reminders: Vec::new(),
+            }),
+        );
+    }
+
+    /// Record a tool result with producer-authored reminder structure.
+    pub fn push_tool_result_with_structured_suffix(
+        &self,
+        item: ConversationItem,
+        truncation_policy: Option<xai_grok_sampling_types::TruncationPolicyConfig>,
+        trusted_suffix: Option<crate::types::TrustedPromptSuffix>,
     ) {
         let _ = self.cmd_tx.send(ChatStateCommand::PushToolResult {
             item,

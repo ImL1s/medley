@@ -428,6 +428,8 @@ jobs:
           run_nonzero -p xai-grok-tools --lib \
             tool_result_truncation_policy_runner_records_trusted_suffix_provenance -- --nocapture
           run_nonzero -p xai-grok-tools --lib \
+            structured_completion_reminders_carry_every_producer_id -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
             tool_result_truncation_policy_proxy_ -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             restricted_gateway_snapshot_exposes_only_trusted_permitted_tools_per_session -- --nocapture

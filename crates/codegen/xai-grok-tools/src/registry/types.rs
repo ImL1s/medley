@@ -2104,7 +2104,7 @@ impl FinalizedToolset {
             let mut r = Vec::new();
             for reminder in &self.reminders {
                 let extra = reminder
-                    .collect_reminders(self.resources.clone(), &output)
+                    .collect_reminder_messages(self.resources.clone(), &output)
                     .await;
                 r.extend(extra);
             }
@@ -2113,18 +2113,12 @@ impl FinalizedToolset {
             Vec::new()
         };
         let prompt_text = output.to_prompt_format();
-        let rendered_reminders = crate::reminders::format_with_reminders(
-            String::new(),
-            reminders,
-            self.system_reminder_tag,
-        );
-        let trusted_prompt_suffix = if rendered_reminders.is_empty() {
-            String::new()
-        } else if prompt_text.is_empty() {
-            rendered_reminders
-        } else {
-            format!("\n\n{rendered_reminders}")
-        };
+        let (trusted_prompt_suffix, trusted_prompt_reminders) =
+            crate::reminders::frame_reminder_messages(
+                reminders,
+                self.system_reminder_tag,
+                !prompt_text.is_empty(),
+            );
         let prompt_text = format!("{prompt_text}{trusted_prompt_suffix}");
         {
             let res = self.resources.lock().await;
@@ -2134,6 +2128,7 @@ impl FinalizedToolset {
             output,
             prompt_text,
             trusted_prompt_suffix,
+            trusted_prompt_reminders,
             effective_tool_name,
         })
     }
@@ -4283,6 +4278,12 @@ mod tests {
             result.prompt_text,
             format!("stub-output{}", result.trusted_prompt_suffix)
         );
+        assert_eq!(result.trusted_prompt_reminders.len(), 1);
+        assert_eq!(
+            result.trusted_prompt_reminders[0].render(),
+            result.trusted_prompt_suffix
+        );
+        assert!(result.trusted_prompt_reminders[0].completion_ids.is_empty());
     }
     /// A streaming stub tool that emits one `Progress` item then a `Terminal`,
     /// used to verify `call_streaming` forwards progress and finalizes the

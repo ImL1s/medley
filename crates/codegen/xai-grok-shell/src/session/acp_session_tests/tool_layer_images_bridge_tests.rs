@@ -29,6 +29,7 @@ fn mcp_screenshot_result(payload_b64: &str) -> ToolRunResult {
         output: ToolOutput::MCP(mcp),
         prompt_text: IMAGE_CONTENT_PLACEHOLDER.into(),
         trusted_prompt_suffix: String::new(),
+        trusted_prompt_reminders: Vec::new(),
         effective_tool_name: None,
     }
 }

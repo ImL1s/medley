@@ -8,7 +8,7 @@ use xai_grok_sampling_types::{
 use super::ChatStateActor;
 use super::request_builder::HARD_CLEAR_PLACEHOLDER;
 use crate::events::ChatStateEvent;
-use crate::types::ChatStateSnapshot;
+use crate::types::{ChatStateSnapshot, TrustedPromptSuffix, TrustedReminderMessage};
 
 /// Static string label for tracing on `ConversationItem` (avoids pulling
 /// the `Role` enum into the format string).
@@ -30,39 +30,48 @@ impl ChatStateActor {
         &mut self,
         mut item: ConversationItem,
         truncation_policy: Option<TruncationPolicyConfig>,
-        trusted_suffix: Option<String>,
+        trusted_suffix: Option<TrustedPromptSuffix>,
     ) {
         if let ConversationItem::ToolResult(result) = &mut item {
             match (
                 truncation_policy.and_then(truncation_policy_byte_limit),
                 trusted_suffix,
             ) {
-                (Some(max_bytes), Some(mut suffix)) => {
-                    // The runner proves only that this suffix was appended by
-                    // framework code; reminder bodies can still contain
-                    // arbitrary subagent/task output. Give the reminder a
-                    // reserved share so raw output cannot consume its entire
-                    // one-shot signal, but keep the complete persisted item
-                    // inside one policy budget. Extremely small budgets can
-                    // preserve only a truncation marker, not XML framing
-                    // (#263).
-                    let suffix_budget = if result.content.is_empty() {
-                        max_bytes
+                (Some(max_bytes), Some(suffix)) => {
+                    if result.content.len().saturating_add(suffix.exact.len()) <= max_bytes {
+                        // Compatibility and quality fast path: an already
+                        // fitting result remains byte-for-byte identical.
+                        append_tool_result_suffix(&mut result.content, &suffix.exact);
+                    } else if suffix.reminders.is_empty() {
+                        // Legacy proxy payload: provenance has only the exact
+                        // suffix boundary, so retain the established bounded
+                        // split without attempting to parse its text.
+                        let mut exact = suffix.exact;
+                        let suffix_budget = if result.content.is_empty() {
+                            max_bytes
+                        } else {
+                            max_bytes.div_ceil(2)
+                        };
+                        truncate_owned_text(&mut exact, suffix_budget);
+                        truncate_tool_result_content(
+                            &mut result.content,
+                            max_bytes.saturating_sub(exact.len()),
+                        );
+                        append_tool_result_suffix(&mut result.content, &exact);
                     } else {
-                        max_bytes.div_ceil(2)
-                    };
-                    truncate_owned_text(&mut suffix, suffix_budget);
-                    truncate_tool_result_content(
-                        &mut result.content,
-                        max_bytes.saturating_sub(suffix.len()),
-                    );
-                    append_tool_result_suffix(&mut result.content, &suffix);
+                        let bounded = bound_structured_tool_result(
+                            result.content.as_ref(),
+                            suffix.reminders,
+                            max_bytes,
+                        );
+                        result.content = bounded.into();
+                    }
                 }
                 (Some(max_bytes), None) => {
                     truncate_tool_result_content(&mut result.content, max_bytes);
                 }
                 (None, Some(suffix)) => {
-                    append_tool_result_suffix(&mut result.content, &suffix);
+                    append_tool_result_suffix(&mut result.content, &suffix.exact);
                 }
                 (None, None) => {}
             }
@@ -626,6 +635,105 @@ fn truncation_policy_byte_limit(policy: TruncationPolicyConfig) -> Option<usize>
         }
     };
     Some(usize::try_from(bytes).unwrap_or(usize::MAX))
+}
+
+fn completion_manifest(message: &TrustedReminderMessage) -> String {
+    message
+        .completion_ids
+        .iter()
+        .map(|id| format!("[completion:{id}]\n"))
+        .collect()
+}
+
+/// Bound raw output plus structured reminders under one hard byte cap.
+/// Completion identity and producer framing are mandatory; payload bytes are
+/// shared fairly only after that manifest fits. If even the compact manifest
+/// cannot fit, the cap wins and an explicit overflow marker is emitted.
+fn bound_structured_tool_result(
+    raw: &str,
+    reminders: Vec<TrustedReminderMessage>,
+    max_bytes: usize,
+) -> String {
+    let manifests: Vec<String> = reminders.iter().map(completion_manifest).collect();
+    let required_bytes = reminders
+        .iter()
+        .zip(&manifests)
+        .map(|(message, manifest)| message.prefix.len() + manifest.len() + message.suffix.len())
+        .sum::<usize>();
+
+    if required_bytes > max_bytes {
+        let ids = reminders
+            .iter()
+            .flat_map(|message| &message.completion_ids)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(",");
+        let compact = format!("[completions:{ids}]\n[completion manifest overflow]");
+        return truncate_text(&compact, max_bytes, "[completion manifest overflow]")
+            .unwrap_or(compact);
+    }
+
+    let remaining = max_bytes - required_bytes;
+    let mut payload_lengths = Vec::with_capacity(reminders.len() + 1);
+    payload_lengths.push(raw.len());
+    payload_lengths.extend(reminders.iter().map(|message| message.payload.len()));
+    let budgets = fair_payload_budgets(&payload_lengths, remaining);
+
+    let mut bounded = String::with_capacity(max_bytes);
+    if let Some(truncated) = truncate_text(raw, budgets[0], "[truncated]") {
+        bounded.push_str(&truncated);
+    } else {
+        bounded.push_str(raw);
+    }
+    for ((message, manifest), budget) in reminders
+        .into_iter()
+        .zip(manifests)
+        .zip(budgets.into_iter().skip(1))
+    {
+        bounded.push_str(&message.prefix);
+        bounded.push_str(&manifest);
+        if let Some(truncated) = truncate_text(&message.payload, budget, "[truncated]") {
+            bounded.push_str(&truncated);
+        } else {
+            bounded.push_str(&message.payload);
+        }
+        bounded.push_str(&message.suffix);
+    }
+    debug_assert!(bounded.len() <= max_bytes);
+    bounded
+}
+
+fn fair_payload_budgets(lengths: &[usize], total: usize) -> Vec<usize> {
+    let mut budgets = vec![0; lengths.len()];
+    let mut remaining = total;
+    let mut active: Vec<usize> = (0..lengths.len()).collect();
+    while !active.is_empty() {
+        let share = remaining / active.len();
+        let mut next = Vec::new();
+        let mut consumed = 0usize;
+        for index in active {
+            if lengths[index] <= share {
+                budgets[index] = lengths[index];
+                consumed += lengths[index];
+            } else {
+                next.push(index);
+            }
+        }
+        remaining = remaining.saturating_sub(consumed);
+        if next.is_empty() {
+            break;
+        }
+        if consumed == 0 {
+            let base = remaining / next.len();
+            let extra = remaining % next.len();
+            for (position, index) in next.into_iter().enumerate() {
+                budgets[index] = base + usize::from(position < extra);
+            }
+            break;
+        }
+        active = next;
+    }
+    budgets
 }
 
 fn truncate_tool_result_content(content: &mut std::sync::Arc<str>, max_bytes: usize) {

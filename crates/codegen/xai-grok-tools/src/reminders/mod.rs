@@ -107,6 +107,27 @@ pub fn format_with_reminders(output: String, reminders: Vec<String>, tag: &str) 
     }
 }
 
+/// Frame producer-structured reminders while retaining the exact string form
+/// used by legacy consumers. Separators and tags live in the non-truncatable
+/// framing fields; only each producer-authored payload may be shortened.
+pub fn frame_reminder_messages(
+    mut reminders: Vec<crate::types::output::ReminderMessage>,
+    tag: &str,
+    follows_output: bool,
+) -> (String, Vec<crate::types::output::ReminderMessage>) {
+    for (index, reminder) in reminders.iter_mut().enumerate() {
+        let separator = if follows_output || index > 0 {
+            "\n\n"
+        } else {
+            ""
+        };
+        reminder.prefix = format!("{separator}<{tag}>\n{}", reminder.prefix);
+        reminder.suffix.push_str(&format!("\n</{tag}>"));
+    }
+    let rendered = reminders.iter().map(|message| message.render()).collect();
+    (rendered, reminders)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

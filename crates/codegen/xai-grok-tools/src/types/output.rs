@@ -137,6 +137,29 @@ impl MediaGenOutput {
 use crate::implementations::grok_build::todo::{TodoItem, TodoState};
 use crate::implementations::skills::skill::SkillOutput;
 use crate::util::truncate::{DEFAULT_SOFT_WRAP_WIDTH, soft_wrap_lines};
+
+/// One producer-authored reminder carried separately from its exact rendered
+/// suffix. `completion_ids` is structural provenance used to retain every
+/// one-shot completion notice when a catalog budget forces payload truncation;
+/// consumers must never recover it by parsing reminder text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReminderMessage {
+    /// Exact framed prefix, including any separator and opening tag.
+    pub prefix: String,
+    /// Producer-authored reminder body. This is the only truncatable part.
+    pub payload: String,
+    /// Exact framed suffix, including the closing tag.
+    pub suffix: String,
+    /// Completion identifiers whose one-shot delivery this reminder carries.
+    #[serde(default)]
+    pub completion_ids: Vec<String>,
+}
+
+impl ReminderMessage {
+    pub fn render(&self) -> String {
+        format!("{}{}{}", self.prefix, self.payload, self.suffix)
+    }
+}
 /// Result of running a tool through the ToolRunner pipeline.
 ///
 /// This is the **single return type** from `ToolRunner::run()`. It carries:
@@ -156,6 +179,10 @@ pub struct ToolRunResult {
     /// arbitrary task or subagent output and are not exempt from the limit.
     #[serde(default)]
     pub trusted_prompt_suffix: String,
+    /// Structured provenance for `trusted_prompt_suffix`. Legacy proxy peers
+    /// omit this field; the exact suffix remains the compatibility fallback.
+    #[serde(default)]
+    pub trusted_prompt_reminders: Vec<ReminderMessage>,
     /// When a meta-tool dispatches to a different underlying tool (for example
     /// `use_tool` → `linear__save_issue`), this carries the effective tool name.
     /// `None` means the requested tool and executed tool are the same.
@@ -2723,6 +2750,7 @@ mod tests {
         ToolRunResult {
             prompt_text: "prompt".into(),
             trusted_prompt_suffix: String::new(),
+            trusted_prompt_reminders: Vec::new(),
             effective_tool_name: None,
             output,
         }
@@ -2735,12 +2763,20 @@ mod tests {
         let mut run = sample_run_result(ToolOutput::Text(TextOutput::from("tool output")));
         run.prompt_text = format!("tool output{suffix}");
         run.trusted_prompt_suffix = suffix.clone();
+        run.trusted_prompt_reminders = vec![ReminderMessage {
+            prefix: "\n\n<system-reminder>\n".into(),
+            payload: "Background task completed.".into(),
+            suffix: "\n</system-reminder>".into(),
+            completion_ids: vec!["bg-1".into()],
+        }];
 
         let typed = run.into_typed_tool_output(xai_tool_protocol::ToolId::new("text").unwrap());
         let decoded: ToolRunResult = serde_json::from_value(typed.value).unwrap();
 
         assert_eq!(decoded.prompt_text, format!("tool output{suffix}"));
         assert_eq!(decoded.trusted_prompt_suffix, suffix);
+        assert_eq!(decoded.trusted_prompt_reminders.len(), 1);
+        assert_eq!(decoded.trusted_prompt_reminders[0].completion_ids, ["bg-1"]);
     }
 
     #[test]
@@ -2751,9 +2787,14 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("trusted_prompt_suffix");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("trusted_prompt_reminders");
 
         let decoded: ToolRunResult = serde_json::from_value(value).unwrap();
         assert!(decoded.trusted_prompt_suffix.is_empty());
+        assert!(decoded.trusted_prompt_reminders.is_empty());
     }
     fn bash_tool_id() -> xai_tool_protocol::ToolId {
         xai_tool_protocol::ToolId::new("bash").unwrap()

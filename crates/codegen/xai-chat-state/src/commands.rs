@@ -86,7 +86,7 @@ pub enum ChatStateCommand {
     PushToolResult {
         item: ConversationItem,
         truncation_policy: Option<xai_grok_sampling_types::TruncationPolicyConfig>,
-        trusted_suffix: Option<String>,
+        trusted_suffix: Option<crate::types::TrustedPromptSuffix>,
     },
 
     /// Record accumulated token usage from a streaming response.

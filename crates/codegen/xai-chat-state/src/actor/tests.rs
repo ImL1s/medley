@@ -12,6 +12,7 @@ use crate::StrictAppendAck;
 use crate::actor::ChatStateActor;
 use crate::events::ChatStateEvent;
 use crate::persistence::{MockChatPersistence, MockPersistenceReceiver, PersistenceRecord};
+use crate::types::{TrustedPromptSuffix, TrustedReminderMessage};
 
 /// Helper to build a `SamplingConfig` for tests.
 fn test_config() -> SamplingConfig {
@@ -547,6 +548,169 @@ async fn tool_result_truncation_policy_preserves_reminder_only_result() {
         panic!("expected tool result");
     };
     assert_eq!(result.content.as_ref(), reminder);
+}
+
+#[tokio::test]
+async fn tool_result_truncation_policy_leaves_fitting_structured_suffix_byte_exact() {
+    let h = TestHarness::new();
+    let message = TrustedReminderMessage {
+        prefix: "\n\n<system-reminder>\n".into(),
+        payload: "Background task bg-short completed.".into(),
+        suffix: "\n</system-reminder>".into(),
+        completion_ids: vec!["bg-short".into()],
+    };
+    let exact = format!("{}{}{}", message.prefix, message.payload, message.suffix);
+
+    h.handle.push_tool_result_with_structured_suffix(
+        ConversationItem::tool_result("call-1", "ok"),
+        Some(TruncationPolicyConfig {
+            mode: TruncationMode::Bytes,
+            limit: 100,
+        }),
+        Some(TrustedPromptSuffix {
+            exact: exact.clone(),
+            reminders: vec![message],
+        }),
+    );
+
+    let conv = h.handle.get_conversation().await;
+    let ConversationItem::ToolResult(result) = &conv[0] else {
+        panic!("expected tool result");
+    };
+    assert_eq!(result.content.as_ref(), format!("ok{exact}"));
+    assert!(!result.content.contains("[completion:"));
+}
+
+#[tokio::test]
+async fn tool_result_truncation_policy_preserves_all_completion_ids_in_large_batch() {
+    let h = TestHarness::new();
+    let ids = ["bg-alpha", "bg-middle", "bg-omega"];
+    let reminders = ids
+        .iter()
+        .map(|id| TrustedReminderMessage {
+            prefix: "\n\n<system-reminder>\n".into(),
+            payload: format!(
+                "Background task {id} completed.\nresponse:\n{}",
+                "x".repeat(2_000)
+            ),
+            suffix: "\n</system-reminder>".into(),
+            completion_ids: vec![(*id).into()],
+        })
+        .collect::<Vec<_>>();
+    let exact = reminders
+        .iter()
+        .map(|message| format!("{}{}{}", message.prefix, message.payload, message.suffix))
+        .collect();
+
+    h.handle.push_tool_result_with_structured_suffix(
+        ConversationItem::tool_result("call-1", "raw".repeat(1_000)),
+        Some(TruncationPolicyConfig {
+            mode: TruncationMode::Bytes,
+            limit: 400,
+        }),
+        Some(TrustedPromptSuffix { exact, reminders }),
+    );
+
+    let conv = h.handle.get_conversation().await;
+    let ConversationItem::ToolResult(result) = &conv[0] else {
+        panic!("expected tool result");
+    };
+    for id in ids {
+        assert!(
+            result.content.contains(&format!("[completion:{id}]")),
+            "missing one-shot completion id {id}: {}",
+            result.content
+        );
+    }
+    assert!(result.content.matches("[truncated]").count() >= 3);
+    assert!(result.content.len() <= 480, "one shared 1.2x budget");
+}
+
+#[tokio::test]
+async fn tool_result_truncation_policy_hard_cap_marks_manifest_overflow() {
+    let h = TestHarness::new();
+    let message = TrustedReminderMessage {
+        prefix: "<system-reminder>\n".into(),
+        payload: "payload".repeat(100),
+        suffix: "\n</system-reminder>".into(),
+        completion_ids: vec!["huge-id-".repeat(100)],
+    };
+    let exact = format!("{}{}{}", message.prefix, message.payload, message.suffix);
+
+    h.handle.push_tool_result_with_structured_suffix(
+        ConversationItem::tool_result("call-1", "raw"),
+        Some(TruncationPolicyConfig {
+            mode: TruncationMode::Bytes,
+            limit: 50,
+        }),
+        Some(TrustedPromptSuffix {
+            exact,
+            reminders: vec![message],
+        }),
+    );
+
+    let conv = h.handle.get_conversation().await;
+    let ConversationItem::ToolResult(result) = &conv[0] else {
+        panic!("expected tool result");
+    };
+    assert!(result.content.contains("completion manifest overflow"));
+    assert!(result.content.len() <= 60, "hard 1.2x cap must win");
+}
+
+#[tokio::test]
+async fn tool_result_truncation_policy_preserves_local_warning_after_legacy_suffix() {
+    let h = TestHarness::new();
+    let legacy = TrustedReminderMessage {
+        prefix: String::new(),
+        payload: format!(
+            "<system-reminder>\nlegacy proxy payload {}\n</system-reminder>",
+            "x".repeat(2_000)
+        ),
+        suffix: String::new(),
+        completion_ids: Vec::new(),
+    };
+    let warning = TrustedReminderMessage {
+        prefix: "\n\n".into(),
+        payload: "<system-reminder>\nIMPORTANT: Your tool call contained 3 concatenated JSON objects, but only the best-matching one was executed. The remaining 2 were ignored. Make 2 individual tool calls for the remaining operations.\n</system-reminder>".into(),
+        suffix: String::new(),
+        completion_ids: Vec::new(),
+    };
+    let exact = format!(
+        "{}{}{}{}",
+        legacy.payload, warning.prefix, warning.payload, warning.suffix
+    );
+
+    h.handle.push_tool_result_with_structured_suffix(
+        ConversationItem::tool_result("call-1", ""),
+        Some(TruncationPolicyConfig {
+            mode: TruncationMode::Bytes,
+            limit: 260,
+        }),
+        Some(TrustedPromptSuffix {
+            exact,
+            reminders: vec![legacy, warning],
+        }),
+    );
+
+    let conv = h.handle.get_conversation().await;
+    let ConversationItem::ToolResult(result) = &conv[0] else {
+        panic!("expected tool result");
+    };
+    assert!(
+        result
+            .content
+            .contains("IMPORTANT: Your tool call contained 3"),
+        "locally-authored warning semantics must survive legacy suffix truncation: {}",
+        result.content
+    );
+    assert!(
+        result
+            .content
+            .contains("remaining operations.\n</system-reminder>"),
+        "the warning's recovery instruction must survive in the retained tail: {}",
+        result.content
+    );
+    assert!(result.content.len() <= 312, "hard 1.2x cap must win");
 }
 
 #[tokio::test]

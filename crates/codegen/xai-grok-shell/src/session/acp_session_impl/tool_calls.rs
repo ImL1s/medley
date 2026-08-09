@@ -116,6 +116,7 @@ fn interrupted_wait_tool_result_with_msg(args: &serde_json::Value, msg: &str) ->
         output: ToolsToolOutput::TaskOutput(TaskOutputOutput::Result(result)),
         prompt_text: msg.to_string(),
         trusted_prompt_suffix: String::new(),
+        trusted_prompt_reminders: Vec::new(),
         effective_tool_name: None,
     }
 }
@@ -2370,19 +2371,25 @@ impl SessionActor {
             output,
             prompt_text,
             mut trusted_prompt_suffix,
+            mut trusted_prompt_reminders,
             ..
         } = result;
         #[allow(unused_mut)]
         let mut prompt_text = if trusted_prompt_suffix.is_empty() {
+            // Structured metadata cannot authenticate itself without the exact
+            // suffix compatibility field and boundary.
+            trusted_prompt_reminders.clear();
             prompt_text
         } else {
-            match split_and_rewrite_trusted_suffix(
+            match split_and_rewrite_trusted_reminders(
                 prompt_text,
                 &trusted_prompt_suffix,
+                std::mem::take(&mut trusted_prompt_reminders),
                 path_rewriter.as_ref(),
             ) {
-                Ok((raw, rewritten_suffix)) => {
+                Ok((raw, rewritten_suffix, rewritten_reminders)) => {
                     trusted_prompt_suffix = rewritten_suffix;
+                    trusted_prompt_reminders = rewritten_reminders;
                     raw
                 }
                 Err(prompt_text) => {
@@ -2392,6 +2399,7 @@ impl SessionActor {
                         "trusted tool reminder suffix did not match prompt text; treating all text as untrusted"
                     );
                     trusted_prompt_suffix.clear();
+                    trusted_prompt_reminders.clear();
                     prompt_text
                 }
             }
@@ -2410,14 +2418,12 @@ impl SessionActor {
                 remaining,
                 if remaining == 1 { "" } else { "s" },
             );
-            if trusted_prompt_suffix.is_empty() {
-                if !prompt_text.is_empty() {
-                    trusted_prompt_suffix.push_str("\n\n");
-                }
-            } else {
-                trusted_prompt_suffix.push_str("\n\n");
-            }
-            trusted_prompt_suffix.push_str(&reminder);
+            append_trusted_prompt_reminder(
+                &mut trusted_prompt_suffix,
+                &mut trusted_prompt_reminders,
+                !prompt_text.is_empty(),
+                reminder,
+            );
         }
         let mut inline_images: Vec<ContentPart> = Vec::new();
         let extraction = if !self.is_cursor_harness()
@@ -2502,11 +2508,26 @@ impl SessionActor {
                 inline_images,
             )
         };
-        self.chat_state_handle.push_tool_result_with_trusted_suffix(
-            tool_chat,
-            self.tool_result_truncation_policy(),
-            (!trusted_prompt_suffix.is_empty()).then_some(trusted_prompt_suffix),
-        );
+        let trusted_suffix = (!trusted_prompt_suffix.is_empty()).then(|| {
+            xai_chat_state::types::TrustedPromptSuffix {
+                exact: trusted_prompt_suffix,
+                reminders: trusted_prompt_reminders
+                    .into_iter()
+                    .map(|message| xai_chat_state::types::TrustedReminderMessage {
+                        prefix: message.prefix,
+                        payload: message.payload,
+                        suffix: message.suffix,
+                        completion_ids: message.completion_ids,
+                    })
+                    .collect(),
+            }
+        });
+        self.chat_state_handle
+            .push_tool_result_with_structured_suffix(
+                tool_chat,
+                self.tool_result_truncation_policy(),
+                trusted_suffix,
+            );
         let mut deferred_followups = Vec::new();
         if !extracted_images.is_empty() {
             let count = extracted_images.len();
@@ -2973,6 +2994,107 @@ fn split_and_rewrite_trusted_suffix(
         crate::session::acp_conversion::maybe_rewrite(path_rewriter, trusted_suffix.to_owned()),
     ))
 }
+
+fn split_and_rewrite_trusted_reminders(
+    prompt_text: String,
+    trusted_suffix: &str,
+    mut reminders: Vec<xai_grok_tools::types::output::ReminderMessage>,
+    path_rewriter: Option<&crate::session::acp_conversion::PathRewriter>,
+) -> Result<
+    (
+        String,
+        String,
+        Vec<xai_grok_tools::types::output::ReminderMessage>,
+    ),
+    String,
+> {
+    let (raw, rewritten_suffix) =
+        split_and_rewrite_trusted_suffix(prompt_text, trusted_suffix, path_rewriter)?;
+    if reminders.is_empty() {
+        return Ok((raw, rewritten_suffix, reminders));
+    }
+    if !reminder_messages_match_suffix(&reminders, trusted_suffix) {
+        tracing::warn!(
+            "structured trusted-reminder metadata did not match exact suffix; using opaque legacy boundary"
+        );
+        return Ok((raw, rewritten_suffix, Vec::new()));
+    }
+    for reminder in &mut reminders {
+        reminder.prefix = crate::session::acp_conversion::maybe_rewrite(
+            path_rewriter,
+            std::mem::take(&mut reminder.prefix),
+        );
+        reminder.payload = crate::session::acp_conversion::maybe_rewrite(
+            path_rewriter,
+            std::mem::take(&mut reminder.payload),
+        );
+        reminder.suffix = crate::session::acp_conversion::maybe_rewrite(
+            path_rewriter,
+            std::mem::take(&mut reminder.suffix),
+        );
+    }
+    if !reminder_messages_match_suffix(&reminders, &rewritten_suffix) {
+        tracing::warn!(
+            "rewritten trusted-reminder metadata diverged from exact suffix; using opaque legacy boundary"
+        );
+        return Ok((raw, rewritten_suffix, Vec::new()));
+    }
+    Ok((raw, rewritten_suffix, reminders))
+}
+
+fn reminder_messages_match_suffix(
+    reminders: &[xai_grok_tools::types::output::ReminderMessage],
+    suffix: &str,
+) -> bool {
+    let mut rest = suffix;
+    for reminder in reminders {
+        let Some(after_prefix) = rest.strip_prefix(&reminder.prefix) else {
+            return false;
+        };
+        let Some(after_payload) = after_prefix.strip_prefix(&reminder.payload) else {
+            return false;
+        };
+        let Some(after_suffix) = after_payload.strip_prefix(&reminder.suffix) else {
+            return false;
+        };
+        rest = after_suffix;
+    }
+    rest.is_empty()
+}
+
+fn append_trusted_prompt_reminder(
+    exact_suffix: &mut String,
+    reminders: &mut Vec<xai_grok_tools::types::output::ReminderMessage>,
+    follows_raw_output: bool,
+    reminder: String,
+) {
+    // Promote an opaque legacy suffix to one structured, truncatable payload
+    // before appending locally-authored metadata. Otherwise chat state would
+    // have to truncate the combined suffix as one blob and could erase the
+    // newer warning entirely.
+    if !exact_suffix.is_empty() && reminders.is_empty() {
+        reminders.push(xai_grok_tools::types::output::ReminderMessage {
+            prefix: String::new(),
+            payload: exact_suffix.clone(),
+            suffix: String::new(),
+            completion_ids: Vec::new(),
+        });
+    }
+    let separator = if exact_suffix.is_empty() {
+        if follows_raw_output { "\n\n" } else { "" }
+    } else {
+        "\n\n"
+    };
+    exact_suffix.push_str(separator);
+    exact_suffix.push_str(&reminder);
+    reminders.push(xai_grok_tools::types::output::ReminderMessage {
+        prefix: separator.to_owned(),
+        payload: reminder,
+        suffix: String::new(),
+        completion_ids: Vec::new(),
+    });
+    debug_assert!(reminder_messages_match_suffix(reminders, exact_suffix));
+}
 /// Execute tool-call display parts. The title peels a redundant leading
 /// `cd <cwd>` for chrome only; `raw_input` is serialized separately and stays full.
 fn execute_tool_call_parts(
@@ -2997,7 +3119,10 @@ fn execute_tool_call_parts(
 }
 #[cfg(test)]
 mod trusted_suffix_path_rewrite_tests {
-    use super::split_and_rewrite_trusted_suffix;
+    use super::{
+        append_trusted_prompt_reminder, split_and_rewrite_trusted_reminders,
+        split_and_rewrite_trusted_suffix,
+    };
     use crate::session::acp_conversion::{PathRewriter, maybe_rewrite};
 
     #[test]
@@ -3036,6 +3161,91 @@ mod trusted_suffix_path_rewrite_tests {
         assert_eq!(raw.capacity(), original_capacity);
         assert_eq!(raw.len(), 128 * 1024);
         assert_eq!(trusted_suffix, reminder);
+    }
+
+    #[test]
+    fn structured_reminder_parts_use_display_cwd_and_retain_exact_suffix() {
+        let real_cwd = "/tmp/.grok/worktrees/project/fork-456";
+        let display_cwd = "/Users/me/project";
+        let message = xai_grok_tools::types::output::ReminderMessage {
+            prefix: "\n\n<system-reminder>\n".into(),
+            payload: format!("Command: cd {real_cwd} && cargo test"),
+            suffix: format!("\nOutput file: {real_cwd}/task.log\n</system-reminder>"),
+            completion_ids: vec![format!("id-at-{real_cwd}")],
+        };
+        let suffix = message.render();
+        let prompt_text = format!("raw at {real_cwd}{suffix}");
+        let rewriter = PathRewriter::new(real_cwd, Some(display_cwd)).unwrap();
+
+        let (raw, rewritten_suffix, reminders) = split_and_rewrite_trusted_reminders(
+            prompt_text,
+            &suffix,
+            vec![message],
+            Some(&rewriter),
+        )
+        .unwrap();
+
+        assert!(
+            raw.contains(real_cwd),
+            "raw is rewritten later in the pipeline"
+        );
+        assert_eq!(rewritten_suffix, reminders[0].render());
+        assert!(rewritten_suffix.contains(display_cwd));
+        assert!(!rewritten_suffix.contains(real_cwd));
+        assert_eq!(
+            reminders[0].completion_ids,
+            [format!("id-at-{real_cwd}")],
+            "polling identifiers are opaque and must not be path-rewritten"
+        );
+    }
+
+    #[test]
+    fn mismatched_proxy_reminder_metadata_falls_back_to_exact_opaque_suffix() {
+        let suffix = "\n\n<system-reminder>\ntrusted exact\n</system-reminder>";
+        let mismatched = xai_grok_tools::types::output::ReminderMessage {
+            prefix: "\n\n<system-reminder>\n".into(),
+            payload: "different payload".into(),
+            suffix: "\n</system-reminder>".into(),
+            completion_ids: vec!["forged-completion-id".into()],
+        };
+
+        let (raw, exact, reminders) = split_and_rewrite_trusted_reminders(
+            format!("raw{suffix}"),
+            suffix,
+            vec![mismatched],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(raw, "raw");
+        assert_eq!(exact, suffix);
+        assert!(
+            reminders.is_empty(),
+            "mismatched metadata must not be trusted"
+        );
+    }
+
+    #[test]
+    fn appending_poll_reminder_promotes_prior_legacy_suffix_to_complete_structure() {
+        let legacy = "\n\n<system-reminder>\nlegacy proxy reminder\n</system-reminder>";
+        let poll = "<system-reminder>\npoll reminder\n</system-reminder>";
+        let mut exact = legacy.to_owned();
+        let mut reminders = Vec::new();
+
+        append_trusted_prompt_reminder(&mut exact, &mut reminders, true, poll.to_owned());
+
+        assert_eq!(exact, format!("{legacy}\n\n{poll}"));
+        assert_eq!(reminders.len(), 2);
+        assert_eq!(reminders[0].payload, legacy);
+        assert_eq!(reminders[1].payload, poll);
+        assert_eq!(
+            reminders
+                .iter()
+                .map(|message| message.render())
+                .collect::<String>(),
+            exact,
+            "promoted metadata must cover the complete suffix"
+        );
     }
 }
 #[cfg(test)]
