@@ -37,6 +37,7 @@ impl ChildControl for TestControl {
 struct TestRunner {
     wait_before_start: bool,
     wait_after_cancel: bool,
+    fail_before_start: bool,
     start: tokio::sync::broadcast::Sender<()>,
     finish: tokio::sync::broadcast::Sender<()>,
     completions: mpsc::UnboundedSender<CompletionDisposition>,
@@ -56,6 +57,7 @@ impl ChildRunner for TestRunner {
     fn run(&self, run: ChildRunRequest<Self::Control>) -> Self::RunFuture {
         let wait_before_start = self.wait_before_start;
         let wait_after_cancel = self.wait_after_cancel;
+        let fail_before_start = self.fail_before_start;
         let mut start = self.start.subscribe();
         let mut finish = self.finish.subscribe();
         let requests = self.requests.clone();
@@ -77,6 +79,19 @@ impl ChildRunner for TestRunner {
                 spawn_parent_session_id,
             });
             let _ = reporters.send(reporter.clone());
+            if fail_before_start {
+                return ChildRunOutput {
+                    result: SubagentResult {
+                        success: false,
+                        error: Some("failed before promotion".to_owned()),
+                        subagent_id: request.id.clone(),
+                        child_session_id: request.id,
+                        ..Default::default()
+                    },
+                    completion_data: (),
+                    snapshot_ref: None,
+                };
+            }
             if wait_before_start {
                 tokio::select! {
                     _ = cancellation.cancelled() => {
@@ -231,12 +246,13 @@ fn harness(wait_before_start: bool, foreground_budget: std::time::Duration) -> H
 }
 
 fn harness_with_config(wait_before_start: bool, config: CoordinatorConfig) -> Harness {
-    harness_with_options(wait_before_start, false, config)
+    harness_with_options(wait_before_start, false, false, config)
 }
 
 fn harness_with_options(
     wait_before_start: bool,
     wait_after_cancel: bool,
+    fail_before_start: bool,
     config: CoordinatorConfig,
 ) -> Harness {
     let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -253,6 +269,7 @@ fn harness_with_options(
             TestRunner {
                 wait_before_start,
                 wait_after_cancel,
+                fail_before_start,
                 start: start.clone(),
                 finish: finish.clone(),
                 completions: completion_tx,
@@ -312,6 +329,34 @@ async fn completed_resume_source_carries_committed_model_lineage() {
     assert_eq!(source.model_id.as_deref(), Some("test-model"));
     assert_eq!(source.model_route.as_deref(), Some("test-model"));
     assert_eq!(source.model_agent_type.as_deref(), Some("general-purpose"));
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn pre_promotion_failure_does_not_mask_durable_resume_fallback() {
+    let mut harness = harness_with_options(false, false, true, CoordinatorConfig::default());
+    let spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("pre-promotion-failure", false)).await }
+    });
+
+    assert_eq!(
+        harness
+            .requests
+            .recv()
+            .await
+            .as_ref()
+            .map(|request| request.id.as_str()),
+        Some("pre-promotion-failure")
+    );
+    let reporter = harness.reporters.recv().await.expect("child reporter");
+    assert!(!spawn.await.unwrap().unwrap().success);
+    assert!(matches!(
+        reporter
+            .resume_source("pre-promotion-failure", "parent")
+            .await,
+        SubagentResumeLookup::Missing
+    ));
     harness.actor.abort();
 }
 
@@ -721,6 +766,7 @@ async fn workflow_cancel_waits_for_drain_and_hides_owned_children() {
     let mut harness = harness_with_options(
         true,
         true,
+        false,
         CoordinatorConfig {
             buffer_completions: true,
             ..CoordinatorConfig::default()
@@ -966,7 +1012,7 @@ async fn teardown_cancels_background_child_without_rebuffering() {
 async fn teardown_rejects_spawn_from_cancelled_parent() {
     // wait_after_cancel keeps the cancelled parent in `active`, so its late
     // nested Spawn still finds it.
-    let mut harness = harness_with_options(true, true, CoordinatorConfig::default());
+    let mut harness = harness_with_options(true, true, false, CoordinatorConfig::default());
 
     // A parent subagent whose child_session_id is "A".
     let parent = spawn_session_child(&mut harness, "A", "parent").await;

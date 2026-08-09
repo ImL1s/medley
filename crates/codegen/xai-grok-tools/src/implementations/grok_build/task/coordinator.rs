@@ -487,6 +487,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                     SubagentResumeLookup::Active
                 } else if let Some(child) = self.completed.get(&source_id)
                     && child.request.parent_session_id == parent_session_id
+                    && !child.effective_model_id.is_empty()
                 {
                     SubagentResumeLookup::Completed(Box::new(SubagentResumeSource {
                         subagent_id: child.request.id.clone(),
@@ -496,8 +497,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                         snapshot_ref: child.snapshot_ref.clone(),
                         subagent_type: child.request.subagent_type.clone(),
                         persona: child.persona.clone(),
-                        model_id: (!child.effective_model_id.is_empty())
-                            .then(|| child.effective_model_id.clone()),
+                        model_id: Some(child.effective_model_id.clone()),
                         model_route: child.effective_model_route.clone(),
                         model_agent_type: child.effective_model_agent_type.clone(),
                     }))
