@@ -1241,7 +1241,10 @@ impl MvpAgent {
                     &session_id,
                     persisted_model,
                     summary.catalog_identity.clone(),
-                    summary.agent_name.clone(),
+                    summary.agent_name.clone().or_else(|| {
+                        self.resident_handle(&session_id)
+                            .map(|handle| handle.agent_name)
+                    }),
                 );
             return;
         }
@@ -1327,7 +1330,10 @@ impl MvpAgent {
                         &session_id,
                         persisted_model,
                         summary.catalog_identity.clone(),
-                        summary.agent_name.clone(),
+                        summary.agent_name.clone().or_else(|| {
+                            self.resident_handle(&session_id)
+                                .map(|handle| handle.agent_name)
+                        }),
                     );
                 return;
             };
@@ -1360,7 +1366,10 @@ impl MvpAgent {
                     &session_id,
                     persisted_model.clone(),
                     summary.catalog_identity.clone(),
-                    summary.agent_name.clone(),
+                    summary.agent_name.clone().or_else(|| {
+                        self.resident_handle(&session_id)
+                            .map(|handle| handle.agent_name)
+                    }),
                 );
             fallback
         };

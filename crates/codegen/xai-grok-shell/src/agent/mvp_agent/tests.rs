@@ -1403,6 +1403,25 @@ fn prompt_recovery_rejects_a_remapped_model_with_an_incompatible_harness() {
 }
 
 #[test]
+fn identity_backed_prompt_recovery_requires_persisted_harness_evidence() {
+    let identity = xai_chat_state::CatalogIdentity {
+        model_id: "persisted-key".to_owned(),
+        route: "persisted-route".to_owned(),
+        lineage: xai_chat_state::CatalogResolutionLineage::UniqueRoute,
+        auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
+    };
+
+    assert!(!latched_recovery_has_required_harness(
+        Some(&identity),
+        None,
+    ));
+    assert!(latched_recovery_has_required_harness(
+        Some(&identity),
+        Some("grok-build"),
+    ));
+}
+
+#[test]
 fn cold_spawn_current_only_fallback_keeps_persisted_model_latched() {
     let persisted = acp::ModelId::new("persisted-unready");
     let current = acp::ModelId::new("current-compatible-but-not-selectable");
@@ -3656,6 +3675,7 @@ fn attach_restore_blocks_exact_key_reuse_and_unique_route_ambiguity() {
             let sid = acp::SessionId::new(format!("resume-{label}"));
             let mut handle = make_test_handle("removed-key", false, None);
             handle.info.id = sid.clone();
+            let resident_agent_name = handle.agent_name.clone();
             let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
             handle.cmd_tx = cmd_tx;
             agent.session_registry.put_resident(&sid, handle);
@@ -3674,7 +3694,7 @@ fn attach_restore_blocks_exact_key_reuse_and_unique_route_ambiguity() {
                 lineage,
                 auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
             });
-            summary.agent_name = Some("grok-build".to_owned());
+            summary.agent_name = (label != "exact-reuse").then(|| "grok-build".to_owned());
             let guard = agent.begin_session_load(&sid);
             agent.restore_persisted_model(&sid, &summary, &guard).await;
             assert_eq!(
@@ -3689,8 +3709,8 @@ fn attach_restore_blocks_exact_key_reuse_and_unique_route_ambiguity() {
             );
             assert_eq!(
                 agent.session_registry.unavailable_agent_name(&sid),
-                summary.agent_name,
-                "{label} must retain the persisted harness for prompt recovery"
+                Some(resident_agent_name),
+                "{label} must retain explicit persisted or resident harness evidence"
             );
             assert!(
                 reconcile_latched_catalog_snapshot(

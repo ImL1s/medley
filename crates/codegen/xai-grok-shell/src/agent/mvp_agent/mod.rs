@@ -1294,6 +1294,13 @@ pub(crate) fn recovered_model_harness_is_compatible(
     )
 }
 
+pub(crate) fn latched_recovery_has_required_harness(
+    identity: Option<&xai_chat_state::CatalogIdentity>,
+    agent_name: Option<&str>,
+) -> bool {
+    identity.is_none() || agent_name.is_some()
+}
+
 /// Apply the main session's authoritative CLI clamps to a freshly discovered
 /// model-required definition.
 ///
