@@ -1390,7 +1390,10 @@ fn apply_requirements_inner(
     enforce_str!("models", "default", config.models.default);
     macro_rules! enforce_auxiliary_model {
         ($key:expr, $field:expr, $requirement:expr) => {
-            if let Some(val) = req_str(req, "models", $key) {
+            if let Some(val) = req_str(req, "models", $key)
+                .map(str::trim)
+                .filter(|val| !val.is_empty())
+            {
                 $requirement.pin(val.to_owned(), source.clone());
                 if $field.as_deref() != Some(val) {
                     $field = Some(val.to_owned());

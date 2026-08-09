@@ -2704,39 +2704,43 @@ impl Config {
         &mut self,
         effective_default: Option<&str>,
     ) {
+        fn non_empty(value: Option<&str>) -> Option<&str> {
+            value.map(str::trim).filter(|value| !value.is_empty())
+        }
         if let Some(policy_model) = self.requirements.web_search_model.pinned() {
             self.web_search_model = policy_model;
             self.web_search_model_explicit = true;
             self.web_search_follows_default = false;
         } else if !self.web_search_model_explicit
-            && let Some(model) = self.models.web_search.as_deref().or(effective_default)
+            && let Some(model) = non_empty(self.models.web_search.as_deref()).or(effective_default)
         {
             self.web_search_model = model.to_owned();
-            self.web_search_follows_default = self.models.web_search.is_none();
+            self.web_search_follows_default =
+                non_empty(self.models.web_search.as_deref()).is_none();
         }
         if let Some(policy_model) = self.requirements.session_summary_model.pinned() {
             self.session_summary_model = Some(policy_model);
             self.session_summary_model_explicit = true;
             self.session_summary_follows_default = false;
         } else if !self.session_summary_model_explicit
-            && let Some(model) = self.models.session_summary.as_deref().or(effective_default)
+            && let Some(model) =
+                non_empty(self.models.session_summary.as_deref()).or(effective_default)
         {
             self.session_summary_model = Some(model.to_owned());
-            self.session_summary_follows_default = self.models.session_summary.is_none();
+            self.session_summary_follows_default =
+                non_empty(self.models.session_summary.as_deref()).is_none();
         }
         if let Some(policy_model) = self.requirements.image_description_model.pinned() {
             self.image_description_model = Some(policy_model);
             self.image_description_model_explicit = true;
             self.image_description_follows_default = false;
         } else if !self.image_description_model_explicit
-            && let Some(model) = self
-                .models
-                .image_description
-                .as_deref()
-                .or(effective_default)
+            && let Some(model) =
+                non_empty(self.models.image_description.as_deref()).or(effective_default)
         {
             self.image_description_model = Some(model.to_owned());
-            self.image_description_follows_default = self.models.image_description.is_none();
+            self.image_description_follows_default =
+                non_empty(self.models.image_description.as_deref()).is_none();
         }
     }
     /// Re-resolve eagerly-resolved runtime fields using the current `Config`
@@ -16337,6 +16341,51 @@ image_description = "config-image"
         assert_eq!(cfg.session_summary_model.as_deref(), Some("env-summary"));
         assert_eq!(cfg.image_description_model.as_deref(), Some("env-image"));
         clear_runtime_env_vars();
+    }
+
+    #[test]
+    #[serial]
+    fn blank_auxiliary_values_remain_unset_during_default_rebind() {
+        clear_runtime_env_vars();
+        let raw: toml::Value = toml::from_str(
+            r#"
+[models]
+web_search = "  "
+session_summary = "\t"
+image_description = "\n"
+"#,
+        )
+        .unwrap();
+        let mut cfg = Config::new_from_toml_cfg(&raw).unwrap();
+        cfg.resolve_runtime_fields(&RuntimeResolutionContext {
+            raw_config: &raw,
+            remote_settings: None,
+            is_headless: false,
+            cli_subagents: None,
+            cli_web_search_model: None,
+            cli_session_summary_model: None,
+            cli_experimental_memory: false,
+            cli_no_memory: false,
+            disable_web_search: false,
+            todo_gate: false,
+            laziness_debug_log: None,
+            storage_mode: None,
+        });
+
+        cfg.rebind_unset_auxiliary_models_to_default(Some("required-default"));
+
+        assert_eq!(cfg.web_search_model, "required-default");
+        assert!(cfg.web_search_follows_default);
+        assert_eq!(
+            cfg.session_summary_model.as_deref(),
+            Some("required-default")
+        );
+        assert!(cfg.session_summary_follows_default);
+        assert_eq!(
+            cfg.image_description_model.as_deref(),
+            Some("required-default")
+        );
+        assert!(cfg.image_description_follows_default);
     }
     #[test]
     #[serial]
