@@ -436,6 +436,8 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             attach_restore_blocks_exact_key_reuse_and_unique_route_ambiguity -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
+            cold_spawn_reconciled_route_rejects_incompatible_harness -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
             issue39_verbatim_fork_tools_intersect_session_admission -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             issue39_rebuild_respects_capability_mode_ceiling -- --nocapture

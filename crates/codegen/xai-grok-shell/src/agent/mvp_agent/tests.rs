@@ -1308,6 +1308,45 @@ fn ready_compatible_fallback_returns_none_without_compatible_candidate() {
 }
 
 #[test]
+fn cold_spawn_reconciled_route_rejects_incompatible_harness() {
+    let active = xai_grok_agent::AgentDefinition::codex();
+    let endpoints = config::EndpointsConfig::default();
+    let mut removed = ModelEntry::fallback("retained-route", &endpoints);
+    removed.info.agent_type = "codex".to_owned();
+    let mut replacement = ModelEntry::fallback("retained-route", &endpoints);
+    replacement.info.agent_type = "cursor".to_owned();
+    let catalog = indexmap::IndexMap::from([
+        ("removed-key".to_owned(), removed),
+        ("replacement-key".to_owned(), replacement),
+    ]);
+    let identity = xai_chat_state::CatalogIdentity {
+        model_id: "removed-key".to_owned(),
+        route: "retained-route".to_owned(),
+        lineage: xai_chat_state::CatalogResolutionLineage::UniqueRoute,
+        auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
+    };
+    let reconciled = crate::agent::models::reconcile_persisted_catalog_identity(
+        &indexmap::IndexMap::from([(
+            "replacement-key".to_owned(),
+            catalog["replacement-key"].clone(),
+        )]),
+        &identity,
+    )
+    .expect("route remaps to the replacement key");
+
+    let selected = first_ready_compatible_model(
+        [acp::ModelId::new(reconciled.model_id)],
+        &active,
+        |id| catalog.get(id.0.as_ref()).cloned(),
+        |agent_type| {
+            xai_grok_agent::discovery::by_name_in_cwd(agent_type, std::path::Path::new("."))
+        },
+    );
+
+    assert_eq!(selected, None, "cold spawn must reject the remapped key");
+}
+
+#[test]
 fn cold_spawn_unresolved_model_uses_catalog_compatible_fallback_without_latch() {
     let persisted = acp::ModelId::new("persisted-unresolved");
     let compatible = acp::ModelId::new("second-ready-compatible");

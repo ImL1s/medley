@@ -2038,6 +2038,16 @@ impl acp::Agent for MvpAgent {
                     },
                 )
             };
+            if persisted_catalog_identity.is_some()
+                && persisted_model_for_spawn != summary.current_model_id
+                && ready_compatible_fallback(vec![persisted_model_for_spawn.clone()]).is_none()
+            {
+                return Err(acp::Error::invalid_params().data(format!(
+                    "reconciled model '{}' is not ready or is incompatible with persisted harness '{}'",
+                    persisted_model_for_spawn.0,
+                    active_definition.name
+                )));
+            }
             let spawn_selection = if persisted_identity_unresolved {
                 return Err(acp::Error::invalid_params().data(format!(
                     "persisted model '{}' no longer resolves to its committed catalog route",
