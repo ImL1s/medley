@@ -22,6 +22,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # Keep every Rust lane on the repository-pinned protobuf toolchain. Ubuntu
+  # ships protoc 21.12, which predates FieldOptions.debug_redact and cannot
+  # compile the upstream debug-redaction fixtures.
+  PROTOC: ${{ github.workspace }}/bin/protoc
 
 jobs:
   audit-publisher:
@@ -149,8 +153,11 @@ jobs:
           toolchain: "1.94.0"
           components: clippy
 
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install DotSlash and verify pinned protoc
+        run: |
+          cargo install dotslash --version 0.5.7 --locked
+          /usr/bin/env dotslash --help >/dev/null
+          "$PROTOC" --version
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -159,8 +166,6 @@ jobs:
           cache-targets: true
 
       - name: Clippy sampler / shell / pager / pager-bin (all targets)
-        env:
-          PROTOC: protoc
         run: |
           # Measured 2026-08-07 on providers (#194): `--all-targets` on these
           # four crates is clean after fixing the handful of test/bench lints
@@ -193,8 +198,12 @@ jobs:
       # the `implementations::` filter that runs those tests, at which point 44
       # of them failed here and passed on a developer machine — because
       # developer machines have `rg`.
-      - name: Install protoc and ripgrep
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler ripgrep
+      - name: Install DotSlash and ripgrep
+        run: |
+          sudo apt-get update && sudo apt-get install -y ripgrep
+          cargo install dotslash --version 0.5.7 --locked
+          /usr/bin/env dotslash --help >/dev/null
+          "$PROTOC" --version
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -203,8 +212,6 @@ jobs:
           cache-targets: true
 
       - name: Sampler auth / wire tests
-        env:
-          PROTOC: protoc
         run: |
           cargo test --manifest-path crates/codegen/xai-grok-sampler/Cargo.toml \
             --test shared_http_wire none_auth_scheme_ -- --nocapture
@@ -216,8 +223,6 @@ jobs:
             omits_xai_identity -- --nocapture
 
       - name: Credential relation and telemetry export guards
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -307,8 +312,6 @@ jobs:
             upload_config_debug_redacts_all_secret_carriers -- --nocapture
 
       - name: Provider docs examples and fixtures
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -339,8 +342,6 @@ jobs:
         # (issue #71). The release workflow trusts this job, and it only checks
         # that the distribution marker is present in the shipped binary — these
         # are what prove the marker actually stops an update.
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -371,8 +372,6 @@ jobs:
         # run_nonzero fails on a zero-match filter, so this also catches the
         # test later being renamed, moved, or cfg'd out — the exact way it
         # silently stopped being covered before.
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -389,8 +388,6 @@ jobs:
           run_nonzero -p xai-grok-shell --lib holder_has_lock_file_open -- --nocapture
 
       - name: Restricted subagent capability boundaries
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -693,8 +690,6 @@ jobs:
           run_nonzero -p xai-grok-pager --test pty_e2e_queue -- --nocapture
 
       - name: Agent serve exposure and authentication
-        env:
-          PROTOC: protoc
         run: |
           set -o pipefail
           run_nonzero() {
@@ -743,8 +738,6 @@ jobs:
         # so without this step these tests would run nowhere. `run_nonzero`
         # fails on a zero-match filter, so renaming them breaks CI loudly
         # instead of silently dropping the coverage.
-        env:
-          PROTOC: protoc
         run: |
           set -o pipefail
           run_nonzero() {
@@ -769,8 +762,6 @@ jobs:
             leader::lock::tests::reclaim -- --nocapture
 
       - name: Shell auth + readiness meta
-        env:
-          PROTOC: protoc
         run: |
           cargo test --manifest-path crates/codegen/xai-grok-shell/Cargo.toml --lib \
             none_auth_scheme -- --nocapture
@@ -823,8 +814,6 @@ jobs:
             terminal::pty_session::tests::dup_fd_is_not_inherited_by_exec_child -- --nocapture
 
       - name: "Substituted default model meta (#131)"
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -862,8 +851,6 @@ jobs:
             warm_cache_refresh_does_not_reseat_over_user_model_pick -- --nocapture
 
       - name: Pager model picker / readiness
-        env:
-          PROTOC: protoc
         run: |
           cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
             slash::commands::model:: -- --nocapture
@@ -887,8 +874,6 @@ jobs:
             preferred_model_persist_failure -- --nocapture
 
       - name: 'Orphaned switch transaction via synthesized switch (issue #239)'
-        env:
-          PROTOC: protoc
         run: |
           # The stricter of the two `run_nonzero` shapes in this file: it reads
           # cargo's own status out of PIPESTATUS before looking at the output.
@@ -918,8 +903,6 @@ jobs:
       # new button-path test pins why THAT path may discard the refusal
       # signal. Full unique names so run_nonzero proves each one still runs.
       - name: 'Dashboard refused-pick mirror obligations (issue #170)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -951,8 +934,6 @@ jobs:
       # looped, so the #171 check can see them. Quoted name: an unquoted `#159`
       # truncates at the comment marker.
       - name: 'Runtime-catalog lookup and memo generation (issue #159)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -986,8 +967,6 @@ jobs:
       # and `dropped_model_switch_ack_...` appears once rather than twice.
       # Filters are unique names, so run_nonzero proves each is selected.
       - name: 'Model-switch persistence boundaries and narrow windows (issues #50, #54)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -1022,8 +1001,6 @@ jobs:
       # CI never varied. Quoted name: an unquoted `#166` truncates at the
       # comment marker.
       - name: 'Colour-asserting pager tests, both NO_COLOR settings (issue #166)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -1074,8 +1051,6 @@ jobs:
       # covers all three and the two new ones carry the protection. Quoted
       # name: an unquoted `#162` truncates at the comment marker.
       - name: 'Workflow restore ordering and scan budget (issue #162)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -1095,8 +1070,6 @@ jobs:
       # must be unique so run_nonzero proves each guard test still executes.
       # Quoted name: an unquoted `#10` truncates at the comment marker.
       - name: 'Catalog ID vs wire slug restore/switch guards (issue #10)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -1121,8 +1094,6 @@ jobs:
       # Unique filters so run_nonzero proves each new test is selected.
       # Quoted name: an unquoted `#165` truncates at the comment marker.
       - name: 'Abandoned attempt text omitted from search index (issue #165)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -1155,8 +1126,6 @@ jobs:
       # either one reddens only its own test. Quoted name: an unquoted `#180`
       # truncates at the comment marker.
       - name: 'Ambient credential label coupling (issue #180)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -1188,8 +1157,6 @@ jobs:
       # material itself, not from a self-reported ambient label alone. Unique
       # filters so run_nonzero proves each new test is selected (#171).
       - name: 'L3 provenance-required and inconsistency (issue #136 step 4)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -1218,8 +1185,6 @@ jobs:
       # check can see them. Quoted name: an unquoted `#123` truncates at the
       # comment marker.
       - name: 'User-declared trusted xAI origins (issue #123)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -1268,8 +1233,6 @@ jobs:
       # out rather than looped so the #171 check can see them. Quoted name: an
       # unquoted `#160` truncates at the comment marker.
       - name: 'web_search env header forwarding (issue #160)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -1305,8 +1268,6 @@ jobs:
       # `web_search_disable` also matches preexisting #57 config/renderer tests,
       # so `run_nonzero` would stay green if the new tests were deleted (#171).
       - name: 'web_search disable notice (issue #161)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -1336,8 +1297,6 @@ jobs:
       # three helpers plus the failed-signal counter contract. Quoted name: an
       # unquoted `#167` truncates the YAML value at the comment marker.
       - name: 'leaders kill summary and PID guard (issue #167)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -1378,8 +1337,6 @@ jobs:
       # its test uniquely. Quoted name: an unquoted `#173` truncates at the
       # comment marker.
       - name: 'MCP respawn arm/insert ordering guards (issue #173)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -1402,8 +1359,6 @@ jobs:
       # client still sends `x.ai/local_workspace`; silent ignore would read as
       # supported and then degrade to NotAttached behavior.
       - name: 'Removed local-workspace meta guard (issue #35)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -1426,8 +1381,6 @@ jobs:
       # query parameter both need a test that fails loudly when they drift.
       # Full unique names so run_nonzero proves each one still runs.
       - name: 'Codex account model catalog (issue #188)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -1462,8 +1415,6 @@ jobs:
       # auto-download bundle. Filters are written explicitly so #171 can prove
       # each new test runs somewhere.
       - name: 'PI fd glob contract and bundling (issue #36)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
@@ -1498,8 +1449,6 @@ jobs:
       # that reaches it. Quoted name: an unquoted `#88` truncates at the comment
       # marker.
       - name: 'Build-script protoc discovery and rerun-if-changed emission (issue #88)'
-        env:
-          PROTOC: protoc
         run: |
           run_nonzero() {
             local output
