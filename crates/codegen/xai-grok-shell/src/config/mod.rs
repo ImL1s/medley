@@ -776,9 +776,9 @@ fn non_empty_model_override(value: Option<&str>) -> Option<String> {
     })
 }
 impl ModelOverrideConfig {
-    /// CLI flag > env var > config.toml > remote settings > compiled default.
-    /// `image_description` and `session_summary` always resolve to `Some(_)`
-    /// (default `grok-build`), never the session model.
+    /// CLI flag > env var > lane-specific config.toml > lane-specific remote
+    /// setting > configured default model > compiled default.
+    /// `image_description` and `session_summary` always resolve to `Some(_)`.
     /// `prompt_suggestion` resolves to a [`PromptSuggestModelPin`] instead of
     /// a model string (no CLI flag; the default and the catalog guard live at
     /// the consumer, `handle_suggest_prompt`).
