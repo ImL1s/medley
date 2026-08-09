@@ -1829,6 +1829,14 @@ async fn read_parent_sampling_config_keeps_auto_when_catalog_has_slug_key_only()
     let mut models = indexmap::IndexMap::new();
     models.insert("grok-4.5".to_string(), test_model_entry("grok-4.5"));
     let ctx = ctx_with_parent_chat_state("auto", "grok-4.5", "auto", models);
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.catalog_identity = Some(test_catalog_identity(
+        "auto",
+        "grok-4.5",
+        xai_chat_state::CatalogResolutionLineage::UniqueRoute,
+    ));
+    chat.restore_snapshot(snapshot);
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
     assert_eq!(config.model, "grok-4.5");
     assert_eq!(model_id.0.as_ref(), "grok-4.5");
@@ -1924,7 +1932,7 @@ async fn read_parent_sampling_config_fallback_reused_key_keeps_baseline_wire() {
 
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
 
-    assert_eq!(model_id.0.as_ref(), "old-routing-model");
+    assert_eq!(model_id.0.as_ref(), "auto");
     assert_eq!(config.model, "old-routing-model");
     assert_eq!(config.codex_wire, Some(baseline_caps));
 }
@@ -2510,7 +2518,7 @@ async fn read_parent_sampling_config_reused_startup_key_different_route_rejects_
 
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
 
-    assert_eq!(model_id.0.as_ref(), "switched-routing-model");
+    assert_eq!(model_id.0.as_ref(), "reused-key");
     assert_eq!(config.model, "switched-routing-model");
     assert!(!config.supports_backend_search);
     assert_eq!(config.codex_wire, None);
@@ -2591,7 +2599,7 @@ async fn read_parent_sampling_config_missing_committed_id_ignores_same_route_sur
 
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
 
-    assert_eq!(model_id.0.as_ref(), "shared-routing-model");
+    assert_eq!(model_id.0.as_ref(), "removed-entry");
     assert_eq!(config.auth_scheme, AuthScheme::Bearer);
     assert!(!config.supports_backend_search);
     assert_eq!(config.codex_wire, None);
@@ -2736,7 +2744,7 @@ async fn read_parent_sampling_config_opaque_override_rejects_reused_committed_ke
 
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
 
-    assert_eq!(model_id.0.as_ref(), "opaque-backend-routing-hint");
+    assert_eq!(model_id.0.as_ref(), "catalog-entry");
     assert_eq!(config.codex_wire, Some(baseline_caps));
 }
 
@@ -2762,9 +2770,16 @@ async fn read_parent_sampling_config_fallback_missing_id_ignores_same_route_surv
     ctx.parent_chat_state = None;
     ctx.sampling_config.codex_wire = Some(baseline_caps.clone());
 
-    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+    let prepared = read_parent_prepared_model(&ctx).await;
+    let config = prepared.sampling_config;
 
-    assert_eq!(model_id.0.as_ref(), "shared-routing-model");
+    assert_eq!(prepared.model_id.0.as_ref(), "removed-entry");
+    assert_eq!(prepared.catalog_identity.model_id, "removed-entry");
+    assert_eq!(prepared.catalog_identity.route, "shared-routing-model");
+    assert_eq!(
+        prepared.catalog_identity.lineage,
+        xai_chat_state::CatalogResolutionLineage::ExactKey
+    );
     assert_eq!(config.codex_wire, Some(baseline_caps));
 }
 
@@ -2854,8 +2869,11 @@ async fn read_parent_sampling_config_exact_stable_key_never_remaps_to_same_route
     snapshot.catalog_identity = Some(selected_identity);
     chat.restore_snapshot(snapshot);
 
-    let (config, model_id) = read_parent_sampling_config(&ctx).await;
-    assert_eq!(model_id.0.as_ref(), "grok-4.5");
+    let prepared = read_parent_prepared_model(&ctx).await;
+    let config = prepared.sampling_config;
+    assert_eq!(prepared.model_id.0.as_ref(), "prod-grok-build");
+    assert_eq!(prepared.catalog_identity.model_id, "prod-grok-build");
+    assert_eq!(prepared.catalog_identity.route, "grok-4.5");
     assert_eq!(config.codex_wire, Some(baseline_caps));
 }
 
@@ -2991,7 +3009,8 @@ async fn read_parent_sampling_config_reused_catalog_key_keeps_sampled_model_wire
     // unrelated entry. Route resolution must find `legacy-entry` instead.
     models.insert("old-routing-model".to_string(), replacement);
     models.insert("legacy-entry".to_string(), old);
-    let ctx = ctx_with_parent_chat_state("auto", "old-routing-model", "auto", models);
+    let mut ctx = ctx_with_parent_chat_state("auto", "old-routing-model", "auto", models);
+    ctx.sampling_config.codex_wire = Some(old_caps.clone());
     let chat = ctx.parent_chat_state.as_ref().expect("chat state");
     let mut snapshot = chat.snapshot().await.expect("chat snapshot");
     snapshot.catalog_identity = Some(test_catalog_identity(
@@ -3003,7 +3022,7 @@ async fn read_parent_sampling_config_reused_catalog_key_keeps_sampled_model_wire
 
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
 
-    assert_eq!(model_id.0.as_ref(), "legacy-entry");
+    assert_eq!(model_id.0.as_ref(), "auto");
     assert_eq!(config.model, "old-routing-model");
     assert_eq!(config.codex_wire, Some(old_caps));
 

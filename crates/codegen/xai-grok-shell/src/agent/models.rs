@@ -280,7 +280,9 @@ pub(crate) fn capabilities_for_route_in(
                 })
                 .map(|entry| (key.0.to_string(), entry))
         });
-    let (model_id, entry) = if let Some(preferred) = preferred {
+    let (model_id, entry) = if preferred_id_must_exist {
+        preferred?
+    } else if let Some(preferred) = preferred {
         preferred
     } else {
         let mut matches = models

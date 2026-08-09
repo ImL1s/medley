@@ -887,7 +887,7 @@ async fn read_parent_prepared_model(ctx: &SubagentSpawnContext) -> PreparedSubag
             let model_id = capabilities
                 .as_ref()
                 .map(|facts| facts.model_id.clone())
-                .unwrap_or_else(|| acp::ModelId::new(cfg.model.clone()));
+                .unwrap_or_else(|| acp::ModelId::new(preferred_model_id));
             let baseline_matches_live = preferred_model_id
                 == ctx.sampling_config_model_id.0.as_ref()
                 && retained_catalog_route.is_some_and(|route| route == ctx.sampling_config.model);
@@ -1067,7 +1067,7 @@ async fn read_parent_prepared_model(ctx: &SubagentSpawnContext) -> PreparedSubag
     let fallback_model_id = capabilities
         .as_ref()
         .map(|facts| facts.model_id.clone())
-        .unwrap_or_else(|| acp::ModelId::new(fallback.model.clone()));
+        .unwrap_or_else(|| ctx.sampling_config_model_id.clone());
     if let Some(capabilities) = capabilities.as_ref() {
         fallback.auth_scheme = capabilities.auth_scheme;
         fallback.supports_backend_search = capabilities.supports_backend_search;
@@ -1098,13 +1098,11 @@ async fn read_parent_prepared_model(ctx: &SubagentSpawnContext) -> PreparedSubag
     // #277 on the path taken whenever the parent's chat-state actor is
     // unavailable — which `try_build_subagent_spawn_context` does not bail
     // on, so a nested child outliving its parent lands here for real.
-    let catalog_identity =
-        crate::agent::models::resolve_catalog_identity(&ctx.available_models, &fallback_model_id)
-            .unwrap_or_else(|| xai_chat_state::CatalogIdentity {
-                model_id: fallback_model_id.0.to_string(),
-                route: fallback.model.clone(),
-                lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
-            });
+    let catalog_identity = xai_chat_state::CatalogIdentity {
+        model_id: ctx.sampling_config_model_id.0.to_string(),
+        route: fallback.model.clone(),
+        lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+    };
     PreparedSubagentModel {
         catalog_identity,
         sampling_config: fallback,
