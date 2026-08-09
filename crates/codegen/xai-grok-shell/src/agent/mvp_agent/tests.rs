@@ -2850,7 +2850,7 @@ fn model_overrides_live_cross_provider_switch_rebuilds_inherited_auxiliary_lanes
                             did_rebuild: false,
                             active_agent_type: Some("grok-build".to_owned()),
                             web_search: Some(crate::session::AppliedWebSearchState {
-                                enabled: true,
+                                enabled: false,
                                 disable_notice: None,
                             }),
                         }));
@@ -2872,7 +2872,7 @@ fn model_overrides_live_cross_provider_switch_rebuilds_inherited_auxiliary_lanes
         assert_eq!(agent.sessions.borrow()[&sid].model_id.0.as_ref(), "target-provider");
         assert!(
             !agent.web_search_disabled.borrow().contains_key(&sid),
-            "the applied usable state must clear the prior notice without a second preflight"
+            "an applied policy-disabled state must clear the prior availability notice"
         );
     });
 }

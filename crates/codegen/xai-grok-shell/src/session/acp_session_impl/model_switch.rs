@@ -297,7 +297,10 @@ impl SessionActor {
                     session_id = %self.session_info.id.0,
                     "model switch left web search disabled because the candidate agent policy has no eligible built-in topology"
                 );
-                None
+                // This is still an applied web-search outcome: clear any
+                // source client and stale availability notice, while the
+                // policy-filtered topology remains disabled as a safe no-op.
+                Some(None)
             }
             other => other,
         };
@@ -1571,30 +1574,30 @@ mod model_switch_transaction_tests {
                     xai_grok_sampling_types::HostedTool::WebSearch { .. }
                 )));
 
-                let mut prepared = prepared_switch("grok-build", None);
+                let mut filtered_definition = xai_grok_agent::AgentDefinition::default_grok_build();
+                filtered_definition.name = "target-policy-filtered".to_owned();
+                filtered_definition.disallowed_tools = vec!["web_search".to_owned()];
+                *actor.active_agent_type.lock() = Some("codex".to_owned());
+                let mut prepared =
+                    prepared_switch("target-policy-filtered", Some(filtered_definition));
                 prepared.summary_sampling_config = Some(prepared.sampling_config.clone());
                 prepared.replace_inherited_web_search = true;
-                prepared.web_search_sampling_config = None;
-                prepared.web_search_disable_notice =
-                    Some(crate::session::WebSearchDisabledNotice {
-                        model_id: "target-model".to_owned(),
-                        reason: "missing test credential".to_owned(),
-                        message: "web_search is unavailable in test".to_owned(),
-                    });
+                let mut web_search_sampling = prepared.sampling_config.clone();
+                web_search_sampling.api_key = Some("target-filtered-key".to_owned());
+                prepared.web_search_sampling_config = Some(web_search_sampling);
+                prepared.web_search_disable_notice = None;
                 let disabled_receipt = actor
                     .handle_apply_model_switch(prepared)
                     .await
-                    .expect("unavailable inherited web search must commit as disabled");
+                    .expect("policy-filtered inherited web search must commit as disabled");
                 assert!(matches!(
                     disabled_receipt.web_search,
                     Some(AppliedWebSearchState {
                         enabled: false,
-                        disable_notice: Some(crate::session::WebSearchDisabledNotice {
-                            ref model_id,
-                            ..
-                        }),
-                    }) if model_id == "target-model"
+                        disable_notice: None,
+                    })
                 ));
+                let bridge = actor.agent.borrow().tool_bridge().clone();
                 assert!(
                     bridge
                         .read_resource::<
