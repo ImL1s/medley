@@ -72,8 +72,15 @@ struct ResumeModelLineage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResumeModelLineageError {
     MissingRoute,
+    MissingDurableIdentity,
     RouteChanged,
     HarnessChanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeModelLineageRecoveryError {
+    ModelConflict,
+    RouteConflict,
 }
 
 fn validate_resume_model_lineage(
@@ -87,6 +94,9 @@ fn validate_resume_model_lineage(
     if source_route != current_route {
         return Err(ResumeModelLineageError::RouteChanged);
     }
+    if source.agent_type.is_none() && source.catalog_identity.is_none() {
+        return Err(ResumeModelLineageError::MissingDurableIdentity);
+    }
     if source
         .agent_type
         .as_deref()
@@ -99,30 +109,26 @@ fn validate_resume_model_lineage(
 
 async fn recover_resume_model_lineage(
     source: &ResumeSourceData,
-    parent_session_id: &str,
-    parent_cwd: &Path,
-) -> ResumeModelLineage {
-    let parent_info = SessionInfo {
-        id: acp::SessionId::new(parent_session_id),
-        cwd: parent_cwd.to_string_lossy().into_owned(),
+) -> Result<ResumeModelLineage, ResumeModelLineageRecoveryError> {
+    let child_info = SessionInfo {
+        id: acp::SessionId::new(source.child_session_id.clone()),
+        cwd: source.child_cwd.clone(),
     };
-    let child_dir = session::persistence::session_dir(&parent_info)
-        .join("subagents")
-        .join(&source.subagent_id);
+    let child_dir = session::persistence::session_dir(&child_info);
     recover_resume_model_lineage_at(source, child_dir).await
 }
 
 async fn recover_resume_model_lineage_at(
     source: &ResumeSourceData,
     child_dir: PathBuf,
-) -> ResumeModelLineage {
+) -> Result<ResumeModelLineage, ResumeModelLineageRecoveryError> {
     let mut lineage = ResumeModelLineage {
         route: source.model_route.clone(),
         agent_type: source.model_agent_type.clone(),
         catalog_identity: None,
     };
     if source.model_id.is_none() {
-        return lineage;
+        return Ok(lineage);
     }
     let metadata_is_incomplete = lineage.route.is_none() || lineage.agent_type.is_none();
 
@@ -138,7 +144,7 @@ async fn recover_resume_model_lineage_at(
                 "Legacy resume metadata lacks complete model lineage and the child session summary could not be loaded"
             );
         }
-        return lineage;
+        return Ok(lineage);
     };
     let Some(identity) = summary.catalog_identity else {
         if metadata_is_incomplete {
@@ -147,26 +153,39 @@ async fn recover_resume_model_lineage_at(
                 "Legacy resume metadata lacks complete model lineage and the child session summary has no catalog identity"
             );
         }
-        return lineage;
+        return Ok(lineage);
     };
     if source.model_id.as_deref() != Some(identity.model_id.as_str())
         || summary.current_model_id.0.as_ref() != identity.model_id
     {
-        tracing::warn!(
+        tracing::error!(
             source_subagent_id = %source.subagent_id,
             metadata_model_id = ?source.model_id,
             summary_model_id = %summary.current_model_id.0,
             catalog_model_id = %identity.model_id,
             "Refusing inconsistent legacy resume model lineage"
         );
-        return lineage;
+        return Err(ResumeModelLineageRecoveryError::ModelConflict);
+    }
+    if lineage
+        .route
+        .as_deref()
+        .is_some_and(|route| route != identity.route)
+    {
+        tracing::error!(
+            source_subagent_id = %source.subagent_id,
+            metadata_route = ?lineage.route,
+            summary_route = %identity.route,
+            "Refusing conflicting durable resume route lineage"
+        );
+        return Err(ResumeModelLineageRecoveryError::RouteConflict);
     }
 
     if lineage.route.is_none() {
         lineage.route = Some(identity.route.clone());
     }
     lineage.catalog_identity = Some(identity);
-    lineage
+    Ok(lineage)
 }
 
 fn should_preflight_model_harness(
@@ -407,10 +426,25 @@ pub(crate) async fn run_shell_child(
     } else {
         None
     };
-    let resume_model_lineage = match resume_source.as_ref() {
-        Some(source) => Some(
-            recover_resume_model_lineage(source, &ctx.parent_session_id, &ctx.parent_cwd).await,
-        ),
+    let mut resume_model_lineage = match resume_source.as_ref() {
+        Some(source) => match recover_resume_model_lineage(source).await {
+            Ok(lineage) => Some(lineage),
+            Err(conflict) => {
+                let detail = match conflict {
+                    ResumeModelLineageRecoveryError::ModelConflict => {
+                        "subagent metadata conflicts with the durable child session model identity"
+                    }
+                    ResumeModelLineageRecoveryError::RouteConflict => {
+                        "subagent metadata conflicts with the durable child session route identity"
+                    }
+                };
+                let msg = format!(
+                    "Cannot resume from subagent '{}': {detail}.",
+                    source.subagent_id,
+                );
+                return child_run_output(failure_result(&request, &msg), completion_data, None);
+            }
+        },
         None => None,
     };
     if let Some(ref source) = resume_source {
@@ -664,8 +698,8 @@ pub(crate) async fn run_shell_child(
     {
         let persisted_identity = resume_model_lineage
             .as_ref()
-            .and_then(|lineage| lineage.catalog_identity.as_ref());
-        let reconciled_identity = persisted_identity.and_then(|identity| {
+            .and_then(|lineage| lineage.catalog_identity.clone());
+        let reconciled_identity = persisted_identity.as_ref().and_then(|identity| {
             crate::agent::models::reconcile_persisted_catalog_identity(
                 &ctx.available_models,
                 identity,
@@ -677,6 +711,11 @@ pub(crate) async fn run_shell_child(
                 source.subagent_id,
             );
             return child_run_output(failure_result(&request, &msg), completion_data, None);
+        }
+        if let Some(identity) = reconciled_identity.as_ref()
+            && let Some(lineage) = resume_model_lineage.as_mut()
+        {
+            lineage.catalog_identity = Some(identity.clone());
         }
         let resume_model_id = reconciled_identity
             .as_ref()
@@ -749,6 +788,9 @@ pub(crate) async fn run_shell_child(
                 ResumeModelLineageError::MissingRoute => {
                     "source model route evidence is missing; resume requires persisted route lineage"
                 }
+                ResumeModelLineageError::MissingDurableIdentity => {
+                    "legacy metadata has no harness lineage and no reconciled durable catalog identity"
+                }
                 ResumeModelLineageError::RouteChanged => {
                     "source model route no longer matches the current catalog"
                 }
@@ -768,39 +810,12 @@ pub(crate) async fn run_shell_child(
             .as_ref()
             .is_some_and(|lineage| lineage.agent_type.is_none())
         {
-            let required_agent_type = prepared_model.agent_type.as_str();
-            let compatibility = if required_agent_type.is_empty() {
-                Err(SubagentModelHarnessError::Unavailable)
-            } else {
-                resolve_and_validate_subagent_model_harness(
-                    &selected_harness_definition,
-                    required_agent_type,
-                    &ctx.parent_cwd,
-                    ctx.plugin_registry.as_deref(),
-                )
-            };
-            if let Err(harness_error) = compatibility {
-                let detail = match harness_error {
-                    SubagentModelHarnessError::Unavailable => "is unavailable",
-                    SubagentModelHarnessError::Incompatible => {
-                        "is incompatible with the selected subagent harness"
-                    }
-                };
-                let msg = format!(
-                    "Cannot resume from subagent '{}': legacy metadata has no persisted harness lineage, and compatibility preflight failed because current harness '{}' {detail}. Re-run with a compatible harness or start a fresh subagent.",
-                    resume_source
-                        .as_ref()
-                        .map_or("unknown", |source| source.subagent_id.as_str()),
-                    required_agent_type,
-                );
-                return child_run_output(failure_result(&request, &msg), completion_data, None);
-            }
             tracing::warn!(
                 source_subagent_id = %resume_source
                     .as_ref()
                     .map_or("unknown", |source| source.subagent_id.as_str()),
-                required_agent_type,
-                "Legacy resume metadata has no persisted harness lineage; continuing only after explicit compatibility preflight"
+                model_route = %prepared_model.catalog_identity.route,
+                "Migrating legacy resume without historical harness lineage after durable catalog identity reconciliation"
             );
         }
     } else if should_preflight_model_harness(
@@ -2398,7 +2413,9 @@ mod resume_model_lineage_tests {
             child_session_id: child_info.id.0.to_string(),
         };
 
-        let recovered = recover_resume_model_lineage_at(&source, child_dir).await;
+        let recovered = recover_resume_model_lineage_at(&source, child_dir)
+            .await
+            .expect("durable lineage should be consistent");
 
         assert_eq!(recovered.route.as_deref(), Some("gpt-5.3-codex-spark"));
         assert!(
