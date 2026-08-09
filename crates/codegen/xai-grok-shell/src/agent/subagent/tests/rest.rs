@@ -2607,7 +2607,7 @@ async fn read_parent_sampling_config_reused_startup_key_different_route_rejects_
 }
 
 #[tokio::test]
-async fn read_parent_sampling_config_uses_spawn_snapshot_after_same_route_live_refresh() {
+async fn read_parent_sampling_config_uses_live_catalog_after_same_route_refresh() {
     use xai_grok_sampler::AuthScheme;
 
     let frozen_caps = xai_grok_sampling_types::CodexWireCapabilities {
@@ -2629,18 +2629,20 @@ async fn read_parent_sampling_config_uses_spawn_snapshot_after_same_route_live_r
     let mut refreshed = test_model_entry("stable-routing-model");
     refreshed.info.auth_scheme = AuthScheme::None;
     refreshed.info.supports_backend_search = true;
-    refreshed.info.codex_wire = Some(xai_grok_sampling_types::CodexWireCapabilities {
+    let refreshed_caps = xai_grok_sampling_types::CodexWireCapabilities {
         supports_reasoning_summary_parameter: Some(true),
         ..Default::default()
-    });
+    };
+    refreshed.info.codex_wire = Some(refreshed_caps.clone());
     ctx.models_manager.insert_test_entry("stable-entry", refreshed);
 
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
 
     assert_eq!(model_id.0.as_ref(), "stable-entry");
-    assert_eq!(config.auth_scheme, AuthScheme::Bearer);
-    assert!(!config.supports_backend_search);
-    assert_eq!(config.codex_wire, Some(frozen_caps));
+    assert_eq!(config.auth_scheme, AuthScheme::None);
+    assert!(config.supports_backend_search);
+    assert_eq!(config.codex_wire, Some(refreshed_caps));
+    assert_ne!(config.codex_wire, Some(frozen_caps));
 }
 
 #[tokio::test]

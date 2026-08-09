@@ -270,7 +270,8 @@ pub(crate) fn capabilities_for_route_in(
         return None;
     }
     let preferred = preferred_id
-        .and_then(|id| resolve_catalog_key(models, &acp::ModelId::new(id)))
+        .filter(|id| models.contains_key(*id))
+        .map(acp::ModelId::new)
         .and_then(|key| {
             models
                 .get(key.0.as_ref())
