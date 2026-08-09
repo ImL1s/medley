@@ -264,7 +264,7 @@ async fn subscription_watch_polls_free_tier_then_goes_dormant_after_upgrade() {
         "allow_access": true,
         "subscription_tier_display": PAID_TIER_DISPLAY,
     }));
-    content.server().set_models(vec![
+    content.set_models(vec![
         MockModel::new("grok-3"),
         MockModel::new(PAID_ONLY_MODEL),
     ]);

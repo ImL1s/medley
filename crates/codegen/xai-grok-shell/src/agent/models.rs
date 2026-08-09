@@ -433,14 +433,14 @@ impl ModelsManager {
         }
 
         let (current_model_key, current_model, model_source, unready_default_reason) =
-            resolve_default_model(cfg, &catalog, is_session_auth);
+            resolve_default_model_for_catalog(cfg, &catalog, is_session_auth, has_prefetched);
 
         if let Some(reason) = &unready_default_reason {
             tracing::error!(
                 model_id = %current_model.model,
                 source = %model_source,
                 %reason,
-                "default model resolved to an unusable configured preference"
+                "default model resolved to an unusable catalog entry"
             );
         } else {
             tracing::info!(
@@ -524,9 +524,9 @@ impl ModelsManager {
             let cat = self.inner.catalog.read();
             let models = &cat.models;
             let cur = self.inner.current_model_id.read();
-            models
-                .get(cur.0.as_ref())
-                .is_some_and(|e| e.info.user_selectable)
+            models.get(cur.0.as_ref()).is_some_and(|e| {
+                e.info.user_selectable && e.info.visible_for_auth(self.is_session_auth())
+            })
         };
         if preferred_changed && !(campaign_only_flip && current_still_ok) {
             self.reselect_default_model(&new_config);
@@ -1193,14 +1193,31 @@ impl ModelsManager {
     pub fn sampling_config(&self) -> SamplingConfig {
         let config = self.inner.cfg.read().clone();
         let auth_manager = self.inner.auth_manager.as_ref();
+        let is_session_auth = self.is_session_auth();
         let current_model_id = self.current_model_id();
         let all_models = self.models();
-        let fallback;
+        let mut fallback;
         let current_model = match all_models
             .get(current_model_id.0.as_ref())
-            .or_else(|| all_models.values().next())
-        {
+            .filter(|entry| {
+                entry.info.user_selectable && entry.info.visible_for_auth(is_session_auth)
+            })
+            .or_else(|| {
+                all_models.values().find(|entry| {
+                    entry.info.user_selectable && entry.info.visible_for_auth(is_session_auth)
+                })
+            }) {
             Some(m) => m,
+            None if !all_models.is_empty() => {
+                tracing::error!(
+                    "catalog has no model selectable for the current auth mode; withholding the sampling endpoint"
+                );
+                fallback = ModelEntry::fallback("", &config.endpoints);
+                fallback
+                    .config_validation_errors
+                    .push("no model is selectable for the current authentication mode".to_owned());
+                &fallback
+            }
             None => {
                 tracing::warn!("no models available in catalog; defaulting to bundled model");
                 let default_id = crate::models::default_model().to_string();
@@ -1478,8 +1495,9 @@ impl ModelsManager {
         self.inner.catalog.read().allowlist_excludes_all
     }
 
-    /// Re-pick the default if `current_model_id` is gone from the catalog *or*
-    /// no longer user-selectable. Always refreshes the #131 verdict: the
+    /// Re-pick the default if `current_model_id` is gone from the catalog,
+    /// no longer user-selectable, or hidden for the current auth mode. Always
+    /// refreshes the #131 verdict: the
     /// early-return path is exactly when a stale `Some` taken against an
     /// emptier catalog would otherwise survive.
     ///
@@ -1498,13 +1516,21 @@ impl ModelsManager {
             let models = &cat.models;
             match models.get(current.0.as_ref()) {
                 None => true,
-                Some(entry) => !entry.info.user_selectable,
+                Some(entry) => {
+                    !entry.info.user_selectable
+                        || !entry.info.visible_for_auth(self.is_session_auth())
+                }
             }
         };
         let (key, _, source, _) = {
             let cat = self.inner.catalog.read();
             let models = &cat.models;
-            resolve_default_model(config, models, self.is_session_auth())
+            resolve_default_model_for_catalog(
+                config,
+                models,
+                self.is_session_auth(),
+                cat.has_fetched_real_catalog,
+            )
         };
         let user_picked = self.inner.user_selected_model.load(Ordering::Relaxed);
         // Only reseat when we previously recorded a substitution: that is the
@@ -1541,7 +1567,12 @@ impl ModelsManager {
         let (key, _, source, unready_reason) = {
             let cat = self.inner.catalog.read();
             let models = &cat.models;
-            resolve_default_model(config, models, self.is_session_auth())
+            resolve_default_model_for_catalog(
+                config,
+                models,
+                self.is_session_auth(),
+                cat.has_fetched_real_catalog,
+            )
         };
         let new_id = acp::ModelId::new(Arc::from(key));
         // Recorded whether or not the selection changes: the catalog landing is
@@ -1554,7 +1585,7 @@ impl ModelsManager {
             if let Some(reason) = &unready_reason {
                 tracing::error!(
                     old = %current.0, new = %new_id.0, source = %source, %reason,
-                    "re-resolved default model to an unusable configured preference"
+                    "re-resolved default model to an unusable catalog entry"
                 );
             } else {
                 tracing::info!(

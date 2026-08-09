@@ -559,6 +559,10 @@ jobs:
             startup:: -- --nocapture
           run_nonzero -p xai-grok-test-support --lib \
             resources:: -- --nocapture
+          # #296: loopback PTY model fixtures must explicitly opt out of auth;
+          # otherwise credential-origin hardening correctly makes them unready.
+          run_nonzero -p xai-grok-test-support --lib \
+            mock_model_emits_explicit_auth_scheme -- --nocapture
           run_nonzero -p xai-grok-tools --lib \
             implementations:: -- --nocapture
           run_nonzero -p xai-grok-tools --lib \
