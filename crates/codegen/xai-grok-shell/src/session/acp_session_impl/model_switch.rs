@@ -386,11 +386,27 @@ impl SessionActor {
                 .borrow_mut()
                 .set_web_search_enabled(web_search_enabled);
             debug_assert!(topology_updated, "web-search topology was preflighted");
+            if topology_updated {
+                self.agent.borrow_mut().finalize_prompt().await;
+                if !use_concise && !self.startup_hints.preserve_inherited_system {
+                    let system_prompt = self.agent.borrow().system_prompt().to_owned();
+                    save_prompt_context(&self.session_info, self.agent.borrow().prompt_context());
+                    let _ = self
+                        .chat_state_handle
+                        .replace_system_head(&system_prompt)
+                        .await;
+                    save_system_prompt(&self.session_info, &system_prompt);
+                    let snapshot = self.chat_state_handle.get_conversation().await;
+                    persist_chat_history_jsonl_sync(&self.session_info, &snapshot);
+                }
+            }
         }
-        if let Some(rebuild) = installed_rebuild {
+        if installed_rebuild.is_some() {
             self.commit_rebuilt_harness_side_effects().await;
-            save_prompt_context(&self.session_info, &rebuild.prompt_context);
-            save_system_prompt(&self.session_info, &rebuild.system_prompt);
+            let agent = self.agent.borrow();
+            save_prompt_context(&self.session_info, agent.prompt_context());
+            save_system_prompt(&self.session_info, agent.system_prompt());
+            drop(agent);
             let snapshot = self.chat_state_handle.get_conversation().await;
             persist_chat_history_jsonl_sync(&self.session_info, &snapshot);
             self.mcp_reminder_dirty
@@ -1623,6 +1639,96 @@ mod model_switch_transaction_tests {
                     tool,
                     xai_grok_sampling_types::HostedTool::XSearch { .. }
                 )));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_harness_web_search_switch_reconciles_rendered_system_prompt() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (persistence_tx, mut persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+                tokio::task::spawn_local(async move {
+                    while let Some(message) = persistence_rx.recv().await {
+                        if let PersistenceMsg::ModelSwitchAndAck { respond_to, .. } = message {
+                            let _ = respond_to.send(Ok(()));
+                        }
+                    }
+                });
+                let (mut actor, _event_rx) =
+                    create_test_actor_ex(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                std::sync::Arc::get_mut(&mut actor.rebuild_spec)
+                    .expect("test actor owns rebuild spec")
+                    .backend_search = true;
+                let mut definition = xai_grok_agent::AgentDefinition::default_grok_build();
+                definition.prompt_body = Some(
+                    "${% if tools.by_kind.web_search %}Web search: ${{ tools.by_kind.web_search }}${% else %}Web search disabled${% endif %}"
+                        .to_owned(),
+                );
+                let dynamic_agent = xai_grok_agent::AgentBuilder::new(
+                    std::env::temp_dir(),
+                    std::sync::Arc::new(
+                        xai_grok_tools::computer::local::LocalTerminalBackend::new(),
+                    ),
+                    xai_grok_tools::notification::ToolNotificationHandle::noop(),
+                )
+                .from_definition(definition.clone())
+                .with_web_search_config(xai_grok_tools::implementations::WebSearchConfig::Disabled)
+                .with_backend_search(true)
+                .build()
+                .await
+                .expect("dynamic web-search test agent");
+                *actor.agent.borrow_mut() = dynamic_agent;
+                actor.supports_backend_search.set(true);
+                *actor.active_agent_type.lock() = Some("grok-build".to_owned());
+                let previous_prompt = actor.agent.borrow().system_prompt().to_owned();
+                assert!(previous_prompt.contains("Web search disabled"));
+
+                let mut prepared = prepared_switch("grok-build", Some(definition));
+                prepared.replace_inherited_web_search = true;
+                let mut web_search_sampling = prepared.sampling_config.clone();
+                web_search_sampling.api_key = Some("target-test-key".to_owned());
+                prepared.web_search_sampling_config = Some(web_search_sampling);
+
+                let receipt = actor
+                    .handle_apply_model_switch(prepared)
+                    .await
+                    .expect("same-harness web-search switch must succeed");
+                assert!(!receipt.did_rebuild);
+                let rendered_prompt = actor.agent.borrow().system_prompt().to_owned();
+                assert_ne!(rendered_prompt, previous_prompt);
+                assert!(rendered_prompt.contains("Web search: web_search"));
+
+                let conversation = actor.chat_state_handle.get_conversation().await;
+                let system_head = conversation
+                    .iter()
+                    .find_map(|item| match item {
+                        ConversationItem::System(system) => Some(system.content.as_ref()),
+                        _ => None,
+                    })
+                    .expect("system head");
+                assert_eq!(system_head, rendered_prompt);
+
+                let session_dir = crate::session::persistence::session_dir(&actor.session_info);
+                assert_eq!(
+                    std::fs::read_to_string(session_dir.join(SYSTEM_PROMPT_FILENAME))
+                        .expect("persisted system prompt"),
+                    rendered_prompt
+                );
+                let first_line = std::fs::read_to_string(session_dir.join("chat_history.jsonl"))
+                    .expect("persisted chat history")
+                    .lines()
+                    .next()
+                    .expect("persisted system line")
+                    .to_owned();
+                let persisted_head: ConversationItem =
+                    serde_json::from_str(&first_line).expect("deserialize persisted system head");
+                let ConversationItem::System(persisted_system) = persisted_head else {
+                    panic!("first persisted item must be the system head");
+                };
+                assert_eq!(persisted_system.content.as_ref(), rendered_prompt);
             })
             .await;
     }

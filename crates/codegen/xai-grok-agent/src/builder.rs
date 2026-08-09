@@ -2549,6 +2549,13 @@ mod tests {
         use xai_grok_tools::types::resources::EnabledNativeToolNames;
 
         let mut agent = build_with_web_search(false, true, &[], None).await;
+        assert_eq!(
+            agent
+                .tool_bridge()
+                .tool_for_kind(xai_grok_tools::types::tool::ToolKind::WebSearch)
+                .await,
+            None
+        );
         let native_names = agent
             .tool_bridge()
             .read_resource::<EnabledNativeToolNames>()
@@ -2575,8 +2582,35 @@ mod tests {
                 .any(|t| matches!(t, xai_grok_sampling_types::HostedTool::XSearch { .. })),
             "expected XSearch hosted tool, got: {hosted:?}"
         );
+        assert_eq!(
+            agent
+                .tool_bridge()
+                .render_prompt(
+                    "${% if tools.by_kind.web_search %}${{ tools.by_kind.web_search }}${% else %}disabled${% endif %}",
+                    &serde_json::json!({}),
+                )
+                .await
+                .as_deref(),
+            Some("disabled")
+        );
         agent.set_web_search_enabled(true);
         assert!(native_names.contains("web_search"));
+        assert_eq!(
+            agent
+                .tool_bridge()
+                .tool_for_kind(xai_grok_tools::types::tool::ToolKind::WebSearch)
+                .await
+                .as_deref(),
+            Some("web_search")
+        );
+        assert_eq!(
+            agent
+                .tool_bridge()
+                .render_prompt("${{ tools.by_kind.web_search }}", &serde_json::json!({}),)
+                .await
+                .as_deref(),
+            Some("web_search")
+        );
         assert!(
             agent
                 .hosted_tools()
@@ -2601,6 +2635,24 @@ mod tests {
         );
         agent.set_web_search_enabled(false);
         assert!(!native_names.contains("web_search"));
+        assert_eq!(
+            agent
+                .tool_bridge()
+                .tool_for_kind(xai_grok_tools::types::tool::ToolKind::WebSearch)
+                .await,
+            None
+        );
+        assert_eq!(
+            agent
+                .tool_bridge()
+                .render_prompt(
+                    "${% if tools.by_kind.web_search %}enabled${% else %}disabled${% endif %}",
+                    &serde_json::json!({}),
+                )
+                .await
+                .as_deref(),
+            Some("disabled")
+        );
         assert!(
             agent
                 .hosted_tools()

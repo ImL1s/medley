@@ -1721,7 +1721,11 @@ impl FinalizedToolset {
     /// enabled. Mirrors `${{ tools.by_kind.<kind> }}` template resolution; used
     /// e.g. to label a background task with its real creator tool name.
     pub fn tool_name_for_kind(&self, kind: ToolKind) -> Option<String> {
-        self.renderer.tool_for_kind(kind).map(str::to_owned)
+        self.tools
+            .read()
+            .iter()
+            .find(|tool| tool.metadata.kind() == kind)
+            .map(|tool| tool.client_name.clone())
     }
     /// Map of client-facing tool name → snake_case [`ToolKind`] key.
     pub fn tool_kinds(&self) -> HashMap<String, String> {
@@ -2340,6 +2344,8 @@ impl FinalizedToolset {
             if let Some(tool) = tools.iter().find(|tool| tool.canonical_id == ID) {
                 self.enabled_native_tool_names
                     .insert(tool.client_name.clone());
+                self.renderer
+                    .set_web_search_enabled(Some(tool.client_name.clone()));
                 return true;
             }
             let Some(tool) = inactive.remove(ID) else {
@@ -2347,18 +2353,21 @@ impl FinalizedToolset {
             };
             let client_name = tool.client_name.clone();
             tools.push(tool);
-            self.enabled_native_tool_names.insert(client_name);
+            self.enabled_native_tool_names.insert(client_name.clone());
+            self.renderer.set_web_search_enabled(Some(client_name));
             true
         } else {
             let Some(index) = tools.iter().position(|tool| tool.canonical_id == ID) else {
                 // A policy-filtered tool is absent from both collections.
                 // Disabling that already-disabled capability is a successful
                 // no-op, matching `can_set_web_search_enabled(false)`.
+                self.renderer.set_web_search_enabled(None);
                 return true;
             };
             let tool = tools.remove(index);
             self.enabled_native_tool_names.remove(&tool.client_name);
             inactive.insert(ID.to_owned(), tool);
+            self.renderer.set_web_search_enabled(None);
             true
         }
     }

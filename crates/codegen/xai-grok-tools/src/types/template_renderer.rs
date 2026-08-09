@@ -184,6 +184,11 @@ pub fn strip_template_markers(raw: &str) -> String {
 #[derive(Clone)]
 pub struct TemplateRenderer {
     ctx: TemplateContext,
+    /// Live override for the one built-in whose availability can change
+    /// without rebuilding the finalized toolset. Clones share this state so
+    /// the renderer stored in resources and the dispatch snapshot stay in
+    /// sync with model-switch topology updates.
+    web_search_override: std::sync::Arc<parking_lot::RwLock<Option<Option<String>>>>,
 }
 
 impl TemplateRenderer {
@@ -219,7 +224,23 @@ impl TemplateRenderer {
                 has_unix_utilities: xai_grok_config::shell::has_unix_utilities(),
                 system_reminders_enabled: true,
             },
+            web_search_override: Default::default(),
         }
+    }
+
+    pub(crate) fn set_web_search_enabled(&self, client_name: Option<String>) {
+        *self.web_search_override.write() = Some(client_name);
+    }
+
+    fn context_with_live_tools(&self) -> Option<TemplateContext> {
+        let web_search = self.web_search_override.read().clone()?;
+        let mut ctx = self.ctx.clone();
+        if let Some(client_name) = web_search {
+            ctx.tools.by_kind.insert(ToolKind::WebSearch, client_name);
+        } else {
+            ctx.tools.by_kind.remove(&ToolKind::WebSearch);
+        }
+        Some(ctx)
     }
 
     /// Override whether templates see `system_reminders_enabled` as true.
@@ -241,7 +262,11 @@ impl TemplateRenderer {
     /// Returns the raw template unchanged (without error) if it contains
     /// no template markers (`${{` or `${%`).
     pub fn render(&self, template: &str) -> Result<String, TemplateRenderError> {
-        render_with_env(template, &self.ctx)
+        if let Some(ctx) = self.context_with_live_tools() {
+            render_with_env(template, &ctx)
+        } else {
+            render_with_env(template, &self.ctx)
+        }
     }
 
     /// Return the finalized canonical-to-client parameter names by tool kind.
@@ -376,7 +401,9 @@ impl TemplateRenderer {
             return Ok(template.to_string());
         }
         // Merge: start with renderer context, overlay caller placeholders.
-        let mut base = serde_json::to_value(&self.ctx).unwrap_or_default();
+        let mut base =
+            serde_json::to_value(self.context_with_live_tools().as_ref().unwrap_or(&self.ctx))
+                .unwrap_or_default();
         if let (Some(base_obj), Some(extra_obj)) = (base.as_object_mut(), placeholders.as_object())
         {
             for (k, v) in extra_obj {
