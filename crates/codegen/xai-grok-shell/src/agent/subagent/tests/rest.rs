@@ -2410,6 +2410,27 @@ async fn read_parent_sampling_config_catalog_miss_keeps_parent_wire_for_the_same
     );
 }
 
+#[tokio::test]
+async fn read_parent_sampling_config_live_catalog_miss_keeps_same_model_baseline_wire() {
+    let baseline_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let mut ctx = ctx_with_parent_chat_state(
+        "runtime-only-model",
+        "runtime-only-model",
+        "runtime-only-model",
+        indexmap::IndexMap::new(),
+    );
+    ctx.sampling_config.model = "runtime-only-model".to_string();
+    ctx.sampling_config.codex_wire = Some(baseline_caps.clone());
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "runtime-only-model");
+    assert_eq!(config.codex_wire, Some(baseline_caps));
+}
+
 /// A refreshed catalog can replace a retained catalog id (`auto`) with the
 /// routing slug key. That is still the same inherited model, and the child
 /// must use the refreshed entry's capabilities rather than losing them.

@@ -845,6 +845,7 @@ async fn read_parent_sampling_config(
                 .as_ref()
                 .map(|facts| facts.model_id.clone())
                 .unwrap_or_else(|| acp::ModelId::new(cfg.model.clone()));
+            let baseline_matches_live = ctx.sampling_config.model == cfg.model;
             let creds = chat_state.get_credentials().await;
             let mut extra_headers = cfg.extra_headers;
             crate::agent::config::inject_url_derived_headers(
@@ -933,13 +934,26 @@ async fn read_parent_sampling_config(
                 },
                 supports_backend_search: capabilities
                     .as_ref()
-                    .is_some_and(|facts| facts.supports_backend_search),
+                    .map(|facts| facts.supports_backend_search)
+                    .unwrap_or_else(|| {
+                        baseline_matches_live && ctx.sampling_config.supports_backend_search
+                    }),
                 compactions_remaining: capabilities
                     .as_ref()
-                    .and_then(|facts| facts.compactions_remaining),
+                    .and_then(|facts| facts.compactions_remaining)
+                    .or_else(|| {
+                        baseline_matches_live
+                            .then_some(ctx.sampling_config.compactions_remaining)
+                            .flatten()
+                    }),
                 compaction_at_tokens: capabilities
                     .as_ref()
-                    .and_then(|facts| facts.compaction_at_tokens),
+                    .and_then(|facts| facts.compaction_at_tokens)
+                    .or_else(|| {
+                        baseline_matches_live
+                            .then_some(ctx.sampling_config.compaction_at_tokens)
+                            .flatten()
+                    }),
                 doom_loop_recovery: ctx.sampling_config.doom_loop_recovery,
                 header_injector: ctx.sampling_config.header_injector.clone(),
                 // Resolved from the subagent's own model, like the three
@@ -948,7 +962,12 @@ async fn read_parent_sampling_config(
                 // parent is running (#277).
                 codex_wire: capabilities
                     .as_ref()
-                    .and_then(|facts| facts.codex_wire.clone()),
+                    .and_then(|facts| facts.codex_wire.clone())
+                    .or_else(|| {
+                        baseline_matches_live
+                            .then(|| ctx.sampling_config.codex_wire.clone())
+                            .flatten()
+                    }),
             };
             let global_model_id = ctx.models_manager.current_model_id();
             xai_grok_telemetry::unified_log::debug(
