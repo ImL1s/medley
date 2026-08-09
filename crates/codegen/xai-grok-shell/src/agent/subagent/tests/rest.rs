@@ -2484,6 +2484,12 @@ async fn read_parent_sampling_config_opaque_name_override_keeps_committed_capabi
     entry.info.codex_wire = Some(committed_caps.clone());
     let mut models = indexmap::IndexMap::new();
     models.insert("catalog-entry".to_string(), entry);
+    let mut colliding = test_model_entry("opaque-backend-routing-hint");
+    colliding.info.codex_wire = Some(xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    });
+    models.insert("colliding-entry".to_string(), colliding);
     let ctx = ctx_with_parent_chat_state(
         "catalog-entry",
         "catalog-routing-model",

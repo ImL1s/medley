@@ -838,19 +838,23 @@ async fn read_parent_sampling_config(
             let preferred_model_id = committed_model_id
                 .as_deref()
                 .unwrap_or(ctx.model_id.0.as_ref());
-            let retained_catalog_route = committed_model_route.as_deref().or_else(|| {
-                crate::agent::models::resolve_catalog_key(
-                    &ctx.available_models,
-                    &acp::ModelId::new(preferred_model_id),
-                )
-                .and_then(|key| ctx.available_models.get(key.0.as_ref()))
-                .map(|entry| entry.info().model.as_str())
-            });
-            let opaque_model_name_override = retained_catalog_route.is_some()
-                && !ctx
-                    .available_models
-                    .values()
-                    .any(|entry| entry.info().model == cfg.model);
+            let retained_catalog_route = committed_model_route
+                .as_deref()
+                .or_else(|| {
+                    (committed_model_id.is_none()
+                        && preferred_model_id == ctx.sampling_config_model_id.0.as_ref())
+                    .then_some(ctx.sampling_config.model.as_str())
+                })
+                .or_else(|| {
+                    crate::agent::models::resolve_catalog_key(
+                        &ctx.available_models,
+                        &acp::ModelId::new(preferred_model_id),
+                    )
+                    .and_then(|key| ctx.available_models.get(key.0.as_ref()))
+                    .map(|entry| entry.info().model.as_str())
+                });
+            let opaque_model_name_override =
+                retained_catalog_route.is_some_and(|route| route != cfg.model);
             let capabilities = ctx.models_manager.capabilities_for_route(
                 Some(preferred_model_id),
                 &cfg.model,
