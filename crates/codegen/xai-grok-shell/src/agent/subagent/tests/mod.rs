@@ -1937,8 +1937,9 @@ async fn issue39_harness_rejection_cleans_fresh_worktree_before_handoff() {
             init_git_repo(&repo);
             std::fs::write(repo.join("tracked.txt"), "original").unwrap();
             git_commit_all(&repo, "initial");
-            let model_id = "issue39-codex-model";
-            let mut model_entry = test_model_entry(model_id);
+            let model_id = "issue39-codex-catalog-key";
+            let routing_model = "issue39-codex-routing-model";
+            let mut model_entry = test_model_entry(routing_model);
             model_entry.info.agent_type = "codex".to_string();
             let mut models = indexmap::IndexMap::new();
             models.insert(model_id.to_string(), model_entry.clone());
@@ -1950,7 +1951,7 @@ async fn issue39_harness_rejection_cleans_fresh_worktree_before_handoff() {
             });
             ctx.fs = Arc::new(xai_grok_workspace::file_system::LocalFs::new(repo.clone()));
             ctx.model_id = acp::ModelId::new(model_id);
-            ctx.sampling_config.model = model_id.to_string();
+            ctx.sampling_config.model = routing_model.to_string();
             ctx.available_models = models.clone();
             ctx.models_manager = crate::agent::models::ModelsManager::new(
                 None,
@@ -1963,7 +1964,7 @@ async fn issue39_harness_rejection_cleans_fresh_worktree_before_handoff() {
             let mut request = auto_wake_test_request(&request_id);
             request.run_in_background = false;
             request.surface_completion = false;
-            request.runtime_overrides.model = Some(model_id.to_string());
+            request.runtime_overrides.model = Some(routing_model.to_string());
             request.runtime_overrides.model_override_provenance = ModelOverrideProvenance::Tool;
             request.runtime_overrides.isolation = Some(xai_tool_types::SubagentIsolationMode::Worktree);
             let expected_worktree = crate::session::worktree::worktree_base_dir_for_source(&repo)

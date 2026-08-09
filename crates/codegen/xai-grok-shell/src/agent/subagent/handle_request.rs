@@ -578,16 +578,11 @@ pub(crate) async fn run_shell_child(
         }
     }
     let requested_model_matches_effective = |requested: &str| {
-        crate::agent::config::find_model_by_id(&ctx.available_models, requested).is_some_and(
-            |entry| {
-                let resolved_id = if ctx.available_models.contains_key(requested) {
-                    requested
-                } else {
-                    entry.info().model.as_str()
-                };
-                effective_model_id.0.as_ref() == resolved_id
-            },
+        crate::agent::models::resolve_catalog_identity(
+            &ctx.available_models,
+            &acp::ModelId::new(requested),
         )
+        .is_some_and(|identity| identity.model_id == effective_model_id.0.as_ref())
     };
     let explicit_model_selection = resume_source
         .as_ref()
