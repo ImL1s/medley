@@ -207,7 +207,31 @@ fn codex_catalog_wire_capabilities(
         supports_image_detail_original: codex_catalog_bool(obj, "supports_image_detail_original"),
         input_modalities: codex_catalog_string_list(obj, "input_modalities"),
         default_reasoning_level: codex_catalog_string(obj, "default_reasoning_level"),
+        truncation_policy: codex_catalog_truncation_policy(obj),
     }
+}
+
+fn codex_catalog_truncation_policy(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<xai_grok_sampling_types::TruncationPolicyConfig> {
+    let value = obj.get("truncation_policy")?;
+    let policy = match serde_json::from_value::<xai_grok_sampling_types::TruncationPolicyConfig>(
+        value.clone(),
+    ) {
+        Ok(policy) => policy,
+        Err(error) => {
+            tracing::warn!(%error, "ignoring invalid Codex catalog truncation_policy");
+            return None;
+        }
+    };
+    if policy.limit <= 0 {
+        tracing::warn!(
+            limit = policy.limit,
+            "ignoring non-positive Codex catalog truncation_policy limit"
+        );
+        return None;
+    }
+    Some(policy)
 }
 
 fn parse_openai_codex_catalog_entry(
@@ -2262,6 +2286,49 @@ mod tests {
             Some(xai_grok_sampling_types::ReasoningEffort::High),
             "catalog default_reasoning_level must become reasoning_effort"
         );
+    }
+
+    #[test]
+    fn codex_catalog_parser_reads_and_validates_truncation_policy() {
+        use xai_grok_sampling_types::{TruncationMode, TruncationPolicyConfig};
+
+        let valid = parse_openai_codex_catalog_entry(&serde_json::json!({
+            "slug": "gpt-5.6-sol",
+            "truncation_policy": { "mode": "tokens", "limit": 10000 }
+        }))
+        .expect("valid catalog entry")
+        .1;
+        let capabilities = valid.codex_wire.expect("Codex wire capabilities");
+        assert_eq!(
+            capabilities.truncation_policy,
+            Some(TruncationPolicyConfig {
+                mode: TruncationMode::Tokens,
+                limit: 10_000,
+            })
+        );
+        let round_trip: xai_grok_sampling_types::CodexWireCapabilities = serde_json::from_value(
+            serde_json::to_value(&capabilities).expect("serialize capabilities"),
+        )
+        .expect("deserialize capabilities");
+        assert_eq!(round_trip, capabilities);
+
+        for invalid in [
+            serde_json::json!({ "mode": "characters", "limit": 10000 }),
+            serde_json::json!({ "mode": "tokens", "limit": 0 }),
+            serde_json::json!({ "mode": "bytes", "limit": -1 }),
+        ] {
+            let parsed = parse_openai_codex_catalog_entry(&serde_json::json!({
+                "slug": "invalid-policy-model",
+                "truncation_policy": invalid,
+            }))
+            .expect("entry remains usable when its policy is invalid")
+            .1;
+            assert_eq!(
+                parsed.codex_wire.and_then(|wire| wire.truncation_policy),
+                None,
+                "invalid units and non-positive limits must fail closed"
+            );
+        }
     }
 
     /// `data` / `id` / `name` are tolerances for shapes this endpoint does not

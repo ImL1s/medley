@@ -17,7 +17,7 @@ use crate::implementations::grok_build::task::types::{
     SubagentCompletionSummary, SubagentCompletionsRequest, SubagentEvent, SubagentEventSender,
 };
 use crate::types::TaskSnapshot;
-use crate::types::output::ToolOutput;
+use crate::types::output::{ReminderMessage, ToolOutput};
 use crate::types::resources::{SharedResources, State, Terminal};
 use crate::types::tool::{Reminder, ToolKind};
 use crate::util::truncate::{PREVIEW_SIZE, PartialOutput, truncate_with_preview};
@@ -621,17 +621,16 @@ pub fn consumed_completion_ids(output: &ToolOutput) -> Vec<&str> {
 /// surfacing newly-completed ones as `<system-reminder>` text inside the
 /// next tool result.
 ///
-/// Registered on `FinalizedToolset` as a cross-cutting reminder.
-/// Returns plain strings; the tool pipeline wraps
-/// each one in `<system-reminder>` tags automatically.
+/// Registered on `FinalizedToolset` as a cross-cutting reminder. The legacy
+/// API still returns plain strings, while the tool runner receives structured
+/// completion identity plus truncatable payload and adds reminder framing.
 pub struct TaskCompletionReminder;
-#[async_trait::async_trait]
-impl Reminder for TaskCompletionReminder {
-    async fn collect_reminders(
+impl TaskCompletionReminder {
+    async fn collect_messages(
         &self,
         resources: SharedResources,
         tool_output: &ToolOutput,
-    ) -> Vec<String> {
+    ) -> Vec<ReminderMessage> {
         let consumed_ids: Vec<String> = consumed_completion_ids(tool_output)
             .into_iter()
             .map(str::to_string)
@@ -711,10 +710,13 @@ impl Reminder for TaskCompletionReminder {
                                 && state.reported.insert(task.task_id.clone())
                         })
                         .map(|task| {
-                            format_bash_completion(
-                                task,
-                                task_output_name.as_deref(),
-                                read_tool_name.as_deref(),
+                            completion_reminder(
+                                &task.task_id,
+                                format_bash_completion(
+                                    task,
+                                    task_output_name.as_deref(),
+                                    read_tool_name.as_deref(),
+                                ),
                             )
                         }),
                 );
@@ -731,10 +733,10 @@ impl Reminder for TaskCompletionReminder {
                     .filter(|t| !t.completed && t.task_id != bg.task_id)
                     .collect();
                 if !running.is_empty() {
-                    reminders.push(format_running_tasks_warning(
+                    reminders.push(payload_reminder(format_running_tasks_warning(
                         &running,
                         kill_task_name.as_deref(),
-                    ));
+                    )));
                 }
             }
         }
@@ -764,12 +766,54 @@ impl Reminder for TaskCompletionReminder {
                 let state = res.get_or_default::<State<ReportedTaskCompletions>>();
                 for c in &completions {
                     if state.reported.insert(c.subagent_id.clone()) && !goal_loop_active {
-                        reminders.push(format_subagent_completion(c, task_output_name.as_deref()));
+                        reminders.push(completion_reminder(
+                            &c.subagent_id,
+                            format_subagent_completion(c, task_output_name.as_deref()),
+                        ));
                     }
                 }
             }
         }
         reminders
+    }
+}
+
+fn payload_reminder(payload: String) -> ReminderMessage {
+    ReminderMessage {
+        prefix: String::new(),
+        payload,
+        suffix: String::new(),
+        completion_ids: Vec::new(),
+    }
+}
+
+fn completion_reminder(id: &str, payload: String) -> ReminderMessage {
+    ReminderMessage {
+        completion_ids: vec![id.to_owned()],
+        ..payload_reminder(payload)
+    }
+}
+
+#[async_trait::async_trait]
+impl Reminder for TaskCompletionReminder {
+    async fn collect_reminders(
+        &self,
+        resources: SharedResources,
+        tool_output: &ToolOutput,
+    ) -> Vec<String> {
+        self.collect_messages(resources, tool_output)
+            .await
+            .into_iter()
+            .map(|message| message.payload)
+            .collect()
+    }
+
+    async fn collect_reminder_messages(
+        &self,
+        resources: SharedResources,
+        tool_output: &ToolOutput,
+    ) -> Vec<ReminderMessage> {
+        self.collect_messages(resources, tool_output).await
     }
 }
 #[cfg(test)]
@@ -1287,6 +1331,26 @@ mod tests {
         res.insert(gate);
         res.register_state::<ReportedTaskCompletions>();
         res.into_shared()
+    }
+
+    #[tokio::test]
+    async fn structured_completion_reminders_carry_every_producer_id() {
+        let shared = shared_with(vec![
+            make_completed("bg-alpha"),
+            make_completed("bg-middle"),
+            make_completed("bg-omega"),
+        ]);
+        let output = ToolOutput::Dynamic(serde_json::Value::Null.into());
+
+        let reminders = TaskCompletionReminder
+            .collect_reminder_messages(shared, &output)
+            .await;
+
+        assert_eq!(reminders.len(), 3);
+        assert_eq!(reminders[0].completion_ids, ["bg-alpha"]);
+        assert_eq!(reminders[1].completion_ids, ["bg-middle"]);
+        assert_eq!(reminders[2].completion_ids, ["bg-omega"]);
+        assert!(reminders.iter().all(|message| !message.payload.is_empty()));
     }
     /// Like `shared_with` but inserts `BashParams` with
     /// `surface_bg_completion_reminders = false` so the

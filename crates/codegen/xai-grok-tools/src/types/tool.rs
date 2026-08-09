@@ -7,7 +7,7 @@
 //! This module provides:
 //! - `ToolNamespace`, `ToolKind` — classification enums
 //! - `Reminder` — post-execution system reminders (per-tool + cross-cutting)
-use crate::types::output::ToolOutput;
+use crate::types::output::{ReminderMessage, ToolOutput};
 use crate::types::requirements::{Expr, ToolRequirement};
 use crate::types::resources::SharedResources;
 /// The toolset a tool belongs to.
@@ -135,5 +135,25 @@ pub trait Reminder {
         _tool_output: &ToolOutput,
     ) -> Vec<String> {
         vec![]
+    }
+
+    /// Structured reminder collection used by the tool runner. The default
+    /// preserves existing reminder implementations as fully truncatable
+    /// payloads with no completion identity.
+    async fn collect_reminder_messages(
+        &self,
+        resources: SharedResources,
+        tool_output: &ToolOutput,
+    ) -> Vec<ReminderMessage> {
+        self.collect_reminders(resources, tool_output)
+            .await
+            .into_iter()
+            .map(|payload| ReminderMessage {
+                prefix: String::new(),
+                payload,
+                suffix: String::new(),
+                completion_ids: Vec::new(),
+            })
+            .collect()
     }
 }

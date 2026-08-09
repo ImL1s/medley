@@ -1316,6 +1316,8 @@ async fn handle_bridge_tool_success_runs_consumed_completion_sweep() {
             let result = ToolRunResult {
                 output,
                 prompt_text: "ok".into(),
+                trusted_prompt_suffix: String::new(),
+                trusted_prompt_reminders: Vec::new(),
                 effective_tool_name: None,
             };
             let parsed_args = serde_json::json!({});

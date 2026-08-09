@@ -2162,7 +2162,7 @@ impl FinalizedToolset {
             let mut r = Vec::new();
             for reminder in &self.reminders {
                 let extra = reminder
-                    .collect_reminders(self.resources.clone(), &output)
+                    .collect_reminder_messages(self.resources.clone(), &output)
                     .await;
                 r.extend(extra);
             }
@@ -2171,11 +2171,13 @@ impl FinalizedToolset {
             Vec::new()
         };
         let prompt_text = output.to_prompt_format();
-        let prompt_text = crate::reminders::format_with_reminders(
-            prompt_text,
-            reminders,
-            self.system_reminder_tag,
-        );
+        let (trusted_prompt_suffix, trusted_prompt_reminders) =
+            crate::reminders::frame_reminder_messages(
+                reminders,
+                self.system_reminder_tag,
+                !prompt_text.is_empty(),
+            );
+        let prompt_text = format!("{prompt_text}{trusted_prompt_suffix}");
         {
             let res = self.resources.lock().await;
             self.resources_persistence.save(&res);
@@ -2183,6 +2185,8 @@ impl FinalizedToolset {
         Ok(ToolRunResult {
             output,
             prompt_text,
+            trusted_prompt_suffix,
+            trusted_prompt_reminders,
             effective_tool_name,
         })
     }
@@ -4394,6 +4398,56 @@ mod tests {
         ) -> Result<String, xai_tool_runtime::ToolError> {
             Ok("stub-output".into())
         }
+    }
+    #[derive(Debug)]
+    struct StaticTrustedReminder;
+    #[async_trait::async_trait]
+    impl Reminder for StaticTrustedReminder {
+        async fn collect_reminders(
+            &self,
+            _resources: SharedResources,
+            _tool_output: &ToolOutput,
+        ) -> Vec<String> {
+            vec!["background task completed".to_owned()]
+        }
+    }
+    #[tokio::test]
+    async fn tool_result_truncation_policy_runner_records_trusted_suffix_provenance() {
+        let tmp = TempDir::new().unwrap();
+        let mut builder = ToolRegistryBuilder::new();
+        builder.register_reminder(StaticTrustedReminder);
+        let config = ToolServerConfig {
+            tools: vec![ToolConfig::for_tool::<grok_build::ReadFileTool>()],
+            behavior_preset: None,
+        };
+        let ctx = test_session_context(&tmp);
+        let toolset = Arc::new(builder.finalize(config, ctx).unwrap());
+        toolset
+            .register_tool(
+                "non_streaming_stub".to_string(),
+                NonStreamingStub,
+                Some(serde_json::json!({"type": "object", "properties": {}})),
+            )
+            .unwrap();
+
+        let result = toolset
+            .call("non_streaming_stub", serde_json::json!({}), "call-a", None)
+            .await
+            .expect("call should succeed");
+        assert_eq!(
+            result.trusted_prompt_suffix,
+            "\n\n<system-reminder>\nbackground task completed\n</system-reminder>"
+        );
+        assert_eq!(
+            result.prompt_text,
+            format!("stub-output{}", result.trusted_prompt_suffix)
+        );
+        assert_eq!(result.trusted_prompt_reminders.len(), 1);
+        assert_eq!(
+            result.trusted_prompt_reminders[0].render(),
+            result.trusted_prompt_suffix
+        );
+        assert!(result.trusted_prompt_reminders[0].completion_ids.is_empty());
     }
     /// A streaming stub tool that emits one `Progress` item then a `Terminal`,
     /// used to verify `call_streaming` forwards progress and finalizes the

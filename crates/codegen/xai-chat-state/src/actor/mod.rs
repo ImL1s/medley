@@ -197,8 +197,12 @@ impl ChatStateActor {
             ChatStateCommand::PushAssistantResponse { item } => {
                 self.push_message(item);
             }
-            ChatStateCommand::PushToolResult { item } => {
-                self.push_message(item);
+            ChatStateCommand::PushToolResult {
+                item,
+                truncation_policy,
+                trusted_suffix,
+            } => {
+                self.push_tool_result(item, truncation_policy, trusted_suffix);
             }
             ChatStateCommand::RecordTokenUsage { total_tokens } => {
                 self.record_token_usage(total_tokens);

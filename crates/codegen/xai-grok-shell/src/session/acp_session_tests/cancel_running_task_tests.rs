@@ -155,6 +155,7 @@ fn persist_ack_waits_for_disk_flush_before_success() {
                 telemetry_enabled: false,
                 supports_backend_search: std::cell::Cell::new(false),
                 catalog_model_id: std::cell::Cell::new("test".to_string()),
+                committed_tool_result_truncation_policy: std::cell::Cell::new(None),
                 tool_overrides: std::cell::RefCell::new(None),
                 resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
                 compactions_remaining: std::cell::Cell::new(None),
@@ -640,6 +641,7 @@ fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history() {
                 telemetry_enabled: false,
                 supports_backend_search: std::cell::Cell::new(false),
                 catalog_model_id: std::cell::Cell::new("test".to_string()),
+                committed_tool_result_truncation_policy: std::cell::Cell::new(None),
                 tool_overrides: std::cell::RefCell::new(None),
                 resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
                 compactions_remaining: std::cell::Cell::new(None),
@@ -931,6 +933,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 telemetry_enabled: false,
                 supports_backend_search: std::cell::Cell::new(false),
                 catalog_model_id: std::cell::Cell::new("test".to_string()),
+                committed_tool_result_truncation_policy: std::cell::Cell::new(None),
                 tool_overrides: std::cell::RefCell::new(None),
                 resolved_tool_overrides: std::sync::Arc::new(
                     arc_swap::ArcSwapOption::empty(),
@@ -2373,6 +2376,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 telemetry_enabled: false,
                 supports_backend_search: std::cell::Cell::new(false),
                 catalog_model_id: std::cell::Cell::new("test".to_string()),
+                committed_tool_result_truncation_policy: std::cell::Cell::new(None),
                 tool_overrides: std::cell::RefCell::new(None),
                 resolved_tool_overrides: std::sync::Arc::new(
                     arc_swap::ArcSwapOption::empty(),

@@ -16,6 +16,26 @@ pub const MEMORY_CONTEXT_OPEN_TAG: &str = "<memory-context>";
 /// Closing tag paired with [`MEMORY_CONTEXT_OPEN_TAG`].
 pub const MEMORY_CONTEXT_CLOSE_TAG: &str = "</memory-context>";
 
+/// Producer-structured trusted reminder. Framing and completion identity are
+/// kept separate from the truncatable body so chat state never parses model-
+/// facing XML/text to recover one-shot delivery semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedReminderMessage {
+    pub prefix: String,
+    pub payload: String,
+    pub suffix: String,
+    pub completion_ids: Vec<String>,
+}
+
+/// Exact legacy suffix plus optional structured provenance for budget-aware
+/// persistence. `exact` remains authoritative whenever the combined result
+/// already fits or a legacy proxy supplied no structured messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedPromptSuffix {
+    pub exact: String,
+    pub reminders: Vec<TrustedReminderMessage>,
+}
+
 /// Configuration for the ChatStateActor at spawn time.
 #[derive(Debug, Clone)]
 pub struct ChatStateConfig {

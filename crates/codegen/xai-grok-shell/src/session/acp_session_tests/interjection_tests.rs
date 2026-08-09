@@ -14,9 +14,10 @@ async fn drain_interjections_pushes_synthetic_user_message_after_tool_result() {
             let (actor, _gateway_rx) = build_actor().await;
 
             const TOOL_RESULT_CONTENT: &str = "file contents: fn main() {}";
-            actor
-                .chat_state_handle
-                .push_tool_result(ConversationItem::tool_result("call-1", TOOL_RESULT_CONTENT));
+            actor.chat_state_handle.push_tool_result(
+                ConversationItem::tool_result("call-1", TOOL_RESULT_CONTENT),
+                None,
+            );
             actor.pending_interjections.push(PendingInterjection {
                 text: "please also add tests".to_string(),
                 attachments: vec![],
@@ -81,9 +82,10 @@ async fn drain_multiple_interjections_pushes_one_user_message_each_in_order() {
             let (actor, _gateway_rx) = build_actor().await;
 
             const TOOL_RESULT_CONTENT: &str = "tool output";
-            actor
-                .chat_state_handle
-                .push_tool_result(ConversationItem::tool_result("call-1", TOOL_RESULT_CONTENT));
+            actor.chat_state_handle.push_tool_result(
+                ConversationItem::tool_result("call-1", TOOL_RESULT_CONTENT),
+                None,
+            );
             actor.pending_interjections.push(PendingInterjection {
                 text: "first steer".to_string(),
                 attachments: vec![],

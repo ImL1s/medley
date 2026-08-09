@@ -1037,6 +1037,11 @@ pub struct CodexWireCapabilities {
     /// session has not set an effort override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_reasoning_level: Option<String>,
+    /// Client-side limit applied to text tool results before they enter
+    /// conversation history. This is catalog metadata, not a Responses API
+    /// request field (#263).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation_policy: Option<TruncationPolicyConfig>,
 }
 
 impl CodexWireCapabilities {
@@ -1055,6 +1060,21 @@ impl CodexWireCapabilities {
     pub fn include_reasoning_summary(&self) -> bool {
         self.supports_reasoning_summary_parameter != Some(false)
     }
+}
+
+/// Unit used by a Codex catalog tool-output truncation policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TruncationMode {
+    Bytes,
+    Tokens,
+}
+
+/// Client-side tool-output truncation policy advertised by the Codex catalog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TruncationPolicyConfig {
+    pub mode: TruncationMode,
+    pub limit: i64,
 }
 
 /// Which API backend to use for model inference.

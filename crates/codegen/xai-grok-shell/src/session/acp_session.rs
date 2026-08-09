@@ -813,6 +813,13 @@ pub(crate) struct SessionActor {
     /// Authoritative catalog model id for auth/readiness lookups. Distinct from
     /// the wire routing slug stored in `chat_state_handle` sampling config.
     pub(crate) catalog_model_id: std::cell::Cell<String>,
+    /// Tool-result truncation policy committed with the active model's
+    /// sampling configuration. Keep this paired with `catalog_model_id`: a
+    /// background catalog refresh must not replace one capability underneath
+    /// an already-running session, while a successful model switch updates
+    /// both together.
+    pub(crate) committed_tool_result_truncation_policy:
+        std::cell::Cell<Option<xai_grok_sampling_types::TruncationPolicyConfig>>,
     /// Per-turn override, set at promotion. Not persisted; a reload reverts to the definition seed.
     pub(crate) tool_overrides: std::cell::RefCell<Option<xai_grok_sampling_types::ToolOverrides>>,
     /// Configured cutoff a subagent inherits, read off the `SessionHandle` without an actor round-trip.
@@ -1304,6 +1311,15 @@ impl SessionActor {
         let out = id.clone();
         self.catalog_model_id.set(id);
         out
+    }
+    /// Return the client-side tool-result truncation policy committed with the
+    /// active model. Model switches replace this value only after the new
+    /// chat generation has been persisted; catalog refreshes do not mutate it
+    /// underneath the session (#245, #263, #277).
+    fn tool_result_truncation_policy(
+        &self,
+    ) -> Option<xai_grok_sampling_types::TruncationPolicyConfig> {
+        self.committed_tool_result_truncation_policy.get()
     }
     /// Build a hook run context for dispatching hook events.
     fn session_id_string(&self) -> String {
