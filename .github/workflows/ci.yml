@@ -277,6 +277,10 @@ jobs:
             transport_failure_never_emits_query_credential_bytes -- --nocapture
           run_nonzero -p xai-grok-sampler --lib \
             provider_controlled_stream_error_is_secret_free_for_all_stream_apis -- --nocapture
+          # #304: Codex sometimes omits answer-span annotations. This proves
+          # the requested web-search action sources remain structured citations.
+          run_nonzero -p xai-grok-tools --lib \
+            codex_web_search_source_fallback_without_output_text_annotations -- --nocapture
           run_nonzero -p xai-grok-mcp --lib \
             callback_errors_never_echo_provider_controlled_credentials -- --nocapture
           # #151: an unlabelled chat-state credential reaching an external origin
