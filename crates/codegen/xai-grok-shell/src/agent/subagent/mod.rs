@@ -1873,30 +1873,8 @@ fn durable_resume_source_for(
         subagent_type: meta.subagent_type,
         persona: meta.persona,
         model_id: meta.effective_model_id,
-    })
-}
-
-fn durable_resume_model_lineage_for(
-    id: &str,
-    parent_session_id: &str,
-    parent_cwd: &Path,
-) -> Option<handle_request::ResumeModelLineage> {
-    let parent_info = SessionInfo {
-        id: acp::SessionId::new(parent_session_id),
-        cwd: parent_cwd.to_string_lossy().into_owned(),
-    };
-    let meta_path = session::persistence::session_dir(&parent_info)
-        .join("subagents")
-        .join(id)
-        .join("meta.json");
-    let data = std::fs::read_to_string(meta_path).ok()?;
-    let meta: SubagentMeta = serde_json::from_str(&data).ok()?;
-    if meta.parent_session_id != parent_session_id || meta.subagent_id != id {
-        return None;
-    }
-    Some(handle_request::ResumeModelLineage {
-        route: meta.effective_model_route,
-        agent_type: meta.effective_model_agent_type,
+        model_route: meta.effective_model_route,
+        model_agent_type: meta.effective_model_agent_type,
     })
 }
 /// Resolve the MCP pool a child subagent should import from its parent.

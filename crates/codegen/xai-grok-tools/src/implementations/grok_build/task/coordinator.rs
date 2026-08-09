@@ -459,6 +459,8 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                         child_cwd: child.child_cwd,
                         worktree_path: child.worktree_path,
                         effective_model_id: child.effective_model_id,
+                        effective_model_route: child.effective_model_route,
+                        effective_model_agent_type: child.effective_model_agent_type,
                         control: child.control,
                     },
                 );
@@ -486,7 +488,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 } else if let Some(child) = self.completed.get(&source_id)
                     && child.request.parent_session_id == parent_session_id
                 {
-                    SubagentResumeLookup::Completed(SubagentResumeSource {
+                    SubagentResumeLookup::Completed(Box::new(SubagentResumeSource {
                         subagent_id: child.request.id.clone(),
                         child_session_id: child.child_session_id.clone(),
                         child_cwd: child.child_cwd.clone(),
@@ -494,8 +496,11 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                         snapshot_ref: child.snapshot_ref.clone(),
                         subagent_type: child.request.subagent_type.clone(),
                         persona: child.persona.clone(),
-                        model_id: Some(child.effective_model_id.clone()),
-                    })
+                        model_id: (!child.effective_model_id.is_empty())
+                            .then(|| child.effective_model_id.clone()),
+                        model_route: child.effective_model_route.clone(),
+                        model_agent_type: child.effective_model_agent_type.clone(),
+                    }))
                 } else {
                     SubagentResumeLookup::Missing
                 };
@@ -603,6 +608,8 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             child_cwd,
             worktree_path,
             effective_model_id,
+            effective_model_route,
+            effective_model_agent_type,
             mut spawn_reply,
             mut handle_only,
         ) = match record {
@@ -614,6 +621,8 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 child.request.cwd.clone().unwrap_or_default(),
                 output.result.worktree_path.clone(),
                 String::new(),
+                None,
+                None,
                 child.spawn_reply,
                 child.handle_only,
             ),
@@ -625,6 +634,8 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 child.child_cwd,
                 child.worktree_path,
                 child.effective_model_id,
+                child.effective_model_route,
+                child.effective_model_agent_type,
                 child.spawn_reply,
                 child.handle_only,
             ),
@@ -642,6 +653,8 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             snapshot_ref: output.snapshot_ref,
             persisted_output_ref,
             effective_model_id,
+            effective_model_route,
+            effective_model_agent_type,
             result: output.result.clone(),
         };
         let snapshot = completed_snapshot(&completed, None);

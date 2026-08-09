@@ -61,9 +61,9 @@ pub(super) fn task_model_override_error(
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(super) struct ResumeModelLineage {
-    pub(super) route: Option<String>,
-    pub(super) agent_type: Option<String>,
+struct ResumeModelLineage {
+    route: Option<String>,
+    agent_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,8 +94,12 @@ fn validate_resume_model_lineage(
     Ok(())
 }
 
-fn should_preflight_model_harness(is_resume: bool, has_fresh_model_selection: bool) -> bool {
-    !is_resume && has_fresh_model_selection
+fn should_preflight_model_harness(
+    is_resume: bool,
+    has_committed_resume_model: bool,
+    has_fresh_model_selection: bool,
+) -> bool {
+    !(is_resume && has_committed_resume_model) && has_fresh_model_selection
 }
 /// Lifecycle guard that keeps managed-gateway refresh barriers aware of live
 /// child sessions until this spawn path exits.
@@ -304,6 +308,8 @@ pub(crate) async fn run_shell_child(
                 subagent_type: info.subagent_type,
                 persona: info.persona,
                 model_id: info.model_id,
+                model_route: info.model_route,
+                model_agent_type: info.model_agent_type,
             }),
             SubagentResumeLookup::Missing => {
                 match durable_resume_source_for(resume_id, &ctx.parent_session_id, &ctx.parent_cwd)
@@ -326,13 +332,10 @@ pub(crate) async fn run_shell_child(
     } else {
         None
     };
-    let resume_model_lineage = request
-        .resume_from
-        .as_deref()
-        .filter(|resume_id| is_valid_resume_id(resume_id))
-        .and_then(|resume_id| {
-            durable_resume_model_lineage_for(resume_id, &ctx.parent_session_id, &ctx.parent_cwd)
-        });
+    let resume_model_lineage = resume_source.as_ref().map(|source| ResumeModelLineage {
+        route: source.model_route.clone(),
+        agent_type: source.model_agent_type.clone(),
+    });
     if let Some(ref source) = resume_source {
         if request.runtime_overrides.model.is_some() {
             tracing::debug!(
@@ -633,7 +636,11 @@ pub(crate) async fn run_shell_child(
             xai_grok_agent::config::ModelOverride::Inherit => false,
         };
     let is_resume = resume_source.is_some();
-    if is_resume {
+    let has_committed_resume_model = resume_source
+        .as_ref()
+        .and_then(|source| source.model_id.as_deref())
+        .is_some();
+    if is_resume && has_committed_resume_model {
         if let Some(source_lineage) = resume_model_lineage.as_ref()
             && let Err(lineage_error) = validate_resume_model_lineage(
                 source_lineage,
@@ -653,7 +660,11 @@ pub(crate) async fn run_shell_child(
             );
             return child_run_output(failure_result(&request, &msg), completion_data, None);
         }
-    } else if should_preflight_model_harness(is_resume, explicit_model_selection) {
+    } else if should_preflight_model_harness(
+        is_resume,
+        has_committed_resume_model,
+        explicit_model_selection,
+    ) {
         if prepared_model.agent_type.is_empty() {
             let msg = format!(
                 "Cannot spawn subagent '{}': resolved model '{}' is no longer in the model catalog.",
@@ -944,6 +955,9 @@ pub(crate) async fn run_shell_child(
     let parent_traceparent = xai_file_utils::trace_context::current_traceparent();
     let tracker_child_cwd = child_session_info.cwd.clone();
     let tracker_model_id = effective_model_id.0.to_string();
+    let tracker_model_route = prepared_model.catalog_identity.route.clone();
+    let tracker_model_agent_type =
+        (!prepared_model.agent_type.is_empty()).then(|| prepared_model.agent_type.clone());
     let initial_child_tokens = xai_chat_state::estimate_conversation_tokens(&forked_conversation);
     let model_has_own_creds = prepared_model.model_has_own_credentials;
     let inherited_auth_type = prepared_model.auth_type;
@@ -1471,6 +1485,8 @@ pub(crate) async fn run_shell_child(
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned()),
             effective_model_id: tracker_model_id.clone(),
+            effective_model_route: Some(tracker_model_route),
+            effective_model_agent_type: tracker_model_agent_type,
             definition_background,
             control: ShellChildRuntime {
                 child_handle: child_handle.clone(),
@@ -2211,11 +2227,11 @@ mod resume_model_lineage_tests {
             "the regression requires role and catalog harness to differ",
         );
         assert!(
-            !should_preflight_model_harness(false, false),
+            !should_preflight_model_harness(false, false, false),
             "a fresh inherited model is not a model override",
         );
         assert!(
-            !should_preflight_model_harness(true, true),
+            !should_preflight_model_harness(true, true, true),
             "resume continues an accepted tuple instead of selecting a new model",
         );
         assert_eq!(
@@ -2233,7 +2249,12 @@ mod resume_model_lineage_tests {
 
     #[test]
     fn fresh_explicit_incompatible_model_still_requires_harness_preflight() {
-        assert!(should_preflight_model_harness(false, true));
+        assert!(should_preflight_model_harness(false, false, true));
+    }
+
+    #[test]
+    fn legacy_resume_without_committed_model_still_preflights_fresh_selection() {
+        assert!(should_preflight_model_harness(true, false, true));
     }
 
     #[test]

@@ -470,6 +470,8 @@ jobs:
           # still run the compatibility preflight.
           run_nonzero -p xai-grok-shell --lib \
             resume_model_lineage_tests -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            completed_resume_source_carries_committed_model_lineage -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             issue39_verbatim_fork_tools_intersect_session_admission -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
