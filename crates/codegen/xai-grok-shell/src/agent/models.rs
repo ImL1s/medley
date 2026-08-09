@@ -252,7 +252,11 @@ impl ModelsManagerBuilder {
     pub(crate) fn build(self) -> ModelsManager {
         let has_session = self.auth_manager.current_or_expired().is_some();
         let fetch_auth = ModelFetchAuth::resolve(&self.cfg.endpoints, has_session);
-        let current_reasoning_effort = self.cfg.models.default_reasoning_effort;
+        let current_reasoning_effort = self.cfg.models.default_reasoning_effort.filter(|effort| {
+            resolve_catalog_key(&self.models, &self.current_model_id)
+                .and_then(|model_id| self.models.get(model_id.0.as_ref()))
+                .is_some_and(|entry| model_offers_reasoning_effort(&entry.info, *effort))
+        });
         ModelsManager {
             inner: Arc::new(Inner {
                 catalog: RwLock::new(CatalogState {

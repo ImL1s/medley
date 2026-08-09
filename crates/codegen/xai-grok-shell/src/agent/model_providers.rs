@@ -820,7 +820,9 @@ fn merge_openai_codex_preset_entries(
         if user_entry.supports_reasoning_effort.is_none() {
             user_entry.supports_reasoning_effort = supports_reasoning_effort;
         }
-        if user_entry.reasoning_efforts.is_empty() {
+        if user_entry.reasoning_efforts.is_empty()
+            && user_entry.supports_reasoning_effort != Some(false)
+        {
             user_entry.reasoning_efforts = reasoning_efforts;
         }
         if user_entry.codex_wire.is_none() {
@@ -2780,6 +2782,48 @@ mod tests {
         assert!(empty.reasoning_efforts.is_empty());
         assert_eq!(empty.reasoning_effort, None);
         assert_eq!(empty.supports_reasoning_effort, Some(false));
+    }
+
+    #[test]
+    fn codex_catalog_metadata_override_can_disable_reasoning_effort() {
+        let key = "gpt-codex-disabled";
+        let mut models = IndexMap::from([(
+            key.to_owned(),
+            ConfigModelOverride {
+                supports_reasoning_effort: Some(false),
+                ..ConfigModelOverride::default()
+            },
+        )]);
+        let presets = parse_openai_codex_catalog_models(&serde_json::json!({
+            "models": [{
+                "slug": key,
+                "default_reasoning_level": "high",
+                "supported_reasoning_levels": [
+                    { "effort": "low" },
+                    { "effort": "high" }
+                ]
+            }]
+        }));
+        merge_openai_codex_preset_entries(&mut models, presets);
+
+        let merged = models.get(key).expect("merged metadata override");
+        assert_eq!(merged.supports_reasoning_effort, Some(false));
+        assert!(
+            merged.reasoning_efforts.is_empty(),
+            "an explicitly disabled override must not inherit the catalog menu"
+        );
+
+        let cfg = Config::default();
+        let resolved = resolve_model_list(
+            &cfg,
+            Some(IndexMap::from([(
+                key.to_owned(),
+                merged.apply(key, None, &cfg.endpoints),
+            )])),
+        );
+        let info = &resolved[key].info;
+        assert!(!info.supports_reasoning_effort);
+        assert!(info.reasoning_efforts.is_empty());
     }
 
     /// `data` / `id` / `name` are tolerances for shapes this endpoint does not

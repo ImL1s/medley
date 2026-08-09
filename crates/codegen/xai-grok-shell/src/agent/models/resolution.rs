@@ -629,7 +629,7 @@ pub(crate) fn resolve_model_catalog(
     if let Some(effort) = cfg.models.default_reasoning_effort
         && let Some(default_id) = cfg.models.default.as_deref()
         && let Some(entry) = catalog.get_mut(default_id)
-        && entry.info.supports_reasoning_effort
+        && model_offers_reasoning_effort(&entry.info, effort)
     {
         entry.info.reasoning_effort = Some(effort);
     }
@@ -646,7 +646,10 @@ pub(crate) fn resolve_model_catalog(
 }
 
 /// Whether `effort` is a value this model will accept on the wire.
-fn model_offers_reasoning_effort(info: &config::ModelInfo, effort: ReasoningEffort) -> bool {
+pub(super) fn model_offers_reasoning_effort(
+    info: &config::ModelInfo,
+    effort: ReasoningEffort,
+) -> bool {
     if !info.supports_reasoning_effort {
         return false;
     }

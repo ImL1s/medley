@@ -755,14 +755,66 @@ fn current_reasoning_effort_seeded_from_config() {
     let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
     let mut cfg = config::Config::default();
     cfg.models.default_reasoning_effort = Some(ReasoningEffort::Xhigh);
+    let mut entry = ModelEntry {
+        info: config::ModelInfo::fallback("default"),
+        api_key: None,
+        env_key: None,
+        auth_provider: None,
+        api_base_url: None,
+        config_validation_errors: Vec::new(),
+    };
+    entry.info.supports_reasoning_effort = true;
+    entry.info.reasoning_efforts = vec![ReasoningEffortOption {
+        id: "xhigh".into(),
+        value: ReasoningEffort::Xhigh,
+        label: "Extra high".into(),
+        description: None,
+        default: true,
+    }];
     let mgr = ModelsManager::new(
         None,
-        IndexMap::new(),
+        IndexMap::from([("default".to_string(), entry)]),
         acp::ModelId::new("default"),
         auth_manager,
         cfg,
     );
     assert_eq!(mgr.current_reasoning_effort(), Some(ReasoningEffort::Xhigh),);
+}
+
+#[test]
+fn current_reasoning_effort_rejects_persisted_value_outside_model_menu() {
+    let tmp = std::env::temp_dir().join("grok-test-models-manager-invalid-seed");
+    let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
+    let mut cfg = config::Config::default();
+    cfg.models.default_reasoning_effort = Some(ReasoningEffort::Xhigh);
+    let mut entry = ModelEntry {
+        info: config::ModelInfo::fallback("default"),
+        api_key: None,
+        env_key: None,
+        auth_provider: None,
+        api_base_url: None,
+        config_validation_errors: Vec::new(),
+    };
+    entry.info.supports_reasoning_effort = true;
+    entry.info.reasoning_efforts = vec![ReasoningEffortOption {
+        id: "low".into(),
+        value: ReasoningEffort::Low,
+        label: "Low".into(),
+        description: None,
+        default: true,
+    }];
+    let mgr = ModelsManager::new(
+        None,
+        IndexMap::from([("default".to_string(), entry)]),
+        acp::ModelId::new("default"),
+        auth_manager,
+        cfg,
+    );
+    assert_eq!(
+        mgr.current_reasoning_effort(),
+        None,
+        "a persisted tier removed from the current model's menu must not seed the session",
+    );
 }
 
 #[test]
@@ -811,6 +863,39 @@ fn default_reasoning_effort_only_stamps_supporting_model() {
     assert_eq!(
         catalog["plain-model"].info.reasoning_effort, None,
         "non-reasoning default model must NOT be stamped with persisted effort",
+    );
+
+    let mut cfg = config::Config::default();
+    cfg.models.default = Some("limited-model".to_string());
+    cfg.models.default_reasoning_effort = Some(ReasoningEffort::High);
+    let mut limited_entry = ModelEntry {
+        info: config::ModelInfo::fallback("limited-model"),
+        api_key: None,
+        env_key: None,
+        auth_provider: None,
+        api_base_url: None,
+        config_validation_errors: Vec::new(),
+    };
+    limited_entry.info.supports_reasoning_effort = true;
+    limited_entry.info.reasoning_efforts = vec![ReasoningEffortOption {
+        id: "low".into(),
+        value: ReasoningEffort::Low,
+        label: "Low".into(),
+        description: None,
+        default: true,
+    }];
+    limited_entry.info.reasoning_effort = Some(ReasoningEffort::Low);
+    let catalog = resolve_model_catalog(
+        &cfg,
+        Some(IndexMap::from([(
+            "limited-model".to_string(),
+            limited_entry,
+        )])),
+    );
+    assert_eq!(
+        catalog["limited-model"].info.reasoning_effort,
+        Some(ReasoningEffort::Low),
+        "a persisted tier outside the advertised menu must not replace the catalog default",
     );
 }
 

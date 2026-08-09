@@ -1505,6 +1505,10 @@ jobs:
             codex_catalog_supported_reasoning_levels_drive_acp_effort_options -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_default_reasoning_level_must_belong_to_supported_levels -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            current_reasoning_effort_rejects_persisted_value_outside_model_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_metadata_override_can_disable_reasoning_effort -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             codex_catalog_effort_options_are_model_specific -- --nocapture
 
