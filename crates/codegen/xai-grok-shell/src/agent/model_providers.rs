@@ -107,6 +107,8 @@ fn persist_codex_catalog_cache(path: &std::path::Path, payload: &serde_json::Val
     let Some(parent) = path.parent() else {
         return;
     };
+    #[cfg(unix)]
+    let cache_directory_created = !parent.exists();
     if let Err(error) = std::fs::create_dir_all(parent) {
         tracing::warn!(error = %error, "Codex catalog cache directory creation failed");
         return;
@@ -142,6 +144,13 @@ fn persist_codex_catalog_cache(path: &std::path::Path, payload: &serde_json::Val
     #[cfg(unix)]
     if let Err(error) = std::fs::File::open(parent).and_then(|directory| directory.sync_all()) {
         tracing::warn!(error = %error, "Codex catalog cache directory sync failed");
+    }
+    #[cfg(unix)]
+    if cache_directory_created
+        && let Some(home) = parent.parent()
+        && let Err(error) = std::fs::File::open(home).and_then(|directory| directory.sync_all())
+    {
+        tracing::warn!(error = %error, "Codex catalog cache parent directory sync failed");
     }
 }
 
@@ -188,12 +197,6 @@ fn mark_codex_catalog_degraded(
         model.catalog_degraded_reason = Some(reason.to_owned());
     }
     models
-}
-
-pub(crate) fn codex_catalog_degraded_reason(description: Option<&str>) -> Option<&str> {
-    description?
-        .split_once(OPENAI_CODEX_CATALOG_DEGRADED_MARKER)
-        .map(|(_, reason)| reason)
 }
 
 fn codex_catalog_fallback_models(
@@ -2770,6 +2773,10 @@ mod tests {
         let model = resolved
             .get(OPENAI_CODEX_PRESET_MODEL_ID)
             .expect("merged Codex model");
+        assert_eq!(
+            model.info.catalog_degraded_reason.as_deref(),
+            Some(OPENAI_CODEX_SAVED_CATALOG_REASON)
+        );
         assert!(
             model
                 .info
@@ -2786,6 +2793,28 @@ mod tests {
             meta.get("catalogDegradedReason")
                 .and_then(serde_json::Value::as_str),
             Some(OPENAI_CODEX_SAVED_CATALOG_REASON)
+        );
+
+        let healthy = ConfigModelOverride {
+            description: Some(format!(
+                "User-authored text containing {}but no runtime failure",
+                OPENAI_CODEX_CATALOG_DEGRADED_MARKER
+            )),
+            ..ConfigModelOverride::default()
+        }
+        .apply(
+            "healthy-custom",
+            None,
+            &crate::agent::config::EndpointsConfig::default(),
+        );
+        let healthy_models = IndexMap::from([("healthy-custom".to_owned(), healthy)]);
+        let healthy_acp = crate::agent::config::to_acp_model_info(&healthy_models);
+        assert!(
+            healthy_acp[&acp::ModelId::new("healthy-custom")]
+                .meta
+                .as_ref()
+                .is_none_or(|meta| !meta.contains_key("catalogDegradedReason")),
+            "display text alone must not synthesize operational degraded state"
         );
     }
 
