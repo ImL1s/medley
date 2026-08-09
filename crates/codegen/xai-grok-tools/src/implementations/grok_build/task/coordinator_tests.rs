@@ -1342,6 +1342,60 @@ async fn loop_tracking_covers_pending_active_and_nested_reparenting() {
     harness.actor.abort();
 }
 
+/// #271: a nested spawn can sit in the root session's admission queue after
+/// reparenting. Its immediate parent must travel with the queued record so the
+/// eventual child capability context is built from the spawner, not the root.
+#[tokio::test]
+async fn queued_nested_spawn_keeps_immediate_parent_for_capability_context() {
+    let mut harness = harness_with_config(false, limited(1, LimitBehavior::Queue));
+
+    let outer_spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("outer", true)).await }
+    });
+    let observed_outer = harness.requests.recv().await.expect("outer started");
+    assert_eq!(observed_outer.request.parent_session_id, "parent");
+    assert_eq!(observed_outer.spawn_parent_session_id, "parent");
+    assert_eq!(harness.started.recv().await.as_deref(), Some("outer"));
+
+    let mut nested_request = request("nested-queued", true);
+    nested_request.parent_session_id = "outer".to_owned();
+    let nested_spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(nested_request).await }
+    });
+    await_queued(&harness.backend, 1).await;
+    assert!(
+        harness.requests.try_recv().is_err(),
+        "the nested spawn must remain queued while its root session is at capacity"
+    );
+
+    let _ = harness.finish.send(());
+    assert!(outer_spawn.await.unwrap().unwrap().success);
+
+    let observed_nested = harness
+        .requests
+        .recv()
+        .await
+        .expect("queued nested child started after a slot freed");
+    assert_eq!(
+        observed_nested.request.parent_session_id, "parent",
+        "lifecycle ownership remains flattened to the root"
+    );
+    assert_eq!(
+        observed_nested.spawn_parent_session_id, "outer",
+        "capability inheritance must remain bound to the immediate spawner after dequeue"
+    );
+    assert_eq!(
+        harness.started.recv().await.as_deref(),
+        Some("nested-queued")
+    );
+
+    let _ = harness.finish.send(());
+    assert!(nested_spawn.await.unwrap().unwrap().success);
+    harness.actor.abort();
+}
+
 #[tokio::test]
 async fn completion_buffer_caps_summary_without_mutating_result() {
     let mut harness = harness_with_config(
