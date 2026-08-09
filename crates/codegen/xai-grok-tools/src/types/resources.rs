@@ -680,9 +680,10 @@ impl ToolNameMapping {
 }
 /// Set of client-facing names of all enabled **native** (non-MCP) tools.
 ///
-/// Populated once at `finalize()` from the finalized tool list (every tool
-/// whose client-facing name does not contain the `__` MCP delimiter). Used by
-/// `use_tool` to detect when the model wrongly routes a native tool call
+/// Populated at `finalize()` from the active tool list (every tool whose
+/// client-facing name does not contain the `__` MCP delimiter) and updated
+/// when a dynamically available native tool is toggled. Used by `use_tool` to
+/// detect when the model wrongly routes a native tool call
 /// (e.g. `scheduler_create`) through `use_tool`. Without this, such calls hit
 /// the generic "not a valid MCP tool name" error and the model gets stuck,
 /// because `search_tool` only indexes MCP tools.
@@ -691,11 +692,23 @@ impl ToolNameMapping {
 /// ("call it directly") instead of the generic "not a valid MCP tool name"
 /// message that left the model stuck.
 #[derive(Debug, Clone, Default)]
-pub struct EnabledNativeToolNames(pub std::collections::HashSet<String>);
+pub struct EnabledNativeToolNames(Arc<parking_lot::RwLock<std::collections::HashSet<String>>>);
 impl EnabledNativeToolNames {
+    pub fn new(names: std::collections::HashSet<String>) -> Self {
+        Self(Arc::new(parking_lot::RwLock::new(names)))
+    }
+
     /// Whether `name` is an enabled native (non-MCP) tool.
     pub fn contains(&self, name: &str) -> bool {
-        self.0.contains(name)
+        self.0.read().contains(name)
+    }
+
+    pub(crate) fn insert(&self, name: String) {
+        self.0.write().insert(name);
+    }
+
+    pub(crate) fn remove(&self, name: &str) {
+        self.0.write().remove(name);
     }
 }
 /// Map of canonical tool name → {canonical param name → model-facing param name}.

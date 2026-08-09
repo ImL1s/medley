@@ -2546,7 +2546,15 @@ mod tests {
     /// WebSearch requires the web-search config.
     #[tokio::test]
     async fn hosted_tools_only_xsearch_when_web_search_disabled() {
+        use xai_grok_tools::types::resources::EnabledNativeToolNames;
+
         let mut agent = build_with_web_search(false, true, &[], None).await;
+        let native_names = agent
+            .tool_bridge()
+            .read_resource::<EnabledNativeToolNames>()
+            .await
+            .expect("enabled native tool names resource");
+        assert!(!native_names.contains("web_search"));
         let hosted = agent.hosted_tools();
         assert!(
             agent
@@ -2568,6 +2576,7 @@ mod tests {
             "expected XSearch hosted tool, got: {hosted:?}"
         );
         agent.set_web_search_enabled(true);
+        assert!(native_names.contains("web_search"));
         assert!(
             agent
                 .hosted_tools()
@@ -2591,6 +2600,7 @@ mod tests {
             1
         );
         agent.set_web_search_enabled(false);
+        assert!(!native_names.contains("web_search"));
         assert!(
             agent
                 .hosted_tools()

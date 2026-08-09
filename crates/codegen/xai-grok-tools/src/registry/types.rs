@@ -455,6 +455,7 @@ pub struct FinalizedToolset {
     /// Web search uses this to follow live credential/model availability
     /// without reclassifying the tool as an external MCP identity.
     inactive_tools: parking_lot::Mutex<HashMap<String, FinalizedTool>>,
+    enabled_native_tool_names: crate::types::resources::EnabledNativeToolNames,
     reminders: Vec<Box<dyn Reminder + Send + Sync>>,
     pub resources: SharedResources,
     resources_persistence: Arc<ResourcesPersistence>,
@@ -1362,12 +1363,15 @@ impl ToolRegistryBuilder {
         }
         let native_tool_names: std::collections::HashSet<String> = tools
             .iter()
-            .filter(|t| !t.client_name.contains("__"))
+            .filter(|t| {
+                !t.client_name.contains("__")
+                    && (!web_search_initially_inactive || t.canonical_id != WEB_SEARCH_ID)
+            })
             .map(|t| t.client_name.clone())
             .collect();
-        resources.insert(crate::types::resources::EnabledNativeToolNames(
-            native_tool_names,
-        ));
+        let enabled_native_tool_names =
+            crate::types::resources::EnabledNativeToolNames::new(native_tool_names);
+        resources.insert(enabled_native_tool_names.clone());
         let proposed: Vec<ProposedTool> = tools
             .iter()
             .map(|t| ProposedTool {
@@ -1441,6 +1445,7 @@ impl ToolRegistryBuilder {
         Ok(FinalizedToolset {
             tools: parking_lot::RwLock::new(tools),
             inactive_tools: parking_lot::Mutex::new(inactive_tools),
+            enabled_native_tool_names,
             reminders: active_reminders,
             resources: shared_resources,
             resources_persistence: persistence,
@@ -1507,13 +1512,15 @@ impl FinalizedToolset {
         Self::empty_for_test_with_capability_policy(CapabilityPolicy::unrestricted())
     }
     pub fn empty_for_test_with_capability_policy(policy: CapabilityPolicy) -> Self {
+        let enabled_native_tool_names = crate::types::resources::EnabledNativeToolNames::default();
+        let mut resources = crate::types::resources::Resources::default();
+        resources.insert(enabled_native_tool_names.clone());
         Self {
             tools: parking_lot::RwLock::new(vec![]),
             inactive_tools: parking_lot::Mutex::new(HashMap::new()),
+            enabled_native_tool_names,
             reminders: vec![],
-            resources: Arc::new(tokio::sync::Mutex::new(
-                crate::types::resources::Resources::default(),
-            )),
+            resources: resources.into_shared(),
             resources_persistence: Arc::new(ResourcesPersistence::noop()),
             scheduler_cancel: None,
             local_registry: xai_computer_hub_sdk::LocalRegistry::new(),
@@ -2330,13 +2337,17 @@ impl FinalizedToolset {
         let mut tools = self.tools.write();
         let mut inactive = self.inactive_tools.lock();
         if enabled {
-            if tools.iter().any(|tool| tool.canonical_id == ID) {
+            if let Some(tool) = tools.iter().find(|tool| tool.canonical_id == ID) {
+                self.enabled_native_tool_names
+                    .insert(tool.client_name.clone());
                 return true;
             }
             let Some(tool) = inactive.remove(ID) else {
                 return false;
             };
+            let client_name = tool.client_name.clone();
             tools.push(tool);
+            self.enabled_native_tool_names.insert(client_name);
             true
         } else {
             let Some(index) = tools.iter().position(|tool| tool.canonical_id == ID) else {
@@ -2346,6 +2357,7 @@ impl FinalizedToolset {
                 return true;
             };
             let tool = tools.remove(index);
+            self.enabled_native_tool_names.remove(&tool.client_name);
             inactive.insert(ID.to_owned(), tool);
             true
         }
