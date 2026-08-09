@@ -565,6 +565,8 @@ jobs:
             mock_model_emits_explicit_auth_scheme -- --nocapture
           run_nonzero -p xai-grok-pager-pty-harness --lib \
             replacement_models_keep_keyless_loopback_default -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            unresolved_empty_current_model_uses_live_fail_closed_sampling_config -- --nocapture
           run_nonzero -p xai-grok-tools --lib \
             implementations:: -- --nocapture
           run_nonzero -p xai-grok-tools --lib \

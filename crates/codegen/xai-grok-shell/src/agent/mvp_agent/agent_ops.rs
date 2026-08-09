@@ -2418,10 +2418,9 @@ impl MvpAgent {
         config.origin_client = origin_client;
         config
     }
-    /// Resolve sampling config for a model by ID, falling back to the global
-    /// default on resolution failure. This ensures API-key auth routes to
-    /// the public API (via resolve_credentials) instead of the global config's
-    /// cli-chat-proxy base_url.
+    /// Resolve sampling config for a model by ID, falling back to the live
+    /// catalog selection on resolution failure. This keeps refreshed auth and
+    /// readiness state authoritative instead of reusing the startup route.
     pub(super) fn resolve_sampling_config_for_model(
         &self,
         model_id: &acp::ModelId,
@@ -2430,7 +2429,7 @@ impl MvpAgent {
         if let Ok(model) = self.resolve_model_id(model_id) {
             self.prepare_sampling_config_for_model(&model, origin_client.clone())
         } else {
-            let mut c = self.sampling_config.borrow().clone();
+            let mut c = self.models_manager.sampling_config();
             c.origin_client = origin_client;
             c
         }
@@ -4711,9 +4710,7 @@ impl MvpAgent {
         let sampling_config = default_model
             .map(|model| self.prepare_sampling_config_for_model(model, origin_client.clone()))
             .unwrap_or_else(|| {
-                let mut config = self.sampling_config.borrow().clone();
-                config.origin_client = origin_client.clone();
-                config
+                self.resolve_sampling_config_for_model(&session_model_id, origin_client.clone())
             });
         let default_catalog_identity = default_catalog_identity.unwrap_or_else(|| {
             xai_chat_state::CatalogIdentity {
