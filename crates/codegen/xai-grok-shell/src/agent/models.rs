@@ -700,6 +700,16 @@ impl ModelsManager {
         left.is_some() && left == right
     }
 
+    /// Whether `model_id` currently resolves to an entry whose wire routing
+    /// model matches `routing_model`.
+    pub(crate) fn model_id_routes_to(&self, model_id: &str, routing_model: &str) -> bool {
+        let catalog = self.inner.catalog.read();
+        let models = &catalog.models;
+        resolve_catalog_key(models, &acp::ModelId::new(model_id))
+            .and_then(|key| models.get(key.0.as_ref()))
+            .is_some_and(|entry| entry.info().model == routing_model)
+    }
+
     pub(crate) fn model_compactions_remaining(
         &self,
         model_id: &str,

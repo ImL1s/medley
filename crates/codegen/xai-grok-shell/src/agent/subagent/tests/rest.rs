@@ -2482,6 +2482,36 @@ async fn read_parent_sampling_config_inflight_switch_uses_live_model_wire() {
 }
 
 #[tokio::test]
+async fn read_parent_sampling_config_reused_catalog_key_keeps_sampled_model_wire() {
+    let old_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(false),
+        ..Default::default()
+    };
+    let replacement_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut replacement = test_model_entry("replacement-routing-model");
+    replacement.info.codex_wire = Some(replacement_caps);
+    let mut old = test_model_entry("old-routing-model");
+    old.info.codex_wire = Some(old_caps.clone());
+    let mut models = indexmap::IndexMap::new();
+    models.insert("auto".to_string(), replacement);
+    models.insert("old-routing-model".to_string(), old);
+    let ctx = ctx_with_parent_chat_state("auto", "old-routing-model", "auto", models);
+    let chat = ctx.parent_chat_state.as_ref().expect("chat state");
+    let mut snapshot = chat.snapshot().await.expect("chat snapshot");
+    snapshot.catalog_model_id = Some("auto".to_string());
+    chat.restore_snapshot(snapshot);
+
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+
+    assert_eq!(model_id.0.as_ref(), "old-routing-model");
+    assert_eq!(config.model, "old-routing-model");
+    assert_eq!(config.codex_wire, Some(old_caps));
+}
+
+#[tokio::test]
 async fn read_parent_sampling_config_resolves_compactions_remaining_from_catalog() {
     use xai_grok_sampling_types::CompactionsRemaining;
     let mut entry = test_model_entry("grok-4.5");

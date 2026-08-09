@@ -848,15 +848,26 @@ async fn read_parent_sampling_config(
                     ctx.model_id.0.as_ref(),
                     ctx.sampling_config_model_id.0.as_ref(),
                 ) && ctx.sampling_config.model == cfg.model);
-            let model_id = committed_model_id
-                .map(acp::ModelId::new)
-                .unwrap_or_else(|| {
+            let model_id = match committed_model_id {
+                Some(committed)
+                    if ctx
+                        .models_manager
+                        .model_id_routes_to(&committed, &cfg.model) =>
+                {
+                    acp::ModelId::new(committed)
+                }
+                // Catalog refresh can reuse a retained key for a different
+                // routing model. Resolve from the sampled model instead of
+                // attaching the replacement entry's capabilities.
+                Some(_) => acp::ModelId::new(cfg.model.clone()),
+                None => {
                     if captured_model_matches {
                         ctx.model_id.clone()
                     } else {
                         acp::ModelId::new(cfg.model.clone())
                     }
-                });
+                }
+            };
             let creds = chat_state.get_credentials().await;
             let mut extra_headers = cfg.extra_headers;
             crate::agent::config::inject_url_derived_headers(
