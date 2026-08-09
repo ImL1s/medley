@@ -87,7 +87,7 @@ pub(crate) fn physical_dir_size(path: &Path, volume: Volume) -> DirSize {
     let mut size = BucketSize::default();
     let mut issues = WalkIssues::default();
     let entered = walk(path, volume, &mut issues, |entry| {
-        if let Visit::File(_, meta) = entry {
+        if let Visit::Dir(_, meta) | Visit::File(_, meta) = entry {
             size.bytes = size.bytes.saturating_add(physical_file_size(meta));
             size.last_modified = size.last_modified.max(modified_at(meta));
         }
@@ -118,28 +118,24 @@ pub(crate) fn physical_buckets(root: &Path, volume: Volume) -> BucketedSizes {
     let mut elsewhere: Vec<PathBuf> = Vec::new();
     let mut total = BucketSize::default();
     let mut issues = WalkIssues::default();
-    let entered = walk(root, volume, &mut issues, |entry| match entry {
-        Visit::Dir(entry) => {
-            if entry.depth() == WORKTREE_DEPTH {
-                counted.entry(entry.path().to_path_buf()).or_default();
-            }
+    let mut count_entry = |entry: &walkdir::DirEntry, meta: &Metadata| {
+        let depth = entry.depth();
+        let bytes = physical_file_size(meta);
+        total.bytes = total.bytes.saturating_add(bytes);
+        total.last_modified = total.last_modified.max(modified_at(meta));
+        if depth >= WORKTREE_DEPTH
+            && let Some(path) = entry.path().ancestors().nth(depth - WORKTREE_DEPTH)
+        {
+            let bucket = counted.entry(path.to_path_buf()).or_default();
+            bucket.bytes = bucket.bytes.saturating_add(bytes);
+            bucket.last_modified = bucket.last_modified.max(modified_at(meta));
         }
+    };
+    let entered = walk(root, volume, &mut issues, |entry| match entry {
+        Visit::Dir(entry, meta) | Visit::File(entry, meta) => count_entry(entry, meta),
         Visit::Elsewhere(entry) => {
             if entry.depth() == WORKTREE_DEPTH {
                 elsewhere.push(entry.path().to_path_buf());
-            }
-        }
-        Visit::File(entry, meta) => {
-            let depth = entry.depth();
-            let bytes = physical_file_size(meta);
-            total.bytes = total.bytes.saturating_add(bytes);
-            total.last_modified = total.last_modified.max(modified_at(meta));
-            if depth > WORKTREE_DEPTH
-                && let Some(path) = entry.path().ancestors().nth(depth - WORKTREE_DEPTH)
-            {
-                let bucket = counted.entry(path.to_path_buf()).or_default();
-                bucket.bytes = bucket.bytes.saturating_add(bytes);
-                bucket.last_modified = bucket.last_modified.max(modified_at(meta));
             }
         }
     });
@@ -160,7 +156,7 @@ pub(crate) fn physical_buckets(root: &Path, volume: Volume) -> BucketedSizes {
 }
 
 enum Visit<'a> {
-    Dir(&'a walkdir::DirEntry),
+    Dir(&'a walkdir::DirEntry, &'a Metadata),
     Elsewhere(&'a walkdir::DirEntry),
     File(&'a walkdir::DirEntry, &'a Metadata),
 }
@@ -196,7 +192,13 @@ fn walk(
                 visit(Visit::Elsewhere(&entry));
                 continue;
             }
-            visit(Visit::Dir(&entry));
+            match entry.metadata() {
+                Ok(meta) => visit(Visit::Dir(&entry, &meta)),
+                Err(e) => {
+                    tracing::debug!(path = %entry.path().display(), error = %e, "du: directory could not be stat'd");
+                    issues.unstatable_entries = issues.unstatable_entries.saturating_add(1);
+                }
+            }
             continue;
         }
         // follow_links(false) makes this symlink_metadata.

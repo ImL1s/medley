@@ -28,9 +28,10 @@ fn sizing_is_physical_not_logical() {
     std::fs::write(&original, vec![b'x'; 8192]).unwrap();
     std::fs::hard_link(&original, linked.join("b.bin")).unwrap();
     let one_link = physical_file_size(&std::fs::symlink_metadata(&original).unwrap());
+    let directory = physical_file_size(&std::fs::symlink_metadata(&linked).unwrap());
     assert_eq!(
         counted(physical_dir_size(&linked, Volume::of(&linked))),
-        one_link * 2,
+        directory + one_link * 2,
         "each hard link to an inode counts at full size, as clones do"
     );
 }
@@ -44,10 +45,15 @@ fn physical_dir_size_sums_files_without_following_symlinks() {
     std::fs::write(target.join("sub/b.bin"), vec![b'y'; 4096]).unwrap();
 
     let full = counted(physical_dir_size(&target, Volume::of(&target)));
-    let expected: u64 = [target.join("a.bin"), target.join("sub/b.bin")]
-        .iter()
-        .map(|p| physical_file_size(&std::fs::symlink_metadata(p).unwrap()))
-        .sum();
+    let expected: u64 = [
+        target.clone(),
+        target.join("sub"),
+        target.join("a.bin"),
+        target.join("sub/b.bin"),
+    ]
+    .iter()
+    .map(|p| physical_file_size(&std::fs::symlink_metadata(p).unwrap()))
+    .sum();
     assert_eq!(full, expected);
 
     #[cfg(unix)]
@@ -56,13 +62,37 @@ fn physical_dir_size_sums_files_without_following_symlinks() {
         std::fs::create_dir_all(&linked).unwrap();
         std::os::unix::fs::symlink(&target, linked.join("escape")).unwrap();
         let link_only = counted(physical_dir_size(&linked, Volume::of(&linked)));
+        let dir_meta = std::fs::symlink_metadata(&linked).unwrap();
         let link_meta = std::fs::symlink_metadata(linked.join("escape")).unwrap();
         assert_eq!(
             link_only,
-            physical_file_size(&link_meta),
-            "a walk must cost exactly the symlink's own inode, never the target"
+            physical_file_size(&dir_meta) + physical_file_size(&link_meta),
+            "a walk must cost exactly the directory and symlink inodes, never the target"
         );
     }
+}
+
+#[test]
+fn directory_blocks_contribute_to_totals_and_worktree_buckets() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().join("worktrees");
+    let owner = root.join("xai");
+    let worktree = owner.join("wt-a");
+    let nested = worktree.join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+
+    let sizes = physical_buckets(&root, Volume::of(&root));
+    let expected_total: u64 = [&root, &owner, &worktree, &nested]
+        .into_iter()
+        .map(|path| physical_file_size(&std::fs::symlink_metadata(path).unwrap()))
+        .sum();
+    let expected_bucket: u64 = [&worktree, &nested]
+        .into_iter()
+        .map(|path| physical_file_size(&std::fs::symlink_metadata(path).unwrap()))
+        .sum();
+
+    assert_eq!(sizes.total.bytes(), Some(expected_total));
+    assert_eq!(sizes.buckets[&worktree].bytes(), Some(expected_bucket));
 }
 
 // The Err arm no permission trick can reach on a root-uid CI runner.
