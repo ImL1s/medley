@@ -2159,6 +2159,58 @@ fn test_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
         config_validation_errors: Vec::new(),
     }
 }
+
+#[test]
+fn subagent_reasoning_override_obeys_authoritative_model_menu() {
+    use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption};
+
+    let options = [ReasoningEffortOption {
+        id: "deep".into(),
+        value: ReasoningEffort::High,
+        label: "Deep".into(),
+        description: None,
+        default: true,
+    }];
+    assert_eq!(
+        resolve_subagent_reasoning_effort_override(true, &options, "high"),
+        Some(ReasoningEffort::High)
+    );
+    for rejected in ["low", "none", "max"] {
+        assert_eq!(
+            resolve_subagent_reasoning_effort_override(true, &options, rejected),
+            None,
+            "explicit model menu must reject {rejected}"
+        );
+    }
+}
+
+#[test]
+fn subagent_reasoning_override_uses_legacy_menu_when_catalog_menu_is_absent() {
+    use xai_grok_sampling_types::ReasoningEffort;
+
+    for (raw, expected) in [
+        ("minimal", ReasoningEffort::Minimal),
+        ("low", ReasoningEffort::Low),
+        ("high", ReasoningEffort::High),
+        ("xhigh", ReasoningEffort::Xhigh),
+    ] {
+        assert_eq!(
+            resolve_subagent_reasoning_effort_override(true, &[], raw),
+            Some(expected)
+        );
+    }
+    for rejected in ["none", "max"] {
+        assert_eq!(
+            resolve_subagent_reasoning_effort_override(true, &[], rejected),
+            None,
+            "menu-less legacy policy must reject {rejected}"
+        );
+    }
+    assert_eq!(
+        resolve_subagent_reasoning_effort_override(false, &[], "high"),
+        None
+    );
+}
 fn byok_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
     crate::agent::config::ModelEntry {
         api_key: Some("byok-key".to_string()),

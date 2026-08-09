@@ -437,19 +437,21 @@ mod tests {
             screen_mode: crate::app::ScreenMode::Fullscreen,
         };
         // Args query has a trailing space -> effort phase. Items come out
-        // ordered xhigh -> low (strongest first) per EFFORT_LEVELS.
+        // ordered xhigh -> minimal (strongest first) per EFFORT_LEVELS.
         let items = cmd.suggest_args(&ctx, "Reasoning X ").unwrap();
-        assert_eq!(items.len(), 4);
+        assert_eq!(items.len(), 5);
         assert_eq!(items[0].insert_text, "Reasoning X xhigh");
         assert_eq!(items[1].insert_text, "Reasoning X high");
         assert_eq!(items[2].insert_text, "Reasoning X medium");
         assert_eq!(items[3].insert_text, "Reasoning X low");
+        assert_eq!(items[4].insert_text, "Reasoning X minimal");
         // Display is just the level so the user sees a clean column.
         assert_eq!(items[0].display, "xhigh");
         // match_text carries the sort-key prefix that forces the matcher's
         // alphabetical tiebreak to render rows in EFFORT_LEVELS order.
         assert!(items[0].match_text.starts_with("a "));
         assert!(items[3].match_text.starts_with("d "));
+        assert!(items[4].match_text.starts_with("e "));
     }
 
     #[test]
@@ -470,7 +472,7 @@ mod tests {
         };
         // Still in effort phase; matcher upstream narrows to high / xhigh.
         let items = cmd.suggest_args(&ctx, "Reasoning X h").unwrap();
-        assert_eq!(items.len(), 4);
+        assert_eq!(items.len(), 5);
     }
 
     #[test]

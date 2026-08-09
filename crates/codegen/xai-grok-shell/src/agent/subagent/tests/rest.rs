@@ -2293,6 +2293,29 @@ fn resolve_model_override_wires_resolver_for_fresh_and_hard_expired_session_keys
         assert!(config.bearer_resolver.is_some(), "key={key}");
     }
 }
+
+#[test]
+fn resolve_model_override_prepared_carries_authoritative_reasoning_menu() {
+    use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption};
+
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    let mut entry = test_model_entry("reasoning-model");
+    entry.info.supports_reasoning_effort = true;
+    entry.info.reasoning_efforts = vec![ReasoningEffortOption {
+        id: "max".into(),
+        value: ReasoningEffort::Max,
+        label: "Maximum".into(),
+        description: None,
+        default: true,
+    }];
+    ctx.available_models
+        .insert("reasoning-model".to_string(), entry);
+
+    let prepared = resolve_model_override_to_prepared("reasoning-model", &ctx).unwrap();
+    assert!(prepared.supports_reasoning_effort);
+    assert_eq!(prepared.reasoning_efforts.len(), 1);
+    assert_eq!(prepared.reasoning_efforts[0].value, ReasoningEffort::Max);
+}
 /// #110: the pinned-model override path is a separate branch from live
 /// parent inheritance, and it wires the parent session resolver too. A pinned
 /// model authenticated only by a header the user declared must not get one:

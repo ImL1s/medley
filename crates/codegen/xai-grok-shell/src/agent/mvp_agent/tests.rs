@@ -1946,6 +1946,34 @@ async fn model_state_prefers_session_reasoning_effort_over_global() {
         "absent session effort falls back to the global default",
     );
 }
+
+#[tokio::test]
+async fn session_config_preserves_resident_effort_after_catalog_disables_reasoning() {
+    use crate::agent::config::{EndpointsConfig, ModelEntry};
+    use xai_grok_sampling_types::ReasoningEffort;
+
+    let agent = build_minimal_agent_for_tests();
+    let mut enabled = ModelEntry::fallback("effort-model", &EndpointsConfig::default());
+    enabled.info.supports_reasoning_effort = true;
+    agent
+        .models_manager
+        .insert_test_entry("effort-model", enabled);
+    let session_id = acp::SessionId::new("resident-effort-after-disable");
+    let mut handle = make_test_handle("effort-model", false, None);
+    handle.reasoning_effort = Some(ReasoningEffort::Xhigh);
+    agent.insert_resident(&session_id, handle);
+
+    let disabled = ModelEntry::fallback("effort-model", &EndpointsConfig::default());
+    agent
+        .models_manager
+        .insert_test_entry("effort-model", disabled);
+
+    let state = agent.model_state(Some(&session_id));
+    let options = agent.session_config_options(Some(&session_id), &state);
+    assert!(options.iter().any(|option| {
+        option.category == "mode" && option.id == "xhigh" && option.selected
+    }));
+}
 /// A session persisted under a routing *slug* (not the catalog map key) must
 /// still get reasoning modes and a selected model from
 /// `session_config_options` — the id is resolved to the catalog key before

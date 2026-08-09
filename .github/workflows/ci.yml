@@ -1531,6 +1531,14 @@ jobs:
             model_state_prefers_session_reasoning_effort_over_global -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             stale_effort_revalidation_does_not_clear_newer_selection -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            subagent_reasoning_override_obeys_authoritative_model_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            subagent_reasoning_override_uses_legacy_menu_when_catalog_menu_is_absent -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            resolve_model_override_prepared_carries_authoritative_reasoning_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            session_config_preserves_resident_effort_after_catalog_disables_reasoning -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             menu_less_reasoning_model_accepts_minimal_but_rejects_none_in_effort_command -- --nocapture
           run_nonzero -p xai-grok-pager --lib \

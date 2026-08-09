@@ -1,5 +1,4 @@
 use super::*;
-use xai_grok_sampling_types::ReasoningEffort;
 use xai_grok_tools::implementations::{grok_build, opencode};
 pub(super) fn inherited_web_search_model_id(
     follows_default: bool,
@@ -620,18 +619,19 @@ pub(crate) async fn run_shell_child(
             return child_run_output(failure_result(&request, &msg), completion_data, None);
         }
     }
-    if let Some(raw) = effective_runtime.reasoning_effort.as_deref()
-        && prepared_model.supports_reasoning_effort
-    {
-        match raw.parse::<ReasoningEffort>() {
-            Ok(eff) => effective_sampling_config.reasoning_effort = Some(eff),
-            Err(err) => {
-                tracing::warn!(
-                    value = raw,
-                    error = %err,
-                    "subagent reasoning_effort: parse failed, ignoring override"
-                )
-            }
+    if let Some(raw) = effective_runtime.reasoning_effort.as_deref() {
+        if let Some(effort) = resolve_subagent_reasoning_effort_override(
+            prepared_model.supports_reasoning_effort,
+            &prepared_model.reasoning_efforts,
+            raw,
+        ) {
+            effective_sampling_config.reasoning_effort = Some(effort);
+        } else {
+            tracing::warn!(
+                value = raw,
+                model_id = %prepared_model.model_id.0,
+                "subagent reasoning_effort is invalid or unavailable for model; ignoring override"
+            );
         }
     }
     let subagent_id = request.id.clone();

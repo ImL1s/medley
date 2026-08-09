@@ -878,10 +878,25 @@ struct PreparedSubagentModel {
     model_id: acp::ModelId,
     catalog_identity: xai_chat_state::CatalogIdentity,
     supports_reasoning_effort: bool,
+    reasoning_efforts: Vec<xai_grok_sampling_types::ReasoningEffortOption>,
     model_has_own_credentials: bool,
     auth_type: xai_chat_state::AuthType,
     agent_type: String,
     auto_compact_threshold_percent: Option<u8>,
+}
+
+fn resolve_subagent_reasoning_effort_override(
+    supports_reasoning_effort: bool,
+    reasoning_efforts: &[xai_grok_sampling_types::ReasoningEffortOption],
+    raw: &str,
+) -> Option<xai_grok_sampling_types::ReasoningEffort> {
+    let effort = raw.parse().ok()?;
+    crate::agent::models::reasoning_effort_is_offered(
+        supports_reasoning_effort,
+        reasoning_efforts,
+        effort,
+    )
+    .then_some(effort)
 }
 
 fn catalog_auth_scheme(
@@ -1129,6 +1144,10 @@ async fn read_parent_prepared_model(ctx: &SubagentSpawnContext) -> PreparedSubag
                 supports_reasoning_effort: capabilities
                     .as_ref()
                     .is_some_and(|facts| facts.supports_reasoning_effort),
+                reasoning_efforts: capabilities
+                    .as_ref()
+                    .map(|facts| facts.reasoning_efforts.clone())
+                    .unwrap_or_default(),
                 model_has_own_credentials: capabilities
                     .as_ref()
                     .is_some_and(|facts| facts.byok == crate::agent::auth_method::ModelByok::Byok),
@@ -1213,6 +1232,10 @@ async fn read_parent_prepared_model(ctx: &SubagentSpawnContext) -> PreparedSubag
         supports_reasoning_effort: capabilities
             .as_ref()
             .is_some_and(|facts| facts.supports_reasoning_effort),
+        reasoning_efforts: capabilities
+            .as_ref()
+            .map(|facts| facts.reasoning_efforts.clone())
+            .unwrap_or_default(),
         model_has_own_credentials: capabilities
             .as_ref()
             .is_some_and(|facts| facts.byok == crate::agent::auth_method::ModelByok::Byok),
@@ -1325,6 +1348,7 @@ fn resolve_model_override_to_prepared(
         model_id: canonical_model_id,
         catalog_identity,
         supports_reasoning_effort: entry.info().supports_reasoning_effort,
+        reasoning_efforts: entry.info().reasoning_efforts.clone(),
         model_has_own_credentials: entry.has_own_credentials(),
         auth_type: resolved_auth_type,
         agent_type: entry.info().agent_type.clone(),

@@ -650,13 +650,25 @@ pub(crate) fn model_offers_reasoning_effort(
     info: &config::ModelInfo,
     effort: ReasoningEffort,
 ) -> bool {
-    if !info.supports_reasoning_effort {
+    reasoning_effort_is_offered(
+        info.supports_reasoning_effort,
+        &info.reasoning_efforts,
+        effort,
+    )
+}
+
+pub(crate) fn reasoning_effort_is_offered(
+    supports_reasoning_effort: bool,
+    reasoning_efforts: &[ReasoningEffortOption],
+    effort: ReasoningEffort,
+) -> bool {
+    if !supports_reasoning_effort {
         return false;
     }
-    if info.reasoning_efforts.is_empty() {
+    if reasoning_efforts.is_empty() {
         crate::agent::session_config::SELECTABLE_REASONING_EFFORTS.contains(&effort)
     } else {
-        info.reasoning_efforts.iter().any(|opt| opt.value == effort)
+        reasoning_efforts.iter().any(|opt| opt.value == effort)
     }
 }
 

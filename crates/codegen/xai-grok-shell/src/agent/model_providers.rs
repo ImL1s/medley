@@ -814,7 +814,13 @@ fn merge_openai_codex_preset_entries(
         if let Some(context_window) = context_window {
             user_entry.context_window.get_or_insert(context_window);
         }
-        if user_entry.reasoning_effort.is_none() {
+        if user_entry.supports_reasoning_effort == Some(false) {
+            // Explicit disable is authoritative for both the menu and scalar;
+            // otherwise the sampler still sends the catalog default even
+            // though every UI/capability surface reports reasoning disabled.
+            user_entry.reasoning_effort = None;
+            user_entry.reasoning_efforts.clear();
+        } else if user_entry.reasoning_effort.is_none() {
             user_entry.reasoning_effort = reasoning_effort;
         }
         if user_entry.supports_reasoning_effort.is_none() {
@@ -2800,6 +2806,14 @@ mod tests {
             key.to_owned(),
             ConfigModelOverride {
                 supports_reasoning_effort: Some(false),
+                reasoning_effort: Some(xai_grok_sampling_types::ReasoningEffort::Xhigh),
+                reasoning_efforts: vec![xai_grok_sampling_types::ReasoningEffortOption {
+                    id: "xhigh".into(),
+                    value: xai_grok_sampling_types::ReasoningEffort::Xhigh,
+                    label: "X-High".into(),
+                    description: None,
+                    default: true,
+                }],
                 ..ConfigModelOverride::default()
             },
         )]);
@@ -2817,6 +2831,7 @@ mod tests {
 
         let merged = models.get(key).expect("merged metadata override");
         assert_eq!(merged.supports_reasoning_effort, Some(false));
+        assert_eq!(merged.reasoning_effort, None);
         assert!(
             merged.reasoning_efforts.is_empty(),
             "an explicitly disabled override must not inherit the catalog menu"
@@ -2833,6 +2848,17 @@ mod tests {
         let info = &resolved[key].info;
         assert!(!info.supports_reasoning_effort);
         assert!(info.reasoning_efforts.is_empty());
+        assert_eq!(info.reasoning_effort, None);
+        let sampler = crate::agent::config::sampling_config_for_model(
+            &resolved[key],
+            crate::agent::config::resolve_credentials(&resolved[key], None),
+            None,
+            None,
+            None,
+            None,
+            &crate::agent::trusted_origins::TrustedXaiOrigins::default(),
+        );
+        assert_eq!(sampler.reasoning_effort, None);
     }
 
     #[test]
