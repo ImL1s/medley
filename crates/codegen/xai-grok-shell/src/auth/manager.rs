@@ -1437,6 +1437,30 @@ impl AuthManager {
             || self.has_usable_disk_token()
     }
 
+    /// Single-observation snapshot: is there a **wire-usable first-party session**
+    /// (WebLogin / OIDC / first-party External) in memory or on disk?
+    ///
+    /// Used for #303 ambient xAI selection so usability and session-kind are
+    /// derived from the **same** credential observation — never
+    /// `has_usable_token() && current().is_session_auth()` which can disagree
+    /// when a soft-expiry buffer token is hard-valid (`current()` is None) or a
+    /// usable sibling-rotated disk token is not yet adopted into memory
+    /// (Pro P0). Hard expiry only (matches [`Self::has_usable_token`]); soft
+    /// early-invalidation buffer still counts as usable.
+    pub(crate) fn has_usable_first_party_session(&self) -> bool {
+        if !self.credential_store_is_safe() {
+            return false;
+        }
+        if let Some(a) = self.current_or_expired()
+            && !self.is_token_hard_expired(&a)
+            && a.is_session_auth()
+        {
+            return true;
+        }
+        self.read_disk_auth()
+            .is_some_and(|a| !self.is_token_hard_expired(&a) && a.is_session_auth())
+    }
+
     /// Like [`read_disk_auth`] but also returns the [`DiskAuthState`] so callers
     /// can tell a transient disk anomaly (`FileMissing`/`Unreadable`) apart from
     /// a genuine logout (`EntryMissing`). Observes the state for transition

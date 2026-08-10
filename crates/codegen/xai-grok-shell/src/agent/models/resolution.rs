@@ -187,7 +187,19 @@ pub(crate) fn is_campaign_only_flip(
 /// xAI session (not merely `current_or_expired` visibility). Also counts ambient
 /// `XAI_API_KEY` and a non-empty deployment key. Does **not** treat BYOK / Codex
 /// as ambient xAI.
+///
+/// An explicit `[auth] preferred_method` pin (`api_key` / `oidc`) preserves
+/// first-party Grok precedence even when no live credential is present, so the
+/// model chooser cannot seat Codex while startup auth remains pinned to an
+/// unavailable xAI family (Pro P0 / #303).
 pub(crate) fn usable_ambient_xai_auth(cfg: &config::Config, has_usable_xai_session: bool) -> bool {
+    use crate::auth::PreferredAuthMethod;
+    if matches!(
+        cfg.grok_com_config.preferred_method,
+        Some(PreferredAuthMethod::ApiKey) | Some(PreferredAuthMethod::Oidc)
+    ) {
+        return true;
+    }
     if has_usable_xai_session {
         return true;
     }

@@ -29,15 +29,39 @@ pub const XAI_API_KEY_ENV_VAR: &str = "XAI_API_KEY";
 /// so existing deployments that use the old name keep working.
 pub const LEGACY_XAI_API_KEY_ENV_VAR: &str = "GROK_CODE_XAI_API_KEY";
 
+/// Non-blank (after trim) value from an env var, if present.
+///
+/// Empty or whitespace-only values are treated as unset so they do not block
+/// fallback to the legacy name and never count as usable ambient credentials
+/// (#303 / Pro P0: blank `XAI_API_KEY` must not pin Grok precedence).
+fn nonblank_env(var: &str) -> Result<String, std::env::VarError> {
+    match std::env::var(var) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Err(std::env::VarError::NotPresent)
+            } else {
+                Ok(trimmed.to_string())
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Read the API key from the environment.
 ///
 /// Checks `XAI_API_KEY` first, then falls back to the legacy
 /// `GROK_CODE_XAI_API_KEY` for backward compatibility.
+///
+/// Only **non-blank after trim** values count. A blank or whitespace-only
+/// primary variable falls through to the legacy name (so a placeholder
+/// `XAI_API_KEY=` in shell profiles / CI secret projection does not mask a
+/// valid legacy key). Both blank → `Err(NotPresent)`.
 pub(crate) fn read_xai_api_key_env() -> Result<String, std::env::VarError> {
-    std::env::var(XAI_API_KEY_ENV_VAR).or_else(|_| std::env::var(LEGACY_XAI_API_KEY_ENV_VAR))
+    nonblank_env(XAI_API_KEY_ENV_VAR).or_else(|_| nonblank_env(LEGACY_XAI_API_KEY_ENV_VAR))
 }
 
-/// Returns `true` if either `XAI_API_KEY` or `GROK_CODE_XAI_API_KEY` is set.
+/// Returns `true` if a non-blank `XAI_API_KEY` or `GROK_CODE_XAI_API_KEY` is set.
 pub fn has_xai_api_key_env() -> bool {
     read_xai_api_key_env().is_ok()
 }
@@ -1325,6 +1349,48 @@ mod tests {
         let _new = EnvGuard::set(XAI_API_KEY_ENV_VAR, "new-key");
         let _legacy = EnvGuard::set(LEGACY_XAI_API_KEY_ENV_VAR, "old-key");
         assert_eq!(read_xai_api_key_env().unwrap(), "new-key");
+    }
+
+    /// Pro P0: empty `XAI_API_KEY` is not usable (presence-only was wrong).
+    #[test]
+    #[serial]
+    fn blank_xai_api_key_env_is_not_usable() {
+        let _new = EnvGuard::set(XAI_API_KEY_ENV_VAR, "");
+        let _legacy = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+        assert!(
+            !has_xai_api_key_env(),
+            "empty XAI_API_KEY must not count as ambient usable"
+        );
+        assert!(read_xai_api_key_env().is_err());
+    }
+
+    /// Pro P0: whitespace-only primary is not usable.
+    #[test]
+    #[serial]
+    fn whitespace_xai_api_key_env_is_not_usable() {
+        let _new = EnvGuard::set(XAI_API_KEY_ENV_VAR, "   \t  ");
+        let _legacy = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+        assert!(!has_xai_api_key_env());
+        assert!(read_xai_api_key_env().is_err());
+    }
+
+    /// Pro P0: blank primary falls through to a valid legacy key.
+    #[test]
+    #[serial]
+    fn blank_primary_falls_through_to_legacy() {
+        let _new = EnvGuard::set(XAI_API_KEY_ENV_VAR, "");
+        let _legacy = EnvGuard::set(LEGACY_XAI_API_KEY_ENV_VAR, "legacy-live-key");
+        assert!(has_xai_api_key_env());
+        assert_eq!(read_xai_api_key_env().unwrap(), "legacy-live-key");
+    }
+
+    /// Pro P0: non-blank values are trimmed.
+    #[test]
+    #[serial]
+    fn nonblank_env_is_trimmed() {
+        let _new = EnvGuard::set(XAI_API_KEY_ENV_VAR, "  padded-key  ");
+        let _legacy = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+        assert_eq!(read_xai_api_key_env().unwrap(), "padded-key");
     }
 
     // -- grok login --legacy regression coverage ------------------------
