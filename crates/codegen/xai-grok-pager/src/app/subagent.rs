@@ -832,6 +832,64 @@ mod tests {
     fn context_badge_none_returns_empty() {
         assert_eq!(format_context_badge(&make_info()), "");
     }
+    /// #306 gate 8: resumed badge driven by `context_source` plus task
+    /// description on the production label / scrollback surfaces (not a
+    /// badge-only rewrap of `context_badge_resumed`).
+    #[test]
+    fn resumed_subagent_badge_and_transcript_are_visible() {
+        let mut info = make_info();
+        info.context_source = Some("resumed".into());
+        info.resumed_from = Some("parent-session-xyz".into());
+        info.description = "Continue Medley providers release gates".into();
+        assert_eq!(format_context_badge(&info), "resumed");
+
+        // Badge is not driven by `resumed_from` alone.
+        let mut forked_only = make_info();
+        forked_only.resumed_from = Some("x".into());
+        forked_only.context_source = None;
+        assert_ne!(format_context_badge(&forked_only), "resumed");
+
+        let (label, clean_desc) = format_subagent_label(&info);
+        assert!(!clean_desc.is_empty());
+        assert!(
+            clean_desc.contains("Continue Medley providers release gates")
+                || info
+                    .description
+                    .contains("Continue Medley providers release gates"),
+            "task description must surface: label={label:?} desc={clean_desc:?}"
+        );
+
+        // Meta path is available for persona/role/model; empty when unset.
+        let _meta = format_subagent_meta(
+            info.persona.as_deref(),
+            info.role.as_deref(),
+            info.model.as_deref(),
+        );
+
+        // Production scrollback block carries the task description (field +
+        // searchable transcript index), matching the spawn path.
+        use crate::scrollback::blocks::SubagentBlock;
+        let block = SubagentBlock::started(
+            info.description.as_ref(),
+            info.child_session_id.as_ref(),
+            info.subagent_type.as_ref(),
+            info.persona.as_ref().map(|s| s.to_string()),
+            info.role.as_ref().map(|s| s.to_string()),
+            info.model.as_ref().map(|s| s.to_string()),
+            info.is_background,
+        );
+        assert_eq!(
+            block.description.as_str(),
+            "Continue Medley providers release gates"
+        );
+        let searchable = RenderBlock::Subagent(block)
+            .searchable_text()
+            .expect("subagent block must index description");
+        assert!(
+            searchable.contains("Continue Medley providers release gates"),
+            "task description must be searchable on SubagentBlock: {searchable:?}"
+        );
+    }
     #[test]
     fn subagent_meta_collapses_duplicate_persona_role() {
         assert_eq!(
