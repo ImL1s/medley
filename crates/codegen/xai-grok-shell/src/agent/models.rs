@@ -440,9 +440,7 @@ impl ModelsManager {
 
         let usable_xai = {
             let has_usable_xai_session = auth_manager.has_usable_token()
-                && auth_manager
-                    .current()
-                    .is_some_and(|a| a.is_session_auth());
+                && auth_manager.current().is_some_and(|a| a.is_session_auth());
             resolution::usable_ambient_xai_auth(cfg, has_usable_xai_session)
         };
         let (current_model_key, current_model, model_source, unready_default_reason) =
@@ -1616,8 +1614,7 @@ impl ModelsManager {
                         && models.values().any(|e| {
                             e.info.user_selectable
                                 && e.info.visible_for_auth(is_session_auth)
-                                && e.info.api_backend
-                                    == crate::sampling::ApiBackend::CodexResponses
+                                && e.info.api_backend == crate::sampling::ApiBackend::CodexResponses
                                 && crate::agent::config::model_readiness(e).0
                         });
                     not_selectable || stranded_on_ambient_grok
@@ -1658,8 +1655,7 @@ impl ModelsManager {
             let still_missing = {
                 let cat = self.inner.catalog.read();
                 cat.models.get(current.0.as_ref()).is_none_or(|entry| {
-                    !entry.info.user_selectable
-                        || !entry.info.visible_for_auth(is_session_auth)
+                    !entry.info.user_selectable || !entry.info.visible_for_auth(is_session_auth)
                 })
             };
             if !still_missing {

@@ -187,10 +187,7 @@ pub(crate) fn is_campaign_only_flip(
 /// xAI session (not merely `current_or_expired` visibility). Also counts ambient
 /// `XAI_API_KEY` and a non-empty deployment key. Does **not** treat BYOK / Codex
 /// as ambient xAI.
-pub(crate) fn usable_ambient_xai_auth(
-    cfg: &config::Config,
-    has_usable_xai_session: bool,
-) -> bool {
+pub(crate) fn usable_ambient_xai_auth(cfg: &config::Config, has_usable_xai_session: bool) -> bool {
     if has_usable_xai_session {
         return true;
     }
@@ -265,9 +262,7 @@ pub(crate) fn resolve_default_model_with_usable_xai(
         // bundled first-party Grok entry as the implicit default solely because
         // it sorts first and is picker-ready. Prefer a ready Codex account entry.
         if !usable_xai
-            && let Some((key, entry)) = ready_visible
-                .iter()
-                .find(|(_, e)| is_ready_codex_entry(e))
+            && let Some((key, entry)) = ready_visible.iter().find(|(_, e)| is_ready_codex_entry(e))
         {
             tracing::info!(
                 model_id = %entry.model,
@@ -444,8 +439,7 @@ pub(crate) fn resolve_default_model_for_catalog_with_usable_xai(
     authoritative: bool,
     usable_xai: bool,
 ) -> (String, ModelEntry, config::ConfigSource, Option<String>) {
-    let resolved =
-        resolve_default_model_with_usable_xai(cfg, catalog, is_session_auth, usable_xai);
+    let resolved = resolve_default_model_with_usable_xai(cfg, catalog, is_session_auth, usable_xai);
     if !authoritative || catalog.is_empty() {
         return resolved;
     }

@@ -1816,14 +1816,10 @@ mod tests {
     fn codex_web_search_viewer_renders_citations() {
         let mut ws = WebSearchToolCallBlock::new("codex web search");
         ws.content = Some("result body".into());
-        let urls = [
-            "https://example.com/a",
-            "https://docs.openai.com/b",
-        ];
+        let urls = ["https://example.com/a", "https://docs.openai.com/b"];
         ws.citations = urls.iter().map(|s| s.to_string()).collect();
         let entry = ScrollbackEntry::new(RenderBlock::ToolCall(ToolCallBlock::WebSearch(ws)));
-        let viewer =
-            BlockViewerPane::for_web_search(entry.id, &entry).expect("web search viewer");
+        let viewer = BlockViewerPane::for_web_search(entry.id, &entry).expect("web search viewer");
         let plain: String = viewer
             .items
             .iter()

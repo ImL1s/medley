@@ -3341,22 +3341,18 @@ fn test_catalog_auth_schemes_and_override() {
     server_task.abort();
 }
 
-
 // ── #303 Codex-only implicit default ────────────────────────────────
 
 /// Serialize #303 fixtures: they mutate process env (GROK_AUTH_PATH / XAI keys)
 /// and must not interleave.
 static CODEX_ONLY_DEFAULT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-
 /// Build a ready Codex preset entry backed by a live-looking scoped credential.
 ///
 /// Returns an [`EnvGuard`] that pins `GROK_AUTH_PATH` to this fixture's auth
 /// file for the lifetime of the test — required because
 /// `AuthManager::new_openai_codex` prefers that env over `grok_home`.
-fn ready_codex_entry(
-    auth_home: &std::path::Path,
-) -> (ModelEntry, xai_grok_test_support::EnvGuard) {
+fn ready_codex_entry(auth_home: &std::path::Path) -> (ModelEntry, xai_grok_test_support::EnvGuard) {
     use xai_grok_test_support::EnvGuard;
     let auth_path = auth_home.join("auth.json");
     let auth = crate::auth::GrokAuth {
@@ -3417,7 +3413,10 @@ fn codex_only_cold_start_defaults_to_ready_codex() {
 
     let cfg = config::Config::default(); // no explicit preference
     let (key, entry, source, reason) = resolve_default_model(&cfg, &catalog, false);
-    assert!(reason.is_none(), "ready Codex default must not be unready: {reason:?}");
+    assert!(
+        reason.is_none(),
+        "ready Codex default must not be unready: {reason:?}"
+    );
     assert!(
         matches!(source, config::ConfigSource::Default),
         "implicit path reports Default, got {source:?}"
@@ -3522,7 +3521,6 @@ fn codex_ready_reseats_ambient_grok_without_xai_auth() {
         "#303: manager reseat must leave ambient Grok for ready Codex when no usable xAI auth"
     );
 }
-
 
 #[test]
 fn byok_and_auth_scheme_none_unchanged_when_codex_ready() {

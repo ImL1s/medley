@@ -921,10 +921,7 @@ mod tests {
                 ("providerHint".into(), serde_json::json!("xAI")),
             ]),
         );
-        let ready_models = [
-            ("gpt-5.6-sol", "GPT-5.6 Sol"),
-            ("gpt-5.4", "GPT-5.4"),
-        ];
+        let ready_models = [("gpt-5.6-sol", "GPT-5.6 Sol"), ("gpt-5.4", "GPT-5.4")];
         let mut ready_ids: Vec<(acp::ModelId, String)> = Vec::new();
         for (id, name) in ready_models {
             let (mid, info) = model_with_meta(
