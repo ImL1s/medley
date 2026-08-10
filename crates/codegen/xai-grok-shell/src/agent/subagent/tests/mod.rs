@@ -1946,6 +1946,7 @@ enum DurableLegacyResumeScenario {
     ModelConflict,
     RouteDrift,
     CompleteMetadataModelConflict,
+    CompleteMetadataRouteConflict,
 }
 
 async fn run_durable_legacy_resume_scenario(
@@ -2036,7 +2037,16 @@ async fn run_durable_legacy_resume_scenario(
     let complete_metadata = matches!(
         scenario,
         DurableLegacyResumeScenario::CompleteMetadataModelConflict
+            | DurableLegacyResumeScenario::CompleteMetadataRouteConflict
     );
+    let metadata_route = if matches!(
+        scenario,
+        DurableLegacyResumeScenario::CompleteMetadataRouteConflict
+    ) {
+        "metadata-conflicting-route"
+    } else {
+        current_route
+    };
     write_subagent_meta(
         &durable_dir,
         &SubagentMeta {
@@ -2062,7 +2072,7 @@ async fn run_durable_legacy_resume_scenario(
             worktree_path: None,
             snapshot_ref: None,
             effective_model_id: Some(model_id.to_owned()),
-            effective_model_route: complete_metadata.then(|| current_route.to_owned()),
+            effective_model_route: complete_metadata.then(|| metadata_route.to_owned()),
             effective_model_agent_type: complete_metadata.then(|| "codex".to_owned()),
         },
     );
@@ -2158,6 +2168,23 @@ async fn durable_legacy_resume_complete_metadata_conflicting_jsonl_fails_closed(
             assert!(
                 error.contains("metadata conflicts with the durable child session model identity"),
                 "complete metadata must not bypass conflicting durable JSONL: {error}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_legacy_resume_complete_metadata_route_conflict_fails_closed() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let result = run_durable_legacy_resume_scenario(
+                DurableLegacyResumeScenario::CompleteMetadataRouteConflict,
+            )
+            .await;
+            let error = result.error.unwrap_or_default();
+            assert!(
+                error.contains("metadata conflicts with the durable child session route identity"),
+                "complete metadata/JSONL route conflict must fail closed: {error}"
             );
         })
         .await;
