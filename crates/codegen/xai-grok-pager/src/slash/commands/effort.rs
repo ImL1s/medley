@@ -394,22 +394,30 @@ mod tests {
         state.available.insert(id_b.clone(), info_b);
 
         let cmd = EffortCommand;
-        let app_ctx = |models: &ModelState| AppCtx {
-            models,
-            cwd: std::path::Path::new("."),
-            has_session_announcements: false,
-            billing_surface_visible: true,
-            usage_command_visible: true,
-            workflows_available: true,
-            screen_mode: crate::app::ScreenMode::Fullscreen,
-        };
 
         // Seat A
         state.current = Some(id_a.clone());
-        let suggest_a = cmd.suggest_args(&app_ctx(&state), "").expect("A has menu");
-        let ids_a: Vec<_> = suggest_a.iter().map(|i| i.insert_text.as_str()).collect();
-        assert!(ids_a.iter().any(|s| *s == "none"), "A must offer none: {ids_a:?}");
-        assert!(ids_a.iter().any(|s| *s == "high"), "A must offer high: {ids_a:?}");
+        let suggest_a = {
+            let ctx = AppCtx {
+                models: &state,
+                cwd: std::path::Path::new("."),
+                has_session_announcements: false,
+                billing_surface_visible: true,
+                usage_command_visible: true,
+                workflows_available: true,
+                screen_mode: crate::app::ScreenMode::Fullscreen,
+            };
+            cmd.suggest_args(&ctx, "").expect("A has menu")
+        };
+        let ids_a: Vec<String> = suggest_a.iter().map(|i| i.insert_text.clone()).collect();
+        assert!(
+            ids_a.iter().any(|s| s == "none"),
+            "A must offer none: {ids_a:?}"
+        );
+        assert!(
+            ids_a.iter().any(|s| s == "high"),
+            "A must offer high: {ids_a:?}"
+        );
         {
             let mut ctx = dummy_exec_ctx(&state);
             match EffortCommand.run(&mut ctx, "none") {
@@ -423,11 +431,28 @@ mod tests {
 
         // Seat B
         state.current = Some(id_b.clone());
-        let suggest_b = cmd.suggest_args(&app_ctx(&state), "").expect("B has legacy menu");
-        let ids_b: Vec<_> = suggest_b.iter().map(|i| i.insert_text.as_str()).collect();
+        let suggest_b = {
+            let ctx = AppCtx {
+                models: &state,
+                cwd: std::path::Path::new("."),
+                has_session_announcements: false,
+                billing_surface_visible: true,
+                usage_command_visible: true,
+                workflows_available: true,
+                screen_mode: crate::app::ScreenMode::Fullscreen,
+            };
+            cmd.suggest_args(&ctx, "").expect("B has legacy menu")
+        };
+        let ids_b: Vec<String> = suggest_b.iter().map(|i| i.insert_text.clone()).collect();
         assert_ne!(ids_a, ids_b, "suggest lists must differ between A and B");
-        assert!(!ids_b.iter().any(|s| *s == "none"), "B must not offer none: {ids_b:?}");
-        assert!(ids_b.iter().any(|s| *s == "minimal"), "B must offer minimal: {ids_b:?}");
+        assert!(
+            !ids_b.iter().any(|s| s == "none"),
+            "B must not offer none: {ids_b:?}"
+        );
+        assert!(
+            ids_b.iter().any(|s| s == "minimal"),
+            "B must offer minimal: {ids_b:?}"
+        );
         {
             let mut ctx = dummy_exec_ctx(&state);
             match EffortCommand.run(&mut ctx, "minimal") {
