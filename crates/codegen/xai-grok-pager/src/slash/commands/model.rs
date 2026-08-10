@@ -729,9 +729,11 @@ mod tests {
         assert!(item.description.contains(reason));
     }
 
-    /// #306 C-min gate 1: Codex-only boot seats ready Codex as the
-    /// authoritative default; the prompt footer must paint that name and never
-    /// fall through to empty / "unknown" or keep ambient Grok.
+    /// #306 C-min gate 1 (**component presentation** — not cold-boot/ACP
+    /// integration; live TUI release capture still required by #306):
+    /// Codex-only boot seats ready Codex as the authoritative default; the
+    /// prompt footer must paint that name and never fall through to empty /
+    /// "unknown" or keep ambient Grok.
     #[test]
     fn codex_only_boot_footer_uses_authoritative_default_never_unknown() {
         use crate::views::prompt_widget::{PromptInfo, PromptStyle, PromptWidget};
@@ -828,8 +830,10 @@ mod tests {
         );
     }
 
-    /// #306 C-min gate 2: model picker lists live ready Codex and presents
-    /// Grok as unready / missing-cred (dimmed, non-selectable, blocked).
+    /// #306 C-min gate 2 (**component presentation** — staged ModelState, not
+    /// shell/ACP catalog sync; #306 live TUI still open): model picker lists
+    /// live ready Codex and presents Grok as unready / missing-cred (dimmed,
+    /// non-selectable, blocked).
     #[test]
     fn codex_model_picker_lists_live_codex_ready_and_grok_unready() {
         let mut state = ModelState::default();
@@ -897,9 +901,11 @@ mod tests {
         }
     }
 
-    /// #306 gate 3: every ready live Codex in the catalog is selectable
-    /// and seats via `SetDefaultModel`; final footer paints the last selected
-    /// Codex name (never empty/unknown/sibling Grok).
+    /// #306 gate 3 (**component presentation** — synthetic two-model fixture,
+    /// not authoritative account-catalog cardinality; #306 live TUI still
+    /// open): every ready live Codex in the catalog is selectable and seats
+    /// via `SetDefaultModel`; final footer paints the last selected Codex name
+    /// (never empty/unknown/sibling Grok).
     #[test]
     fn codex_model_picker_selects_every_live_catalog_model() {
         use crate::views::prompt_widget::{PromptInfo, PromptStyle, PromptWidget};

@@ -3914,6 +3914,119 @@ fn refreshable_expired_oidc_session_keeps_first_party_when_codex_ready() {
     );
 }
 
+/// Pro P1 stack: `ModelsManager::from_config` (no CLI `--model`) seats ready
+/// OpenAI Codex and produces a CodexResponses sampling config against the
+/// official Codex base URL — not ambient Grok.
+///
+/// Uses production config presets (`merge_openai_codex_presets`) so the Codex
+/// entry is a **canonical** account route; hand-stitched
+/// `AuthProviderRef::openai_codex` on prefetched entries is fail-closed by
+/// `resolve_model_list` outside that profile.
+///
+/// Stops short of a full ACP turn / mock HTTP (still out of residual scope).
+#[test]
+fn codex_only_from_config_seats_codex_and_sampling_stack() {
+    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    use xai_grok_test_support::EnvGuard;
+    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+    let tmp = tempfile::tempdir().expect("temp home");
+    // Live Codex credential file + GROK_AUTH_PATH pin (used by attached
+    // openai-codex manager during resolve_model_list).
+    let (_codex_fixture, _auth_path_pin) = ready_codex_entry(tmp.path());
+    let codex_key = crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string();
+
+    // Prefetch only ambient Grok first — Codex arrives from config presets so
+    // it is marked canonical and keeps a working auth_provider attachment.
+    let mut prefetched: IndexMap<String, ModelEntry> = IndexMap::new();
+    prefetched.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
+
+    // Empty first-party xAI home — no ambient session on the models AuthManager.
+    // Unset GROK_AUTH_PATH only for this AuthManager construction would steal
+    // the Codex pin; instead use a dedicated path that has no xAI entry while
+    // GROK_AUTH_PATH remains the Codex fixture for the provider attach step.
+    let xai_home = tmp.path().join("xai-empty");
+    std::fs::create_dir_all(&xai_home).unwrap();
+    // Build xAI manager against xai_home *without* reading GROK_AUTH_PATH:
+    // temporarily clear, construct, restore via drop order after pin lives.
+    let auth = {
+        let _clear_path = EnvGuard::unset("GROK_AUTH_PATH");
+        Arc::new(AuthManager::new(&xai_home, GrokComConfig::default()))
+    };
+    // Re-pin Codex auth path for resolve_model_list provider attach.
+    let _re_pin = EnvGuard::set(
+        "GROK_AUTH_PATH",
+        tmp.path()
+            .join("auth.json")
+            .to_str()
+            .expect("utf-8 temp path"),
+    );
+    assert!(
+        !auth.has_ambient_first_party_session(),
+        "precondition: no ambient first-party session"
+    );
+
+    // Production config path includes openai-codex presets (not Config::default).
+    let empty = toml::Value::Table(toml::map::Map::new());
+    let cfg = config::Config::new_from_toml_cfg(&empty).expect("empty toml config");
+    assert!(
+        cfg.config_models.contains_key(codex_key.as_str())
+            || cfg
+                .config_models
+                .values()
+                .any(|m| m.model_provider.as_deref()
+                    == Some(crate::agent::model_providers::OPENAI_CODEX_PROVIDER_ID)),
+        "precondition: config must carry openai-codex preset after merge"
+    );
+
+    let mgr = ModelsManager::from_config_with_remote_fetch(&cfg, Some(prefetched), auth, false)
+        .expect("from_config with prefetched catalog must succeed offline");
+
+    assert_eq!(
+        mgr.current_model_id().0.as_ref(),
+        codex_key.as_str(),
+        "from_config cold start without --model must seat ready Codex, not Grok"
+    );
+
+    let models = mgr.models();
+    let current = models
+        .get(codex_key.as_str())
+        .expect("seated Codex remains in catalog");
+    assert!(
+        resolution::is_ready_selectable_openai_codex_entry(current, false),
+        "seated entry must be the shared OpenAI Codex account predicate"
+    );
+    assert!(
+        current.auth_provider.is_some(),
+        "Codex account route carries provider-scoped bearer, not XAI_API_KEY"
+    );
+
+    let sampling = mgr.sampling_config();
+    assert_eq!(
+        sampling.api_backend,
+        crate::sampling::ApiBackend::CodexResponses,
+        "sampling stack must use CodexResponses backend"
+    );
+    assert_eq!(
+        sampling.base_url.trim_end_matches('/'),
+        crate::auth::openai_codex::CODEX_API_BASE_URL.trim_end_matches('/'),
+        "sampling destination must be official Codex API base"
+    );
+    assert_eq!(
+        sampling.model.as_str(),
+        crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID,
+        "sampling model id must match seated catalog wire model"
+    );
+    assert!(
+        !sampling.base_url.is_empty(),
+        "ready Codex sampling config must keep its endpoint"
+    );
+}
+
 /// Pro P1: hard-expired session without complete refresh surface seats Codex.
 #[test]
 fn hard_expired_nonrefreshable_session_seats_codex() {
