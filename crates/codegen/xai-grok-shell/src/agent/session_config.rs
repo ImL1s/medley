@@ -112,6 +112,21 @@ pub(crate) fn build_session_config_options(
         });
     }
 
+    if let Some(active) = current_effort
+        && !effort_options.iter().any(|option| option.value == active)
+    {
+        options.push(SessionConfigOption {
+            id: active.to_string(),
+            category: "mode".to_string(),
+            label: effort_label(active),
+            description: Some(
+                "Active for this running session; no longer offered by the current model catalog"
+                    .to_string(),
+            ),
+            selected: true,
+        });
+    }
+
     options
 }
 
@@ -156,15 +171,30 @@ mod tests {
         assert!(!SELECTABLE_REASONING_EFFORTS.contains(&ReasoningEffort::None));
         let models = [model("grok-build", "Grok Build")];
         let current = acp::ModelId::from("grok-build");
-        let opts = build_session_config_options(
-            &models,
-            &current,
-            &legacy_session_effort_options(),
-            Some(ReasoningEffort::None),
-        );
+        let opts =
+            build_session_config_options(&models, &current, &legacy_session_effort_options(), None);
         let modes: Vec<_> = opts.iter().filter(|o| o.category == "mode").collect();
         assert!(modes.iter().all(|o| o.id != "none"));
         assert!(modes.iter().all(|o| !o.selected));
+    }
+
+    #[test]
+    fn active_none_effort_is_preserved_as_stale_session_mode() {
+        let models = [model("gpt-codex", "GPT Codex")];
+        let current = acp::ModelId::from("gpt-codex");
+        let opts =
+            build_session_config_options(&models, &current, &[], Some(ReasoningEffort::None));
+        let modes: Vec<_> = opts.iter().filter(|o| o.category == "mode").collect();
+        assert_eq!(modes.len(), 1);
+        assert_eq!(modes[0].id, "none");
+        assert_eq!(modes[0].label, "None");
+        assert!(modes[0].selected);
+        assert!(
+            modes[0]
+                .description
+                .as_deref()
+                .is_some_and(|description| description.contains("no longer offered"))
+        );
     }
 
     #[test]

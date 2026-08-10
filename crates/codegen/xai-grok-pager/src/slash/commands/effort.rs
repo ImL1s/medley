@@ -157,11 +157,11 @@ mod tests {
         match result {
             CommandResult::Error(msg) => {
                 assert!(msg.contains("Usage: /effort"));
-                // Legacy menu option ids only — not none/minimal.
-                assert!(msg.contains("xhigh|high|medium|low"), "msg={msg}");
+                // Legacy menu option ids only — `none` still requires an
+                // explicit server menu, while Minimal is a legacy level.
+                assert!(msg.contains("xhigh|high|medium|low|minimal"), "msg={msg}");
                 assert!(msg.contains("current: medium"));
                 assert!(!msg.contains("none"));
-                assert!(!msg.contains("minimal"));
             }
             other => panic!("expected Error, got {other:?}"),
         }
@@ -181,7 +181,7 @@ mod tests {
                 assert!(msg.contains("use one of:"), "msg={msg}");
                 assert!(msg.contains("xhigh"), "msg={msg}");
                 assert!(!msg.contains("none"), "msg={msg}");
-                assert!(!msg.contains("minimal"), "msg={msg}");
+                assert!(msg.contains("minimal"), "msg={msg}");
             }
             other => panic!("expected Error, got {other:?}"),
         }
@@ -205,37 +205,32 @@ mod tests {
     }
 
     #[test]
-    fn none_and_minimal_rejected_when_model_menu_omits_them() {
-        // Legacy fallback menu is low..xhigh — `none`/`minimal` used to pass
-        // through and 400 on grok-4.5; reject at the TUI instead.
+    fn menu_less_reasoning_model_accepts_minimal_but_rejects_none_in_effort_command() {
+        // The menu-less fallback preserves legacy Minimal. `none` remains
+        // server-advertised only, so it is still rejected here.
         let mut state = ModelState::default();
         let (id, info) = model_with_reasoning("reasoning-x", "Reasoning X");
         state.available.insert(id.clone(), info);
-        state.current = Some(id);
+        state.current = Some(id.clone());
         let mut ctx = dummy_exec_ctx(&state);
-        for token in ["none", "minimal"] {
-            let result = EffortCommand.run(&mut ctx, token);
-            match result {
-                CommandResult::Error(ref msg) => {
-                    assert!(
-                        msg.contains(&format!("unknown effort level '{token}'")),
-                        "expected Error for {token}, got {msg}"
-                    );
-                    // Must not re-advertise the rejected token as a valid choice
-                    // (aside from quoting it in "unknown effort level '…'").
-                    let after_prefix = msg
-                        .split_once("; ")
-                        .map(|(_, rest)| rest)
-                        .unwrap_or(msg.as_str());
-                    assert!(
-                        !after_prefix.contains(token),
-                        "error must not list {token} as offered: {msg}"
-                    );
-                    assert!(!msg.contains("unset"), "msg={msg}");
-                }
-                other => panic!("expected Error for {token}, got {other:?}"),
+        match EffortCommand.run(&mut ctx, "minimal") {
+            CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+                assert_eq!(model_id, id);
+                assert_eq!(effort, Some(ReasoningEffort::Minimal));
             }
+            other => panic!("expected SwitchModel with minimal, got {other:?}"),
         }
+
+        let CommandResult::Error(msg) = EffortCommand.run(&mut ctx, "none") else {
+            panic!("expected Error for none");
+        };
+        assert!(msg.contains("unknown effort level 'none'"), "msg={msg}");
+        let after_prefix = msg
+            .split_once("; ")
+            .map(|(_, rest)| rest)
+            .unwrap_or(msg.as_str());
+        assert!(!after_prefix.contains("none"), "msg={msg}");
+        assert!(!msg.contains("unset"), "msg={msg}");
     }
 
     #[test]

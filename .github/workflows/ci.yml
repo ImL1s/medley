@@ -1500,6 +1500,59 @@ jobs:
           # #245: catalog wire flags that differ from the Sol preset must parse.
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_parser_reads_wire_capabilities_that_differ_from_the_preset -- --nocapture
+          # #261: catalog reasoning menus must reach ACP and remain model-specific in the TUI.
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_supported_reasoning_levels_drive_acp_effort_options -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_default_reasoning_level_must_belong_to_supported_levels -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            current_reasoning_effort_rejects_persisted_value_outside_model_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_metadata_override_can_disable_reasoning_effort -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_metadata_override_rejects_default_outside_inherited_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            catalog_refresh_clears_current_effort_removed_from_model_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            config_refresh_clears_current_effort_removed_from_model_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            model_switch_rejects_effort_outside_model_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            unconditional_default_reselection_revalidates_current_effort -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            session_model_effort_validation_uses_requested_model_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            menu_less_reasoning_model_accepts_legacy_minimal_effort -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            rebuild_revalidates_current_reasoning_effort -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_metadata_override_keeps_default_without_inherited_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_metadata_narrower_menu_reconciles_scalar_end_to_end -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_explicit_empty_reasoning_menu_disables_unclaimed_scalar_end_to_end -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            model_state_prefers_session_reasoning_effort_over_global -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            active_none_effort_is_preserved_as_stale_session_mode -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            stale_effort_revalidation_does_not_clear_newer_selection -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            subagent_reasoning_override_obeys_authoritative_model_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            subagent_reasoning_override_uses_legacy_menu_when_catalog_menu_is_absent -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            inherited_subagent_effort_reconciles_after_catalog_refresh -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            resolve_model_override_prepared_carries_authoritative_reasoning_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            session_config_preserves_resident_effort_after_catalog_disables_reasoning -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            menu_less_reasoning_model_accepts_minimal_but_rejects_none_in_effort_command -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            deferred_cli_accepts_minimal_for_menu_less_reasoning_model -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            codex_catalog_effort_options_are_model_specific -- --nocapture
 
       # #36: restore fd bundling only with a public PI caller and contract.
       # The tests are split by build mode: override-path bundle and release

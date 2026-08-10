@@ -755,14 +755,274 @@ fn current_reasoning_effort_seeded_from_config() {
     let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
     let mut cfg = config::Config::default();
     cfg.models.default_reasoning_effort = Some(ReasoningEffort::Xhigh);
+    let mut entry = ModelEntry {
+        info: config::ModelInfo::fallback("default"),
+        api_key: None,
+        env_key: None,
+        auth_provider: None,
+        api_base_url: None,
+        config_validation_errors: Vec::new(),
+    };
+    entry.info.supports_reasoning_effort = true;
+    entry.info.reasoning_efforts = vec![ReasoningEffortOption {
+        id: "xhigh".into(),
+        value: ReasoningEffort::Xhigh,
+        label: "Extra high".into(),
+        description: None,
+        default: true,
+    }];
     let mgr = ModelsManager::new(
         None,
-        IndexMap::new(),
+        IndexMap::from([("default".to_string(), entry)]),
         acp::ModelId::new("default"),
         auth_manager,
         cfg,
     );
     assert_eq!(mgr.current_reasoning_effort(), Some(ReasoningEffort::Xhigh),);
+}
+
+#[test]
+fn current_reasoning_effort_rejects_persisted_value_outside_model_menu() {
+    let tmp = std::env::temp_dir().join("grok-test-models-manager-invalid-seed");
+    let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
+    let mut cfg = config::Config::default();
+    cfg.models.default_reasoning_effort = Some(ReasoningEffort::Xhigh);
+    let mut entry = ModelEntry {
+        info: config::ModelInfo::fallback("default"),
+        api_key: None,
+        env_key: None,
+        auth_provider: None,
+        api_base_url: None,
+        config_validation_errors: Vec::new(),
+    };
+    entry.info.supports_reasoning_effort = true;
+    entry.info.reasoning_efforts = vec![ReasoningEffortOption {
+        id: "low".into(),
+        value: ReasoningEffort::Low,
+        label: "Low".into(),
+        description: None,
+        default: true,
+    }];
+    let mgr = ModelsManager::new(
+        None,
+        IndexMap::from([("default".to_string(), entry)]),
+        acp::ModelId::new("default"),
+        auth_manager,
+        cfg,
+    );
+    assert_eq!(
+        mgr.current_reasoning_effort(),
+        None,
+        "a persisted tier removed from the current model's menu must not seed the session",
+    );
+}
+
+fn reasoning_entry_with_menu(model: &str, effort: ReasoningEffort) -> (String, ModelEntry) {
+    let mut entry = ModelEntry {
+        info: config::ModelInfo::fallback(model),
+        api_key: None,
+        env_key: None,
+        auth_provider: None,
+        api_base_url: None,
+        config_validation_errors: Vec::new(),
+    };
+    entry.info.supports_reasoning_effort = true;
+    entry.info.reasoning_efforts = vec![ReasoningEffortOption {
+        id: effort.to_string(),
+        value: effort,
+        label: effort.to_string(),
+        description: None,
+        default: true,
+    }];
+    entry.info.reasoning_effort = Some(effort);
+    (model.to_owned(), entry)
+}
+
+#[test]
+fn catalog_refresh_clears_current_effort_removed_from_model_menu() {
+    let mgr = test_manager();
+    mgr.set_current_reasoning_effort(Some(ReasoningEffort::High));
+    mgr.apply_catalog_for_test(IndexMap::from([reasoning_entry_with_menu(
+        "default",
+        ReasoningEffort::Low,
+    )]));
+    assert_eq!(mgr.current_reasoning_effort(), None);
+}
+
+#[test]
+fn stale_effort_revalidation_does_not_clear_newer_selection() {
+    let mgr = test_manager();
+    let validated_model = mgr.current_model_id();
+    mgr.set_current_reasoning_effort(Some(ReasoningEffort::High));
+
+    // Deterministic interleaving: validation captured A/high, then a switch
+    // committed B/high before the invalid result attempted its conditional
+    // clear. Comparing only the effort would incorrectly clear B's selection.
+    mgr.set_current_model_id(acp::ModelId::new("grok-4"));
+    mgr.set_current_reasoning_effort(Some(ReasoningEffort::High));
+    mgr.clear_reasoning_effort_if_selection_unchanged(&validated_model, ReasoningEffort::High);
+
+    assert_eq!(
+        mgr.current_reasoning_effort(),
+        Some(ReasoningEffort::High),
+        "a refresh validating A/high must not clobber a newer B/high selection"
+    );
+}
+
+#[test]
+fn config_refresh_clears_current_effort_removed_from_model_menu() {
+    let tmp = std::env::temp_dir().join("grok-test-models-manager-config-effort-refresh");
+    let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
+    let mgr = ModelsManager::new(
+        None,
+        IndexMap::from([reasoning_entry_with_menu("default", ReasoningEffort::High)]),
+        acp::ModelId::new("default"),
+        auth_manager,
+        config::Config::default(),
+    );
+    mgr.set_current_reasoning_effort(Some(ReasoningEffort::High));
+
+    let mut new_config = config::Config::default();
+    new_config.config_models.insert(
+        "default".to_owned(),
+        config::ConfigModelOverride {
+            supports_reasoning_effort: Some(true),
+            reasoning_effort: Some(ReasoningEffort::Low),
+            reasoning_efforts: vec![ReasoningEffortOption {
+                id: "low".into(),
+                value: ReasoningEffort::Low,
+                label: "Low".into(),
+                description: None,
+                default: true,
+            }],
+            ..Default::default()
+        },
+    );
+    mgr.apply_config(new_config);
+    assert_eq!(mgr.current_reasoning_effort(), None);
+}
+
+#[test]
+fn unconditional_default_reselection_revalidates_current_effort() {
+    let tmp = std::env::temp_dir().join("grok-test-models-manager-default-effort-reselect");
+    let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
+    let mut cfg = config::Config::default();
+    cfg.models.default = Some("model-b".to_owned());
+    for (model, effort) in [
+        ("model-a", ReasoningEffort::High),
+        ("model-b", ReasoningEffort::Low),
+    ] {
+        cfg.config_models.insert(
+            model.to_owned(),
+            config::ConfigModelOverride {
+                model: Some(model.to_owned()),
+                supports_reasoning_effort: Some(true),
+                reasoning_effort: Some(effort),
+                reasoning_efforts: vec![ReasoningEffortOption {
+                    id: effort.to_string(),
+                    value: effort,
+                    label: effort.to_string(),
+                    description: None,
+                    default: true,
+                }],
+                ..Default::default()
+            },
+        );
+    }
+    let initial_models = resolve_model_catalog(&cfg, None);
+    let mgr = ModelsManager::new(
+        None,
+        initial_models,
+        acp::ModelId::new("model-a"),
+        auth_manager,
+        cfg.clone(),
+    );
+    mgr.set_current_reasoning_effort(Some(ReasoningEffort::High));
+
+    mgr.apply_config_reselecting_default(cfg);
+
+    assert_eq!(mgr.current_model_id(), acp::ModelId::new("model-b"));
+    assert_eq!(mgr.current_reasoning_effort(), None);
+}
+
+#[test]
+fn session_model_effort_validation_uses_requested_model_menu() {
+    let tmp = std::env::temp_dir().join("grok-test-models-manager-session-effort");
+    let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
+    let models = IndexMap::from([
+        reasoning_entry_with_menu("model-a", ReasoningEffort::Xhigh),
+        reasoning_entry_with_menu("model-b", ReasoningEffort::Low),
+    ]);
+    let mgr = ModelsManager::new(
+        None,
+        models,
+        acp::ModelId::new("model-a"),
+        auth_manager,
+        config::Config::default(),
+    );
+
+    assert!(mgr.model_offers_reasoning_effort("model-a", ReasoningEffort::Xhigh));
+    assert!(
+        !mgr.model_offers_reasoning_effort("model-b", ReasoningEffort::Xhigh),
+        "a custom session model must not inherit an effort offered only by the manager's current model"
+    );
+}
+
+#[test]
+fn menu_less_reasoning_model_accepts_legacy_minimal_effort() {
+    let tmp = std::env::temp_dir().join("grok-test-models-manager-minimal-effort");
+    let auth_manager = Arc::new(AuthManager::new(&tmp, GrokComConfig::default()));
+    let mut entry = ModelEntry {
+        info: config::ModelInfo::fallback("legacy-reasoning"),
+        api_key: None,
+        env_key: None,
+        auth_provider: None,
+        api_base_url: None,
+        config_validation_errors: Vec::new(),
+    };
+    entry.info.supports_reasoning_effort = true;
+    entry.info.reasoning_efforts.clear();
+    let mut cfg = config::Config::default();
+    cfg.models.default_reasoning_effort = Some(ReasoningEffort::Minimal);
+    let mgr = ModelsManager::new(
+        None,
+        IndexMap::from([("legacy-reasoning".to_string(), entry)]),
+        acp::ModelId::new("legacy-reasoning"),
+        auth_manager,
+        cfg,
+    );
+
+    assert!(mgr.model_offers_reasoning_effort("legacy-reasoning", ReasoningEffort::Minimal));
+    assert_eq!(
+        mgr.current_reasoning_effort(),
+        Some(ReasoningEffort::Minimal)
+    );
+}
+
+#[test]
+fn rebuild_revalidates_current_reasoning_effort() {
+    let mut cfg = config::Config::default();
+    cfg.config_models.insert(
+        "default".to_string(),
+        config::ConfigModelOverride {
+            model: Some("default".to_string()),
+            supports_reasoning_effort: Some(true),
+            reasoning_efforts: vec![ReasoningEffortOption {
+                id: "low".to_string(),
+                value: ReasoningEffort::Low,
+                label: "Low".to_string(),
+                description: None,
+                default: true,
+            }],
+            ..Default::default()
+        },
+    );
+    let mgr = test_manager();
+    mgr.set_current_reasoning_effort(Some(ReasoningEffort::High));
+
+    mgr.rebuild(&cfg, None);
+
+    assert_eq!(mgr.current_reasoning_effort(), None);
 }
 
 #[test]
@@ -811,6 +1071,39 @@ fn default_reasoning_effort_only_stamps_supporting_model() {
     assert_eq!(
         catalog["plain-model"].info.reasoning_effort, None,
         "non-reasoning default model must NOT be stamped with persisted effort",
+    );
+
+    let mut cfg = config::Config::default();
+    cfg.models.default = Some("limited-model".to_string());
+    cfg.models.default_reasoning_effort = Some(ReasoningEffort::High);
+    let mut limited_entry = ModelEntry {
+        info: config::ModelInfo::fallback("limited-model"),
+        api_key: None,
+        env_key: None,
+        auth_provider: None,
+        api_base_url: None,
+        config_validation_errors: Vec::new(),
+    };
+    limited_entry.info.supports_reasoning_effort = true;
+    limited_entry.info.reasoning_efforts = vec![ReasoningEffortOption {
+        id: "low".into(),
+        value: ReasoningEffort::Low,
+        label: "Low".into(),
+        description: None,
+        default: true,
+    }];
+    limited_entry.info.reasoning_effort = Some(ReasoningEffort::Low);
+    let catalog = resolve_model_catalog(
+        &cfg,
+        Some(IndexMap::from([(
+            "limited-model".to_string(),
+            limited_entry,
+        )])),
+    );
+    assert_eq!(
+        catalog["limited-model"].info.reasoning_effort,
+        Some(ReasoningEffort::Low),
+        "a persisted tier outside the advertised menu must not replace the catalog default",
     );
 }
 
@@ -1481,9 +1774,11 @@ fn clear_resets_has_fetched_real_catalog() {
     let prefetched = make_prefetched(&["grok-3", "grok-4"]);
     mgr.apply_refresh_result(&cfg, Some(prefetched), None);
     assert!(mgr.has_fetched_real_catalog());
+    mgr.set_current_reasoning_effort(Some(ReasoningEffort::High));
 
     mgr.clear();
     assert!(!mgr.has_fetched_real_catalog());
+    assert_eq!(mgr.current_reasoning_effort(), None);
 
     let prefetched = make_prefetched(&["grok-4.5", "grok-4.3"]);
     mgr.apply_refresh_result(&cfg, Some(prefetched), None);

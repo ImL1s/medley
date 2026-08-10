@@ -3760,15 +3760,19 @@ impl MvpAgent {
             .values()
             .cloned()
             .collect();
-        let override_effort = session_id
+        let session_effort = session_id
             .and_then(|sid| self.resident_handle(sid).map(|h| h.reasoning_effort))
-            .flatten()
-            .or_else(|| self.models_manager.current_reasoning_effort());
+            .flatten();
+        let override_effort =
+            session_effort.or_else(|| self.models_manager.current_reasoning_effort());
         if let Some(override_effort) = override_effort
             && let Some(info) = available_models
                 .iter_mut()
                 .find(|info| info.model_id == model_id)
-            && supports_reasoning_effort_meta(info.meta.as_ref())
+            && (session_effort == Some(override_effort)
+                || self
+                    .models_manager
+                    .model_offers_reasoning_effort(model_id.0.as_ref(), override_effort))
         {
             let mut map = info.meta.clone().unwrap_or_default();
             map.insert(
@@ -3804,19 +3808,29 @@ impl MvpAgent {
         } else {
             Vec::new()
         };
-        let current_effort = if supports_effort {
-            session_id
-                .and_then(|sid| self.resident_handle(sid).map(|h| h.reasoning_effort))
-                .flatten()
-                .or_else(|| self.models_manager.current_reasoning_effort())
-                .or_else(|| {
-                    self
-                        .models_manager
-                        .model_default_reasoning_effort(model_id.0.as_ref())
+        // A resident actor's sampling config is immutable for its lifetime.
+        // Preserve that actual effort even if a later catalog refresh disables
+        // reasoning; only process-global/default fallbacks obey the live gate.
+        let session_effort = session_id
+            .and_then(|sid| self.resident_handle(sid).map(|h| h.reasoning_effort))
+            .flatten();
+        let current_effort = session_effort.or_else(|| {
+            supports_effort
+                .then(|| {
+                let selected = self
+                    .models_manager
+                    .current_reasoning_effort()
+                    .or_else(|| {
+                        self.models_manager
+                            .model_default_reasoning_effort(model_id.0.as_ref())
+                    });
+                selected.filter(|effort| {
+                    self.models_manager
+                        .model_offers_reasoning_effort(model_id.0.as_ref(), *effort)
                 })
-        } else {
-            None
-        };
+                })
+                .flatten()
+        });
         session_config::build_session_config_options(
             &state.available_models,
             &model_id,

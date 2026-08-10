@@ -122,6 +122,7 @@ pub(crate) struct ResolvedModelCapabilities {
     pub agent_type: String,
     pub auth_scheme: xai_grok_sampler::AuthScheme,
     pub supports_reasoning_effort: bool,
+    pub reasoning_efforts: Vec<ReasoningEffortOption>,
     pub supports_backend_search: bool,
     pub auto_compact_threshold_percent: Option<u8>,
     pub compactions_remaining: Option<xai_grok_sampling_types::CompactionsRemaining>,
@@ -252,7 +253,11 @@ impl ModelsManagerBuilder {
     pub(crate) fn build(self) -> ModelsManager {
         let has_session = self.auth_manager.current_or_expired().is_some();
         let fetch_auth = ModelFetchAuth::resolve(&self.cfg.endpoints, has_session);
-        let current_reasoning_effort = self.cfg.models.default_reasoning_effort;
+        let current_reasoning_effort = self.cfg.models.default_reasoning_effort.filter(|effort| {
+            resolve_catalog_key(&self.models, &self.current_model_id)
+                .and_then(|model_id| self.models.get(model_id.0.as_ref()))
+                .is_some_and(|entry| model_offers_reasoning_effort(&entry.info, *effort))
+        });
         ModelsManager {
             inner: Arc::new(Inner {
                 catalog: RwLock::new(CatalogState {
@@ -326,6 +331,7 @@ pub(crate) fn capabilities_for_route_in(
         agent_type: info.agent_type.clone(),
         auth_scheme: info.auth_scheme,
         supports_reasoning_effort: info.supports_reasoning_effort,
+        reasoning_efforts: info.reasoning_efforts.clone(),
         supports_backend_search: info.supports_backend_search,
         auto_compact_threshold_percent: info.auto_compact_threshold_percent,
         compactions_remaining: info.compactions_remaining,
@@ -533,6 +539,7 @@ impl ModelsManager {
         } else {
             self.reselect_current_model_if_missing(&new_config);
         }
+        self.revalidate_current_reasoning_effort();
 
         self.notify_models_updated();
     }
@@ -541,6 +548,7 @@ impl ModelsManager {
     pub(crate) fn apply_config_reselecting_default(&self, new_config: config::Config) {
         self.apply_config(new_config.clone());
         self.reselect_default_model(&new_config);
+        self.revalidate_current_reasoning_effort();
         self.notify_models_updated();
     }
 
@@ -742,6 +750,42 @@ impl ModelsManager {
         *self.inner.current_reasoning_effort.write() = effort;
     }
 
+    fn revalidate_current_reasoning_effort(&self) {
+        let Some(effort) = self.current_reasoning_effort() else {
+            return;
+        };
+        let current_model_id = self.inner.current_model_id.read().clone();
+        let is_valid = {
+            let catalog = self.inner.catalog.read();
+            resolve_catalog_key(&catalog.models, &current_model_id)
+                .and_then(|model_id| catalog.models.get(model_id.0.as_ref()))
+                .is_some_and(|entry| model_offers_reasoning_effort(&entry.info, effort))
+        };
+        if !is_valid {
+            self.clear_reasoning_effort_if_selection_unchanged(&current_model_id, effort);
+        }
+    }
+
+    fn clear_reasoning_effort_if_selection_unchanged(
+        &self,
+        expected_model_id: &acp::ModelId,
+        expected_effort: ReasoningEffort,
+    ) {
+        // Keep the model read guard through the conditional effort write. A
+        // concurrent A/high -> B/high switch otherwise defeats an effort-only
+        // CAS because the value is unchanged even though the selection is new.
+        // Model switching never holds the model lock while taking the effort
+        // lock, so this ordering cannot invert that path.
+        let current_model_id = self.inner.current_model_id.read();
+        if *current_model_id != *expected_model_id {
+            return;
+        }
+        let mut current_effort = self.inner.current_reasoning_effort.write();
+        if *current_effort == Some(expected_effort) {
+            *current_effort = None;
+        }
+    }
+
     /// Whether the given model supports reasoning effort according to the catalog.
     pub(crate) fn model_supports_reasoning_effort(&self, model_id: &str) -> bool {
         self.inner
@@ -751,6 +795,17 @@ impl ModelsManager {
             .get(model_id)
             .map(|e| e.info().supports_reasoning_effort)
             .unwrap_or(false)
+    }
+
+    pub(crate) fn model_offers_reasoning_effort(
+        &self,
+        model_id: &str,
+        effort: ReasoningEffort,
+    ) -> bool {
+        let catalog = self.inner.catalog.read();
+        resolve_catalog_key(&catalog.models, &acp::ModelId::new(model_id))
+            .and_then(|resolved_id| catalog.models.get(resolved_id.0.as_ref()))
+            .is_some_and(|entry| model_offers_reasoning_effort(&entry.info, effort))
     }
 
     pub(crate) fn model_default_reasoning_effort(&self, model_id: &str) -> Option<ReasoningEffort> {
@@ -879,6 +934,7 @@ impl ModelsManager {
         // dropped its subject (#159 F1).
         self.inner.catalog.write().models = resolve_model_catalog(cfg, prefetched);
         self.bump_catalog_generation();
+        self.revalidate_current_reasoning_effort();
     }
 
     /// Refresh models when the etag changes.
@@ -1175,6 +1231,9 @@ impl ModelsManager {
     /// Wipe in-memory state so a previous identity's catalog doesn't leak.
     fn clear(&self) {
         *self.inner.catalog.write() = CatalogState::default();
+        // The previous identity's model capability must not remain a future
+        // session default while the replacement catalog is still loading.
+        *self.inner.current_reasoning_effort.write() = None;
         // A new identity starts fresh: drop the prior user's pick so its
         // first catalog reselects that identity's default.
         self.inner
@@ -1468,6 +1527,7 @@ impl ModelsManager {
         } else {
             self.reselect_current_model_if_missing(cfg);
         }
+        self.revalidate_current_reasoning_effort();
     }
 
     fn apply_refresh_result(
