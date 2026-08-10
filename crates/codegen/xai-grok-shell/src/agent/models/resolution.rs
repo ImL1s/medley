@@ -177,10 +177,72 @@ pub(crate) fn is_campaign_only_flip(
 /// The fourth return value is `Some(reason)` when an *explicit* configured
 /// preference is present in the catalog but unusable (#131): the id is kept
 /// (no silent substitute) and callers surface the readiness reason.
+/// Whether ambient first-party xAI auth can actually sample right now.
+///
+/// Used only for **implicit** default selection (#303). Does not change
+/// [`crate::agent::config::model_readiness`] (first-party entries stay
+/// picker-ready without a live credential for login UX).
+///
+/// `has_usable_xai_session` must mean a **non-expired, sample-ready** first-party
+/// xAI session (not merely `current_or_expired` visibility). Also counts ambient
+/// `XAI_API_KEY` and a non-empty deployment key. Does **not** treat BYOK / Codex
+/// as ambient xAI.
+pub(crate) fn usable_ambient_xai_auth(
+    cfg: &config::Config,
+    has_usable_xai_session: bool,
+) -> bool {
+    if has_usable_xai_session {
+        return true;
+    }
+    if crate::agent::auth_method::has_xai_api_key_env() {
+        return true;
+    }
+    cfg.endpoints
+        .deployment_key
+        .as_ref()
+        .is_some_and(|k| !k.trim().is_empty())
+}
+
+/// True when this catalog entry is a ready OpenAI Codex Responses route.
+fn is_ready_codex_entry(entry: &ModelEntry) -> bool {
+    entry.info.api_backend == crate::sampling::ApiBackend::CodexResponses
+        && crate::agent::config::model_readiness(entry).0
+}
+
+/// Bundled / ambient first-party xAI entry (no own credential, first-party origin).
+///
+/// Used to narrow #303 reseat so BYOK / `auth_scheme=none` / third-party routes
+/// are not yanked when a ready Codex catalog appears.
+pub(crate) fn is_first_party_ambient_xai_entry(entry: &ModelEntry) -> bool {
+    if entry.info.api_backend == crate::sampling::ApiBackend::CodexResponses {
+        return false;
+    }
+    if entry.has_own_credentials() {
+        return false;
+    }
+    if entry.info.auth_scheme == xai_grok_sampler::AuthScheme::None {
+        return false;
+    }
+    crate::util::is_xai_api_bearer_url(&entry.info.base_url)
+}
+
 pub(crate) fn resolve_default_model(
     cfg: &config::Config,
     catalog: &IndexMap<String, ModelEntry>,
     is_session_auth: bool,
+) -> (String, ModelEntry, config::ConfigSource, Option<String>) {
+    // Test / simple callers: treat OAuth-visible session as usable. Production
+    // `ModelsManager` paths use [`resolve_default_model_with_usable_xai`] with a
+    // non-expired usable-token probe so hard-expired sessions do not pin Grok.
+    let usable_xai = usable_ambient_xai_auth(cfg, is_session_auth);
+    resolve_default_model_with_usable_xai(cfg, catalog, is_session_auth, usable_xai)
+}
+
+pub(crate) fn resolve_default_model_with_usable_xai(
+    cfg: &config::Config,
+    catalog: &IndexMap<String, ModelEntry>,
+    is_session_auth: bool,
+    usable_xai: bool,
 ) -> (String, ModelEntry, config::ConfigSource, Option<String>) {
     // Visible ≠ ready (#133/#131): auth-gated listing must not collapse onto
     // the readiness bool. Ready entries are a separate filter used only when
@@ -199,6 +261,20 @@ pub(crate) fn resolve_default_model(
     let model_pref = configured_preference(cfg);
 
     let first_or_fallback = || -> (String, ModelEntry) {
+        // #303: when there is no usable ambient xAI credential, do not seat the
+        // bundled first-party Grok entry as the implicit default solely because
+        // it sorts first and is picker-ready. Prefer a ready Codex account entry.
+        if !usable_xai
+            && let Some((key, entry)) = ready_visible
+                .iter()
+                .find(|(_, e)| is_ready_codex_entry(e))
+        {
+            tracing::info!(
+                model_id = %entry.model,
+                "no usable ambient xAI auth; seating first ready Codex default"
+            );
+            return (key.clone(), entry.clone());
+        }
         if let Some((key, first)) = ready_visible.first() {
             return (key.clone(), first.clone());
         }
@@ -351,7 +427,25 @@ pub(crate) fn resolve_default_model_for_catalog(
     is_session_auth: bool,
     authoritative: bool,
 ) -> (String, ModelEntry, config::ConfigSource, Option<String>) {
-    let resolved = resolve_default_model(cfg, catalog, is_session_auth);
+    let usable_xai = usable_ambient_xai_auth(cfg, is_session_auth);
+    resolve_default_model_for_catalog_with_usable_xai(
+        cfg,
+        catalog,
+        is_session_auth,
+        authoritative,
+        usable_xai,
+    )
+}
+
+pub(crate) fn resolve_default_model_for_catalog_with_usable_xai(
+    cfg: &config::Config,
+    catalog: &IndexMap<String, ModelEntry>,
+    is_session_auth: bool,
+    authoritative: bool,
+    usable_xai: bool,
+) -> (String, ModelEntry, config::ConfigSource, Option<String>) {
+    let resolved =
+        resolve_default_model_with_usable_xai(cfg, catalog, is_session_auth, usable_xai);
     if !authoritative || catalog.is_empty() {
         return resolved;
     }

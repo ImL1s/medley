@@ -438,8 +438,21 @@ impl ModelsManager {
             validate_selectable(cfg, &catalog)?;
         }
 
+        let usable_xai = {
+            let has_usable_xai_session = auth_manager.has_usable_token()
+                && auth_manager
+                    .current()
+                    .is_some_and(|a| a.is_session_auth());
+            resolution::usable_ambient_xai_auth(cfg, has_usable_xai_session)
+        };
         let (current_model_key, current_model, model_source, unready_default_reason) =
-            resolve_default_model_for_catalog(cfg, &catalog, is_session_auth, has_prefetched);
+            resolve_default_model_for_catalog_with_usable_xai(
+                cfg,
+                &catalog,
+                is_session_auth,
+                has_prefetched,
+                usable_xai,
+            );
 
         if let Some(reason) = &unready_default_reason {
             tracing::error!(
@@ -588,6 +601,20 @@ impl ModelsManager {
             .auth_manager
             .current_or_expired()
             .is_some_and(|a| a.is_session_auth())
+    }
+
+    /// Sample-ready ambient xAI for #303 default selection (not catalog visibility).
+    ///
+    /// Uses a **non-expired** usable token + first-party session shape, ambient
+    /// `XAI_API_KEY`, or deployment key — never bare `current_or_expired`.
+    fn usable_ambient_xai(&self, cfg: &config::Config) -> bool {
+        let has_usable_xai_session = self.inner.auth_manager.has_usable_token()
+            && self
+                .inner
+                .auth_manager
+                .current()
+                .is_some_and(|a| a.is_session_auth());
+        resolution::usable_ambient_xai_auth(cfg, has_usable_xai_session)
     }
 
     /// Whether a Codex-backed model is actually reachable: holding a live
@@ -1571,25 +1598,41 @@ impl ModelsManager {
     /// campaign-only preferred flips from yanking a live session.
     fn reselect_current_model_if_missing(&self, config: &config::Config) {
         let current = self.inner.current_model_id.read().clone();
+        let is_session_auth = self.is_session_auth();
+        let usable_xai = self.usable_ambient_xai(config);
         let needs_reselection = {
             let cat = self.inner.catalog.read();
             let models = &cat.models;
             match models.get(current.0.as_ref()) {
                 None => true,
                 Some(entry) => {
-                    !entry.info.user_selectable
-                        || !entry.info.visible_for_auth(self.is_session_auth())
+                    let not_selectable = !entry.info.user_selectable
+                        || !entry.info.visible_for_auth(is_session_auth);
+                    // #303: only yank first-party ambient Grok/sentinel when a
+                    // ready Codex route exists — never BYOK / auth_scheme=none
+                    // / third-party ready models.
+                    let stranded_on_ambient_grok = !usable_xai
+                        && resolution::is_first_party_ambient_xai_entry(entry)
+                        && models.values().any(|e| {
+                            e.info.user_selectable
+                                && e.info.visible_for_auth(is_session_auth)
+                                && e.info.api_backend
+                                    == crate::sampling::ApiBackend::CodexResponses
+                                && crate::agent::config::model_readiness(e).0
+                        });
+                    not_selectable || stranded_on_ambient_grok
                 }
             }
         };
         let (key, _, source, _) = {
             let cat = self.inner.catalog.read();
             let models = &cat.models;
-            resolve_default_model_for_catalog(
+            resolve_default_model_for_catalog_with_usable_xai(
                 config,
                 models,
-                self.is_session_auth(),
+                is_session_auth,
                 cat.has_fetched_real_catalog,
+                usable_xai,
             )
         };
         let user_picked = self.inner.user_selected_model.load(Ordering::Relaxed);
@@ -1598,6 +1641,9 @@ impl ModelsManager {
         // this gate, a campaign-only preferred flip (which deliberately takes
         // this method rather than reselect_default_model) would yank a live
         // session onto the pushed default.
+        //
+        // #303 strand reseat is an exception: it must not require a prior
+        // substitution verdict (login skip leaves Grok seated with none).
         let had_substitution = self.substituted_preference().is_some();
         let honour_explicit_preference = had_substitution
             && !user_picked
@@ -1606,6 +1652,19 @@ impl ModelsManager {
         self.record_substituted_preference(config, source);
         if !needs_reselection && !honour_explicit_preference {
             return;
+        }
+        // User-picked models stay put even under Codex-only (#131 family).
+        if user_picked && !honour_explicit_preference {
+            let still_missing = {
+                let cat = self.inner.catalog.read();
+                cat.models.get(current.0.as_ref()).is_none_or(|entry| {
+                    !entry.info.user_selectable
+                        || !entry.info.visible_for_auth(is_session_auth)
+                })
+            };
+            if !still_missing {
+                return;
+            }
         }
         let new_id = acp::ModelId::new(Arc::from(key));
         if honour_explicit_preference && !needs_reselection {
@@ -1624,14 +1683,16 @@ impl ModelsManager {
 
     /// Re-resolve the default model against the current catalog.
     fn reselect_default_model(&self, config: &config::Config) {
+        let usable_xai = self.usable_ambient_xai(config);
         let (key, _, source, unready_reason) = {
             let cat = self.inner.catalog.read();
             let models = &cat.models;
-            resolve_default_model_for_catalog(
+            resolve_default_model_for_catalog_with_usable_xai(
                 config,
                 models,
                 self.is_session_auth(),
                 cat.has_fetched_real_catalog,
+                usable_xai,
             )
         };
         let new_id = acp::ModelId::new(Arc::from(key));
