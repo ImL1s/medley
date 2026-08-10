@@ -1539,7 +1539,19 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             codex_ready_reseats_ambient_grok_without_xai_auth -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
-            byok_and_auth_scheme_none_unchanged_when_codex_ready -- --nocapture
+            byok_unchanged_when_codex_ready -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            auth_scheme_none_unchanged_when_codex_ready -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            deployment_key_keeps_first_party_when_codex_ready -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            third_party_codex_responses_does_not_steal_default -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            blank_xai_env_does_not_pin_grok_when_codex_ready -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            preferred_method_api_key_pin_keeps_first_party_when_codex_ready -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            has_usable_first_party_session_single_snapshot -- --nocapture
           # #245: catalog wire flags that differ from the Sol preset must parse.
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_parser_reads_wire_capabilities_that_differ_from_the_preset -- --nocapture
