@@ -49,7 +49,7 @@ mod meta;
 pub(crate) use error::with_login_instruction;
 pub use error::{AuthError, RefreshTokenError, RefreshTokenFailedReason};
 pub use manager::{AuthManager, shared_api_key_provider};
-pub(crate) use manager::{AuthRemedy, SilentRefresh};
+pub(crate) use manager::{AuthRemedy, FirstPartySessionEligibility, SilentRefresh};
 pub use meta::{AuthMeta, GateInfo};
 pub use model::{AuthMode, GrokAuth, lookup_auth};
 pub(crate) use model::{TOKEN_TTL, UserInfo, default_coding_data_retention_opt_out, is_expired};

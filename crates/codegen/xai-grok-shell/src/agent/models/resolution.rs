@@ -177,39 +177,84 @@ pub(crate) fn is_campaign_only_flip(
 /// The fourth return value is `Some(reason)` when an *explicit* configured
 /// preference is present in the catalog but unusable (#131): the id is kept
 /// (no silent substitute) and callers surface the readiness reason.
-/// Whether ambient first-party xAI auth can actually sample right now.
+/// Full ambient-xAI eligibility for #303 implicit default selection (Pro P1).
 ///
-/// Used only for **implicit** default selection (#303). Does not change
-/// [`crate::agent::config::model_readiness`] (first-party entries stay
-/// picker-ready without a live credential for login UX).
+/// Distinct reasons so tests and future policy can pin transitions without
+/// collapsing everything to a single bool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AmbientXaiEligibility {
+    /// No ambient first-party path that should keep Grok over ready Codex.
+    Unavailable,
+    /// Explicit `[auth] preferred_method` pin (`api_key` / `oidc`).
+    ExplicitlyPinned,
+    /// Non-blank `XAI_API_KEY` / legacy env or non-empty deployment key.
+    StaticKey,
+    /// Hard-valid first-party session (incl. soft early-invalidation buffer).
+    WireUsableSession,
+    /// Hard-expired first-party session with complete OIDC refresh surface.
+    RefreshableSession,
+}
+
+impl AmbientXaiEligibility {
+    pub(crate) fn is_usable(self) -> bool {
+        !matches!(self, Self::Unavailable)
+    }
+}
+
+/// Classify ambient first-party xAI for **implicit** default selection (#303).
 ///
-/// `has_usable_xai_session` must mean a **non-expired, sample-ready** first-party
-/// xAI session (not merely `current_or_expired` visibility). Also counts ambient
-/// `XAI_API_KEY` and a non-empty deployment key. Does **not** treat BYOK / Codex
-/// as ambient xAI.
-///
-/// An explicit `[auth] preferred_method` pin (`api_key` / `oidc`) preserves
-/// first-party Grok precedence even when no live credential is present, so the
-/// model chooser cannot seat Codex while startup auth remains pinned to an
-/// unavailable xAI family (Pro P0 / #303).
-pub(crate) fn usable_ambient_xai_auth(cfg: &config::Config, has_usable_xai_session: bool) -> bool {
+/// Does not change [`crate::agent::config::model_readiness`] (first-party
+/// entries stay picker-ready without a live credential for login UX).
+/// Does **not** treat BYOK / Codex as ambient xAI.
+pub(crate) fn classify_ambient_xai_auth(
+    cfg: &config::Config,
+    session: crate::auth::FirstPartySessionEligibility,
+) -> AmbientXaiEligibility {
+    use crate::auth::FirstPartySessionEligibility as Sess;
     use crate::auth::PreferredAuthMethod;
     if matches!(
         cfg.grok_com_config.preferred_method,
         Some(PreferredAuthMethod::ApiKey) | Some(PreferredAuthMethod::Oidc)
     ) {
-        return true;
+        return AmbientXaiEligibility::ExplicitlyPinned;
     }
-    if has_usable_xai_session {
-        return true;
+    match session {
+        Sess::WireUsable => return AmbientXaiEligibility::WireUsableSession,
+        Sess::Refreshable => return AmbientXaiEligibility::RefreshableSession,
+        Sess::None => {}
     }
     if crate::agent::auth_method::has_xai_api_key_env() {
-        return true;
+        return AmbientXaiEligibility::StaticKey;
     }
-    cfg.endpoints
+    if cfg
+        .endpoints
         .deployment_key
         .as_ref()
         .is_some_and(|k| !k.trim().is_empty())
+    {
+        return AmbientXaiEligibility::StaticKey;
+    }
+    AmbientXaiEligibility::Unavailable
+}
+
+/// Whether ambient first-party xAI auth can actually sample right now.
+///
+/// Thin bool wrapper over [`classify_ambient_xai_auth`]. Prefer the classifier
+/// when tests need to assert *why* Grok precedence was preserved.
+///
+/// `has_usable_xai_session` is true when the session half is
+/// [`FirstPartySessionEligibility::WireUsable`] **or**
+/// [`FirstPartySessionEligibility::Refreshable`].
+pub(crate) fn usable_ambient_xai_auth(cfg: &config::Config, has_usable_xai_session: bool) -> bool {
+    use crate::auth::FirstPartySessionEligibility as Sess;
+    let session = if has_usable_xai_session {
+        // Callers that only have a bool (tests / simple paths) map "yes" to
+        // WireUsable so static-key / pin layers still apply correctly.
+        Sess::WireUsable
+    } else {
+        Sess::None
+    };
+    classify_ambient_xai_auth(cfg, session).is_usable()
 }
 
 /// Official OpenAI Codex account route (not a third-party CodexResponses shim).

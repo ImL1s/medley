@@ -62,6 +62,59 @@ pub(crate) enum RefreshReason {
     ServerRejected,
 }
 
+/// First-party session half of ambient xAI eligibility for #303 (Pro P1).
+///
+/// Classified from **one** memory-or-disk observation — never split
+/// `has_usable_token()` vs `current()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FirstPartySessionEligibility {
+    /// No first-party session, or hard-expired without complete refresh surface.
+    None,
+    /// Hard-valid (incl. soft early-invalidation buffer) session auth.
+    WireUsable,
+    /// Hard-expired session that still has complete OIDC refresh metadata and
+    /// can self-heal without re-login.
+    Refreshable,
+}
+
+impl FirstPartySessionEligibility {
+    /// Whether this session classification alone should keep first-party Grok
+    /// precedence over an implicit Codex default.
+    pub(crate) fn preserves_ambient_precedence(self) -> bool {
+        matches!(self, Self::WireUsable | Self::Refreshable)
+    }
+}
+
+/// Complete OIDC refresh surface for ambient "self-healing" classification.
+///
+/// Requires non-empty `refresh_token` **and** issuer + client_id. A bare
+/// `refresh_token.is_some()` (empty string / missing IdP fields) is **not**
+/// enough — those must not pin Grok over ready Codex (Pro P1).
+fn session_has_complete_refresh_surface(auth: &GrokAuth) -> bool {
+    if !auth.is_session_auth() {
+        return false;
+    }
+    let Some(rt) = auth.refresh_token.as_deref() else {
+        return false;
+    };
+    if rt.trim().is_empty() {
+        return false;
+    }
+    match auth.auth_mode {
+        AuthMode::Oidc | AuthMode::External => {
+            auth.oidc_issuer
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+                && auth
+                    .oidc_client_id
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
+        }
+        // WebLogin is not OIDC-refreshable for ambient classification.
+        AuthMode::WebLogin | AuthMode::ApiKey | AuthMode::OpenAiCodex => false,
+    }
+}
+
 /// Timeout for acquiring the advisory `auth.json.lock` file lock.
 /// Used by advisory (non-critical) lock sites: `flow.rs`, `enrichment.rs`,
 /// `recovery.rs`.
@@ -1448,17 +1501,50 @@ impl AuthManager {
     /// (Pro P0). Hard expiry only (matches [`Self::has_usable_token`]); soft
     /// early-invalidation buffer still counts as usable.
     pub(crate) fn has_usable_first_party_session(&self) -> bool {
+        matches!(
+            self.first_party_session_eligibility(),
+            FirstPartySessionEligibility::WireUsable
+        )
+    }
+
+    /// One observation classifying first-party session for #303 ambient selection
+    /// (Pro P1): hard-valid wire session vs hard-expired-but-self-healing.
+    ///
+    /// `Refreshable` requires **complete** OIDC refresh surface — non-empty
+    /// refresh_token **and** issuer + client_id — not `refresh_token.is_some()`
+    /// alone (malformed/incomplete credentials must not pin Grok).
+    pub(crate) fn first_party_session_eligibility(&self) -> FirstPartySessionEligibility {
         if !self.credential_store_is_safe() {
-            return false;
+            return FirstPartySessionEligibility::None;
         }
-        if let Some(a) = self.current_or_expired()
-            && !self.is_token_hard_expired(&a)
-            && a.is_session_auth()
-        {
-            return true;
+        let observe = |a: &GrokAuth| -> FirstPartySessionEligibility {
+            if !a.is_session_auth() {
+                return FirstPartySessionEligibility::None;
+            }
+            if !self.is_token_hard_expired(a) {
+                return FirstPartySessionEligibility::WireUsable;
+            }
+            if session_has_complete_refresh_surface(a) {
+                return FirstPartySessionEligibility::Refreshable;
+            }
+            FirstPartySessionEligibility::None
+        };
+        if let Some(a) = self.current_or_expired() {
+            let e = observe(&a);
+            if e != FirstPartySessionEligibility::None {
+                return e;
+            }
         }
         self.read_disk_auth()
-            .is_some_and(|a| !self.is_token_hard_expired(&a) && a.is_session_auth())
+            .map(|a| observe(&a))
+            .unwrap_or(FirstPartySessionEligibility::None)
+    }
+
+    /// Wire-usable **or** complete-refreshable first-party session — the session
+    /// half of ambient xAI eligibility for #303 (keeps Grok over Codex).
+    pub(crate) fn has_ambient_first_party_session(&self) -> bool {
+        self.first_party_session_eligibility()
+            .preserves_ambient_precedence()
     }
 
     /// Like [`read_disk_auth`] but also returns the [`DiskAuthState`] so callers

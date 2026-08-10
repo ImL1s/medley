@@ -3848,3 +3848,131 @@ fn preferred_method_oidc_pin_keeps_first_party_when_codex_ready() {
     let (key, _, _, _) = resolve_default_model(&cfg, &catalog, false);
     assert_eq!(key, "grok-4.5");
 }
+
+/// Pro P1: hard-expired OIDC with complete refresh surface keeps Grok over Codex.
+#[test]
+fn refreshable_expired_oidc_session_keeps_first_party_when_codex_ready() {
+    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    use crate::auth::{AuthMode, FirstPartySessionEligibility, GrokAuth, XAI_OAUTH2_ISSUER};
+    use xai_grok_test_support::EnvGuard;
+    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+    let tmp = tempfile::tempdir().expect("temp home");
+    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
+    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
+    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
+    catalog.insert(
+        crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string(),
+        codex,
+    );
+
+    let xai_home = tmp.path().join("xai-refreshable");
+    std::fs::create_dir_all(&xai_home).unwrap();
+    let am = Arc::new(AuthManager::new(&xai_home, GrokComConfig::default()));
+    let expired = GrokAuth {
+        key: "expired-access".into(),
+        auth_mode: AuthMode::Oidc,
+        create_time: chrono::Utc::now() - chrono::Duration::hours(2),
+        expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+        refresh_token: Some("rt-complete".into()),
+        oidc_issuer: Some(XAI_OAUTH2_ISSUER.to_owned()),
+        oidc_client_id: Some("client".into()),
+        user_id: "u".into(),
+        ..GrokAuth::test_default()
+    };
+    // Use hot_swap for memory classification.
+    am.hot_swap(expired);
+    assert_eq!(
+        am.first_party_session_eligibility(),
+        FirstPartySessionEligibility::Refreshable
+    );
+    let cfg = config::Config::default();
+    assert_eq!(
+        resolution::classify_ambient_xai_auth(&cfg, am.first_party_session_eligibility()),
+        resolution::AmbientXaiEligibility::RefreshableSession
+    );
+
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        catalog,
+        acp::ModelId::new("grok-4.5"),
+        am,
+        cfg.clone(),
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    // Warm path: stranded ambient Grok must stay when refreshable session exists.
+    mgr.reselect_current_model_if_missing(&cfg);
+    assert_eq!(
+        mgr.current_model_id().0.as_ref(),
+        "grok-4.5",
+        "refreshable hard-expired OIDC must not reseat to Codex"
+    );
+}
+
+/// Pro P1: hard-expired session without complete refresh surface seats Codex.
+#[test]
+fn hard_expired_nonrefreshable_session_seats_codex() {
+    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    use crate::auth::{AuthMode, FirstPartySessionEligibility, GrokAuth};
+    use xai_grok_test_support::EnvGuard;
+    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+    let tmp = tempfile::tempdir().expect("temp home");
+    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
+    let codex_key = crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string();
+    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
+    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
+    catalog.insert(codex_key.clone(), codex);
+
+    let xai_home = tmp.path().join("xai-dead");
+    std::fs::create_dir_all(&xai_home).unwrap();
+    let am = Arc::new(AuthManager::new(&xai_home, GrokComConfig::default()));
+    // RT present but no issuer/client — malformed for ambient self-heal.
+    let dead = GrokAuth {
+        key: "expired-access".into(),
+        auth_mode: AuthMode::Oidc,
+        create_time: chrono::Utc::now() - chrono::Duration::hours(2),
+        expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+        refresh_token: Some("rt-incomplete".into()),
+        oidc_issuer: None,
+        oidc_client_id: None,
+        user_id: "u".into(),
+        ..GrokAuth::test_default()
+    };
+    am.hot_swap(dead);
+    assert_eq!(
+        am.first_party_session_eligibility(),
+        FirstPartySessionEligibility::None
+    );
+
+    let cfg = config::Config::default();
+    assert_eq!(
+        resolution::classify_ambient_xai_auth(&cfg, am.first_party_session_eligibility()),
+        resolution::AmbientXaiEligibility::Unavailable
+    );
+
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        catalog,
+        acp::ModelId::new("grok-4.5"),
+        am,
+        cfg.clone(),
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    mgr.reselect_current_model_if_missing(&cfg);
+    assert_eq!(
+        mgr.current_model_id().0.as_ref(),
+        codex_key.as_str(),
+        "hard-expired non-refreshable session must reseat ambient Grok to Codex"
+    );
+}
