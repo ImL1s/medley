@@ -255,10 +255,7 @@ fn has_usable_first_party_session_single_snapshot() {
     // Old split: has_usable_token() && current().is_session_auth() → false.
     mgr.clear_in_memory();
     assert!(mgr.current().is_none(), "memory cleared");
-    assert!(
-        mgr.has_usable_token(),
-        "disk OIDC still wire-valid"
-    );
+    assert!(mgr.has_usable_token(), "disk OIDC still wire-valid");
     assert!(
         mgr.has_usable_first_party_session(),
         "disk-only OIDC must count as usable first-party session (single snapshot)"

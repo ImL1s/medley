@@ -3720,5 +3720,3 @@ fn preferred_method_oidc_pin_keeps_first_party_when_codex_ready() {
     let (key, _, _, _) = resolve_default_model(&cfg, &catalog, false);
     assert_eq!(key, "grok-4.5");
 }
-
-
