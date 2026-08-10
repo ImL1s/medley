@@ -678,6 +678,61 @@ impl BlockContent for SessionEventBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::agent::{AgentCommand, AgentState};
+    use std::time::Instant;
+
+    /// Gate 5: manual `/compact` activity label + completion copy.
+    ///
+    /// ACTIVE: `AgentState::CommandRunning { Compact }` → status "Compacting…"
+    /// via `display_name()` + `is_compact_running()`.
+    /// COMPLETE: `SessionEvent::CompactCompleted` → "Compaction completed in …"
+    /// (not auto-path "Context compacted" / AutoCompacting).
+    #[test]
+    fn manual_compaction_renders_activity_and_completion() {
+        // ACTIVE half — status label path used by turn status / dashboard.
+        assert_eq!(AgentCommand::Compact.display_name(), "Compacting");
+        let status = format!("{}…", AgentCommand::Compact.display_name());
+        assert_eq!(status, "Compacting…");
+
+        let running = AgentState::CommandRunning {
+            command: AgentCommand::Compact,
+            started_at: Instant::now(),
+        };
+        assert!(
+            running.is_compact_running(),
+            "CommandRunning Compact must report is_compact_running"
+        );
+        assert!(
+            !AgentState::Idle.is_compact_running(),
+            "Idle is not a manual compact"
+        );
+        assert!(
+            !AgentState::TurnRunning.is_compact_running(),
+            "TurnRunning (auto path) is not is_compact_running"
+        );
+
+        // COMPLETE half — manual CompactCompleted scrollback message.
+        let elapsed = Duration::from_secs(2);
+        let event = SessionEvent::CompactCompleted { elapsed };
+        let msg = event.message();
+        assert!(
+            msg.contains("Compaction completed in"),
+            "manual complete must say Compaction completed in…, got: {msg}"
+        );
+        assert_eq!(
+            msg,
+            format!("Compaction completed in {}.", format_duration(elapsed))
+        );
+        // Forbidden: auto-path wording on the manual event.
+        assert!(
+            !msg.contains("Context compacted"),
+            "manual CompactCompleted must not use auto CompactionCompleted copy: {msg}"
+        );
+        assert!(
+            !msg.contains("AutoCompacting"),
+            "manual path must not mention AutoCompacting: {msg}"
+        );
+    }
 
     #[test]
     fn turn_completed_message() {

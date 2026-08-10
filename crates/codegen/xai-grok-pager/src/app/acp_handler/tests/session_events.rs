@@ -765,6 +765,104 @@
         }
     }
 
+    /// Gate 6: auto-compaction activity + deferred completion (distinct from
+    /// manual `/compact` Gate 5).
+    ///
+    /// ACTIVE: `AutoCompactStarted` → `TurnActivity::AutoCompacting` +
+    /// `SessionEvent::CompactionStarted` user text containing "Compacting…".
+    /// COMPLETE: `AutoCompactCompleted` deferred until `finish_turn`, then
+    /// `SessionEvent::CompactionCompleted` message contains "Context compacted".
+    #[test]
+    fn auto_compaction_renders_activity_and_completion() {
+        let mut session = make_session(Some("s1"));
+        let mut scrollback = ScrollbackState::new();
+
+        // ACTIVE half — auto-compact start sets activity and user-facing start line.
+        let started = XaiSessionUpdate::AutoCompactStarted {
+            tokens_used: 90_000,
+            context_window: 131_072,
+            percentage: 85,
+            reason: "threshold".into(),
+        };
+        assert!(apply_session_event(
+            &started,
+            &mut session,
+            &mut scrollback,
+            false
+        ));
+        assert_eq!(
+            session.tracker.activity(),
+            Some(TurnActivity::AutoCompacting),
+            "AutoCompactStarted must set AutoCompacting activity"
+        );
+        match last_session_event(&scrollback) {
+            Some(SessionEvent::CompactionStarted { percentage }) => {
+                assert_eq!(percentage, 85);
+                let msg = SessionEvent::CompactionStarted { percentage: 85 }.message();
+                assert!(
+                    msg.contains("Compacting…"),
+                    "CompactionStarted user text must include Compacting…, got: {msg}"
+                );
+            }
+            other => panic!("expected CompactionStarted, got {other:?}"),
+        }
+
+        // COMPLETE half — live completion is deferred; activity clears immediately.
+        let completed = XaiSessionUpdate::AutoCompactCompleted {
+            tokens_before: Some(90_000),
+            tokens_after: 20_000,
+            elapsed_ms: Some(500),
+            summary_preview: None,
+        };
+        assert!(apply_session_event(
+            &completed,
+            &mut session,
+            &mut scrollback,
+            false
+        ));
+        assert_eq!(
+            session.tracker.activity(),
+            None,
+            "AutoCompactCompleted clears compaction activity"
+        );
+        assert!(
+            !matches!(
+                last_session_event(&scrollback),
+                Some(SessionEvent::CompactionCompleted { .. })
+            ),
+            "live AutoCompactCompleted must not push CompactionCompleted immediately"
+        );
+        assert!(
+            matches!(
+                last_session_event(&scrollback),
+                Some(SessionEvent::CompactionStarted { .. })
+            ),
+            "scrollback still ends on CompactionStarted until finish_turn"
+        );
+
+        session.finish_turn(&mut scrollback);
+        match last_session_event(&scrollback) {
+            Some(event @ SessionEvent::CompactionCompleted { .. }) => {
+                let msg = event.message();
+                assert!(
+                    msg.contains("Context compacted"),
+                    "auto complete message must contain Context compacted, got: {msg}"
+                );
+                // Distinct from manual CompactCompleted wording (Gate 5).
+                assert!(
+                    !msg.contains("Compaction completed in"),
+                    "auto path must not use manual CompactCompleted wording: {msg}"
+                );
+            }
+            other => panic!("expected deferred CompactionCompleted after finish_turn, got {other:?}"),
+        }
+        assert_eq!(
+            session.tracker.activity(),
+            None,
+            "activity remains cleared after finish_turn flushes deferred completion"
+        );
+    }
+
     #[test]
     fn apply_compaction_completed_falls_back_to_estimate_without_confirmation() {
         let mut session = make_session(Some("s1"));
