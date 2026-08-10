@@ -1811,7 +1811,9 @@ mod tests {
     use crate::scrollback::blocks::tool::{ToolCallBlock, WebSearchToolCallBlock};
     use crate::scrollback::entry::ScrollbackEntry;
 
-    /// #306 gate 7: fullscreen web-search viewer shows Sources (N) + full citation URLs.
+    /// #306 gate 7 (**component presentation** — block already holds URLs, not
+    /// Codex SSE decode; #306 live TUI still open): fullscreen web-search
+    /// viewer shows Sources (N) + full citation URLs.
     #[test]
     fn codex_web_search_viewer_renders_citations() {
         let mut ws = WebSearchToolCallBlock::new("codex web search");

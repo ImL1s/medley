@@ -370,7 +370,9 @@ mod tests {
         assert!(items[3].match_text.starts_with("d "));
     }
 
-    /// #306 gate 4: effort menu is model-specific; none only when advertised;
+    /// #306 gate 4 (**component presentation** — fabricated metadata, not shell
+    /// dispatch; #306 live TUI still open): effort menu is model-specific; none
+    /// only when advertised;
     /// menu-less models still accept minimal and reject none.
     #[test]
     fn codex_effort_picker_obeys_each_model_menu_including_minimal_and_none() {

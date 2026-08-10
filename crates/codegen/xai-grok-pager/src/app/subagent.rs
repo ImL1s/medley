@@ -832,7 +832,9 @@ mod tests {
     fn context_badge_none_returns_empty() {
         assert_eq!(format_context_badge(&make_info()), "");
     }
-    /// #306 gate 8: resumed badge driven by `context_source` plus task
+    /// #306 gate 8 (**component presentation** — constructor-level, not
+    /// persistence/hydration; #306 live TUI still open): resumed badge driven
+    /// by `context_source` plus task
     /// description on the production label / scrollback surfaces (not a
     /// badge-only rewrap of `context_badge_resumed`).
     #[test]
