@@ -223,6 +223,72 @@ fn has_usable_token_covers_memory_and_disk() {
     );
 }
 
+/// Pro P1: hard-expired OIDC with complete refresh surface is Refreshable;
+/// incomplete/malformed surface is None (must not pin Grok).
+#[test]
+fn first_party_session_eligibility_refreshable_vs_malformed() {
+    use crate::auth::XAI_OAUTH2_ISSUER;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+
+    // Hard-expired OIDC with complete surface → Refreshable.
+    let mut complete = make_auth(Some(Utc::now() - Duration::hours(1)), Utc::now());
+    complete.auth_mode = AuthMode::Oidc;
+    complete.refresh_token = Some("rt-live".to_owned());
+    complete.oidc_issuer = Some(XAI_OAUTH2_ISSUER.to_owned());
+    complete.oidc_client_id = Some("client-id".to_owned());
+    mgr.hot_swap(complete);
+    assert_eq!(
+        mgr.first_party_session_eligibility(),
+        FirstPartySessionEligibility::Refreshable
+    );
+    assert!(
+        mgr.has_ambient_first_party_session(),
+        "refreshable session preserves ambient Grok precedence"
+    );
+    assert!(
+        !mgr.has_usable_first_party_session(),
+        "wire-usable is false when hard-expired"
+    );
+
+    // Empty refresh_token string → not refreshable.
+    let mut empty_rt = make_auth(Some(Utc::now() - Duration::hours(1)), Utc::now());
+    empty_rt.auth_mode = AuthMode::Oidc;
+    empty_rt.refresh_token = Some("   ".to_owned());
+    empty_rt.oidc_issuer = Some(XAI_OAUTH2_ISSUER.to_owned());
+    empty_rt.oidc_client_id = Some("client-id".to_owned());
+    mgr.hot_swap(empty_rt);
+    assert_eq!(
+        mgr.first_party_session_eligibility(),
+        FirstPartySessionEligibility::None
+    );
+
+    // Missing issuer → not refreshable.
+    let mut no_issuer = make_auth(Some(Utc::now() - Duration::hours(1)), Utc::now());
+    no_issuer.auth_mode = AuthMode::Oidc;
+    no_issuer.refresh_token = Some("rt".to_owned());
+    no_issuer.oidc_issuer = None;
+    no_issuer.oidc_client_id = Some("client-id".to_owned());
+    mgr.hot_swap(no_issuer);
+    assert_eq!(
+        mgr.first_party_session_eligibility(),
+        FirstPartySessionEligibility::None
+    );
+
+    // RT present but no client_id → not refreshable.
+    let mut no_client = make_auth(Some(Utc::now() - Duration::hours(1)), Utc::now());
+    no_client.auth_mode = AuthMode::Oidc;
+    no_client.refresh_token = Some("rt".to_owned());
+    no_client.oidc_issuer = Some(XAI_OAUTH2_ISSUER.to_owned());
+    no_client.oidc_client_id = None;
+    mgr.hot_swap(no_client);
+    assert_eq!(
+        mgr.first_party_session_eligibility(),
+        FirstPartySessionEligibility::None
+    );
+}
+
 /// Pro P0: one observation classifies usability + first-party session kind.
 ///
 /// Production disk sibling path uses **OIDC** — `lookup_auth` skips WebLogin on

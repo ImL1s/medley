@@ -439,9 +439,12 @@ impl ModelsManager {
         }
 
         let usable_xai = {
-            // One AuthManager observation: usability + session kind (Pro P0).
-            let has_usable_xai_session = auth_manager.has_usable_first_party_session();
-            resolution::usable_ambient_xai_auth(cfg, has_usable_xai_session)
+            // One AuthManager observation → full ambient eligibility (Pro P1).
+            resolution::classify_ambient_xai_auth(
+                cfg,
+                auth_manager.first_party_session_eligibility(),
+            )
+            .is_usable()
         };
         let (current_model_key, current_model, model_source, unready_default_reason) =
             resolve_default_model_for_catalog_with_usable_xai(
@@ -603,13 +606,15 @@ impl ModelsManager {
 
     /// Sample-ready ambient xAI for #303 default selection (not catalog visibility).
     ///
-    /// Uses a single AuthManager snapshot ([`AuthManager::has_usable_first_party_session`]),
-    /// ambient non-blank `XAI_API_KEY`, deployment key, or an explicit
-    /// `preferred_method` pin — never bare `current_or_expired` / mixed
-    /// `has_usable_token() && current()`.
+    /// Uses [`AuthManager::first_party_session_eligibility`] (wire-usable **or**
+    /// complete-refreshable session) plus static keys / preferred_method pin —
+    /// never bare `current_or_expired` / mixed `has_usable_token() && current()`.
     fn usable_ambient_xai(&self, cfg: &config::Config) -> bool {
-        let has_usable_xai_session = self.inner.auth_manager.has_usable_first_party_session();
-        resolution::usable_ambient_xai_auth(cfg, has_usable_xai_session)
+        resolution::classify_ambient_xai_auth(
+            cfg,
+            self.inner.auth_manager.first_party_session_eligibility(),
+        )
+        .is_usable()
     }
 
     /// Whether a Codex-backed model is actually reachable: holding a live
