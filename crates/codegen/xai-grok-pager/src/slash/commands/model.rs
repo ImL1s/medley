@@ -959,7 +959,7 @@ mod tests {
                 other => panic!("expected SetDefaultModel for {name}, got {other:?}"),
             }
             state.set_current(id.clone(), None);
-            assert_eq!(state.current_model_id_str().as_deref(), Some(id.0.as_ref()));
+            assert_eq!(state.current_model_id_str(), Some(id.0.as_ref()));
             assert_eq!(state.current_model_name().as_deref(), Some(name.as_str()));
             assert_eq!(state.current.as_ref(), Some(id));
             last_name = name.clone();
