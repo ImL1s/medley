@@ -626,12 +626,9 @@ impl ModelsManager {
     /// `readinessReason` meta — visible and available are not one bool (#133).
     pub(crate) fn has_selectable_openai_codex_model(&self) -> bool {
         let is_session_auth = self.is_session_auth();
-        self.models().values().any(|entry| {
-            entry.is_openai_codex_profile()
-                && entry.info.user_selectable
-                && entry.info.visible_for_auth(is_session_auth)
-                && config::model_readiness(entry).0
-        })
+        self.models()
+            .values()
+            .any(|entry| resolution::is_ready_selectable_openai_codex_entry(entry, is_session_auth))
     }
 
     /// ACP-visible (non-hidden) projection of the catalog.
@@ -1604,15 +1601,12 @@ impl ModelsManager {
                     let not_selectable = !entry.info.user_selectable
                         || !entry.info.visible_for_auth(is_session_auth);
                     // #303: only yank first-party ambient Grok/sentinel when a
-                    // ready Codex route exists — never BYOK / auth_scheme=none
-                    // / third-party ready models.
+                    // ready OpenAI Codex *account* route exists — never BYOK /
+                    // auth_scheme=none / third-party CodexResponses shims.
                     let stranded_on_ambient_grok = !usable_xai
                         && resolution::is_first_party_ambient_xai_entry(entry)
                         && models.values().any(|e| {
-                            e.info.user_selectable
-                                && e.info.visible_for_auth(is_session_auth)
-                                && e.info.api_backend == crate::sampling::ApiBackend::CodexResponses
-                                && crate::agent::config::model_readiness(e).0
+                            resolution::is_ready_selectable_openai_codex_entry(e, is_session_auth)
                         });
                     not_selectable || stranded_on_ambient_grok
                 }

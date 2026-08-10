@@ -212,9 +212,37 @@ pub(crate) fn usable_ambient_xai_auth(cfg: &config::Config, has_usable_xai_sessi
         .is_some_and(|k| !k.trim().is_empty())
 }
 
-/// True when this catalog entry is a ready OpenAI Codex Responses route.
-fn is_ready_codex_entry(entry: &ModelEntry) -> bool {
-    entry.info.api_backend == crate::sampling::ApiBackend::CodexResponses
+/// Official OpenAI Codex account route (not a third-party CodexResponses shim).
+///
+/// Requires the reserved wire base URL and/or the `openai-codex` auth provider.
+/// Bare `api_backend == CodexResponses` alone is not enough — otherwise a custom
+/// catalog entry could steal #303 default priority without being an OpenAI
+/// Codex account path (Pro P1 taxonomy).
+pub(crate) fn is_openai_codex_account_route(entry: &ModelEntry) -> bool {
+    if !entry.is_openai_codex_profile() {
+        return false;
+    }
+    let official = crate::auth::openai_codex::CODEX_API_BASE_URL.trim_end_matches('/');
+    let base = entry.info.base_url.trim_end_matches('/');
+    if base == official {
+        return true;
+    }
+    entry
+        .auth_provider
+        .as_ref()
+        .is_some_and(|p| p.name == crate::agent::model_providers::OPENAI_CODEX_PROVIDER_ID)
+}
+
+/// Shared #303 / login-suppression predicate: ready, picker-visible OpenAI Codex
+/// account entry. Same identity + readiness rules for default selection, warm
+/// reseat, and [`ModelsManager::has_selectable_openai_codex_model`].
+pub(crate) fn is_ready_selectable_openai_codex_entry(
+    entry: &ModelEntry,
+    is_session_auth: bool,
+) -> bool {
+    is_openai_codex_account_route(entry)
+        && entry.info.user_selectable
+        && entry.info.visible_for_auth(is_session_auth)
         && crate::agent::config::model_readiness(entry).0
 }
 
@@ -274,7 +302,9 @@ pub(crate) fn resolve_default_model_with_usable_xai(
         // bundled first-party Grok entry as the implicit default solely because
         // it sorts first and is picker-ready. Prefer a ready Codex account entry.
         if !usable_xai
-            && let Some((key, entry)) = ready_visible.iter().find(|(_, e)| is_ready_codex_entry(e))
+            && let Some((key, entry)) = ready_visible
+                .iter()
+                .find(|(_, e)| is_ready_selectable_openai_codex_entry(e, is_session_auth))
         {
             tracing::info!(
                 model_id = %entry.model,
