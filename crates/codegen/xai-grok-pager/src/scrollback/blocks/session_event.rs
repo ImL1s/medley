@@ -683,17 +683,21 @@ mod tests {
 
     /// Gate 5: manual `/compact` activity label + completion copy.
     ///
-    /// ACTIVE: `AgentState::CommandRunning { Compact }` → status "Compacting…"
-    /// via `display_name()` + `is_compact_running()`.
-    /// COMPLETE: `SessionEvent::CompactCompleted` → "Compaction completed in …"
-    /// (not auto-path "Context compacted" / AutoCompacting).
+    /// ACTIVE: `AgentState::CommandRunning { Compact }` → production
+    /// `render_turn_status` paints "Compacting…" (`compute_activity` path used
+    /// by the turn-status row). Also asserts `is_compact_running()`.
+    /// COMPLETE: `RenderBlock::session_event(CompactCompleted)` — the same
+    /// block `handle_compact_complete` pushes — searchable text is
+    /// "Compaction completed in …" (not auto-path "Context compacted").
     #[test]
     fn manual_compaction_renders_activity_and_completion() {
-        // ACTIVE half — status label path used by turn status / dashboard.
-        assert_eq!(AgentCommand::Compact.display_name(), "Compacting");
-        let status = format!("{}…", AgentCommand::Compact.display_name());
-        assert_eq!(status, "Compacting…");
+        use crate::acp::tracker::TurnActivity;
+        use crate::scrollback::block::RenderBlock;
+        use crate::views::turn_status::{TurnStatusArgs, Watchers, render_turn_status};
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
 
+        // ACTIVE half — production turn-status paint for CommandRunning Compact.
         let running = AgentState::CommandRunning {
             command: AgentCommand::Compact,
             started_at: Instant::now(),
@@ -711,26 +715,68 @@ mod tests {
             "TurnRunning (auto path) is not is_compact_running"
         );
 
-        // COMPLETE half — manual CompactCompleted scrollback message.
-        let elapsed = Duration::from_secs(2);
-        let event = SessionEvent::CompactCompleted { elapsed };
-        let msg = event.message();
+        let area = Rect::new(0, 0, 80, 1);
+        let mut buf = Buffer::empty(area);
+        let activity: Option<TurnActivity> = None;
+        render_turn_status(
+            &mut buf,
+            area,
+            TurnStatusArgs {
+                state: &running,
+                activity: &activity,
+                turn_elapsed: Some(Duration::from_secs(1)),
+                activity_started_at: None,
+                tick: 0,
+                drain_blocked: false,
+                buttons: None,
+                has_running_execute: false,
+                total_tokens: None,
+                mcp_init_progress: None,
+                is_bash_turn: false,
+                is_pending_user_input: false,
+                goal_verifying: false,
+                watchers: Watchers::default(),
+                parked: false,
+                flat_background: false,
+                held_queue: 0,
+                held_queue_top_sendable: false,
+            },
+        );
+        let mut painted = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if let Some(cell) = buf.cell((x, y)) {
+                    painted.push_str(cell.symbol());
+                }
+            }
+        }
         assert!(
-            msg.contains("Compaction completed in"),
-            "manual complete must say Compaction completed in…, got: {msg}"
+            painted.contains("Compacting…"),
+            "manual compact turn_status must paint Compacting…, got: {painted:?}"
+        );
+
+        // COMPLETE half — same RenderBlock payload handle_compact_complete pushes.
+        let elapsed = Duration::from_secs(2);
+        let block = RenderBlock::session_event(SessionEvent::CompactCompleted { elapsed });
+        let text = block
+            .searchable_text()
+            .expect("CompactCompleted scrollback must be searchable");
+        assert!(
+            text.contains("Compaction completed in"),
+            "manual complete must say Compaction completed in…, got: {text}"
         );
         assert_eq!(
-            msg,
+            SessionEvent::CompactCompleted { elapsed }.message(),
             format!("Compaction completed in {}.", format_duration(elapsed))
         );
         // Forbidden: auto-path wording on the manual event.
         assert!(
-            !msg.contains("Context compacted"),
-            "manual CompactCompleted must not use auto CompactionCompleted copy: {msg}"
+            !text.contains("Context compacted"),
+            "manual CompactCompleted must not use auto CompactionCompleted copy: {text}"
         );
         assert!(
-            !msg.contains("AutoCompacting"),
-            "manual path must not mention AutoCompacting: {msg}"
+            !text.contains("AutoCompacting"),
+            "manual path must not mention AutoCompacting: {text}"
         );
     }
 

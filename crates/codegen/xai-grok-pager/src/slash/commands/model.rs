@@ -897,7 +897,7 @@ mod tests {
         }
     }
 
-    /// #306 C-min gate 3: every ready live Codex in the catalog is selectable
+    /// #306 gate 3: every ready live Codex in the catalog is selectable
     /// and seats via `SetDefaultModel`; final footer paints the last selected
     /// Codex name (never empty/unknown/sibling Grok).
     #[test]
