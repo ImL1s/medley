@@ -52,7 +52,7 @@ pub(crate) use crate::terminal::{kitty_flags_pushed, kitty_releases_reported};
 pub use cli::{
     AgentArgs, AgentCmd, AuthArgs, AuthCommand, Command, HeadlessArgs, LeaderArgs, LeaderMgmtArgs,
     LeaderMgmtCommand, LeaderTargetArgs, LoginProvider, OutputFormat, PagerArgs, ServeArgs,
-    WrapArgs, program_name, program_name_for_instruction,
+    StatusProvider, WrapArgs, program_name, program_name_for_instruction,
 };
 pub use cli::{WorkspaceMgmtArgs, WorkspaceMgmtCommand, WorkspaceStartArgs};
 use crossterm::cursor::{self, SetCursorStyle};

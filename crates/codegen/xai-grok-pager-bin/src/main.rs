@@ -33,7 +33,7 @@ use std::num::NonZeroUsize;
 use tokio_util::sync::CancellationToken;
 use xai_grok_pager::app::{
     AgentCmd, AuthCommand, Command, HeadlessArgs, LeaderMgmtArgs, LeaderMgmtCommand, LeaderMode,
-    LeaderTargetArgs, LoginProvider, PagerArgs, ServeArgs, join_early_prefetch,
+    LeaderTargetArgs, LoginProvider, PagerArgs, ServeArgs, StatusProvider, join_early_prefetch,
     resolve_leader_mode, resolve_use_leader, warn_leader_disabled_by_sandbox,
 };
 use xai_grok_pager::app::{WorkspaceMgmtArgs, WorkspaceMgmtCommand, WorkspaceStartArgs};
@@ -2771,8 +2771,10 @@ async fn async_main(args: PagerArgs, prepared_serve: Option<PreparedServe>) -> R
             Command::Auth(auth_args) => {
                 init_tracing_simple("cli");
                 match auth_args.command {
+                    // StatusProvider is the status-only allow-list (#270): only
+                    // implemented providers parse; xAI stays on LoginProvider.
                     AuthCommand::Status { provider, json } => match provider {
-                        LoginProvider::OpenaiCodex => {
+                        StatusProvider::OpenaiCodex => {
                             let manager = xai_grok_shell::auth::openai_codex::manager(
                                 &xai_grok_shell::util::grok_home::grok_home(),
                             );
@@ -2782,11 +2784,6 @@ async fn async_main(args: PagerArgs, prepared_serve: Option<PreparedServe>) -> R
                             } else {
                                 println!("{}", codex_auth_status_text(&status));
                             }
-                        }
-                        LoginProvider::Xai => {
-                            anyhow::bail!(
-                                "provider status currently supports --provider openai-codex"
-                            );
                         }
                     },
                 }

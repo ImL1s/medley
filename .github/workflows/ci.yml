@@ -1510,6 +1510,36 @@ jobs:
             codex_catalog_builtin_fallback_reports_absent_persisted_default -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             codex_catalog_degraded_state_is_visible_in_model_picker -- --nocapture
+          # #306 C-min: Codex-only boot footer + picker readiness presentation
+          # (presentation unit tests; fail closed if the exact names vanish).
+          run_nonzero -p xai-grok-pager --lib \
+            codex_only_boot_footer_uses_authoritative_default_never_unknown -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            codex_model_picker_lists_live_codex_ready_and_grok_unready -- --nocapture
+          # #306 remaining gates 3–8 (presentation; fail closed if names vanish)
+          run_nonzero -p xai-grok-pager --lib \
+            codex_model_picker_selects_every_live_catalog_model -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            codex_effort_picker_obeys_each_model_menu_including_minimal_and_none -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            manual_compaction_renders_activity_and_completion -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            auto_compaction_renders_activity_and_completion -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            codex_web_search_viewer_renders_citations -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            resumed_subagent_badge_and_transcript_are_visible -- --nocapture
+          # #303: Codex-only implicit default + reseat (selection policy).
+          run_nonzero -p xai-grok-shell --lib \
+            codex_only_cold_start_defaults_to_ready_codex -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_only_default_not_bundled_grok_when_codex_ready -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            xai_ambient_still_prefers_first_party_grok -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_ready_reseats_ambient_grok_without_xai_auth -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            byok_and_auth_scheme_none_unchanged_when_codex_ready -- --nocapture
           # #245: catalog wire flags that differ from the Sol preset must parse.
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_parser_reads_wire_capabilities_that_differ_from_the_preset -- --nocapture

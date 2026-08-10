@@ -1803,3 +1803,38 @@ impl BlockViewerPane {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scrollback::block::RenderBlock;
+    use crate::scrollback::blocks::tool::{ToolCallBlock, WebSearchToolCallBlock};
+    use crate::scrollback::entry::ScrollbackEntry;
+
+    /// #306 gate 7: fullscreen web-search viewer shows Sources (N) + full citation URLs.
+    #[test]
+    fn codex_web_search_viewer_renders_citations() {
+        let mut ws = WebSearchToolCallBlock::new("codex web search");
+        ws.content = Some("result body".into());
+        let urls = ["https://example.com/a", "https://docs.openai.com/b"];
+        ws.citations = urls.iter().map(|s| s.to_string()).collect();
+        let entry = ScrollbackEntry::new(RenderBlock::ToolCall(ToolCallBlock::WebSearch(ws)));
+        let viewer = BlockViewerPane::for_web_search(entry.id, &entry).expect("web search viewer");
+        let plain: String = viewer
+            .items
+            .iter()
+            .map(|c| c.plain_text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            plain.contains("Sources (2)"),
+            "must show Sources (2), got:\n{plain}"
+        );
+        for url in urls {
+            assert!(
+                plain.contains(url),
+                "must include full URL {url}, got:\n{plain}"
+            );
+        }
+    }
+}

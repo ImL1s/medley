@@ -224,7 +224,11 @@ pub enum Command {
     Dashboard,
 }
 
-/// Authentication provider selected by login/logout/status commands.
+/// Authentication provider selected by login/logout commands.
+///
+/// Keep this distinct from [`StatusProvider`]: login/logout support xAI and
+/// OpenAI Codex, while `auth status` only implements the providers it can
+/// actually report readiness for (issue #270).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 pub enum LoginProvider {
     /// The normal Grok/xAI account session.
@@ -262,6 +266,25 @@ impl LoginProvider {
     }
 }
 
+/// Providers that `auth status --provider` can report readiness for.
+///
+/// Intentionally narrower than [`LoginProvider`]: listing a value here that
+/// always errors at runtime is an enum lie (issue #270). Add a variant only
+/// when status output is implemented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum StatusProvider {
+    /// ChatGPT Codex OAuth, stored separately from the Grok session.
+    OpenaiCodex,
+}
+
+impl StatusProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenaiCodex => "openai-codex",
+        }
+    }
+}
+
 #[derive(Debug, Clone, clap::Args)]
 pub struct AuthArgs {
     #[command(subcommand)]
@@ -272,8 +295,9 @@ pub struct AuthArgs {
 pub enum AuthCommand {
     /// Show non-secret authentication readiness for a provider.
     Status {
+        /// Credential provider to inspect (only providers with implemented status).
         #[arg(long, value_enum)]
-        provider: LoginProvider,
+        provider: StatusProvider,
         /// Emit machine-readable JSON output.
         #[arg(long)]
         json: bool,
@@ -1870,7 +1894,7 @@ mod tests {
             status.command,
             Some(Command::Auth(AuthArgs {
                 command: AuthCommand::Status {
-                    provider: LoginProvider::OpenaiCodex,
+                    provider: StatusProvider::OpenaiCodex,
                     json: true,
                 }
             }))
@@ -1884,6 +1908,69 @@ mod tests {
                 provider: LoginProvider::OpenaiCodex
             })
         ));
+    }
+
+    /// #270: `auth status --provider` must not advertise `xai` (always refused).
+    /// Login/logout keep the full LoginProvider surface including xAI.
+    #[test]
+    fn auth_status_provider_rejects_xai_while_login_keeps_it() {
+        let err = PagerArgs::try_parse_from(["grok", "auth", "status", "--provider", "xai"])
+            .expect_err("xai is not a status provider");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+
+        let login = PagerArgs::try_parse_from(["grok", "login", "--provider", "xai"])
+            .expect("xai remains a valid login provider");
+        assert!(matches!(
+            login.command,
+            Some(Command::Login {
+                provider: LoginProvider::Xai,
+                ..
+            })
+        ));
+
+        let logout = PagerArgs::try_parse_from(["grok", "logout", "--provider", "xai"])
+            .expect("xai remains a valid logout provider");
+        assert!(matches!(
+            logout.command,
+            Some(Command::Logout {
+                provider: LoginProvider::Xai
+            })
+        ));
+
+        let codex_status =
+            PagerArgs::try_parse_from(["grok", "auth", "status", "--provider", "openai-codex"])
+                .expect("openai-codex status still parses");
+        assert!(matches!(
+            codex_status.command,
+            Some(Command::Auth(AuthArgs {
+                command: AuthCommand::Status {
+                    provider: StatusProvider::OpenaiCodex,
+                    json: false,
+                }
+            }))
+        ));
+    }
+
+    #[test]
+    fn auth_status_help_lists_only_implemented_status_providers() {
+        use clap::CommandFactory as _;
+
+        let mut command = PagerArgs::command();
+        let status = command
+            .find_subcommand_mut("auth")
+            .and_then(|auth| auth.find_subcommand_mut("status"))
+            .expect("auth status subcommand");
+        let help = status.render_long_help().to_string();
+
+        assert!(
+            help.contains("openai-codex"),
+            "status help must advertise the implemented provider: {help}"
+        );
+        // Login still accepts xai; status help must not list it as a choice.
+        assert!(
+            !help.contains("xai"),
+            "status help must not list xai (issue #270): {help}"
+        );
     }
     #[test]
     fn positional_prompt_conflicts_with_headless_single() {

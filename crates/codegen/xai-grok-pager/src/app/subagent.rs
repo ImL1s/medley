@@ -832,6 +832,65 @@ mod tests {
     fn context_badge_none_returns_empty() {
         assert_eq!(format_context_badge(&make_info()), "");
     }
+    /// #306 gate 8: resumed badge driven by `context_source` plus task
+    /// description on the production label / scrollback surfaces (not a
+    /// badge-only rewrap of `context_badge_resumed`).
+    #[test]
+    fn resumed_subagent_badge_and_transcript_are_visible() {
+        let task = "Continue Medley providers release gates";
+        let mut info = make_info();
+        info.context_source = Some("resumed".into());
+        info.resumed_from = Some("parent-session-xyz".into());
+        info.description = task.into();
+
+        // Badge is driven by context_source, not resumed_from alone.
+        assert_eq!(format_context_badge(&info), "resumed");
+        let mut forked_only = make_info();
+        forked_only.resumed_from = Some("x".into());
+        forked_only.context_source = None;
+        assert_ne!(format_context_badge(&forked_only), "resumed");
+
+        // Production tasks-pane / status surfaces compose badge + label +
+        // cleaned description from the same SubagentInfo (see tasks_pane
+        // `from_subagent` + `render_agent_overlay`).
+        let badge = format_context_badge(&info);
+        let (label, clean_desc) = format_subagent_label(&info);
+        assert!(
+            !clean_desc.is_empty(),
+            "format_subagent_label must return non-empty description"
+        );
+        assert!(
+            clean_desc.contains(task),
+            "task description must surface via format_subagent_label clean_desc only \
+             (not a tautological OR on info.description): label={label:?} desc={clean_desc:?}"
+        );
+        let tasks_row = format!("{label} {clean_desc} {badge}");
+        assert!(
+            tasks_row.contains("resumed") && tasks_row.contains(task),
+            "tasks-pane composition must co-surface badge + description: {tasks_row:?}"
+        );
+
+        // Production scrollback block carries the task description (field +
+        // searchable transcript index), matching the spawn path.
+        use crate::scrollback::blocks::SubagentBlock;
+        let block = SubagentBlock::started(
+            info.description.as_ref(),
+            info.child_session_id.as_ref(),
+            info.subagent_type.as_ref(),
+            info.persona.as_ref().map(|s| s.to_string()),
+            info.role.as_ref().map(|s| s.to_string()),
+            info.model.as_ref().map(|s| s.to_string()),
+            info.is_background,
+        );
+        assert_eq!(block.description.as_str(), task);
+        let searchable = RenderBlock::Subagent(block)
+            .searchable_text()
+            .expect("subagent block must index description");
+        assert!(
+            searchable.contains(task),
+            "task description must be searchable on SubagentBlock: {searchable:?}"
+        );
+    }
     #[test]
     fn subagent_meta_collapses_duplicate_persona_role() {
         assert_eq!(

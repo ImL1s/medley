@@ -3340,3 +3340,239 @@ fn test_catalog_auth_schemes_and_override() {
 
     server_task.abort();
 }
+
+// ── #303 Codex-only implicit default ────────────────────────────────
+
+/// Serialize #303 fixtures: they mutate process env (GROK_AUTH_PATH / XAI keys)
+/// and must not interleave.
+static CODEX_ONLY_DEFAULT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Build a ready Codex preset entry backed by a live-looking scoped credential.
+///
+/// Returns an [`EnvGuard`] that pins `GROK_AUTH_PATH` to this fixture's auth
+/// file for the lifetime of the test — required because
+/// `AuthManager::new_openai_codex` prefers that env over `grok_home`.
+fn ready_codex_entry(auth_home: &std::path::Path) -> (ModelEntry, xai_grok_test_support::EnvGuard) {
+    use xai_grok_test_support::EnvGuard;
+    let auth_path = auth_home.join("auth.json");
+    let auth = crate::auth::GrokAuth {
+        key: "live-codex-token".to_owned(),
+        auth_mode: crate::auth::AuthMode::OpenAiCodex,
+        refresh_token: Some("refresh".to_owned()),
+        expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        oidc_issuer: Some(crate::auth::openai_codex::ISSUER.to_owned()),
+        oidc_client_id: Some(crate::auth::openai_codex::CLIENT_ID.to_owned()),
+        account_id: Some("account".to_owned()),
+        ..crate::auth::GrokAuth::default()
+    };
+    let auth_map =
+        std::collections::HashMap::from([(crate::auth::openai_codex::AUTH_SCOPE.to_owned(), auth)]);
+    std::fs::write(&auth_path, serde_json::to_vec(&auth_map).unwrap()).unwrap();
+
+    // Pin after write so status reads this file even if peer tests thrash env.
+    let auth_path_guard = EnvGuard::set(
+        "GROK_AUTH_PATH",
+        auth_path.to_str().expect("utf-8 temp path"),
+    );
+
+    let slug = crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID;
+    let mut entry = ModelEntry::fallback(slug, &config::EndpointsConfig::default());
+    entry.info.model = slug.to_string();
+    entry.info.api_backend = crate::sampling::ApiBackend::CodexResponses;
+    entry.info.base_url = crate::auth::openai_codex::CODEX_API_BASE_URL.to_string();
+    entry.info.user_selectable = true;
+    entry.auth_provider = Some(crate::auth::AuthProviderRef::openai_codex(
+        crate::auth::openai_codex::manager(auth_home),
+    ));
+    let (ready, reason) = crate::agent::config::model_readiness(&entry);
+    assert!(
+        ready,
+        "fixture Codex entry must be ready, got reason={reason:?}"
+    );
+    (entry, auth_path_guard)
+}
+
+#[test]
+fn codex_only_cold_start_defaults_to_ready_codex() {
+    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    use xai_grok_test_support::EnvGuard;
+    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+    let tmp = tempfile::tempdir().expect("temp home");
+    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
+    let codex_key = crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string();
+
+    // Grok first (bundled order), then ready Codex — the historical failure mode.
+    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
+    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
+    catalog.insert(codex_key.clone(), codex);
+
+    let cfg = config::Config::default(); // no explicit preference
+    let (key, entry, source, reason) = resolve_default_model(&cfg, &catalog, false);
+    assert!(
+        reason.is_none(),
+        "ready Codex default must not be unready: {reason:?}"
+    );
+    assert!(
+        matches!(source, config::ConfigSource::Default),
+        "implicit path reports Default, got {source:?}"
+    );
+    assert_eq!(
+        key, codex_key,
+        "#303: Codex-only cold start must seat ready Codex, not ambient-ready Grok"
+    );
+    assert_eq!(
+        entry.info.api_backend,
+        crate::sampling::ApiBackend::CodexResponses
+    );
+}
+
+#[test]
+fn codex_only_default_not_bundled_grok_when_codex_ready() {
+    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    use xai_grok_test_support::EnvGuard;
+    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+    let tmp = tempfile::tempdir().expect("temp home");
+    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
+    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
+    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
+    catalog.insert(
+        crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string(),
+        codex,
+    );
+
+    let (key, _, _, _) = resolve_default_model(&config::Config::default(), &catalog, false);
+    assert_ne!(
+        key,
+        crate::models::default_model(),
+        "must not keep the bundled default when a ready Codex route exists"
+    );
+}
+
+#[test]
+fn xai_ambient_still_prefers_first_party_grok() {
+    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use crate::agent::auth_method::XAI_API_KEY_ENV_VAR;
+    use xai_grok_test_support::EnvGuard;
+    let _g = EnvGuard::set(XAI_API_KEY_ENV_VAR, "test-xai-key-not-real");
+
+    let tmp = tempfile::tempdir().expect("temp home");
+    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
+    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
+    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
+    catalog.insert(
+        crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string(),
+        codex,
+    );
+
+    let (key, _, _, _) = resolve_default_model(&config::Config::default(), &catalog, false);
+    assert_eq!(
+        key, "grok-4.5",
+        "with ambient XAI_API_KEY, first ready first-party Grok remains eligible"
+    );
+}
+
+#[test]
+fn codex_ready_reseats_ambient_grok_without_xai_auth() {
+    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    use xai_grok_test_support::EnvGuard;
+    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+    let tmp = tempfile::tempdir().expect("temp home");
+    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
+    let codex_key = crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string();
+
+    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
+    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
+    catalog.insert(codex_key.clone(), codex);
+
+    let xai_home = tmp.path().join("xai");
+    std::fs::create_dir_all(&xai_home).unwrap();
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        catalog,
+        acp::ModelId::new("grok-4.5"), // stranded default
+        Arc::new(AuthManager::new(&xai_home, GrokComConfig::default())),
+        config::Config::default(),
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+
+    assert_eq!(mgr.current_model_id().0.as_ref(), "grok-4.5");
+    mgr.reselect_current_model_if_missing(&config::Config::default());
+    assert_eq!(
+        mgr.current_model_id().0.as_ref(),
+        codex_key.as_str(),
+        "#303: manager reseat must leave ambient Grok for ready Codex when no usable xAI auth"
+    );
+}
+
+#[test]
+fn byok_and_auth_scheme_none_unchanged_when_codex_ready() {
+    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    use xai_grok_test_support::EnvGuard;
+    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+    let tmp = tempfile::tempdir().expect("temp home");
+    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
+
+    // BYOK-style entry: own api_key, non-first-party origin.
+    let mut byok = make_model_entry("my-byok");
+    byok.info.base_url = "https://third-party.example/v1".to_string();
+    byok.api_key = Some("sk-test".to_string());
+    assert!(byok.has_own_credentials());
+    assert!(!resolution::is_first_party_ambient_xai_entry(&byok));
+
+    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
+    catalog.insert("my-byok".to_string(), byok);
+    catalog.insert(
+        crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string(),
+        codex,
+    );
+
+    let mut cfg = config::Config::default();
+    cfg.models.default = Some("my-byok".to_string());
+    let (key, _, _, _) = resolve_default_model(&cfg, &catalog, false);
+    assert_eq!(
+        key, "my-byok",
+        "explicit BYOK preference must not be swapped for Codex under #303"
+    );
+
+    // Manager reseat must not yank BYOK current when ready Codex exists.
+    let xai_home = tmp.path().join("xai");
+    std::fs::create_dir_all(&xai_home).unwrap();
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        catalog,
+        acp::ModelId::new("my-byok"),
+        Arc::new(AuthManager::new(&xai_home, GrokComConfig::default())),
+        config::Config::default(),
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    mgr.reselect_current_model_if_missing(&config::Config::default());
+    assert_eq!(
+        mgr.current_model_id().0.as_ref(),
+        "my-byok",
+        "BYOK current must not be stranded-reseat to Codex"
+    );
+}

@@ -369,4 +369,103 @@ mod tests {
         assert!(items[0].match_text.starts_with("a "));
         assert!(items[3].match_text.starts_with("d "));
     }
+
+    /// #306 gate 4: effort menu is model-specific; none only when advertised;
+    /// menu-less models still accept minimal and reject none.
+    #[test]
+    fn codex_effort_picker_obeys_each_model_menu_including_minimal_and_none() {
+        let mut state = ModelState::default();
+        // Model A: catalog menu with none
+        let id_a = acp::ModelId::new(Arc::from("codex-with-none"));
+        let info_a = acp::ModelInfo::new(id_a.clone(), "Codex With None".to_string()).meta(
+            serde_json::json!({
+                "supportsReasoningEffort": true,
+                "reasoningEfforts": [
+                    { "value": "none", "label": "None", "default": true },
+                    { "value": "high", "label": "High" },
+                ],
+            })
+            .as_object()
+            .cloned(),
+        );
+        // Model B: menu-less reasoning
+        let (id_b, info_b) = model_with_reasoning("reasoning-menu-less", "Reasoning Menu Less");
+        state.available.insert(id_a.clone(), info_a);
+        state.available.insert(id_b.clone(), info_b);
+
+        let cmd = EffortCommand;
+
+        // Seat A
+        state.current = Some(id_a.clone());
+        let suggest_a = {
+            let ctx = AppCtx {
+                models: &state,
+                cwd: std::path::Path::new("."),
+                has_session_announcements: false,
+                billing_surface_visible: true,
+                usage_command_visible: true,
+                workflows_available: true,
+                screen_mode: crate::app::ScreenMode::Fullscreen,
+            };
+            cmd.suggest_args(&ctx, "").expect("A has menu")
+        };
+        let ids_a: Vec<String> = suggest_a.iter().map(|i| i.insert_text.clone()).collect();
+        assert!(
+            ids_a.iter().any(|s| s == "none"),
+            "A must offer none: {ids_a:?}"
+        );
+        assert!(
+            ids_a.iter().any(|s| s == "high"),
+            "A must offer high: {ids_a:?}"
+        );
+        {
+            let mut ctx = dummy_exec_ctx(&state);
+            match EffortCommand.run(&mut ctx, "none") {
+                CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+                    assert_eq!(model_id, id_a);
+                    assert_eq!(effort, Some(ReasoningEffort::None));
+                }
+                other => panic!("expected SwitchModel none, got {other:?}"),
+            }
+        }
+
+        // Seat B
+        state.current = Some(id_b.clone());
+        let suggest_b = {
+            let ctx = AppCtx {
+                models: &state,
+                cwd: std::path::Path::new("."),
+                has_session_announcements: false,
+                billing_surface_visible: true,
+                usage_command_visible: true,
+                workflows_available: true,
+                screen_mode: crate::app::ScreenMode::Fullscreen,
+            };
+            cmd.suggest_args(&ctx, "").expect("B has legacy menu")
+        };
+        let ids_b: Vec<String> = suggest_b.iter().map(|i| i.insert_text.clone()).collect();
+        assert_ne!(ids_a, ids_b, "suggest lists must differ between A and B");
+        assert!(
+            !ids_b.iter().any(|s| s == "none"),
+            "B must not offer none: {ids_b:?}"
+        );
+        assert!(
+            ids_b.iter().any(|s| s == "minimal"),
+            "B must offer minimal: {ids_b:?}"
+        );
+        {
+            let mut ctx = dummy_exec_ctx(&state);
+            match EffortCommand.run(&mut ctx, "minimal") {
+                CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+                    assert_eq!(model_id, id_b);
+                    assert_eq!(effort, Some(ReasoningEffort::Minimal));
+                }
+                other => panic!("expected minimal, got {other:?}"),
+            }
+            let CommandResult::Error(msg) = EffortCommand.run(&mut ctx, "none") else {
+                panic!("expected Error for none on B");
+            };
+            assert!(msg.contains("unknown effort level 'none'"), "msg={msg}");
+        }
+    }
 }

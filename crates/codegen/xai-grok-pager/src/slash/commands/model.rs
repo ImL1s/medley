@@ -729,6 +729,298 @@ mod tests {
         assert!(item.description.contains(reason));
     }
 
+    /// #306 C-min gate 1: Codex-only boot seats ready Codex as the
+    /// authoritative default; the prompt footer must paint that name and never
+    /// fall through to empty / "unknown" or keep ambient Grok.
+    #[test]
+    fn codex_only_boot_footer_uses_authoritative_default_never_unknown() {
+        use crate::views::prompt_widget::{PromptInfo, PromptStyle, PromptWidget};
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        let mut state = ModelState::default();
+        // Catalog order mirrors historical defaults-first: Grok ambient-ready,
+        // then live ready Codex. After #303 the shell seats Codex as current.
+        let (grok_id, grok_info) = model_with_meta(
+            "grok-4.5",
+            "Grok 4.5",
+            serde_json::Map::from_iter([
+                ("authScheme".into(), serde_json::json!("bearer")),
+                ("authClass".into(), serde_json::json!("env")),
+                ("ready".into(), serde_json::json!(true)),
+                ("providerHint".into(), serde_json::json!("xAI")),
+            ]),
+        );
+        let (codex_id, codex_info) = model_with_meta(
+            "gpt-5.6-sol",
+            "GPT-5.6 Sol",
+            serde_json::Map::from_iter([
+                ("authScheme".into(), serde_json::json!("bearer")),
+                ("authClass".into(), serde_json::json!("session")),
+                ("ready".into(), serde_json::json!(true)),
+                ("providerHint".into(), serde_json::json!("chatgpt.com")),
+            ]),
+        );
+        state.available.insert(grok_id.clone(), grok_info);
+        state.available.insert(codex_id.clone(), codex_info);
+        state.set_current(codex_id.clone(), None);
+
+        let footer_label = state
+            .current_model_name()
+            .expect("boot footer requires an authoritative current model");
+        assert_eq!(footer_label, "GPT-5.6 Sol");
+        assert!(
+            !footer_label.is_empty() && !footer_label.eq_ignore_ascii_case("unknown"),
+            "footer label must never be empty/unknown, got {footer_label:?}"
+        );
+        assert_ne!(
+            footer_label, "Grok 4.5",
+            "Codex-only boot must not keep ambient-ready Grok as the footer default"
+        );
+        assert_eq!(state.current_model_id_str(), Some("gpt-5.6-sol"));
+        assert_ne!(state.current.as_ref(), Some(&grok_id));
+        assert!(
+            model_not_ready_reason(&state, &codex_id).is_none(),
+            "seated Codex must be ready for boot"
+        );
+
+        // Welcome / agent prompt chrome: same label path as AppView
+        // (`current_model_name` → PromptInfo.model_name).
+        let mut pw = PromptWidget::new();
+        let area = Rect::new(0, 0, 80, 4);
+        let mut buf = Buffer::empty(area);
+        let info = PromptInfo {
+            model_name: &footer_label,
+            flags: &[],
+            multiline: false,
+            usage_warning: None,
+            usage_warning_critical: false,
+        };
+        pw.draw(
+            &mut buf,
+            area,
+            None,
+            &PromptStyle::default(),
+            Some(&info),
+            None,
+        );
+
+        let mut painted = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if let Some(cell) = buf.cell((x, y)) {
+                    painted.push_str(cell.symbol());
+                }
+            }
+            painted.push('\n');
+        }
+        assert!(
+            painted.contains("GPT-5.6 Sol"),
+            "boot footer buffer must paint ready Codex name, got:\n{painted}"
+        );
+        assert!(
+            !painted.to_ascii_lowercase().contains("unknown"),
+            "boot footer must never paint 'unknown':\n{painted}"
+        );
+        assert!(
+            !painted.contains("Grok 4.5"),
+            "Codex-only boot footer must not paint Grok:\n{painted}"
+        );
+    }
+
+    /// #306 C-min gate 2: model picker lists live ready Codex and presents
+    /// Grok as unready / missing-cred (dimmed, non-selectable, blocked).
+    #[test]
+    fn codex_model_picker_lists_live_codex_ready_and_grok_unready() {
+        let mut state = ModelState::default();
+        let (grok_id, grok_info) = model_with_meta(
+            "grok-4.5",
+            "Grok 4.5",
+            serde_json::Map::from_iter([
+                ("authScheme".into(), serde_json::json!("bearer")),
+                ("authClass".into(), serde_json::json!("env")),
+                ("ready".into(), serde_json::json!(false)),
+                (
+                    "readinessReason".into(),
+                    serde_json::json!("missing XAI_API_KEY"),
+                ),
+                ("providerHint".into(), serde_json::json!("xAI")),
+            ]),
+        );
+        let (codex_id, codex_info) = model_with_meta(
+            "gpt-5.6-sol",
+            "GPT-5.6 Sol",
+            serde_json::Map::from_iter([
+                ("authScheme".into(), serde_json::json!("bearer")),
+                ("authClass".into(), serde_json::json!("session")),
+                ("ready".into(), serde_json::json!(true)),
+                ("providerHint".into(), serde_json::json!("chatgpt.com")),
+            ]),
+        );
+        state.available.insert(grok_id, grok_info);
+        state.available.insert(codex_id.clone(), codex_info);
+        state.set_current(codex_id, None);
+
+        let items = build_model_items(&state);
+        assert_eq!(items.len(), 2, "picker must list both catalog entries");
+
+        let codex = items
+            .iter()
+            .find(|i| i.match_text == "GPT-5.6 Sol")
+            .expect("live Codex row in picker");
+        assert_eq!(codex.badge, "ready");
+        assert!(!codex.dimmed);
+        assert!(!codex.non_selectable);
+        assert!(codex.blocked_reason.is_empty());
+        assert_eq!(codex.description, "chatgpt.com · bearer");
+        assert!(
+            codex.display.contains("(current)"),
+            "seated Codex should be marked current, got {}",
+            codex.display
+        );
+
+        let grok = items
+            .iter()
+            .find(|i| i.match_text == "Grok 4.5")
+            .expect("Grok row in picker");
+        assert_eq!(grok.badge, "missing");
+        assert!(grok.dimmed);
+        assert!(grok.non_selectable);
+        assert_eq!(grok.blocked_reason, "missing XAI_API_KEY");
+        assert_eq!(grok.description, "xAI · bearer");
+
+        // Selecting unready Grok must hard-block with the readiness reason.
+        let mut ctx = dummy_exec_ctx(&state);
+        match ModelCommand.run(&mut ctx, "Grok 4.5") {
+            CommandResult::Error(msg) => assert_eq!(msg, "missing XAI_API_KEY"),
+            other => panic!("expected Error for unready Grok, got {other:?}"),
+        }
+    }
+
+    /// #306 gate 3: every ready live Codex in the catalog is selectable
+    /// and seats via `SetDefaultModel`; final footer paints the last selected
+    /// Codex name (never empty/unknown/sibling Grok).
+    #[test]
+    fn codex_model_picker_selects_every_live_catalog_model() {
+        use crate::views::prompt_widget::{PromptInfo, PromptStyle, PromptWidget};
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        let mut state = ModelState::default();
+        let (grok_id, grok_info) = model_with_meta(
+            "grok-4.5",
+            "Grok 4.5",
+            serde_json::Map::from_iter([
+                ("authScheme".into(), serde_json::json!("bearer")),
+                ("authClass".into(), serde_json::json!("env")),
+                ("ready".into(), serde_json::json!(false)),
+                (
+                    "readinessReason".into(),
+                    serde_json::json!("missing XAI_API_KEY"),
+                ),
+                ("providerHint".into(), serde_json::json!("xAI")),
+            ]),
+        );
+        let ready_models = [("gpt-5.6-sol", "GPT-5.6 Sol"), ("gpt-5.4", "GPT-5.4")];
+        let mut ready_ids: Vec<(acp::ModelId, String)> = Vec::new();
+        for (id, name) in ready_models {
+            let (mid, info) = model_with_meta(
+                id,
+                name,
+                serde_json::Map::from_iter([
+                    ("authScheme".into(), serde_json::json!("bearer")),
+                    ("authClass".into(), serde_json::json!("session")),
+                    ("ready".into(), serde_json::json!(true)),
+                    ("providerHint".into(), serde_json::json!("chatgpt.com")),
+                ]),
+            );
+            ready_ids.push((mid.clone(), name.to_string()));
+            state.available.insert(mid, info);
+        }
+        state.available.insert(grok_id, grok_info);
+
+        let items = build_model_items(&state);
+        for (_, name) in &ready_ids {
+            let row = items
+                .iter()
+                .find(|i| i.match_text == *name)
+                .expect("ready Codex row in picker");
+            assert_eq!(row.badge, "ready");
+            assert!(!row.non_selectable);
+        }
+
+        let mut last_name = String::new();
+        for (id, name) in &ready_ids {
+            let mut ctx = dummy_exec_ctx(&state);
+            match ModelCommand.run(&mut ctx, name) {
+                CommandResult::Action(Action::SetDefaultModel(resolved)) => {
+                    assert_eq!(&resolved, id);
+                }
+                other => panic!("expected SetDefaultModel for {name}, got {other:?}"),
+            }
+            state.set_current(id.clone(), None);
+            assert_eq!(state.current_model_id_str(), Some(id.0.as_ref()));
+            assert_eq!(state.current_model_name().as_deref(), Some(name.as_str()));
+            assert_eq!(state.current.as_ref(), Some(id));
+            last_name = name.clone();
+        }
+
+        // Paint footer like gate 1 — label is last Codex name.
+        let footer_label = state
+            .current_model_name()
+            .expect("footer requires an authoritative current model after last selection");
+        assert_eq!(footer_label, last_name);
+        assert!(
+            !footer_label.is_empty() && !footer_label.eq_ignore_ascii_case("unknown"),
+            "footer label must never be empty/unknown, got {footer_label:?}"
+        );
+        assert_ne!(
+            footer_label, "Grok 4.5",
+            "last selection footer must not paint sibling unready Grok"
+        );
+
+        let mut pw = PromptWidget::new();
+        let area = Rect::new(0, 0, 80, 4);
+        let mut buf = Buffer::empty(area);
+        let info = PromptInfo {
+            model_name: &footer_label,
+            flags: &[],
+            multiline: false,
+            usage_warning: None,
+            usage_warning_critical: false,
+        };
+        pw.draw(
+            &mut buf,
+            area,
+            None,
+            &PromptStyle::default(),
+            Some(&info),
+            None,
+        );
+
+        let mut painted = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if let Some(cell) = buf.cell((x, y)) {
+                    painted.push_str(cell.symbol());
+                }
+            }
+            painted.push('\n');
+        }
+        assert!(
+            painted.contains(&last_name),
+            "footer must paint last Codex name, got:\n{painted}"
+        );
+        assert!(
+            !painted.contains("Grok 4.5"),
+            "footer must not paint unready Grok:\n{painted}"
+        );
+        assert!(
+            !painted.to_ascii_lowercase().contains("unknown"),
+            "footer must never paint 'unknown':\n{painted}"
+        );
+    }
+
     #[test]
     fn run_hard_blocks_invalid_auth_scheme_model() {
         let reason = r#"invalid auth_scheme "not-a-scheme": expected bearer, x_api_key, or none"#;
