@@ -3576,3 +3576,147 @@ fn byok_and_auth_scheme_none_unchanged_when_codex_ready() {
         "BYOK current must not be stranded-reseat to Codex"
     );
 }
+
+/// Pro P0: blank primary + valid legacy still counts as ambient usable → Grok.
+#[test]
+fn blank_primary_valid_legacy_keeps_grok_when_codex_ready() {
+    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    use xai_grok_test_support::EnvGuard;
+    let _g = EnvGuard::set(XAI_API_KEY_ENV_VAR, "");
+    let _l = EnvGuard::set(LEGACY_XAI_API_KEY_ENV_VAR, "legacy-live-key");
+
+    let tmp = tempfile::tempdir().expect("temp home");
+    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
+    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
+    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
+    catalog.insert(
+        crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string(),
+        codex,
+    );
+
+    assert!(
+        resolution::usable_ambient_xai_auth(&config::Config::default(), false),
+        "blank primary + valid legacy must count as ambient xAI"
+    );
+    let (key, _, _, _) = resolve_default_model(&config::Config::default(), &catalog, false);
+    assert_eq!(
+        key, "grok-4.5",
+        "legacy fallthrough must keep first-party Grok over Codex"
+    );
+}
+
+/// Pro P0: blank / whitespace `XAI_API_KEY` must not keep Grok over ready Codex.
+#[test]
+fn blank_xai_env_does_not_pin_grok_when_codex_ready() {
+    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    use xai_grok_test_support::EnvGuard;
+    let _g = EnvGuard::set(XAI_API_KEY_ENV_VAR, "");
+    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+    let tmp = tempfile::tempdir().expect("temp home");
+    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
+    let codex_key = crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string();
+    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
+    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
+    catalog.insert(codex_key.clone(), codex);
+
+    assert!(
+        !resolution::usable_ambient_xai_auth(&config::Config::default(), false),
+        "blank XAI_API_KEY must not count as usable ambient xAI"
+    );
+    let (key, _, _, _) = resolve_default_model(&config::Config::default(), &catalog, false);
+    assert_eq!(
+        key, codex_key,
+        "blank env must seat ready Codex, not ambient Grok"
+    );
+}
+
+/// Pro P0: whitespace-only primary is not ambient usable.
+#[test]
+fn whitespace_xai_env_does_not_pin_grok_when_codex_ready() {
+    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    use xai_grok_test_support::EnvGuard;
+    let _g = EnvGuard::set(XAI_API_KEY_ENV_VAR, "  \t ");
+    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+    let tmp = tempfile::tempdir().expect("temp home");
+    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
+    let codex_key = crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string();
+    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
+    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
+    catalog.insert(codex_key.clone(), codex);
+
+    let (key, _, _, _) = resolve_default_model(&config::Config::default(), &catalog, false);
+    assert_eq!(key, codex_key);
+}
+
+/// Pro P0: `[auth] preferred_method = api_key` keeps Grok even with ready Codex
+/// and no live credential (avoids model/auth-surface contradiction).
+#[test]
+fn preferred_method_api_key_pin_keeps_first_party_when_codex_ready() {
+    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    use crate::auth::PreferredAuthMethod;
+    use xai_grok_test_support::EnvGuard;
+    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+    let tmp = tempfile::tempdir().expect("temp home");
+    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
+    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
+    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
+    catalog.insert(
+        crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string(),
+        codex,
+    );
+
+    let mut cfg = config::Config::default();
+    cfg.grok_com_config.preferred_method = Some(PreferredAuthMethod::ApiKey);
+    assert!(
+        resolution::usable_ambient_xai_auth(&cfg, false),
+        "api_key pin must preserve ambient xAI / Grok precedence"
+    );
+    let (key, _, _, _) = resolve_default_model(&cfg, &catalog, false);
+    assert_eq!(
+        key, "grok-4.5",
+        "preferred_method=api_key must not seat Codex over first-party Grok"
+    );
+}
+
+/// Pro P0: `[auth] preferred_method = oidc` same pin semantics as api_key.
+#[test]
+fn preferred_method_oidc_pin_keeps_first_party_when_codex_ready() {
+    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    use crate::auth::PreferredAuthMethod;
+    use xai_grok_test_support::EnvGuard;
+    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+    let tmp = tempfile::tempdir().expect("temp home");
+    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
+    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
+    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
+    catalog.insert(
+        crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string(),
+        codex,
+    );
+
+    let mut cfg = config::Config::default();
+    cfg.grok_com_config.preferred_method = Some(PreferredAuthMethod::Oidc);
+    let (key, _, _, _) = resolve_default_model(&cfg, &catalog, false);
+    assert_eq!(key, "grok-4.5");
+}

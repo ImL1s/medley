@@ -223,6 +223,87 @@ fn has_usable_token_covers_memory_and_disk() {
     );
 }
 
+/// Pro P0: one observation classifies usability + first-party session kind.
+///
+/// Production disk sibling path uses **OIDC** — `lookup_auth` skips WebLogin on
+/// disk, so fixtures must not use WebLogin to claim disk coverage.
+#[test]
+fn has_usable_first_party_session_single_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+
+    assert!(
+        !mgr.has_usable_first_party_session(),
+        "empty manager is not a usable first-party session"
+    );
+
+    // OIDC is the production first-party session that survives disk lookup.
+    let mut oidc = make_auth(Some(Utc::now() + Duration::hours(1)), Utc::now());
+    oidc.auth_mode = AuthMode::Oidc;
+    oidc.oidc_issuer = Some(crate::auth::config::XAI_OAUTH2_ISSUER.to_owned());
+    mgr.persist_and_swap(oidc.clone());
+    assert!(
+        mgr.has_usable_first_party_session(),
+        "persisted OIDC must count"
+    );
+    assert!(
+        mgr.read_disk_auth().is_some(),
+        "precondition: OIDC must be loadable from disk via lookup_auth"
+    );
+
+    // Disk-only sibling: clear memory; hard-valid OIDC remains on disk only.
+    // Old split: has_usable_token() && current().is_session_auth() → false.
+    mgr.clear_in_memory();
+    assert!(mgr.current().is_none(), "memory cleared");
+    assert!(mgr.has_usable_token(), "disk OIDC still wire-valid");
+    assert!(
+        mgr.has_usable_first_party_session(),
+        "disk-only OIDC must count as usable first-party session (single snapshot)"
+    );
+
+    // Soft-expired in memory (inside early buffer) with empty disk still counts
+    // via hard-valid current_or_expired path.
+    let mut soft = make_auth(Some(Utc::now() + Duration::minutes(2)), Utc::now());
+    soft.auth_mode = AuthMode::Oidc;
+    soft.oidc_issuer = Some(crate::auth::config::XAI_OAUTH2_ISSUER.to_owned());
+    // Overwrite disk with hard-expired so only soft memory remains.
+    let mut dead = soft.clone();
+    dead.expires_at = Some(Utc::now() - Duration::hours(1));
+    mgr.persist_and_swap(dead);
+    mgr.hot_swap(soft);
+    assert!(
+        mgr.current().is_none(),
+        "soft-expired token is filtered from current()"
+    );
+    assert!(
+        !mgr.has_usable_disk_token(),
+        "disk deliberately hard-expired for soft-memory isolation"
+    );
+    assert!(
+        mgr.has_usable_token(),
+        "soft-expired but hard-valid memory still usable"
+    );
+    assert!(
+        mgr.has_usable_first_party_session(),
+        "single snapshot must not require current() for soft-expired OIDC"
+    );
+
+    // OpenAiCodex is never first-party xAI session auth.
+    let mut codex = make_auth(Some(Utc::now() + Duration::hours(1)), Utc::now());
+    codex.auth_mode = AuthMode::OpenAiCodex;
+    mgr.persist_and_swap(codex);
+    assert!(
+        !mgr.has_usable_first_party_session(),
+        "OpenAiCodex must not count as first-party xAI session"
+    );
+
+    // Plain API key is not session auth either.
+    let mut api = make_auth(Some(Utc::now() + Duration::hours(1)), Utc::now());
+    api.auth_mode = AuthMode::ApiKey;
+    mgr.hot_swap(api);
+    assert!(!mgr.has_usable_first_party_session());
+}
+
 #[test]
 fn auth_scope_uses_oauth2_when_present() {
     let cfg = GrokComConfig::default();
