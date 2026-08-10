@@ -333,6 +333,8 @@ impl ChildRunner for SoakRunner {
                     child_cwd: request.cwd.clone().unwrap_or_default(),
                     worktree_path: None,
                     effective_model_id: "soak-model".to_owned(),
+                    effective_model_route: Some("soak-model".to_owned()),
+                    effective_model_agent_type: Some(request.subagent_type.clone()),
                     definition_background: false,
                     control: SoakControl {
                         cancellation: cancellation.clone(),

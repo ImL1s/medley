@@ -61,6 +61,11 @@ pub struct ResumeSourceData {
     /// Used by the shell for resume model pinning (model overrides on
     /// resume are soft-ignored, not identity-gated).
     pub model_id: Option<String>,
+    /// Routing model committed with `model_id` by the source child.
+    pub model_route: Option<String>,
+    /// Catalog sampling harness committed with `model_id` by the source child.
+    /// This is distinct from `subagent_type`, which identifies the child role.
+    pub model_agent_type: Option<String>,
     /// Effective cwd the source child used. Consumed by the shell's
     /// spawn orchestration to reconstruct `SessionInfo` for raw
     /// transcript continuation and worktree reuse.

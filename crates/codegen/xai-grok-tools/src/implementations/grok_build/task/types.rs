@@ -754,13 +754,15 @@ pub struct SubagentResumeSource {
     pub subagent_type: String,
     pub persona: Option<String>,
     pub model_id: Option<String>,
+    pub model_route: Option<String>,
+    pub model_agent_type: Option<String>,
 }
 
 /// Result of a resume-source lookup.
 #[derive(Debug, Clone)]
 pub enum SubagentResumeLookup {
     Active,
-    Completed(SubagentResumeSource),
+    Completed(Box<SubagentResumeSource>),
     Missing,
 }
 

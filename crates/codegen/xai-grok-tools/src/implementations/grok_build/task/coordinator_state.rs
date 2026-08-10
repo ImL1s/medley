@@ -48,6 +48,8 @@ pub struct StartedChild<C> {
     pub child_cwd: String,
     pub worktree_path: Option<String>,
     pub effective_model_id: String,
+    pub effective_model_route: Option<String>,
+    pub effective_model_agent_type: Option<String>,
     /// The resolved agent definition declares `background: true`. Folded into
     /// `Outstanding` accounting (background, never turn-blocking) while the
     /// foreground await budget stays gated on the tool's own
@@ -313,6 +315,8 @@ pub(super) struct ActiveChild<C> {
     pub(super) child_cwd: String,
     pub(super) worktree_path: Option<String>,
     pub(super) effective_model_id: String,
+    pub(super) effective_model_route: Option<String>,
+    pub(super) effective_model_agent_type: Option<String>,
     pub(super) control: C,
 }
 
@@ -327,6 +331,8 @@ pub(super) struct CompletedChild {
     pub(super) snapshot_ref: Option<String>,
     pub(super) persisted_output_ref: Option<String>,
     pub(super) effective_model_id: String,
+    pub(super) effective_model_route: Option<String>,
+    pub(super) effective_model_agent_type: Option<String>,
     pub(super) result: SubagentResult,
 }
 

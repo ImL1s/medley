@@ -1873,6 +1873,8 @@ fn durable_resume_source_for(
         subagent_type: meta.subagent_type,
         persona: meta.persona,
         model_id: meta.effective_model_id,
+        model_route: meta.effective_model_route,
+        model_agent_type: meta.effective_model_agent_type,
     })
 }
 /// Resolve the MCP pool a child subagent should import from its parent.
@@ -2775,6 +2777,16 @@ pub(crate) struct SubagentMeta {
     /// durable `resume_from` identity validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_model_id: Option<String>,
+    /// Routing model committed with `effective_model_id`. This is model
+    /// lineage, not the subagent role stored in `subagent_type`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_model_route: Option<String>,
+    /// Catalog harness committed with `effective_model_id`. This is kept
+    /// separate from the selected subagent role so resume compares harness
+    /// identity with harness identity instead of treating `general-purpose`
+    /// as a model harness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_model_agent_type: Option<String>,
 }
 /// Canonical subagent metadata for GCS persistence (`subagent.json`).
 ///
@@ -2812,6 +2824,13 @@ pub(crate) struct SubagentSessionMetadata {
     pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
+    /// Routing model committed with `model_id` for durable resume identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_route: Option<String>,
+    /// Catalog sampling harness committed with `model_id`. This is distinct
+    /// from the selected subagent role stored in `subagent_type`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_agent_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2875,6 +2894,8 @@ impl SubagentSessionMetadata {
             capability_mode: capability_mode.map(str::to_string),
             reasoning_effort: reasoning_effort.map(str::to_string),
             model_id: model_id.map(str::to_string),
+            model_route: meta.effective_model_route.clone(),
+            model_agent_type: meta.effective_model_agent_type.clone(),
             cwd: cwd.map(str::to_string),
             worktree_path: worktree_path.map(str::to_string),
             isolation_mode: isolation_mode.map(str::to_string),

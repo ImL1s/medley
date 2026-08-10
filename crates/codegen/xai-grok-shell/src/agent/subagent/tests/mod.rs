@@ -7,6 +7,7 @@ use super::handle_request::{
 use crate::test_support::lsp_runtime::{
     DummyLspDispatch, ctx_with_toggle, test_gateway, test_gateway_with_receiver,
 };
+use crate::session::storage::{StorageAdapter, jsonl::JsonlStorageAdapter};
 use xai_grok_subagent_resolution::resolve_effective_overrides;
 use xai_grok_tools::implementations::grok_build::task::backend::{ChannelBackend, SubagentBackend};
 use xai_grok_tools::implementations::grok_build::task::coordinator::{
@@ -1936,6 +1937,257 @@ async fn run_issue39_spawn(request: SubagentRequest, ctx: SubagentSpawnContext) 
         .expect("spawn request should return a result");
     actor.abort();
     result
+}
+
+#[derive(Clone, Copy)]
+enum DurableLegacyResumeScenario {
+    Unchanged,
+    MissingCatalogIdentity,
+    ModelConflict,
+    RouteDrift,
+    CompleteMetadataModelConflict,
+    CompleteMetadataRouteConflict,
+}
+
+async fn run_durable_legacy_resume_scenario(
+    scenario: DurableLegacyResumeScenario,
+) -> SubagentResult {
+    let temp = tempfile::tempdir().expect("temp workspace");
+    let parent_id = format!("legacy-resume-parent-{}", uuid::Uuid::now_v7());
+    let source_id = format!("legacy-resume-source-{}", uuid::Uuid::now_v7());
+    let model_id = "legacy-codex-key";
+    let current_route = "current-codex-route";
+    let mut model_entry = test_model_entry(current_route);
+    model_entry.info.agent_type = "codex".to_owned();
+    let models = indexmap::IndexMap::from([(model_id.to_owned(), model_entry)]);
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.parent_session_id = parent_id.clone();
+    ctx.parent_cwd = temp.path().to_path_buf();
+    ctx.parent_session_info = Some(SessionInfo {
+        id: acp::SessionId::new(parent_id.clone()),
+        cwd: temp.path().to_string_lossy().into_owned(),
+    });
+    ctx.model_id = acp::ModelId::new(model_id);
+    ctx.sampling_config.model = current_route.to_owned();
+    ctx.available_models = models.clone();
+    ctx.models_manager = crate::agent::models::ModelsManager::new(
+        None,
+        models,
+        acp::ModelId::new(model_id),
+        ctx.auth_manager.clone(),
+        crate::agent::config::Config::default(),
+    );
+
+    let parent_info = ctx.parent_session_info.clone().expect("parent info");
+    let durable_dir = crate::session::persistence::session_dir(&parent_info)
+        .join("subagents")
+        .join(&source_id);
+    let child_session_id = format!("child-{source_id}");
+    let child_info = SessionInfo {
+        id: acp::SessionId::new(child_session_id.clone()),
+        cwd: temp.path().to_string_lossy().into_owned(),
+    };
+    let child_session_dir = crate::session::persistence::session_dir(&child_info);
+    let child_storage = JsonlStorageAdapter::with_explicit_session_dir(child_session_dir.clone());
+    let summary_model_id = if matches!(
+        scenario,
+        DurableLegacyResumeScenario::ModelConflict
+            | DurableLegacyResumeScenario::CompleteMetadataModelConflict
+    ) {
+        "conflicting-codex-key"
+    } else {
+        model_id
+    };
+    child_storage
+        .init_session(&child_info, acp::ModelId::new(summary_model_id))
+        .await
+        .expect("initialize durable source child JSONL");
+    child_storage
+        .append_chat_message(
+            &child_info,
+            &xai_grok_sampling_types::conversation::ConversationItem::user(
+                "persisted source turn",
+            ),
+        )
+        .await
+        .expect("persist source child transcript");
+    if !matches!(scenario, DurableLegacyResumeScenario::MissingCatalogIdentity) {
+        let summary_route = if matches!(scenario, DurableLegacyResumeScenario::RouteDrift) {
+            "historical-codex-route"
+        } else {
+            current_route
+        };
+        let identity = xai_chat_state::CatalogIdentity {
+            model_id: summary_model_id.to_owned(),
+            route: summary_route.to_owned(),
+            lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+            auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
+        };
+        child_storage
+            .update_current_model_identity_and_agent(
+                &child_info,
+                &acp::ModelId::new(summary_model_id),
+                Some(&identity),
+                Some("general-purpose"),
+                None,
+            )
+            .await
+            .expect("persist durable source catalog identity");
+    }
+    let complete_metadata = matches!(
+        scenario,
+        DurableLegacyResumeScenario::CompleteMetadataModelConflict
+            | DurableLegacyResumeScenario::CompleteMetadataRouteConflict
+    );
+    let metadata_route = if matches!(
+        scenario,
+        DurableLegacyResumeScenario::CompleteMetadataRouteConflict
+    ) {
+        "metadata-conflicting-route"
+    } else {
+        current_route
+    };
+    write_subagent_meta(
+        &durable_dir,
+        &SubagentMeta {
+            subagent_id: source_id.clone(),
+            parent_session_id: parent_id.clone(),
+            child_session_id,
+            subagent_type: "general-purpose".to_owned(),
+            description: "legacy source".to_owned(),
+            prompt: "source prompt".to_owned(),
+            status: "completed".to_owned(),
+            started_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
+            duration_ms: Some(1),
+            tool_calls: Some(0),
+            turns: Some(1),
+            error: None,
+            effective_context_source: Some("new".to_owned()),
+            context_normalized: false,
+            fork_copy_error: None,
+            persona: None,
+            resumed_from: None,
+            child_cwd: Some(temp.path().to_string_lossy().into_owned()),
+            worktree_path: None,
+            snapshot_ref: None,
+            effective_model_id: Some(model_id.to_owned()),
+            effective_model_route: complete_metadata.then(|| metadata_route.to_owned()),
+            effective_model_agent_type: complete_metadata.then(|| "codex".to_owned()),
+        },
+    );
+
+    let mut request = auto_wake_test_request(&format!("resume-{source_id}"));
+    request.parent_session_id = parent_id;
+    request.resume_from = Some(source_id);
+    request.run_in_background = false;
+    request.surface_completion = false;
+    if matches!(scenario, DurableLegacyResumeScenario::Unchanged) {
+        request.cancel_token.cancel();
+    }
+    let result = run_issue39_spawn(request, ctx).await;
+    let _ = std::fs::remove_dir_all(
+        crate::session::persistence::session_dir(&parent_info),
+    );
+    let _ = std::fs::remove_dir_all(child_session_dir);
+    result
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_legacy_resume_with_reconciled_jsonl_reaches_child_runtime() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let result =
+                run_durable_legacy_resume_scenario(DurableLegacyResumeScenario::Unchanged).await;
+            let error = result.error.unwrap_or_default();
+            assert!(
+                result.cancelled && !error.contains("Cannot resume from subagent"),
+                "unchanged pre-patch Codex lineage must pass resume validation and reach the cancelled child runtime: {error}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_legacy_resume_missing_catalog_identity_fails_closed() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let result = run_durable_legacy_resume_scenario(
+                DurableLegacyResumeScenario::MissingCatalogIdentity,
+            )
+            .await;
+            let error = result.error.unwrap_or_default();
+            assert!(
+                error.contains("source model route evidence is missing"),
+                "pre-patch metadata without durable catalog identity must fail closed: {error}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_legacy_resume_model_conflict_fails_closed() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let result =
+                run_durable_legacy_resume_scenario(DurableLegacyResumeScenario::ModelConflict)
+                    .await;
+            let error = result.error.unwrap_or_default();
+            assert!(
+                error.contains("metadata conflicts with the durable child session model identity"),
+                "legacy metadata/JSONL model conflict must fail closed: {error}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_legacy_resume_route_drift_fails_closed() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let result =
+                run_durable_legacy_resume_scenario(DurableLegacyResumeScenario::RouteDrift).await;
+            let error = result.error.unwrap_or_default();
+            assert!(
+                error.contains("persisted source model lineage no longer matches the current catalog"),
+                "durable route drift must fail closed before child spawn: {error}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_legacy_resume_complete_metadata_conflicting_jsonl_fails_closed() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let result = run_durable_legacy_resume_scenario(
+                DurableLegacyResumeScenario::CompleteMetadataModelConflict,
+            )
+            .await;
+            let error = result.error.unwrap_or_default();
+            assert!(
+                error.contains("metadata conflicts with the durable child session model identity"),
+                "complete metadata must not bypass conflicting durable JSONL: {error}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_legacy_resume_complete_metadata_route_conflict_fails_closed() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let result = run_durable_legacy_resume_scenario(
+                DurableLegacyResumeScenario::CompleteMetadataRouteConflict,
+            )
+            .await;
+            let error = result.error.unwrap_or_default();
+            assert!(
+                error.contains("metadata conflicts with the durable child session route identity"),
+                "complete metadata/JSONL route conflict must fail closed: {error}"
+            );
+        })
+        .await;
 }
 #[tokio::test(flavor = "current_thread")]
 async fn issue39_harness_rejection_cleans_fresh_worktree_before_handoff() {

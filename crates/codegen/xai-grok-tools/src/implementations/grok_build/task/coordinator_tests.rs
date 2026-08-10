@@ -37,11 +37,13 @@ impl ChildControl for TestControl {
 struct TestRunner {
     wait_before_start: bool,
     wait_after_cancel: bool,
+    fail_before_start: bool,
     start: tokio::sync::broadcast::Sender<()>,
     finish: tokio::sync::broadcast::Sender<()>,
     completions: mpsc::UnboundedSender<CompletionDisposition>,
     requests: mpsc::UnboundedSender<ObservedRun>,
     started: mpsc::UnboundedSender<String>,
+    reporters: mpsc::UnboundedSender<ChildReporter<TestControl>>,
     queue_waits: mpsc::UnboundedSender<(String, Option<std::time::Duration>, usize)>,
 }
 
@@ -55,10 +57,12 @@ impl ChildRunner for TestRunner {
     fn run(&self, run: ChildRunRequest<Self::Control>) -> Self::RunFuture {
         let wait_before_start = self.wait_before_start;
         let wait_after_cancel = self.wait_after_cancel;
+        let fail_before_start = self.fail_before_start;
         let mut start = self.start.subscribe();
         let mut finish = self.finish.subscribe();
         let requests = self.requests.clone();
         let started = self.started.clone();
+        let reporters = self.reporters.clone();
         let queue_waits = self.queue_waits.clone();
         Box::pin(async move {
             let ChildRunRequest {
@@ -74,6 +78,20 @@ impl ChildRunner for TestRunner {
                 request: request.clone(),
                 spawn_parent_session_id,
             });
+            let _ = reporters.send(reporter.clone());
+            if fail_before_start {
+                return ChildRunOutput {
+                    result: SubagentResult {
+                        success: false,
+                        error: Some("failed before promotion".to_owned()),
+                        subagent_id: request.id.clone(),
+                        child_session_id: request.id,
+                        ..Default::default()
+                    },
+                    completion_data: (),
+                    snapshot_ref: None,
+                };
+            }
             if wait_before_start {
                 tokio::select! {
                     _ = cancellation.cancelled() => {
@@ -97,6 +115,8 @@ impl ChildRunner for TestRunner {
                     child_cwd: request.cwd.clone().unwrap_or_default(),
                     worktree_path: None,
                     effective_model_id: "test-model".to_owned(),
+                    effective_model_route: Some("test-model".to_owned()),
+                    effective_model_agent_type: Some("general-purpose".to_owned()),
                     // Mock definition resolution: this type declares background.
                     definition_background: request.subagent_type == "background-default",
                     control: TestControl {
@@ -197,6 +217,7 @@ struct Harness {
     completions: mpsc::UnboundedReceiver<CompletionDisposition>,
     requests: mpsc::UnboundedReceiver<ObservedRun>,
     started: mpsc::UnboundedReceiver<String>,
+    reporters: mpsc::UnboundedReceiver<ChildReporter<TestControl>>,
     queue_waits: mpsc::UnboundedReceiver<(String, Option<std::time::Duration>, usize)>,
     actor: tokio::task::JoinHandle<()>,
 }
@@ -225,12 +246,13 @@ fn harness(wait_before_start: bool, foreground_budget: std::time::Duration) -> H
 }
 
 fn harness_with_config(wait_before_start: bool, config: CoordinatorConfig) -> Harness {
-    harness_with_options(wait_before_start, false, config)
+    harness_with_options(wait_before_start, false, false, config)
 }
 
 fn harness_with_options(
     wait_before_start: bool,
     wait_after_cancel: bool,
+    fail_before_start: bool,
     config: CoordinatorConfig,
 ) -> Harness {
     let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -239,6 +261,7 @@ fn harness_with_options(
     let (completion_tx, completions) = mpsc::unbounded_channel();
     let (request_tx, requests) = mpsc::unbounded_channel();
     let (started_tx, started) = mpsc::unbounded_channel();
+    let (reporter_tx, reporters) = mpsc::unbounded_channel();
     let (queue_wait_tx, queue_waits) = mpsc::unbounded_channel();
     let actor = tokio::spawn(
         SubagentCoordinator::new(
@@ -246,11 +269,13 @@ fn harness_with_options(
             TestRunner {
                 wait_before_start,
                 wait_after_cancel,
+                fail_before_start,
                 start: start.clone(),
                 finish: finish.clone(),
                 completions: completion_tx,
                 requests: request_tx,
                 started: started_tx,
+                reporters: reporter_tx,
                 queue_waits: queue_wait_tx,
             },
             config,
@@ -267,9 +292,72 @@ fn harness_with_options(
         completions,
         requests,
         started,
+        reporters,
         queue_waits,
         actor,
     }
+}
+
+#[tokio::test]
+async fn completed_resume_source_carries_committed_model_lineage() {
+    let mut harness = harness(false, std::time::Duration::from_secs(60));
+    let mut source_request = request("source", false);
+    source_request.await_to_completion = true;
+    let spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(source_request).await }
+    });
+
+    assert_eq!(
+        harness
+            .requests
+            .recv()
+            .await
+            .as_ref()
+            .map(|request| request.id.as_str()),
+        Some("source")
+    );
+    let reporter = harness.reporters.recv().await.expect("child reporter");
+    assert_eq!(harness.started.recv().await.as_deref(), Some("source"));
+    let _ = harness.finish.send(());
+    assert!(spawn.await.unwrap().unwrap().success);
+
+    let source = match reporter.resume_source("source", "parent").await {
+        SubagentResumeLookup::Completed(source) => source,
+        other => panic!("expected completed resume source, got {other:?}"),
+    };
+    assert_eq!(source.model_id.as_deref(), Some("test-model"));
+    assert_eq!(source.model_route.as_deref(), Some("test-model"));
+    assert_eq!(source.model_agent_type.as_deref(), Some("general-purpose"));
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn pre_promotion_failure_does_not_mask_durable_resume_fallback() {
+    let mut harness = harness_with_options(false, false, true, CoordinatorConfig::default());
+    let spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("pre-promotion-failure", false)).await }
+    });
+
+    assert_eq!(
+        harness
+            .requests
+            .recv()
+            .await
+            .as_ref()
+            .map(|request| request.id.as_str()),
+        Some("pre-promotion-failure")
+    );
+    let reporter = harness.reporters.recv().await.expect("child reporter");
+    assert!(!spawn.await.unwrap().unwrap().success);
+    assert!(matches!(
+        reporter
+            .resume_source("pre-promotion-failure", "parent")
+            .await,
+        SubagentResumeLookup::Missing
+    ));
+    harness.actor.abort();
 }
 
 /// Session-bound backend for ParentSession cancel / admission on the default
@@ -678,6 +766,7 @@ async fn workflow_cancel_waits_for_drain_and_hides_owned_children() {
     let mut harness = harness_with_options(
         true,
         true,
+        false,
         CoordinatorConfig {
             buffer_completions: true,
             ..CoordinatorConfig::default()
@@ -923,7 +1012,7 @@ async fn teardown_cancels_background_child_without_rebuffering() {
 async fn teardown_rejects_spawn_from_cancelled_parent() {
     // wait_after_cancel keeps the cancelled parent in `active`, so its late
     // nested Spawn still finds it.
-    let mut harness = harness_with_options(true, true, CoordinatorConfig::default());
+    let mut harness = harness_with_options(true, true, false, CoordinatorConfig::default());
 
     // A parent subagent whose child_session_id is "A".
     let parent = spawn_session_child(&mut harness, "A", "parent").await;
