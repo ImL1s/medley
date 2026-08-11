@@ -27,6 +27,7 @@ fn test_manager() -> ModelsManager {
 /// entries it cannot find, so the user's first prompt would be sent to that
 /// origin with no authentication. Unready has to mean unusable at this seam.
 #[test]
+#[serial_test::serial]
 fn construction_fallback_is_unusable_when_the_catalog_endpoint_is_external() {
     use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
     use xai_grok_test_support::EnvGuard;
@@ -3143,6 +3144,7 @@ fn warm_cache_refresh_does_not_reseat_over_user_model_pick() {
 }
 
 #[test]
+#[serial_test::serial]
 fn test_catalog_auth_schemes_and_override() {
     use crate::remote::client::fetch_models_blocking;
     use xai_grok_test_support::EnvGuard;
@@ -3393,6 +3395,7 @@ fn ready_codex_entry(auth_home: &std::path::Path) -> (ModelEntry, xai_grok_test_
 }
 
 #[test]
+#[serial_test::serial]
 fn codex_only_cold_start_defaults_to_ready_codex() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -3432,6 +3435,7 @@ fn codex_only_cold_start_defaults_to_ready_codex() {
 }
 
 #[test]
+#[serial_test::serial]
 fn codex_only_default_not_bundled_grok_when_codex_ready() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -3459,6 +3463,7 @@ fn codex_only_default_not_bundled_grok_when_codex_ready() {
 }
 
 #[test]
+#[serial_test::serial]
 fn xai_ambient_still_prefers_first_party_grok() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -3484,6 +3489,7 @@ fn xai_ambient_still_prefers_first_party_grok() {
 }
 
 #[test]
+#[serial_test::serial]
 fn codex_ready_reseats_ambient_grok_without_xai_auth() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -3884,6 +3890,7 @@ fn invalid_env_probe_preserves_other_usable_xai_routes() {
 }
 
 #[test]
+#[serial_test::serial]
 fn byok_unchanged_when_codex_ready() {
     use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
     use xai_grok_test_support::EnvGuard;
@@ -3941,6 +3948,7 @@ fn byok_unchanged_when_codex_ready() {
 /// Keyless `auth_scheme = none` is not ambient first-party xAI and must not be
 /// reseated to Codex when the user already seated it (Pro P1 coverage split).
 #[test]
+#[serial_test::serial]
 fn auth_scheme_none_unchanged_when_codex_ready() {
     use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
     use xai_grok_test_support::EnvGuard;
@@ -3997,6 +4005,7 @@ fn auth_scheme_none_unchanged_when_codex_ready() {
 
 /// Deployment key is ambient usable xAI — keep Grok over ready Codex.
 #[test]
+#[serial_test::serial]
 fn deployment_key_keeps_first_party_when_codex_ready() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -4028,6 +4037,7 @@ fn deployment_key_keeps_first_party_when_codex_ready() {
 /// Third-party CodexResponses shim must not steal #303 default over ambient Grok
 /// (Pro P1: only official OpenAI Codex account routes qualify).
 #[test]
+#[serial_test::serial]
 fn third_party_codex_responses_does_not_steal_default() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -4068,6 +4078,7 @@ fn third_party_codex_responses_does_not_steal_default() {
 
 /// Pro P0: blank primary + valid legacy still counts as ambient usable → Grok.
 #[test]
+#[serial_test::serial]
 fn blank_primary_valid_legacy_keeps_grok_when_codex_ready() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -4099,6 +4110,7 @@ fn blank_primary_valid_legacy_keeps_grok_when_codex_ready() {
 
 /// Pro P0: blank / whitespace `XAI_API_KEY` must not keep Grok over ready Codex.
 #[test]
+#[serial_test::serial]
 fn blank_xai_env_does_not_pin_grok_when_codex_ready() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -4128,6 +4140,7 @@ fn blank_xai_env_does_not_pin_grok_when_codex_ready() {
 
 /// Pro P0: whitespace-only primary is not ambient usable.
 #[test]
+#[serial_test::serial]
 fn whitespace_xai_env_does_not_pin_grok_when_codex_ready() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -4151,6 +4164,7 @@ fn whitespace_xai_env_does_not_pin_grok_when_codex_ready() {
 /// Pro P0: `[auth] preferred_method = api_key` keeps Grok even with ready Codex
 /// and no live credential (avoids model/auth-surface contradiction).
 #[test]
+#[serial_test::serial]
 fn preferred_method_api_key_pin_keeps_first_party_when_codex_ready() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -4185,6 +4199,7 @@ fn preferred_method_api_key_pin_keeps_first_party_when_codex_ready() {
 
 /// Pro P0: `[auth] preferred_method = oidc` same pin semantics as api_key.
 #[test]
+#[serial_test::serial]
 fn preferred_method_oidc_pin_keeps_first_party_when_codex_ready() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -4212,6 +4227,7 @@ fn preferred_method_oidc_pin_keeps_first_party_when_codex_ready() {
 
 /// Pro P1: hard-expired OIDC with complete refresh surface keeps Grok over Codex.
 #[test]
+#[serial_test::serial]
 fn refreshable_expired_oidc_session_keeps_first_party_when_codex_ready() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -4284,6 +4300,7 @@ fn refreshable_expired_oidc_session_keeps_first_party_when_codex_ready() {
 /// therefore does not need an OIDC client_id or refresh_token to keep ambient
 /// Grok precedence while the command can deterministically self-heal it.
 #[test]
+#[serial_test::serial]
 fn refreshable_expired_external_session_keeps_first_party_when_codex_ready() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -4357,6 +4374,7 @@ fn refreshable_expired_external_session_keeps_first_party_when_codex_ready() {
 /// `AuthProviderRef::openai_codex` on prefetched entries is fail-closed by
 /// `resolve_model_list` outside that profile.
 #[test]
+#[serial_test::serial]
 fn codex_only_from_config_seats_codex_and_sampling_stack() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -4517,6 +4535,7 @@ fn codex_only_from_config_seats_codex_and_sampling_stack() {
 
 /// Pro P1: hard-expired session without complete refresh surface seats Codex.
 #[test]
+#[serial_test::serial]
 fn hard_expired_nonrefreshable_session_seats_codex() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
