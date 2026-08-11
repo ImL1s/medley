@@ -1694,26 +1694,27 @@ impl ModelsManager {
 
     /// Wipe in-memory state so a previous identity's catalog doesn't leak.
     fn clear(&self) {
-        *self.inner.catalog.write() = CatalogState::default();
+        // Match the catalog publication lock order. Authority readers can see
+        // either the previous catalog/selection pair or the fully-cleared
+        // state, never an empty catalog with the previous explicit-pick flag.
+        let mut catalog = self.inner.catalog.write();
+        let selection_commit = self.inner.selection_commit.write();
+        let current = self.inner.current_model_id.write();
+        *catalog = CatalogState::default();
+        self.inner
+            .user_selected_model
+            .store(false, Ordering::Relaxed);
+        self.bump_catalog_generation();
+        drop(current);
+        drop(selection_commit);
+        drop(catalog);
+
         // The previous identity's model capability must not remain a future
         // session default while the replacement catalog is still loading.
         *self.inner.current_reasoning_effort.write() = None;
-        // A new identity starts fresh: drop the prior user's pick so its
-        // first catalog reselects that identity's default.
-        {
-            let selection_commit = self.inner.selection_commit.write();
-            self.inner
-                .user_selected_model
-                .store(false, Ordering::Relaxed);
-            drop(selection_commit);
-        }
         // Same invariant for #131: a previous identity's substitution verdict
         // must not accuse the new one of rejecting a preference it never held.
         *self.inner.substituted_preference.write() = None;
-        // The catalog just became empty, which is a content change like any
-        // other -- without this a memo taken under the previous identity stays
-        // valid at the same generation and is served after the wipe (#159).
-        self.bump_catalog_generation();
     }
 
     /// Build a `SamplingConfig` from the current model + auth state.
@@ -1966,16 +1967,115 @@ impl ModelsManager {
         models: IndexMap<String, ModelEntry>,
         new_etag: Option<String>,
     ) {
-        let (first_real_catalog, excludes_all) = {
-            let mut cat = self.inner.catalog.write();
-            let first_real_catalog = !cat.has_fetched_real_catalog;
-            cat.has_fetched_real_catalog = true;
-            cat.prefetched = Some(models);
-            cat.models = resolve_model_catalog(cfg, cat.prefetched.clone());
-            cat.etag = new_etag;
-            cat.allowlist_excludes_all = allowlist_matches_nothing(cfg, &cat.models);
-            (first_real_catalog, cat.allowlist_excludes_all)
+        #[cfg(test)]
+        self.apply_catalog_inner(cfg, models, new_etag, || {});
+        #[cfg(not(test))]
+        self.apply_catalog_inner(cfg, models, new_etag);
+    }
+
+    fn apply_catalog_inner(
+        &self,
+        cfg: &config::Config,
+        models: IndexMap<String, ModelEntry>,
+        new_etag: Option<String>,
+        #[cfg(test)] mut before_selection_commit: impl FnMut(),
+    ) {
+        // Keep the catalog write guard through the paired selection commit.
+        // Session authority readers use catalog -> selection -> current, so
+        // this identical order publishes one coherent authority state.
+        let mut cat = self.inner.catalog.write();
+        let first_real_catalog = !cat.has_fetched_real_catalog;
+        cat.has_fetched_real_catalog = true;
+        cat.prefetched = Some(models);
+        cat.models = resolve_model_catalog(cfg, cat.prefetched.clone());
+        cat.etag = new_etag;
+        cat.allowlist_excludes_all = allowlist_matches_nothing(cfg, &cat.models);
+        let excludes_all = cat.allowlist_excludes_all;
+
+        let (source, old, new_id, changed, honour_explicit_preference, needs_reselection) = loop {
+            let auth = self.inner.auth_manager.selection_snapshot();
+            let usable_xai = Self::usable_ambient_xai_from_snapshot(cfg, auth);
+            let models = &cat.models;
+            let (key, _, source, _) = resolve_default_model_for_catalog_with_usable_xai(
+                cfg,
+                models,
+                auth.is_session_auth,
+                cat.has_fetched_real_catalog,
+                usable_xai,
+            );
+            let selection_commit = self.inner.selection_commit.write();
+            let mut current = self.inner.current_model_id.write();
+            #[cfg(test)]
+            before_selection_commit();
+
+            let old = current.clone();
+            let user_picked = self.inner.user_selected_model.load(Ordering::Relaxed);
+            let needs_reselection = match models.get(old.0.as_ref()) {
+                None => true,
+                Some(entry) => {
+                    let not_selectable = !entry.info.user_selectable
+                        || !entry.info.visible_for_auth(auth.is_session_auth);
+                    let stranded_on_ambient_grok = !usable_xai
+                        && resolution::is_first_party_ambient_xai_entry(entry)
+                        && models.values().any(|entry| {
+                            resolution::is_ready_selectable_openai_codex_entry(
+                                entry,
+                                auth.is_session_auth,
+                            )
+                        });
+                    not_selectable || stranded_on_ambient_grok
+                }
+            };
+            let had_substitution = self.substituted_preference().is_some();
+            let honour_explicit_preference = !first_real_catalog
+                && had_substitution
+                && !user_picked
+                && key.as_str() != old.0.as_ref()
+                && resolution::is_explicit_preference(source);
+            let select_default = (first_real_catalog && !user_picked)
+                || needs_reselection
+                || honour_explicit_preference;
+            let new_id = if select_default {
+                acp::ModelId::new(Arc::from(key))
+            } else {
+                old.clone()
+            };
+
+            if !self
+                .inner
+                .auth_manager
+                .selection_generation_is_current(auth.generation)
+            {
+                drop(current);
+                drop(selection_commit);
+                std::thread::yield_now();
+                continue;
+            }
+            let changed = old != new_id;
+            *current = new_id.clone();
+            if !self
+                .inner
+                .auth_manager
+                .selection_generation_is_current(auth.generation)
+            {
+                *current = old;
+                drop(current);
+                drop(selection_commit);
+                std::thread::yield_now();
+                continue;
+            }
+            drop(current);
+            drop(selection_commit);
+            break (
+                source,
+                old,
+                new_id,
+                changed,
+                honour_explicit_preference,
+                needs_reselection,
+            );
         };
+
         // Every publish advances the generation so session `model_auth_memo`
         // entries that depended on the prior snapshot are not reused after a
         // transient miss (etag refresh that drops then restores a model).
@@ -1983,26 +2083,43 @@ impl ModelsManager {
         // generation key is required — `invalidate_model_auth_memo_all_sessions`
         // only runs on config-watcher ext methods (#159 F1).
         self.bump_catalog_generation();
+        drop(cat);
+
+        // None of these secondary effects may extend the authority transaction.
+        self.record_substituted_preference(cfg, source);
         if excludes_all {
             tracing::error!("allowed_models excludes all fetched models; prompts will be blocked");
         }
-
-        // Respect an explicit pre-catalog `/model` pick: auto-select the
-        // default on the first catalog only when the user hasn't chosen.
-        // Either way a now-invalid selection is replaced.
-        if first_real_catalog {
-            // The first-catalog "no explicit pick" decision is part of the
-            // same selection transaction as the default commit. A `/model`
-            // writer that reaches its flag/id midpoint first therefore wins;
-            // it cannot be overwritten by a decision made before the writer
-            // published the id.
-            if !self.reselect_default_model_if_no_user_pick(cfg) {
-                self.reselect_current_model_if_missing(cfg);
+        if changed {
+            if honour_explicit_preference && !needs_reselection {
+                tracing::info!(
+                    old = %old.0, new = %new_id.0, source = %source,
+                    "configured preference now honourable, reseating"
+                );
+            } else {
+                tracing::info!(
+                    old = %old.0, new = %new_id.0, source = %source,
+                    "catalog publication reselected current model"
+                );
             }
-        } else {
-            self.reselect_current_model_if_missing(cfg);
+            self.publish_model_switch();
         }
         self.revalidate_current_reasoning_effort();
+    }
+
+    #[cfg(test)]
+    fn apply_catalog_with_before_selection_commit_for_test(
+        &self,
+        cfg: &config::Config,
+        models: IndexMap<String, ModelEntry>,
+        before_selection_commit: impl FnOnce(),
+    ) {
+        let mut before_selection_commit = Some(before_selection_commit);
+        self.apply_catalog_inner(cfg, models, None, || {
+            if let Some(before_selection_commit) = before_selection_commit.take() {
+                before_selection_commit();
+            }
+        });
     }
 
     fn apply_refresh_result(
@@ -2198,32 +2315,16 @@ impl ModelsManager {
     /// Re-resolve the default model against the current catalog.
     fn reselect_default_model(&self, config: &config::Config) {
         #[cfg(test)]
-        self.reselect_default_model_inner(config, false, || {});
+        self.reselect_default_model_inner(config, || {});
         #[cfg(not(test))]
-        self.reselect_default_model_inner(config, false);
-    }
-
-    /// Reselect the first real catalog's default only if the user-pick flag is
-    /// still clear at the exact selection commit boundary. Returns `false`
-    /// when an explicit pick won and the caller must validate that pick against
-    /// the newly published catalog instead.
-    fn reselect_default_model_if_no_user_pick(&self, config: &config::Config) -> bool {
-        #[cfg(test)]
-        {
-            self.reselect_default_model_inner(config, true, || {})
-        }
-        #[cfg(not(test))]
-        {
-            self.reselect_default_model_inner(config, true)
-        }
+        self.reselect_default_model_inner(config);
     }
 
     fn reselect_default_model_inner(
         &self,
         config: &config::Config,
-        require_implicit_selection: bool,
         #[cfg(test)] mut before_commit: impl FnMut(),
-    ) -> bool {
+    ) {
         let mut retries = 0usize;
         loop {
             let auth = self.inner.auth_manager.selection_snapshot();
@@ -2243,12 +2344,6 @@ impl ModelsManager {
             let new_id = acp::ModelId::new(Arc::from(key));
             let selection_commit = self.inner.selection_commit.write();
             let mut current = self.inner.current_model_id.write();
-            if require_implicit_selection && self.inner.user_selected_model.load(Ordering::Relaxed)
-            {
-                drop(current);
-                drop(selection_commit);
-                return false;
-            }
             if !self
                 .inner
                 .auth_manager
@@ -2295,7 +2390,7 @@ impl ModelsManager {
                 }
                 self.publish_model_switch();
             }
-            return true;
+            return;
         }
     }
 
@@ -2306,25 +2401,11 @@ impl ModelsManager {
         before_commit: impl FnOnce(),
     ) {
         let mut before_commit = Some(before_commit);
-        self.reselect_default_model_inner(config, false, || {
+        self.reselect_default_model_inner(config, || {
             if let Some(before_commit) = before_commit.take() {
                 before_commit();
             }
         });
-    }
-
-    #[cfg(test)]
-    fn reselect_default_model_if_no_user_pick_with_before_commit(
-        &self,
-        config: &config::Config,
-        before_commit: impl FnOnce(),
-    ) -> bool {
-        let mut before_commit = Some(before_commit);
-        self.reselect_default_model_inner(config, true, || {
-            if let Some(before_commit) = before_commit.take() {
-                before_commit();
-            }
-        })
     }
 }
 
@@ -2421,63 +2502,96 @@ mod selection_atomicity_tests {
             "authority readers cannot acquire the transaction at the torn midpoint"
         );
 
+        let (reader_started_tx, reader_started_rx) = mpsc::channel();
+        let (reader_reached_selection_tx, reader_reached_selection_rx) = mpsc::channel();
+        let reader = {
+            let manager = manager.clone();
+            std::thread::spawn(move || {
+                reader_started_tx
+                    .send(())
+                    .expect("announce authority reader start");
+                manager.session_model_authority_with_before_selection_snapshot(|| {
+                    reader_reached_selection_tx
+                        .send(())
+                        .expect("announce authority selection boundary");
+                })
+            })
+        };
+        reader_started_rx
+            .recv()
+            .expect("authority reader must start while writer is paused");
+        assert!(
+            manager.inner.selection_commit.try_read().is_none(),
+            "the actual authority reader remains excluded at the torn midpoint"
+        );
+
         release_selection_tx
             .send(())
             .expect("release explicit selection");
         writer.join().expect("selection writer must finish");
-        let snapshot = manager.session_model_authority(None);
+        let snapshot = reader.join().expect("authority reader must finish");
+        reader_reached_selection_rx
+            .recv()
+            .expect("authority reader must cross the selection boundary");
         assert_eq!(snapshot.fallback_model_id.0.as_ref(), "grok-new");
     }
 
     #[test]
-    fn first_catalog_default_commit_rechecks_concurrent_explicit_pick() {
+    fn authority_reader_never_sees_new_catalog_with_old_selection() {
         let tmp = tempfile::tempdir().expect("temp first-catalog selection home");
         let mut cfg = config::Config::default();
         cfg.models.default = Some("grok-default".to_string());
-        let mut catalog = IndexMap::new();
-        catalog.insert("grok-old".to_string(), ready_xai_entry("grok-old"));
-        catalog.insert("grok-default".to_string(), ready_xai_entry("grok-default"));
-        catalog.insert(
-            "grok-explicit".to_string(),
-            ready_xai_entry("grok-explicit"),
-        );
         let manager = ModelsManager::new(
             None,
-            catalog,
+            IndexMap::new(),
             acp::ModelId::new("grok-old"),
             Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default())),
             cfg.clone(),
         );
+        let mut catalog = IndexMap::new();
+        catalog.insert("grok-old".to_string(), ready_xai_entry("grok-old"));
+        catalog.insert("grok-default".to_string(), ready_xai_entry("grok-default"));
 
-        let (resolved_tx, resolved_rx) = mpsc::channel();
+        let (catalog_midpoint_tx, catalog_midpoint_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let default_writer = {
+        let catalog_writer = {
             let manager = manager.clone();
             std::thread::spawn(move || {
-                manager.reselect_default_model_if_no_user_pick_with_before_commit(&cfg, || {
-                    resolved_tx
+                manager.apply_catalog_with_before_selection_commit_for_test(&cfg, catalog, || {
+                    catalog_midpoint_tx
                         .send(())
-                        .expect("announce resolved first-catalog default");
-                    release_rx
-                        .recv()
-                        .expect("release first-catalog default commit");
-                })
+                        .expect("announce catalog/selection commit midpoint");
+                    release_rx.recv().expect("release catalog/selection commit");
+                });
             })
         };
-        resolved_rx
+        catalog_midpoint_rx
             .recv()
-            .expect("default writer must resolve before commit");
+            .expect("catalog writer must reach the selection commit midpoint");
 
-        manager.set_current_model_id(acp::ModelId::new("grok-explicit"));
-        release_tx
-            .send(())
-            .expect("release stale default selection attempt");
+        let (reader_started_tx, reader_started_rx) = mpsc::channel();
+        let reader = {
+            let manager = manager.clone();
+            std::thread::spawn(move || {
+                reader_started_tx
+                    .send(())
+                    .expect("announce catalog authority reader start");
+                manager.session_model_authority_with_before_selection_snapshot(|| {})
+            })
+        };
+        reader_started_rx
+            .recv()
+            .expect("authority reader must start during catalog publication");
         assert!(
-            !default_writer.join().expect("default writer must finish"),
-            "the commit transaction must reject a stale no-user-pick decision"
+            manager.inner.selection_commit.try_read().is_none(),
+            "catalog publication must retain the selection transaction until current is committed"
         );
-        assert!(manager.inner.user_selected_model.load(Ordering::Relaxed));
-        assert_eq!(manager.current_model_id().0.as_ref(), "grok-explicit");
+
+        release_tx.send(()).expect("release catalog publication");
+        catalog_writer.join().expect("catalog writer must finish");
+        let snapshot = reader.join().expect("authority reader must finish");
+        assert_eq!(snapshot.fallback_model_id.0.as_ref(), "grok-default");
+        assert!(snapshot.catalog.contains_key("grok-default"));
     }
 }
 
