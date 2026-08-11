@@ -4107,7 +4107,6 @@ fn refreshable_expired_external_session_keeps_first_party_when_codex_ready() {
 /// `AuthProviderRef::openai_codex` on prefetched entries is fail-closed by
 /// `resolve_model_list` outside that profile.
 ///
-/// Stops short of a full ACP turn / mock HTTP (still out of residual scope).
 #[test]
 fn codex_only_from_config_seats_codex_and_sampling_stack() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
@@ -4209,6 +4208,62 @@ fn codex_only_from_config_seats_codex_and_sampling_stack() {
         !sampling.base_url.is_empty(),
         "ready Codex sampling config must keep its endpoint"
     );
+    assert!(
+        sampling.api_key.is_none(),
+        "production Codex construction must not freeze raw credential bytes in api_key"
+    );
+    assert_eq!(
+        sampling.credential_source,
+        Some(crate::sampling::CredentialSource::AuthProvider {
+            name: crate::agent::model_providers::OPENAI_CODEX_PROVIDER_ID.to_owned(),
+        }),
+        "production Codex construction must retain provider-scoped auth provenance"
+    );
+    let resolver = sampling
+        .bearer_resolver
+        .as_ref()
+        .expect("production Codex construction carries a live provider resolver");
+    let credential = resolver
+        .current_credential()
+        .expect("provider resolver exposes the structured Codex credential");
+    assert_eq!(credential.access_token, "live-codex-token");
+    assert_eq!(
+        credential.account_id, None,
+        "persisted workspace identity must be normalized from trusted JWT claims"
+    );
+
+    for name in sampling.extra_headers.keys() {
+        let name = name.to_ascii_lowercase();
+        assert!(
+            name != "authorization"
+                && name != "chatgpt-account-id"
+                && name != "x-api-key"
+                && !name.starts_with("x-xai-")
+                && !name.starts_with("x-grok-"),
+            "production Codex construction carried identity header {name} outside its resolver"
+        );
+    }
+    for name in [
+        "x-api-key",
+        "x-xai-token-auth",
+        "x-grok-conv-id",
+        "x-grok-req-id",
+        "x-grok-session-id",
+        "x-grok-agent-id",
+        "x-grok-turn-idx",
+        "x-grok-deployment-id",
+        "x-grok-user-id",
+        "x-grok-client-version",
+        "x-grok-doom-loop-check",
+        "x-compactions-remaining",
+    ] {
+        assert!(
+            !sampling.extra_headers.contains_key(name),
+            "production Codex construction retained xAI-only header {name}"
+        );
+    }
+    crate::sampling::Client::new(sampling.clone())
+        .expect("production Codex sampling config must construct only for the official endpoint");
 }
 
 /// Pro P1: hard-expired session without complete refresh surface seats Codex.
