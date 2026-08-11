@@ -4993,18 +4993,118 @@ async fn prepared_new_session_plan_survives_same_key_catalog_swap() {
 }
 
 #[test]
+fn new_session_profile_pin_reports_the_committed_resident_model() {
+    run_local_for_bridge_test(|| async {
+        use crate::agent::config::{Config as AgentConfig, ConfigModelOverride};
+        use crate::auth::{AuthManager, GrokComConfig};
+
+        let tmp = tempfile::tempdir().expect("profile fixture");
+        let profile = tmp.path().join("pinned.md");
+        std::fs::write(
+            &profile,
+            "---\nname: grok-build\ndescription: pinned fixture\nmodel: pinned-model\n---\n",
+        )
+        .expect("write profile");
+        let mut cfg = AgentConfig::default();
+        cfg.models.default = Some("prepared-model".to_owned());
+        cfg.agent_profile_path = Some(profile);
+        for (id, auth_scheme) in [
+            ("prepared-model", xai_grok_sampler::AuthScheme::None),
+            ("pinned-model", xai_grok_sampler::AuthScheme::None),
+            ("unready-request", xai_grok_sampler::AuthScheme::Bearer),
+        ] {
+            cfg.config_models.insert(
+                id.to_owned(),
+                ConfigModelOverride {
+                    model: Some(id.to_owned()),
+                    base_url: Some("http://localhost".to_owned()),
+                    auth_scheme: Some(auth_scheme),
+                    agent_type: Some("grok-build".to_owned()),
+                    ..Default::default()
+                },
+            );
+        }
+        let auth = std::sync::Arc::new(AuthManager::new(
+            tmp.path().join("auth"),
+            GrokComConfig::default(),
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let agent = MvpAgent::new(GatewaySender::new(tx), &cfg, auth, None).expect("agent");
+        agent
+            .initialize_request
+            .set(
+                acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_capabilities(
+                    acp::ClientCapabilities::new()
+                        .fs(acp::FileSystemCapabilities::new())
+                        .terminal(false),
+                ),
+            )
+            .expect("initialize once");
+        let cwd = tempfile::tempdir().expect("session cwd");
+        let response = agent
+            .new_session_inner(
+                acp::NewSessionRequest::new(cwd.path().to_path_buf()).meta(
+                    serde_json::json!({ "modelId": "unready-request" })
+                        .as_object()
+                        .cloned(),
+                ),
+            )
+            .await
+            .expect("spawn profile-pinned session");
+        assert_eq!(
+            response
+                .models
+                .expect("advertised model")
+                .current_model_id
+                .0
+                .as_ref(),
+            "pinned-model"
+        );
+        assert_eq!(
+            agent
+                .resident_handle(&response.session_id)
+                .expect("resident")
+                .model_id
+                .0
+                .as_ref(),
+            "pinned-model"
+        );
+        let notification = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|message| match message {
+                xai_acp_lib::AcpClientMessage::ExtNotification(args)
+                    if args.request.method.as_ref() == "x.ai/session_notification" =>
+                {
+                    Some(args.request.params.get().to_owned())
+                }
+                _ => None,
+            })
+            .find(|payload| payload.contains("model_auto_switched"))
+            .expect("fallback notification");
+        assert!(notification.contains("unready-request"));
+        assert!(notification.contains("pinned-model"));
+        assert!(!notification.contains("prepared-model"));
+    });
+}
+
+#[test]
 fn spawn_runtime_tuning_prefers_pinned_then_prepared_exact_entry() {
     let endpoints = config::EndpointsConfig::default();
     let mut pinned = ModelEntry::fallback("shared-key", &endpoints);
     pinned.info.model = "pinned-route".to_owned();
+    pinned.info.auto_compact_threshold_percent = Some(71);
+    pinned.info.system_prompt_label = Some("Pinned".to_owned());
     pinned.info.inference_idle_timeout_secs = Some(41);
     pinned.info.max_retries = Some(2);
     let mut prepared = ModelEntry::fallback("shared-key", &endpoints);
     prepared.info.model = "prepared-route".to_owned();
+    prepared.info.auto_compact_threshold_percent = Some(72);
+    prepared.info.system_prompt_label = Some("Prepared".to_owned());
     prepared.info.inference_idle_timeout_secs = Some(51);
     prepared.info.max_retries = Some(3);
     let mut replacement = ModelEntry::fallback("shared-key", &endpoints);
     replacement.info.model = "replacement-route".to_owned();
+    replacement.info.auto_compact_threshold_percent = Some(73);
+    replacement.info.system_prompt_label = Some("Replacement".to_owned());
     replacement.info.inference_idle_timeout_secs = Some(61);
     replacement.info.max_retries = Some(4);
     let catalog = indexmap::IndexMap::from([("shared-key".to_owned(), replacement)]);
@@ -5018,20 +5118,80 @@ fn spawn_runtime_tuning_prefers_pinned_then_prepared_exact_entry() {
     let selected = select_spawn_model_entry(Some(&pinned), Some(&prepared), &catalog, &identity)
         .expect("pinned entry wins");
     assert_eq!(selected.info.model, "pinned-route");
+    assert_eq!(selected.info.auto_compact_threshold_percent, Some(71));
+    assert_eq!(selected.info.system_prompt_label.as_deref(), Some("Pinned"));
     assert_eq!(resolve_inference_idle_timeout_secs(Some(selected), None), 41);
     assert_eq!(selected.info.max_retries, Some(2));
 
     let selected = select_spawn_model_entry(None, Some(&prepared), &catalog, &identity)
         .expect("prepared entry wins over a same-key replacement");
     assert_eq!(selected.info.model, "prepared-route");
+    assert_eq!(selected.info.auto_compact_threshold_percent, Some(72));
+    assert_eq!(selected.info.system_prompt_label.as_deref(), Some("Prepared"));
     assert_eq!(resolve_inference_idle_timeout_secs(Some(selected), None), 51);
     assert_eq!(selected.info.max_retries, Some(3));
 
     let selected = select_spawn_model_entry(None, None, &catalog, &identity)
         .expect("live catalog is the final fallback");
     assert_eq!(selected.info.model, "replacement-route");
+    assert_eq!(selected.info.auto_compact_threshold_percent, Some(73));
+    assert_eq!(
+        selected.info.system_prompt_label.as_deref(),
+        Some("Replacement")
+    );
     assert_eq!(resolve_inference_idle_timeout_secs(Some(selected), None), 61);
     assert_eq!(selected.info.max_retries, Some(4));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unready_spawn_latch_rejects_ready_same_key_replacement_on_first_prompt() {
+    use acp::Agent as _;
+
+    let agent = build_agent_with_model_for_tests("shared-key", "grok-build");
+    let sid = acp::SessionId::new("unready-spawn-exact-identity");
+    let mut handle = make_test_handle("shared-key", false, None);
+    handle.info.id = sid.clone();
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    handle.cmd_tx = cmd_tx;
+    agent.session_registry.put_resident(&sid, handle);
+    let identity = xai_chat_state::CatalogIdentity {
+        model_id: "shared-key".to_owned(),
+        route: "prepared-unready-route".to_owned(),
+        lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+        auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
+    };
+    agent.latch_unavailable_spawn_model(
+        &sid,
+        acp::ModelId::new("shared-key"),
+        identity.clone(),
+        "grok-build".to_owned(),
+    );
+    let mut replacement = agent.models_manager.models()["shared-key"].clone();
+    replacement.info.model = "ready-replacement-route".to_owned();
+    replacement.info.base_url = "https://replacement.invalid/v1".to_owned();
+    replacement.info.auth_scheme = xai_grok_sampler::AuthScheme::Bearer;
+    replacement.api_key = Some("replacement-credential-must-not-attach".to_owned());
+    agent
+        .models_manager
+        .insert_test_entry("shared-key", replacement);
+
+    let response = agent
+        .prompt(acp::PromptRequest::new(
+            sid.clone(),
+            vec![acp::ContentBlock::from("first prompt")],
+        ))
+        .await
+        .expect("identity mismatch blocks the prompt without failing transport");
+    assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
+    assert_eq!(
+        agent.session_registry.unavailable_catalog_identity(&sid),
+        Some(identity),
+        "the exact prepared route must remain authoritative"
+    );
+    assert!(
+        cmd_rx.try_recv().is_err(),
+        "first prompt must not switch the actor or attach the replacement credential"
+    );
 }
 /// Minimal agent whose `grok_com_config` engages the api-key kill switch
 /// (`disable_api_key_auth = true`), mirroring a forced-IdP deployment.

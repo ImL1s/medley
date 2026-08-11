@@ -1600,7 +1600,7 @@ impl MvpAgent {
         &self,
         session_id: &acp::SessionId,
         local_workspace_intent: bool,
-    ) -> Result<(), acp::Error> {
+    ) -> Result<acp::ModelId, acp::Error> {
         if !local_workspace_intent {
             return Ok(());
         }
@@ -5191,7 +5191,13 @@ impl MvpAgent {
         );
         let unavailable_spawn_model = selected_model
             .is_some_and(|entry| !crate::agent::config::model_readiness(entry).0)
-            .then(|| session_model_id.clone());
+            .then(|| {
+                (
+                    session_model_id.clone(),
+                    catalog_identity.clone(),
+                    agent_definition.name.clone(),
+                )
+            });
         let auto_compact_threshold_percent = {
             let cfg = self.cfg.borrow();
             crate::util::config::resolve_auto_compact_threshold_percent(
@@ -5769,19 +5775,24 @@ impl MvpAgent {
             });
         self.notify_session_cwd_for_watch(std::path::Path::new(&session_info.cwd));
         self.activity.register_session(&session_info.id.0, &handle);
+        let committed_model_id = handle.model_id.clone();
         if let Some(old) = self.insert_resident(&session_info.id, handle)
             && let Some(scope) = &old.tool_context.process_scope
         {
             scope.kill_all();
         }
-        if let Some(model_id) = unavailable_spawn_model {
+        if let Some((model_id, catalog_identity, agent_name)) = unavailable_spawn_model {
             tracing::warn!(
                 session_id = %session_info.id.0,
                 model_id = %model_id.0,
                 "session spawn selected an unready exact catalog entry; latching prompts"
             );
-            self.session_registry
-                .set_unavailable_model(&session_info.id, model_id);
+            self.latch_unavailable_spawn_model(
+                &session_info.id,
+                model_id,
+                catalog_identity,
+                agent_name,
+            );
         }
         self.spawn_managed_gateway_tool_catalog_fetch();
         let cwd_for_maintenance = session_info.cwd.clone();
@@ -5789,7 +5800,21 @@ impl MvpAgent {
             crate::session::prompt_history::truncate_if_needed_async(cwd_for_maintenance)
                 .await;
         });
-        Ok(())
+        Ok(committed_model_id)
+    }
+    fn latch_unavailable_spawn_model(
+        &self,
+        session_id: &acp::SessionId,
+        model_id: acp::ModelId,
+        catalog_identity: xai_chat_state::CatalogIdentity,
+        agent_name: String,
+    ) {
+        self.session_registry.set_unavailable_model_with_identity(
+            session_id,
+            model_id,
+            Some(catalog_identity),
+            Some(agent_name),
+        );
     }
     /// Collects all pending permission events from a session's receiver.
     /// Returns only the events from the current turn (since last collection).

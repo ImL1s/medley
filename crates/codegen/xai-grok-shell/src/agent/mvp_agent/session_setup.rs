@@ -450,11 +450,7 @@ impl MvpAgent {
         if spawn_res.is_err() {
             self.shutdown_gateway_bridge(&session_id);
         }
-        spawn_res?;
-        let spawned_session_model_id = self
-            .resident_handle(&session_id)
-            .map(|handle| handle.model_id)
-            .unwrap_or_else(|| session_model_id.clone());
+        let spawned_session_model_id = spawn_res?;
         tracing::debug!(session_id = %session_id.0, "new_session: spawn_session_actor");
         #[cfg(feature = "local-workspace")]
         if local_workspace_intent_present(arguments.meta.as_ref()) {
