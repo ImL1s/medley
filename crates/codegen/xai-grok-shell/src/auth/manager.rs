@@ -7,6 +7,7 @@ use parking_lot::RwLock;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration as StdDuration;
 use xai_grok_auth::bearer_suffix;
 
@@ -75,6 +76,30 @@ pub(crate) enum FirstPartySessionEligibility {
     /// Hard-expired session that still has complete mode-specific refresh
     /// authority and can self-heal without re-login.
     Refreshable,
+}
+
+/// Stable auth authority inputs used by implicit model selection.
+///
+/// The generation is even only while no auth selection mutation is in
+/// progress. Callers must validate it again at their model commit boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AuthSelectionSnapshot {
+    pub(crate) generation: u64,
+    pub(crate) has_auth: bool,
+    pub(crate) session_eligibility: FirstPartySessionEligibility,
+    pub(crate) is_session_auth: bool,
+    pub(crate) first_party_env_api_key_ok: bool,
+}
+
+struct AuthSelectionMutationGuard<'a> {
+    generation: &'a AtomicU64,
+}
+
+impl Drop for AuthSelectionMutationGuard<'_> {
+    fn drop(&mut self) {
+        let previous = self.generation.fetch_add(1, Ordering::Release);
+        debug_assert_eq!(previous % 2, 1, "auth selection mutation must end odd");
+    }
 }
 
 impl FirstPartySessionEligibility {
@@ -200,6 +225,9 @@ pub struct AuthManager {
     /// enforces "no `.await` while holding the lock". `Arc`
     /// so the spawned `/user` enrichment task can write back.
     inner: Arc<RwLock<Option<GrokAuth>>>,
+    /// Seqlock generation for the auth inputs consumed by implicit model
+    /// selection. Even = stable; odd = a writer is active.
+    selection_generation: AtomicU64,
     path: PathBuf,
     scope: String,
     /// xAI-only policy and `/user` enrichment are forbidden for provider
@@ -525,6 +553,7 @@ impl AuthManager {
     ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(inner)),
+            selection_generation: AtomicU64::new(0),
             path,
             scope,
             xai_session,
@@ -587,6 +616,7 @@ impl AuthManager {
 
     /// Record initialize probe result for cached-token fallthrough advertise.
     pub(crate) fn set_first_party_env_api_key_ok(&self, ok: bool) {
+        let _mutation = self.begin_selection_mutation();
         self.first_party_env_api_key_ok
             .store(ok, std::sync::atomic::Ordering::Relaxed);
     }
@@ -766,7 +796,7 @@ impl AuthManager {
     /// short-circuits with no live credential until a wire-valid login;
     /// non-sticky verdicts read absent once their scoped key is gone.
     fn clear_inner(&self) {
-        *self.inner.write() = None;
+        self.with_inner_write(|inner| *inner = None);
     }
 
     /// Re-read `auth.json` and reconcile the in-memory cache with it.
@@ -804,7 +834,7 @@ impl AuthManager {
                 // permanent_failure here -- the token may just be a re-export
                 // of the same broken refresh_token.
                 DiskAuthState::Ok => {
-                    *self.inner.write() = auth;
+                    self.with_inner_write(|inner| *inner = auth);
                     // A re-read (e.g. relay reconnect) can adopt a wrong-team
                     // token a sibling wrote; clear it here, mirroring `new()`.
                     self.enforce_pin_on_loaded_token();
@@ -974,8 +1004,66 @@ impl AuthManager {
     /// the lock is held. Prefer this over `self.inner.write()`.
     #[inline]
     pub(crate) fn with_inner_write<R>(&self, f: impl FnOnce(&mut Option<GrokAuth>) -> R) -> R {
+        let _mutation = self.begin_selection_mutation();
         let mut guard = self.inner.write();
         f(&mut guard)
+    }
+
+    fn begin_selection_mutation(&self) -> AuthSelectionMutationGuard<'_> {
+        loop {
+            let generation = self.selection_generation.load(Ordering::Acquire);
+            if generation % 2 == 1 {
+                std::hint::spin_loop();
+                continue;
+            }
+            if self
+                .selection_generation
+                .compare_exchange(
+                    generation,
+                    generation.wrapping_add(1),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return AuthSelectionMutationGuard {
+                    generation: &self.selection_generation,
+                };
+            }
+        }
+    }
+
+    /// Capture all auth authority inputs for implicit selection from one
+    /// stable even generation.
+    pub(crate) fn selection_snapshot(&self) -> AuthSelectionSnapshot {
+        loop {
+            let before = self.selection_generation.load(Ordering::Acquire);
+            if before % 2 == 1 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let session_eligibility = self.first_party_session_eligibility();
+            let current = self.current_or_expired();
+            let has_auth = current.is_some();
+            let is_session_auth = current.is_some_and(|auth| auth.is_session_auth());
+            let first_party_env_api_key_ok = self.first_party_env_api_key_ok();
+            let after = self.selection_generation.load(Ordering::Acquire);
+            if before == after && after.is_multiple_of(2) {
+                return AuthSelectionSnapshot {
+                    generation: after,
+                    has_auth,
+                    session_eligibility,
+                    is_session_auth,
+                    first_party_env_api_key_ok,
+                };
+            }
+        }
+    }
+
+    /// Whether a previously captured selection snapshot is still current.
+    pub(crate) fn selection_generation_is_current(&self, generation: u64) -> bool {
+        generation.is_multiple_of(2)
+            && self.selection_generation.load(Ordering::Acquire) == generation
     }
 
     /// Closure-scoped read counterpart to [`Self::with_inner_write`].

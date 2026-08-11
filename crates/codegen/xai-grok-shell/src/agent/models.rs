@@ -18,6 +18,8 @@ use crate::sampling::SamplerConfig as SamplingConfig;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption};
 
+const IMPLICIT_SELECTION_RETRY_YIELD_AFTER: usize = 8;
+
 // ── Auth method for model fetching ──────────────────────────────────────────
 
 /// Credential for `/v1/models` fetching.
@@ -251,8 +253,8 @@ impl ModelsManagerBuilder {
     }
 
     pub(crate) fn build(self) -> ModelsManager {
-        let has_session = self.auth_manager.current_or_expired().is_some();
-        let fetch_auth = ModelFetchAuth::resolve(&self.cfg.endpoints, has_session);
+        let auth = self.auth_manager.selection_snapshot();
+        let fetch_auth = ModelFetchAuth::resolve(&self.cfg.endpoints, auth.has_auth);
         let current_reasoning_effort = self.cfg.models.default_reasoning_effort.filter(|effort| {
             resolve_catalog_key(&self.models, &self.current_model_id)
                 .and_then(|model_id| self.models.get(model_id.0.as_ref()))
@@ -412,11 +414,8 @@ impl ModelsManager {
         auth_manager: Arc<AuthManager>,
         remote_fetch_enabled: bool,
     ) -> Result<Self, String> {
-        let has_session = auth_manager.current_or_expired().is_some();
-        let is_session_auth = auth_manager
-            .current_or_expired()
-            .is_some_and(|a| a.is_session_auth());
-        let fetch_auth = ModelFetchAuth::resolve(&cfg.endpoints, has_session);
+        let auth = auth_manager.selection_snapshot();
+        let fetch_auth = ModelFetchAuth::resolve(&cfg.endpoints, auth.has_auth);
         crate::remote::validate_models_catalog_auth(
             &cfg.endpoints,
             fetch_auth,
@@ -438,20 +437,12 @@ impl ModelsManager {
             validate_selectable(cfg, &catalog)?;
         }
 
-        let usable_xai = {
-            // One AuthManager observation → full ambient eligibility (Pro P1).
-            resolution::classify_ambient_xai_auth(
-                cfg,
-                auth_manager.first_party_session_eligibility(),
-                auth_manager.first_party_env_api_key_ok(),
-            )
-            .is_usable()
-        };
+        let usable_xai = Self::usable_ambient_xai_from_snapshot(cfg, auth);
         let (current_model_key, current_model, model_source, unready_default_reason) =
             resolve_default_model_for_catalog_with_usable_xai(
                 cfg,
                 &catalog,
-                is_session_auth,
+                auth.is_session_auth,
                 has_prefetched,
                 usable_xai,
             );
@@ -611,12 +602,26 @@ impl ModelsManager {
     /// complete-refreshable session) plus static keys / preferred_method pin —
     /// never bare `current_or_expired` / mixed `has_usable_token() && current()`.
     fn usable_ambient_xai(&self, cfg: &config::Config) -> bool {
+        let snapshot = self.inner.auth_manager.selection_snapshot();
+        Self::usable_ambient_xai_from_snapshot(cfg, snapshot)
+    }
+
+    fn usable_ambient_xai_from_snapshot(
+        cfg: &config::Config,
+        snapshot: crate::auth::AuthSelectionSnapshot,
+    ) -> bool {
         resolution::classify_ambient_xai_auth(
             cfg,
-            self.inner.auth_manager.first_party_session_eligibility(),
-            self.inner.auth_manager.first_party_env_api_key_ok(),
+            snapshot.session_eligibility,
+            snapshot.first_party_env_api_key_ok,
         )
         .is_usable()
+    }
+
+    fn publish_model_switch(&self) {
+        self.inner
+            .model_switch_watch
+            .send_modify(|generation| *generation += 1);
     }
 
     /// Publish the first-party env-key probe verdict and repair only the
@@ -638,39 +643,56 @@ impl ModelsManager {
     fn apply_first_party_env_api_key_probe_result_inner(
         &self,
         ok: bool,
-        #[cfg(test)] before_commit: impl FnOnce(),
+        #[cfg(test)] mut before_commit: impl FnMut(),
     ) {
         self.inner.auth_manager.set_first_party_env_api_key_ok(ok);
         if ok || self.inner.user_selected_model.load(Ordering::Relaxed) {
             return;
         }
 
-        // Keep one config snapshot locked through target resolution and commit.
-        // This orders the repair cfg -> catalog -> current: a concurrent config
-        // reload either lands first (and is observed here) or lands afterward
-        // and performs its own authoritative reselection.
-        let cfg = self.inner.cfg.read();
-        let ambient = resolution::classify_ambient_xai_auth(
-            &cfg,
-            self.inner.auth_manager.first_party_session_eligibility(),
-            self.inner.auth_manager.first_party_env_api_key_ok(),
-        );
-        if ambient.is_usable() {
-            return;
-        }
+        let mut retries = 0usize;
+        loop {
+            let auth = self.inner.auth_manager.selection_snapshot();
+            // Keep one config snapshot locked through target resolution and
+            // commit. Auth is deliberately not locked with model state: its
+            // even generation is revalidated at the commit boundary instead.
+            let cfg = self.inner.cfg.read();
+            if Self::usable_ambient_xai_from_snapshot(&cfg, auth) {
+                if self
+                    .inner
+                    .auth_manager
+                    .selection_generation_is_current(auth.generation)
+                {
+                    return;
+                }
+                retries += 1;
+                if retries >= IMPLICIT_SELECTION_RETRY_YIELD_AFTER {
+                    std::thread::yield_now();
+                }
+                continue;
+            }
 
-        let is_session_auth = self.is_session_auth();
-        let (current, target) = {
             let catalog = self.inner.catalog.read();
             let (key, entry, _, _) = resolve_default_model_for_catalog_with_usable_xai(
                 &cfg,
                 &catalog.models,
-                is_session_auth,
+                auth.is_session_auth,
                 catalog.has_fetched_real_catalog,
                 false,
             );
-            if !resolution::is_ready_selectable_openai_codex_entry(&entry, is_session_auth) {
-                return;
+            if !resolution::is_ready_selectable_openai_codex_entry(&entry, auth.is_session_auth) {
+                if self
+                    .inner
+                    .auth_manager
+                    .selection_generation_is_current(auth.generation)
+                {
+                    return;
+                }
+                retries += 1;
+                if retries >= IMPLICIT_SELECTION_RETRY_YIELD_AFTER {
+                    std::thread::yield_now();
+                }
+                continue;
             }
             let target = acp::ModelId::new(key);
 
@@ -685,6 +707,17 @@ impl ModelsManager {
             // rechecking both the user-pick flag and current under the current
             // lock prevents a concurrent `/model` choice from being overwritten.
             let mut current = self.inner.current_model_id.write();
+            if !self
+                .inner
+                .auth_manager
+                .selection_generation_is_current(auth.generation)
+            {
+                retries += 1;
+                if retries >= IMPLICIT_SELECTION_RETRY_YIELD_AFTER {
+                    std::thread::yield_now();
+                }
+                continue;
+            }
             if self.inner.user_selected_model.load(Ordering::Relaxed)
                 || !catalog
                     .models
@@ -696,19 +729,31 @@ impl ModelsManager {
             }
             let old = current.clone();
             *current = target.clone();
-            (old, target)
-        };
-        drop(cfg);
+            if !self
+                .inner
+                .auth_manager
+                .selection_generation_is_current(auth.generation)
+            {
+                *current = old;
+                retries += 1;
+                if retries >= IMPLICIT_SELECTION_RETRY_YIELD_AFTER {
+                    std::thread::yield_now();
+                }
+                continue;
+            }
+            drop(current);
+            drop(catalog);
+            drop(cfg);
 
-        tracing::info!(
-            old = %current.0,
-            new = %target.0,
-            "invalid first-party env key left implicit Grok unusable; reseating ready Codex"
-        );
-        self.inner
-            .model_switch_watch
-            .send_modify(|generation| *generation += 1);
-        self.revalidate_current_reasoning_effort();
+            tracing::info!(
+                old = %old.0,
+                new = %target.0,
+                "invalid first-party env key left implicit Grok unusable; reseating ready Codex"
+            );
+            self.publish_model_switch();
+            self.revalidate_current_reasoning_effort();
+            return;
+        }
     }
 
     #[cfg(test)]
@@ -717,7 +762,12 @@ impl ModelsManager {
         ok: bool,
         before_commit: impl FnOnce(),
     ) {
-        self.apply_first_party_env_api_key_probe_result_inner(ok, before_commit);
+        let mut before_commit = Some(before_commit);
+        self.apply_first_party_env_api_key_probe_result_inner(ok, || {
+            if let Some(before_commit) = before_commit.take() {
+                before_commit();
+            }
+        });
     }
 
     /// Whether a Codex-backed model is actually reachable: holding a live
@@ -1727,120 +1777,244 @@ impl ModelsManager {
     /// substitute stayed seated. Gating on a prior verdict also keeps
     /// campaign-only preferred flips from yanking a live session.
     fn reselect_current_model_if_missing(&self, config: &config::Config) {
-        let current = self.inner.current_model_id.read().clone();
-        let is_session_auth = self.is_session_auth();
-        let usable_xai = self.usable_ambient_xai(config);
-        let needs_reselection = {
+        #[cfg(test)]
+        self.reselect_current_model_if_missing_inner(config, || {});
+        #[cfg(not(test))]
+        self.reselect_current_model_if_missing_inner(config);
+    }
+
+    fn reselect_current_model_if_missing_inner(
+        &self,
+        config: &config::Config,
+        #[cfg(test)] mut before_commit: impl FnMut(),
+    ) {
+        let mut retries = 0usize;
+        loop {
+            let auth = self.inner.auth_manager.selection_snapshot();
+            let usable_xai = Self::usable_ambient_xai_from_snapshot(config, auth);
             let cat = self.inner.catalog.read();
             let models = &cat.models;
-            match models.get(current.0.as_ref()) {
+            let mut current = self.inner.current_model_id.write();
+            let old = current.clone();
+            let needs_reselection = match models.get(old.0.as_ref()) {
                 None => true,
                 Some(entry) => {
                     let not_selectable = !entry.info.user_selectable
-                        || !entry.info.visible_for_auth(is_session_auth);
+                        || !entry.info.visible_for_auth(auth.is_session_auth);
                     // #303: only yank first-party ambient Grok/sentinel when a
                     // ready OpenAI Codex *account* route exists — never BYOK /
                     // auth_scheme=none / third-party CodexResponses shims.
                     let stranded_on_ambient_grok = !usable_xai
                         && resolution::is_first_party_ambient_xai_entry(entry)
-                        && models.values().any(|e| {
-                            resolution::is_ready_selectable_openai_codex_entry(e, is_session_auth)
+                        && models.values().any(|entry| {
+                            resolution::is_ready_selectable_openai_codex_entry(
+                                entry,
+                                auth.is_session_auth,
+                            )
                         });
                     not_selectable || stranded_on_ambient_grok
                 }
-            }
-        };
-        let (key, _, source, _) = {
-            let cat = self.inner.catalog.read();
-            let models = &cat.models;
-            resolve_default_model_for_catalog_with_usable_xai(
+            };
+            let (key, _, source, _) = resolve_default_model_for_catalog_with_usable_xai(
                 config,
                 models,
-                is_session_auth,
+                auth.is_session_auth,
                 cat.has_fetched_real_catalog,
                 usable_xai,
-            )
-        };
-        let user_picked = self.inner.user_selected_model.load(Ordering::Relaxed);
-        // Only reseat when we previously recorded a substitution: that is the
-        // warm-cache "preference was missing, now honourable" path. Without
-        // this gate, a campaign-only preferred flip (which deliberately takes
-        // this method rather than reselect_default_model) would yank a live
-        // session onto the pushed default.
-        //
-        // #303 strand reseat is an exception: it must not require a prior
-        // substitution verdict (login skip leaves Grok seated with none).
-        let had_substitution = self.substituted_preference().is_some();
-        let honour_explicit_preference = had_substitution
-            && !user_picked
-            && key.as_str() != current.0.as_ref()
-            && resolution::is_explicit_preference(source);
-        self.record_substituted_preference(config, source);
-        if !needs_reselection && !honour_explicit_preference {
-            return;
-        }
-        // User-picked models stay put even under Codex-only (#131 family).
-        if user_picked && !honour_explicit_preference {
-            let still_missing = {
-                let cat = self.inner.catalog.read();
-                cat.models.get(current.0.as_ref()).is_none_or(|entry| {
-                    !entry.info.user_selectable || !entry.info.visible_for_auth(is_session_auth)
-                })
-            };
-            if !still_missing {
+            );
+            #[cfg(test)]
+            before_commit();
+            let user_picked = self.inner.user_selected_model.load(Ordering::Relaxed);
+            // Only reseat when we previously recorded a substitution: that is
+            // the warm-cache "preference was missing, now honourable" path.
+            let had_substitution = self.substituted_preference().is_some();
+            let honour_explicit_preference = had_substitution
+                && !user_picked
+                && key.as_str() != old.0.as_ref()
+                && resolution::is_explicit_preference(source);
+            let should_change = needs_reselection || honour_explicit_preference;
+            if user_picked && !honour_explicit_preference {
+                let still_missing = models.get(old.0.as_ref()).is_none_or(|entry| {
+                    !entry.info.user_selectable
+                        || !entry.info.visible_for_auth(auth.is_session_auth)
+                });
+                if !still_missing {
+                    if self
+                        .inner
+                        .auth_manager
+                        .selection_generation_is_current(auth.generation)
+                    {
+                        drop(current);
+                        drop(cat);
+                        self.record_substituted_preference(config, source);
+                        return;
+                    }
+                    retries += 1;
+                    if retries >= IMPLICIT_SELECTION_RETRY_YIELD_AFTER {
+                        std::thread::yield_now();
+                    }
+                    continue;
+                }
+            }
+            if !self
+                .inner
+                .auth_manager
+                .selection_generation_is_current(auth.generation)
+            {
+                retries += 1;
+                if retries >= IMPLICIT_SELECTION_RETRY_YIELD_AFTER {
+                    std::thread::yield_now();
+                }
+                continue;
+            }
+            if !should_change {
+                drop(current);
+                drop(cat);
+                self.record_substituted_preference(config, source);
                 return;
             }
+            let new_id = acp::ModelId::new(Arc::from(key));
+            let changed = *current != new_id;
+            *current = new_id.clone();
+            if !self
+                .inner
+                .auth_manager
+                .selection_generation_is_current(auth.generation)
+            {
+                *current = old;
+                retries += 1;
+                if retries >= IMPLICIT_SELECTION_RETRY_YIELD_AFTER {
+                    std::thread::yield_now();
+                }
+                continue;
+            }
+            drop(current);
+            drop(cat);
+            self.record_substituted_preference(config, source);
+            if changed {
+                if honour_explicit_preference && !needs_reselection {
+                    tracing::info!(
+                        old = %old.0, new = %new_id.0, source = %source,
+                        "configured preference now honourable, reseating"
+                    );
+                } else {
+                    tracing::info!(
+                        old = %old.0, new = %new_id.0, source = %source,
+                        "current model not in new catalog, reselecting default"
+                    );
+                }
+                self.publish_model_switch();
+            }
+            return;
         }
-        let new_id = acp::ModelId::new(Arc::from(key));
-        if honour_explicit_preference && !needs_reselection {
-            tracing::info!(
-                old = %current.0, new = %new_id.0, source = %source,
-                "configured preference now honourable, reseating"
-            );
-        } else {
-            tracing::info!(
-                old = %current.0, new = %new_id.0, source = %source,
-                "current model not in new catalog, reselecting default"
-            );
-        }
-        self.set_current_model_id_internal(new_id);
+    }
+
+    #[cfg(test)]
+    fn reselect_current_model_if_missing_with_before_commit(
+        &self,
+        config: &config::Config,
+        before_commit: impl FnOnce(),
+    ) {
+        let mut before_commit = Some(before_commit);
+        self.reselect_current_model_if_missing_inner(config, || {
+            if let Some(before_commit) = before_commit.take() {
+                before_commit();
+            }
+        });
     }
 
     /// Re-resolve the default model against the current catalog.
     fn reselect_default_model(&self, config: &config::Config) {
-        let usable_xai = self.usable_ambient_xai(config);
-        let (key, _, source, unready_reason) = {
+        #[cfg(test)]
+        self.reselect_default_model_inner(config, || {});
+        #[cfg(not(test))]
+        self.reselect_default_model_inner(config);
+    }
+
+    fn reselect_default_model_inner(
+        &self,
+        config: &config::Config,
+        #[cfg(test)] mut before_commit: impl FnMut(),
+    ) {
+        let mut retries = 0usize;
+        loop {
+            let auth = self.inner.auth_manager.selection_snapshot();
+            let usable_xai = Self::usable_ambient_xai_from_snapshot(config, auth);
             let cat = self.inner.catalog.read();
             let models = &cat.models;
-            resolve_default_model_for_catalog_with_usable_xai(
-                config,
-                models,
-                self.is_session_auth(),
-                cat.has_fetched_real_catalog,
-                usable_xai,
-            )
-        };
-        let new_id = acp::ModelId::new(Arc::from(key));
-        // Recorded whether or not the selection changes: the catalog landing is
-        // exactly when an "absent" verdict taken against an emptier catalog
-        // becomes wrong, and that correction is independent of whether the
-        // resolved key moved.
-        self.record_substituted_preference(config, source);
-        let current = self.inner.current_model_id.read().clone();
-        if current.0.as_ref() != new_id.0.as_ref() {
-            if let Some(reason) = &unready_reason {
-                tracing::error!(
-                    old = %current.0, new = %new_id.0, source = %source, %reason,
-                    "re-resolved default model to an unusable catalog entry"
+            let (key, _, source, unready_reason) =
+                resolve_default_model_for_catalog_with_usable_xai(
+                    config,
+                    models,
+                    auth.is_session_auth,
+                    cat.has_fetched_real_catalog,
+                    usable_xai,
                 );
-            } else {
-                tracing::info!(
-                    old = %current.0, new = %new_id.0, source = %source,
-                    "re-resolved default model after catalog populated"
-                );
+            #[cfg(test)]
+            before_commit();
+            let new_id = acp::ModelId::new(Arc::from(key));
+            let mut current = self.inner.current_model_id.write();
+            if !self
+                .inner
+                .auth_manager
+                .selection_generation_is_current(auth.generation)
+            {
+                retries += 1;
+                if retries >= IMPLICIT_SELECTION_RETRY_YIELD_AFTER {
+                    std::thread::yield_now();
+                }
+                continue;
             }
-            self.set_current_model_id_internal(new_id);
+            let old = current.clone();
+            let changed = old != new_id;
+            *current = new_id.clone();
+            if !self
+                .inner
+                .auth_manager
+                .selection_generation_is_current(auth.generation)
+            {
+                *current = old;
+                retries += 1;
+                if retries >= IMPLICIT_SELECTION_RETRY_YIELD_AFTER {
+                    std::thread::yield_now();
+                }
+                continue;
+            }
+            drop(current);
+            drop(cat);
+            // Publish #131 only for the stable attempt that committed (or
+            // stably confirmed) this model selection.
+            self.record_substituted_preference(config, source);
+            if changed {
+                if let Some(reason) = &unready_reason {
+                    tracing::error!(
+                        old = %old.0, new = %new_id.0, source = %source, %reason,
+                        "re-resolved default model to an unusable catalog entry"
+                    );
+                } else {
+                    tracing::info!(
+                        old = %old.0, new = %new_id.0, source = %source,
+                        "re-resolved default model after catalog populated"
+                    );
+                }
+                self.publish_model_switch();
+            }
+            return;
         }
+    }
+
+    #[cfg(test)]
+    fn reselect_default_model_with_before_commit(
+        &self,
+        config: &config::Config,
+        before_commit: impl FnOnce(),
+    ) {
+        let mut before_commit = Some(before_commit);
+        self.reselect_default_model_inner(config, || {
+            if let Some(before_commit) = before_commit.take() {
+                before_commit();
+            }
+        });
     }
 }
 

@@ -157,6 +157,68 @@ fn make_auth(expires_at: Option<DateTime<Utc>>, create_time: DateTime<Utc>) -> G
 }
 
 #[test]
+fn selection_snapshot_generation_tracks_auth_and_probe_mutations() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+
+    let initial = mgr.selection_snapshot();
+    assert_eq!(initial.generation, 0);
+    assert!(!initial.has_auth);
+    assert_eq!(
+        initial.session_eligibility,
+        FirstPartySessionEligibility::None
+    );
+    assert!(!initial.is_session_auth);
+    assert!(initial.first_party_env_api_key_ok);
+
+    let mut auth = make_auth(Some(Utc::now() + Duration::hours(1)), Utc::now());
+    auth.auth_mode = AuthMode::Oidc;
+    mgr.hot_swap(auth);
+    let with_session = mgr.selection_snapshot();
+    assert_eq!(with_session.generation, initial.generation + 2);
+    assert!(with_session.has_auth);
+    assert_eq!(
+        with_session.session_eligibility,
+        FirstPartySessionEligibility::WireUsable
+    );
+    assert!(with_session.is_session_auth);
+
+    mgr.set_first_party_env_api_key_ok(false);
+    let failed_probe = mgr.selection_snapshot();
+    assert_eq!(failed_probe.generation, with_session.generation + 2);
+    assert!(!failed_probe.first_party_env_api_key_ok);
+    assert!(mgr.selection_generation_is_current(failed_probe.generation));
+
+    mgr.clear_in_memory();
+    let cleared = mgr.selection_snapshot();
+    assert_eq!(cleared.generation, failed_probe.generation + 2);
+    assert!(!cleared.has_auth);
+    assert!(!cleared.is_session_auth);
+    assert!(!mgr.selection_generation_is_current(failed_probe.generation));
+}
+
+#[test]
+fn selection_snapshot_waits_for_odd_mutation_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let mutation = mgr.begin_selection_mutation();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = Arc::clone(&mgr);
+    let thread = std::thread::spawn(move || {
+        tx.send(reader.selection_snapshot()).unwrap();
+    });
+
+    assert!(
+        rx.recv_timeout(StdDuration::from_millis(25)).is_err(),
+        "a snapshot must not publish while the generation is odd"
+    );
+    drop(mutation);
+    let snapshot = rx.recv_timeout(StdDuration::from_secs(1)).unwrap();
+    assert_eq!(snapshot.generation % 2, 0);
+    thread.join().unwrap();
+}
+
+#[test]
 fn expired_within_5min_buffer() {
     let auth = make_auth(Some(Utc::now() + Duration::minutes(4)), Utc::now());
     assert!(is_expired(&auth));
