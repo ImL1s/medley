@@ -8459,6 +8459,72 @@ mod soft_default_settings_emit {
 #[test]
 #[serial_test::serial]
 fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex() {
+    const CHILD_ENV: &str = "__MEDLEY_INVALID_XAI_PROBE_CHILD";
+    const CHILD_PASS: &str = "invalid-xai-probe-reseat-ok";
+
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let tmp = tempfile::tempdir().expect("fresh-process state home");
+        let state_home = tmp.path().join("state");
+        std::fs::create_dir_all(&state_home).expect("create fresh-process state home");
+        let filter = module_path!()
+            .split_once("::")
+            .map(|(_, rest)| rest)
+            .unwrap_or_default();
+        let mut command = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+        command
+            .arg("--exact")
+            .arg(format!(
+                "{filter}::initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex"
+            ))
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(CHILD_ENV, &state_home)
+            .env("MEDLEY_HOME", &state_home)
+            .env("GROK_HOME", &state_home)
+            .env_remove("GROK_DEFAULT_MODEL")
+            .env_remove("GROK_DISABLE_API_KEY_AUTH")
+            .env_remove("GROK_AUTH")
+            .env_remove("GROK_AUTH_PATH")
+            .env_remove("GROK_LOCAL_AUTH")
+            .env_remove("GROK_AUTH_PROVIDER_COMMAND")
+            .env_remove("GROK_AUTH_PROVIDER_LABEL")
+            .env_remove("GROK_AUTH_TOKEN_TTL")
+            .env_remove("GROK_OIDC_ISSUER")
+            .env_remove("GROK_OIDC_CLIENT_ID")
+            .env_remove("GROK_OIDC_SCOPES")
+            .env_remove("GROK_OIDC_AUDIENCE")
+            .env_remove("GROK_OAUTH2_ISSUER")
+            .env_remove("GROK_OAUTH2_CLIENT_ID")
+            .env_remove("GROK_OAUTH2_SCOPES")
+            .env_remove("GROK_OAUTH2_PRINCIPAL_TYPE")
+            .env_remove("GROK_OAUTH2_PRINCIPAL_ID")
+            .env_remove("GROK_OAUTH2_REFERRER")
+            .stdin(std::process::Stdio::null());
+        xai_tty_utils::detach_std_command(&mut command);
+        let output = command.output().expect("spawn invalid-probe child test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && !stderr.contains("panicked at"),
+            "fresh-process invalid-probe regression failed (status: {:?})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+        assert!(
+            stdout.contains(CHILD_PASS),
+            "child did not execute the invalid-probe regression\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        return;
+    }
+
+    let state_home = std::path::PathBuf::from(
+        std::env::var_os(CHILD_ENV).expect("child state home marker must be present"),
+    );
+    assert_eq!(
+        xai_grok_config::grok_home(),
+        state_home,
+        "fresh child must pin the process-global state home to the fixture"
+    );
+
     run_local_for_bridge_test(|| async {
         use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
         use crate::agent::config::Config as AgentConfig;
@@ -8522,11 +8588,7 @@ fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex() {
                 .expect("write probe response");
         });
 
-        let tmp = tempfile::tempdir().expect("temp home");
-        let state_home = tmp.path().join("state");
-        std::fs::create_dir_all(&state_home).expect("create isolated state home");
-        let _medley_home = EnvGuard::set("MEDLEY_HOME", &state_home);
-        let _grok_home = EnvGuard::set("GROK_HOME", &state_home);
+        let tmp = tempfile::tempdir().expect("temp auth fixtures");
         let auth_path = tmp.path().join("auth.json");
         let codex_auth = GrokAuth {
             key: "live-codex-token".to_owned(),
@@ -8547,6 +8609,8 @@ fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex() {
 
         let _xai_key = EnvGuard::set(XAI_API_KEY_ENV_VAR, "invalid-xai-key");
         let _legacy_key = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+        let _api_key_lockdown = EnvGuard::unset("GROK_DISABLE_API_KEY_AUTH");
+        let _default_model = EnvGuard::unset("GROK_DEFAULT_MODEL");
         let xai_home = tmp.path().join("xai-empty");
         std::fs::create_dir_all(&xai_home).expect("create xAI home");
         let auth_manager =
@@ -8607,6 +8671,7 @@ fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex() {
             "invalid ambient xAI key must not leave the implicit cold-start model stranded on Grok when Codex OAuth is ready"
         );
     });
+    println!("{CHILD_PASS}");
 }
 
 /// #131 B3: the deliverable is the `initialize` response `_meta` key, not the
