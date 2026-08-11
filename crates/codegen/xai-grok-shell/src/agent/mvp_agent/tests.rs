@@ -8482,6 +8482,7 @@ fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex() {
             .env("MEDLEY_HOME", &state_home)
             .env("GROK_HOME", &state_home)
             .env_remove("GROK_DEFAULT_MODEL")
+            .env_remove("GROK_DEPLOYMENT_KEY")
             .env_remove("GROK_DISABLE_API_KEY_AUTH")
             .env_remove("GROK_AUTH")
             .env_remove("GROK_AUTH_PATH")
@@ -8622,6 +8623,10 @@ fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex() {
 
         let empty = toml::Value::Table(toml::map::Map::new());
         let mut cfg = AgentConfig::new_from_toml_cfg(&empty).expect("production config");
+        assert!(
+            cfg.endpoints.deployment_key.is_none(),
+            "fixture must not inherit deployment auth that bypasses the invalid env-key probe"
+        );
         // Keep the fixture cold and deterministic: production bootstrap otherwise
         // fetches process-global remote settings, whose campaign default can
         // explicitly pin a Codex model before the probe under test runs.
