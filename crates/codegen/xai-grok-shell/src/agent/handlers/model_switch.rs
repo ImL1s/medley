@@ -446,10 +446,7 @@ async fn apply_with_load_gate(
     if agent.cfg.borrow().mode != config::AgentMode::Leader {
         agent
             .models_manager
-            .set_current_model_id(catalog_model_id.clone());
-        agent
-            .models_manager
-            .set_current_reasoning_effort(applied_effort);
+            .set_current_model_and_reasoning_effort(catalog_model_id.clone(), applied_effort);
     }
     agent.sync_process_static_api_key(Some(catalog_model_id.0.as_ref()));
     failure_telemetry.disarm();

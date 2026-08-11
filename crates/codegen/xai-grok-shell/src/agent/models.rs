@@ -855,6 +855,7 @@ impl ModelsManager {
                 }
                 continue;
             }
+            self.revalidate_reasoning_effort_locked(&catalog.models, &target);
             drop(current);
             drop(selection_commit);
             drop(catalog);
@@ -866,7 +867,6 @@ impl ModelsManager {
                 "invalid first-party env key left implicit Grok unusable; reseating ready Codex"
             );
             self.publish_model_switch();
-            self.revalidate_current_reasoning_effort();
             return;
         }
     }
@@ -1126,14 +1126,26 @@ impl ModelsManager {
 
     pub(crate) fn set_current_model_id(&self, id: acp::ModelId) {
         #[cfg(test)]
-        self.set_current_model_id_inner(id, || {});
+        self.set_current_model_id_inner(id, None, || {});
         #[cfg(not(test))]
-        self.set_current_model_id_inner(id);
+        self.set_current_model_id_inner(id, None);
+    }
+
+    pub(crate) fn set_current_model_and_reasoning_effort(
+        &self,
+        id: acp::ModelId,
+        effort: Option<ReasoningEffort>,
+    ) {
+        #[cfg(test)]
+        self.set_current_model_id_inner(id, Some(effort), || {});
+        #[cfg(not(test))]
+        self.set_current_model_id_inner(id, Some(effort));
     }
 
     fn set_current_model_id_inner(
         &self,
         id: acp::ModelId,
+        effort: Option<Option<ReasoningEffort>>,
         #[cfg(test)] before_id_publish: impl FnOnce(),
     ) {
         let selection_commit = self.inner.selection_commit.write();
@@ -1146,6 +1158,9 @@ impl ModelsManager {
             let mut cur = self.inner.current_model_id.write();
             let changed = *cur != id;
             *cur = id;
+            if let Some(effort) = effort {
+                *self.inner.current_reasoning_effort.write() = effort;
+            }
             changed
         };
         drop(selection_commit);
@@ -1162,7 +1177,17 @@ impl ModelsManager {
         id: acp::ModelId,
         before_id_publish: impl FnOnce(),
     ) {
-        self.set_current_model_id_inner(id, before_id_publish);
+        self.set_current_model_id_inner(id, None, before_id_publish);
+    }
+
+    #[cfg(test)]
+    fn set_current_model_and_reasoning_effort_with_before_id_publish(
+        &self,
+        id: acp::ModelId,
+        effort: Option<ReasoningEffort>,
+        before_id_publish: impl FnOnce(),
+    ) {
+        self.set_current_model_id_inner(id, Some(effort), before_id_publish);
     }
 
     /// Per-model Layer-3 LazinessDetector config for `model_id` (disabled default when absent).
@@ -1204,7 +1229,26 @@ impl ModelsManager {
     }
 
     pub(crate) fn set_current_reasoning_effort(&self, effort: Option<ReasoningEffort>) {
+        let selection_commit = self.inner.selection_commit.write();
+        let current = self.inner.current_model_id.read();
         *self.inner.current_reasoning_effort.write() = effort;
+        drop(current);
+        drop(selection_commit);
+    }
+
+    fn revalidate_reasoning_effort_locked(
+        &self,
+        models: &IndexMap<String, ModelEntry>,
+        current_model_id: &acp::ModelId,
+    ) {
+        let mut current_effort = self.inner.current_reasoning_effort.write();
+        if current_effort.is_some_and(|effort| {
+            !resolve_catalog_key(models, current_model_id)
+                .and_then(|model_id| models.get(model_id.0.as_ref()))
+                .is_some_and(|entry| model_offers_reasoning_effort(&entry.info, effort))
+        }) {
+            *current_effort = None;
+        }
     }
 
     fn revalidate_current_reasoning_effort(&self) {
@@ -1712,10 +1756,19 @@ impl ModelsManager {
 
     /// Wipe in-memory state so a previous identity's catalog doesn't leak.
     fn clear(&self) {
+        #[cfg(test)]
+        self.clear_inner(|| {});
+        #[cfg(not(test))]
+        self.clear_inner();
+    }
+
+    fn clear_inner(&self, #[cfg(test)] after_catalog_lock: impl FnOnce()) {
         // Match the catalog publication lock order. Authority readers can see
         // either the previous catalog/selection pair or the fully-cleared
         // state, never an empty catalog with the previous explicit-pick flag.
         let mut catalog = self.inner.catalog.write();
+        #[cfg(test)]
+        after_catalog_lock();
         let selection_commit = self.inner.selection_commit.write();
         let current = self.inner.current_model_id.write();
         *catalog = CatalogState::default();
@@ -1728,6 +1781,11 @@ impl ModelsManager {
         drop(current);
         drop(selection_commit);
         drop(catalog);
+    }
+
+    #[cfg(test)]
+    fn clear_with_after_catalog_lock(&self, after_catalog_lock: impl FnOnce()) {
+        self.clear_inner(after_catalog_lock);
     }
 
     /// Build a `SamplingConfig` from the current model + auth state.
@@ -2081,15 +2139,7 @@ impl ModelsManager {
                 std::thread::yield_now();
                 continue;
             }
-            let mut current_effort = self.inner.current_reasoning_effort.write();
-            if current_effort.is_some_and(|effort| {
-                !resolve_catalog_key(models, &new_id)
-                    .and_then(|model_id| models.get(model_id.0.as_ref()))
-                    .is_some_and(|entry| model_offers_reasoning_effort(&entry.info, effort))
-            }) {
-                *current_effort = None;
-            }
-            drop(current_effort);
+            self.revalidate_reasoning_effort_locked(models, &new_id);
             *self.inner.substituted_preference.write() =
                 resolution::substituted_preference(cfg, source);
             drop(current);
@@ -2255,10 +2305,12 @@ impl ModelsManager {
                         .auth_manager
                         .selection_generation_is_current(auth.generation)
                     {
+                        self.revalidate_reasoning_effort_locked(models, &current);
+                        *self.inner.substituted_preference.write() =
+                            resolution::substituted_preference(config, source);
                         drop(current);
                         drop(selection_commit);
                         drop(cat);
-                        self.record_substituted_preference(config, source);
                         return;
                     }
                     retries += 1;
@@ -2280,10 +2332,12 @@ impl ModelsManager {
                 continue;
             }
             if !should_change {
+                self.revalidate_reasoning_effort_locked(models, &current);
+                *self.inner.substituted_preference.write() =
+                    resolution::substituted_preference(config, source);
                 drop(current);
                 drop(selection_commit);
                 drop(cat);
-                self.record_substituted_preference(config, source);
                 return;
             }
             let new_id = acp::ModelId::new(Arc::from(key));
@@ -2301,10 +2355,12 @@ impl ModelsManager {
                 }
                 continue;
             }
+            self.revalidate_reasoning_effort_locked(models, &new_id);
+            *self.inner.substituted_preference.write() =
+                resolution::substituted_preference(config, source);
             drop(current);
             drop(selection_commit);
             drop(cat);
-            self.record_substituted_preference(config, source);
             if changed {
                 if honour_explicit_preference && !needs_reselection {
                     tracing::info!(
@@ -2395,12 +2451,12 @@ impl ModelsManager {
                 }
                 continue;
             }
+            self.revalidate_reasoning_effort_locked(models, &new_id);
+            *self.inner.substituted_preference.write() =
+                resolution::substituted_preference(config, source);
             drop(current);
             drop(selection_commit);
             drop(cat);
-            // Publish #131 only for the stable attempt that committed (or
-            // stably confirmed) this model selection.
-            self.record_substituted_preference(config, source);
             if changed {
                 if let Some(reason) = &unready_reason {
                     tracing::error!(
@@ -2694,6 +2750,126 @@ mod selection_atomicity_tests {
         );
         manager.apply_catalog_for_test(catalog);
         assert_eq!(manager.current_model_id().0.as_ref(), "grok-explicit");
+    }
+
+    #[test]
+    fn clear_linearizes_after_in_flight_reselection_secondary_state() {
+        let tmp = tempfile::tempdir().expect("temp clear/reselection home");
+        let mut cfg = config::Config::default();
+        cfg.models.default = Some("missing-preference".to_string());
+        let mut catalog = IndexMap::new();
+        catalog.insert(
+            "grok-fallback".to_string(),
+            ready_xai_entry("grok-fallback"),
+        );
+        let manager = ModelsManager::new(
+            None,
+            catalog,
+            acp::ModelId::new("grok-fallback"),
+            Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default())),
+            cfg.clone(),
+        );
+
+        let (reselection_ready_tx, reselection_ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let reselection = {
+            let manager = manager.clone();
+            std::thread::spawn(move || {
+                manager.reselect_default_model_with_before_commit(&cfg, || {
+                    reselection_ready_tx
+                        .send(())
+                        .expect("announce reselection commit boundary");
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("release reselection commit");
+                });
+            })
+        };
+        reselection_ready_rx
+            .recv()
+            .expect("reselection must hold the catalog snapshot");
+
+        let (clear_started_tx, clear_started_rx) = mpsc::channel();
+        let clear = {
+            let manager = manager.clone();
+            std::thread::spawn(move || {
+                clear_started_tx.send(()).expect("announce clear attempt");
+                manager.clear();
+            })
+        };
+        clear_started_rx.recv().expect("clear must start");
+        assert!(manager.inner.catalog.try_write().is_none());
+
+        release_tx.send(()).expect("release reselection");
+        reselection.join().expect("reselection must finish");
+        clear.join().expect("clear must finish after reselection");
+        assert!(manager.models().is_empty());
+        assert!(manager.substituted_preference().is_none());
+        assert_eq!(manager.current_reasoning_effort(), None);
+    }
+
+    #[test]
+    fn clear_cannot_split_atomic_user_model_and_effort_selection() {
+        let tmp = tempfile::tempdir().expect("temp clear/user-selection home");
+        let mut catalog = IndexMap::new();
+        catalog.insert("grok-old".to_string(), ready_xai_entry("grok-old"));
+        catalog.insert("grok-new".to_string(), ready_xai_entry("grok-new"));
+        let manager = ModelsManager::new(
+            None,
+            catalog,
+            acp::ModelId::new("grok-old"),
+            Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default())),
+            config::Config::default(),
+        );
+
+        let (selection_ready_tx, selection_ready_rx) = mpsc::channel();
+        let (release_selection_tx, release_selection_rx) = mpsc::channel();
+        let selection = {
+            let manager = manager.clone();
+            std::thread::spawn(move || {
+                manager.set_current_model_and_reasoning_effort_with_before_id_publish(
+                    acp::ModelId::new("grok-new"),
+                    Some(ReasoningEffort::High),
+                    || {
+                        selection_ready_tx
+                            .send(())
+                            .expect("announce atomic user-selection midpoint");
+                        release_selection_rx
+                            .recv_timeout(Duration::from_secs(5))
+                            .expect("release atomic user selection");
+                    },
+                );
+            })
+        };
+        selection_ready_rx
+            .recv()
+            .expect("user selection must hold selection_commit");
+
+        let (clear_has_catalog_tx, clear_has_catalog_rx) = mpsc::channel();
+        let clear = {
+            let manager = manager.clone();
+            std::thread::spawn(move || {
+                manager.clear_with_after_catalog_lock(|| {
+                    clear_has_catalog_tx
+                        .send(())
+                        .expect("announce clear catalog lock");
+                });
+            })
+        };
+        clear_has_catalog_rx
+            .recv()
+            .expect("clear must own catalog before waiting on selection");
+        assert!(manager.inner.catalog.try_read().is_none());
+        assert!(manager.inner.selection_commit.try_read().is_none());
+
+        release_selection_tx
+            .send(())
+            .expect("release user selection");
+        selection.join().expect("user selection must finish");
+        clear.join().expect("clear must finish");
+        assert!(!manager.inner.user_selected_model.load(Ordering::Relaxed));
+        assert_eq!(manager.current_reasoning_effort(), None);
+        assert!(manager.models().is_empty());
     }
 }
 

@@ -908,17 +908,49 @@ fn catalog_refresh_clears_current_effort_removed_from_model_menu() {
 
 #[test]
 fn stale_effort_revalidation_does_not_clear_newer_selection() {
-    let mgr = test_manager();
-    let validated_model = mgr.current_model_id();
+    let tmp = tempfile::tempdir().expect("temp effort revalidation home");
+    let catalog = IndexMap::from([
+        reasoning_entry_with_menu("model-a", ReasoningEffort::Low),
+        reasoning_entry_with_menu("model-b", ReasoningEffort::High),
+    ]);
+    let mgr = ModelsManager::new(
+        None,
+        catalog,
+        acp::ModelId::new("model-a"),
+        Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default())),
+        config::Config::default(),
+    );
     mgr.set_current_reasoning_effort(Some(ReasoningEffort::High));
 
-    // Deterministic interleaving: validation captured A/high, then a switch
-    // committed B/high before the invalid result attempted its conditional
-    // clear. Comparing only the effort would incorrectly clear B's selection.
-    mgr.set_current_model_id(acp::ModelId::new("grok-4"));
-    mgr.set_current_reasoning_effort(Some(ReasoningEffort::High));
-    mgr.clear_reasoning_effort_if_selection_unchanged(&validated_model, ReasoningEffort::High);
+    // Validation owns the catalog snapshot but has not acquired selection or
+    // current yet. The atomic B/high commit wins before validation continues,
+    // so it must validate the newer pair rather than clear by effort alone.
+    let (catalog_locked_tx, catalog_locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let validator = {
+        let mgr = mgr.clone();
+        std::thread::spawn(move || {
+            mgr.revalidate_current_reasoning_effort_with_after_catalog_lock(|| {
+                catalog_locked_tx
+                    .send(())
+                    .expect("announce effort catalog snapshot");
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("release effort validation");
+            });
+        })
+    };
+    catalog_locked_rx
+        .recv()
+        .expect("validator must acquire catalog before selection");
+    mgr.set_current_model_and_reasoning_effort(
+        acp::ModelId::new("model-b"),
+        Some(ReasoningEffort::High),
+    );
+    release_tx.send(()).expect("release validator");
+    validator.join().expect("validator must finish");
 
+    assert_eq!(mgr.current_model_id().0.as_ref(), "model-b");
     assert_eq!(
         mgr.current_reasoning_effort(),
         Some(ReasoningEffort::High),
@@ -3448,6 +3480,49 @@ fn ready_codex_entry(auth_home: &std::path::Path) -> (ModelEntry, xai_grok_test_
         "fixture Codex entry must be ready, got reason={reason:?}"
     );
     (entry, auth_path_guard)
+}
+
+#[test]
+#[serial_test::serial]
+fn catalog_refresh_preserves_explicit_grok_with_ready_codex_route() {
+    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    use xai_grok_test_support::EnvGuard;
+    let _g = EnvGuard::set(XAI_API_KEY_ENV_VAR, "invalid-xai-key");
+    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+    let _default = EnvGuard::unset("GROK_DEFAULT_MODEL");
+
+    let tmp = tempfile::tempdir().expect("temp explicit Grok refresh home");
+    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
+    assert!(resolution::is_ready_selectable_openai_codex_entry(
+        &codex, false
+    ));
+    let xai_home = tmp.path().join("xai-explicit-refresh");
+    std::fs::create_dir_all(&xai_home).unwrap();
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        IndexMap::new(),
+        acp::ModelId::new("grok-4.5"),
+        Arc::new(AuthManager::new(&xai_home, GrokComConfig::default())),
+        config::Config::default(),
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    mgr.set_current_model_id(acp::ModelId::new("grok-4.5"));
+    let catalog = IndexMap::from([
+        ("grok-4.5".to_string(), ready_entry("grok-4.5")),
+        (
+            crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string(),
+            codex,
+        ),
+    ]);
+
+    mgr.apply_catalog_for_test(catalog);
+
+    assert_eq!(mgr.current_model_id().0.as_ref(), "grok-4.5");
+    assert!(mgr.inner.user_selected_model.load(Ordering::Relaxed));
 }
 
 #[test]
