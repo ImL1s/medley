@@ -5135,6 +5135,9 @@ fn production_spawn_latches_post_seal_unready_prepared_identity() {
                 ),
             )
             .expect("initialize once");
+        agent.set_auth_method(acp::AuthMethodId::new(
+            crate::agent::auth_method::XAI_API_KEY_METHOD_ID,
+        ));
         let removed_key = std::rc::Rc::new(std::cell::RefCell::new(None));
         let removed_key_hook = removed_key.clone();
         let seal_hook = agent_ops::install_new_session_plan_before_seal_hook(move || {
@@ -5145,7 +5148,13 @@ fn production_spawn_latches_post_seal_unready_prepared_identity() {
         });
         let cwd = tempfile::tempdir().expect("session cwd");
         let response = agent
-            .new_session_inner(acp::NewSessionRequest::new(cwd.path().to_path_buf()))
+            .new_session_inner(
+                acp::NewSessionRequest::new(cwd.path().to_path_buf()).meta(
+                    serde_json::json!({ "modelId": "sealed-model" })
+                        .as_object()
+                        .cloned(),
+                ),
+            )
             .await
             .expect("spawn sealed prepared session");
         drop(seal_hook);
@@ -5160,12 +5169,16 @@ fn production_spawn_latches_post_seal_unready_prepared_identity() {
             .expect("production spawn must retain exact prepared identity");
         assert_eq!(sealed_identity.model_id, "sealed-model");
         assert_eq!(sealed_identity.route, "sealed-route");
+        let resident_agent_name = agent
+            .resident_handle(&response.session_id)
+            .expect("resident after production spawn")
+            .agent_name;
         assert_eq!(
             agent
                 .session_registry
                 .unavailable_agent_name(&response.session_id)
                 .as_deref(),
-            Some("grok-build")
+            Some(resident_agent_name.as_str())
         );
         let before_key = agent
             .resident_handle(&response.session_id)
