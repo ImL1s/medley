@@ -8486,9 +8486,31 @@ fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex() {
                     Err(error) => panic!("accept probe request: {error}"),
                 }
             };
-            let mut request = [0u8; 2048];
-            let read = stream.read(&mut request).expect("read probe request");
-            let request = String::from_utf8_lossy(&request[..read]);
+            stream
+                .set_nonblocking(false)
+                .expect("make accepted probe stream blocking");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                .expect("bound probe request read");
+
+            const MAX_REQUEST_HEADER_BYTES: usize = 8192;
+            let mut request = Vec::with_capacity(2048);
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                assert!(
+                    request.len() < MAX_REQUEST_HEADER_BYTES,
+                    "probe request headers exceeded {MAX_REQUEST_HEADER_BYTES} bytes"
+                );
+                let mut chunk = [0u8; 1024];
+                let remaining = MAX_REQUEST_HEADER_BYTES - request.len();
+                let read_len = remaining.min(chunk.len());
+                match stream.read(&mut chunk[..read_len]) {
+                    Ok(0) => panic!("probe connection closed before complete request headers"),
+                    Ok(read) => request.extend_from_slice(&chunk[..read]),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => panic!("read probe request: {error}"),
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
             assert!(
                 request.starts_with("GET /v1/api-key "),
                 "initialize must use the production /api-key probe path: {request}"
