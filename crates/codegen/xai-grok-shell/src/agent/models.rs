@@ -158,6 +158,13 @@ struct CatalogState {
 
 struct Inner {
     catalog: RwLock<CatalogState>,
+    /// Linearizes the current model id with whether it was explicitly picked.
+    ///
+    /// The values keep their existing storage so current-id-only readers stay
+    /// cheap, but every current-id publication takes this lock for write and
+    /// authority snapshots take it for read. This prevents observing the
+    /// explicit-pick bit from one selection with the id from another.
+    selection_commit: RwLock<()>,
     current_model_id: RwLock<acp::ModelId>,
     current_reasoning_effort: RwLock<Option<ReasoningEffort>>,
     /// Set when the user's configured default was not seated and a substitute
@@ -279,6 +286,7 @@ impl ModelsManagerBuilder {
                     models: self.models,
                     ..Default::default()
                 }),
+                selection_commit: RwLock::new(()),
                 current_model_id: RwLock::new(self.current_model_id),
                 current_reasoning_effort: RwLock::new(current_reasoning_effort),
                 substituted_preference: RwLock::new(None),
@@ -797,8 +805,9 @@ impl ModelsManager {
 
             // Lock order is catalog -> current. Holding the catalog read guard
             // keeps the selected Codex target present/ready through commit;
-            // rechecking both the user-pick flag and current under the current
+            // rechecking both the user-pick flag and current under the selection
             // lock prevents a concurrent `/model` choice from being overwritten.
+            let _selection_commit = self.inner.selection_commit.write();
             let mut current = self.inner.current_model_id.write();
             if !self
                 .inner
@@ -902,7 +911,7 @@ impl ModelsManager {
         campaign_model_id: Option<&str>,
     ) -> SessionModelAuthoritySnapshot {
         #[cfg(test)]
-        return self.session_model_authority_inner(campaign_model_id, || {});
+        return self.session_model_authority_inner(campaign_model_id, || {}, || {});
         #[cfg(not(test))]
         self.session_model_authority_inner(campaign_model_id)
     }
@@ -910,6 +919,7 @@ impl ModelsManager {
     fn session_model_authority_inner(
         &self,
         campaign_model_id: Option<&str>,
+        #[cfg(test)] mut before_selection_snapshot: impl FnMut(),
         #[cfg(test)] mut before_commit: impl FnMut(),
     ) -> SessionModelAuthoritySnapshot {
         let mut retries = 0usize;
@@ -936,6 +946,9 @@ impl ModelsManager {
                 })
             });
 
+            #[cfg(test)]
+            before_selection_snapshot();
+            let selection_commit = self.inner.selection_commit.read();
             let current = self.inner.current_model_id.read().clone();
             let user_selected = self.inner.user_selected_model.load(Ordering::Relaxed);
             let current_key = resolve_catalog_key(models, &current);
@@ -963,6 +976,7 @@ impl ModelsManager {
                 acp::ModelId::new(key)
             };
             let owned_catalog = models.clone();
+            drop(selection_commit);
             #[cfg(test)]
             before_commit();
             if self
@@ -993,12 +1007,33 @@ impl ModelsManager {
         before_decision: impl FnOnce(),
     ) -> bool {
         let mut before_decision = Some(before_decision);
-        self.session_model_authority_inner(Some(model_id), || {
-            if let Some(before_decision) = before_decision.take() {
-                before_decision();
-            }
-        })
+        self.session_model_authority_inner(
+            Some(model_id),
+            || {},
+            || {
+                if let Some(before_decision) = before_decision.take() {
+                    before_decision();
+                }
+            },
+        )
         .campaign_eligible
+    }
+
+    #[cfg(test)]
+    fn session_model_authority_with_before_selection_snapshot(
+        &self,
+        before_selection_snapshot: impl FnOnce(),
+    ) -> SessionModelAuthoritySnapshot {
+        let mut before_selection_snapshot = Some(before_selection_snapshot);
+        self.session_model_authority_inner(
+            None,
+            || {
+                if let Some(before_selection_snapshot) = before_selection_snapshot.take() {
+                    before_selection_snapshot();
+                }
+            },
+            || {},
+        )
     }
 
     /// ACP-visible (non-hidden) projection of the catalog.
@@ -1077,13 +1112,23 @@ impl ModelsManager {
     }
 
     pub(crate) fn set_current_model_id(&self, id: acp::ModelId) {
+        #[cfg(test)]
+        self.set_current_model_id_inner(id, || {});
+        #[cfg(not(test))]
+        self.set_current_model_id_inner(id);
+    }
+
+    fn set_current_model_id_inner(
+        &self,
+        id: acp::ModelId,
+        #[cfg(test)] before_id_publish: impl FnOnce(),
+    ) {
+        let _selection_commit = self.inner.selection_commit.write();
         self.inner
             .user_selected_model
             .store(true, Ordering::Relaxed);
-        self.set_current_model_id_internal(id);
-    }
-
-    fn set_current_model_id_internal(&self, id: acp::ModelId) {
+        #[cfg(test)]
+        before_id_publish();
         let changed = {
             let mut cur = self.inner.current_model_id.write();
             let changed = *cur != id;
@@ -1095,6 +1140,15 @@ impl ModelsManager {
                 .model_switch_watch
                 .send_modify(|generation| *generation += 1);
         }
+    }
+
+    #[cfg(test)]
+    fn set_current_model_id_with_before_id_publish(
+        &self,
+        id: acp::ModelId,
+        before_id_publish: impl FnOnce(),
+    ) {
+        self.set_current_model_id_inner(id, before_id_publish);
     }
 
     /// Per-model Layer-3 LazinessDetector config for `model_id` (disabled default when absent).
@@ -1995,6 +2049,7 @@ impl ModelsManager {
             let usable_xai = Self::usable_ambient_xai_from_snapshot(config, auth);
             let cat = self.inner.catalog.read();
             let models = &cat.models;
+            let _selection_commit = self.inner.selection_commit.write();
             let mut current = self.inner.current_model_id.write();
             let old = current.clone();
             let needs_reselection = match models.get(old.0.as_ref()) {
@@ -2154,6 +2209,7 @@ impl ModelsManager {
             #[cfg(test)]
             before_commit();
             let new_id = acp::ModelId::new(Arc::from(key));
+            let _selection_commit = self.inner.selection_commit.write();
             let mut current = self.inner.current_model_id.write();
             if !self
                 .inner
@@ -2245,6 +2301,99 @@ pub use fetch::{
     start_early_prefetch_settings_only, start_early_prefetch_with_auth,
 };
 pub(crate) use resolution::*;
+
+#[cfg(test)]
+mod selection_atomicity_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn ready_xai_entry(slug: &str) -> ModelEntry {
+        let mut info = config::ModelInfo::fallback(slug);
+        info.base_url = "https://api.x.ai/v1".to_string();
+        ModelEntry {
+            info,
+            api_key: None,
+            env_key: None,
+            auth_provider: None,
+            api_base_url: None,
+            config_validation_errors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn session_authority_never_observes_mixed_explicit_selection() {
+        let tmp = tempfile::tempdir().expect("temp model-selection home");
+        let mut catalog = IndexMap::new();
+        catalog.insert("grok-old".to_string(), ready_xai_entry("grok-old"));
+        catalog.insert("grok-new".to_string(), ready_xai_entry("grok-new"));
+        let manager = ModelsManager::new(
+            None,
+            catalog,
+            acp::ModelId::new("grok-old"),
+            Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default())),
+            config::Config::default(),
+        );
+
+        let (selection_midpoint_tx, selection_midpoint_rx) = mpsc::channel();
+        let (release_selection_tx, release_selection_rx) = mpsc::channel();
+        let writer = {
+            let manager = manager.clone();
+            std::thread::spawn(move || {
+                manager.set_current_model_id_with_before_id_publish(
+                    acp::ModelId::new("grok-new"),
+                    || {
+                        selection_midpoint_tx
+                            .send(())
+                            .expect("announce explicit-selection midpoint");
+                        release_selection_rx
+                            .recv()
+                            .expect("release explicit-selection publication");
+                    },
+                );
+            })
+        };
+        selection_midpoint_rx
+            .recv()
+            .expect("writer must reach the flag/id midpoint");
+
+        let (snapshot_started_tx, snapshot_started_rx) = mpsc::channel();
+        let (snapshot_done_tx, snapshot_done_rx) = mpsc::channel();
+        let reader = {
+            let manager = manager.clone();
+            std::thread::spawn(move || {
+                let snapshot =
+                    manager.session_model_authority_with_before_selection_snapshot(|| {
+                        snapshot_started_tx
+                            .send(())
+                            .expect("announce authority snapshot attempt");
+                    });
+                snapshot_done_tx
+                    .send(snapshot.fallback_model_id)
+                    .expect("publish authority result");
+            })
+        };
+        snapshot_started_rx
+            .recv()
+            .expect("reader must attempt the authority snapshot at the midpoint");
+        assert!(
+            snapshot_done_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "authority snapshot must wait for the explicit id and flag to publish together"
+        );
+
+        release_selection_tx
+            .send(())
+            .expect("release explicit selection");
+        writer.join().expect("selection writer must finish");
+        let fallback = snapshot_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("authority snapshot must finish after selection publication");
+        reader.join().expect("authority reader must finish");
+        assert_eq!(fallback.0.as_ref(), "grok-new");
+    }
+}
 
 #[cfg(test)]
 mod tests;
