@@ -112,7 +112,7 @@ fn session_has_complete_refresh_surface(
                     .as_deref()
                     .is_some_and(|s| !s.trim().is_empty())
         }
-        AuthMode::External => auth_provider_command.is_some_and(|cmd| !cmd.trim().is_empty()),
+        AuthMode::External => super::has_nonblank_auth_provider_command(auth_provider_command),
         // WebLogin has no silent refresh authority for ambient classification.
         AuthMode::WebLogin | AuthMode::ApiKey | AuthMode::OpenAiCodex => false,
     }
@@ -2595,8 +2595,9 @@ impl AuthManager {
     }
 
     fn is_external_provider_refresh_authority(&self) -> bool {
-        self.grok_com_config.auth_provider_command.is_some()
-            && self.token_type() == TokenType::ExternalBinary
+        super::has_nonblank_auth_provider_command(
+            self.grok_com_config.auth_provider_command.as_deref(),
+        ) && self.token_type() == TokenType::ExternalBinary
     }
 
     /// `true` iff a [`TokenRefresher`] is wired in. `false` for static-key

@@ -4221,7 +4221,6 @@ fn refreshable_expired_external_session_keeps_first_party_when_codex_ready() {
 /// entry is a **canonical** account route; hand-stitched
 /// `AuthProviderRef::openai_codex` on prefetched entries is fail-closed by
 /// `resolve_model_list` outside that profile.
-///
 #[test]
 fn codex_only_from_config_seats_codex_and_sampling_stack() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK

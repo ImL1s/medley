@@ -191,7 +191,8 @@ pub(crate) enum AmbientXaiEligibility {
     StaticKey,
     /// Hard-valid first-party session (incl. soft early-invalidation buffer).
     WireUsableSession,
-    /// Hard-expired first-party session with complete OIDC refresh surface.
+    /// Hard-expired first-party session with complete OIDC or external-command
+    /// refresh authority.
     RefreshableSession,
 }
 

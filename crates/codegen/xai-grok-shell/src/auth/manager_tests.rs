@@ -325,6 +325,22 @@ fn first_party_session_eligibility_refreshable_vs_malformed() {
         FirstPartySessionEligibility::None
     );
 
+    // Whitespace is not an executable provider command and therefore cannot
+    // make the same expired External credential self-healing.
+    let blank_command_dir = tempfile::tempdir().unwrap();
+    let blank_command_mgr = Arc::new(AuthManager::new(
+        blank_command_dir.path(),
+        GrokComConfig {
+            auth_provider_command: Some(" \t\n".to_owned()),
+            ..GrokComConfig::default()
+        },
+    ));
+    blank_command_mgr.hot_swap(external.clone());
+    assert_eq!(
+        blank_command_mgr.first_party_session_eligibility(),
+        FirstPartySessionEligibility::None
+    );
+
     // Third-party External credentials remain excluded even when a command is
     // configured: is_session_auth() fail-closes before refresh classification.
     external.oidc_issuer = Some("https://idp.acme.example".to_owned());
