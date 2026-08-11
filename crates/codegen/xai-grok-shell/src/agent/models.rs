@@ -937,6 +937,7 @@ impl ModelsManager {
             });
 
             let current = self.inner.current_model_id.read().clone();
+            let user_selected = self.inner.user_selected_model.load(Ordering::Relaxed);
             let current_key = resolve_catalog_key(models, &current);
             let current_is_usable = current_key
                 .as_ref()
@@ -944,7 +945,8 @@ impl ModelsManager {
                 .is_some_and(|entry| {
                     entry.info.user_selectable
                         && entry.info.visible_for_auth(auth.is_session_auth)
-                        && (usable_xai
+                        && (user_selected
+                            || usable_xai
                             || !resolution::is_first_party_ambient_xai_entry(entry)
                             || !ready_codex_exists)
                 });

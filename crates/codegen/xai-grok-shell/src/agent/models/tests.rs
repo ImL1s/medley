@@ -3717,6 +3717,15 @@ fn new_session_campaign_rejects_only_stranded_ambient_grok() {
     .build();
 
     manager.apply_first_party_env_api_key_probe_result(false);
+    assert_eq!(
+        manager
+            .session_model_authority(Some("grok-4.5"))
+            .fallback_model_id
+            .0
+            .as_ref(),
+        codex_key,
+        "an implicit stranded Grok current model must resolve a Codex session fallback"
+    );
     assert!(
         !manager.campaign_default_is_eligible("grok-4.5"),
         "a campaign must not revive ambient Grok after its only env key failed"
@@ -3732,6 +3741,17 @@ fn new_session_campaign_rejects_only_stranded_ambient_grok() {
     assert!(
         manager.campaign_default_is_eligible("missing-campaign-model"),
         "unknown campaign ids retain the existing resolution fallback"
+    );
+
+    manager.set_current_model_id(acp::ModelId::new("grok-4.5"));
+    assert_eq!(
+        manager
+            .session_model_authority(None)
+            .fallback_model_id
+            .0
+            .as_ref(),
+        "grok-4.5",
+        "an explicit /model choice remains authoritative even when its ambient credential is unready"
     );
 }
 
