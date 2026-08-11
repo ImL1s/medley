@@ -5089,6 +5089,8 @@ fn new_session_profile_pin_reports_the_committed_resident_model() {
 #[test]
 #[serial_test::serial]
 fn production_spawn_latches_post_seal_unready_prepared_identity() {
+    use acp::Agent as _;
+
     run_local_for_bridge_test(|| async {
         use crate::agent::config::{Config as AgentConfig, ConfigModelOverride, EnvKeys};
         use crate::auth::{AuthManager, GrokComConfig};
