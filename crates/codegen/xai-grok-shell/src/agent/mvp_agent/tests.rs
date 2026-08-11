@@ -4995,6 +4995,7 @@ async fn prepared_new_session_plan_survives_same_key_catalog_swap() {
 #[test]
 fn new_session_profile_pin_reports_the_committed_resident_model() {
     run_local_for_bridge_test(|| async {
+        use acp::Agent as _;
         use crate::agent::config::{Config as AgentConfig, ConfigModelOverride};
         use crate::auth::{AuthManager, GrokComConfig};
 
@@ -5040,6 +5041,12 @@ fn new_session_profile_pin_reports_the_committed_resident_model() {
                 ),
             )
             .expect("initialize once");
+        agent
+            .authenticate(acp::AuthenticateRequest::new(acp::AuthMethodId::new(
+                crate::agent::auth_method::LOCAL_NONE_METHOD_ID,
+            )))
+            .await
+            .expect("authenticate local fixture");
         let cwd = tempfile::tempdir().expect("session cwd");
         let response = agent
             .new_session_inner(
