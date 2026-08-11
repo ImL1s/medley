@@ -2800,6 +2800,94 @@ fn resolve_catalog_key_none_when_slug_is_ambiguous() {
 }
 
 #[test]
+fn model_dispatch_authority_reports_matching_catalog_ids_for_ambiguous_route() {
+    let mut models = IndexMap::new();
+    models.insert("local-fast".to_string(), ready_entry("qwen"));
+    models.insert("remote-accurate".to_string(), ready_entry("qwen"));
+    let mut hidden = ready_entry("qwen");
+    hidden.info.hidden = true;
+    models.insert("hidden-internal".to_string(), hidden);
+    let manager = manager_over(&config::Config::default(), models);
+
+    let error = manager
+        .model_dispatch_authority(&acp::ModelId::new("qwen"))
+        .err()
+        .expect("an ambiguous routing slug must require a catalog id");
+
+    assert_eq!(
+        error,
+        "ambiguous model routing slug 'qwen'; matching available catalog ids: local-fast, remote-accurate. Use an explicit catalog id."
+    );
+    assert!(!error.contains("hidden-internal"));
+}
+
+#[test]
+fn model_dispatch_authority_does_not_disclose_ambiguous_hidden_catalog_ids() {
+    let mut first = ready_entry("qwen");
+    first.info.hidden = true;
+    let mut second = ready_entry("qwen");
+    second.info.hidden = true;
+    let manager = manager_over(
+        &config::Config::default(),
+        IndexMap::from([
+            ("hidden-internal".to_string(), first),
+            ("filtered-alias".to_string(), second),
+        ]),
+    );
+
+    let error = manager
+        .model_dispatch_authority(&acp::ModelId::new("qwen"))
+        .err()
+        .expect("full-catalog ambiguity must remain fail closed");
+
+    assert_eq!(
+        error,
+        "ambiguous model routing slug 'qwen'. Use an explicit catalog id."
+    );
+    assert!(!error.contains("hidden-internal"));
+    assert!(!error.contains("filtered-alias"));
+}
+
+#[test]
+fn ambiguous_dispatch_diagnostic_retries_after_auth_generation_changes() {
+    let tmp = tempfile::tempdir().expect("ambiguous dispatch auth race home");
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    auth_manager.hot_swap(GrokAuth::test_default());
+
+    let public = ready_entry("qwen");
+    let mut session_only = ready_entry("qwen");
+    session_only.info.supported_in_api = false;
+    let manager = ModelsManagerBuilder::new(
+        None,
+        IndexMap::from([
+            ("public-alias".to_string(), public),
+            ("session-only-alias".to_string(), session_only),
+        ]),
+        acp::ModelId::new("public-alias"),
+        auth_manager.clone(),
+        config::Config::default(),
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+
+    let error = manager
+        .model_dispatch_authority_with_before_publication(&acp::ModelId::new("qwen"), || {
+            auth_manager.clear_in_memory();
+        })
+        .err()
+        .expect("full-catalog ambiguity must remain fail closed after auth changes");
+
+    assert_eq!(
+        error,
+        "ambiguous model routing slug 'qwen'; matching available catalog ids: public-alias. Use an explicit catalog id."
+    );
+    assert!(
+        !error.contains("session-only-alias"),
+        "a diagnostic computed from stale session auth must not be published"
+    );
+}
+
+#[test]
 fn selectable_catalog_key_for_persisted_none_when_resolved_not_available() {
     let mut models = IndexMap::new();
     models.insert(

@@ -447,45 +447,90 @@ impl ModelsManager {
         &self,
         requested_model_id: &acp::ModelId,
     ) -> Result<ModelDispatchAuthoritySnapshot, String> {
+        #[cfg(test)]
+        return self.model_dispatch_authority_inner(requested_model_id, || {});
+        #[cfg(not(test))]
+        self.model_dispatch_authority_inner(requested_model_id)
+    }
+
+    fn model_dispatch_authority_inner(
+        &self,
+        requested_model_id: &acp::ModelId,
+        #[cfg(test)] mut before_publication: impl FnMut(),
+    ) -> Result<ModelDispatchAuthoritySnapshot, String> {
         let mut retries = 0usize;
         loop {
             let auth = self.inner.auth_manager.selection_snapshot();
             let catalog = self.inner.catalog.read();
             let catalog_generation = self.catalog_generation();
-            let Some(catalog_identity) =
+            let outcome = if let Some(catalog_identity) =
                 resolve_catalog_identity(&catalog.models, requested_model_id)
-            else {
-                return Err("unknown model id".to_owned());
+            {
+                let model = catalog
+                    .models
+                    .get(catalog_identity.model_id.as_str())
+                    .cloned()
+                    .expect("resolved catalog identity has a catalog entry");
+                let authorized = model.info().user_selectable
+                    && model.info().visible_for_auth(auth.is_session_auth);
+                let (ready, reason) = config::model_readiness(&model);
+                if !authorized {
+                    Err(
+                        "This model is not available for the current authentication mode or allowed_models setting."
+                            .to_owned(),
+                    )
+                } else if !ready {
+                    Err(reason.unwrap_or_else(|| "model is not ready".to_owned()))
+                } else {
+                    Ok(ModelDispatchAuthoritySnapshot {
+                        auth_generation: auth.generation,
+                        is_session_auth: auth.is_session_auth,
+                        catalog_generation,
+                        catalog_identity,
+                        model,
+                    })
+                }
+            } else {
+                let matching_entries = catalog
+                    .models
+                    .iter()
+                    .filter(|(_, entry)| entry.info().model == requested_model_id.0.as_ref())
+                    .collect::<Vec<_>>();
+                if matching_entries.len() > 1 {
+                    let mut visible_catalog_ids = matching_entries
+                        .iter()
+                        .filter(|(_, entry)| {
+                            entry.info().user_selectable
+                                && entry.info().visible_for_auth(auth.is_session_auth)
+                        })
+                        .map(|(catalog_id, _)| catalog_id.as_str())
+                        .collect::<Vec<_>>();
+                    visible_catalog_ids.sort_unstable();
+                    if visible_catalog_ids.is_empty() {
+                        Err(format!(
+                            "ambiguous model routing slug '{}'. Use an explicit catalog id.",
+                            requested_model_id.0
+                        ))
+                    } else {
+                        Err(format!(
+                            "ambiguous model routing slug '{}'; matching available catalog ids: {}. Use an explicit catalog id.",
+                            requested_model_id.0,
+                            visible_catalog_ids.join(", ")
+                        ))
+                    }
+                } else {
+                    Err("unknown model id".to_owned())
+                }
             };
-            let model = catalog
-                .models
-                .get(catalog_identity.model_id.as_str())
-                .cloned()
-                .expect("resolved catalog identity has a catalog entry");
-            let authorized =
-                model.info().user_selectable && model.info().visible_for_auth(auth.is_session_auth);
-            let (ready, reason) = config::model_readiness(&model);
+
+            #[cfg(test)]
+            before_publication();
             if self
                 .inner
                 .auth_manager
                 .selection_generation_is_current(auth.generation)
             {
-                if !authorized {
-                    return Err(
-                        "This model is not available for the current authentication mode or allowed_models setting."
-                            .to_owned(),
-                    );
-                }
-                if !ready {
-                    return Err(reason.unwrap_or_else(|| "model is not ready".to_owned()));
-                }
-                return Ok(ModelDispatchAuthoritySnapshot {
-                    auth_generation: auth.generation,
-                    is_session_auth: auth.is_session_auth,
-                    catalog_generation,
-                    catalog_identity,
-                    model,
-                });
+                return outcome;
             }
             drop(catalog);
             retries += 1;
@@ -493,6 +538,20 @@ impl ModelsManager {
                 std::thread::yield_now();
             }
         }
+    }
+
+    #[cfg(test)]
+    fn model_dispatch_authority_with_before_publication(
+        &self,
+        requested_model_id: &acp::ModelId,
+        before_publication: impl FnOnce(),
+    ) -> Result<ModelDispatchAuthoritySnapshot, String> {
+        let mut before_publication = Some(before_publication);
+        self.model_dispatch_authority_inner(requested_model_id, || {
+            if let Some(before_publication) = before_publication.take() {
+                before_publication();
+            }
+        })
     }
 
     /// Hold the catalog read guard, then seal the captured auth generation,
