@@ -257,6 +257,61 @@ async fn auth_refresh_watcher_refetches_on_notify() {
     assert!(calls.load(Ordering::SeqCst) >= 1);
 }
 
+#[tokio::test]
+async fn auth_refresh_watcher_consumes_preconstruction_notify_waiters_event() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct PrearmedEndpoint {
+        calls: Arc<AtomicUsize>,
+    }
+    impl ModelsEndpoint for PrearmedEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Some(make_prefetched(&["grok-prearmed"])) })
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tmp = tempfile::tempdir().expect("temp auth-refresh home");
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let notify = auth_manager.refresh_notifier();
+    let first = notify.clone().notified_owned();
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        IndexMap::new(),
+        acp::ModelId::new("default"),
+        auth_manager,
+        config::Config::default(),
+    )
+    .endpoint(Arc::new(PrearmedEndpoint {
+        calls: calls.clone(),
+    }))
+    .build();
+
+    // `notify_waiters` does not store a permit. This deliberately fires after
+    // the waiter is armed but before the watcher task exists, matching the
+    // bootstrap construction-to-registration gap.
+    notify.notify_waiters();
+    mgr.start_auth_refresh_watcher_with_first(notify, first);
+
+    for _ in 0..200 {
+        if mgr.models().contains_key("grok-prearmed") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        mgr.models().contains_key("grok-prearmed"),
+        "the prearmed waiter must retain a notify_waiters event across watcher startup"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test(start_paused = true)]
 async fn hanging_fetch_does_not_block_refresh() {
     struct HangingEndpoint;
@@ -4685,6 +4740,79 @@ fn refreshable_expired_external_session_keeps_first_party_when_codex_ready() {
 /// entry is a **canonical** account route; hand-stitched
 /// `AuthProviderRef::openai_codex` on prefetched entries is fail-closed by
 /// `resolve_model_list` outside that profile.
+#[test]
+#[serial_test::serial]
+fn from_config_retries_auth_generation_before_initial_model_commit() {
+    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    use crate::auth::{AuthMode, XAI_OAUTH2_ISSUER};
+    use xai_grok_test_support::EnvGuard;
+    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+    let tmp = tempfile::tempdir().expect("temp home");
+    let (_codex_fixture, _auth_path_pin) = ready_codex_entry(tmp.path());
+    let codex_key = crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID;
+    let prefetched = IndexMap::from([("grok-4.5".to_string(), ready_entry("grok-4.5"))]);
+    let cfg = config::Config::new_from_toml_cfg(&toml::Value::Table(toml::map::Map::new()))
+        .expect("production config presets");
+    let live_xai = || GrokAuth {
+        key: "live-xai-access".into(),
+        auth_mode: AuthMode::Oidc,
+        expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        refresh_token: Some("live-xai-refresh".into()),
+        oidc_issuer: Some(XAI_OAUTH2_ISSUER.to_owned()),
+        oidc_client_id: Some("client".into()),
+        user_id: "u".into(),
+        ..GrokAuth::test_default()
+    };
+
+    let clearing_home = tmp.path().join("xai-cleared-during-construction");
+    std::fs::create_dir_all(&clearing_home).unwrap();
+    let clearing_auth = {
+        let _clear_path = EnvGuard::unset("GROK_AUTH_PATH");
+        Arc::new(AuthManager::new(&clearing_home, GrokComConfig::default()))
+    };
+    clearing_auth.hot_swap(live_xai());
+    let cleared = ModelsManager::from_config_with_remote_fetch_and_before_commit(
+        &cfg,
+        Some(prefetched.clone()),
+        clearing_auth.clone(),
+        false,
+        || clearing_auth.clear_in_memory(),
+    )
+    .expect("auth-stable construction after clear");
+    assert_eq!(
+        cleared.current_model_id().0.as_ref(),
+        codex_key,
+        "a stale usable-xAI snapshot must retry to ready Codex after auth clears"
+    );
+    assert!(cleared.substituted_preference().is_none());
+
+    let restoring_home = tmp.path().join("xai-restored-during-construction");
+    std::fs::create_dir_all(&restoring_home).unwrap();
+    let restoring_auth = {
+        let _clear_path = EnvGuard::unset("GROK_AUTH_PATH");
+        Arc::new(AuthManager::new(&restoring_home, GrokComConfig::default()))
+    };
+    let restored = ModelsManager::from_config_with_remote_fetch_and_before_commit(
+        &cfg,
+        Some(prefetched),
+        restoring_auth.clone(),
+        false,
+        || restoring_auth.hot_swap(live_xai()),
+    )
+    .expect("auth-stable construction after session adoption");
+    assert_eq!(
+        restored.current_model_id().0.as_ref(),
+        "grok-4.5",
+        "a newly usable first-party session must invalidate the stale Codex resolution"
+    );
+    assert!(restored.substituted_preference().is_none());
+}
+
 #[test]
 #[serial_test::serial]
 fn codex_only_from_config_seats_codex_and_sampling_stack() {

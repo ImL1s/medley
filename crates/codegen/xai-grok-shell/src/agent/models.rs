@@ -132,6 +132,18 @@ pub(crate) struct ResolvedModelCapabilities {
     pub codex_wire: Option<xai_grok_sampling_types::CodexWireCapabilities>,
 }
 
+/// One auth-stable model/catalog authority snapshot for a new-session plan.
+///
+/// The caller builds its complete synchronous plan from this owned catalog,
+/// then seals `auth_generation` before publishing the plan. A failed seal
+/// means auth changed and the whole plan must be retried.
+pub(crate) struct SessionModelAuthoritySnapshot {
+    pub(crate) auth_generation: u64,
+    pub(crate) catalog: IndexMap<String, ModelEntry>,
+    pub(crate) fallback_model_id: acp::ModelId,
+    pub(crate) campaign_eligible: bool,
+}
+
 /// Catalog fields written together under one lock, so readers never see a torn mix.
 #[derive(Default)]
 struct CatalogState {
@@ -414,68 +426,154 @@ impl ModelsManager {
         auth_manager: Arc<AuthManager>,
         remote_fetch_enabled: bool,
     ) -> Result<Self, String> {
-        let auth = auth_manager.selection_snapshot();
-        let fetch_auth = ModelFetchAuth::resolve(&cfg.endpoints, auth.has_auth);
-        crate::remote::validate_models_catalog_auth(
-            &cfg.endpoints,
-            fetch_auth,
-            remote_fetch_enabled,
-        )?;
-        let prefetched_models = prefetched_models.or_else(|| {
-            let cache = ModelsCacheManager::new();
-            cache
-                .load_fresh(
-                    &fetch_auth.cache_auth_method(),
-                    &crate::remote::models_list_url(&cfg.endpoints, fetch_auth),
-                )
-                .map(|c| c.models)
-        });
-        let has_prefetched = prefetched_models.is_some();
-        let catalog = resolve_model_catalog(cfg, prefetched_models.clone());
-
-        if has_prefetched {
-            validate_selectable(cfg, &catalog)?;
-        }
-
-        let usable_xai = Self::usable_ambient_xai_from_snapshot(cfg, auth);
-        let (current_model_key, current_model, model_source, unready_default_reason) =
-            resolve_default_model_for_catalog_with_usable_xai(
-                cfg,
-                &catalog,
-                auth.is_session_auth,
-                has_prefetched,
-                usable_xai,
-            );
-
-        if let Some(reason) = &unready_default_reason {
-            tracing::error!(
-                model_id = %current_model.model,
-                source = %model_source,
-                %reason,
-                "default model resolved to an unusable catalog entry"
-            );
-        } else {
-            tracing::info!(
-                model_id = %current_model.model,
-                source = %model_source,
-                "default model resolved"
-            );
-        }
-
-        let current_model_id = acp::ModelId::new(Arc::from(current_model_key));
-
-        let mgr = Self::new(
+        #[cfg(test)]
+        return Self::from_config_with_remote_fetch_inner(
+            cfg,
             prefetched_models,
-            catalog,
-            current_model_id,
             auth_manager,
-            cfg.clone(),
+            remote_fetch_enabled,
+            || {},
         );
-        mgr.record_substituted_preference(cfg, model_source);
-        if has_prefetched {
-            mgr.inner.catalog.write().has_fetched_real_catalog = true;
+        #[cfg(not(test))]
+        Self::from_config_with_remote_fetch_inner(
+            cfg,
+            prefetched_models,
+            auth_manager,
+            remote_fetch_enabled,
+        )
+    }
+
+    fn from_config_with_remote_fetch_inner(
+        cfg: &config::Config,
+        prefetched_models: Option<IndexMap<String, ModelEntry>>,
+        auth_manager: Arc<AuthManager>,
+        remote_fetch_enabled: bool,
+        #[cfg(test)] mut before_commit: impl FnMut(),
+    ) -> Result<Self, String> {
+        let mut retries = 0usize;
+        loop {
+            let auth = auth_manager.selection_snapshot();
+            let fetch_auth = ModelFetchAuth::resolve(&cfg.endpoints, auth.has_auth);
+            if let Err(error) = crate::remote::validate_models_catalog_auth(
+                &cfg.endpoints,
+                fetch_auth,
+                remote_fetch_enabled,
+            ) {
+                if auth_manager.selection_generation_is_current(auth.generation) {
+                    return Err(error);
+                }
+                retries += 1;
+                if retries >= IMPLICIT_SELECTION_RETRY_YIELD_AFTER {
+                    std::thread::yield_now();
+                }
+                continue;
+            }
+            let resolved_prefetched = prefetched_models.clone().or_else(|| {
+                let cache = ModelsCacheManager::new();
+                cache
+                    .load_fresh(
+                        &fetch_auth.cache_auth_method(),
+                        &crate::remote::models_list_url(&cfg.endpoints, fetch_auth),
+                    )
+                    .map(|c| c.models)
+            });
+            let has_prefetched = resolved_prefetched.is_some();
+            let catalog = resolve_model_catalog(cfg, resolved_prefetched.clone());
+
+            if has_prefetched && let Err(error) = validate_selectable(cfg, &catalog) {
+                if auth_manager.selection_generation_is_current(auth.generation) {
+                    return Err(error);
+                }
+                retries += 1;
+                if retries >= IMPLICIT_SELECTION_RETRY_YIELD_AFTER {
+                    std::thread::yield_now();
+                }
+                continue;
+            }
+
+            let usable_xai = Self::usable_ambient_xai_from_snapshot(cfg, auth);
+            let (current_model_key, current_model, model_source, unready_default_reason) =
+                resolve_default_model_for_catalog_with_usable_xai(
+                    cfg,
+                    &catalog,
+                    auth.is_session_auth,
+                    has_prefetched,
+                    usable_xai,
+                );
+
+            #[cfg(test)]
+            before_commit();
+            if !auth_manager.selection_generation_is_current(auth.generation) {
+                retries += 1;
+                if retries >= IMPLICIT_SELECTION_RETRY_YIELD_AFTER {
+                    std::thread::yield_now();
+                }
+                continue;
+            }
+
+            let current_model_id = acp::ModelId::new(Arc::from(current_model_key));
+            let mgr = Self::new(
+                resolved_prefetched,
+                catalog,
+                current_model_id,
+                auth_manager.clone(),
+                cfg.clone(),
+            );
+            // `ModelsManagerBuilder` serves tests that supply an already chosen
+            // model and takes its own auth snapshot. Startup selection must
+            // instead keep fetch authority and the chosen default on this one
+            // generation.
+            *mgr.inner.fetch_auth.write() = fetch_auth;
+            if !auth_manager.selection_generation_is_current(auth.generation) {
+                retries += 1;
+                if retries >= IMPLICIT_SELECTION_RETRY_YIELD_AFTER {
+                    std::thread::yield_now();
+                }
+                continue;
+            }
+
+            mgr.record_substituted_preference(cfg, model_source);
+            if has_prefetched {
+                mgr.inner.catalog.write().has_fetched_real_catalog = true;
+            }
+            if let Some(reason) = &unready_default_reason {
+                tracing::error!(
+                    model_id = %current_model.model,
+                    source = %model_source,
+                    %reason,
+                    "default model resolved to an unusable catalog entry"
+                );
+            } else {
+                tracing::info!(
+                    model_id = %current_model.model,
+                    source = %model_source,
+                    "default model resolved"
+                );
+            }
+            return Ok(mgr);
         }
-        Ok(mgr)
+    }
+
+    #[cfg(test)]
+    fn from_config_with_remote_fetch_and_before_commit(
+        cfg: &config::Config,
+        prefetched_models: Option<IndexMap<String, ModelEntry>>,
+        auth_manager: Arc<AuthManager>,
+        remote_fetch_enabled: bool,
+        before_commit: impl FnOnce(),
+    ) -> Result<Self, String> {
+        let mut before_commit = Some(before_commit);
+        Self::from_config_with_remote_fetch_inner(
+            cfg,
+            prefetched_models,
+            auth_manager,
+            remote_fetch_enabled,
+            || {
+                if let Some(before_commit) = before_commit.take() {
+                    before_commit();
+                }
+            },
+        )
     }
 
     pub(crate) fn set_gateway(&self, gateway: xai_acp_lib::AcpAgentGatewaySender) {
@@ -792,50 +890,90 @@ impl ModelsManager {
     /// official Codex account route. All other campaign targets and usable xAI
     /// routes retain their existing behavior.
     pub(crate) fn campaign_default_is_eligible(&self, model_id: &str) -> bool {
-        #[cfg(test)]
-        return self.campaign_default_is_eligible_inner(model_id, || {});
-        #[cfg(not(test))]
-        self.campaign_default_is_eligible_inner(model_id)
+        self.session_model_authority(Some(model_id))
+            .campaign_eligible
     }
 
-    fn campaign_default_is_eligible_inner(
+    /// Capture the catalog, auth-correct fallback, and campaign verdict from
+    /// one stable auth generation. The returned data remains provisional
+    /// until its generation is sealed at the session plan commit boundary.
+    pub(crate) fn session_model_authority(
         &self,
-        model_id: &str,
-        #[cfg(test)] mut before_decision: impl FnMut(),
-    ) -> bool {
+        campaign_model_id: Option<&str>,
+    ) -> SessionModelAuthoritySnapshot {
+        #[cfg(test)]
+        return self.session_model_authority_inner(campaign_model_id, || {});
+        #[cfg(not(test))]
+        self.session_model_authority_inner(campaign_model_id)
+    }
+
+    fn session_model_authority_inner(
+        &self,
+        campaign_model_id: Option<&str>,
+        #[cfg(test)] mut before_commit: impl FnMut(),
+    ) -> SessionModelAuthoritySnapshot {
         let mut retries = 0usize;
         loop {
             let auth = self.inner.auth_manager.selection_snapshot();
-            // Match the config -> catalog order used by the #303 repair paths
-            // so a concurrent config reload cannot mix its policy with an
-            // older catalog snapshot. Auth is validated separately through
-            // its even generation at the decision boundary.
+            // Match the config -> catalog -> current order used by the #303
+            // repair paths. Auth is validated independently through its even
+            // generation at the decision boundary.
             let cfg = self.inner.cfg.read();
             let usable_xai = Self::usable_ambient_xai_from_snapshot(&cfg, auth);
             let catalog = self.inner.catalog.read();
             let models = &catalog.models;
-            #[cfg(test)]
-            before_decision();
-            let eligible =
+            let ready_codex_exists = models.values().any(|candidate| {
+                resolution::is_ready_selectable_openai_codex_entry(candidate, auth.is_session_auth)
+            });
+            let campaign_eligible = campaign_model_id.is_none_or(|model_id| {
                 resolve_catalog_key(models, &acp::ModelId::new(model_id)).is_none_or(|key| {
                     let entry = models
                         .get(key.0.as_ref())
                         .expect("resolve_catalog_key returns a present key");
                     usable_xai
                         || !resolution::is_first_party_ambient_xai_entry(entry)
-                        || !models.values().any(|candidate| {
-                            resolution::is_ready_selectable_openai_codex_entry(
-                                candidate,
-                                auth.is_session_auth,
-                            )
-                        })
+                        || !ready_codex_exists
+                })
+            });
+
+            let current = self.inner.current_model_id.read().clone();
+            let current_key = resolve_catalog_key(models, &current);
+            let current_is_usable = current_key
+                .as_ref()
+                .and_then(|key| models.get(key.0.as_ref()))
+                .is_some_and(|entry| {
+                    entry.info.user_selectable
+                        && entry.info.visible_for_auth(auth.is_session_auth)
+                        && (usable_xai
+                            || !resolution::is_first_party_ambient_xai_entry(entry)
+                            || !ready_codex_exists)
                 });
+            let fallback_model_id = if current_is_usable {
+                current_key.expect("usable current model has a resolved catalog key")
+            } else {
+                let (key, _, _, _) = resolve_default_model_for_catalog_with_usable_xai(
+                    &cfg,
+                    models,
+                    auth.is_session_auth,
+                    catalog.has_fetched_real_catalog,
+                    usable_xai,
+                );
+                acp::ModelId::new(key)
+            };
+            let owned_catalog = models.clone();
+            #[cfg(test)]
+            before_commit();
             if self
                 .inner
                 .auth_manager
                 .selection_generation_is_current(auth.generation)
             {
-                return eligible;
+                return SessionModelAuthoritySnapshot {
+                    auth_generation: auth.generation,
+                    catalog: owned_catalog,
+                    fallback_model_id,
+                    campaign_eligible,
+                };
             }
             drop(catalog);
             drop(cfg);
@@ -853,11 +991,12 @@ impl ModelsManager {
         before_decision: impl FnOnce(),
     ) -> bool {
         let mut before_decision = Some(before_decision);
-        self.campaign_default_is_eligible_inner(model_id, || {
+        self.session_model_authority_inner(Some(model_id), || {
             if let Some(before_decision) = before_decision.take() {
                 before_decision();
             }
         })
+        .campaign_eligible
     }
 
     /// ACP-visible (non-hidden) projection of the catalog.
@@ -1418,6 +1557,18 @@ impl ModelsManager {
 
     /// Refresh the model catalog on every auth token refresh.
     pub fn start_auth_refresh_watcher(&self, notify: Arc<tokio::sync::Notify>) {
+        let first = notify.clone().notified_owned();
+        self.start_auth_refresh_watcher_with_first(notify, first);
+    }
+
+    /// Start the watcher with a waiter that may have been armed before model
+    /// construction. The next waiter is created before each reconciliation so
+    /// a refresh that lands during the async fetch is handled next iteration.
+    pub(crate) fn start_auth_refresh_watcher_with_first(
+        &self,
+        notify: Arc<tokio::sync::Notify>,
+        first: tokio::sync::futures::OwnedNotified,
+    ) {
         let mgr = self.clone();
         let had_catalog_at_start = self.inner.catalog.read().has_fetched_real_catalog;
         xai_grok_telemetry::unified_log::info(
@@ -1429,14 +1580,10 @@ impl ModelsManager {
             })),
         );
         tokio::spawn(async move {
+            let mut next = first;
             loop {
-                notify.notified().await;
-                if !crate::util::config::resolve_remote_fetch_enabled() {
-                    tracing::debug!(
-                        "model catalog: auth refresh watcher skipped (remote_fetch disabled)"
-                    );
-                    continue;
-                }
+                next.await;
+                next = notify.clone().notified_owned();
                 let had_catalog = mgr.inner.catalog.read().has_fetched_real_catalog;
                 let old_count = mgr.available().len();
                 xai_grok_telemetry::unified_log::info(
@@ -1447,7 +1594,10 @@ impl ModelsManager {
                         "model_count_before": old_count,
                     })),
                 );
-                mgr.fetch_and_apply().await;
+                // Refreshes may change both fetch authority and which implicit
+                // default is usable. Reconcile the complete auth-dependent
+                // state, rather than only issuing the transport fetch.
+                mgr.on_auth_changed().await;
                 let has_catalog = mgr.inner.catalog.read().has_fetched_real_catalog;
                 let new_count = mgr.available().len();
                 if has_catalog {

@@ -95,10 +95,33 @@ struct AuthSelectionMutationGuard<'a> {
     generation: &'a AtomicU64,
 }
 
+/// Short synchronous pin for an auth-dependent decision that has already
+/// captured a stable generation. Writers observe the temporary odd value and
+/// wait; dropping the seal restores the same even generation because no auth
+/// mutation occurred.
+pub(crate) struct AuthSelectionSeal {
+    manager: Arc<AuthManager>,
+    stable_generation: u64,
+}
+
 impl Drop for AuthSelectionMutationGuard<'_> {
     fn drop(&mut self) {
         let previous = self.generation.fetch_add(1, Ordering::Release);
         debug_assert_eq!(previous % 2, 1, "auth selection mutation must end odd");
+    }
+}
+
+impl Drop for AuthSelectionSeal {
+    fn drop(&mut self) {
+        let sealed_generation = self.stable_generation.wrapping_add(1);
+        let observed = self.manager.selection_generation.load(Ordering::Relaxed);
+        debug_assert_eq!(
+            observed, sealed_generation,
+            "auth selection seal must restore its unchanged even generation"
+        );
+        self.manager
+            .selection_generation
+            .store(self.stable_generation, Ordering::Release);
     }
 }
 
@@ -1064,6 +1087,29 @@ impl AuthManager {
     pub(crate) fn selection_generation_is_current(&self, generation: u64) -> bool {
         generation.is_multiple_of(2)
             && self.selection_generation.load(Ordering::Acquire) == generation
+    }
+
+    /// Pin a previously captured stable selection generation across a short,
+    /// synchronous commit plan. The guard must be dropped before any `.await`.
+    pub(crate) fn try_seal_selection(
+        self: &Arc<Self>,
+        generation: u64,
+    ) -> Option<AuthSelectionSeal> {
+        if !generation.is_multiple_of(2) {
+            return None;
+        }
+        self.selection_generation
+            .compare_exchange(
+                generation,
+                generation.wrapping_add(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()?;
+        Some(AuthSelectionSeal {
+            manager: Arc::clone(self),
+            stable_generation: generation,
+        })
     }
 
     /// Closure-scoped read counterpart to [`Self::with_inner_write`].

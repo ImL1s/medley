@@ -50,7 +50,8 @@ pub(crate) use error::with_login_instruction;
 pub use error::{AuthError, RefreshTokenError, RefreshTokenFailedReason};
 pub use manager::{AuthManager, shared_api_key_provider};
 pub(crate) use manager::{
-    AuthRemedy, AuthSelectionSnapshot, FirstPartySessionEligibility, SilentRefresh,
+    AuthRemedy, AuthSelectionSeal, AuthSelectionSnapshot, FirstPartySessionEligibility,
+    SilentRefresh,
 };
 pub use meta::{AuthMeta, GateInfo};
 pub use model::{AuthMode, GrokAuth, lookup_auth};

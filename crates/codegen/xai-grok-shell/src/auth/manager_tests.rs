@@ -219,6 +219,39 @@ fn selection_snapshot_waits_for_odd_mutation_generation() {
 }
 
 #[test]
+fn selection_seal_blocks_writers_without_advancing_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let initial = mgr.selection_snapshot();
+    let seal = mgr
+        .try_seal_selection(initial.generation)
+        .expect("stable generation must be sealable");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let writer = Arc::clone(&mgr);
+    let thread = std::thread::spawn(move || {
+        writer.set_first_party_env_api_key_ok(false);
+        tx.send(()).unwrap();
+    });
+    assert!(
+        rx.recv_timeout(StdDuration::from_millis(25)).is_err(),
+        "auth writers must wait while a synchronous selection seal is held"
+    );
+
+    drop(seal);
+    rx.recv_timeout(StdDuration::from_secs(1))
+        .expect("writer must resume after the seal drops");
+    let changed = mgr.selection_snapshot();
+    assert_eq!(
+        changed.generation,
+        initial.generation + 2,
+        "the read seal itself must not invent a mutation generation"
+    );
+    assert!(!changed.first_party_env_api_key_ok);
+    thread.join().unwrap();
+}
+
+#[test]
 fn expired_within_5min_buffer() {
     let auth = make_auth(Some(Utc::now() + Duration::minutes(4)), Utc::now());
     assert!(is_expired(&auth));
