@@ -617,6 +617,73 @@ impl ModelsManager {
         .is_usable()
     }
 
+    /// Publish the first-party env-key probe verdict and repair only the
+    /// implicit cold-start state it can invalidate.
+    ///
+    /// Presence-only startup resolution deliberately treats a non-blank env
+    /// key as usable so boot does not block on I/O. If the later `/api-key`
+    /// probe disproves that assumption, an implicitly seated ambient Grok may
+    /// be stranded even though a ready Codex account route exists. Honourable
+    /// CLI/env/config defaults and `/model` picks remain authoritative; other
+    /// usable xAI routes (pin, session, deployment key) also keep Grok.
+    pub(crate) fn apply_first_party_env_api_key_probe_result(&self, ok: bool) {
+        self.inner.auth_manager.set_first_party_env_api_key_ok(ok);
+        if ok || self.inner.user_selected_model.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let cfg = self.inner.cfg.read().clone();
+        let ambient = resolution::classify_ambient_xai_auth(
+            &cfg,
+            self.inner.auth_manager.first_party_session_eligibility(),
+        );
+        let usable_without_env = match ambient {
+            resolution::AmbientXaiEligibility::StaticKey => cfg
+                .endpoints
+                .deployment_key
+                .as_ref()
+                .is_some_and(|key| !key.trim().is_empty()),
+            other => other.is_usable(),
+        };
+        if usable_without_env {
+            return;
+        }
+
+        let is_session_auth = self.is_session_auth();
+        let current = self.current_model_id();
+        let target = {
+            let catalog = self.inner.catalog.read();
+            let current_is_ambient_grok = catalog
+                .models
+                .get(current.0.as_ref())
+                .is_some_and(resolution::is_first_party_ambient_xai_entry);
+            if !current_is_ambient_grok {
+                None
+            } else {
+                let (key, entry, _, _) = resolve_default_model_for_catalog_with_usable_xai(
+                    &cfg,
+                    &catalog.models,
+                    is_session_auth,
+                    catalog.has_fetched_real_catalog,
+                    false,
+                );
+                resolution::is_ready_selectable_openai_codex_entry(&entry, is_session_auth)
+                    .then(|| acp::ModelId::new(key))
+            }
+        };
+        let Some(target) = target else {
+            return;
+        };
+
+        tracing::info!(
+            old = %current.0,
+            new = %target.0,
+            "invalid first-party env key left implicit Grok unusable; reseating ready Codex"
+        );
+        self.set_current_model_id_internal(target);
+        self.revalidate_current_reasoning_effort();
+    }
+
     /// Whether a Codex-backed model is actually reachable: holding a live
     /// provider credential *and* surviving the same `user_selectable` /
     /// `visible_for_auth` filters the picker applies.
