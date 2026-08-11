@@ -287,6 +287,52 @@ fn first_party_session_eligibility_refreshable_vs_malformed() {
         mgr.first_party_session_eligibility(),
         FirstPartySessionEligibility::None
     );
+
+    // External refresh authority is its configured command, not OIDC
+    // refresh-token/client metadata.
+    let external_dir = tempfile::tempdir().unwrap();
+    let external_mgr = Arc::new(AuthManager::new(
+        external_dir.path(),
+        GrokComConfig {
+            auth_provider_command: Some(
+                "printf '%s' '{\"access_token\":\"fresh-external\",\"issuer\":\"https://auth.x.ai\"}'"
+                    .to_owned(),
+            ),
+            ..GrokComConfig::default()
+        },
+    ));
+    let mut external = make_auth(Some(Utc::now() - Duration::hours(1)), Utc::now());
+    external.auth_mode = AuthMode::External;
+    external.refresh_token = None;
+    external.oidc_issuer = Some(XAI_OAUTH2_ISSUER.to_owned());
+    external.oidc_client_id = None;
+    external_mgr.hot_swap(external.clone());
+    assert_eq!(
+        external_mgr.first_party_session_eligibility(),
+        FirstPartySessionEligibility::Refreshable
+    );
+
+    // First-party provenance alone is not refresh authority: without a
+    // configured command the same expired External credential stays closed.
+    let no_command_dir = tempfile::tempdir().unwrap();
+    let no_command_mgr = Arc::new(AuthManager::new(
+        no_command_dir.path(),
+        GrokComConfig::default(),
+    ));
+    no_command_mgr.hot_swap(external.clone());
+    assert_eq!(
+        no_command_mgr.first_party_session_eligibility(),
+        FirstPartySessionEligibility::None
+    );
+
+    // Third-party External credentials remain excluded even when a command is
+    // configured: is_session_auth() fail-closes before refresh classification.
+    external.oidc_issuer = Some("https://idp.acme.example".to_owned());
+    external_mgr.hot_swap(external);
+    assert_eq!(
+        external_mgr.first_party_session_eligibility(),
+        FirstPartySessionEligibility::None
+    );
 }
 
 /// Pro P0: one observation classifies usability + first-party session kind.
