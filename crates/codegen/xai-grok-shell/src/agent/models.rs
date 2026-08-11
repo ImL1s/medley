@@ -141,7 +141,14 @@ pub(crate) struct SessionModelAuthoritySnapshot {
     pub(crate) auth_generation: u64,
     pub(crate) catalog: IndexMap<String, ModelEntry>,
     pub(crate) fallback_model_id: acp::ModelId,
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
     pub(crate) campaign_eligible: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CurrentModelSelectionSnapshot {
+    pub(crate) model_id: acp::ModelId,
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// Catalog fields written together under one lock, so readers never see a torn mix.
@@ -962,7 +969,8 @@ impl ModelsManager {
             #[cfg(test)]
             before_selection_snapshot();
             let selection_commit = self.inner.selection_commit.read();
-            let current = self.inner.current_model_id.read().clone();
+            let current_guard = self.inner.current_model_id.read();
+            let current = current_guard.clone();
             let user_selected = self.inner.user_selected_model.load(Ordering::Relaxed);
             let current_key = resolve_catalog_key(models, &current);
             let current_is_usable = current_key
@@ -988,7 +996,9 @@ impl ModelsManager {
                 );
                 acp::ModelId::new(key)
             };
+            let reasoning_effort = *self.inner.current_reasoning_effort.read();
             let owned_catalog = models.clone();
+            drop(current_guard);
             drop(selection_commit);
             #[cfg(test)]
             before_commit();
@@ -1001,6 +1011,7 @@ impl ModelsManager {
                     auth_generation: auth.generation,
                     catalog: owned_catalog,
                     fallback_model_id,
+                    reasoning_effort,
                     campaign_eligible,
                 };
             }
@@ -1063,6 +1074,39 @@ impl ModelsManager {
 
     pub fn current_model_id(&self) -> acp::ModelId {
         self.inner.current_model_id.read().clone()
+    }
+
+    pub(crate) fn current_model_selection_snapshot(&self) -> CurrentModelSelectionSnapshot {
+        #[cfg(test)]
+        return self.current_model_selection_snapshot_inner(|| {});
+        #[cfg(not(test))]
+        self.current_model_selection_snapshot_inner()
+    }
+
+    fn current_model_selection_snapshot_inner(
+        &self,
+        #[cfg(test)] before_selection_snapshot: impl FnOnce(),
+    ) -> CurrentModelSelectionSnapshot {
+        #[cfg(test)]
+        before_selection_snapshot();
+        let selection_commit = self.inner.selection_commit.read();
+        let current = self.inner.current_model_id.read();
+        let model_id = current.clone();
+        let reasoning_effort = *self.inner.current_reasoning_effort.read();
+        drop(current);
+        drop(selection_commit);
+        CurrentModelSelectionSnapshot {
+            model_id,
+            reasoning_effort,
+        }
+    }
+
+    #[cfg(test)]
+    fn current_model_selection_snapshot_with_before_selection_snapshot(
+        &self,
+        before_selection_snapshot: impl FnOnce(),
+    ) -> CurrentModelSelectionSnapshot {
+        self.current_model_selection_snapshot_inner(before_selection_snapshot)
     }
 
     /// The configured default that resolve fell through on (absent from the
@@ -2536,6 +2580,23 @@ mod selection_atomicity_tests {
         }
     }
 
+    fn ready_xai_entry_with_efforts(slug: &str, efforts: &[ReasoningEffort]) -> ModelEntry {
+        let mut entry = ready_xai_entry(slug);
+        entry.info.supports_reasoning_effort = true;
+        entry.info.reasoning_efforts = efforts
+            .iter()
+            .enumerate()
+            .map(|(index, effort)| ReasoningEffortOption {
+                id: effort.to_string(),
+                value: *effort,
+                label: effort.to_string(),
+                description: None,
+                default: index == 0,
+            })
+            .collect();
+        entry
+    }
+
     #[test]
     fn session_authority_never_observes_mixed_explicit_selection() {
         let tmp = tempfile::tempdir().expect("temp model-selection home");
@@ -2616,6 +2677,92 @@ mod selection_atomicity_tests {
         writer.join().expect("selection writer must finish");
         let snapshot = reader.join().expect("authority reader must finish");
         assert_eq!(snapshot.fallback_model_id.0.as_ref(), "grok-new");
+    }
+
+    #[test]
+    fn model_selection_snapshot_never_observes_old_model_with_new_effort() {
+        let tmp = tempfile::tempdir().expect("temp atomic model-effort snapshot home");
+        let mut catalog = IndexMap::new();
+        catalog.insert(
+            "grok-a".to_string(),
+            ready_xai_entry_with_efforts("grok-a", &[ReasoningEffort::Low, ReasoningEffort::High]),
+        );
+        catalog.insert(
+            "grok-b".to_string(),
+            ready_xai_entry_with_efforts("grok-b", &[ReasoningEffort::High]),
+        );
+        let manager = ModelsManager::new(
+            None,
+            catalog,
+            acp::ModelId::new("grok-a"),
+            Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default())),
+            config::Config::default(),
+        );
+        manager.set_current_reasoning_effort(Some(ReasoningEffort::Low));
+
+        let (selection_midpoint_tx, selection_midpoint_rx) = mpsc::channel();
+        let (release_selection_tx, release_selection_rx) = mpsc::channel();
+        let writer = {
+            let manager = manager.clone();
+            std::thread::spawn(move || {
+                manager.set_current_model_and_reasoning_effort_with_before_id_publish(
+                    acp::ModelId::new("grok-b"),
+                    Some(ReasoningEffort::High),
+                    || {
+                        selection_midpoint_tx
+                            .send(())
+                            .expect("announce model/effort commit midpoint");
+                        release_selection_rx
+                            .recv_timeout(Duration::from_secs(5))
+                            .expect("release model/effort commit");
+                    },
+                );
+            })
+        };
+        selection_midpoint_rx
+            .recv()
+            .expect("model/effort writer must reach its commit midpoint");
+
+        let (reader_started_tx, reader_started_rx) = mpsc::channel();
+        let (reader_reached_selection_tx, reader_reached_selection_rx) = mpsc::channel();
+        let reader = {
+            let manager = manager.clone();
+            std::thread::spawn(move || {
+                reader_started_tx
+                    .send(())
+                    .expect("announce model/effort snapshot reader start");
+                manager.current_model_selection_snapshot_with_before_selection_snapshot(|| {
+                    reader_reached_selection_tx
+                        .send(())
+                        .expect("announce model/effort snapshot selection boundary");
+                })
+            })
+        };
+        reader_started_rx
+            .recv()
+            .expect("model/effort snapshot reader must start");
+        reader_reached_selection_rx
+            .recv()
+            .expect("model/effort snapshot reader must reach selection boundary");
+        assert!(
+            manager.inner.selection_commit.try_read().is_none(),
+            "the snapshot reader must remain excluded from the writer midpoint"
+        );
+
+        release_selection_tx
+            .send(())
+            .expect("release model/effort selection");
+        writer.join().expect("model/effort writer must finish");
+        let snapshot = reader
+            .join()
+            .expect("model/effort snapshot reader must finish");
+        assert_eq!(snapshot.model_id.0.as_ref(), "grok-b");
+        assert_eq!(snapshot.reasoning_effort, Some(ReasoningEffort::High));
+        assert_ne!(
+            (snapshot.model_id.0.as_ref(), snapshot.reasoning_effort),
+            ("grok-a", Some(ReasoningEffort::High)),
+            "grok-a accepts high, so validity filtering cannot hide a torn A/high snapshot"
+        );
     }
 
     #[test]

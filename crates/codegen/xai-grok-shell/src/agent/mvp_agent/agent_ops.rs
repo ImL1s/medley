@@ -2528,6 +2528,7 @@ impl MvpAgent {
                 campaign_candidate.as_ref().map(|campaign| campaign.value.as_str()),
             );
             let fallback_model_id = authority.fallback_model_id;
+            let default_reasoning_effort = authority.reasoning_effort;
             let campaign_nudge = campaign_candidate.filter(|_| authority.campaign_eligible);
             let campaign_nudged = campaign_nudge.is_some();
             if let Some(campaign) = &campaign_nudge {
@@ -2623,7 +2624,7 @@ impl MvpAgent {
             let model_agent_type = Some(model.info().agent_type.clone());
             let mut sampling_config =
                 self.prepare_sampling_config_for_model(&model, origin_client.clone());
-            if let Some(effort) = self.models_manager.current_reasoning_effort()
+            if let Some(effort) = default_reasoning_effort
                 && model.info().reasoning_efforts.iter().any(|option| option.value == effort)
             {
                 sampling_config.reasoning_effort = Some(effort);
@@ -3956,10 +3957,11 @@ impl MvpAgent {
         &self,
         session_id: Option<&acp::SessionId>,
     ) -> acp::SessionModelState {
+        let default_selection = self.models_manager.current_model_selection_snapshot();
         let model_id = lookup_session_model(
             session_id
                 .and_then(|sid| self.resident_handle(sid).map(|h| h.model_id.clone())),
-            &self.models_manager.current_model_id(),
+            &default_selection.model_id,
         );
         let mut available_models: Vec<acp::ModelInfo> = self
             .models_manager
@@ -3970,8 +3972,7 @@ impl MvpAgent {
         let session_effort = session_id
             .and_then(|sid| self.resident_handle(sid).map(|h| h.reasoning_effort))
             .flatten();
-        let override_effort =
-            session_effort.or_else(|| self.models_manager.current_reasoning_effort());
+        let override_effort = session_effort.or(default_selection.reasoning_effort);
         if let Some(override_effort) = override_effort
             && let Some(info) = available_models
                 .iter_mut()
@@ -3995,10 +3996,9 @@ impl MvpAgent {
         session_id: Option<&acp::SessionId>,
         state: &acp::SessionModelState,
     ) -> Vec<session_config::SessionConfigOption> {
-        let model_id = resolve_catalog_key(
-                &self.models_manager.models(),
-                &state.current_model_id,
-            )
+        let default_selection = self.models_manager.current_model_selection_snapshot();
+        let model_id =
+            resolve_catalog_key(&self.models_manager.models(), &state.current_model_id)
             .unwrap_or_else(|| state.current_model_id.clone());
         let supports_effort = self
             .models_manager
@@ -4022,21 +4022,20 @@ impl MvpAgent {
             .and_then(|sid| self.resident_handle(sid).map(|h| h.reasoning_effort))
             .flatten();
         let current_effort = session_effort.or_else(|| {
-            supports_effort
-                .then(|| {
-                let selected = self
-                    .models_manager
-                    .current_reasoning_effort()
-                    .or_else(|| {
-                        self.models_manager
-                            .model_default_reasoning_effort(model_id.0.as_ref())
-                    });
-                selected.filter(|effort| {
-                    self.models_manager
-                        .model_offers_reasoning_effort(model_id.0.as_ref(), *effort)
-                })
-                })
+            if !supports_effort {
+                return None;
+            }
+            let selected = (default_selection.model_id == model_id)
+                .then_some(default_selection.reasoning_effort)
                 .flatten()
+                .or_else(|| {
+                    self.models_manager
+                        .model_default_reasoning_effort(model_id.0.as_ref())
+                });
+            selected.filter(|effort| {
+                self.models_manager
+                    .model_offers_reasoning_effort(model_id.0.as_ref(), *effort)
+            })
         });
         session_config::build_session_config_options(
             &state.available_models,
