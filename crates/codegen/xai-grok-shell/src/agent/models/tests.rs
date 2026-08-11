@@ -3540,16 +3540,23 @@ fn invalid_env_probe_reseats_only_after_unusable_verdict() {
     let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
     catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
     catalog.insert(codex_key.clone(), codex);
+    let prefetched = IndexMap::from([(
+        "grok-4.5".to_string(),
+        catalog.get("grok-4.5").expect("ambient Grok entry").clone(),
+    )]);
+    let empty = toml::Value::Table(toml::map::Map::new());
+    let production_cfg = config::Config::new_from_toml_cfg(&empty)
+        .expect("production config with canonical Codex preset");
 
     let xai_home = tmp.path().join("xai-probe-verdict");
     std::fs::create_dir_all(&xai_home).unwrap();
     let auth_manager = Arc::new(AuthManager::new(&xai_home, GrokComConfig::default()));
     let mgr = ModelsManagerBuilder::new(
-        None,
+        Some(prefetched.clone()),
         catalog,
         acp::ModelId::new("grok-4.5"),
         auth_manager.clone(),
-        config::Config::default(),
+        production_cfg.clone(),
     )
     .cache(test_cache_manager(tmp.path()))
     .build();
@@ -3565,6 +3572,115 @@ fn invalid_env_probe_reseats_only_after_unusable_verdict() {
         "a failed probe must invalidate presence-only Grok precedence"
     );
     assert!(!auth_manager.first_party_env_api_key_ok());
+
+    mgr.apply_catalog_for_test(prefetched);
+    assert_eq!(
+        mgr.current_model_id().0.as_ref(),
+        codex_key.as_str(),
+        "the first real catalog must retain the failed env-probe verdict"
+    );
+
+    let default_reapply = production_cfg.clone();
+    assert!(
+        !mgr.usable_ambient_xai(&default_reapply),
+        "the stored failed verdict must suppress env-only ambient xAI"
+    );
+    mgr.apply_config_reselecting_default(default_reapply);
+    assert!(
+        !mgr.usable_ambient_xai(&production_cfg),
+        "config reapply must not clear the stored failed verdict"
+    );
+    assert!(mgr.models().values().any(|entry| {
+        resolution::is_ready_selectable_openai_codex_entry(entry, mgr.is_session_auth())
+    }));
+    assert_eq!(
+        mgr.current_model_id().0.as_ref(),
+        codex_key.as_str(),
+        "a later default re-resolution must retain the failed env-probe verdict"
+    );
+
+    let mut campaign = production_cfg.clone();
+    campaign.models.default = Some("grok-4.5".to_string());
+    campaign.models.default_is_campaign_driven = true;
+    mgr.apply_config_reselecting_default(campaign);
+    assert_eq!(
+        mgr.current_model_id().0.as_ref(),
+        codex_key.as_str(),
+        "a campaign-driven Grok default must not revive a proven-invalid ambient env route"
+    );
+
+    mgr.apply_first_party_env_api_key_probe_result(true);
+    let mut valid_campaign = production_cfg;
+    valid_campaign.models.default = Some("grok-4.5".to_string());
+    valid_campaign.models.default_is_campaign_driven = true;
+    mgr.apply_config_reselecting_default(valid_campaign);
+    assert_eq!(
+        mgr.current_model_id().0.as_ref(),
+        "grok-4.5",
+        "a successful env probe must keep campaign-driven Grok eligible"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn invalid_env_probe_does_not_overwrite_user_pick_at_commit_boundary() {
+    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    use xai_grok_test_support::EnvGuard;
+    let _g = EnvGuard::set(XAI_API_KEY_ENV_VAR, "invalid-xai-key");
+    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+    let _default = EnvGuard::unset("GROK_DEFAULT_MODEL");
+
+    let tmp = tempfile::tempdir().expect("temp home");
+    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
+    let mut user_model = ready_entry("local-user-model");
+    user_model.info.base_url = "http://127.0.0.1:8080/v1".to_string();
+    user_model.info.auth_scheme = xai_grok_sampler::AuthScheme::None;
+    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
+    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
+    catalog.insert(
+        crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string(),
+        codex,
+    );
+    catalog.insert("local-user-model".to_string(), user_model);
+
+    let xai_home = tmp.path().join("xai-probe-user-race");
+    std::fs::create_dir_all(&xai_home).unwrap();
+    let auth_manager = Arc::new(AuthManager::new(&xai_home, GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        catalog,
+        acp::ModelId::new("grok-4.5"),
+        auth_manager.clone(),
+        config::Config::default(),
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+
+    mgr.apply_first_party_env_api_key_probe_result_with_before_commit(false, || {
+        assert!(
+            mgr.inner.cfg.try_write().is_none(),
+            "the config snapshot must stay read-locked through current-model commit"
+        );
+        assert!(
+            mgr.inner.catalog.try_write().is_none(),
+            "the catalog snapshot must stay read-locked through current-model commit"
+        );
+        mgr.set_current_model_id(acp::ModelId::new("local-user-model"));
+    });
+
+    assert_eq!(
+        mgr.current_model_id().0.as_ref(),
+        "local-user-model",
+        "a user pick after target resolution but before commit must win"
+    );
+    assert!(mgr.inner.user_selected_model.load(Ordering::Relaxed));
+    assert!(
+        !auth_manager.first_party_env_api_key_ok(),
+        "the race-safe abort must still publish the failed probe verdict"
+    );
 }
 
 #[test]
@@ -3592,7 +3708,7 @@ fn invalid_env_probe_preserves_explicit_and_user_picked_grok() {
     let auth_manager = Arc::new(AuthManager::new(&xai_home, GrokComConfig::default()));
     let manager = |cfg: config::Config| {
         ModelsManagerBuilder::new(
-            None,
+            Some(catalog.clone()),
             catalog.clone(),
             acp::ModelId::new("grok-4.5"),
             auth_manager.clone(),
@@ -3620,6 +3736,14 @@ fn invalid_env_probe_preserves_explicit_and_user_picked_grok() {
     let configured_mgr = manager(configured);
     configured_mgr.apply_first_party_env_api_key_probe_result(false);
     assert_eq!(configured_mgr.current_model_id().0.as_ref(), "grok-4.5");
+    let mut configured_reapply = config::Config::default();
+    configured_reapply.models.default = Some("grok-4.5".to_string());
+    configured_mgr.apply_config_reselecting_default(configured_reapply);
+    assert_eq!(
+        configured_mgr.current_model_id().0.as_ref(),
+        "grok-4.5",
+        "a genuine user config preference remains authoritative after a failed env probe"
+    );
 
     let mut missing = config::Config::default();
     missing.default_model_override = Some("missing-explicit-model".to_string());
@@ -3667,7 +3791,7 @@ fn invalid_env_probe_preserves_other_usable_xai_routes() {
     };
     let manager = |cfg: config::Config, auth: Arc<AuthManager>| {
         ModelsManagerBuilder::new(
-            None,
+            Some(catalog.clone()),
             catalog.clone(),
             acp::ModelId::new("grok-4.5"),
             auth,
@@ -3686,6 +3810,13 @@ fn invalid_env_probe_preserves_other_usable_xai_routes() {
         assert!(
             !mgr.inner.auth_manager.first_party_env_api_key_ok(),
             "{label} must still publish the failed env-key verdict"
+        );
+        let cfg = mgr.inner.cfg.read().clone();
+        mgr.apply_config_reselecting_default(cfg);
+        assert_eq!(
+            mgr.current_model_id().0.as_ref(),
+            "grok-4.5",
+            "{label} must preserve Grok across later default re-resolution"
         );
     };
 
@@ -4122,7 +4253,11 @@ fn refreshable_expired_oidc_session_keeps_first_party_when_codex_ready() {
     );
     let cfg = config::Config::default();
     assert_eq!(
-        resolution::classify_ambient_xai_auth(&cfg, am.first_party_session_eligibility()),
+        resolution::classify_ambient_xai_auth(
+            &cfg,
+            am.first_party_session_eligibility(),
+            am.first_party_env_api_key_ok(),
+        ),
         resolution::AmbientXaiEligibility::RefreshableSession
     );
 
@@ -4422,7 +4557,11 @@ fn hard_expired_nonrefreshable_session_seats_codex() {
 
     let cfg = config::Config::default();
     assert_eq!(
-        resolution::classify_ambient_xai_auth(&cfg, am.first_party_session_eligibility()),
+        resolution::classify_ambient_xai_auth(
+            &cfg,
+            am.first_party_session_eligibility(),
+            am.first_party_env_api_key_ok(),
+        ),
         resolution::AmbientXaiEligibility::Unavailable
     );
 

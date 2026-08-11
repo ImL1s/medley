@@ -443,6 +443,7 @@ impl ModelsManager {
             resolution::classify_ambient_xai_auth(
                 cfg,
                 auth_manager.first_party_session_eligibility(),
+                auth_manager.first_party_env_api_key_ok(),
             )
             .is_usable()
         };
@@ -613,6 +614,7 @@ impl ModelsManager {
         resolution::classify_ambient_xai_auth(
             cfg,
             self.inner.auth_manager.first_party_session_eligibility(),
+            self.inner.auth_manager.first_party_env_api_key_ok(),
         )
         .is_usable()
     }
@@ -627,61 +629,95 @@ impl ModelsManager {
     /// CLI/env/config defaults and `/model` picks remain authoritative; other
     /// usable xAI routes (pin, session, deployment key) also keep Grok.
     pub(crate) fn apply_first_party_env_api_key_probe_result(&self, ok: bool) {
+        #[cfg(test)]
+        self.apply_first_party_env_api_key_probe_result_inner(ok, || {});
+        #[cfg(not(test))]
+        self.apply_first_party_env_api_key_probe_result_inner(ok);
+    }
+
+    fn apply_first_party_env_api_key_probe_result_inner(
+        &self,
+        ok: bool,
+        #[cfg(test)] before_commit: impl FnOnce(),
+    ) {
         self.inner.auth_manager.set_first_party_env_api_key_ok(ok);
         if ok || self.inner.user_selected_model.load(Ordering::Relaxed) {
             return;
         }
 
-        let cfg = self.inner.cfg.read().clone();
+        // Keep one config snapshot locked through target resolution and commit.
+        // This orders the repair cfg -> catalog -> current: a concurrent config
+        // reload either lands first (and is observed here) or lands afterward
+        // and performs its own authoritative reselection.
+        let cfg = self.inner.cfg.read();
         let ambient = resolution::classify_ambient_xai_auth(
             &cfg,
             self.inner.auth_manager.first_party_session_eligibility(),
+            self.inner.auth_manager.first_party_env_api_key_ok(),
         );
-        let usable_without_env = match ambient {
-            resolution::AmbientXaiEligibility::StaticKey => cfg
-                .endpoints
-                .deployment_key
-                .as_ref()
-                .is_some_and(|key| !key.trim().is_empty()),
-            other => other.is_usable(),
-        };
-        if usable_without_env {
+        if ambient.is_usable() {
             return;
         }
 
         let is_session_auth = self.is_session_auth();
-        let current = self.current_model_id();
-        let target = {
+        let (current, target) = {
             let catalog = self.inner.catalog.read();
-            let current_is_ambient_grok = catalog
-                .models
-                .get(current.0.as_ref())
-                .is_some_and(resolution::is_first_party_ambient_xai_entry);
-            if !current_is_ambient_grok {
-                None
-            } else {
-                let (key, entry, _, _) = resolve_default_model_for_catalog_with_usable_xai(
-                    &cfg,
-                    &catalog.models,
-                    is_session_auth,
-                    catalog.has_fetched_real_catalog,
-                    false,
-                );
-                resolution::is_ready_selectable_openai_codex_entry(&entry, is_session_auth)
-                    .then(|| acp::ModelId::new(key))
+            let (key, entry, _, _) = resolve_default_model_for_catalog_with_usable_xai(
+                &cfg,
+                &catalog.models,
+                is_session_auth,
+                catalog.has_fetched_real_catalog,
+                false,
+            );
+            if !resolution::is_ready_selectable_openai_codex_entry(&entry, is_session_auth) {
+                return;
             }
+            let target = acp::ModelId::new(key);
+
+            // In test builds, mark the exact race boundary after target
+            // resolution but before current-model commit. The seam is absent
+            // from production builds.
+            #[cfg(test)]
+            before_commit();
+
+            // Lock order is catalog -> current. Holding the catalog read guard
+            // keeps the selected Codex target present/ready through commit;
+            // rechecking both the user-pick flag and current under the current
+            // lock prevents a concurrent `/model` choice from being overwritten.
+            let mut current = self.inner.current_model_id.write();
+            if self.inner.user_selected_model.load(Ordering::Relaxed)
+                || !catalog
+                    .models
+                    .get(current.0.as_ref())
+                    .is_some_and(resolution::is_first_party_ambient_xai_entry)
+                || *current == target
+            {
+                return;
+            }
+            let old = current.clone();
+            *current = target.clone();
+            (old, target)
         };
-        let Some(target) = target else {
-            return;
-        };
+        drop(cfg);
 
         tracing::info!(
             old = %current.0,
             new = %target.0,
             "invalid first-party env key left implicit Grok unusable; reseating ready Codex"
         );
-        self.set_current_model_id_internal(target);
+        self.inner
+            .model_switch_watch
+            .send_modify(|generation| *generation += 1);
         self.revalidate_current_reasoning_effort();
+    }
+
+    #[cfg(test)]
+    fn apply_first_party_env_api_key_probe_result_with_before_commit(
+        &self,
+        ok: bool,
+        before_commit: impl FnOnce(),
+    ) {
+        self.apply_first_party_env_api_key_probe_result_inner(ok, before_commit);
     }
 
     /// Whether a Codex-backed model is actually reachable: holding a live

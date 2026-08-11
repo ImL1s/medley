@@ -210,6 +210,7 @@ impl AmbientXaiEligibility {
 pub(crate) fn classify_ambient_xai_auth(
     cfg: &config::Config,
     session: crate::auth::FirstPartySessionEligibility,
+    env_api_key_ok: bool,
 ) -> AmbientXaiEligibility {
     use crate::auth::FirstPartySessionEligibility as Sess;
     use crate::auth::PreferredAuthMethod;
@@ -224,7 +225,11 @@ pub(crate) fn classify_ambient_xai_auth(
         Sess::Refreshable => return AmbientXaiEligibility::RefreshableSession,
         Sess::None => {}
     }
-    if crate::agent::auth_method::has_xai_api_key_env() {
+    // Startup may optimistically classify a present env key before the
+    // `/api-key` probe completes. Once that probe publishes a negative
+    // verdict, every later manager re-resolution must keep that one route
+    // suppressed instead of reviving Grok from presence alone (#303).
+    if env_api_key_ok && crate::agent::auth_method::has_xai_api_key_env() {
         return AmbientXaiEligibility::StaticKey;
     }
     if cfg
@@ -255,7 +260,7 @@ pub(crate) fn usable_ambient_xai_auth(cfg: &config::Config, has_usable_xai_sessi
     } else {
         Sess::None
     };
-    classify_ambient_xai_auth(cfg, session).is_usable()
+    classify_ambient_xai_auth(cfg, session, true).is_usable()
 }
 
 /// Official OpenAI Codex account route (not a third-party CodexResponses shim).
@@ -439,14 +444,19 @@ pub(crate) fn resolve_default_model_with_usable_xai(
                     // authenticate. An unready model is absent from
                     // `ready_visible`, so falling through here lands in the
                     // `found == None` branch where that recovery lives.
-                } else if selectable {
+                } else if selectable
+                    && (usable_xai || !campaign_driven || !is_first_party_ambient_xai_entry(entry))
+                {
                     return (key.clone(), entry.clone(), pref.source, None);
                 }
             }
 
             let found = ready_visible
                 .get_key_value(&pref.value)
-                .or_else(|| ready_visible.iter().find(|(_, m)| m.model == pref.value));
+                .or_else(|| ready_visible.iter().find(|(_, m)| m.model == pref.value))
+                .filter(|(_, entry)| {
+                    usable_xai || !campaign_driven || !is_first_party_ambient_xai_entry(entry)
+                });
 
             if let Some((key, entry)) = found {
                 (key.clone(), entry.clone(), pref.source, None)
@@ -472,6 +482,7 @@ pub(crate) fn resolve_default_model_with_usable_xai(
                     && let Some((key, entry)) = ready_visible
                         .get_key_value(prev)
                         .or_else(|| ready_visible.iter().find(|(_, m)| m.model == prev))
+                    && (usable_xai || !is_first_party_ambient_xai_entry(entry))
                 {
                     tracing::info!(
                         unavailable = %pref.value, fallback = %prev,
