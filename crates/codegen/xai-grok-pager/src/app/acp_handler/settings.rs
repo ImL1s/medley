@@ -13,24 +13,18 @@ pub(super) fn handle_models_update(notif: &acp::ExtNotification, app: &mut AppVi
 
         let shell_fallback_current = new_models.current.clone();
 
-        // Override app-level default with the active agent's model.
-        let mut app_models = new_models.clone();
-        if let ActiveView::Agent(id) = app.active_view
-            && let Some(agent) = app.agents.get(&id)
-            && let Some(ref agent_model) = agent.session.models.current
-            && app_models.available.contains_key(agent_model)
-        {
-            app_models.current = Some(agent_model.clone());
-        }
-
-        app.models = app_models;
-
         for agent in app.agents.values_mut() {
             // Log when an update drops the agent's active model — this is the
             // moment the status bar visibly "switches model mid-conversation"
             // (the agent falls back to the shell's current model below).
             if let Some(ref current) = agent.session.models.current
                 && !new_models.available.contains_key(current)
+                && !agent
+                    .session
+                    .models
+                    .available
+                    .get(current)
+                    .is_some_and(crate::acp::model_state::is_unavailable_resident_model)
             {
                 tracing::warn!(
                     current_model = %current.0,
@@ -44,6 +38,25 @@ pub(super) fn handle_models_update(notif: &acp::ExtNotification, app: &mut AppVi
                 .models
                 .update_catalog(new_models.available.clone(), shell_fallback_current.clone());
         }
+
+        // Override the app-level default with the active agent's effective
+        // model after every per-session catalog has reconciled. A running
+        // session may retain a display-only unavailable-resident placeholder;
+        // carry that exact row into app state so the status/settings surfaces
+        // never claim the actor silently switched to the shell fallback.
+        let mut app_models = new_models;
+        if let ActiveView::Agent(id) = app.active_view
+            && let Some(agent) = app.agents.get(&id)
+            && let Some(ref agent_model) = agent.session.models.current
+            && let Some(agent_info) = agent.session.models.available.get(agent_model)
+        {
+            app_models
+                .available
+                .insert(agent_model.clone(), agent_info.clone());
+            app_models.current = Some(agent_model.clone());
+            app_models.reasoning_effort = agent.session.models.reasoning_effort;
+        }
+        app.models = app_models;
         true
     } else {
         tracing::warn!("Failed to parse x.ai/models/update");

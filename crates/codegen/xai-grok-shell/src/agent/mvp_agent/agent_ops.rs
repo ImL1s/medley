@@ -3957,30 +3957,69 @@ impl MvpAgent {
         &self,
         session_id: Option<&acp::SessionId>,
     ) -> acp::SessionModelState {
-        let default_selection = self.models_manager.current_model_selection_snapshot();
-        let model_id = lookup_session_model(
-            session_id
-                .and_then(|sid| self.resident_handle(sid).map(|h| h.model_id.clone())),
-            &default_selection.model_id,
-        );
-        let mut available_models: Vec<acp::ModelInfo> = self
-            .models_manager
-            .available()
-            .values()
-            .cloned()
-            .collect();
-        let session_effort = session_id
-            .and_then(|sid| self.resident_handle(sid).map(|h| h.reasoning_effort))
+        self.model_state_with_presentation(session_id).0
+    }
+    pub(super) fn model_state_with_presentation(
+        &self,
+        session_id: Option<&acp::SessionId>,
+    ) -> (
+        acp::SessionModelState,
+        crate::agent::models::ModelPresentationSnapshot,
+    ) {
+        let presentation = self.models_manager.presentation_snapshot();
+        let resident = session_id.and_then(|sid| self.resident_handle(sid));
+        let resident_model_id = resident.as_ref().map(|handle| handle.model_id.clone());
+        let raw_model_id = lookup_session_model(resident_model_id.clone(), &presentation.current_model_id);
+        let resolved_resident_model = resident_model_id
+            .as_ref()
+            .and_then(|model_id| resolve_catalog_key(&presentation.catalog, model_id));
+        let model_id = resolved_resident_model.unwrap_or_else(|| raw_model_id.clone());
+        let mut available_models: Vec<acp::ModelInfo> =
+            presentation.available.values().cloned().collect();
+        if resident_model_id.is_some() && !presentation.available.contains_key(&model_id) {
+            let reason = if resolve_catalog_key(&presentation.catalog, &raw_model_id).is_some() {
+                "This running session's model is unavailable for the current authentication mode"
+            } else {
+                "This running session's model is no longer present in the model catalog"
+            };
+            let mut meta = serde_json::Map::new();
+            meta.insert("ready".to_string(), serde_json::Value::Bool(false));
+            meta.insert(
+                "readinessReason".to_string(),
+                serde_json::Value::String(reason.to_string()),
+            );
+            meta.insert(
+                "unavailableResidentModel".to_string(),
+                serde_json::Value::Bool(true),
+            );
+            available_models.push(
+                acp::ModelInfo::new(
+                    model_id.clone(),
+                    format!("{} (unavailable)", model_id.0),
+                )
+                .description(reason)
+                .meta(meta),
+            );
+        }
+        let session_effort = resident.as_ref().and_then(|handle| handle.reasoning_effort);
+        let model_entry = presentation
+            .available
+            .contains_key(&model_id)
+            .then(|| presentation.catalog.get(model_id.0.as_ref()))
             .flatten();
-        let override_effort = session_effort.or(default_selection.reasoning_effort);
+        let override_effort = session_effort.or_else(|| {
+            let entry = model_entry?;
+            let selected = (presentation.current_model_id == model_id)
+                .then_some(presentation.reasoning_effort)
+                .flatten()
+                .or(entry.info().reasoning_effort)?;
+            crate::agent::models::model_offers_reasoning_effort(entry.info(), selected)
+                .then_some(selected)
+        });
         if let Some(override_effort) = override_effort
             && let Some(info) = available_models
                 .iter_mut()
                 .find(|info| info.model_id == model_id)
-            && (session_effort == Some(override_effort)
-                || self
-                    .models_manager
-                    .model_offers_reasoning_effort(model_id.0.as_ref(), override_effort))
         {
             let mut map = info.meta.clone().unwrap_or_default();
             map.insert(
@@ -3989,24 +4028,37 @@ impl MvpAgent {
             );
             info.meta = Some(map);
         }
-        acp::SessionModelState::new(model_id, available_models)
+        (
+            acp::SessionModelState::new(model_id, available_models),
+            presentation,
+        )
     }
     pub(super) fn session_config_options(
         &self,
         session_id: Option<&acp::SessionId>,
         state: &acp::SessionModelState,
     ) -> Vec<session_config::SessionConfigOption> {
-        let default_selection = self.models_manager.current_model_selection_snapshot();
-        let model_id =
-            resolve_catalog_key(&self.models_manager.models(), &state.current_model_id)
+        let presentation = self.models_manager.presentation_snapshot();
+        self.session_config_options_from_presentation(session_id, state, &presentation)
+    }
+    fn session_config_options_from_presentation(
+        &self,
+        session_id: Option<&acp::SessionId>,
+        state: &acp::SessionModelState,
+        presentation: &crate::agent::models::ModelPresentationSnapshot,
+    ) -> Vec<session_config::SessionConfigOption> {
+        let model_id = resolve_catalog_key(&presentation.catalog, &state.current_model_id)
             .unwrap_or_else(|| state.current_model_id.clone());
-        let supports_effort = self
-            .models_manager
-            .model_supports_reasoning_effort(model_id.0.as_ref());
+        let model_entry = presentation
+            .available
+            .contains_key(&model_id)
+            .then(|| presentation.catalog.get(model_id.0.as_ref()))
+            .flatten();
+        let supports_effort = model_entry.is_some_and(|entry| entry.info().supports_reasoning_effort);
         let effort_options: Vec<ReasoningEffortOption> = if supports_effort {
-            let options = self
-                .models_manager
-                .model_reasoning_efforts(model_id.0.as_ref());
+            let options = model_entry
+                .map(|entry| entry.info().reasoning_efforts.clone())
+                .unwrap_or_default();
             if options.is_empty() {
                 session_config::legacy_session_effort_options()
             } else {
@@ -4025,20 +4077,31 @@ impl MvpAgent {
             if !supports_effort {
                 return None;
             }
-            let selected = (default_selection.model_id == model_id)
-                .then_some(default_selection.reasoning_effort)
+            let selected = (presentation.current_model_id == model_id)
+                .then_some(presentation.reasoning_effort)
                 .flatten()
-                .or_else(|| {
-                    self.models_manager
-                        .model_default_reasoning_effort(model_id.0.as_ref())
-                });
+                .or_else(|| model_entry.and_then(|entry| entry.info().reasoning_effort));
             selected.filter(|effort| {
-                self.models_manager
-                    .model_offers_reasoning_effort(model_id.0.as_ref(), *effort)
+                model_entry.is_some_and(|entry| {
+                    crate::agent::models::model_offers_reasoning_effort(entry.info(), *effort)
+                })
             })
         });
+        let selectable_models: Vec<_> = state
+            .available_models
+            .iter()
+            .filter(|model| {
+                !model
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.get("unavailableResidentModel"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
         session_config::build_session_config_options(
-            &state.available_models,
+            &selectable_models,
             &model_id,
             &effort_options,
             current_effort,
@@ -4162,7 +4225,27 @@ impl MvpAgent {
         title: Option<String>,
         model_state: &acp::SessionModelState,
     ) {
-        let config_options = self.session_config_options(Some(session_id), model_state);
+        let presentation = self.models_manager.presentation_snapshot();
+        self.insert_session_config_meta_with_presentation(
+            meta,
+            session_id,
+            cwd,
+            title,
+            model_state,
+            &presentation,
+        );
+    }
+    pub(super) fn insert_session_config_meta_with_presentation(
+        &self,
+        meta: &mut serde_json::Map<String, serde_json::Value>,
+        session_id: &acp::SessionId,
+        cwd: String,
+        title: Option<String>,
+        model_state: &acp::SessionModelState,
+        presentation: &crate::agent::models::ModelPresentationSnapshot,
+    ) {
+        let config_options =
+            self.session_config_options_from_presentation(Some(session_id), model_state, presentation);
         let detail = session_config::GrokSessionDetail::build(
             session_id.0.to_string(),
             cwd,
@@ -4580,12 +4663,9 @@ impl MvpAgent {
         let model_agent_definition = model_agent_type.and_then(|required| {
             xai_grok_agent::discovery::by_name_in_cwd_with_plugins(required, cwd, plugins)
         });
-        let model_requires_exact_harness = model_agent_definition.as_ref().is_some_and(|def| {
-            def.is_strict_harness()
-                || def.plugin_name.is_some()
-                || def.source_path.is_some()
-                || def.prompt_body.is_some()
-        });
+        let model_requires_exact_harness = model_agent_definition
+            .as_ref()
+            .is_some_and(definition_requires_exact_harness);
         if !grok_agent_env_set && !config_agent_explicitly_set
             && model_requires_exact_harness
             && let Some(def) = model_agent_definition.clone()

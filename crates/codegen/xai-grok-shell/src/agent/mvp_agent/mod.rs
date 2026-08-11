@@ -1198,6 +1198,21 @@ pub(crate) fn harnesses_are_compatible(
     !active.is_strict_harness() && !required.is_strict_harness()
 }
 
+/// Whether a discovered model harness carries an exact runtime contract.
+///
+/// Stock, non-strict harnesses deliberately allow an explicit ACP/CLI agent
+/// profile to keep its own prompt and tool configuration. Strict, plugin, and
+/// file-backed definitions do not: their wire contract and source identity are
+/// part of the model route and must be resolved exactly.
+pub(crate) fn definition_requires_exact_harness(
+    definition: &xai_grok_agent::AgentDefinition,
+) -> bool {
+    definition.is_strict_harness()
+        || definition.plugin_name.is_some()
+        || definition.source_path.is_some()
+        || definition.prompt_body.is_some()
+}
+
 /// Select the first ready model whose required harness can reuse the active
 /// session definition. Candidate order is preserved so catalog priority stays
 /// authoritative while incompatible strict harnesses are skipped.

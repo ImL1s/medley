@@ -794,6 +794,240 @@ fn rebuild_updates_models_and_available() {
     );
 }
 
+fn presentation_race_entry(id: &str) -> ModelEntry {
+    let mut entry = ModelEntry::fallback(id, &config::EndpointsConfig::default());
+    entry.info.auth_scheme = xai_grok_sampler::AuthScheme::None;
+    entry.info.supports_reasoning_effort = true;
+    entry.info.reasoning_efforts = vec![ReasoningEffortOption {
+        id: "low".to_string(),
+        value: ReasoningEffort::Low,
+        label: "Low".to_string(),
+        description: None,
+        default: true,
+    }];
+    entry
+}
+
+fn assert_coherent_presentation(snapshot: &ModelPresentationSnapshot, expected: &str) {
+    assert_eq!(snapshot.current_model_id.0.as_ref(), expected);
+    assert!(snapshot.catalog.contains_key(expected));
+    assert!(snapshot.available.contains_key(&snapshot.current_model_id));
+    if let Some(effort) = snapshot.reasoning_effort {
+        let entry = snapshot
+            .catalog
+            .get(expected)
+            .expect("current presentation model is in its catalog");
+        assert!(model_offers_reasoning_effort(entry.info(), effort));
+    }
+}
+
+#[test]
+fn presentation_snapshot_retries_when_auth_generation_changes() {
+    let tmp = tempfile::tempdir().expect("presentation auth race home");
+    let mut oauth_only = make_model_entry("oauth-only");
+    oauth_only.info.supported_in_api = false;
+    let manager = ModelsManager::new(
+        None,
+        IndexMap::from([("oauth-only".to_string(), oauth_only)]),
+        acp::ModelId::new("oauth-only"),
+        Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default())),
+        config::Config::default(),
+    );
+    let calls = std::cell::Cell::new(0usize);
+    let snapshot = manager.presentation_snapshot_with_after_catalog_snapshot(|| {
+        let attempt = calls.get();
+        calls.set(attempt + 1);
+        if attempt == 0 {
+            manager
+                .inner
+                .auth_manager
+                .hot_swap(GrokAuth::test_default());
+        }
+    });
+    assert_eq!(calls.get(), 2, "auth mutation must discard the first view");
+    assert_eq!(snapshot.current_model_id.0.as_ref(), "oauth-only");
+    assert!(snapshot.catalog.contains_key("oauth-only"));
+    assert!(snapshot.available.contains_key(&snapshot.current_model_id));
+}
+
+#[test]
+fn presentation_fails_closed_until_auth_hidden_selection_is_reconciled() {
+    let tmp = tempfile::tempdir().expect("presentation auth-clear home");
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    auth_manager.hot_swap(GrokAuth::test_default());
+    let mut oauth_only = make_model_entry("oauth-only");
+    oauth_only.info.supported_in_api = false;
+    let public = make_model_entry("public");
+    let manager = ModelsManager::new(
+        None,
+        IndexMap::from([
+            ("oauth-only".to_string(), oauth_only),
+            ("public".to_string(), public),
+        ]),
+        acp::ModelId::new("oauth-only"),
+        auth_manager.clone(),
+        config::Config::default(),
+    );
+    manager.inner.catalog.write().has_fetched_real_catalog = true;
+    manager.set_current_reasoning_effort(Some(ReasoningEffort::High));
+    assert_eq!(
+        manager.presentation_snapshot().current_model_id.0.as_ref(),
+        "oauth-only"
+    );
+
+    auth_manager.clear_in_memory();
+    let transient = manager.presentation_snapshot();
+    assert!(transient.current_model_id.0.is_empty());
+    assert!(transient.available.is_empty());
+    assert_eq!(transient.reasoning_effort, None);
+
+    let cfg = manager.inner.cfg.read().clone();
+    manager.reconcile_selection_for_auth_change(&cfg);
+    let reconciled = manager.presentation_snapshot();
+    assert_eq!(reconciled.current_model_id.0.as_ref(), "public");
+    assert!(
+        reconciled
+            .available
+            .contains_key(&reconciled.current_model_id)
+    );
+    assert_eq!(reconciled.reasoning_effort, None);
+}
+
+#[test]
+fn apply_config_publishes_catalog_and_selection_as_one_presentation() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let tmp = tempfile::tempdir().expect("presentation config race home");
+    let mut old_cfg = config::Config::default();
+    old_cfg.models.default = Some("race-old".to_string());
+    old_cfg.config_models.insert(
+        "race-old".to_string(),
+        config::ConfigModelOverride {
+            model: Some("race-old".to_string()),
+            auth_scheme: Some(xai_grok_sampler::AuthScheme::None),
+            supports_reasoning_effort: Some(true),
+            reasoning_efforts: presentation_race_entry("race-old").info.reasoning_efforts,
+            ..Default::default()
+        },
+    );
+    let manager = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&old_cfg, None),
+        acp::ModelId::new("race-old"),
+        Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default())),
+        old_cfg,
+    )
+    .build();
+    manager.set_current_reasoning_effort(Some(ReasoningEffort::Low));
+    assert_coherent_presentation(&manager.presentation_snapshot(), "race-old");
+
+    let mut new_cfg = config::Config::default();
+    new_cfg.models.default = Some("race-new".to_string());
+    new_cfg.config_models.insert(
+        "race-new".to_string(),
+        config::ConfigModelOverride {
+            model: Some("race-new".to_string()),
+            auth_scheme: Some(xai_grok_sampler::AuthScheme::None),
+            supports_reasoning_effort: Some(true),
+            reasoning_efforts: presentation_race_entry("race-new").info.reasoning_efforts,
+            ..Default::default()
+        },
+    );
+    let (mid_tx, mid_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let writer = {
+        let manager = manager.clone();
+        std::thread::spawn(move || {
+            manager.apply_config_with_after_catalog_write_for_test(new_cfg, || {
+                mid_tx.send(()).expect("announce config catalog midpoint");
+                release_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("release config publication");
+            });
+        })
+    };
+    mid_rx.recv().expect("config writer reaches midpoint");
+    let (reader_started_tx, reader_started_rx) = mpsc::channel();
+    let reader = {
+        let manager = manager.clone();
+        std::thread::spawn(move || {
+            reader_started_tx
+                .send(())
+                .expect("announce config presentation read");
+            manager.presentation_snapshot()
+        })
+    };
+    reader_started_rx
+        .recv()
+        .expect("config presentation reader starts at midpoint");
+    assert!(manager.inner.catalog.try_read().is_none());
+    release_tx.send(()).expect("release config writer");
+    writer.join().expect("config writer finishes");
+    assert_coherent_presentation(
+        &reader.join().expect("presentation reader finishes"),
+        "race-new",
+    );
+}
+
+#[test]
+fn rebuild_publishes_catalog_and_selection_as_one_presentation() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let tmp = tempfile::tempdir().expect("presentation rebuild race home");
+    let old_catalog =
+        IndexMap::from([("race-old".to_string(), presentation_race_entry("race-old"))]);
+    let manager = ModelsManager::new(
+        None,
+        old_catalog,
+        acp::ModelId::new("race-old"),
+        Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default())),
+        config::Config::default(),
+    );
+    manager.set_current_reasoning_effort(Some(ReasoningEffort::Low));
+    assert_coherent_presentation(&manager.presentation_snapshot(), "race-old");
+
+    let mut cfg = config::Config::default();
+    cfg.models.default = Some("race-new".to_string());
+    let prefetched =
+        IndexMap::from([("race-new".to_string(), presentation_race_entry("race-new"))]);
+    let (mid_tx, mid_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let writer = {
+        let manager = manager.clone();
+        std::thread::spawn(move || {
+            manager.rebuild_with_after_catalog_write_for_test(&cfg, Some(prefetched), || {
+                mid_tx.send(()).expect("announce rebuild catalog midpoint");
+                release_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("release rebuild publication");
+            });
+        })
+    };
+    mid_rx.recv().expect("rebuild writer reaches midpoint");
+    let (reader_started_tx, reader_started_rx) = mpsc::channel();
+    let reader = {
+        let manager = manager.clone();
+        std::thread::spawn(move || {
+            reader_started_tx
+                .send(())
+                .expect("announce rebuild presentation read");
+            manager.presentation_snapshot()
+        })
+    };
+    reader_started_rx
+        .recv()
+        .expect("rebuild presentation reader starts at midpoint");
+    assert!(manager.inner.catalog.try_read().is_none());
+    release_tx.send(()).expect("release rebuild writer");
+    writer.join().expect("rebuild writer finishes");
+    assert_coherent_presentation(
+        &reader.join().expect("presentation reader finishes"),
+        "race-new",
+    );
+}
+
 #[test]
 fn current_reasoning_effort_round_trip() {
     let mgr = test_manager();

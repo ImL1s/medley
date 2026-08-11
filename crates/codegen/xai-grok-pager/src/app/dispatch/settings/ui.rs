@@ -77,8 +77,7 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                 available_models: agent
                     .session
                     .models
-                    .available
-                    .iter()
+                    .selectable_models()
                     .map(|(id, info)| (info.name.clone(), id.clone()))
                     .collect(),
                 coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
@@ -227,8 +226,7 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
         available_models: agent
             .session
             .models
-            .available
-            .iter()
+            .selectable_models()
             .map(|(id, info)| (info.name.clone(), id.clone()))
             .collect(),
         coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
@@ -713,8 +711,7 @@ fn agent_available_models(app: &AppView) -> Vec<(String, acp::ModelId)> {
         return agent
             .session
             .models
-            .available
-            .iter()
+            .selectable_models()
             .map(|(id, info)| (info.name.clone(), id.clone()))
             .collect();
     }

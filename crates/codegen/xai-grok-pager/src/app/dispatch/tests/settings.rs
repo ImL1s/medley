@@ -1346,6 +1346,42 @@ fn set_default_model_resolves_known_name() {
     ));
     assert_eq!(app.agents[&agent_id].session.models.current, Some(id));
 }
+
+#[test]
+fn settings_snapshot_displays_but_does_not_offer_unavailable_resident() {
+    use agent_client_protocol as acp;
+    use std::sync::Arc;
+
+    let mut app = test_app_with_agent();
+    let agent_id = AgentId(0);
+    let resident_id = acp::ModelId::new(Arc::from("retired"));
+    let resident_info = acp::ModelInfo::new(resident_id.clone(), "Retired Model".to_string()).meta(
+        serde_json::json!({ "unavailableResidentModel": true })
+            .as_object()
+            .cloned(),
+    );
+    let ready_id = acp::ModelId::new(Arc::from("ready"));
+    let ready_info = acp::ModelInfo::new(ready_id.clone(), "Ready Model".to_string());
+    {
+        let models = &mut app.agents.get_mut(&agent_id).unwrap().session.models;
+        models.available.insert(resident_id.clone(), resident_info);
+        models.available.insert(ready_id.clone(), ready_info);
+        models.current = Some(resident_id);
+    }
+
+    let snapshot = build_pager_snapshot(&app);
+    assert_eq!(
+        snapshot.current_model_name.as_deref(),
+        Some("Retired Model"),
+        "settings must continue to display the session's actual resident model"
+    );
+    assert_eq!(
+        snapshot.available_models,
+        vec![("Ready Model".to_string(), ready_id)],
+        "the displayed-only resident placeholder must not become a settings choice"
+    );
+}
+
 fn model_with_readiness_meta(
     id: &str,
     name: &str,

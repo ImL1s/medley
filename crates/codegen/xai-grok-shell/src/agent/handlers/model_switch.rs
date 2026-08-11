@@ -1,9 +1,8 @@
 //! Applies a model switch to a session.
 //!
-//! `set_session_model` enforces the `allowed_models` gate before delegating
-//! here. Credential / config readiness is enforced inside `apply` so internal
-//! callers (`new_session`, `load_session`, prompt restore) cannot attach an
-//! unready model (e.g. invalid `auth_scheme` fail-open → ambient Bearer).
+//! Authorization is enforced inside the serialized `apply` path so public and
+//! internal callers (`new_session`, `load_session`, prompt restore) cannot
+//! race auth visibility, `allowed_models`, catalog replacement, or readiness.
 use crate::agent::config;
 use crate::agent::models::model_offers_reasoning_effort;
 use crate::agent::mvp_agent::{
@@ -102,6 +101,37 @@ static CAPTURED_FAILURE_TELEMETRY: std::sync::LazyLock<std::sync::Mutex<Vec<serd
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
 #[cfg(test)]
+type DispatchBoundaryHook = Box<dyn FnOnce() + 'static>;
+
+#[cfg(test)]
+thread_local! {
+    static DISPATCH_BOUNDARY_HOOKS: std::cell::RefCell<
+        std::collections::HashMap<String, DispatchBoundaryHook>
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+#[cfg(test)]
+pub(crate) fn install_dispatch_boundary_hook(
+    session_id: &acp::SessionId,
+    hook: impl FnOnce() + 'static,
+) {
+    DISPATCH_BOUNDARY_HOOKS.with(|hooks| {
+        hooks
+            .borrow_mut()
+            .insert(session_id.0.to_string(), Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_dispatch_boundary_hook(session_id: &acp::SessionId) {
+    let hook =
+        DISPATCH_BOUNDARY_HOOKS.with(|hooks| hooks.borrow_mut().remove(session_id.0.as_ref()));
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn take_captured_failure_telemetry(session_id: &str) -> Vec<serde_json::Value> {
     let mut captured = CAPTURED_FAILURE_TELEMETRY.lock().unwrap();
     let mut matching = Vec::new();
@@ -117,8 +147,7 @@ pub(crate) fn take_captured_failure_telemetry(session_id: &str) -> Vec<serde_jso
 }
 /// Apply a model switch to a session.
 ///
-/// Always fail-closed on `model_readiness`. The ACP `allowed_models` gate still
-/// lives in `set_session_model` only.
+/// Always fail-closed on auth visibility, `allowed_models`, and readiness.
 pub(crate) async fn apply(
     agent: &MvpAgent,
     args: acp::SetSessionModelRequest,
@@ -188,53 +217,29 @@ async fn apply_with_load_gate(
     // outer-handle sequence with prompt intake and other model switches.
     let dispatch_lock = agent.dispatch_lock(&session_id);
     let _dispatch_guard = dispatch_lock.lock().await;
-    let requested_model_str = requested_model_id.0.as_ref();
+    #[cfg(test)]
+    run_dispatch_boundary_hook(&session_id);
+    let dispatch_authority = agent
+        .models_manager
+        .model_dispatch_authority(&requested_model_id)
+        .map_err(|reason| acp::Error::invalid_params().data(reason))?;
     let (catalog_identity, model) = if let Some((identity, model)) = restored_model {
-        if identity.model_id != requested_model_str || identity.route != model.info().model {
+        if identity != dispatch_authority.catalog_identity || identity.route != model.info().model {
             return Err(acp::Error::invalid_params()
                 .data("restored model no longer matches its committed catalog identity"));
         }
-        (identity, model)
+        (
+            dispatch_authority.catalog_identity.clone(),
+            dispatch_authority.model.clone(),
+        )
     } else {
-        let models = agent.models_manager.models();
-        let slug_matches: Vec<String> = models
-            .iter()
-            .filter(|(_, entry)| entry.info().model == requested_model_str)
-            .map(|(key, _)| key.clone())
-            .collect();
-        let Some(identity) =
-            crate::agent::models::resolve_catalog_identity(&models, &requested_model_id)
-        else {
-            if !models.contains_key(requested_model_str) && slug_matches.len() > 1 {
-                return Err(acp::Error::invalid_params().data(format!(
-                    "model slug '{}' matches multiple catalog ids: {}. \
-                     Choose an explicit catalog id.",
-                    requested_model_str,
-                    slug_matches.join(", ")
-                )));
-            }
-            return Err(acp::Error::invalid_params().data("unknown model id"));
-        };
-        let model = models
-            .get(identity.model_id.as_str())
-            .cloned()
-            .expect("resolve_catalog_key returned key present in models()");
-        (identity, model)
+        (
+            dispatch_authority.catalog_identity.clone(),
+            dispatch_authority.model.clone(),
+        )
     };
     let catalog_model_id = acp::ModelId::new(catalog_identity.model_id.clone());
     failure_telemetry.new_model_id = catalog_model_id.0.to_string();
-    let (ready, reason) = config::model_readiness(&model);
-    if !ready {
-        tracing::warn!(
-            session_id = %session_id.0,
-            model_id = %catalog_model_id.0,
-            model_slug = %model.info().model,
-            reason = ?reason,
-            "model_switch::apply: rejecting unready model (fail-closed)"
-        );
-        return Err(acp::Error::invalid_params()
-            .data(reason.unwrap_or_else(|| "model is not ready".to_owned())));
-    }
     if requested_model_id != catalog_model_id {
         tracing::info!(
             session_id = %session_id.0,
@@ -375,26 +380,29 @@ async fn apply_with_load_gate(
         resolve_model_switch_auto_compact_threshold_percent(&cfg, &catalog_model_id, &model)
     };
     let (tx, rx) = oneshot::channel();
-    handle
-        .cmd_tx
-        .send(SessionCommand::ApplyModelSwitch {
-            prepared: Box::new(crate::session::PreparedModelSwitch {
-                catalog_identity,
-                resolved_model: model.clone(),
-                sampling_config: model_sampling,
-                use_concise,
-                auto_compact_threshold_percent: new_threshold,
-                required_agent_type: required_agent_type.clone(),
-                required_definition,
-                summary_sampling_config,
-                replace_inherited_web_search: web_search_follows_default,
-                web_search_sampling_config,
-                web_search_disable_notice,
-                web_search_alpha_test_key: agent.alpha_test_key(),
-                image_description_model,
-            }),
-            responds_to: tx,
+    agent
+        .models_manager
+        .commit_model_dispatch(&dispatch_authority, || {
+            handle.cmd_tx.send(SessionCommand::ApplyModelSwitch {
+                prepared: Box::new(crate::session::PreparedModelSwitch {
+                    catalog_identity,
+                    resolved_model: model.clone(),
+                    sampling_config: model_sampling,
+                    use_concise,
+                    auto_compact_threshold_percent: new_threshold,
+                    required_agent_type: required_agent_type.clone(),
+                    required_definition,
+                    summary_sampling_config,
+                    replace_inherited_web_search: web_search_follows_default,
+                    web_search_sampling_config,
+                    web_search_disable_notice,
+                    web_search_alpha_test_key: agent.alpha_test_key(),
+                    image_description_model,
+                }),
+                responds_to: tx,
+            })
         })
+        .map_err(|reason| acp::Error::invalid_params().data(reason))?
         .map_err(|_| acp::Error::internal_error().data("model_switch: session actor closed"))?;
     let receipt = match rx.await {
         Ok(Ok(receipt)) => receipt,

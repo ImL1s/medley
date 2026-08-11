@@ -145,9 +145,34 @@ pub(crate) struct SessionModelAuthoritySnapshot {
     pub(crate) campaign_eligible: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CurrentModelSelectionSnapshot {
-    pub(crate) model_id: acp::ModelId,
+/// Short-lived authority captured before preparing an actor dispatch.
+///
+/// Callers may perform asynchronous preparation after capturing this value,
+/// but must pass it to [`ModelsManager::commit_model_dispatch`] immediately
+/// around the final synchronous channel send. That commit rejects any auth or
+/// catalog generation change rather than dispatching a stale model decision.
+pub(crate) struct ModelDispatchAuthoritySnapshot {
+    pub(crate) auth_generation: u64,
+    is_session_auth: bool,
+    pub(crate) catalog_generation: u64,
+    pub(crate) catalog_identity: xai_chat_state::CatalogIdentity,
+    pub(crate) model: ModelEntry,
+}
+
+/// One auth-stable view of every field used to present model state to clients.
+///
+/// Captured under the global `catalog -> selection_commit -> current -> effort`
+/// order.  Keeping the owned catalog alongside its ACP projection lets session
+/// configuration derive effort menus from the exact catalog generation that
+/// produced `available_models` and `current_model_id`. The wire invariant is:
+/// `current_model_id` is a key in `available`, or both are empty to represent a
+/// fail-closed unavailable state. A routing-slug selection is normalized to its
+/// unique catalog key before publication.
+#[derive(Clone)]
+pub(crate) struct ModelPresentationSnapshot {
+    pub(crate) catalog: IndexMap<String, ModelEntry>,
+    pub(crate) available: IndexMap<acp::ModelId, acp::ModelInfo>,
+    pub(crate) current_model_id: acp::ModelId,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
 }
 
@@ -415,6 +440,107 @@ impl ModelsManager {
         self.inner.catalog_generation.load(Ordering::Acquire)
     }
 
+    /// Resolve one selectable, auth-visible, ready model from a stable auth and
+    /// catalog generation. This is the prepare half of the dispatch protocol;
+    /// [`Self::commit_model_dispatch`] must still guard the final send.
+    pub(crate) fn model_dispatch_authority(
+        &self,
+        requested_model_id: &acp::ModelId,
+    ) -> Result<ModelDispatchAuthoritySnapshot, String> {
+        let mut retries = 0usize;
+        loop {
+            let auth = self.inner.auth_manager.selection_snapshot();
+            let catalog = self.inner.catalog.read();
+            let catalog_generation = self.catalog_generation();
+            let Some(catalog_identity) =
+                resolve_catalog_identity(&catalog.models, requested_model_id)
+            else {
+                return Err("unknown model id".to_owned());
+            };
+            let model = catalog
+                .models
+                .get(catalog_identity.model_id.as_str())
+                .cloned()
+                .expect("resolved catalog identity has a catalog entry");
+            let authorized =
+                model.info().user_selectable && model.info().visible_for_auth(auth.is_session_auth);
+            let (ready, reason) = config::model_readiness(&model);
+            if self
+                .inner
+                .auth_manager
+                .selection_generation_is_current(auth.generation)
+            {
+                if !authorized {
+                    return Err(
+                        "This model is not available for the current authentication mode or allowed_models setting."
+                            .to_owned(),
+                    );
+                }
+                if !ready {
+                    return Err(reason.unwrap_or_else(|| "model is not ready".to_owned()));
+                }
+                return Ok(ModelDispatchAuthoritySnapshot {
+                    auth_generation: auth.generation,
+                    is_session_auth: auth.is_session_auth,
+                    catalog_generation,
+                    catalog_identity,
+                    model,
+                });
+            }
+            drop(catalog);
+            retries += 1;
+            if retries >= IMPLICIT_SELECTION_RETRY_YIELD_AFTER {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    /// Hold the catalog read guard, then seal the captured auth generation,
+    /// only for the final synchronous dispatch. This order matches catalog
+    /// writers that may consult auth while holding `catalog.write()`; taking
+    /// the odd auth seal first would deadlock against such a writer. No seal or
+    /// sync guard crosses an `.await`.
+    pub(crate) fn commit_model_dispatch<R>(
+        &self,
+        authority: &ModelDispatchAuthoritySnapshot,
+        dispatch: impl FnOnce() -> R,
+    ) -> Result<R, String> {
+        let catalog = self.inner.catalog.read();
+        let Some(_auth_seal) = self
+            .inner
+            .auth_manager
+            .try_seal_selection(authority.auth_generation)
+        else {
+            return Err("model authorization changed before dispatch; retry".to_owned());
+        };
+        if self.catalog_generation() != authority.catalog_generation {
+            return Err("model catalog changed before dispatch; retry".to_owned());
+        }
+        let Some(current_identity) = resolve_catalog_identity(
+            &catalog.models,
+            &acp::ModelId::new(authority.catalog_identity.model_id.clone()),
+        ) else {
+            return Err("model is no longer available".to_owned());
+        };
+        if current_identity != authority.catalog_identity {
+            return Err("model route changed before dispatch; retry".to_owned());
+        }
+        let model = catalog
+            .models
+            .get(current_identity.model_id.as_str())
+            .expect("resolved catalog identity has a catalog entry");
+        if !model.info().user_selectable
+            || !model.info().visible_for_auth(authority.is_session_auth)
+        {
+            return Err("model is no longer allowed".to_owned());
+        }
+        let (ready, reason) = config::model_readiness(model);
+        if !ready {
+            return Err(reason.unwrap_or_else(|| "model is not ready".to_owned()));
+        }
+        Ok(dispatch())
+    }
+
     fn bump_catalog_generation(&self) {
         self.inner
             .catalog_generation
@@ -597,6 +723,18 @@ impl ModelsManager {
 
     /// Swap config, rebuild catalog, and reselect the model.
     pub(crate) fn apply_config(&self, new_config: config::Config) {
+        #[cfg(test)]
+        self.apply_config_inner(new_config, false, || {});
+        #[cfg(not(test))]
+        self.apply_config_inner(new_config, false);
+    }
+
+    fn apply_config_inner(
+        &self,
+        new_config: config::Config,
+        force_default: bool,
+        #[cfg(test)] mut after_catalog_write: impl FnMut(),
+    ) {
         if let Err(e) = new_config.validate_model_filters() {
             tracing::error!(error = %e, "ignoring config reload: invalid model filters");
             return;
@@ -621,18 +759,6 @@ impl ModelsManager {
         *self.inner.fetch_auth.write() =
             ModelFetchAuth::resolve(&new_config.endpoints, has_session);
         *self.inner.cfg.write() = new_config.clone();
-        {
-            let mut cat = self.inner.catalog.write();
-            if has_real_catalog {
-                cat.allowlist_excludes_all = allowlist_matches_nothing(&new_config, &new_catalog);
-            }
-            cat.models = new_catalog;
-        }
-        // Catalog contents changed (config-driven re-resolve); invalidate
-        // generation-keyed auth memos even when the config-watcher also
-        // broadcasts InvalidateModelAuthMemo.
-        self.bump_catalog_generation();
-
         let preferred_changed = new_preferred != old_preferred && new_preferred.is_some();
         let mut campaign_defaults = std::collections::HashSet::new();
         if new_config.models.default_is_campaign_driven
@@ -645,30 +771,49 @@ impl ModelsManager {
         }
         let campaign_only_flip =
             is_campaign_only_flip(&old_preferred, &new_preferred, &campaign_defaults);
-        let current_still_ok = {
-            let cat = self.inner.catalog.read();
-            let models = &cat.models;
-            let cur = self.inner.current_model_id.read();
-            models.get(cur.0.as_ref()).is_some_and(|e| {
-                e.info.user_selectable && e.info.visible_for_auth(self.is_session_auth())
-            })
+        let changed = {
+            // Publish catalog and selection as one transaction. Presentation
+            // readers take the same catalog -> selection -> current order.
+            let mut cat = self.inner.catalog.write();
+            if has_real_catalog {
+                cat.allowlist_excludes_all = allowlist_matches_nothing(&new_config, &new_catalog);
+            }
+            cat.models = new_catalog;
+            #[cfg(test)]
+            after_catalog_write();
+            let force_default = force_default || (preferred_changed && !campaign_only_flip);
+            let changed =
+                self.reselect_after_catalog_change_locked(&new_config, &cat, force_default);
+            self.bump_catalog_generation();
+            changed
         };
-        if preferred_changed && !(campaign_only_flip && current_still_ok) {
-            self.reselect_default_model(&new_config);
-        } else {
-            self.reselect_current_model_if_missing(&new_config);
+        if changed {
+            self.publish_model_switch();
         }
-        self.revalidate_current_reasoning_effort();
 
         self.notify_models_updated();
     }
 
     /// [`Self::apply_config`] plus an unconditional default re-resolve, for remote-settings arrival while no session exists.
     pub(crate) fn apply_config_reselecting_default(&self, new_config: config::Config) {
-        self.apply_config(new_config.clone());
-        self.reselect_default_model(&new_config);
-        self.revalidate_current_reasoning_effort();
-        self.notify_models_updated();
+        #[cfg(test)]
+        self.apply_config_inner(new_config, true, || {});
+        #[cfg(not(test))]
+        self.apply_config_inner(new_config, true);
+    }
+
+    #[cfg(test)]
+    fn apply_config_with_after_catalog_write_for_test(
+        &self,
+        new_config: config::Config,
+        after_catalog_write: impl FnOnce(),
+    ) {
+        let mut after_catalog_write = Some(after_catalog_write);
+        self.apply_config_inner(new_config, false, || {
+            if let Some(after_catalog_write) = after_catalog_write.take() {
+                after_catalog_write();
+            }
+        });
     }
 
     // ── Accessors ───────────────────────────────────────────────────
@@ -1065,6 +1210,91 @@ impl ModelsManager {
         self.models_and_available().1
     }
 
+    /// Capture catalog, ACP projection, current selection, and effort from one
+    /// auth-stable publication. If auth changes while the snapshot is being
+    /// built, discard it and retry rather than mixing visibility rules from one
+    /// credential generation with selection state from another.
+    pub(crate) fn presentation_snapshot(&self) -> ModelPresentationSnapshot {
+        #[cfg(test)]
+        return self.presentation_snapshot_inner(|| {});
+        #[cfg(not(test))]
+        self.presentation_snapshot_inner()
+    }
+
+    fn presentation_snapshot_inner(
+        &self,
+        #[cfg(test)] mut after_catalog_snapshot: impl FnMut(),
+    ) -> ModelPresentationSnapshot {
+        let mut retries = 0usize;
+        loop {
+            let auth = self.inner.auth_manager.selection_snapshot();
+            let catalog = self.inner.catalog.read();
+            #[cfg(test)]
+            after_catalog_snapshot();
+            let selection_commit = self.inner.selection_commit.read();
+            let current = self.inner.current_model_id.read();
+            let effort = self.inner.current_reasoning_effort.read();
+            let owned_catalog = catalog.models.clone();
+            let selectable = owned_catalog
+                .iter()
+                .filter(|(_, entry)| entry.info.user_selectable)
+                .map(|(key, entry)| (key.clone(), entry.clone()))
+                .collect();
+            let mut available = available_models(&selectable, auth.is_session_auth);
+            let resolved_current = resolve_catalog_key(&owned_catalog, &current)
+                .filter(|model_id| available.contains_key(model_id));
+            let (current_model_id, reasoning_effort) = match resolved_current {
+                Some(model_id) => {
+                    let effort = (*effort).filter(|effort| {
+                        owned_catalog.get(model_id.0.as_ref()).is_some_and(|entry| {
+                            model_offers_reasoning_effort(entry.info(), *effort)
+                        })
+                    });
+                    (model_id, effort)
+                }
+                None => {
+                    // Auth can change immediately before `on_auth_changed`
+                    // obtains the model publication locks. Never publish the
+                    // old hidden/missing selection beside a new visibility
+                    // projection. The writer will reconcile shortly; this
+                    // transient state is deliberately unusable rather than a
+                    // reader-invented replacement for sampler authority.
+                    available.clear();
+                    (acp::ModelId::new(String::new()), None)
+                }
+            };
+            let snapshot = ModelPresentationSnapshot {
+                catalog: owned_catalog,
+                available,
+                current_model_id,
+                reasoning_effort,
+            };
+            drop(effort);
+            drop(current);
+            drop(selection_commit);
+            if self
+                .inner
+                .auth_manager
+                .selection_generation_is_current(auth.generation)
+            {
+                return snapshot;
+            }
+            drop(catalog);
+            retries += 1;
+            if retries >= IMPLICIT_SELECTION_RETRY_YIELD_AFTER {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn presentation_snapshot_with_after_catalog_snapshot(
+        &self,
+        mut after_catalog_snapshot: impl FnMut(),
+    ) -> ModelPresentationSnapshot {
+        self.presentation_snapshot_inner(|| after_catalog_snapshot())
+    }
+
     pub(crate) fn task_model_error(&self, requested: &str) -> Option<String> {
         let is_session_auth = self.is_session_auth();
         let cat = self.inner.catalog.read();
@@ -1074,39 +1304,6 @@ impl ModelsManager {
 
     pub fn current_model_id(&self) -> acp::ModelId {
         self.inner.current_model_id.read().clone()
-    }
-
-    pub(crate) fn current_model_selection_snapshot(&self) -> CurrentModelSelectionSnapshot {
-        #[cfg(test)]
-        return self.current_model_selection_snapshot_inner(|| {});
-        #[cfg(not(test))]
-        self.current_model_selection_snapshot_inner()
-    }
-
-    fn current_model_selection_snapshot_inner(
-        &self,
-        #[cfg(test)] before_selection_snapshot: impl FnOnce(),
-    ) -> CurrentModelSelectionSnapshot {
-        #[cfg(test)]
-        before_selection_snapshot();
-        let selection_commit = self.inner.selection_commit.read();
-        let current = self.inner.current_model_id.read();
-        let model_id = current.clone();
-        let reasoning_effort = *self.inner.current_reasoning_effort.read();
-        drop(current);
-        drop(selection_commit);
-        CurrentModelSelectionSnapshot {
-            model_id,
-            reasoning_effort,
-        }
-    }
-
-    #[cfg(test)]
-    fn current_model_selection_snapshot_with_before_selection_snapshot(
-        &self,
-        before_selection_snapshot: impl FnOnce(),
-    ) -> CurrentModelSelectionSnapshot {
-        self.current_model_selection_snapshot_inner(before_selection_snapshot)
     }
 
     /// The configured default that resolve fell through on (absent from the
@@ -1476,16 +1673,137 @@ impl ModelsManager {
 
     // ── Mutations ───────────────────────────────────────────────────
 
+    /// Seat a selection compatible with `cat` while its write guard is held.
+    /// Returns whether the current id changed; callers publish the watch event
+    /// only after releasing the catalog transaction.
+    fn reselect_after_catalog_change_locked(
+        &self,
+        config: &config::Config,
+        cat: &CatalogState,
+        force_default: bool,
+    ) -> bool {
+        let mut retries = 0usize;
+        loop {
+            let auth = self.inner.auth_manager.selection_snapshot();
+            let usable_xai = Self::usable_ambient_xai_from_snapshot(config, auth);
+            let models = &cat.models;
+            let (key, _, source, _) = resolve_default_model_for_catalog_with_usable_xai(
+                config,
+                models,
+                auth.is_session_auth,
+                cat.has_fetched_real_catalog,
+                usable_xai,
+            );
+            let selection_commit = self.inner.selection_commit.write();
+            let mut current = self.inner.current_model_id.write();
+            let old = current.clone();
+            let user_picked = self.inner.user_selected_model.load(Ordering::Relaxed);
+            let current_ok = models.get(old.0.as_ref()).is_some_and(|entry| {
+                entry.info.user_selectable
+                    && entry.info.visible_for_auth(auth.is_session_auth)
+                    && (user_picked
+                        || usable_xai
+                        || !resolution::is_first_party_ambient_xai_entry(entry)
+                        || !models.values().any(|candidate| {
+                            resolution::is_ready_selectable_openai_codex_entry(
+                                candidate,
+                                auth.is_session_auth,
+                            )
+                        }))
+            });
+            let had_substitution = self.substituted_preference().is_some();
+            let honour_explicit_preference = !force_default
+                && had_substitution
+                && !user_picked
+                && key.as_str() != old.0.as_ref()
+                && resolution::is_explicit_preference(source);
+            let new_id = if force_default || !current_ok || honour_explicit_preference {
+                acp::ModelId::new(Arc::from(key))
+            } else {
+                old.clone()
+            };
+            if !self
+                .inner
+                .auth_manager
+                .selection_generation_is_current(auth.generation)
+            {
+                drop(current);
+                drop(selection_commit);
+                retries += 1;
+                if retries >= IMPLICIT_SELECTION_RETRY_YIELD_AFTER {
+                    std::thread::yield_now();
+                }
+                continue;
+            }
+            let changed = old != new_id;
+            *current = new_id.clone();
+            if !self
+                .inner
+                .auth_manager
+                .selection_generation_is_current(auth.generation)
+            {
+                *current = old;
+                drop(current);
+                drop(selection_commit);
+                retries += 1;
+                if retries >= IMPLICIT_SELECTION_RETRY_YIELD_AFTER {
+                    std::thread::yield_now();
+                }
+                continue;
+            }
+            self.revalidate_reasoning_effort_locked(models, &new_id);
+            *self.inner.substituted_preference.write() =
+                resolution::substituted_preference(config, source);
+            return changed;
+        }
+    }
+
     fn rebuild(&self, cfg: &config::Config, prefetched: Option<IndexMap<String, ModelEntry>>) {
+        #[cfg(test)]
+        self.rebuild_inner(cfg, prefetched, || {});
+        #[cfg(not(test))]
+        self.rebuild_inner(cfg, prefetched);
+    }
+
+    fn rebuild_inner(
+        &self,
+        cfg: &config::Config,
+        prefetched: Option<IndexMap<String, ModelEntry>>,
+        #[cfg(test)] mut after_catalog_write: impl FnMut(),
+    ) {
         // Mutate, then bump — same order as apply_catalog / apply_config.
         // `on_auth_changed` reaches this via the bundled-fallback branch when a
         // remote fetch fails (or remote_fetch is off) and no real catalog was
         // ever published; without the bump, a session auth memo under the prior
         // generation would outlive a wholesale models replacement that may have
         // dropped its subject (#159 F1).
-        self.inner.catalog.write().models = resolve_model_catalog(cfg, prefetched);
-        self.bump_catalog_generation();
-        self.revalidate_current_reasoning_effort();
+        let changed = {
+            let mut cat = self.inner.catalog.write();
+            cat.models = resolve_model_catalog(cfg, prefetched);
+            #[cfg(test)]
+            after_catalog_write();
+            let changed = self.reselect_after_catalog_change_locked(cfg, &cat, false);
+            self.bump_catalog_generation();
+            changed
+        };
+        if changed {
+            self.publish_model_switch();
+        }
+    }
+
+    #[cfg(test)]
+    fn rebuild_with_after_catalog_write_for_test(
+        &self,
+        cfg: &config::Config,
+        prefetched: Option<IndexMap<String, ModelEntry>>,
+        after_catalog_write: impl FnOnce(),
+    ) {
+        let mut after_catalog_write = Some(after_catalog_write);
+        self.rebuild_inner(cfg, prefetched, || {
+            if let Some(after_catalog_write) = after_catalog_write.take() {
+                after_catalog_write();
+            }
+        });
     }
 
     /// Refresh models when the etag changes.
@@ -1514,10 +1832,16 @@ impl ModelsManager {
         let has_session = self.inner.auth_manager.current_or_expired().is_some();
         let fetch_auth = ModelFetchAuth::resolve(&config.endpoints, has_session);
         *self.inner.fetch_auth.write() = fetch_auth;
+        // Auth visibility changes independently of catalog contents. Repair
+        // the authoritative selection before any await/fetch so concurrent
+        // model-state readers do not remain stranded on a session-only model
+        // after logout (or its API-only inverse after login).
+        self.reconcile_selection_for_auth_change(&config);
         if self.inner.auth_manager.current_or_expired().is_none()
             && fetch_auth == ModelFetchAuth::Session
         {
             self.clear();
+            self.notify_models_updated();
             return;
         }
 
@@ -1542,7 +1866,6 @@ impl ModelsManager {
                 tracing::debug!("model catalog: bundled defaults in use (remote_fetch disabled)");
             }
             self.rebuild(&config, None);
-            self.reselect_current_model_if_missing(&config);
 
             if remote_fetch_enabled {
                 self.spawn_catalog_retry();
@@ -1552,16 +1875,21 @@ impl ModelsManager {
         self.notify_models_updated();
     }
 
+    fn reconcile_selection_for_auth_change(&self, config: &config::Config) {
+        if !self.inner.catalog.read().models.is_empty() {
+            self.reselect_current_model_if_missing(config);
+        }
+    }
+
     fn notify_models_updated(&self) {
-        let available = self.available();
-        let current = self.current_model_id();
-        let count = available.len();
+        let snapshot = self.presentation_snapshot();
+        let count = snapshot.available.len();
         xai_grok_telemetry::unified_log::info(
             "model catalog: notifying clients",
             None,
             Some(serde_json::json!({
                 "model_count": count,
-                "current_model_id": current.0.as_ref(),
+                "current_model_id": snapshot.current_model_id.0.as_ref(),
             })),
         );
         if let Some(ref gw) = *self.inner.gateway.read() {
@@ -1576,8 +1904,10 @@ impl ModelsManager {
             // `SessionModelState._meta` (inside the update params). Same key
             // name, different JSON path — first consumers must branch.
             // JSON `null` means "no longer substituted".
-            let mut model_state =
-                acp::SessionModelState::new(current, available.values().cloned().collect());
+            let mut model_state = acp::SessionModelState::new(
+                snapshot.current_model_id,
+                snapshot.available.into_values().collect(),
+            );
             let mut meta = serde_json::Map::new();
             self.write_substituted_default_model_meta(&mut meta, true);
             model_state = model_state.meta(meta);
@@ -1814,8 +2144,10 @@ impl ModelsManager {
         #[cfg(test)]
         after_catalog_lock();
         let selection_commit = self.inner.selection_commit.write();
-        let current = self.inner.current_model_id.write();
+        let mut current = self.inner.current_model_id.write();
+        let changed = !current.0.is_empty();
         *catalog = CatalogState::default();
+        *current = acp::ModelId::new(String::new());
         self.inner
             .user_selected_model
             .store(false, Ordering::Relaxed);
@@ -1825,6 +2157,9 @@ impl ModelsManager {
         drop(current);
         drop(selection_commit);
         drop(catalog);
+        if changed {
+            self.publish_model_switch();
+        }
     }
 
     #[cfg(test)]
@@ -2680,92 +3015,6 @@ mod selection_atomicity_tests {
     }
 
     #[test]
-    fn model_selection_snapshot_never_observes_old_model_with_new_effort() {
-        let tmp = tempfile::tempdir().expect("temp atomic model-effort snapshot home");
-        let mut catalog = IndexMap::new();
-        catalog.insert(
-            "grok-a".to_string(),
-            ready_xai_entry_with_efforts("grok-a", &[ReasoningEffort::Low, ReasoningEffort::High]),
-        );
-        catalog.insert(
-            "grok-b".to_string(),
-            ready_xai_entry_with_efforts("grok-b", &[ReasoningEffort::High]),
-        );
-        let manager = ModelsManager::new(
-            None,
-            catalog,
-            acp::ModelId::new("grok-a"),
-            Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default())),
-            config::Config::default(),
-        );
-        manager.set_current_reasoning_effort(Some(ReasoningEffort::Low));
-
-        let (selection_midpoint_tx, selection_midpoint_rx) = mpsc::channel();
-        let (release_selection_tx, release_selection_rx) = mpsc::channel();
-        let writer = {
-            let manager = manager.clone();
-            std::thread::spawn(move || {
-                manager.set_current_model_and_reasoning_effort_with_before_id_publish(
-                    acp::ModelId::new("grok-b"),
-                    Some(ReasoningEffort::High),
-                    || {
-                        selection_midpoint_tx
-                            .send(())
-                            .expect("announce model/effort commit midpoint");
-                        release_selection_rx
-                            .recv_timeout(Duration::from_secs(5))
-                            .expect("release model/effort commit");
-                    },
-                );
-            })
-        };
-        selection_midpoint_rx
-            .recv()
-            .expect("model/effort writer must reach its commit midpoint");
-
-        let (reader_started_tx, reader_started_rx) = mpsc::channel();
-        let (reader_reached_selection_tx, reader_reached_selection_rx) = mpsc::channel();
-        let reader = {
-            let manager = manager.clone();
-            std::thread::spawn(move || {
-                reader_started_tx
-                    .send(())
-                    .expect("announce model/effort snapshot reader start");
-                manager.current_model_selection_snapshot_with_before_selection_snapshot(|| {
-                    reader_reached_selection_tx
-                        .send(())
-                        .expect("announce model/effort snapshot selection boundary");
-                })
-            })
-        };
-        reader_started_rx
-            .recv()
-            .expect("model/effort snapshot reader must start");
-        reader_reached_selection_rx
-            .recv()
-            .expect("model/effort snapshot reader must reach selection boundary");
-        assert!(
-            manager.inner.selection_commit.try_read().is_none(),
-            "the snapshot reader must remain excluded from the writer midpoint"
-        );
-
-        release_selection_tx
-            .send(())
-            .expect("release model/effort selection");
-        writer.join().expect("model/effort writer must finish");
-        let snapshot = reader
-            .join()
-            .expect("model/effort snapshot reader must finish");
-        assert_eq!(snapshot.model_id.0.as_ref(), "grok-b");
-        assert_eq!(snapshot.reasoning_effort, Some(ReasoningEffort::High));
-        assert_ne!(
-            (snapshot.model_id.0.as_ref(), snapshot.reasoning_effort),
-            ("grok-a", Some(ReasoningEffort::High)),
-            "grok-a accepts high, so validity filtering cannot hide a torn A/high snapshot"
-        );
-    }
-
-    #[test]
     fn authority_reader_never_sees_new_catalog_with_old_selection() {
         let tmp = tempfile::tempdir().expect("temp first-catalog selection home");
         let mut cfg = config::Config::default();
@@ -2951,6 +3200,10 @@ mod selection_atomicity_tests {
         reselection.join().expect("reselection must finish");
         clear.join().expect("clear must finish after reselection");
         assert!(manager.models().is_empty());
+        assert!(manager.current_model_id().0.is_empty());
+        let presentation = manager.presentation_snapshot();
+        assert!(presentation.current_model_id.0.is_empty());
+        assert!(presentation.available.is_empty());
         assert!(manager.substituted_preference().is_none());
         assert_eq!(manager.current_reasoning_effort(), None);
     }
@@ -3016,6 +3269,7 @@ mod selection_atomicity_tests {
         clear.join().expect("clear must finish");
         assert!(!manager.inner.user_selected_model.load(Ordering::Relaxed));
         assert_eq!(manager.current_reasoning_effort(), None);
+        assert!(manager.current_model_id().0.is_empty());
         assert!(manager.models().is_empty());
     }
 }

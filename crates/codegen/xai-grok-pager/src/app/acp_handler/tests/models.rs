@@ -75,6 +75,74 @@
     }
 
     #[test]
+    fn models_update_preserves_unavailable_resident_as_display_only() {
+        let mut app = make_app_with_agent("sess-1");
+        let resident_id = acp::ModelId::new(std::sync::Arc::from("retired"));
+        let resident_info = acp::ModelInfo::new(
+            resident_id.clone(),
+            "Retired Model (unavailable)".to_string(),
+        )
+        .meta(
+            serde_json::json!({ "unavailableResidentModel": true })
+                .as_object()
+                .cloned(),
+        );
+        {
+            let models = &mut app
+                .agents
+                .get_mut(&AgentId(0))
+                .expect("active agent")
+                .session
+                .models;
+            models
+                .available
+                .insert(resident_id.clone(), resident_info.clone());
+            models.current = Some(resident_id.clone());
+        }
+
+        let notif = make_models_update_notif("ready", &["ready"]);
+        assert!(handle_models_update(&notif, &mut app));
+
+        let agent_models = &app.agents[&AgentId(0)].session.models;
+        assert_eq!(agent_models.current.as_ref(), Some(&resident_id));
+        assert_eq!(agent_models.available.get(&resident_id), Some(&resident_info));
+        assert_eq!(
+            agent_models.current_model_name().as_deref(),
+            Some("Retired Model (unavailable)")
+        );
+        assert!(agent_models.resolve_by_name_or_id("retired").is_none());
+        assert_eq!(
+            agent_models.next_model().as_ref().map(|id| id.0.as_ref()),
+            Some("ready"),
+            "model cycle must leave the placeholder and enter the selectable catalog"
+        );
+        assert_eq!(
+            agent_models
+                .selectable_models()
+                .map(|(id, _)| id.0.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["ready"]
+        );
+
+        assert_eq!(app.models.current.as_ref(), Some(&resident_id));
+        assert_eq!(app.models.available.get(&resident_id), Some(&resident_info));
+        let snapshot = crate::app::dispatch::build_pager_snapshot(&app);
+        assert_eq!(
+            snapshot.current_model_name.as_deref(),
+            Some("Retired Model (unavailable)")
+        );
+        assert_eq!(
+            snapshot
+                .available_models
+                .iter()
+                .map(|(_, id)| id.0.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["ready"],
+            "settings picker must exclude the display-only resident"
+        );
+    }
+
+    #[test]
     fn models_update_uses_shell_default_when_agent_model_removed() {
         let mut app = make_app_with_agent("sess-1");
 
@@ -441,4 +509,3 @@
             "unrelated-session broadcast must not touch this agent's model"
         );
     }
-

@@ -6,6 +6,37 @@ use super::*;
 use crate::auth::SilentRefresh;
 use crate::leader::protocol::InternalMethod;
 
+#[cfg(test)]
+type PromptDispatchBoundaryHook = Box<dyn FnOnce() + 'static>;
+
+#[cfg(test)]
+thread_local! {
+    static PROMPT_DISPATCH_BOUNDARY_HOOKS: std::cell::RefCell<
+        std::collections::HashMap<String, PromptDispatchBoundaryHook>
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+#[cfg(test)]
+pub(crate) fn install_prompt_dispatch_boundary_hook(
+    session_id: &acp::SessionId,
+    hook: impl FnOnce() + 'static,
+) {
+    PROMPT_DISPATCH_BOUNDARY_HOOKS.with(|hooks| {
+        hooks
+            .borrow_mut()
+            .insert(session_id.0.to_string(), Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_prompt_dispatch_boundary_hook(session_id: &acp::SessionId) {
+    let hook = PROMPT_DISPATCH_BOUNDARY_HOOKS
+        .with(|hooks| hooks.borrow_mut().remove(session_id.0.as_ref()));
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 pub(super) fn has_advertised_auth_provider_command(
     config: &crate::auth::GrokComConfig,
 ) -> bool {
@@ -1174,9 +1205,11 @@ impl acp::Agent for MvpAgent {
             .as_ref()
             .map(|plan| plan.session_model_id.clone())
             .unwrap_or_else(|| self.models_manager.current_model_id());
-        // A model-declared harness is a prerequisite, not a best-effort hint.
-        // Resolve it only after both explicit and default-model paths have
-        // selected their harness, but before persistence or actor creation.
+        // An exact model-declared harness is a prerequisite, not a best-effort
+        // hint. Stock non-strict harnesses intentionally allow an explicit
+        // agent profile (including its own ready model pin) to keep its prompt
+        // and tool configuration. Validate strict, plugin/file-backed, and
+        // unresolved harnesses before persistence or actor creation.
         if let Some(required_agent_type) = model_agent_type.as_deref() {
             let plugin_registry = self.plugin_registry_handle.snapshot();
             let selected_agent = {
@@ -1196,7 +1229,10 @@ impl acp::Agent for MvpAgent {
                     cwd.as_path(),
                     plugin_registry.as_deref(),
                 );
-            if !harnesses_are_compatible(
+            let requires_exact_harness = required_definition
+                .as_ref()
+                .is_none_or(definition_requires_exact_harness);
+            if requires_exact_harness && !harnesses_are_compatible(
                 &selected_agent,
                 required_agent_type,
                 required_definition.as_ref(),
@@ -1446,14 +1482,17 @@ impl acp::Agent for MvpAgent {
             Some(session_id.0.as_ref()),
             Some(serde_json::json!({"cwd": cwd.as_str()})),
         );
-        let models = if is_chat_kind {
-            chat_new_session_model_state(
-                self.chat_modes.model_state().await,
-                session_initial_model
-                    .filter(|_| matches!(bridge_attach, BridgeAttach::Spawned)),
+        let (models, model_presentation) = if is_chat_kind {
+            (
+                chat_new_session_model_state(
+                    self.chat_modes.model_state().await,
+                    session_initial_model
+                        .filter(|_| matches!(bridge_attach, BridgeAttach::Spawned)),
+                ),
+                self.models_manager.presentation_snapshot(),
             )
         } else {
-            self.model_state(Some(&session_id))
+            self.model_state_with_presentation(Some(&session_id))
         };
         let applied_tool_overrides = match self
             .session_handle_waiting_for_load(&session_id)
@@ -1477,12 +1516,13 @@ impl acp::Agent for MvpAgent {
             "feedbackEnabled": feedback_enabled,
         });
         if let Some(obj) = meta.as_object_mut() {
-            self.insert_session_config_meta(
+            self.insert_session_config_meta_with_presentation(
                 obj,
                 &session_id,
                 cwd.as_str().to_owned(),
                 None,
                 &models,
+                &model_presentation,
             );
             insert_applied_tool_overrides(obj, applied_tool_overrides.as_ref());
         }
@@ -2724,13 +2764,15 @@ impl acp::Agent for MvpAgent {
                 .recompute_web_search_disable_notice_for_session(&session_id)
                 .await;
         }
-        let model_state = self.model_state(Some(&session_id));
-        self.insert_session_config_meta(
+        let (model_state, model_presentation) =
+            self.model_state_with_presentation(Some(&session_id));
+        self.insert_session_config_meta_with_presentation(
             &mut response_meta_map,
             &session_id,
             session_cwd.clone().unwrap_or_default(),
             summary.display_title_opt(),
             &model_state,
+            &model_presentation,
         );
         let applied_tool_overrides = {
             let cmd_tx = self
@@ -2847,11 +2889,66 @@ impl acp::Agent for MvpAgent {
                 .await;
             return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
         }
+        if self
+            .session_registry
+            .unavailable_model(&arguments.session_id)
+            .is_none()
+        {
+            let presentation = self.models_manager.presentation_snapshot();
+            let resident_model = handle.model_id.clone();
+            let resolved_model = crate::agent::models::resolve_catalog_key(
+                &presentation.catalog,
+                &resident_model,
+            );
+            let normalized_model = resolved_model
+                .clone()
+                .unwrap_or_else(|| resident_model.clone());
+            if normalized_model != resident_model {
+                self.with_resident_mut(&arguments.session_id, |resident| {
+                    resident.model_id = normalized_model.clone();
+                });
+            }
+            let visible_model = resolved_model.as_ref().and_then(|model_id| {
+                presentation
+                    .available
+                    .contains_key(model_id)
+                    .then(|| presentation.catalog.get(model_id.0.as_ref()))
+                    .flatten()
+            });
+            let ready = visible_model
+                .is_some_and(|model| crate::agent::config::model_readiness(model).0);
+            if !ready {
+                let catalog_identity = resolved_model.as_ref().and_then(|model_id| {
+                    crate::agent::models::resolve_catalog_identity(
+                        &presentation.catalog,
+                        model_id,
+                    )
+                });
+                self.session_registry.set_unavailable_model_with_identity(
+                    &arguments.session_id,
+                    normalized_model.clone(),
+                    catalog_identity,
+                    Some(handle.agent_name.clone()),
+                );
+                tracing::warn!(
+                    session_id = %arguments.session_id.0,
+                    resident_model_id = %resident_model.0,
+                    normalized_model_id = %normalized_model.0,
+                    present = resolved_model.is_some(),
+                    auth_visible = resolved_model
+                        .as_ref()
+                        .is_some_and(|model_id| presentation.available.contains_key(model_id)),
+                    "prompt: resident model became unavailable; latching before actor dispatch"
+                );
+            }
+        }
         let latched_model = self
             .session_registry
             .unavailable_model(&arguments.session_id);
         if let Some(unavailable_model) = latched_model {
-            let (models, available) = self.models_manager.models_and_available();
+            let presentation = self.models_manager.presentation_snapshot();
+            let models = presentation.catalog;
+            let available = presentation.available;
             let latched_identity = self
                 .session_registry
                 .unavailable_catalog_identity(&arguments.session_id);
@@ -3021,12 +3118,23 @@ impl acp::Agent for MvpAgent {
                     return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
                 }
                 crate::agent::models::PersistedCatalogKeyResolution::Missing => {
+                    let auth_hidden = crate::agent::models::resolve_catalog_key(
+                        &models,
+                        &unavailable_model,
+                    )
+                    .is_some();
+                    let user_notice = if auth_hidden {
+                        "Your session model is not available for the current authentication mode. Sign in with the required account or choose another visible model."
+                    } else {
+                        "Your previous model is no longer available and could not be switched to a compatible model. Please start a new session."
+                    };
                     tracing::warn!(
                         session_id = %arguments.session_id.0,
                         unavailable_model = %unavailable_model.0,
+                        auth_hidden,
                         available_count = available.len(),
                         available_keys = ?available.keys().take(10).collect::<Vec<_>>(),
-                        "prompt blocked: session model unavailable since load and still missing from the catalog"
+                        "prompt blocked: resident model is absent from the auth-visible catalog"
                     );
                     xai_grok_telemetry::unified_log::warn(
                         "prompt blocked: model unavailable",
@@ -3042,8 +3150,7 @@ impl acp::Agent for MvpAgent {
                             &arguments.session_id,
                             &acp::ModelId::new(String::new()),
                             &acp::ModelId::new(String::new()),
-                            "Your previous model is no longer available and could not \
-                         be switched to a compatible model. Please start a new session.",
+                            user_notice,
                         )
                         .await;
                     return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
@@ -3052,6 +3159,41 @@ impl acp::Agent for MvpAgent {
         }
         let dispatch_lock = self.dispatch_lock(&arguments.session_id);
         let dispatch_guard = dispatch_lock.lock().await;
+        #[cfg(test)]
+        run_prompt_dispatch_boundary_hook(&arguments.session_id);
+        // A model switch may have completed while this prompt waited for the
+        // dispatch lock. Re-read the resident under serialization and capture
+        // auth/catalog authority before sending any actor command.
+        let handle = self
+            .resident_handle(&arguments.session_id)
+            .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))?;
+        let prompt_dispatch_authority = match self
+            .models_manager
+            .model_dispatch_authority(&handle.model_id)
+        {
+            Ok(authority) => authority,
+            Err(reason) => {
+                let catalog_identity = crate::agent::models::resolve_catalog_identity(
+                    &self.models_manager.models(),
+                    &handle.model_id,
+                );
+                self.session_registry.set_unavailable_model_with_identity(
+                    &arguments.session_id,
+                    handle.model_id.clone(),
+                    catalog_identity,
+                    Some(handle.agent_name.clone()),
+                );
+                drop(dispatch_guard);
+                self.send_model_auto_switched(
+                    &arguments.session_id,
+                    &acp::ModelId::new(String::new()),
+                    &acp::ModelId::new(String::new()),
+                    &format!("Prompt blocked because the resident model is unavailable: {reason}"),
+                )
+                .await;
+                return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+            }
+        };
         let meta_prompt_mode = arguments
             .meta
             .as_ref()
@@ -3271,9 +3413,7 @@ impl acp::Agent for MvpAgent {
                 }
             }
         };
-        handle
-            .cmd_tx
-            .send(SessionCommand::Prompt {
+        let prompt_command = SessionCommand::Prompt {
                 prompt_id: prompt_id.clone(),
                 prompt_blocks: arguments.prompt.clone(),
                 prompt_mode,
@@ -3291,11 +3431,36 @@ impl acp::Agent for MvpAgent {
                 respond_to: tx,
                 persist_ack: None,
                 parsed_prompt_tx,
-            })
-            .map_err(|e| {
+            };
+        let prompt_dispatch = self
+            .models_manager
+            .commit_model_dispatch(&prompt_dispatch_authority, || {
+                handle.cmd_tx.send(prompt_command)
+            });
+        match prompt_dispatch {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(
                 acp::Error::internal_error()
                     .data(format!("failed to dispatch prompt to session: {e}"))
-            })?;
+            ),
+            Err(reason) => {
+                self.session_registry.set_unavailable_model_with_identity(
+                    &arguments.session_id,
+                    handle.model_id.clone(),
+                    Some(prompt_dispatch_authority.catalog_identity.clone()),
+                    Some(handle.agent_name.clone()),
+                );
+                drop(dispatch_guard);
+                self.send_model_auto_switched(
+                    &arguments.session_id,
+                    &acp::ModelId::new(String::new()),
+                    &acp::ModelId::new(String::new()),
+                    &format!("Prompt blocked because model authorization changed: {reason}"),
+                )
+                .await;
+                return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+            }
+        }
         drop(dispatch_guard);
         self.push_roster_activity_delta(
             &arguments.session_id,
@@ -4137,19 +4302,9 @@ impl acp::Agent for MvpAgent {
                 &args.session_id,
                 &args.model_id,
             );
-        let model = self.resolve_model_id(&args.model_id)?;
-        if !model.info.user_selectable {
-            return Err(
-                acp::Error::invalid_params()
-                    .data("This model isn't allowed by your allowed_models setting."),
-            );
-        }
-        let (ready, reason) = crate::agent::config::model_readiness(&model);
-        if !ready {
-            return Err(acp::Error::invalid_params().data(
-                reason.unwrap_or_else(|| "model is not ready".to_owned()),
-            ));
-        }
+        // Authorization is deliberately deferred to `apply`, after it owns
+        // the session dispatch lock. A picker snapshot here would race auth,
+        // allowlist, and catalog mutation before actor dispatch.
         validation_failure_telemetry.disarm();
         let session_id = args.session_id.clone();
         let res = crate::agent::handlers::model_switch::apply(self, args).await;

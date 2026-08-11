@@ -211,8 +211,7 @@ fn split_trailing_token(args: &str) -> Option<(&str, &str)> {
 /// Longest-name-first to disambiguate names that share a prefix.
 fn detect_effort_phase(models: &ModelState, args_query: &str) -> Option<acp::ModelId> {
     let mut candidates: Vec<(&acp::ModelId, &str)> = models
-        .available
-        .iter()
+        .selectable_models()
         .filter(|(_, info)| supports_reasoning_effort(info))
         .map(|(id, info)| (id, info.name.as_str()))
         .collect();
@@ -235,7 +234,7 @@ fn detect_effort_phase(models: &ModelState, args_query: &str) -> Option<acp::Mod
 fn build_model_items(models: &ModelState) -> Vec<ArgItem> {
     let current_id = models.current.as_ref();
     let mut items: Vec<ArgItem> = Vec::with_capacity(models.available.len());
-    for (id, info) in &models.available {
+    for (id, info) in models.selectable_models() {
         let is_current = current_id == Some(id);
         let supports = supports_reasoning_effort(info);
         let readiness = parse_model_readiness(info.meta.as_ref());
@@ -418,6 +417,46 @@ mod tests {
         // Plain model has no trailing space -- Enter commits immediately.
         let plain = items.iter().find(|i| i.match_text == "Grok 4.5").unwrap();
         assert_eq!(plain.insert_text, "Grok 4.5");
+    }
+
+    #[test]
+    fn unavailable_resident_is_neither_suggested_nor_runnable() {
+        let mut state = ModelState::default();
+        let (resident_id, resident_info) = model_with_meta(
+            "retired",
+            "Retired Model",
+            serde_json::Map::from_iter([(
+                "unavailableResidentModel".into(),
+                serde_json::json!(true),
+            )]),
+        );
+        let (ready_id, ready_info) = plain_model("ready", "Ready Model");
+        state.available.insert(resident_id.clone(), resident_info);
+        state.available.insert(ready_id, ready_info);
+        state.current = Some(resident_id);
+
+        let app_ctx = AppCtx {
+            models: &state,
+            cwd: std::path::Path::new("."),
+            has_session_announcements: false,
+            billing_surface_visible: true,
+            usage_command_visible: true,
+            workflows_available: true,
+            screen_mode: crate::app::ScreenMode::Fullscreen,
+        };
+        let items = ModelCommand.suggest_args(&app_ctx, "").unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].match_text, "Ready Model");
+
+        let mut exec_ctx = dummy_exec_ctx(&state);
+        assert!(matches!(
+            ModelCommand.run(&mut exec_ctx, "Retired Model"),
+            CommandResult::Error(message) if message == "Unknown model: Retired Model"
+        ));
+        assert!(matches!(
+            ModelCommand.run(&mut exec_ctx, "retired"),
+            CommandResult::Error(message) if message == "Unknown model: retired"
+        ));
     }
 
     #[test]
