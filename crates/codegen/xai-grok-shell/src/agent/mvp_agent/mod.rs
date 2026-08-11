@@ -1552,15 +1552,22 @@ pub(crate) fn inject_proxy_headers(
     }
     let _ = (alpha_test_key, base_url);
 }
+fn select_spawn_model_entry<'a>(
+    pinned: Option<&'a ModelEntry>,
+    prepared: Option<&'a ModelEntry>,
+    catalog: &'a indexmap::IndexMap<String, ModelEntry>,
+    catalog_identity: &xai_chat_state::CatalogIdentity,
+) -> Option<&'a ModelEntry> {
+    pinned
+        .or(prepared)
+        .or_else(|| catalog.get(catalog_identity.model_id.as_str()))
+}
+
 fn resolve_inference_idle_timeout_secs(
-    models: &indexmap::IndexMap<String, crate::agent::config::ModelEntry>,
-    model: &str,
+    model: Option<&crate::agent::config::ModelEntry>,
     remote_settings: Option<&crate::util::config::RemoteSettings>,
 ) -> u64 {
-    let per_model = models
-        .get(model)
-        .or_else(|| models.values().find(|entry| entry.info.model == model))
-        .and_then(|entry| entry.info.inference_idle_timeout_secs);
+    let per_model = model.and_then(|entry| entry.info.inference_idle_timeout_secs);
     let remote = remote_settings.and_then(|s| s.inference_idle_timeout_secs);
     per_model.or(remote).unwrap_or(600).max(10)
 }

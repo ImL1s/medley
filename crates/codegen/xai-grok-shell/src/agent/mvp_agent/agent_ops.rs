@@ -5179,9 +5179,19 @@ impl MvpAgent {
                     sampling_config,
                 )
             };
-        let selected_model = prepared_model_entry
-            .as_ref()
-            .or_else(|| catalog.get(catalog_identity.model_id.as_str()));
+        // Runtime tuning must follow the exact entry that actually won spawn:
+        // an agent-profile pin overrides the prepared session default, while a
+        // prepared entry must beat any same-key catalog replacement published
+        // after the new-session authority seal.
+        let selected_model = select_spawn_model_entry(
+            pinned_model.as_ref().map(|(_, entry)| entry),
+            prepared_model_entry.as_ref(),
+            &catalog,
+            &catalog_identity,
+        );
+        let unavailable_spawn_model = selected_model
+            .is_some_and(|entry| !crate::agent::config::model_readiness(entry).0)
+            .then(|| session_model_id.clone());
         let auto_compact_threshold_percent = {
             let cfg = self.cfg.borrow();
             crate::util::config::resolve_auto_compact_threshold_percent(
@@ -5285,20 +5295,10 @@ impl MvpAgent {
             }
         }
         let inference_idle_timeout_secs = {
-            let models = self.models_manager.models();
             let cfg = self.cfg.borrow();
-            resolve_inference_idle_timeout_secs(
-                &models,
-                &sampling_config.model,
-                cfg.remote_settings.as_ref(),
-            )
+            resolve_inference_idle_timeout_secs(selected_model, cfg.remote_settings.as_ref())
         };
-        let model_max_retries = self
-            .models_manager
-            .models()
-            .values()
-            .find(|entry| entry.info.model == sampling_config.model)
-            .and_then(|entry| entry.info.max_retries);
+        let model_max_retries = selected_model.and_then(|entry| entry.info.max_retries);
         let origin_client = self.origin_client_info_from_meta(init.meta.as_ref());
         let disable_web_search = self.cfg.borrow().disable_web_search;
         let mut web_search_disable_reason = None;
@@ -5773,6 +5773,15 @@ impl MvpAgent {
             && let Some(scope) = &old.tool_context.process_scope
         {
             scope.kill_all();
+        }
+        if let Some(model_id) = unavailable_spawn_model {
+            tracing::warn!(
+                session_id = %session_info.id.0,
+                model_id = %model_id.0,
+                "session spawn selected an unready exact catalog entry; latching prompts"
+            );
+            self.session_registry
+                .set_unavailable_model(&session_info.id, model_id);
         }
         self.spawn_managed_gateway_tool_catalog_fetch();
         let cwd_for_maintenance = session_info.cwd.clone();

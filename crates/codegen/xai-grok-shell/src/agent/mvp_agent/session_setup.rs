@@ -399,7 +399,7 @@ impl MvpAgent {
                     cwd.clone(),
                     arguments.meta.as_ref(),
                     model_agent_type.as_deref(),
-                    session_model_id,
+                    session_model_id.clone(),
                     session_yolo_mode,
                 )
             } else {
@@ -437,7 +437,7 @@ impl MvpAgent {
                         .as_ref()
                         .map(|plan| plan.model_entry.clone()),
                     persisted_catalog_identity: None,
-                    session_model_id,
+                    session_model_id: session_model_id.clone(),
                     session_yolo_mode,
                     session_auto_mode: session_auto_mode && !session_yolo_mode,
                     prompt_display_cwd: None,
@@ -451,6 +451,10 @@ impl MvpAgent {
             self.shutdown_gateway_bridge(&session_id);
         }
         spawn_res?;
+        let spawned_session_model_id = self
+            .resident_handle(&session_id)
+            .map(|handle| handle.model_id)
+            .unwrap_or_else(|| session_model_id.clone());
         tracing::debug!(session_id = %session_id.0, "new_session: spawn_session_actor");
         #[cfg(feature = "local-workspace")]
         if local_workspace_intent_present(arguments.meta.as_ref()) {
@@ -490,29 +494,27 @@ impl MvpAgent {
             });
         }
         if let Some(requested) = disallowed_custom {
-            let current = self.models_manager.current_model_id();
             let reason = format!(
                 "\"{requested}\" isn't allowed by your allowed_models setting, so this session is using \"{}\".",
-                current.0
+                spawned_session_model_id.0
             );
             self.send_model_auto_switched(
                 &session_id,
                 &acp::ModelId::new(requested),
-                &current,
+                &spawned_session_model_id,
                 &reason,
             )
             .await;
         }
         if let Some((requested, readiness_reason)) = unreadiness_custom {
-            let current = self.models_manager.current_model_id();
             let reason = format!(
                 "\"{requested}\" isn't ready ({readiness_reason}), so this session is using \"{}\".",
-                current.0
+                spawned_session_model_id.0
             );
             self.send_model_auto_switched(
                 &session_id,
                 &acp::ModelId::new(requested),
-                &current,
+                &spawned_session_model_id,
                 &reason,
             )
             .await;

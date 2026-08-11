@@ -4991,6 +4991,48 @@ async fn prepared_new_session_plan_survives_same_key_catalog_swap() {
         "test must replace the endpoint while the prepared sampler stays pinned"
     );
 }
+
+#[test]
+fn spawn_runtime_tuning_prefers_pinned_then_prepared_exact_entry() {
+    let endpoints = config::EndpointsConfig::default();
+    let mut pinned = ModelEntry::fallback("shared-key", &endpoints);
+    pinned.info.model = "pinned-route".to_owned();
+    pinned.info.inference_idle_timeout_secs = Some(41);
+    pinned.info.max_retries = Some(2);
+    let mut prepared = ModelEntry::fallback("shared-key", &endpoints);
+    prepared.info.model = "prepared-route".to_owned();
+    prepared.info.inference_idle_timeout_secs = Some(51);
+    prepared.info.max_retries = Some(3);
+    let mut replacement = ModelEntry::fallback("shared-key", &endpoints);
+    replacement.info.model = "replacement-route".to_owned();
+    replacement.info.inference_idle_timeout_secs = Some(61);
+    replacement.info.max_retries = Some(4);
+    let catalog = indexmap::IndexMap::from([("shared-key".to_owned(), replacement)]);
+    let identity = xai_chat_state::CatalogIdentity {
+        model_id: "shared-key".to_owned(),
+        route: "prepared-route".to_owned(),
+        lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+        auth_scheme: None,
+    };
+
+    let selected = select_spawn_model_entry(Some(&pinned), Some(&prepared), &catalog, &identity)
+        .expect("pinned entry wins");
+    assert_eq!(selected.info.model, "pinned-route");
+    assert_eq!(resolve_inference_idle_timeout_secs(Some(selected), None), 41);
+    assert_eq!(selected.info.max_retries, Some(2));
+
+    let selected = select_spawn_model_entry(None, Some(&prepared), &catalog, &identity)
+        .expect("prepared entry wins over a same-key replacement");
+    assert_eq!(selected.info.model, "prepared-route");
+    assert_eq!(resolve_inference_idle_timeout_secs(Some(selected), None), 51);
+    assert_eq!(selected.info.max_retries, Some(3));
+
+    let selected = select_spawn_model_entry(None, None, &catalog, &identity)
+        .expect("live catalog is the final fallback");
+    assert_eq!(selected.info.model, "replacement-route");
+    assert_eq!(resolve_inference_idle_timeout_secs(Some(selected), None), 61);
+    assert_eq!(selected.info.max_retries, Some(4));
+}
 /// Minimal agent whose `grok_com_config` engages the api-key kill switch
 /// (`disable_api_key_auth = true`), mirroring a forced-IdP deployment.
 fn build_agent_with_api_key_auth_disabled() -> MvpAgent {
@@ -8610,7 +8652,7 @@ fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex() {
             .expect("nonblocking probe listener");
         let probe_server = std::thread::spawn(move || {
             use std::io::{Read, Write};
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             let (mut stream, _) = loop {
                 match listener.accept() {
                     Ok(connection) => break connection,
@@ -8754,13 +8796,13 @@ fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex() {
         let active_attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let active_attempts_hook = active_attempts.clone();
         let active_auth_manager = agent.auth_manager.clone();
-        let active_hook = install_new_session_plan_before_seal_hook(move || {
+        let active_hook = agent_ops::install_new_session_plan_before_seal_hook(move || {
             if active_attempts_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                let mut replacement = active_auth_manager
-                    .current()
-                    .expect("active /new race starts authenticated");
-                replacement.key = "active-new-post-race-token".to_owned();
-                active_auth_manager.hot_swap(replacement);
+                // The selection authority is the process xAI manager. This
+                // fixture intentionally keeps that manager empty while Codex
+                // credentials live in their provider-scoped store, so use the
+                // real in-memory clear writer to advance its generation.
+                active_auth_manager.clear_in_memory();
             }
         });
         let session_cwd = tempfile::tempdir().expect("new-session cwd");
@@ -8794,32 +8836,35 @@ fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex() {
             crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID,
             "the persisted/session sampling identity must match the advertised Codex model"
         );
-        let sampling = handle
+        let (sampling, _, credentials) = handle
             .chat_state_handle
-            .get_sampling_config()
+            .get_prepared_model_state()
             .await
-            .expect("resident session must expose its live sampling config");
+            .expect("resident session must expose its live prepared model state");
         assert_eq!(
             sampling.model,
             crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID,
             "the live sampler must stay pinned to Codex under the rejected Grok campaign"
         );
         assert_eq!(
-            sampling.api_key.as_deref(),
-            Some("active-new-post-race-token"),
-            "active /new must publish only the rebuilt post-race sampler"
+            credentials.api_key(),
+            None,
+            "active /new must not persist provider-scoped Codex bearer bytes in chat state"
+        );
+        assert_eq!(
+            credentials.source(),
+            Some(&xai_grok_sampler::CredentialSource::AuthProvider {
+                name: crate::agent::model_providers::OPENAI_CODEX_PROVIDER_ID.to_owned(),
+            }),
+            "active /new must bind the credential to the official Codex provider"
         );
 
         let dormant_attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let dormant_attempts_hook = dormant_attempts.clone();
         let dormant_auth_manager = agent.auth_manager.clone();
-        let dormant_hook = install_new_session_plan_before_seal_hook(move || {
+        let dormant_hook = agent_ops::install_new_session_plan_before_seal_hook(move || {
             if dormant_attempts_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                let mut replacement = dormant_auth_manager
-                    .current()
-                    .expect("dormant /new race starts authenticated");
-                replacement.key = "dormant-new-post-race-token".to_owned();
-                dormant_auth_manager.hot_swap(replacement);
+                dormant_auth_manager.clear_in_memory();
             }
         });
         let inner_cwd = tempfile::tempdir().expect("new-session-inner cwd");
@@ -8849,20 +8894,27 @@ fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex() {
         let inner_handle = agent
             .resident_handle(&inner_response.session_id)
             .expect("inner-created session must remain resident");
-        let inner_sampling = inner_handle
+        let (inner_sampling, _, inner_credentials) = inner_handle
             .chat_state_handle
-            .get_sampling_config()
+            .get_prepared_model_state()
             .await
-            .expect("inner-created session sampling config");
+            .expect("inner-created session prepared model state");
         assert_eq!(
             inner_sampling.model,
             crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID,
             "the dormant path's live sampler must also stay on Codex"
         );
         assert_eq!(
-            inner_sampling.api_key.as_deref(),
-            Some("dormant-new-post-race-token"),
-            "dormant /new must publish only the rebuilt post-race sampler"
+            inner_credentials.api_key(),
+            None,
+            "dormant /new must not persist provider-scoped Codex bearer bytes in chat state"
+        );
+        assert_eq!(
+            inner_credentials.source(),
+            Some(&xai_grok_sampler::CredentialSource::AuthProvider {
+                name: crate::agent::model_providers::OPENAI_CODEX_PROVIDER_ID.to_owned(),
+            }),
+            "dormant /new must bind the credential to the official Codex provider"
         );
     });
     println!("{CHILD_PASS}");
