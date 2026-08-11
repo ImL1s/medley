@@ -714,6 +714,18 @@ impl ModelsManager {
         .is_usable()
     }
 
+    fn should_reseat_stranded_ambient_grok(
+        user_picked: bool,
+        usable_xai: bool,
+        current: &ModelEntry,
+        ready_codex_exists: bool,
+    ) -> bool {
+        !user_picked
+            && !usable_xai
+            && resolution::is_first_party_ambient_xai_entry(current)
+            && ready_codex_exists
+    }
+
     #[cfg(test)]
     fn usable_ambient_xai(&self, cfg: &config::Config) -> bool {
         Self::usable_ambient_xai_from_snapshot(cfg, self.inner.auth_manager.selection_snapshot())
@@ -1196,39 +1208,45 @@ impl ModelsManager {
     }
 
     fn revalidate_current_reasoning_effort(&self) {
-        let Some(effort) = self.current_reasoning_effort() else {
-            return;
-        };
-        let current_model_id = self.inner.current_model_id.read().clone();
-        let is_valid = {
-            let catalog = self.inner.catalog.read();
-            resolve_catalog_key(&catalog.models, &current_model_id)
-                .and_then(|model_id| catalog.models.get(model_id.0.as_ref()))
-                .is_some_and(|entry| model_offers_reasoning_effort(&entry.info, effort))
-        };
-        if !is_valid {
-            self.clear_reasoning_effort_if_selection_unchanged(&current_model_id, effort);
-        }
+        #[cfg(test)]
+        self.revalidate_current_reasoning_effort_inner(|| {});
+        #[cfg(not(test))]
+        self.revalidate_current_reasoning_effort_inner();
     }
 
-    fn clear_reasoning_effort_if_selection_unchanged(
+    fn revalidate_current_reasoning_effort_inner(
         &self,
-        expected_model_id: &acp::ModelId,
-        expected_effort: ReasoningEffort,
+        #[cfg(test)] after_catalog_lock: impl FnOnce(),
     ) {
-        // Keep the model read guard through the conditional effort write. A
-        // concurrent A/high -> B/high switch otherwise defeats an effort-only
-        // CAS because the value is unchanged even though the selection is new.
-        // Model switching never holds the model lock while taking the effort
-        // lock, so this ordering cannot invert that path.
+        // Global nested state order: catalog -> selection -> current -> effort.
+        // Catalog publication and clear use the same order, so reasoning
+        // revalidation cannot deadlock by owning current while waiting on a
+        // catalog writer.
+        let catalog = self.inner.catalog.read();
+        #[cfg(test)]
+        after_catalog_lock();
+        let selection_commit = self.inner.selection_commit.read();
         let current_model_id = self.inner.current_model_id.read();
-        if *current_model_id != *expected_model_id {
-            return;
-        }
         let mut current_effort = self.inner.current_reasoning_effort.write();
-        if *current_effort == Some(expected_effort) {
+        if current_effort.is_some_and(|effort| {
+            !resolve_catalog_key(&catalog.models, &current_model_id)
+                .and_then(|model_id| catalog.models.get(model_id.0.as_ref()))
+                .is_some_and(|entry| model_offers_reasoning_effort(&entry.info, effort))
+        }) {
             *current_effort = None;
         }
+        drop(current_effort);
+        drop(current_model_id);
+        drop(selection_commit);
+        drop(catalog);
+    }
+
+    #[cfg(test)]
+    fn revalidate_current_reasoning_effort_with_after_catalog_lock(
+        &self,
+        after_catalog_lock: impl FnOnce(),
+    ) {
+        self.revalidate_current_reasoning_effort_inner(after_catalog_lock);
     }
 
     /// Whether the given model supports reasoning effort according to the catalog.
@@ -1704,17 +1722,12 @@ impl ModelsManager {
         self.inner
             .user_selected_model
             .store(false, Ordering::Relaxed);
+        *self.inner.current_reasoning_effort.write() = None;
+        *self.inner.substituted_preference.write() = None;
         self.bump_catalog_generation();
         drop(current);
         drop(selection_commit);
         drop(catalog);
-
-        // The previous identity's model capability must not remain a future
-        // session default while the replacement catalog is still loading.
-        *self.inner.current_reasoning_effort.write() = None;
-        // Same invariant for #131: a previous identity's substitution verdict
-        // must not accuse the new one of rejecting a preference it never held.
-        *self.inner.substituted_preference.write() = None;
     }
 
     /// Build a `SamplingConfig` from the current model + auth state.
@@ -2015,14 +2028,18 @@ impl ModelsManager {
                 Some(entry) => {
                     let not_selectable = !entry.info.user_selectable
                         || !entry.info.visible_for_auth(auth.is_session_auth);
-                    let stranded_on_ambient_grok = !usable_xai
-                        && resolution::is_first_party_ambient_xai_entry(entry)
-                        && models.values().any(|entry| {
-                            resolution::is_ready_selectable_openai_codex_entry(
-                                entry,
-                                auth.is_session_auth,
-                            )
-                        });
+                    let ready_codex_exists = models.values().any(|entry| {
+                        resolution::is_ready_selectable_openai_codex_entry(
+                            entry,
+                            auth.is_session_auth,
+                        )
+                    });
+                    let stranded_on_ambient_grok = Self::should_reseat_stranded_ambient_grok(
+                        user_picked,
+                        usable_xai,
+                        entry,
+                        ready_codex_exists,
+                    );
                     not_selectable || stranded_on_ambient_grok
                 }
             };
@@ -2064,6 +2081,17 @@ impl ModelsManager {
                 std::thread::yield_now();
                 continue;
             }
+            let mut current_effort = self.inner.current_reasoning_effort.write();
+            if current_effort.is_some_and(|effort| {
+                !resolve_catalog_key(models, &new_id)
+                    .and_then(|model_id| models.get(model_id.0.as_ref()))
+                    .is_some_and(|entry| model_offers_reasoning_effort(&entry.info, effort))
+            }) {
+                *current_effort = None;
+            }
+            drop(current_effort);
+            *self.inner.substituted_preference.write() =
+                resolution::substituted_preference(cfg, source);
             drop(current);
             drop(selection_commit);
             break (
@@ -2085,8 +2113,6 @@ impl ModelsManager {
         self.bump_catalog_generation();
         drop(cat);
 
-        // None of these secondary effects may extend the authority transaction.
-        self.record_substituted_preference(cfg, source);
         if excludes_all {
             tracing::error!("allowed_models excludes all fetched models; prompts will be blocked");
         }
@@ -2104,7 +2130,6 @@ impl ModelsManager {
             }
             self.publish_model_switch();
         }
-        self.revalidate_current_reasoning_effort();
     }
 
     #[cfg(test)]
@@ -2440,6 +2465,7 @@ pub(crate) use resolution::*;
 mod selection_atomicity_tests {
     use super::*;
     use std::sync::mpsc;
+    use std::time::Duration;
 
     fn ready_xai_entry(slug: &str) -> ModelEntry {
         let mut info = config::ModelInfo::fallback(slug);
@@ -2480,7 +2506,7 @@ mod selection_atomicity_tests {
                             .send(())
                             .expect("announce explicit-selection midpoint");
                         release_selection_rx
-                            .recv()
+                            .recv_timeout(Duration::from_secs(5))
                             .expect("release explicit-selection publication");
                     },
                 );
@@ -2520,6 +2546,9 @@ mod selection_atomicity_tests {
         reader_started_rx
             .recv()
             .expect("authority reader must start while writer is paused");
+        reader_reached_selection_rx
+            .recv()
+            .expect("authority reader must reach the protected selection boundary");
         assert!(
             manager.inner.selection_commit.try_read().is_none(),
             "the actual authority reader remains excluded at the torn midpoint"
@@ -2530,9 +2559,6 @@ mod selection_atomicity_tests {
             .expect("release explicit selection");
         writer.join().expect("selection writer must finish");
         let snapshot = reader.join().expect("authority reader must finish");
-        reader_reached_selection_rx
-            .recv()
-            .expect("authority reader must cross the selection boundary");
         assert_eq!(snapshot.fallback_model_id.0.as_ref(), "grok-new");
     }
 
@@ -2561,7 +2587,9 @@ mod selection_atomicity_tests {
                     catalog_midpoint_tx
                         .send(())
                         .expect("announce catalog/selection commit midpoint");
-                    release_rx.recv().expect("release catalog/selection commit");
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("release catalog/selection commit");
                 });
             })
         };
@@ -2583,8 +2611,16 @@ mod selection_atomicity_tests {
             .recv()
             .expect("authority reader must start during catalog publication");
         assert!(
+            manager.inner.catalog.try_read().is_none(),
+            "new catalog must remain unpublished until its selection commits"
+        );
+        assert!(
             manager.inner.selection_commit.try_read().is_none(),
             "catalog publication must retain the selection transaction until current is committed"
+        );
+        assert!(
+            manager.inner.current_model_id.try_read().is_none(),
+            "catalog publication must retain current-model commit ownership"
         );
 
         release_tx.send(()).expect("release catalog publication");
@@ -2592,6 +2628,72 @@ mod selection_atomicity_tests {
         let snapshot = reader.join().expect("authority reader must finish");
         assert_eq!(snapshot.fallback_model_id.0.as_ref(), "grok-default");
         assert!(snapshot.catalog.contains_key("grok-default"));
+    }
+
+    #[test]
+    fn reasoning_revalidation_acquires_catalog_before_selection_state() {
+        let tmp = tempfile::tempdir().expect("temp reasoning lock-order home");
+        let mut catalog = IndexMap::new();
+        catalog.insert("grok-current".to_string(), ready_xai_entry("grok-current"));
+        let manager = ModelsManager::new(
+            None,
+            catalog,
+            acp::ModelId::new("grok-current"),
+            Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default())),
+            config::Config::default(),
+        );
+
+        let (catalog_locked_tx, catalog_locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let validator = {
+            let manager = manager.clone();
+            std::thread::spawn(move || {
+                manager.revalidate_current_reasoning_effort_with_after_catalog_lock(|| {
+                    catalog_locked_tx
+                        .send(())
+                        .expect("announce reasoning catalog lock");
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("release reasoning lock-order probe");
+                });
+            })
+        };
+        catalog_locked_rx
+            .recv()
+            .expect("reasoning validator must acquire catalog first");
+
+        assert!(manager.inner.catalog.try_write().is_none());
+        assert!(manager.inner.selection_commit.try_write().is_some());
+        assert!(manager.inner.current_model_id.try_write().is_some());
+        assert!(manager.inner.current_reasoning_effort.try_write().is_some());
+        release_tx.send(()).expect("release reasoning revalidation");
+        validator.join().expect("reasoning validator must finish");
+    }
+
+    #[test]
+    fn explicit_ambient_grok_survives_catalog_refresh() {
+        let tmp = tempfile::tempdir().expect("temp explicit refresh home");
+        let mut cfg = config::Config::default();
+        cfg.models.default = Some("grok-default".to_string());
+        let manager = ModelsManager::new(
+            None,
+            IndexMap::new(),
+            acp::ModelId::new("grok-default"),
+            Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default())),
+            cfg,
+        );
+        manager.set_current_model_id(acp::ModelId::new("grok-explicit"));
+        let mut catalog = IndexMap::new();
+        let explicit = ready_xai_entry("grok-explicit");
+        catalog.insert("grok-explicit".to_string(), explicit.clone());
+        catalog.insert("grok-default".to_string(), ready_xai_entry("grok-default"));
+
+        assert!(
+            !ModelsManager::should_reseat_stranded_ambient_grok(true, false, &explicit, true),
+            "a ready Codex route must not override a present explicit /model Grok pick"
+        );
+        manager.apply_catalog_for_test(catalog);
+        assert_eq!(manager.current_model_id().0.as_ref(), "grok-explicit");
     }
 }
 
