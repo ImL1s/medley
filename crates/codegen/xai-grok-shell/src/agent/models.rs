@@ -1557,7 +1557,8 @@ impl ModelsManager {
 
     /// Refresh the model catalog on every auth token refresh.
     pub fn start_auth_refresh_watcher(&self, notify: Arc<tokio::sync::Notify>) {
-        let first = notify.clone().notified_owned();
+        let mut first = Box::pin(notify.clone().notified_owned());
+        first.as_mut().enable();
         self.start_auth_refresh_watcher_with_first(notify, first);
     }
 
@@ -1567,7 +1568,7 @@ impl ModelsManager {
     pub(crate) fn start_auth_refresh_watcher_with_first(
         &self,
         notify: Arc<tokio::sync::Notify>,
-        first: tokio::sync::futures::OwnedNotified,
+        first: Pin<Box<tokio::sync::futures::OwnedNotified>>,
     ) {
         let mgr = self.clone();
         let had_catalog_at_start = self.inner.catalog.read().has_fetched_real_catalog;
@@ -1582,8 +1583,9 @@ impl ModelsManager {
         tokio::spawn(async move {
             let mut next = first;
             loop {
-                next.await;
-                next = notify.clone().notified_owned();
+                next.as_mut().await;
+                next.set(notify.clone().notified_owned());
+                next.as_mut().enable();
                 let had_catalog = mgr.inner.catalog.read().has_fetched_real_catalog;
                 let old_count = mgr.available().len();
                 xai_grok_telemetry::unified_log::info(
@@ -1594,10 +1596,16 @@ impl ModelsManager {
                         "model_count_before": old_count,
                     })),
                 );
-                // Refreshes may change both fetch authority and which implicit
-                // default is usable. Reconcile the complete auth-dependent
-                // state, rather than only issuing the transport fetch.
-                mgr.on_auth_changed().await;
+                // A refresh can change the catalog transport authority even
+                // when the selected model stays the same. Recompute it before
+                // fetching; unlike `on_auth_changed`, this path must retain the
+                // historical unauthenticated fetch behavior used by custom
+                // endpoints and tests.
+                let config = mgr.inner.cfg.read().clone();
+                let has_session = mgr.inner.auth_manager.current_or_expired().is_some();
+                *mgr.inner.fetch_auth.write() =
+                    ModelFetchAuth::resolve(&config.endpoints, has_session);
+                mgr.fetch_and_apply().await;
                 let has_catalog = mgr.inner.catalog.read().has_fetched_real_catalog;
                 let new_count = mgr.available().len();
                 if has_catalog {

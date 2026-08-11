@@ -49,7 +49,8 @@ pub fn bootstrap(
     // between the final construction generation check and watcher startup
     // observable instead of permanently losing catalog reconciliation.
     let auth_refresh_notify = auth_manager.refresh_notifier();
-    let first_auth_refresh = auth_refresh_notify.clone().notified_owned();
+    let mut first_auth_refresh = Box::pin(auth_refresh_notify.clone().notified_owned());
+    first_auth_refresh.as_mut().enable();
     let models_manager = {
         let _timer = crate::instrumentation_timer!("startup.bootstrap.models_manager");
         ModelsManager::from_config(&cfg, prefetched, auth_manager.clone())?

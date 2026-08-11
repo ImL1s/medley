@@ -280,7 +280,8 @@ async fn auth_refresh_watcher_consumes_preconstruction_notify_waiters_event() {
     let tmp = tempfile::tempdir().expect("temp auth-refresh home");
     let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
     let notify = auth_manager.refresh_notifier();
-    let first = notify.clone().notified_owned();
+    let mut first = Box::pin(notify.clone().notified_owned());
+    first.as_mut().enable();
     let mgr = ModelsManagerBuilder::new(
         None,
         IndexMap::new(),
