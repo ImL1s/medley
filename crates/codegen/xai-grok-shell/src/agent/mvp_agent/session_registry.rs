@@ -6,6 +6,29 @@ use super::*;
 pub(super) struct SessionRegistry {
     sessions: Rc<RefCell<HashMap<acp::SessionId, SessionResources>>>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UnavailableRecoverySnapshot {
+    pub(crate) unavailable_model: acp::ModelId,
+    pub(crate) resident_model_id: acp::ModelId,
+    pub(crate) catalog_identity: Option<xai_chat_state::CatalogIdentity>,
+    pub(crate) agent_name: Option<String>,
+    pub(crate) revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnavailableModelCommitPolicy {
+    ClearIfRevision(u64),
+    Preserve,
+}
+
+pub(crate) enum ModelSwitchCommitOutcome {
+    Committed {
+        cleared_unavailable_model: Option<acp::ModelId>,
+        unavailable_model_revision_matched: bool,
+    },
+    Superseded,
+}
 /// Turn activity of a resident actor. Split from [`SessionLiveState`] so a
 /// reader cannot observe `Working` without a resident actor: that combination
 /// was representable when liveness was a parallel field.
@@ -216,6 +239,7 @@ struct SessionResources {
     unavailable_model: Option<acp::ModelId>,
     unavailable_catalog_identity: Option<xai_chat_state::CatalogIdentity>,
     unavailable_agent_name: Option<String>,
+    unavailable_model_revision: u64,
 }
 #[derive(Default)]
 pub(super) struct SessionCounts {
@@ -258,6 +282,7 @@ impl SessionRegistry {
                     unavailable_model: None,
                     unavailable_catalog_identity: None,
                     unavailable_agent_name: None,
+                    unavailable_model_revision: 0,
                 },
             );
         }
@@ -447,6 +472,59 @@ impl SessionRegistry {
             .as_mut()?
             .hosted_handle_mut()?;
         Some(f(handle))
+    }
+
+    pub(super) fn commit_model_switch(
+        &self,
+        id: &acp::SessionId,
+        expected_cmd_tx: &tokio::sync::mpsc::UnboundedSender<SessionCommand>,
+        allow_attaching: bool,
+        unavailable_model_policy: UnavailableModelCommitPolicy,
+        update: impl FnOnce(&mut SessionHandle),
+    ) -> ModelSwitchCommitOutcome {
+        let mut entries = self.sessions.borrow_mut();
+        let Some(entry) = entries.get_mut(id) else {
+            return ModelSwitchCommitOutcome::Superseded;
+        };
+        let unavailable_model_revision_matched = match unavailable_model_policy {
+            UnavailableModelCommitPolicy::ClearIfRevision(expected) => {
+                entry.unavailable_model_revision == expected
+            }
+            UnavailableModelCommitPolicy::Preserve => true,
+        };
+        {
+            let handle = match entry.presence.as_mut() {
+                Some(SessionPresence::Resident {
+                    handle: Some(handle),
+                    ..
+                }) => handle,
+                Some(SessionPresence::Attaching {
+                    handle: Some(handle),
+                    ..
+                }) if allow_attaching => handle,
+                _ => return ModelSwitchCommitOutcome::Superseded,
+            };
+            if !handle.cmd_tx.same_channel(expected_cmd_tx) {
+                return ModelSwitchCommitOutcome::Superseded;
+            }
+            update(handle)
+        }
+        let clear_unavailable_model = matches!(
+            unavailable_model_policy,
+            UnavailableModelCommitPolicy::ClearIfRevision(_)
+        ) && unavailable_model_revision_matched;
+        let unavailable_model = if clear_unavailable_model {
+            entry.unavailable_model_revision = entry.unavailable_model_revision.saturating_add(1);
+            entry.unavailable_catalog_identity = None;
+            entry.unavailable_agent_name = None;
+            entry.unavailable_model.take()
+        } else {
+            None
+        };
+        ModelSwitchCommitOutcome::Committed {
+            cleared_unavailable_model: unavailable_model,
+            unavailable_model_revision_matched,
+        }
     }
     /// Place a handle on the current presence without changing live kind.
     /// An entry with no presence becomes [`SessionPresence::Resident`] idle.
@@ -706,6 +784,7 @@ impl SessionRegistry {
     }
     pub(super) fn set_unavailable_model(&self, id: &acp::SessionId, model: acp::ModelId) {
         self.edit(id, |e| {
+            e.unavailable_model_revision = e.unavailable_model_revision.saturating_add(1);
             e.unavailable_model = Some(model);
             e.unavailable_catalog_identity = None;
             e.unavailable_agent_name = None;
@@ -719,6 +798,7 @@ impl SessionRegistry {
         agent_name: Option<String>,
     ) {
         self.edit(id, |e| {
+            e.unavailable_model_revision = e.unavailable_model_revision.saturating_add(1);
             e.unavailable_model = Some(model);
             e.unavailable_catalog_identity = catalog_identity;
             e.unavailable_agent_name = agent_name;
@@ -726,6 +806,9 @@ impl SessionRegistry {
     }
     pub(super) fn unavailable_model(&self, id: &acp::SessionId) -> Option<acp::ModelId> {
         self.with(id, |e| e.unavailable_model.clone()).flatten()
+    }
+    pub(super) fn unavailable_model_revision(&self, id: &acp::SessionId) -> Option<u64> {
+        self.with(id, |e| e.unavailable_model_revision)
     }
     pub(super) fn unavailable_catalog_identity(
         &self,
@@ -737,12 +820,41 @@ impl SessionRegistry {
     pub(super) fn unavailable_agent_name(&self, id: &acp::SessionId) -> Option<String> {
         self.with(id, |e| e.unavailable_agent_name.clone()).flatten()
     }
+
+    pub(super) fn unavailable_recovery_snapshot(
+        &self,
+        id: &acp::SessionId,
+    ) -> Option<UnavailableRecoverySnapshot> {
+        let entries = self.sessions.borrow();
+        let entry = entries.get(id)?;
+        Some(UnavailableRecoverySnapshot {
+            unavailable_model: entry.unavailable_model.clone()?,
+            resident_model_id: entry
+                .presence
+                .as_ref()?
+                .hosted_handle()?
+                .model_id
+                .clone(),
+            catalog_identity: entry.unavailable_catalog_identity.clone(),
+            agent_name: entry.unavailable_agent_name.clone(),
+            revision: entry.unavailable_model_revision,
+        })
+    }
+
+    pub(super) fn unavailable_recovery_is_current(
+        &self,
+        id: &acp::SessionId,
+        expected: &UnavailableRecoverySnapshot,
+    ) -> bool {
+        self.unavailable_recovery_snapshot(id).as_ref() == Some(expected)
+    }
     pub(super) fn take_unavailable_model(&self, id: &acp::SessionId) -> Option<acp::ModelId> {
         let model = self
             .sessions
             .borrow_mut()
             .get_mut(id)
             .and_then(|e| {
+                e.unavailable_model_revision = e.unavailable_model_revision.saturating_add(1);
                 e.unavailable_catalog_identity = None;
                 e.unavailable_agent_name = None;
                 e.unavailable_model.take()
@@ -818,6 +930,7 @@ impl SessionRegistry {
                 unavailable_model,
                 unavailable_catalog_identity: _,
                 unavailable_agent_name: _,
+                unavailable_model_revision: _,
             } = entry;
             counts.retained_resources += usize::from(retained.is_some());
             counts.resident_resources += usize::from(resident.is_some());
@@ -875,6 +988,7 @@ impl SessionResources {
             unavailable_model,
             unavailable_catalog_identity: _,
             unavailable_agent_name: _,
+            unavailable_model_revision: _,
         } = self;
         let chat_vacant = true;
         let presence_vacant = match presence {

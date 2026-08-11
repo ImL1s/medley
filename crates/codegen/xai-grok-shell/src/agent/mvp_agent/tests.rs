@@ -2295,6 +2295,789 @@ async fn prompt_slug_normalization_does_not_overwrite_a_concurrent_model_switch(
 }
 
 #[test]
+fn production_prompt_recovery_does_not_undo_a_concurrent_user_model_switch() {
+    run_local_for_bridge_test(|| async {
+        let old_model = "prompt-recovery-old";
+        let new_model = "prompt-recovery-new";
+        let agent = std::rc::Rc::new(build_agent_with_model_for_tests(
+            old_model,
+            "grok-build",
+        ));
+        let mut new_entry = agent.models_manager.models()[old_model].clone();
+        new_entry.info.model = new_model.to_owned();
+        agent
+            .models_manager
+            .insert_test_entry(new_model, new_entry);
+
+        let sid = acp::SessionId::new("prompt-recovery-user-switch-race");
+        let (mut handle, _cmd_tx, mut cmd_rx) = make_live_session_handle(&sid, None);
+        handle.model_id = acp::ModelId::new(old_model);
+        handle.agent_name = "grok-build".to_owned();
+        agent.insert_resident(&sid, handle);
+        let old_identity = crate::agent::models::resolve_catalog_identity(
+            &agent.models_manager.models(),
+            &acp::ModelId::new(old_model),
+        )
+        .expect("old model identity");
+        agent.session_registry.set_unavailable_model_with_identity(
+            &sid,
+            acp::ModelId::new(old_model),
+            Some(old_identity),
+            Some("grok-build".to_owned()),
+        );
+
+        let (switch_holds_lock_tx, switch_holds_lock_rx) = tokio::sync::oneshot::channel();
+        let (prompt_captured_tx, prompt_captured_rx) = tokio::sync::oneshot::channel();
+        let hook_agent = agent.clone();
+        let hook_sid = sid.clone();
+        super::acp_agent::install_prompt_recovery_boundary_hook(
+            &sid,
+            move |restore_model_id| {
+                assert_eq!(restore_model_id.0.as_ref(), old_model);
+                assert_eq!(
+                    hook_agent.session_registry.unavailable_model(&hook_sid),
+                    Some(acp::ModelId::new(old_model))
+                );
+                let _ = prompt_captured_tx.send(());
+            },
+        );
+
+        let apply_targets = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let actor_apply_targets = apply_targets.clone();
+        let get_active_agent_count = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let actor_get_active_agent_count = get_active_agent_count.clone();
+        let prompt_count = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let actor_prompt_count = prompt_count.clone();
+        let (prompt_dispatched_tx, prompt_dispatched_rx) = tokio::sync::oneshot::channel();
+        let actor = tokio::task::spawn_local(async move {
+            let mut switch_holds_lock_tx = Some(switch_holds_lock_tx);
+            let mut prompt_captured_rx = Some(prompt_captured_rx);
+            let mut prompt_dispatched_tx = Some(prompt_dispatched_tx);
+            while let Some(command) = cmd_rx.recv().await {
+                match command {
+                    TestSessionCommand::GetActiveAgent { responds_to } => {
+                        actor_get_active_agent_count
+                            .set(actor_get_active_agent_count.get() + 1);
+                        if let Some(tx) = switch_holds_lock_tx.take() {
+                            let _ = tx.send(());
+                            prompt_captured_rx
+                                .take()
+                                .expect("first switch waits for prompt recovery snapshot")
+                                .await
+                                .expect("prompt must capture the old latch");
+                        }
+                        let _ = responds_to.send(Some("grok-build".to_owned()));
+                    }
+                    TestSessionCommand::ApplyModelSwitch {
+                        prepared,
+                        responds_to,
+                    } => {
+                        let target = prepared.catalog_identity.model_id.clone();
+                        actor_apply_targets.borrow_mut().push(target.clone());
+                        let _ = responds_to.send(Ok(crate::session::AppliedModelSwitch {
+                            previous_model_id: acp::ModelId::new(old_model),
+                            catalog_model_id: acp::ModelId::new(target),
+                            did_rebuild: false,
+                            active_agent_type: Some("grok-build".to_owned()),
+                            web_search: None,
+                        }));
+                    }
+                    TestSessionCommand::GetCurrentPromptMode { responds_to } => {
+                        let _ = responds_to.send(Default::default());
+                    }
+                    TestSessionCommand::GetCurrentModel { responds_to } => {
+                        let _ = responds_to.send(new_model.to_owned());
+                    }
+                    TestSessionCommand::GetModelMetadata { responds_to } => {
+                        let _ = responds_to.send(Default::default());
+                    }
+                    TestSessionCommand::CopyFile { respond_to } => {
+                        let _ = respond_to.send(Err(anyhow::anyhow!(
+                            "session copy is unavailable in the fake actor"
+                        )));
+                    }
+                    TestSessionCommand::SetNextTraceTurn { .. } => {}
+                    TestSessionCommand::PersistGitHead { .. } => {}
+                    TestSessionCommand::TakeHarnessTraceTurns { respond_to } => {
+                        let _ = respond_to.send(Vec::new());
+                    }
+                    TestSessionCommand::TakeTurnMessages { respond_to } => {
+                        let _ = respond_to.send(None);
+                    }
+                    TestSessionCommand::TakeStreamingCapture { respond_to, .. } => {
+                        let _ = respond_to.send(None);
+                    }
+                    TestSessionCommand::Prompt { respond_to, .. } => {
+                        actor_prompt_count.set(actor_prompt_count.get() + 1);
+                        if let Some(tx) = prompt_dispatched_tx.take() {
+                            let _ = tx.send(());
+                        }
+                        let _ = respond_to.send(crate::session::ok_end_turn(0, None));
+                    }
+                    _ => panic!("unexpected command during prompt recovery race"),
+                }
+            }
+        });
+
+        let switch_agent = agent.clone();
+        let switch_sid = sid.clone();
+        let switch_task = tokio::task::spawn_local(async move {
+            <MvpAgent as acp::Agent>::set_session_model(
+                &switch_agent,
+                acp::SetSessionModelRequest::new(
+                    switch_sid,
+                    acp::ModelId::new(new_model),
+                ),
+            )
+            .await
+        });
+        switch_holds_lock_rx
+            .await
+            .expect("user switch must hold the dispatch lock before prompt starts");
+
+        let prompt_agent = agent.clone();
+        let prompt_sid = sid.clone();
+        let prompt_task = tokio::task::spawn_local(async move {
+            <MvpAgent as acp::Agent>::prompt(
+                &prompt_agent,
+                acp::PromptRequest::new(
+                    prompt_sid,
+                    vec![acp::ContentBlock::from("use the newly selected model")],
+                ),
+            )
+            .await
+        });
+
+        let switch_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async {
+                let switch_result = switch_task.await.expect("switch task");
+                prompt_dispatched_rx
+                    .await
+                    .expect("the prompt must reach the actor after the user switch");
+                switch_result
+            },
+        )
+        .await
+        .expect("the serialized switch and prompt must complete without deadlock");
+        switch_result.expect("user model switch");
+        prompt_task.abort();
+        assert_eq!(apply_targets.borrow().as_slice(), [new_model]);
+        assert_eq!(get_active_agent_count.get(), 1);
+        assert_eq!(prompt_count.get(), 1);
+        assert_eq!(
+            agent.resident_handle(&sid).unwrap().model_id,
+            acp::ModelId::new(new_model)
+        );
+        assert!(agent.session_registry.unavailable_model(&sid).is_none());
+        assert!(
+            agent
+                .session_registry
+                .unavailable_catalog_identity(&sid)
+                .is_none()
+        );
+        assert!(
+            agent
+                .session_registry
+                .unavailable_agent_name(&sid)
+                .is_none()
+        );
+        actor.abort();
+    });
+}
+
+#[test]
+fn production_prompt_recovery_superseded_by_a_new_block_remains_fail_closed() {
+    run_local_for_bridge_test(|| async {
+        let old_model = "prompt-recovery-old-block";
+        let ready_fallback = "prompt-recovery-ready-fallback";
+        let new_unavailable_model = "prompt-recovery-new-block";
+        let agent = std::rc::Rc::new(build_agent_with_model_for_tests(
+            old_model,
+            "grok-build",
+        ));
+        let mut fallback_entry = agent.models_manager.models()[old_model].clone();
+        fallback_entry.info.model = ready_fallback.to_owned();
+        agent
+            .models_manager
+            .insert_test_entry(ready_fallback, fallback_entry);
+
+        let sid = acp::SessionId::new("prompt-recovery-new-block-race");
+        let (mut handle, _cmd_tx, mut cmd_rx) = make_live_session_handle(&sid, None);
+        handle.model_id = acp::ModelId::new(old_model);
+        handle.agent_name = "grok-build".to_owned();
+        agent.insert_resident(&sid, handle);
+        let old_identity = crate::agent::models::resolve_catalog_identity(
+            &agent.models_manager.models(),
+            &acp::ModelId::new(old_model),
+        )
+        .expect("old model identity");
+        agent.session_registry.set_unavailable_model_with_identity(
+            &sid,
+            acp::ModelId::new(old_model),
+            Some(old_identity),
+            Some("grok-build".to_owned()),
+        );
+
+        let hook_agent = agent.clone();
+        let hook_sid = sid.clone();
+        super::acp_agent::install_prompt_recovery_boundary_hook(
+            &sid,
+            move |restore_model_id| {
+                assert_eq!(restore_model_id.0.as_ref(), old_model);
+                hook_agent.with_resident_mut(&hook_sid, |resident| {
+                    resident.model_id = acp::ModelId::new(ready_fallback);
+                });
+                hook_agent.session_registry.set_unavailable_model_with_identity(
+                    &hook_sid,
+                    acp::ModelId::new(new_unavailable_model),
+                    None,
+                    Some("grok-build".to_owned()),
+                );
+            },
+        );
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            <MvpAgent as acp::Agent>::prompt(
+                &agent,
+                acp::PromptRequest::new(
+                    sid.clone(),
+                    vec![acp::ContentBlock::from("must remain blocked")],
+                ),
+            ),
+        )
+        .await
+        .expect("superseded recovery must not hang")
+        .expect("superseded recovery must block cleanly");
+
+        assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
+        assert_eq!(
+            agent.resident_handle(&sid).unwrap().model_id,
+            acp::ModelId::new(ready_fallback)
+        );
+        assert_eq!(
+            agent.session_registry.unavailable_model(&sid),
+            Some(acp::ModelId::new(new_unavailable_model))
+        );
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "a newer unavailable latch must block before any actor command"
+        );
+    });
+}
+
+#[test]
+fn production_prompt_recovery_preserves_an_aba_latch_written_during_actor_commit() {
+    run_local_for_bridge_test(|| async {
+        let model_id = "prompt-recovery-actor-aba";
+        let agent = std::rc::Rc::new(build_agent_with_model_for_tests(model_id, "grok-build"));
+        let sid = acp::SessionId::new("prompt-recovery-actor-aba");
+        let (mut handle, _cmd_tx, mut cmd_rx) = make_live_session_handle(&sid, None);
+        handle.model_id = acp::ModelId::new(model_id);
+        handle.agent_name = "grok-build".to_owned();
+        agent.insert_resident(&sid, handle);
+        let identity = crate::agent::models::resolve_catalog_identity(
+            &agent.models_manager.models(),
+            &acp::ModelId::new(model_id),
+        )
+        .expect("model identity");
+        agent.session_registry.set_unavailable_model_with_identity(
+            &sid,
+            acp::ModelId::new(model_id),
+            Some(identity.clone()),
+            Some("grok-build".to_owned()),
+        );
+
+        let apply_count = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let actor_apply_count = apply_count.clone();
+        let actor_agent = agent.clone();
+        let actor_sid = sid.clone();
+        let actor_identity = identity.clone();
+        let actor = tokio::task::spawn_local(async move {
+            while let Some(command) = cmd_rx.recv().await {
+                match command {
+                    TestSessionCommand::GetActiveAgent { responds_to } => {
+                        let _ = responds_to.send(Some("grok-build".to_owned()));
+                    }
+                    TestSessionCommand::ApplyModelSwitch {
+                        prepared,
+                        responds_to,
+                    } => {
+                        actor_apply_count.set(actor_apply_count.get() + 1);
+                        assert_eq!(prepared.catalog_identity.model_id, model_id);
+                        actor_agent
+                            .session_registry
+                            .take_unavailable_model(&actor_sid);
+                        actor_agent.session_registry.set_unavailable_model_with_identity(
+                            &actor_sid,
+                            acp::ModelId::new(model_id),
+                            Some(actor_identity.clone()),
+                            Some("grok-build".to_owned()),
+                        );
+                        let _ = responds_to.send(Ok(crate::session::AppliedModelSwitch {
+                            previous_model_id: acp::ModelId::new(model_id),
+                            catalog_model_id: acp::ModelId::new(model_id),
+                            did_rebuild: false,
+                            active_agent_type: Some("grok-build".to_owned()),
+                            web_search: None,
+                        }));
+                    }
+                    _ => panic!("unexpected command after an ABA recovery latch"),
+                }
+            }
+        });
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            <MvpAgent as acp::Agent>::prompt(
+                &agent,
+                acp::PromptRequest::new(
+                    sid.clone(),
+                    vec![acp::ContentBlock::from("must remain blocked after ABA")],
+                ),
+            ),
+        )
+        .await
+        .expect("ABA recovery must not hang")
+        .expect("ABA recovery must block cleanly");
+
+        assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
+        assert_eq!(apply_count.get(), 1);
+        assert_eq!(
+            agent.session_registry.unavailable_model(&sid),
+            Some(acp::ModelId::new(model_id))
+        );
+        assert_eq!(
+            agent.session_registry.unavailable_catalog_identity(&sid),
+            Some(identity)
+        );
+        actor.abort();
+    });
+}
+
+#[test]
+fn production_prompt_rechecks_a_new_latch_immediately_before_actor_dispatch() {
+    run_local_for_bridge_test(|| async {
+        let model_id = "prompt-late-unavailable-model";
+        let agent = std::rc::Rc::new(build_agent_with_model_for_tests(model_id, "grok-build"));
+        let sid = acp::SessionId::new("prompt-late-unavailable-model");
+        let (mut handle, _cmd_tx, mut cmd_rx) = make_live_session_handle(&sid, None);
+        handle.model_id = acp::ModelId::new(model_id);
+        agent.insert_resident(&sid, handle);
+
+        let prompt_count = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let actor_prompt_count = prompt_count.clone();
+        let actor_agent = agent.clone();
+        let actor_sid = sid.clone();
+        let actor = tokio::task::spawn_local(async move {
+            while let Some(command) = cmd_rx.recv().await {
+                match command {
+                    TestSessionCommand::GetCurrentPromptMode { responds_to } => {
+                        actor_agent.session_registry.set_unavailable_model(
+                            &actor_sid,
+                            acp::ModelId::new(model_id),
+                        );
+                        let _ = responds_to.send(Default::default());
+                    }
+                    TestSessionCommand::GetCurrentModel { responds_to } => {
+                        let _ = responds_to.send(model_id.to_owned());
+                    }
+                    TestSessionCommand::CopyFile { respond_to } => {
+                        let _ = respond_to.send(Err(anyhow::anyhow!(
+                            "session copy is unavailable in the fake actor"
+                        )));
+                    }
+                    TestSessionCommand::SetNextTraceTurn { .. } => {}
+                    TestSessionCommand::Prompt { .. } => {
+                        actor_prompt_count.set(actor_prompt_count.get() + 1);
+                    }
+                    _ => panic!("unexpected command during late unavailable-model latch"),
+                }
+            }
+        });
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            <MvpAgent as acp::Agent>::prompt(
+                &agent,
+                acp::PromptRequest::new(
+                    sid.clone(),
+                    vec![acp::ContentBlock::from("must not reach the actor")],
+                ),
+            ),
+        )
+        .await
+        .expect("late latch must not hang")
+        .expect("late latch must block cleanly");
+
+        assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
+        assert_eq!(prompt_count.get(), 0);
+        assert_eq!(
+            agent.session_registry.unavailable_model(&sid),
+            Some(acp::ModelId::new(model_id))
+        );
+        actor.abort();
+    });
+}
+
+struct TestSessionLoadMarker {
+    registry: SessionRegistry,
+    session_id: acp::SessionId,
+    rx: tokio::sync::watch::Receiver<bool>,
+    _tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl TestSessionLoadMarker {
+    fn begin(agent: &MvpAgent, session_id: &acp::SessionId) -> Self {
+        let registry = agent.session_registry.clone();
+        let (tx, rx) = registry.begin_attach(session_id);
+        Self {
+            registry,
+            session_id: session_id.clone(),
+            rx,
+            _tx: tx,
+        }
+    }
+}
+
+impl Drop for TestSessionLoadMarker {
+    fn drop(&mut self) {
+        self.registry.settle_attach(&self.session_id, &self.rx);
+    }
+}
+
+#[test]
+fn production_prompt_fails_closed_when_load_starts_at_dispatch_boundary() {
+    run_local_for_bridge_test(|| async {
+        let model_id = "prompt-load-at-dispatch-boundary";
+        let agent = build_agent_with_model_for_tests(model_id, "grok-build");
+        let sid = acp::SessionId::new("prompt-load-at-dispatch-boundary");
+        let (mut handle, _cmd_tx, mut cmd_rx) = make_live_session_handle(&sid, None);
+        handle.model_id = acp::ModelId::new(model_id);
+        agent.insert_resident(&sid, handle);
+
+        let load_marker = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let hook_marker = load_marker.clone();
+        let registry_agent = agent.session_registry.clone();
+        let hook_sid = sid.clone();
+        super::acp_agent::install_prompt_dispatch_boundary_hook(&sid, move || {
+            let (tx, rx) = registry_agent.begin_attach(&hook_sid);
+            *hook_marker.borrow_mut() = Some(TestSessionLoadMarker {
+                registry: registry_agent,
+                session_id: hook_sid,
+                rx,
+                _tx: tx,
+            });
+        });
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            <MvpAgent as acp::Agent>::prompt(
+                &agent,
+                acp::PromptRequest::new(
+                    sid.clone(),
+                    vec![acp::ContentBlock::from("must not reach the actor")],
+                ),
+            ),
+        )
+        .await
+        .expect("the dispatch-boundary load race must not hang")
+        .expect("a load raced at the dispatch boundary must block cleanly");
+
+        assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
+        assert!(
+            agent.session_registry.is_attaching(&sid),
+            "the boundary hook must keep the raced load active through the fail-closed check"
+        );
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        drop(load_marker.borrow_mut().take());
+        assert!(
+            !agent.session_registry.is_attaching(&sid),
+            "the test load marker must settle after the assertion"
+        );
+    });
+}
+
+#[test]
+fn production_prompt_rechecks_load_immediately_before_actor_dispatch() {
+    run_local_for_bridge_test(|| async {
+        let model_id = "prompt-load-during-preparation";
+        let agent = std::rc::Rc::new(build_agent_with_model_for_tests(model_id, "grok-build"));
+        let sid = acp::SessionId::new("prompt-load-during-preparation");
+        let (mut handle, _cmd_tx, mut cmd_rx) = make_live_session_handle(&sid, None);
+        handle.model_id = acp::ModelId::new(model_id);
+        agent.insert_resident(&sid, handle);
+
+        let load_marker = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let actor_marker = load_marker.clone();
+        let actor_agent = agent.clone();
+        let actor_sid = sid.clone();
+        let prompt_count = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let actor_prompt_count = prompt_count.clone();
+        let actor = tokio::task::spawn_local(async move {
+            while let Some(command) = cmd_rx.recv().await {
+                match command {
+                    TestSessionCommand::GetCurrentPromptMode { responds_to } => {
+                        *actor_marker.borrow_mut() = Some(TestSessionLoadMarker::begin(
+                            &actor_agent,
+                            &actor_sid,
+                        ));
+                        let _ = responds_to.send(Default::default());
+                    }
+                    TestSessionCommand::GetCurrentModel { responds_to } => {
+                        let _ = responds_to.send(model_id.to_owned());
+                    }
+                    TestSessionCommand::CopyFile { respond_to } => {
+                        let _ = respond_to.send(Err(anyhow::anyhow!(
+                            "session copy is unavailable in the fake actor"
+                        )));
+                    }
+                    TestSessionCommand::SetNextTraceTurn { .. } => {}
+                    TestSessionCommand::Prompt { .. } => {
+                        actor_prompt_count.set(actor_prompt_count.get() + 1);
+                    }
+                    _ => panic!("unexpected command during prompt preparation load race"),
+                }
+            }
+        });
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            <MvpAgent as acp::Agent>::prompt(
+                &agent,
+                acp::PromptRequest::new(
+                    sid.clone(),
+                    vec![acp::ContentBlock::from("must not reach the actor")],
+                ),
+            ),
+        )
+        .await
+        .expect("the prompt preparation load race must not hang")
+        .expect("a load raced during preparation must block cleanly");
+
+        assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
+        assert_eq!(prompt_count.get(), 0, "no Prompt command may be dispatched");
+        assert!(agent.session_registry.is_attaching(&sid));
+        drop(load_marker.borrow_mut().take());
+        assert!(!agent.session_registry.is_attaching(&sid));
+        actor.abort();
+    });
+}
+
+#[test]
+fn production_model_switch_rejects_load_started_while_waiting_for_dispatch_lock() {
+    use std::task::Poll;
+
+    run_local_for_bridge_test(|| async {
+        let old_model = "switch-load-race-old";
+        let new_model = "switch-load-race-new";
+        let agent = build_agent_with_model_for_tests(old_model, "grok-build");
+        let mut new_entry = agent.models_manager.models()[old_model].clone();
+        new_entry.info.model = new_model.to_owned();
+        agent
+            .models_manager
+            .insert_test_entry(new_model, new_entry);
+
+        let sid = acp::SessionId::new("switch-load-race");
+        let (mut handle, _cmd_tx, mut cmd_rx) = make_live_session_handle(&sid, None);
+        handle.model_id = acp::ModelId::new(old_model);
+        agent.insert_resident(&sid, handle);
+
+        let dispatch_lock = agent.dispatch_lock(&sid);
+        let dispatch_guard = dispatch_lock.lock().await;
+        let mut switch = Box::pin(<MvpAgent as acp::Agent>::set_session_model(
+            &agent,
+            acp::SetSessionModelRequest::new(sid.clone(), acp::ModelId::new(new_model)),
+        ));
+        assert!(
+            matches!(futures::poll!(switch.as_mut()), Poll::Pending),
+            "the model switch must be waiting on the held dispatch lock"
+        );
+
+        let load_guard = agent.begin_session_load(&sid);
+        drop(dispatch_guard);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), switch)
+            .await
+            .expect("the waiting model switch load race must not hang")
+            .expect_err("a newly-started load must supersede the waiting model switch");
+
+        assert_eq!(error.code, acp::ErrorCode::InternalError);
+        assert!(
+            error
+                .to_string()
+                .contains("session load started before actor dispatch"),
+            "unexpected error: {error:?}"
+        );
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        drop(load_guard);
+        assert!(!agent.session_registry.is_attaching(&sid));
+        assert_eq!(
+            agent.resident_handle(&sid).unwrap().model_id,
+            acp::ModelId::new(old_model)
+        );
+    });
+}
+
+#[test]
+fn production_user_model_switch_preserves_a_newer_unavailable_latch() {
+    run_local_for_bridge_test(|| async {
+        let old_model = "user-switch-old-model";
+        let new_model = "user-switch-new-model";
+        let concurrent_block = "user-switch-concurrent-block";
+        let agent = std::rc::Rc::new(build_agent_with_model_for_tests(
+            old_model,
+            "grok-build",
+        ));
+        let mut new_entry = agent.models_manager.models()[old_model].clone();
+        new_entry.info.model = new_model.to_owned();
+        agent
+            .models_manager
+            .insert_test_entry(new_model, new_entry);
+
+        let sid = acp::SessionId::new("user-switch-preserves-newer-latch");
+        let (mut handle, _cmd_tx, mut cmd_rx) = make_live_session_handle(&sid, None);
+        handle.model_id = acp::ModelId::new(old_model);
+        handle.agent_name = "grok-build".to_owned();
+        agent.insert_resident(&sid, handle);
+
+        let actor_agent = agent.clone();
+        let actor_sid = sid.clone();
+        let actor = tokio::task::spawn_local(async move {
+            while let Some(command) = cmd_rx.recv().await {
+                match command {
+                    TestSessionCommand::GetActiveAgent { responds_to } => {
+                        let _ = responds_to.send(Some("grok-build".to_owned()));
+                    }
+                    TestSessionCommand::ApplyModelSwitch {
+                        prepared,
+                        responds_to,
+                    } => {
+                        assert_eq!(prepared.catalog_identity.model_id, new_model);
+                        actor_agent.session_registry.set_unavailable_model(
+                            &actor_sid,
+                            acp::ModelId::new(concurrent_block),
+                        );
+                        let _ = responds_to.send(Ok(crate::session::AppliedModelSwitch {
+                            previous_model_id: acp::ModelId::new(old_model),
+                            catalog_model_id: acp::ModelId::new(new_model),
+                            did_rebuild: false,
+                            active_agent_type: Some("grok-build".to_owned()),
+                            web_search: None,
+                        }));
+                    }
+                    _ => panic!("unexpected command during user model switch"),
+                }
+            }
+        });
+
+        <MvpAgent as acp::Agent>::set_session_model(
+            &agent,
+            acp::SetSessionModelRequest::new(sid.clone(), acp::ModelId::new(new_model)),
+        )
+        .await
+        .expect("the user model switch itself must commit");
+
+        assert_eq!(
+            agent.resident_handle(&sid).unwrap().model_id,
+            acp::ModelId::new(new_model)
+        );
+        assert_eq!(
+            agent.session_registry.unavailable_model(&sid),
+            Some(acp::ModelId::new(concurrent_block)),
+            "the newer fail-closed decision must survive the older actor receipt"
+        );
+        assert_eq!(
+            agent.models_manager.current_model_id(),
+            acp::ModelId::new(new_model)
+        );
+        actor.abort();
+    });
+}
+
+#[test]
+fn production_model_switch_rejects_a_receipt_from_a_replaced_resident() {
+    run_local_for_bridge_test(|| async {
+        let old_model = "replaced-resident-old-model";
+        let new_model = "replaced-resident-new-model";
+        let replacement_model = "replacement-resident-model";
+        let agent = std::rc::Rc::new(build_agent_with_model_for_tests(
+            old_model,
+            "grok-build",
+        ));
+        let mut new_entry = agent.models_manager.models()[old_model].clone();
+        new_entry.info.model = new_model.to_owned();
+        agent
+            .models_manager
+            .insert_test_entry(new_model, new_entry);
+
+        let sid = acp::SessionId::new("model-switch-replaced-resident");
+        let (mut handle, _cmd_tx, mut cmd_rx) = make_live_session_handle(&sid, None);
+        handle.model_id = acp::ModelId::new(old_model);
+        handle.agent_name = "grok-build".to_owned();
+        agent.insert_resident(&sid, handle);
+
+        let actor_agent = agent.clone();
+        let actor_sid = sid.clone();
+        let actor = tokio::task::spawn_local(async move {
+            while let Some(command) = cmd_rx.recv().await {
+                match command {
+                    TestSessionCommand::GetActiveAgent { responds_to } => {
+                        let _ = responds_to.send(Some("grok-build".to_owned()));
+                    }
+                    TestSessionCommand::ApplyModelSwitch {
+                        prepared,
+                        responds_to,
+                    } => {
+                        assert_eq!(prepared.catalog_identity.model_id, new_model);
+                        let (mut replacement, _replacement_tx, _replacement_rx) =
+                            make_live_session_handle(&actor_sid, None);
+                        replacement.model_id = acp::ModelId::new(replacement_model);
+                        actor_agent.insert_resident(&actor_sid, replacement);
+                        let _ = responds_to.send(Ok(crate::session::AppliedModelSwitch {
+                            previous_model_id: acp::ModelId::new(old_model),
+                            catalog_model_id: acp::ModelId::new(new_model),
+                            did_rebuild: false,
+                            active_agent_type: Some("grok-build".to_owned()),
+                            web_search: None,
+                        }));
+                    }
+                    _ => panic!("unexpected command during replaced-resident switch"),
+                }
+            }
+        });
+
+        let error = <MvpAgent as acp::Agent>::set_session_model(
+            &agent,
+            acp::SetSessionModelRequest::new(sid.clone(), acp::ModelId::new(new_model)),
+        )
+        .await
+        .expect_err("a receipt from the displaced actor must not commit outer mirrors");
+
+        assert!(
+            error.to_string().contains("resident session changed"),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            agent.resident_handle(&sid).unwrap().model_id,
+            acp::ModelId::new(replacement_model)
+        );
+        assert_eq!(
+            agent.models_manager.current_model_id(),
+            acp::ModelId::new(old_model),
+            "a stale receipt must not update the process-wide model mirror"
+        );
+        actor.abort();
+    });
+}
+
+#[test]
 fn production_set_model_reauthorizes_after_dispatch_lock_before_any_actor_command() {
     use crate::agent::config::{EndpointsConfig, ModelEntry};
 
@@ -4615,6 +5398,10 @@ fn load_restore_apply_bypasses_own_marker_and_preserves_request_order() {
             let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
             handle.cmd_tx = cmd_tx;
             agent.session_registry.put_resident(&sid, handle);
+            let unavailable_model = acp::ModelId::new("persisted-unavailable");
+            agent
+                .session_registry
+                .set_unavailable_model(&sid, unavailable_model.clone());
 
             tokio::task::spawn_local(async move {
                 while let Some(command) = cmd_rx.recv().await {
@@ -4662,6 +5449,11 @@ fn load_restore_apply_bypasses_own_marker_and_preserves_request_order() {
                 restored_model,
                 "the load restore must commit before the load marker is released"
             );
+            assert_eq!(
+                agent.session_registry.unavailable_model(&sid),
+                Some(unavailable_model),
+                "session/load must preserve its intentional fail-closed latch"
+            );
             assert!(
                 matches!(futures::poll!(later_request.as_mut()), Poll::Pending),
                 "the external request must still be gated until load completion"
@@ -4675,6 +5467,11 @@ fn load_restore_apply_bypasses_own_marker_and_preserves_request_order() {
                 agent.resident_handle(&sid).unwrap().model_id.0.as_ref(),
                 later_model,
                 "the later external request must be the final committed model"
+            );
+            assert_eq!(
+                agent.session_registry.unavailable_model(&sid),
+                None,
+                "a successful external user switch must clear the load-time latch"
             );
         }));
 }

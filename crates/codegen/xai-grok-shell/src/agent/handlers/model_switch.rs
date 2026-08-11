@@ -6,7 +6,8 @@
 use crate::agent::config;
 use crate::agent::models::model_offers_reasoning_effort;
 use crate::agent::mvp_agent::{
-    MvpAgent, SessionLoadGuard, agent_name_after_model_switch, apply_session_cli_clamps,
+    ModelSwitchCommitOutcome, MvpAgent, SessionLoadGuard, UnavailableModelCommitPolicy,
+    UnavailableRecoverySnapshot, agent_name_after_model_switch, apply_session_cli_clamps,
     harnesses_are_compatible, resolve_required_agent_type,
 };
 use crate::session::SessionCommand;
@@ -152,7 +153,9 @@ pub(crate) async fn apply(
     agent: &MvpAgent,
     args: acp::SetSessionModelRequest,
 ) -> Result<acp::SetSessionModelResponse, acp::Error> {
-    apply_with_load_gate(agent, args, None, None).await
+    apply_with_load_gate(agent, args, None, None, None)
+        .await?
+        .ok_or_else(|| acp::Error::internal_error().data("unexpected stale model switch"))
 }
 
 /// Apply a model that was reconciled from a persisted catalog identity.
@@ -166,7 +169,21 @@ pub(crate) async fn apply_catalog_snapshot(
     catalog_identity: xai_chat_state::CatalogIdentity,
     model: config::ModelEntry,
 ) -> Result<acp::SetSessionModelResponse, acp::Error> {
-    apply_with_load_gate(agent, args, None, Some((catalog_identity, model))).await
+    apply_with_load_gate(agent, args, None, Some((catalog_identity, model)), None)
+        .await?
+        .ok_or_else(|| acp::Error::internal_error().data("unexpected stale model switch"))
+}
+
+/// Restore a prompt's unavailable resident only if the latch and resident
+/// still match the snapshot captured before waiting for the dispatch lock.
+/// `Ok(None)` means a newer model decision superseded this recovery attempt.
+pub(crate) async fn apply_recovery(
+    agent: &MvpAgent,
+    args: acp::SetSessionModelRequest,
+    expected: UnavailableRecoverySnapshot,
+    restored_model: Option<(xai_chat_state::CatalogIdentity, config::ModelEntry)>,
+) -> Result<Option<acp::SetSessionModelResponse>, acp::Error> {
+    apply_with_load_gate(agent, args, None, restored_model, Some(expected)).await
 }
 
 /// Apply the model restored by `session/load` while that load's guard is alive.
@@ -183,7 +200,9 @@ pub(crate) async fn apply_during_session_load(
     load_guard: &SessionLoadGuard<'_>,
     restored_model: Option<(xai_chat_state::CatalogIdentity, config::ModelEntry)>,
 ) -> Result<acp::SetSessionModelResponse, acp::Error> {
-    apply_with_load_gate(agent, args, Some(load_guard), restored_model).await
+    apply_with_load_gate(agent, args, Some(load_guard), restored_model, None)
+        .await?
+        .ok_or_else(|| acp::Error::internal_error().data("unexpected stale model switch"))
 }
 
 async fn apply_with_load_gate(
@@ -191,7 +210,8 @@ async fn apply_with_load_gate(
     args: acp::SetSessionModelRequest,
     load_guard: Option<&SessionLoadGuard<'_>>,
     restored_model: Option<(xai_chat_state::CatalogIdentity, config::ModelEntry)>,
-) -> Result<acp::SetSessionModelResponse, acp::Error> {
+    recovery_expectation: Option<UnavailableRecoverySnapshot>,
+) -> Result<Option<acp::SetSessionModelResponse>, acp::Error> {
     tracing::info!("Received set session model request {args:?}");
     tracing::debug!("session_session_model::mvp_agent: {:?}", &args);
     let effort_override = parse_reasoning_effort_meta(args.meta.as_ref());
@@ -203,7 +223,7 @@ async fn apply_with_load_gate(
     // Armed until the complete actor receipt and outer mirrors have committed.
     // Every early return therefore emits exactly one sanitized failure event.
     let mut failure_telemetry = FailureTelemetry::new(&session_id, &requested_model_id);
-    let handle = match load_guard {
+    let _load_resolved_handle = match load_guard {
         Some(guard) => agent.session_handle_during_load(&session_id, guard),
         None => agent.session_handle_waiting_for_load(&session_id).await,
     }
@@ -219,6 +239,36 @@ async fn apply_with_load_gate(
     let _dispatch_guard = dispatch_lock.lock().await;
     #[cfg(test)]
     run_dispatch_boundary_hook(&session_id);
+    if load_guard.is_none() && agent.session_load_in_flight(&session_id) {
+        return Err(acp::Error::internal_error()
+            .data("model_switch: session load started before actor dispatch"));
+    }
+    let handle = match load_guard {
+        Some(guard) => agent.session_handle_during_load(&session_id, guard),
+        None => agent.resident_handle(&session_id),
+    };
+    let Some(handle) = handle else {
+        if recovery_expectation.is_some() {
+            failure_telemetry.disarm();
+            return Ok(None);
+        }
+        return Err(acp::Error::invalid_params().data("unknown session id"));
+    };
+    if let Some(expected) = recovery_expectation.as_ref()
+        && !agent.unavailable_recovery_is_current(&session_id, expected)
+    {
+        failure_telemetry.disarm();
+        tracing::info!(
+            session_id = %session_id.0,
+            expected_unavailable_model = %expected.unavailable_model.0,
+            expected_resident_model = %expected.resident_model_id.0,
+            "prompt recovery superseded by a newer resident model decision"
+        );
+        return Ok(None);
+    }
+    let unavailable_model_revision = agent
+        .unavailable_model_revision(&session_id)
+        .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))?;
     let dispatch_authority = agent
         .models_manager
         .model_dispatch_authority(&requested_model_id)
@@ -422,12 +472,60 @@ async fn apply_with_load_gate(
     let did_rebuild = receipt.did_rebuild;
     let committed_previous_model_id = receipt.previous_model_id.0.to_string();
     let updated_model = receipt.catalog_model_id;
-    agent.with_resident_mut(&session_id, |handle| {
-        handle.model_id = catalog_model_id.clone();
-        handle.reasoning_effort = applied_effort;
-        handle.agent_name =
-            agent_name_after_model_switch(did_rebuild, &required_agent_type, &handle.agent_name);
-    });
+    let unavailable_model_policy = if load_guard.is_some() {
+        UnavailableModelCommitPolicy::Preserve
+    } else {
+        UnavailableModelCommitPolicy::ClearIfRevision(unavailable_model_revision)
+    };
+    let commit_outcome = agent.commit_model_switch(
+        &session_id,
+        &handle.cmd_tx,
+        load_guard,
+        unavailable_model_policy,
+        |handle| {
+            handle.model_id = catalog_model_id.clone();
+            handle.reasoning_effort = applied_effort;
+            handle.agent_name = agent_name_after_model_switch(
+                did_rebuild,
+                &required_agent_type,
+                &handle.agent_name,
+            );
+        },
+    );
+    let (cleared_unavailable_model, unavailable_model_revision_matched) = match commit_outcome {
+        ModelSwitchCommitOutcome::Committed {
+            cleared_unavailable_model,
+            unavailable_model_revision_matched,
+        } => (
+            cleared_unavailable_model,
+            unavailable_model_revision_matched,
+        ),
+        ModelSwitchCommitOutcome::Superseded => {
+            if recovery_expectation.is_some() {
+                failure_telemetry.disarm();
+                return Ok(None);
+            }
+            failure_telemetry.mark_commit_phase();
+            return Err(acp::Error::internal_error()
+                .data("model_switch: resident session changed before outer commit"));
+        }
+    };
+    let recovery_superseded_after_actor =
+        recovery_expectation.is_some() && !unavailable_model_revision_matched;
+    if !unavailable_model_revision_matched {
+        tracing::info!(
+            session_id = %session_id.0,
+            model_id = %catalog_model_id.0,
+            "model switch preserved a newer unavailable-model decision"
+        );
+    }
+    if let Some(unavailable_model) = cleared_unavailable_model {
+        tracing::info!(
+            session_id = %session_id.0,
+            previously_unavailable_model = %unavailable_model.0,
+            "committed model switch cleared the model-unavailable block"
+        );
+    }
     if let Some(web_search) = receipt.web_search {
         agent.set_web_search_disable_notice_for_session(&session_id, web_search.disable_notice);
     }
@@ -458,12 +556,22 @@ async fn apply_with_load_gate(
     }
     agent.sync_process_static_api_key(Some(catalog_model_id.0.as_ref()));
     failure_telemetry.disarm();
-    Ok(acp::SetSessionModelResponse::new().meta(
-        serde_json::json!({
-            "model": updated_model,
-        })
-        .as_object()
-        .cloned(),
+    if recovery_superseded_after_actor {
+        tracing::info!(
+            session_id = %session_id.0,
+            model_id = %catalog_model_id.0,
+            "prompt recovery actor commit preserved a newer unavailable-model decision"
+        );
+        return Ok(None);
+    }
+    Ok(Some(
+        acp::SetSessionModelResponse::new().meta(
+            serde_json::json!({
+                "model": updated_model,
+            })
+            .as_object()
+            .cloned(),
+        ),
     ))
 }
 /// Broadcast a `ModelChanged` to every client subscribed to this session so

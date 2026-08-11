@@ -1662,6 +1662,9 @@ mod agent_ops;
 mod acp_agent;
 mod session_setup;
 use session_registry::SessionRegistry;
+pub(crate) use session_registry::{
+    ModelSwitchCommitOutcome, UnavailableModelCommitPolicy, UnavailableRecoverySnapshot,
+};
 pub(crate) use session_lifecycle::RegistrySnapshot;
 pub(super) use super::ext_parsers;
 /// Emit the `auth.lifecycle` login span with optional user id and error

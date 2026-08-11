@@ -10,9 +10,15 @@ use crate::leader::protocol::InternalMethod;
 type PromptDispatchBoundaryHook = Box<dyn FnOnce() + 'static>;
 
 #[cfg(test)]
+type PromptRecoveryBoundaryHook = Box<dyn FnOnce(&acp::ModelId) + 'static>;
+
+#[cfg(test)]
 thread_local! {
     static PROMPT_DISPATCH_BOUNDARY_HOOKS: std::cell::RefCell<
         std::collections::HashMap<String, PromptDispatchBoundaryHook>
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+    static PROMPT_RECOVERY_BOUNDARY_HOOKS: std::cell::RefCell<
+        std::collections::HashMap<String, PromptRecoveryBoundaryHook>
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
@@ -34,6 +40,30 @@ fn run_prompt_dispatch_boundary_hook(session_id: &acp::SessionId) {
         .with(|hooks| hooks.borrow_mut().remove(session_id.0.as_ref()));
     if let Some(hook) = hook {
         hook();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_prompt_recovery_boundary_hook(
+    session_id: &acp::SessionId,
+    hook: impl FnOnce(&acp::ModelId) + 'static,
+) {
+    PROMPT_RECOVERY_BOUNDARY_HOOKS.with(|hooks| {
+        hooks
+            .borrow_mut()
+            .insert(session_id.0.to_string(), Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_prompt_recovery_boundary_hook(
+    session_id: &acp::SessionId,
+    restore_model_id: &acp::ModelId,
+) {
+    let hook = PROMPT_RECOVERY_BOUNDARY_HOOKS
+        .with(|hooks| hooks.borrow_mut().remove(session_id.0.as_ref()));
+    if let Some(hook) = hook {
+        hook(restore_model_id);
     }
 }
 
@@ -2960,22 +2990,19 @@ impl acp::Agent for MvpAgent {
                 }
             }
         }
-        let latched_model = self
+        let latched_recovery = self
             .session_registry
-            .unavailable_model(&arguments.session_id);
-        if let Some(unavailable_model) = latched_model {
+            .unavailable_recovery_snapshot(&arguments.session_id);
+        if let Some(recovery_snapshot) = latched_recovery {
+            let unavailable_model = recovery_snapshot.unavailable_model.clone();
             let presentation = self.models_manager.presentation_snapshot();
             let models = presentation.catalog;
             let available = presentation.available;
-            let latched_identity = self
-                .session_registry
-                .unavailable_catalog_identity(&arguments.session_id);
+            let latched_identity = recovery_snapshot.catalog_identity.clone();
             let mut reconciled_snapshot = latched_identity.as_ref().and_then(|identity| {
                 reconcile_latched_catalog_snapshot(&models, &available, identity)
             });
-            let persisted_agent_name = self
-                .session_registry
-                .unavailable_agent_name(&arguments.session_id);
+            let persisted_agent_name = recovery_snapshot.agent_name.clone();
             if !latched_recovery_has_required_harness(
                 latched_identity.as_ref(),
                 persisted_agent_name.as_deref(),
@@ -3065,47 +3092,65 @@ impl acp::Agent for MvpAgent {
                     tracing::info!(
                         session_id = %arguments.session_id.0,
                         model_id = %restore_model_id.0,
-                        "prompt: previously-unavailable model is back in the catalog; restoring it and unblocking the session"
-                    );
-                    xai_grok_telemetry::unified_log::info(
-                        "prompt: previously-unavailable model recovered, unblocking session",
-                        Some(arguments.session_id.0.as_ref()),
-                        Some(
-                            serde_json::json!({
-                            "model_id": restore_model_id.0.as_ref(),
-                        }),
-                        ),
+                        "prompt: previously-unavailable model is back in the catalog; attempting recovery"
                     );
                     let request = acp::SetSessionModelRequest::new(
                         arguments.session_id.clone(),
                         restore_model_id.clone(),
                     );
-                    let apply_result = if let Some((_, identity, model)) = reconciled_snapshot {
-                        crate::agent::handlers::model_switch::apply_catalog_snapshot(
-                            self, request, identity, model,
-                        )
-                        .await
-                    } else {
-                        crate::agent::handlers::model_switch::apply(self, request).await
-                    };
-                    if let Err(e) = apply_result {
-                        tracing::warn!(
-                            session_id = %arguments.session_id.0,
-                            model_id = %restore_model_id.0,
-                            error = ?e,
-                            "prompt: failed to restore previously-unavailable model; keeping block"
-                        );
-                        self.send_model_auto_switched(
+                    #[cfg(test)]
+                    run_prompt_recovery_boundary_hook(
+                        &arguments.session_id,
+                        &restore_model_id,
+                    );
+                    let restored_model = reconciled_snapshot
+                        .map(|(_, identity, model)| (identity, model));
+                    match crate::agent::handlers::model_switch::apply_recovery(
+                        self,
+                        request,
+                        recovery_snapshot,
+                        restored_model,
+                    )
+                    .await
+                    {
+                        Ok(Some(_)) => {
+                            tracing::info!(
+                                session_id = %arguments.session_id.0,
+                                model_id = %restore_model_id.0,
+                                "prompt: restored previously-unavailable model and unblocked the session"
+                            );
+                            xai_grok_telemetry::unified_log::info(
+                                "prompt: previously-unavailable model recovered, unblocking session",
+                                Some(arguments.session_id.0.as_ref()),
+                                Some(serde_json::json!({
+                                    "model_id": restore_model_id.0.as_ref(),
+                                })),
+                            );
+                        }
+                        Ok(None) => {
+                            tracing::info!(
+                                session_id = %arguments.session_id.0,
+                                model_id = %restore_model_id.0,
+                                "prompt: stale unavailable-model recovery was superseded"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                session_id = %arguments.session_id.0,
+                                model_id = %restore_model_id.0,
+                                error = ?e,
+                                "prompt: failed to restore previously-unavailable model; keeping block"
+                            );
+                            self.send_model_auto_switched(
                                 &arguments.session_id,
                                 &acp::ModelId::new(String::new()),
                                 &acp::ModelId::new(String::new()),
                                 "Could not restore your previous model; prompts stay blocked until a successful switch.",
                             )
                             .await;
-                        return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+                            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+                        }
                     }
-                    self.session_registry
-                        .take_unavailable_model(&arguments.session_id);
                 }
                 crate::agent::models::PersistedCatalogKeyResolution::AmbiguousSlug {
                     matches,
@@ -3179,6 +3224,40 @@ impl acp::Agent for MvpAgent {
         let dispatch_guard = dispatch_lock.lock().await;
         #[cfg(test)]
         run_prompt_dispatch_boundary_hook(&arguments.session_id);
+        if self.session_load_in_flight(&arguments.session_id) {
+            tracing::warn!(
+                session_id = %arguments.session_id.0,
+                "prompt: session load started before serialized dispatch"
+            );
+            drop(dispatch_guard);
+            self.send_model_auto_switched(
+                &arguments.session_id,
+                &acp::ModelId::new(String::new()),
+                &acp::ModelId::new(String::new()),
+                "This session is still restoring; retry the prompt after restoration completes.",
+            )
+            .await;
+            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+        }
+        if let Some(blocked_model) = self
+            .session_registry
+            .unavailable_model(&arguments.session_id)
+        {
+            tracing::warn!(
+                session_id = %arguments.session_id.0,
+                unavailable_model = %blocked_model.0,
+                "prompt: unavailable-model block is still current after serialized recovery"
+            );
+            drop(dispatch_guard);
+            self.send_model_auto_switched(
+                &arguments.session_id,
+                &acp::ModelId::new(String::new()),
+                &acp::ModelId::new(String::new()),
+                "Your session model is still unavailable; choose a ready model or restore its credentials.",
+            )
+            .await;
+            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+        }
         // A model switch may have completed while this prompt waited for the
         // dispatch lock. Re-read the resident under serialization and capture
         // auth/catalog authority before sending any actor command.
@@ -3431,6 +3510,40 @@ impl acp::Agent for MvpAgent {
                 }
             }
         };
+        if self.session_load_in_flight(&arguments.session_id) {
+            tracing::warn!(
+                session_id = %arguments.session_id.0,
+                "prompt: session load started during prompt preparation"
+            );
+            drop(dispatch_guard);
+            self.send_model_auto_switched(
+                &arguments.session_id,
+                &acp::ModelId::new(String::new()),
+                &acp::ModelId::new(String::new()),
+                "This session began restoring while the prompt was prepared; retry after restoration completes.",
+            )
+            .await;
+            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+        }
+        if let Some(blocked_model) = self
+            .session_registry
+            .unavailable_model(&arguments.session_id)
+        {
+            tracing::warn!(
+                session_id = %arguments.session_id.0,
+                unavailable_model = %blocked_model.0,
+                "prompt: unavailable-model block changed during prompt preparation"
+            );
+            drop(dispatch_guard);
+            self.send_model_auto_switched(
+                &arguments.session_id,
+                &acp::ModelId::new(String::new()),
+                &acp::ModelId::new(String::new()),
+                "Your session model became unavailable while preparing this prompt; choose a ready model or restore its credentials.",
+            )
+            .await;
+            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+        }
         let prompt_command = SessionCommand::Prompt {
                 prompt_id: prompt_id.clone(),
                 prompt_blocks: arguments.prompt.clone(),
@@ -4324,20 +4437,7 @@ impl acp::Agent for MvpAgent {
         // the session dispatch lock. A picker snapshot here would race auth,
         // allowlist, and catalog mutation before actor dispatch.
         validation_failure_telemetry.disarm();
-        let session_id = args.session_id.clone();
-        let res = crate::agent::handlers::model_switch::apply(self, args).await;
-        if res.is_ok()
-            && let Some(unavailable) = self
-                .session_registry
-                .take_unavailable_model(&session_id)
-        {
-            tracing::info!(
-                session_id = %session_id.0,
-                previously_unavailable_model = %unavailable.0,
-                "set_session_model: user model switch cleared the model-unavailable block"
-            );
-        }
-        res
+        crate::agent::handlers::model_switch::apply(self, args).await
     }
     #[tracing::instrument(
         name = "agent.ext_method",
