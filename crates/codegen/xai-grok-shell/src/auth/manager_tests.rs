@@ -4,10 +4,9 @@
 
 use super::*;
 use crate::auth::error::RefreshTokenError;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
-#[cfg(unix)]
 fn codex_auth(key: &str) -> GrokAuth {
     GrokAuth {
         key: key.into(),
@@ -32,10 +31,8 @@ fn mode(path: &Path) -> u32 {
     std::fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
 
-#[cfg(unix)]
 struct PermissionRepairFault(PathBuf);
 
-#[cfg(unix)]
 impl PermissionRepairFault {
     fn install(path: &Path) -> Self {
         crate::auth::storage::PERMISSION_REPAIR_FAULT_PATHS
@@ -46,13 +43,37 @@ impl PermissionRepairFault {
     }
 }
 
-#[cfg(unix)]
 impl Drop for PermissionRepairFault {
     fn drop(&mut self) {
         let mut faults = crate::auth::storage::PERMISSION_REPAIR_FAULT_PATHS
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        faults.retain(|path| path != &self.0);
+        if let Some(index) = faults.iter().rposition(|path| path == &self.0) {
+            faults.remove(index);
+        }
+    }
+}
+
+struct PostRenamePermissionFault(PathBuf);
+
+impl PostRenamePermissionFault {
+    fn install(path: &Path) -> Self {
+        crate::auth::storage::POST_RENAME_PERMISSION_FAULT_PATHS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(path.to_owned());
+        Self(path.to_owned())
+    }
+}
+
+impl Drop for PostRenamePermissionFault {
+    fn drop(&mut self) {
+        let mut faults = crate::auth::storage::POST_RENAME_PERMISSION_FAULT_PATHS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(index) = faults.iter().rposition(|path| path == &self.0) {
+            faults.remove(index);
+        }
     }
 }
 
@@ -249,6 +270,407 @@ fn selection_seal_blocks_writers_without_advancing_generation() {
     );
     assert!(!changed.first_party_env_api_key_ok);
     thread.join().unwrap();
+}
+
+#[test]
+fn selection_wait_never_parks_on_a_stable_even_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+    let thread = std::thread::spawn(move || {
+        // Model the saturated backoff left after a prior contended mutation.
+        // A selection seal may legally restore the same even generation, so
+        // the park predicate must be "currently odd", never "value changed".
+        let mut backoff = AuthSelectionBackoff { attempts: 96 };
+        mgr.wait_for_selection_progress(&mut backoff);
+        let _ = done_tx.send(());
+    });
+    let completed = done_rx.recv_timeout(StdDuration::from_secs(1));
+    let joined = if completed.is_ok() {
+        thread.join().is_ok()
+    } else {
+        drop(thread);
+        false
+    };
+
+    assert!(
+        completed.is_ok(),
+        "stable even generation must never enter the Condvar wait"
+    );
+    assert!(joined, "stable-generation waiter must finish");
+}
+
+#[derive(Clone, Copy)]
+enum XaiPublicationPath {
+    Update,
+    SaveWithoutEnrichment,
+}
+
+struct SelectionPublicationPause {
+    manager: Arc<AuthManager>,
+    publication_reached_rx: std::sync::mpsc::Receiver<()>,
+    reader_observed_odd_rx: std::sync::mpsc::Receiver<()>,
+    release_publication_tx: std::sync::mpsc::SyncSender<()>,
+}
+
+impl SelectionPublicationPause {
+    fn install(manager: Arc<AuthManager>) -> Self {
+        let (publication_reached_tx, publication_reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_publication_tx, release_publication_rx) = std::sync::mpsc::sync_channel(1);
+        let release_publication_rx = Arc::new(std::sync::Mutex::new(release_publication_rx));
+        let release_hook = Arc::clone(&release_publication_rx);
+        manager.set_selection_after_disk_before_memory_hook(Some(Arc::new(move || {
+            let _ = publication_reached_tx.try_send(());
+            // Last-resort cleanup guarantee: even if the test driver dies,
+            // never strand a runtime worker inside the publication seam.
+            let _ = release_hook
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .recv_timeout(StdDuration::from_secs(2));
+        })));
+
+        let (reader_observed_odd_tx, reader_observed_odd_rx) = std::sync::mpsc::sync_channel(1);
+        let observed_once = Arc::new(AtomicBool::new(false));
+        manager.set_selection_snapshot_observed_odd_hook(Some(Arc::new(move || {
+            if !observed_once.swap(true, Ordering::SeqCst) {
+                let _ = reader_observed_odd_tx.try_send(());
+            }
+        })));
+
+        Self {
+            manager,
+            publication_reached_rx,
+            reader_observed_odd_rx,
+            release_publication_tx,
+        }
+    }
+
+    fn release(&self) {
+        let _ = self.release_publication_tx.try_send(());
+    }
+}
+
+impl Drop for SelectionPublicationPause {
+    fn drop(&mut self) {
+        self.release();
+        self.manager
+            .set_selection_after_disk_before_memory_hook(None);
+        self.manager.set_selection_snapshot_observed_odd_hook(None);
+    }
+}
+
+struct SelectionPublicationObservation {
+    publication_reached: bool,
+    reader_observed_odd: bool,
+    early_snapshot: Option<AuthSelectionSnapshot>,
+    snapshot: Option<AuthSelectionSnapshot>,
+    reader_joined: bool,
+    writer_result: Result<std::io::Result<GrokAuth>, String>,
+}
+
+async fn observe_selection_publication<F>(
+    manager: Arc<AuthManager>,
+    pause: &SelectionPublicationPause,
+    mut writer: tokio::task::JoinHandle<std::io::Result<GrokAuth>>,
+    on_publication_reached: F,
+) -> SelectionPublicationObservation
+where
+    F: FnOnce(),
+{
+    let publication_reached = pause
+        .publication_reached_rx
+        .recv_timeout(StdDuration::from_secs(1))
+        .is_ok();
+    if publication_reached {
+        on_publication_reached();
+    }
+
+    let (snapshot_tx, snapshot_rx) = std::sync::mpsc::sync_channel(1);
+    let snapshot_thread = std::thread::spawn(move || {
+        let _ = snapshot_tx.send(manager.selection_snapshot());
+    });
+    let reader_observed_odd = pause
+        .reader_observed_odd_rx
+        .recv_timeout(StdDuration::from_secs(1))
+        .is_ok();
+    let early_snapshot = snapshot_rx.recv_timeout(StdDuration::from_millis(25)).ok();
+
+    // Every unbounded operation is released or timed out before assertions.
+    pause.release();
+    let writer_result = match tokio::time::timeout(StdDuration::from_secs(3), &mut writer).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => Err(format!("publication task failed to join: {error}")),
+        Err(_) => {
+            writer.abort();
+            // Aborting cannot pre-empt synchronous filesystem work, but the
+            // publication seam has already been released. Give that work a
+            // bounded cleanup join instead of immediately detaching it.
+            let _ = tokio::time::timeout(StdDuration::from_secs(1), &mut writer).await;
+            Err("publication task timed out".to_string())
+        }
+    };
+    let snapshot =
+        early_snapshot.or_else(|| snapshot_rx.recv_timeout(StdDuration::from_secs(1)).ok());
+    let reader_joined = if snapshot.is_some() {
+        snapshot_thread.join().is_ok()
+    } else {
+        // Detach instead of allowing a failed regression to hang the suite.
+        drop(snapshot_thread);
+        false
+    };
+
+    SelectionPublicationObservation {
+        publication_reached,
+        reader_observed_odd,
+        early_snapshot,
+        snapshot,
+        reader_joined,
+        writer_result,
+    }
+}
+
+fn assert_selection_reader_was_blocked(observation: &SelectionPublicationObservation) {
+    assert!(
+        observation.publication_reached,
+        "credential must reach the disk/write-result publication seam"
+    );
+    assert!(
+        observation.reader_observed_odd,
+        "snapshot reader must actually observe the in-flight odd generation"
+    );
+    assert!(
+        observation.early_snapshot.is_none(),
+        "snapshot must not escape between durable disk publication and memory publication"
+    );
+    assert!(
+        observation.reader_joined,
+        "snapshot reader must complete after publication"
+    );
+}
+
+async fn assert_selection_snapshot_waits_for_disk_to_memory_auth_publication(
+    publication_path: XaiPublicationPath,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(
+        AuthManager::new(dir.path(), GrokComConfig::default())
+            .with_proxy_base_url("http://127.0.0.1:9"),
+    );
+    let initial = mgr.selection_snapshot();
+    let pause = SelectionPublicationPause::install(Arc::clone(&mgr));
+
+    let mut auth = make_auth(Some(Utc::now() + Duration::hours(1)), Utc::now());
+    auth.auth_mode = AuthMode::Oidc;
+    let writer = Arc::clone(&mgr);
+    let update = tokio::spawn(async move {
+        match publication_path {
+            XaiPublicationPath::Update => writer.update(auth).await,
+            XaiPublicationPath::SaveWithoutEnrichment => writer.save_without_enrichment(auth).await,
+        }
+    });
+    let observation = observe_selection_publication(Arc::clone(&mgr), &pause, update, || {}).await;
+    drop(pause);
+
+    assert_selection_reader_was_blocked(&observation);
+    observation
+        .writer_result
+        .expect("publication task must join")
+        .expect("publication must succeed");
+    let snapshot = observation
+        .snapshot
+        .expect("snapshot must complete after publication");
+    assert_eq!(snapshot.generation, initial.generation + 2);
+    assert!(snapshot.has_auth);
+    assert_eq!(
+        snapshot.session_eligibility,
+        FirstPartySessionEligibility::WireUsable
+    );
+    assert!(snapshot.is_session_auth);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selection_snapshot_waits_for_disk_to_memory_auth_publication() {
+    assert_selection_snapshot_waits_for_disk_to_memory_auth_publication(
+        XaiPublicationPath::SaveWithoutEnrichment,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selection_snapshot_waits_for_update_disk_to_memory_auth_publication() {
+    assert_selection_snapshot_waits_for_disk_to_memory_auth_publication(XaiPublicationPath::Update)
+        .await;
+}
+
+async fn assert_codex_strict_publication(post_rename_failure: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+    if post_rename_failure {
+        manager
+            .save_without_enrichment(codex_auth("codex-initial"))
+            .await
+            .unwrap();
+    }
+    let before = manager.selection_snapshot();
+    let pause = SelectionPublicationPause::install(Arc::clone(&manager));
+    let _fault =
+        post_rename_failure.then(|| PostRenamePermissionFault::install(manager.auth_json_path()));
+    let expected_key = if post_rename_failure {
+        "codex-rotated"
+    } else {
+        "codex-success"
+    };
+    let writer_manager = Arc::clone(&manager);
+    let writer = tokio::spawn(async move {
+        writer_manager
+            .save_without_enrichment(codex_auth(expected_key))
+            .await
+    });
+    let observation =
+        observe_selection_publication(Arc::clone(&manager), &pause, writer, || {}).await;
+    drop(pause);
+
+    let disk = read_auth_json_owner_only(manager.auth_json_path()).unwrap();
+
+    assert_selection_reader_was_blocked(&observation);
+    let operation = observation
+        .writer_result
+        .expect("Codex publication task must join");
+    let snapshot = observation
+        .snapshot
+        .expect("blocked reader must complete after Codex publication");
+    if post_rename_failure {
+        assert_eq!(
+            operation.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    } else {
+        assert_eq!(operation.unwrap().key, expected_key);
+    }
+    assert_eq!(manager.current_or_expired().unwrap().key, expected_key);
+    assert_eq!(
+        disk.get(crate::auth::openai_codex::AUTH_SCOPE).unwrap().key,
+        expected_key,
+        "the strict writer must leave a complete owner-only durable credential"
+    );
+    assert_eq!(snapshot.generation, before.generation + 2);
+    assert!(snapshot.has_auth);
+    assert!(!snapshot.is_session_auth);
+    assert_eq!(
+        snapshot.session_eligibility,
+        FirstPartySessionEligibility::None
+    );
+    if post_rename_failure {
+        assert_strict_reconciliation_telemetry(DiskAuthState::Ok, true, expected_key);
+    }
+}
+
+fn assert_strict_reconciliation_telemetry(
+    expected_disk_state: DiskAuthState,
+    expected_reconciled_present: bool,
+    forbidden_secret: &str,
+) {
+    let bytes = xai_grok_telemetry::unified_log::snapshot_log()
+        .expect("strict reconciliation must emit unified telemetry");
+    let expected_disk_state = format!("{expected_disk_state:?}");
+    let event = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+        .find(|entry| {
+            entry.get("msg").and_then(serde_json::Value::as_str)
+                == Some("auth: strict credential write failed; durable state reconciled")
+                && entry
+                    .pointer("/ctx/error_kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("PermissionDenied")
+                && entry
+                    .pointer("/ctx/disk_state")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(expected_disk_state.as_str())
+                && entry
+                    .pointer("/ctx/reconciled_present")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(expected_reconciled_present)
+        })
+        .expect("strict reconciliation telemetry must preserve its attributable outcome");
+    assert!(
+        !event.to_string().contains(forbidden_secret),
+        "strict reconciliation telemetry must never contain credential bytes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_strict_save_publishes_disk_and_memory_in_one_generation() {
+    assert_codex_strict_publication(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_post_rename_failure_reconciles_memory_to_safe_disk_before_generation_stabilizes() {
+    assert_codex_strict_publication(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_post_rename_unsafe_disk_clears_memory_before_generation_stabilizes() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+    manager
+        .save_without_enrichment(codex_auth("codex-initial"))
+        .await
+        .unwrap();
+    let before = manager.selection_snapshot();
+    let pause = SelectionPublicationPause::install(Arc::clone(&manager));
+    let _post_rename_fault = PostRenamePermissionFault::install(manager.auth_json_path());
+    let _repair_fault = PermissionRepairFault::install(manager.auth_json_path());
+    let unsafe_path = manager.auth_json_path().to_owned();
+    let writer_manager = Arc::clone(&manager);
+    let writer = tokio::spawn(async move {
+        writer_manager
+            .save_without_enrichment(codex_auth("codex-unsafe-rotated"))
+            .await
+    });
+    let observation =
+        observe_selection_publication(Arc::clone(&manager), &pause, writer, move || {
+            #[cfg(unix)]
+            set_mode(&unsafe_path, 0o644);
+            #[cfg(not(unix))]
+            let _ = unsafe_path;
+        })
+        .await;
+    drop(pause);
+
+    assert_selection_reader_was_blocked(&observation);
+    assert_eq!(
+        observation
+            .writer_result
+            .expect("Codex publication task must join")
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    let snapshot = observation
+        .snapshot
+        .expect("blocked reader must complete after failed-closed publication");
+    assert_eq!(snapshot.generation, before.generation + 2);
+    assert!(!snapshot.has_auth);
+    assert!(!snapshot.is_session_auth);
+    assert_eq!(
+        snapshot.session_eligibility,
+        FirstPartySessionEligibility::None
+    );
+    assert!(
+        manager.current_or_expired().is_none(),
+        "unsafe durable credentials must be cleared from memory before the generation stabilizes"
+    );
+    assert!(
+        read_auth_json_owner_only(manager.auth_json_path()).is_err(),
+        "test precondition: strict durable readback must reject the unsafe object"
+    );
+    assert_strict_reconciliation_telemetry(
+        DiskAuthState::Unreadable,
+        false,
+        "codex-unsafe-rotated",
+    );
 }
 
 #[test]

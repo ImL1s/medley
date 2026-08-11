@@ -444,8 +444,8 @@ pub(super) static WRITE_FAULT_PATH: std::sync::Mutex<Option<PathBuf>> = std::syn
 pub(super) static WRITE_STORAGE_FULL_FAULT_PATH: std::sync::Mutex<Option<PathBuf>> =
     std::sync::Mutex::new(None);
 #[cfg(test)]
-pub(super) static POST_RENAME_PERMISSION_FAULT_PATH: std::sync::Mutex<Option<PathBuf>> =
-    std::sync::Mutex::new(None);
+pub(super) static POST_RENAME_PERMISSION_FAULT_PATHS: std::sync::Mutex<Vec<PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Atomic write: tmp + replace in one operation.
 /// Unix uses `rename(2)` replacement semantics; Windows uses
@@ -550,11 +550,11 @@ fn replace_auth_file(tmp: &Path, auth_file: &Path) -> std::io::Result<()> {
 fn finalize_auth_file_permissions(auth_file: &Path, strict_write: bool) -> std::io::Result<()> {
     #[cfg(test)]
     if strict_write
-        && POST_RENAME_PERMISSION_FAULT_PATH
+        && POST_RENAME_PERMISSION_FAULT_PATHS
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .as_deref()
-            == Some(auth_file)
+            .iter()
+            .any(|path| path == auth_file)
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -765,7 +765,9 @@ mod write_fallback_tests {
             let mut swaps = STRICT_READ_SWAP_AFTER_OPEN_PATHS
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            swaps.retain(|path| path != &self.0);
+            if let Some(index) = swaps.iter().rposition(|path| path == &self.0) {
+                swaps.remove(index);
+            }
         }
     }
 
@@ -773,20 +775,21 @@ mod write_fallback_tests {
 
     impl PostRenamePermissionFault {
         fn install(path: &Path) -> Self {
-            *POST_RENAME_PERMISSION_FAULT_PATH
+            POST_RENAME_PERMISSION_FAULT_PATHS
                 .lock()
-                .unwrap_or_else(|error| error.into_inner()) = Some(path.to_owned());
+                .unwrap_or_else(|error| error.into_inner())
+                .push(path.to_owned());
             Self(path.to_owned())
         }
     }
 
     impl Drop for PostRenamePermissionFault {
         fn drop(&mut self) {
-            let mut guard = POST_RENAME_PERMISSION_FAULT_PATH
+            let mut paths = POST_RENAME_PERMISSION_FAULT_PATHS
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            if guard.as_deref() == Some(self.0.as_path()) {
-                *guard = None;
+            if let Some(index) = paths.iter().rposition(|path| path == &self.0) {
+                paths.remove(index);
             }
         }
     }

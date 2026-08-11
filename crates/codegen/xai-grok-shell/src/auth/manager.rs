@@ -93,6 +93,32 @@ pub(crate) struct AuthSelectionSnapshot {
 
 struct AuthSelectionMutationGuard<'a> {
     generation: &'a AtomicU64,
+    wait_lock: &'a parking_lot::Mutex<()>,
+    changed: &'a parking_lot::Condvar,
+}
+
+#[derive(Default)]
+struct AuthSelectionBackoff {
+    attempts: u32,
+}
+
+impl AuthSelectionBackoff {
+    /// Auth publication can include an `auth.json` sync + rename. Keep the
+    /// short uncontended path as a spin, yield briefly, then tell the caller
+    /// to park instead of burning a core through a slow filesystem operation.
+    fn should_park(&mut self) -> bool {
+        const SPIN_ATTEMPTS: u32 = 64;
+        const YIELD_ATTEMPTS: u32 = 96;
+        if self.attempts < SPIN_ATTEMPTS {
+            std::hint::spin_loop();
+        } else if self.attempts < YIELD_ATTEMPTS {
+            std::thread::yield_now();
+        } else {
+            return true;
+        }
+        self.attempts = self.attempts.saturating_add(1);
+        false
+    }
 }
 
 /// Short synchronous pin for an auth-dependent decision that has already
@@ -106,13 +132,16 @@ pub(crate) struct AuthSelectionSeal {
 
 impl Drop for AuthSelectionMutationGuard<'_> {
     fn drop(&mut self) {
+        let _wait_guard = self.wait_lock.lock();
         let previous = self.generation.fetch_add(1, Ordering::Release);
         debug_assert_eq!(previous % 2, 1, "auth selection mutation must end odd");
+        self.changed.notify_all();
     }
 }
 
 impl Drop for AuthSelectionSeal {
     fn drop(&mut self) {
+        let _wait_guard = self.manager.selection_wait_lock.lock();
         let sealed_generation = self.stable_generation.wrapping_add(1);
         let observed = self.manager.selection_generation.load(Ordering::Relaxed);
         debug_assert_eq!(
@@ -122,6 +151,7 @@ impl Drop for AuthSelectionSeal {
         self.manager
             .selection_generation
             .store(self.stable_generation, Ordering::Release);
+        self.manager.selection_changed.notify_all();
     }
 }
 
@@ -251,6 +281,21 @@ pub struct AuthManager {
     /// Seqlock generation for the auth inputs consumed by implicit model
     /// selection. Even = stable; odd = a writer is active.
     selection_generation: AtomicU64,
+    /// Parking path after bounded spin/yield retries. Generation transitions
+    /// to stable state and notifications occur while `selection_wait_lock` is
+    /// held, preventing a waiter from missing the wake-up.
+    selection_wait_lock: parking_lot::Mutex<()>,
+    selection_changed: parking_lot::Condvar,
+    /// Deterministic seam for proving that disk -> memory credential
+    /// publication remains inside one selection-generation transaction.
+    #[cfg(test)]
+    selection_after_disk_before_memory_hook:
+        parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Deterministic seam for proving a selection reader actually observed an
+    /// in-flight (odd) publication generation rather than merely being
+    /// scheduled near it.
+    #[cfg(test)]
+    selection_snapshot_observed_odd_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     path: PathBuf,
     scope: String,
     /// xAI-only policy and `/user` enrichment are forbidden for provider
@@ -577,6 +622,12 @@ impl AuthManager {
         Self {
             inner: Arc::new(RwLock::new(inner)),
             selection_generation: AtomicU64::new(0),
+            selection_wait_lock: parking_lot::Mutex::new(()),
+            selection_changed: parking_lot::Condvar::new(),
+            #[cfg(test)]
+            selection_after_disk_before_memory_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            selection_snapshot_observed_odd_hook: parking_lot::Mutex::new(None),
             path,
             scope,
             xai_session,
@@ -1033,10 +1084,11 @@ impl AuthManager {
     }
 
     fn begin_selection_mutation(&self) -> AuthSelectionMutationGuard<'_> {
+        let mut backoff = AuthSelectionBackoff::default();
         loop {
             let generation = self.selection_generation.load(Ordering::Acquire);
             if generation % 2 == 1 {
-                std::hint::spin_loop();
+                self.wait_for_selection_progress(&mut backoff);
                 continue;
             }
             if self
@@ -1051,18 +1103,66 @@ impl AuthManager {
             {
                 return AuthSelectionMutationGuard {
                     generation: &self.selection_generation,
+                    wait_lock: &self.selection_wait_lock,
+                    changed: &self.selection_changed,
                 };
             }
+            self.wait_for_selection_progress(&mut backoff);
+        }
+    }
+
+    fn wait_for_selection_progress(&self, backoff: &mut AuthSelectionBackoff) {
+        if !backoff.should_park() {
+            return;
+        }
+        let mut wait_guard = self.selection_wait_lock.lock();
+        while self.selection_generation.load(Ordering::Acquire) % 2 == 1 {
+            self.selection_changed.wait(&mut wait_guard);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_selection_after_disk_before_memory_hook(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self.selection_after_disk_before_memory_hook.lock() = hook;
+    }
+
+    #[cfg(test)]
+    fn run_selection_after_disk_before_memory_hook(&self) {
+        let hook = self.selection_after_disk_before_memory_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_selection_snapshot_observed_odd_hook(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self.selection_snapshot_observed_odd_hook.lock() = hook;
+    }
+
+    #[cfg(test)]
+    fn run_selection_snapshot_observed_odd_hook(&self) {
+        let hook = self.selection_snapshot_observed_odd_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 
     /// Capture all auth authority inputs for implicit selection from one
     /// stable even generation.
     pub(crate) fn selection_snapshot(&self) -> AuthSelectionSnapshot {
+        let mut backoff = AuthSelectionBackoff::default();
         loop {
             let before = self.selection_generation.load(Ordering::Acquire);
             if before % 2 == 1 {
-                std::hint::spin_loop();
+                #[cfg(test)]
+                self.run_selection_snapshot_observed_odd_hook();
+                self.wait_for_selection_progress(&mut backoff);
                 continue;
             }
             let session_eligibility = self.first_party_session_eligibility();
@@ -1080,6 +1180,7 @@ impl AuthManager {
                     first_party_env_api_key_ok,
                 };
             }
+            self.wait_for_selection_progress(&mut backoff);
         }
     }
 
@@ -1235,6 +1336,7 @@ impl AuthManager {
             return self.save_provider_strict(auth).await;
         }
         let update_started = std::time::Instant::now();
+        let _selection_mutation = self.begin_selection_mutation();
         let map = match read_auth_json_or_empty_recovering_corrupt(&self.path) {
             Ok(map) => map,
             Err(e) => {
@@ -1245,7 +1347,8 @@ impl AuthManager {
                     None,
                     Some(serde_json::json!({ "error": e.to_string() })),
                 );
-                self.with_inner_write(|inner| *inner = Some(auth.clone()));
+                *self.inner.write() = Some(auth.clone());
+                drop(_selection_mutation);
                 if self.xai_session {
                     self.spawn_user_info_enrichment(auth.clone());
                 }
@@ -1256,7 +1359,22 @@ impl AuthManager {
         // One entry per scope (personal and team share the scope key).
         tracing::debug!(scope = %self.scope, "auth: storing token");
         map.insert(self.scope.clone(), auth.clone());
+        // Disk must lead memory for refresh-token rotation safety, but both
+        // publications are one model-selection authority mutation. Without
+        // this outer guard, a snapshot can observe the new disk session and
+        // the old in-memory credential under an unchanged even generation.
         let write_result = write_auth_json(&self.path, &map);
+        #[cfg(test)]
+        if write_result.is_ok() {
+            self.run_selection_after_disk_before_memory_hook();
+        }
+        // Always update in-memory, even if disk write failed. This lets the
+        // current session work with fresh credentials while the user fixes the
+        // filesystem (e.g. read-only disk). Without this, a disk failure leaves
+        // the stale/dead token in memory and the user is completely stuck.
+        *self.permanent_failure.write() = None;
+        *self.inner.write() = Some(auth.clone());
+        drop(_selection_mutation);
         let elapsed_ms = update_started.elapsed().as_millis() as u64;
         match &write_result {
             Ok(()) => xai_grok_telemetry::unified_log::info(
@@ -1277,12 +1395,6 @@ impl AuthManager {
                 })),
             ),
         }
-        // Always update in-memory, even if disk write failed. This lets the
-        // current session work with fresh credentials while the user fixes the
-        // filesystem (e.g. read-only disk). Without this, a disk failure leaves
-        // the stale/dead token in memory and the user is completely stuck.
-        *self.permanent_failure.write() = None;
-        self.with_inner_write(|inner| *inner = Some(auth.clone()));
 
         // Fire-and-forget enrichment. Off the critical path -- a slow
         // `/user` would otherwise widen the sibling-process
@@ -1305,6 +1417,7 @@ impl AuthManager {
             return self.save_provider_strict(auth).await;
         }
         let started = std::time::Instant::now();
+        let _selection_mutation = self.begin_selection_mutation();
         let map = match read_auth_json_or_empty_recovering_corrupt(&self.path) {
             Ok(map) => map,
             Err(e) => {
@@ -1315,7 +1428,8 @@ impl AuthManager {
                     None,
                     Some(serde_json::json!({ "error": e.to_string() })),
                 );
-                self.with_inner_write(|inner| *inner = Some(auth.clone()));
+                *self.inner.write() = Some(auth.clone());
+                drop(_selection_mutation);
                 return Ok(auth);
             }
         };
@@ -1323,6 +1437,14 @@ impl AuthManager {
         tracing::debug!(scope = %self.scope, "auth: storing token (no enrichment)");
         map.insert(self.scope.clone(), auth.clone());
         let write_result = write_auth_json(&self.path, &map);
+        #[cfg(test)]
+        if write_result.is_ok() {
+            self.run_selection_after_disk_before_memory_hook();
+        }
+        // Always update in-memory, even if disk write failed (see update()).
+        *self.permanent_failure.write() = None;
+        *self.inner.write() = Some(auth.clone());
+        drop(_selection_mutation);
         let elapsed_ms = started.elapsed().as_millis() as u64;
         match &write_result {
             Ok(()) => xai_grok_telemetry::unified_log::info(
@@ -1343,9 +1465,6 @@ impl AuthManager {
                 })),
             ),
         }
-        // Always update in-memory, even if disk write failed (see update()).
-        *self.permanent_failure.write() = None;
-        self.with_inner_write(|inner| *inner = Some(auth.clone()));
         write_result?;
         Ok(auth)
     }
@@ -1356,12 +1475,42 @@ impl AuthManager {
     async fn save_provider_strict(&self, mut auth: GrokAuth) -> std::io::Result<GrokAuth> {
         debug_assert!(!self.xai_session);
         crate::auth::openai_codex::normalize_workspace_metadata(&mut auth);
+        let _selection_mutation = self.begin_selection_mutation();
         let mut map = read_auth_json_owner_only_or_empty_recovering_corrupt(&self.path)?;
         map.insert(self.scope.clone(), auth.clone());
-        write_auth_json_strict(&self.path, &map)?;
-        *self.permanent_failure.write() = None;
-        self.with_inner_write(|inner| *inner = Some(auth.clone()));
-        Ok(auth)
+        let write_result = write_auth_json_strict(&self.path, &map);
+        #[cfg(test)]
+        self.run_selection_after_disk_before_memory_hook();
+        match write_result {
+            Ok(()) => {
+                *self.permanent_failure.write() = None;
+                *self.inner.write() = Some(auth.clone());
+                Ok(auth)
+            }
+            Err(error) => {
+                // A strict atomic writer can fail its final-path permission
+                // assertion after rename. Re-read the durable object through
+                // the owner-only path while the generation remains odd, then
+                // make memory match exactly what can safely be recovered.
+                // Pre-rename failures recover the prior credential; an unsafe
+                // or unreadable final object clears memory and fails closed.
+                let (committed, disk_state) = self.read_disk_auth_with_state();
+                let reconciled_present = committed.is_some();
+                *self.inner.write() = committed;
+                xai_grok_telemetry::unified_log::warn(
+                    "auth: strict credential write failed; durable state reconciled",
+                    None,
+                    Some(serde_json::json!({
+                        "error_kind": format!("{:?}", error.kind()),
+                        "disk_state": format!("{disk_state:?}"),
+                        "reconciled_present": reconciled_present,
+                        "path": self.path.display().to_string(),
+                        "scope": &self.scope,
+                    })),
+                );
+                Err(error)
+            }
+        }
     }
 
     /// Spawn the `/user` enrichment task; body in the `enrichment` submodule.
