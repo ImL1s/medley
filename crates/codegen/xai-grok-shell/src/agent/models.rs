@@ -596,16 +596,6 @@ impl ModelsManager {
             .is_some_and(|a| a.is_session_auth())
     }
 
-    /// Sample-ready ambient xAI for #303 default selection (not catalog visibility).
-    ///
-    /// Uses [`AuthManager::first_party_session_eligibility`] (wire-usable **or**
-    /// complete-refreshable session) plus static keys / preferred_method pin —
-    /// never bare `current_or_expired` / mixed `has_usable_token() && current()`.
-    fn usable_ambient_xai(&self, cfg: &config::Config) -> bool {
-        let snapshot = self.inner.auth_manager.selection_snapshot();
-        Self::usable_ambient_xai_from_snapshot(cfg, snapshot)
-    }
-
     fn usable_ambient_xai_from_snapshot(
         cfg: &config::Config,
         snapshot: crate::auth::AuthSelectionSnapshot,
@@ -616,6 +606,11 @@ impl ModelsManager {
             snapshot.first_party_env_api_key_ok,
         )
         .is_usable()
+    }
+
+    #[cfg(test)]
+    fn usable_ambient_xai(&self, cfg: &config::Config) -> bool {
+        Self::usable_ambient_xai_from_snapshot(cfg, self.inner.auth_manager.selection_snapshot())
     }
 
     fn publish_model_switch(&self) {
@@ -797,26 +792,72 @@ impl ModelsManager {
     /// official Codex account route. All other campaign targets and usable xAI
     /// routes retain their existing behavior.
     pub(crate) fn campaign_default_is_eligible(&self, model_id: &str) -> bool {
-        // Match the config -> catalog order used by the #303 repair paths so a
-        // concurrent config reload cannot mix its auth policy with an older
-        // catalog snapshot.
-        let cfg = self.inner.cfg.read();
-        let usable_xai = self.usable_ambient_xai(&cfg);
-        let is_session_auth = self.is_session_auth();
-        let catalog = self.inner.catalog.read();
-        let models = &catalog.models;
-        let Some(key) = resolve_catalog_key(models, &acp::ModelId::new(model_id)) else {
-            // Preserve the existing unknown-campaign fallback and diagnostics.
-            return true;
-        };
-        let entry = models
-            .get(key.0.as_ref())
-            .expect("resolve_catalog_key returns a present key");
-        usable_xai
-            || !resolution::is_first_party_ambient_xai_entry(entry)
-            || !models.values().any(|candidate| {
-                resolution::is_ready_selectable_openai_codex_entry(candidate, is_session_auth)
-            })
+        #[cfg(test)]
+        return self.campaign_default_is_eligible_inner(model_id, || {});
+        #[cfg(not(test))]
+        self.campaign_default_is_eligible_inner(model_id)
+    }
+
+    fn campaign_default_is_eligible_inner(
+        &self,
+        model_id: &str,
+        #[cfg(test)] mut before_decision: impl FnMut(),
+    ) -> bool {
+        let mut retries = 0usize;
+        loop {
+            let auth = self.inner.auth_manager.selection_snapshot();
+            // Match the config -> catalog order used by the #303 repair paths
+            // so a concurrent config reload cannot mix its policy with an
+            // older catalog snapshot. Auth is validated separately through
+            // its even generation at the decision boundary.
+            let cfg = self.inner.cfg.read();
+            let usable_xai = Self::usable_ambient_xai_from_snapshot(&cfg, auth);
+            let catalog = self.inner.catalog.read();
+            let models = &catalog.models;
+            #[cfg(test)]
+            before_decision();
+            let eligible =
+                resolve_catalog_key(models, &acp::ModelId::new(model_id)).is_none_or(|key| {
+                    let entry = models
+                        .get(key.0.as_ref())
+                        .expect("resolve_catalog_key returns a present key");
+                    usable_xai
+                        || !resolution::is_first_party_ambient_xai_entry(entry)
+                        || !models.values().any(|candidate| {
+                            resolution::is_ready_selectable_openai_codex_entry(
+                                candidate,
+                                auth.is_session_auth,
+                            )
+                        })
+                });
+            if self
+                .inner
+                .auth_manager
+                .selection_generation_is_current(auth.generation)
+            {
+                return eligible;
+            }
+            drop(catalog);
+            drop(cfg);
+            retries += 1;
+            if retries >= IMPLICIT_SELECTION_RETRY_YIELD_AFTER {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn campaign_default_is_eligible_with_before_decision(
+        &self,
+        model_id: &str,
+        before_decision: impl FnOnce(),
+    ) -> bool {
+        let mut before_decision = Some(before_decision);
+        self.campaign_default_is_eligible_inner(model_id, || {
+            if let Some(before_decision) = before_decision.take() {
+                before_decision();
+            }
+        })
     }
 
     /// ACP-visible (non-hidden) projection of the catalog.

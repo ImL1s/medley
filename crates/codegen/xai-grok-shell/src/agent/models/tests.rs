@@ -3681,6 +3681,63 @@ fn new_session_campaign_rejects_only_stranded_ambient_grok() {
 
 #[test]
 #[serial_test::serial]
+fn new_session_campaign_retries_when_auth_changes_during_decision() {
+    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    use crate::auth::{AuthMode, XAI_OAUTH2_ISSUER};
+    use xai_grok_test_support::EnvGuard;
+    let _g = EnvGuard::set(XAI_API_KEY_ENV_VAR, "probe-key");
+    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+    let tmp = tempfile::tempdir().expect("temp home");
+    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
+    let mut catalog = IndexMap::new();
+    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
+    catalog.insert(
+        crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string(),
+        codex,
+    );
+    let xai_home = tmp.path().join("xai-campaign-race");
+    std::fs::create_dir_all(&xai_home).unwrap();
+    let auth_manager = Arc::new(AuthManager::new(&xai_home, GrokComConfig::default()));
+    let manager = ModelsManagerBuilder::new(
+        None,
+        catalog,
+        acp::ModelId::new("grok-4.5"),
+        auth_manager.clone(),
+        config::Config::default(),
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+
+    assert!(
+        !manager.campaign_default_is_eligible_with_before_decision("grok-4.5", || {
+            auth_manager.set_first_party_env_api_key_ok(false);
+        }),
+        "a failed probe at the decision boundary must invalidate the stale eligible snapshot"
+    );
+
+    assert!(
+        manager.campaign_default_is_eligible_with_before_decision("grok-4.5", || {
+            auth_manager.hot_swap(GrokAuth {
+                key: "newly-live-access".into(),
+                auth_mode: AuthMode::Oidc,
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                refresh_token: Some("newly-live-refresh".into()),
+                oidc_issuer: Some(XAI_OAUTH2_ISSUER.to_owned()),
+                oidc_client_id: Some("client".into()),
+                user_id: "u".into(),
+                ..GrokAuth::test_default()
+            });
+        }),
+        "a newly usable xAI session must invalidate the stale rejection and preserve Grok"
+    );
+}
+
+#[test]
+#[serial_test::serial]
 fn new_session_campaign_preserves_usable_xai_and_no_codex_fallback() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
