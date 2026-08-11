@@ -5010,7 +5010,7 @@ fn new_session_profile_pin_reports_the_committed_resident_model() {
         cfg.agent_profile_path = Some(profile);
         for (id, auth_scheme) in [
             ("prepared-model", xai_grok_sampler::AuthScheme::None),
-            ("pinned-model", xai_grok_sampler::AuthScheme::Bearer),
+            ("pinned-model", xai_grok_sampler::AuthScheme::None),
             ("unready-request", xai_grok_sampler::AuthScheme::Bearer),
         ] {
             cfg.config_models.insert(
@@ -5069,25 +5069,6 @@ fn new_session_profile_pin_reports_the_committed_resident_model() {
                 .as_ref(),
             "pinned-model"
         );
-        assert_eq!(
-            agent.session_registry.unavailable_model(&response.session_id),
-            Some(acp::ModelId::new("pinned-model")),
-            "production spawn must latch the unready profile-pinned model"
-        );
-        let pinned_identity = agent
-            .session_registry
-            .unavailable_catalog_identity(&response.session_id)
-            .expect("spawn latch must retain exact catalog identity");
-        assert_eq!(pinned_identity.model_id, "pinned-model");
-        assert_eq!(pinned_identity.route, "pinned-model");
-        assert_eq!(
-            agent
-                .session_registry
-                .unavailable_agent_name(&response.session_id)
-                .as_deref(),
-            Some("grok-build"),
-            "spawn latch must retain the operative profile harness"
-        );
         let notification = std::iter::from_fn(|| rx.try_recv().ok())
             .filter_map(|message| match message {
                 xai_acp_lib::AcpClientMessage::ExtNotification(args)
@@ -5102,71 +5083,142 @@ fn new_session_profile_pin_reports_the_committed_resident_model() {
         assert!(notification.contains("unready-request"));
         assert!(notification.contains("pinned-model"));
         assert!(!notification.contains("prepared-model"));
+    });
+}
 
-        let before_credentials = agent
+#[test]
+#[serial_test::serial]
+fn production_spawn_latches_post_seal_unready_prepared_identity() {
+    run_local_for_bridge_test(|| async {
+        use crate::agent::config::{Config as AgentConfig, ConfigModelOverride, EnvKeys};
+        use crate::auth::{AuthManager, GrokComConfig};
+        use xai_grok_test_support::EnvGuard;
+
+        const KEY_ENV: &str = "GROK_TEST_POST_SEAL_PREPARED_KEY";
+        let _key = EnvGuard::set(KEY_ENV, "sealed-prepared-credential");
+        let tmp = tempfile::tempdir().expect("post-seal fixture");
+        let mut cfg = AgentConfig::default();
+        cfg.models.default = Some("sealed-model".to_owned());
+        cfg.config_models.insert(
+            "sealed-model".to_owned(),
+            ConfigModelOverride {
+                model: Some("sealed-route".to_owned()),
+                base_url: Some("http://localhost".to_owned()),
+                auth_scheme: Some(xai_grok_sampler::AuthScheme::Bearer),
+                env_key: Some(EnvKeys::One(KEY_ENV.to_owned())),
+                agent_type: Some("grok-build".to_owned()),
+                ..Default::default()
+            },
+        );
+        let auth = std::sync::Arc::new(AuthManager::new(
+            &tmp.path().join("auth"),
+            GrokComConfig::default(),
+        ));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let agent = MvpAgent::new(GatewaySender::new(tx), &cfg, auth, None).expect("agent");
+        agent
+            .initialize_request
+            .set(
+                acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_capabilities(
+                    acp::ClientCapabilities::new()
+                        .fs(acp::FileSystemCapabilities::new())
+                        .terminal(false),
+                ),
+            )
+            .expect("initialize once");
+        let removed_key = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let removed_key_hook = removed_key.clone();
+        let seal_hook = agent_ops::install_new_session_plan_before_seal_hook(move || {
+            let should_remove = removed_key_hook.borrow().is_none();
+            if should_remove {
+                *removed_key_hook.borrow_mut() = Some(EnvGuard::unset(KEY_ENV));
+            }
+        });
+        let cwd = tempfile::tempdir().expect("session cwd");
+        let response = agent
+            .new_session_inner(acp::NewSessionRequest::new(cwd.path().to_path_buf()))
+            .await
+            .expect("spawn sealed prepared session");
+        drop(seal_hook);
+
+        assert_eq!(
+            agent.session_registry.unavailable_model(&response.session_id),
+            Some(acp::ModelId::new("sealed-model"))
+        );
+        let sealed_identity = agent
+            .session_registry
+            .unavailable_catalog_identity(&response.session_id)
+            .expect("production spawn must retain exact prepared identity");
+        assert_eq!(sealed_identity.model_id, "sealed-model");
+        assert_eq!(sealed_identity.route, "sealed-route");
+        assert_eq!(
+            agent
+                .session_registry
+                .unavailable_agent_name(&response.session_id)
+                .as_deref(),
+            Some("grok-build")
+        );
+        let before_key = agent
             .resident_handle(&response.session_id)
             .expect("resident before recovery")
             .chat_state_handle
             .get_prepared_model_state()
             .await
             .expect("prepared state before recovery")
-            .2;
-        assert_eq!(before_credentials.api_key(), None);
+            .2
+            .api_key()
+            .map(str::to_owned);
 
-        // Same identity, but a harness incompatible with the persisted
-        // profile. This reaches the identity-backed recovery branch that must
-        // consult `unavailable_agent_name` and remain fail-closed.
-        let mut wrong_harness = agent.models_manager.models()["pinned-model"].clone();
+        let mut wrong_harness = agent.models_manager.models()["sealed-model"].clone();
         wrong_harness.api_key = Some("wrong-harness-secret".to_owned());
         wrong_harness.info.agent_type = "codex".to_owned();
         agent
             .models_manager
-            .insert_test_entry("pinned-model", wrong_harness);
+            .insert_test_entry("sealed-model", wrong_harness);
         let blocked = agent
             .prompt(acp::PromptRequest::new(
                 response.session_id.clone(),
                 vec![acp::ContentBlock::from("recover with wrong harness")],
             ))
             .await
-            .expect("wrong-harness recovery blocks without transport failure");
+            .expect("wrong-harness recovery blocks cleanly");
         assert_eq!(blocked.stop_reason, acp::StopReason::EndTurn);
 
-        // A ready entry reusing the catalog key on a different route must not
-        // replace the sealed identity or attach its credential on first prompt.
-        let mut replacement = agent.models_manager.models()["pinned-model"].clone();
+        let mut replacement = agent.models_manager.models()["sealed-model"].clone();
         replacement.info.model = "ready-replacement-route".to_owned();
         replacement.info.agent_type = "grok-build".to_owned();
         replacement.api_key = Some("replacement-credential-must-not-attach".to_owned());
         agent
             .models_manager
-            .insert_test_entry("pinned-model", replacement);
+            .insert_test_entry("sealed-model", replacement);
         let blocked = agent
             .prompt(acp::PromptRequest::new(
                 response.session_id.clone(),
                 vec![acp::ContentBlock::from("first prompt after replacement")],
             ))
             .await
-            .expect("same-key replacement blocks without transport failure");
+            .expect("same-key replacement blocks cleanly");
         assert_eq!(blocked.stop_reason, acp::StopReason::EndTurn);
         assert_eq!(
             agent
                 .session_registry
                 .unavailable_catalog_identity(&response.session_id),
-            Some(pinned_identity),
-            "replacement must not overwrite the sealed spawn identity"
+            Some(sealed_identity)
         );
-        let after_credentials = agent
+        let after_key = agent
             .resident_handle(&response.session_id)
-            .expect("resident after blocked recovery")
+            .expect("resident after recovery")
             .chat_state_handle
             .get_prepared_model_state()
             .await
-            .expect("prepared state after blocked recovery")
-            .2;
-        assert_eq!(
-            after_credentials.api_key(),
-            None,
-            "blocked recovery must not attach either replacement credential"
+            .expect("prepared state after recovery")
+            .2
+            .api_key()
+            .map(str::to_owned);
+        assert_eq!(after_key, before_key);
+        assert_ne!(
+            after_key.as_deref(),
+            Some("replacement-credential-must-not-attach")
         );
     });
 }
