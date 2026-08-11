@@ -37,6 +37,18 @@ fn run_prompt_dispatch_boundary_hook(session_id: &acp::SessionId) {
     }
 }
 
+pub(super) fn normalize_resident_model_if_unchanged(
+    resident: &mut SessionHandle,
+    expected_model: &acp::ModelId,
+    normalized_model: &acp::ModelId,
+) -> bool {
+    if resident.model_id != *expected_model {
+        return false;
+    }
+    resident.model_id = normalized_model.clone();
+    true
+}
+
 pub(super) fn has_advertised_auth_provider_command(
     config: &crate::auth::GrokComConfig,
 ) -> bool {
@@ -2903,43 +2915,49 @@ impl acp::Agent for MvpAgent {
             let normalized_model = resolved_model
                 .clone()
                 .unwrap_or_else(|| resident_model.clone());
-            if normalized_model != resident_model {
-                self.with_resident_mut(&arguments.session_id, |resident| {
-                    resident.model_id = normalized_model.clone();
-                });
-            }
-            let visible_model = resolved_model.as_ref().and_then(|model_id| {
-                presentation
-                    .available
-                    .contains_key(model_id)
-                    .then(|| presentation.catalog.get(model_id.0.as_ref()))
-                    .flatten()
-            });
-            let ready = visible_model
-                .is_some_and(|model| crate::agent::config::model_readiness(model).0);
-            if !ready {
-                let catalog_identity = resolved_model.as_ref().and_then(|model_id| {
-                    crate::agent::models::resolve_catalog_identity(
-                        &presentation.catalog,
-                        model_id,
+            let resident_snapshot_is_current = self
+                .with_resident_mut(&arguments.session_id, |resident| {
+                    normalize_resident_model_if_unchanged(
+                        resident,
+                        &resident_model,
+                        &normalized_model,
                     )
+                })
+                .unwrap_or(false);
+            if resident_snapshot_is_current {
+                let visible_model = resolved_model.as_ref().and_then(|model_id| {
+                    presentation
+                        .available
+                        .contains_key(model_id)
+                        .then(|| presentation.catalog.get(model_id.0.as_ref()))
+                        .flatten()
                 });
-                self.session_registry.set_unavailable_model_with_identity(
-                    &arguments.session_id,
-                    normalized_model.clone(),
-                    catalog_identity,
-                    Some(handle.agent_name.clone()),
-                );
-                tracing::warn!(
-                    session_id = %arguments.session_id.0,
-                    resident_model_id = %resident_model.0,
-                    normalized_model_id = %normalized_model.0,
-                    present = resolved_model.is_some(),
-                    auth_visible = resolved_model
-                        .as_ref()
-                        .is_some_and(|model_id| presentation.available.contains_key(model_id)),
-                    "prompt: resident model became unavailable; latching before actor dispatch"
-                );
+                let ready = visible_model
+                    .is_some_and(|model| crate::agent::config::model_readiness(model).0);
+                if !ready {
+                    let catalog_identity = resolved_model.as_ref().and_then(|model_id| {
+                        crate::agent::models::resolve_catalog_identity(
+                            &presentation.catalog,
+                            model_id,
+                        )
+                    });
+                    self.session_registry.set_unavailable_model_with_identity(
+                        &arguments.session_id,
+                        normalized_model.clone(),
+                        catalog_identity,
+                        Some(handle.agent_name.clone()),
+                    );
+                    tracing::warn!(
+                        session_id = %arguments.session_id.0,
+                        resident_model_id = %resident_model.0,
+                        normalized_model_id = %normalized_model.0,
+                        present = resolved_model.is_some(),
+                        auth_visible = resolved_model
+                            .as_ref()
+                            .is_some_and(|model_id| presentation.available.contains_key(model_id)),
+                        "prompt: resident model became unavailable; latching before actor dispatch"
+                    );
+                }
             }
         }
         let latched_model = self

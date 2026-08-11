@@ -2266,6 +2266,34 @@ fn production_prompt_latches_removed_or_auth_hidden_resident_before_dispatch() {
     });
 }
 
+#[tokio::test]
+async fn prompt_slug_normalization_does_not_overwrite_a_concurrent_model_switch() {
+    let sid = acp::SessionId::new("prompt-normalization-cas");
+    let (mut handle, _cmd_tx, _cmd_rx) = make_live_session_handle(&sid, None);
+    let stale_slug = acp::ModelId::new("stale-routing-slug");
+    let normalized_key = acp::ModelId::new("stale-catalog-key");
+    let switched_model = acp::ModelId::new("concurrently-selected-model");
+
+    handle.model_id = switched_model.clone();
+    assert!(
+        !super::acp_agent::normalize_resident_model_if_unchanged(
+            &mut handle,
+            &stale_slug,
+            &normalized_key,
+        ),
+        "a stale normalization attempt must lose to the newer committed model"
+    );
+    assert_eq!(handle.model_id, switched_model);
+
+    handle.model_id = stale_slug.clone();
+    assert!(super::acp_agent::normalize_resident_model_if_unchanged(
+        &mut handle,
+        &stale_slug,
+        &normalized_key,
+    ));
+    assert_eq!(handle.model_id, normalized_key);
+}
+
 #[test]
 fn production_set_model_reauthorizes_after_dispatch_lock_before_any_actor_command() {
     use crate::agent::config::{EndpointsConfig, ModelEntry};
