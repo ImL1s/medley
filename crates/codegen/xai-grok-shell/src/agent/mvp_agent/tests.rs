@@ -4938,6 +4938,59 @@ async fn auth_type_no_method_id_with_current_returns_session_token() {
     assert!(agent.auth_manager.current().is_some());
     assert_eq!(agent.auth_type(), xai_chat_state::AuthType::SessionToken,);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn prepared_new_session_plan_survives_same_key_catalog_swap() {
+    let agent = build_minimal_agent_for_tests();
+    let current = agent.models_manager.current_model_id();
+    let original_catalog = agent.models_manager.models();
+    let original = original_catalog
+        .get(current.0.as_ref())
+        .expect("minimal agent current model must exist")
+        .clone();
+    let original_route = original.info().model.clone();
+    let original_base_url = original.info().base_url.clone();
+    let mut replacement = original.clone();
+    replacement.info.model = "same-key-replacement-route".to_owned();
+    replacement.info.base_url = "https://replacement.invalid/v1".to_owned();
+    let mut replacement_catalog = original_catalog;
+    replacement_catalog.insert(current.0.to_string(), replacement);
+    let swapped = std::cell::Cell::new(false);
+    let plan = agent.prepare_new_session_model_plan_with_before_seal(None, None, || {
+        if !swapped.replace(true) {
+            agent
+                .models_manager
+                .apply_catalog_for_test(replacement_catalog.clone());
+        }
+    })
+    .expect("same-key plan must resolve");
+    assert_eq!(plan.catalog_identity.route, original_route);
+    assert_eq!(plan.model_entry.info().model, original_route);
+    assert_eq!(plan.sampling_config.model, original_route);
+    assert_eq!(plan.sampling_config.base_url, original_base_url);
+    assert_ne!(
+        agent
+            .models_manager
+            .models()
+            .get(current.0.as_ref())
+            .expect("replacement remains published")
+            .info()
+            .model,
+        original_route,
+        "test must actually replace the live entry under the same key"
+    );
+    assert_eq!(
+        agent
+            .models_manager
+            .models()
+            .get(current.0.as_ref())
+            .expect("replacement remains published")
+            .info()
+            .base_url,
+        "https://replacement.invalid/v1",
+        "test must replace the endpoint while the prepared sampler stays pinned"
+    );
+}
 /// Minimal agent whose `grok_com_config` engages the api-key kill switch
 /// (`disable_api_key_auth = true`), mirroring a forced-IdP deployment.
 fn build_agent_with_api_key_auth_disabled() -> MvpAgent {
@@ -8698,6 +8751,18 @@ fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex() {
             "GROK_CAMPAIGNS_OVERRIDE",
             r#"[{"id":"issue-320-new-session","models":{"default":"grok-4.5"}}]"#,
         );
+        let active_attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let active_attempts_hook = active_attempts.clone();
+        let active_auth_manager = agent.auth_manager.clone();
+        let active_hook = install_new_session_plan_before_seal_hook(move || {
+            if active_attempts_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                let mut replacement = active_auth_manager
+                    .current()
+                    .expect("active /new race starts authenticated");
+                replacement.key = "active-new-post-race-token".to_owned();
+                active_auth_manager.hot_swap(replacement);
+            }
+        });
         let session_cwd = tempfile::tempdir().expect("new-session cwd");
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(15),
@@ -8709,6 +8774,12 @@ fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex() {
         .await
         .expect("production /new must not hang")
         .expect("production /new must succeed on the repaired Codex route");
+        drop(active_hook);
+        assert_eq!(
+            active_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "active ACP /new must rebuild after the pre-seal auth mutation"
+        );
         let advertised = response.models.expect("/new must advertise its model state");
         assert_eq!(
             advertised.current_model_id.0.as_ref(),
@@ -8733,7 +8804,24 @@ fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex() {
             crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID,
             "the live sampler must stay pinned to Codex under the rejected Grok campaign"
         );
+        assert_eq!(
+            sampling.api_key.as_deref(),
+            Some("active-new-post-race-token"),
+            "active /new must publish only the rebuilt post-race sampler"
+        );
 
+        let dormant_attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dormant_attempts_hook = dormant_attempts.clone();
+        let dormant_auth_manager = agent.auth_manager.clone();
+        let dormant_hook = install_new_session_plan_before_seal_hook(move || {
+            if dormant_attempts_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                let mut replacement = dormant_auth_manager
+                    .current()
+                    .expect("dormant /new race starts authenticated");
+                replacement.key = "dormant-new-post-race-token".to_owned();
+                dormant_auth_manager.hot_swap(replacement);
+            }
+        });
         let inner_cwd = tempfile::tempdir().expect("new-session-inner cwd");
         let inner_response = tokio::time::timeout(
             std::time::Duration::from_secs(15),
@@ -8744,6 +8832,12 @@ fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex() {
         .await
         .expect("new_session_inner must not hang")
         .expect("new_session_inner must preserve the repaired Codex route");
+        drop(dormant_hook);
+        assert_eq!(
+            dormant_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "dormant /new must rebuild after the pre-seal auth mutation"
+        );
         let inner_advertised = inner_response
             .models
             .expect("new_session_inner must advertise its model state");
@@ -8755,15 +8849,20 @@ fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex() {
         let inner_handle = agent
             .resident_handle(&inner_response.session_id)
             .expect("inner-created session must remain resident");
+        let inner_sampling = inner_handle
+            .chat_state_handle
+            .get_sampling_config()
+            .await
+            .expect("inner-created session sampling config");
         assert_eq!(
-            inner_handle
-                .chat_state_handle
-                .get_sampling_config()
-                .await
-                .expect("inner-created session sampling config")
-                .model,
+            inner_sampling.model,
             crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID,
             "the dormant path's live sampler must also stay on Codex"
+        );
+        assert_eq!(
+            inner_sampling.api_key.as_deref(),
+            Some("dormant-new-post-race-token"),
+            "dormant /new must publish only the rebuilt post-race sampler"
         );
     });
     println!("{CHILD_PASS}");

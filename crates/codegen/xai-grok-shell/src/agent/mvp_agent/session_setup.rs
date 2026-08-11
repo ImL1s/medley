@@ -324,103 +324,44 @@ impl MvpAgent {
                     .map(|s| s.to_string())
             });
         let session_info = begin_session(&session_id, &cwd);
-        let mut model_agent_type: Option<String> = None;
-        let mut session_sampling_override: Option<SamplingConfig> = None;
-        let mut disallowed_custom: Option<String> = None;
         let session_initial_model = chat_initial_model(is_chat_kind, custom_model_id);
-        let build_custom_model_id = if is_chat_kind { None } else { custom_model_id };
-        let campaign_nudge = if is_chat_kind {
+        let origin_client = self.origin_client_info_from_meta(arguments.meta.as_ref());
+        let prepared_model_plan = if is_chat_kind {
             None
         } else {
-            crate::util::config::campaign_driven_models_default().filter(|c| {
-                build_custom_model_id.is_none()
-                    || build_custom_model_id == c.pre_campaign.as_deref()
-                    || build_custom_model_id == Some(c.value.as_str())
-            }).filter(|c| {
-                self.models_manager
-                    .campaign_default_is_eligible(&c.value)
-            })
-        };
-        let campaign_nudged = campaign_nudge.is_some();
-        if let Some(c) = &campaign_nudge {
-            tracing::info!(
-                model = %c.value,
-                requested = ?custom_model_id,
-                "new_session: applying campaign-driven default model"
-            );
-        }
-        let build_custom_model_id: Option<String> = campaign_nudge
-            .map(|c| c.value)
-            .or_else(|| build_custom_model_id.map(str::to_owned));
-        let resolved_custom_model = build_custom_model_id
-            .as_deref()
-            .and_then(|custom_model| match self
-                .resolve_model_id(&acp::ModelId::new(custom_model))
-            {
-                Ok(model) if model.info.user_selectable => {
-                    model_agent_type = Some(model.info().agent_type.clone());
-                    let origin_client = self
-                        .origin_client_info_from_meta(arguments.meta.as_ref());
-                    session_sampling_override = Some(
-                        self.prepare_sampling_config_for_model(&model, origin_client),
-                    );
-                    Some(custom_model)
-                }
-                Ok(_) => {
-                    tracing::warn!(
-                        requested_model = custom_model,
-                        "Requested model not allowed by allowed_models; falling back to current default model"
-                    );
-                    if !campaign_nudged {
-                        disallowed_custom = Some(custom_model.to_string());
-                    }
-                    None
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        requested_model = custom_model,
-                        fallback_model = %self.models_manager.current_model_id().0,
-                        "Requested model not found, falling back to current default model"
-                    );
-                    None
-                }
-            });
-        if model_agent_type.is_none()
-            && custom_model_id.is_none()
-            && let Ok(default_model) =
-                self.resolve_model_id(&self.models_manager.current_model_id())
-        {
-            model_agent_type = Some(default_model.info().agent_type.clone());
-        } else if model_agent_type.is_none() && custom_model_id.is_some() {
-            tracing::debug!(
-                custom_model = ?custom_model_id,
-                current_model_id = %self.models_manager.current_model_id().0,
-                "Skipping current_model_id agent_type fallback: custom model was requested, \
-                 avoiding cross-client agent_type contamination in leader mode"
-            );
-        }
-        let origin_client = self.origin_client_info_from_meta(arguments.meta.as_ref());
-        let mut session_sampling = session_sampling_override.unwrap_or_else(|| {
-            self.resolve_sampling_config_for_model(
-                &self.models_manager.current_model_id(),
+            Some(self.prepare_new_session_model_plan(
+                custom_model_id,
                 origin_client.clone(),
-            )
-        });
-        if let Some(effort) = self.models_manager.current_reasoning_effort()
-            && self
-                .models_manager
-                .model_offers_reasoning_effort(&session_sampling.model, effort)
-        {
-            session_sampling.reasoning_effort = Some(effort);
-        }
+            )?)
+        };
+        let model_agent_type = prepared_model_plan
+            .as_ref()
+            .and_then(|plan| plan.model_agent_type.clone());
+        let disallowed_custom = prepared_model_plan
+            .as_ref()
+            .and_then(|plan| plan.disallowed_custom.clone());
+        let unreadiness_custom = prepared_model_plan
+            .as_ref()
+            .and_then(|plan| plan.unreadiness_custom.clone());
+        let fallback_model_id = prepared_model_plan
+            .as_ref()
+            .map(|plan| plan.session_model_id.clone())
+            .unwrap_or_else(|| self.models_manager.current_model_id());
+        let session_sampling = prepared_model_plan
+            .as_ref()
+            .map(|plan| plan.sampling_config.clone())
+            .unwrap_or_else(|| {
+                self.resolve_sampling_config_for_model(
+                    &fallback_model_id,
+                    origin_client.clone(),
+                )
+            });
         let (summary_client, summary_model) = self.build_summary_client(&session_sampling).await?;
         let relay_sync = self.start_relay_sync(&session_id, &session_info);
-        let model_id = match &session_initial_model {
-            Some(chat_model) => acp::ModelId::new(chat_model.clone()),
-            None => resolved_custom_model
-                .map(acp::ModelId::new)
-                .unwrap_or_else(|| self.models_manager.current_model_id()),
-        };
+        let model_id = session_initial_model
+            .as_ref()
+            .map(|chat_model| acp::ModelId::new(chat_model.clone()))
+            .unwrap_or_else(|| fallback_model_id.clone());
         let session_model_id = model_id.clone();
         let persistence = if is_chat_kind {
             crate::session::persistence::PersistenceHandle::noop()
@@ -486,6 +427,15 @@ impl MvpAgent {
                     session_meta: arguments.meta.as_ref(),
                     managed_mcp_expires_at,
                     model_agent_type: model_agent_type.as_deref(),
+                    prepared_sampling_config: prepared_model_plan
+                        .as_ref()
+                        .map(|plan| plan.sampling_config.clone()),
+                    prepared_catalog_identity: prepared_model_plan
+                        .as_ref()
+                        .map(|plan| plan.catalog_identity.clone()),
+                    prepared_model_entry: prepared_model_plan
+                        .as_ref()
+                        .map(|plan| plan.model_entry.clone()),
                     persisted_catalog_identity: None,
                     session_model_id,
                     session_yolo_mode,
@@ -539,20 +489,24 @@ impl MvpAgent {
                 xai_grok_telemetry::session_ctx::log_event_dual(product_analytics, ev);
             });
         }
-        if let Some(model_id) = resolved_custom_model {
-            let _ = crate::timed!(log: "new_session: set_session_model", {
-                crate::agent::handlers::model_switch::apply(
-                    self,
-                    acp::SetSessionModelRequest::new(session_id.clone(), acp::ModelId::new(model_id)),
-                )
-                .await
-            });
-            tracing::debug!(session_id = %session_id.0, "new_session: set_session_model");
-        }
         if let Some(requested) = disallowed_custom {
             let current = self.models_manager.current_model_id();
             let reason = format!(
                 "\"{requested}\" isn't allowed by your allowed_models setting, so this session is using \"{}\".",
+                current.0
+            );
+            self.send_model_auto_switched(
+                &session_id,
+                &acp::ModelId::new(requested),
+                &current,
+                &reason,
+            )
+            .await;
+        }
+        if let Some((requested, readiness_reason)) = unreadiness_custom {
+            let current = self.models_manager.current_model_id();
+            let reason = format!(
+                "\"{requested}\" isn't ready ({readiness_reason}), so this session is using \"{}\".",
                 current.0
             );
             self.send_model_auto_switched(
@@ -879,6 +833,9 @@ impl MvpAgent {
                     session_meta: request_meta.as_ref(),
                     managed_mcp_expires_at,
                     model_agent_type: persisted_agent_name.as_deref(),
+                    prepared_sampling_config: None,
+                    prepared_catalog_identity: None,
+                    prepared_model_entry: None,
                     persisted_catalog_identity: summary
                         .catalog_identity
                         .clone()

@@ -6,6 +6,26 @@ use super::*;
 use crate::auth::PreferredAuthMethod;
 use xai_grok_tools::implementations::grok_build::task::backend::SubagentBackend;
 use xai_tty_utils::ProcessScope;
+#[cfg(test)]
+thread_local! {
+    static NEW_SESSION_PLAN_BEFORE_SEAL_HOOK: RefCell<Option<Box<dyn FnMut()>>> =
+        RefCell::new(None);
+}
+#[cfg(test)]
+pub(super) struct NewSessionPlanSealHookGuard;
+#[cfg(test)]
+impl Drop for NewSessionPlanSealHookGuard {
+    fn drop(&mut self) {
+        NEW_SESSION_PLAN_BEFORE_SEAL_HOOK.with(|hook| *hook.borrow_mut() = None);
+    }
+}
+#[cfg(test)]
+pub(super) fn install_new_session_plan_before_seal_hook(
+    hook: impl FnMut() + 'static,
+) -> NewSessionPlanSealHookGuard {
+    NEW_SESSION_PLAN_BEFORE_SEAL_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    NewSessionPlanSealHookGuard
+}
 /// `preferred` model, else catalog `current`, else first with own credentials.
 fn byok_from_models(
     models: &indexmap::IndexMap<String, ModelEntry>,
@@ -27,6 +47,21 @@ fn summary_config_or_primary(
         primary.clone()
     } else {
         resolved.unwrap_or_else(|| primary.clone())
+    }
+}
+fn catalog_identity_for_sampling(
+    model_id: &acp::ModelId,
+    sampling: &SamplingConfig,
+) -> xai_chat_state::CatalogIdentity {
+    xai_chat_state::CatalogIdentity {
+        model_id: model_id.0.to_string(),
+        route: sampling.model.clone(),
+        lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
+        auth_scheme: Some(match sampling.auth_scheme {
+            xai_grok_sampler::AuthScheme::Bearer => xai_chat_state::CatalogAuthScheme::Bearer,
+            xai_grok_sampler::AuthScheme::XApiKey => xai_chat_state::CatalogAuthScheme::XApiKey,
+            xai_grok_sampler::AuthScheme::None => xai_chat_state::CatalogAuthScheme::None,
+        }),
     }
 }
 struct MissingSessionCtx {
@@ -2454,6 +2489,178 @@ impl MvpAgent {
         config.origin_client = origin_client;
         config
     }
+
+    /// Prepare every model-dependent input for a build-kind `/new` from one
+    /// immutable catalog entry, then validate the auth generation at the
+    /// commit boundary. A failed seal means auth changed while the plan was
+    /// being assembled, so the entire plan is rebuilt.
+    pub(super) fn prepare_new_session_model_plan(
+        &self,
+        custom_model_id: Option<&str>,
+        origin_client: Option<crate::http::OriginClientInfo>,
+    ) -> Result<PreparedNewSessionModelPlan, acp::Error> {
+        #[cfg(test)]
+        return self.prepare_new_session_model_plan_inner(custom_model_id, origin_client, || {
+            NEW_SESSION_PLAN_BEFORE_SEAL_HOOK.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().as_mut() {
+                    hook();
+                }
+            });
+        });
+        #[cfg(not(test))]
+        self.prepare_new_session_model_plan_inner(custom_model_id, origin_client, || {})
+    }
+
+    fn prepare_new_session_model_plan_inner(
+        &self,
+        custom_model_id: Option<&str>,
+        origin_client: Option<crate::http::OriginClientInfo>,
+        mut before_seal: impl FnMut(),
+    ) -> Result<PreparedNewSessionModelPlan, acp::Error> {
+        loop {
+            let campaign_candidate = crate::util::config::campaign_driven_models_default()
+                .filter(|campaign| {
+                    custom_model_id.is_none()
+                        || custom_model_id == campaign.pre_campaign.as_deref()
+                        || custom_model_id == Some(campaign.value.as_str())
+                });
+            let authority = self.models_manager.session_model_authority(
+                campaign_candidate.as_ref().map(|campaign| campaign.value.as_str()),
+            );
+            let fallback_model_id = authority.fallback_model_id;
+            let campaign_nudge = campaign_candidate.filter(|_| authority.campaign_eligible);
+            let campaign_nudged = campaign_nudge.is_some();
+            if let Some(campaign) = &campaign_nudge {
+                tracing::info!(
+                    model = %campaign.value,
+                    requested = ?custom_model_id,
+                    "new_session: applying campaign-driven default model"
+                );
+            }
+            let requested_model_id = campaign_nudge
+                .map(|campaign| campaign.value)
+                .or_else(|| custom_model_id.map(str::to_owned));
+            let catalog = authority.catalog;
+            let mut disallowed_custom = None;
+            let mut unreadiness_custom = None;
+            let selected_custom = requested_model_id.as_deref().and_then(|requested| {
+                let requested_id = acp::ModelId::new(requested);
+                let identity = crate::agent::models::resolve_catalog_identity(
+                    &catalog,
+                    &requested_id,
+                )?;
+                let model = catalog.get(identity.model_id.as_str())?.clone();
+                if !model.info.user_selectable {
+                    tracing::warn!(
+                        requested_model = requested,
+                        "Requested model not allowed by allowed_models; falling back to current default model"
+                    );
+                    if !campaign_nudged {
+                        disallowed_custom = Some(requested.to_owned());
+                    }
+                    return None;
+                }
+                let (ready, reason) = crate::agent::config::model_readiness(&model);
+                if !ready {
+                    let reason = reason.unwrap_or_else(|| "model is not ready".to_owned());
+                    tracing::warn!(
+                        requested_model = requested,
+                        %reason,
+                        "Requested model is not ready; falling back to current default model"
+                    );
+                    unreadiness_custom = Some((requested.to_owned(), reason));
+                    return None;
+                }
+                Some((requested_id, identity, model))
+            });
+            if requested_model_id.is_some() && selected_custom.is_none()
+                && disallowed_custom.is_none() && unreadiness_custom.is_none()
+            {
+                tracing::warn!(
+                    requested_model = ?requested_model_id,
+                    fallback_model = %fallback_model_id.0,
+                    "Requested model not found, falling back to current default model"
+                );
+            }
+            let (session_model_id, catalog_identity, model) = if let Some(selected) = selected_custom
+            {
+                selected
+            } else {
+                let Some(identity) = crate::agent::models::resolve_catalog_identity(
+                    &catalog,
+                    &fallback_model_id,
+                ) else {
+                    before_seal();
+                    if let Some(seal) = self
+                        .auth_manager
+                        .try_seal_selection(authority.auth_generation)
+                    {
+                        drop(seal);
+                        return Err(acp::Error::invalid_params().data(
+                            "No usable default model is available for this session",
+                        ));
+                    }
+                    continue;
+                };
+                let Some(model) = catalog
+                    .get(identity.model_id.as_str())
+                    .cloned()
+                else {
+                    before_seal();
+                    if let Some(seal) = self
+                        .auth_manager
+                        .try_seal_selection(authority.auth_generation)
+                    {
+                        drop(seal);
+                        return Err(acp::Error::internal_error().data(
+                            "Resolved default model is absent from its captured catalog",
+                        ));
+                    }
+                    continue;
+                };
+                (fallback_model_id.clone(), identity, model)
+            };
+            let model_agent_type = Some(model.info().agent_type.clone());
+            let mut sampling_config =
+                self.prepare_sampling_config_for_model(&model, origin_client.clone());
+            if let Some(effort) = self.models_manager.current_reasoning_effort()
+                && model.info().reasoning_efforts.iter().any(|option| option.value == effort)
+            {
+                sampling_config.reasoning_effort = Some(effort);
+            }
+            let plan = PreparedNewSessionModelPlan {
+                model_agent_type,
+                session_model_id,
+                sampling_config,
+                catalog_identity,
+                model_entry: model,
+                disallowed_custom,
+                unreadiness_custom,
+            };
+            before_seal();
+            if let Some(seal) = self
+                .auth_manager
+                .try_seal_selection(authority.auth_generation)
+            {
+                drop(seal);
+                return Ok(plan);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn prepare_new_session_model_plan_with_before_seal(
+        &self,
+        custom_model_id: Option<&str>,
+        origin_client: Option<crate::http::OriginClientInfo>,
+        before_seal: impl FnMut(),
+    ) -> Result<PreparedNewSessionModelPlan, acp::Error> {
+        self.prepare_new_session_model_plan_inner(
+            custom_model_id,
+            origin_client,
+            before_seal,
+        )
+    }
     /// Resolve sampling config for a model by ID, falling back to the live
     /// catalog selection on resolution failure. This keeps refreshed auth and
     /// readiness state authoritative instead of reusing the startup route.
@@ -4553,6 +4760,9 @@ impl MvpAgent {
             managed_mcp_expires_at,
             model_agent_type,
             session_model_id,
+            prepared_sampling_config,
+            prepared_catalog_identity,
+            prepared_model_entry,
             persisted_catalog_identity,
             session_yolo_mode,
             session_auto_mode,
@@ -4792,46 +5002,55 @@ impl MvpAgent {
         // catalog snapshot. A refresh must not rebind the prepared sampler to
         // a replacement entry that reused the same key.
         let catalog = self.models_manager.models();
-        let default_catalog_identity = match persisted_catalog_identity
-            .filter(|identity| identity.model_id == session_model_id.0.as_ref())
-        {
-            Some(identity) => crate::agent::models::reconcile_persisted_catalog_identity(
-                &catalog, &identity,
-            )
-            .or(Some(identity)),
-            None => crate::agent::models::resolve_catalog_identity(&catalog, &session_model_id),
-        };
-        let default_model = default_catalog_identity
-            .as_ref()
-            .and_then(|identity| catalog.get(identity.model_id.as_str()))
-            .filter(|entry| {
-                default_catalog_identity
+        let (sampling_config, default_catalog_identity) = match (
+            prepared_sampling_config,
+            prepared_catalog_identity,
+            prepared_model_entry.as_ref(),
+        ) {
+            (Some(sampling), Some(identity), Some(_)) => (sampling, identity),
+            (None, None, None) => {
+                let identity = match persisted_catalog_identity
+                    .filter(|identity| identity.model_id == session_model_id.0.as_ref())
+                {
+                    Some(identity) => crate::agent::models::reconcile_persisted_catalog_identity(
+                        &catalog, &identity,
+                    )
+                    .or(Some(identity)),
+                    None => crate::agent::models::resolve_catalog_identity(
+                        &catalog,
+                        &session_model_id,
+                    ),
+                };
+                let model = identity
                     .as_ref()
-                    .is_some_and(|identity| entry.info().model == identity.route)
-            });
-        let sampling_config = default_model
-            .map(|model| self.prepare_sampling_config_for_model(model, origin_client.clone()))
-            .unwrap_or_else(|| {
-                self.resolve_sampling_config_for_model(&session_model_id, origin_client.clone())
-            });
-        let default_catalog_identity = default_catalog_identity.unwrap_or_else(|| {
-            xai_chat_state::CatalogIdentity {
-                model_id: session_model_id.0.to_string(),
-                route: sampling_config.model.clone(),
-                lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
-                auth_scheme: Some(match sampling_config.auth_scheme {
-                    xai_grok_sampler::AuthScheme::Bearer => {
-                        xai_chat_state::CatalogAuthScheme::Bearer
-                    }
-                    xai_grok_sampler::AuthScheme::XApiKey => {
-                        xai_chat_state::CatalogAuthScheme::XApiKey
-                    }
-                    xai_grok_sampler::AuthScheme::None => {
-                        xai_chat_state::CatalogAuthScheme::None
-                    }
-                }),
+                    .and_then(|identity| catalog.get(identity.model_id.as_str()))
+                    .filter(|entry| {
+                        identity
+                            .as_ref()
+                            .is_some_and(|identity| entry.info().model == identity.route)
+                    });
+                let sampling = model
+                    .map(|model| {
+                        self.prepare_sampling_config_for_model(model, origin_client.clone())
+                    })
+                    .unwrap_or_else(|| {
+                        self.resolve_sampling_config_for_model(
+                            &session_model_id,
+                            origin_client.clone(),
+                        )
+                    });
+                let identity = identity.unwrap_or_else(|| catalog_identity_for_sampling(
+                    &session_model_id,
+                    &sampling,
+                ));
+                (sampling, identity)
             }
-        });
+            _ => {
+                return Err(acp::Error::internal_error().data(
+                    "prepared session sampling, catalog identity, and model entry must be provided together",
+                ));
+            }
+        };
         if self.auth_method_id.load().is_none() {
             return Err(acp::Error::auth_required().data("no auth method id provided"));
         }
@@ -4960,7 +5179,9 @@ impl MvpAgent {
                     sampling_config,
                 )
             };
-        let selected_model = catalog.get(catalog_identity.model_id.as_str());
+        let selected_model = prepared_model_entry
+            .as_ref()
+            .or_else(|| catalog.get(catalog_identity.model_id.as_str()));
         let auto_compact_threshold_percent = {
             let cfg = self.cfg.borrow();
             crate::util::config::resolve_auto_compact_threshold_percent(

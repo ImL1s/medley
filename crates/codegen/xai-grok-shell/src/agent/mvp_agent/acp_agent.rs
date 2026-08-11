@@ -1151,92 +1151,29 @@ impl acp::Agent for MvpAgent {
             id: session_id.clone(),
             cwd: cwd.as_str().to_owned(),
         };
-        let mut model_agent_type: Option<String> = None;
-        let mut session_sampling_override: Option<SamplingConfig> = None;
-        let mut disallowed_custom: Option<String> = None;
-        let mut unreadiness_custom: Option<(String, String)> = None;
-        let fallback_model_id = self.models_manager.current_model_id();
         let session_initial_model = chat_initial_model(is_chat_kind, custom_model_id);
-        let build_custom_model_id = if is_chat_kind { None } else { custom_model_id };
-        let campaign_nudge = if is_chat_kind {
+        let origin_client = self.origin_client_info_from_meta(arguments.meta.as_ref());
+        let prepared_model_plan = if is_chat_kind {
             None
         } else {
-            crate::util::config::campaign_driven_models_default()
-                .filter(|c| {
-                    build_custom_model_id.is_none()
-                        || build_custom_model_id == c.pre_campaign.as_deref()
-                        || build_custom_model_id == Some(c.value.as_str())
-                })
-                .filter(|c| {
-                    self.models_manager
-                        .campaign_default_is_eligible(&c.value)
-                })
+            Some(self.prepare_new_session_model_plan(
+                custom_model_id,
+                origin_client.clone(),
+            )?)
         };
-        let campaign_nudged = campaign_nudge.is_some();
-        if let Some(c) = &campaign_nudge {
-            tracing::info!(
-                model = %c.value,
-                requested = ?custom_model_id,
-                "new_session: applying campaign-driven default model"
-            );
-        }
-        let build_custom_model_id: Option<String> = campaign_nudge
-            .map(|c| c.value)
-            .or_else(|| build_custom_model_id.map(str::to_owned));
-        let resolved_custom_model = build_custom_model_id
-            .as_deref()
-            .and_then(|custom_model| match self
-                .resolve_model_id(&acp::ModelId::new(custom_model))
-            {
-                Ok(model) if model.info.user_selectable => {
-                    let (ready, reason) = crate::agent::config::model_readiness(&model);
-                    if !ready {
-                        let reason = reason.unwrap_or_else(|| "model is not ready".to_owned());
-                        tracing::warn!(
-                            requested_model = custom_model,
-                            %reason,
-                            "Requested model is not ready; falling back to current default model"
-                        );
-                        unreadiness_custom = Some((custom_model.to_string(), reason));
-                        return None;
-                    }
-                    model_agent_type = Some(model.info().agent_type.clone());
-                    let origin_client = self
-                        .origin_client_info_from_meta(arguments.meta.as_ref());
-                    session_sampling_override = Some(
-                        self.prepare_sampling_config_for_model(&model, origin_client),
-                    );
-                    Some(custom_model)
-                }
-                Ok(_) => {
-                    tracing::warn!(
-                        requested_model = custom_model,
-                        "Requested model not allowed by allowed_models; falling back to current default model"
-                    );
-                    if !campaign_nudged {
-                        disallowed_custom = Some(custom_model.to_string());
-                    }
-                    None
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        requested_model = custom_model,
-                        fallback_model = %fallback_model_id.0,
-                        "Requested model not found, falling back to current default model"
-                    );
-                    None
-                }
-            });
-        if model_agent_type.is_none()
-            && !is_chat_kind
-            && let Ok(default_model) = self.resolve_model_id(&fallback_model_id)
-        {
-            // Unknown, disallowed, and unready explicit models all fall back
-            // to this exact captured default model below. Carry its harness
-            // identity through the same pre-spawn prerequisite check instead
-            // of silently spawning the fallback with an unrelated profile.
-            model_agent_type = Some(default_model.info().agent_type.clone());
-        }
+        let model_agent_type = prepared_model_plan
+            .as_ref()
+            .and_then(|plan| plan.model_agent_type.clone());
+        let disallowed_custom = prepared_model_plan
+            .as_ref()
+            .and_then(|plan| plan.disallowed_custom.clone());
+        let unreadiness_custom = prepared_model_plan
+            .as_ref()
+            .and_then(|plan| plan.unreadiness_custom.clone());
+        let fallback_model_id = prepared_model_plan
+            .as_ref()
+            .map(|plan| plan.session_model_id.clone())
+            .unwrap_or_else(|| self.models_manager.current_model_id());
         // A model-declared harness is a prerequisite, not a best-effort hint.
         // Resolve it only after both explicit and default-model paths have
         // selected their harness, but before persistence or actor creation.
@@ -1264,9 +1201,7 @@ impl acp::Agent for MvpAgent {
                 required_agent_type,
                 required_definition.as_ref(),
             ) {
-                let requested_model = resolved_custom_model
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| fallback_model_id.0.to_string());
+                let requested_model = fallback_model_id.0.to_string();
                 return Err(crate::agent::config::ModelSwitchHarnessError {
                     code: crate::agent::config::MODEL_SWITCH_REBUILD_FAILED.to_owned(),
                     active_agent_type: selected_agent.name,
@@ -1281,22 +1216,15 @@ impl acp::Agent for MvpAgent {
                 .into_acp_error());
             }
         }
-        let origin_client = self.origin_client_info_from_meta(arguments.meta.as_ref());
-        let mut session_sampling = session_sampling_override
+        let session_sampling = prepared_model_plan
+            .as_ref()
+            .map(|plan| plan.sampling_config.clone())
             .unwrap_or_else(|| {
-                self
-                    .resolve_sampling_config_for_model(
-                        &fallback_model_id,
-                        origin_client.clone(),
-                    )
+                self.resolve_sampling_config_for_model(
+                    &fallback_model_id,
+                    origin_client.clone(),
+                )
             });
-        if let Some(effort) = self.models_manager.current_reasoning_effort()
-            && self
-                .models_manager
-                .model_offers_reasoning_effort(&session_sampling.model, effort)
-        {
-            session_sampling.reasoning_effort = Some(effort);
-        }
         let (summary_client, summary_model) = self
             .build_summary_client(&session_sampling)
             .await?;
@@ -1312,14 +1240,10 @@ impl acp::Agent for MvpAgent {
         } else {
             None
         };
-        let model_id = match &session_initial_model {
-            Some(chat_model) => acp::ModelId::new(chat_model.clone()),
-            None => {
-                resolved_custom_model
-                    .map(acp::ModelId::new)
-                    .unwrap_or_else(|| fallback_model_id.clone())
-            }
-        };
+        let model_id = session_initial_model
+            .as_ref()
+            .map(|chat_model| acp::ModelId::new(chat_model.clone()))
+            .unwrap_or_else(|| fallback_model_id.clone());
         let session_model_id = model_id.clone();
         let persistence = if is_chat_kind {
             crate::session::persistence::PersistenceHandle::noop()
@@ -1397,6 +1321,15 @@ impl acp::Agent for MvpAgent {
                         session_meta: arguments.meta.as_ref(),
                         managed_mcp_expires_at,
                         model_agent_type: model_agent_type.as_deref(),
+                        prepared_sampling_config: prepared_model_plan
+                            .as_ref()
+                            .map(|plan| plan.sampling_config.clone()),
+                        prepared_catalog_identity: prepared_model_plan
+                            .as_ref()
+                            .map(|plan| plan.catalog_identity.clone()),
+                        prepared_model_entry: prepared_model_plan
+                            .as_ref()
+                            .map(|plan| plan.model_entry.clone()),
                         persisted_catalog_identity: None,
                         session_model_id: session_model_id.clone(),
                         session_yolo_mode,
@@ -1449,28 +1382,6 @@ impl acp::Agent for MvpAgent {
                 };
                 xai_grok_telemetry::session_ctx::log_event_dual(product_analytics, ev);
             });
-        }
-        if let Some(model_id) = resolved_custom_model {
-            let apply_result = crate::timed!(log: "new_session: set_session_model", {
-                crate::agent::handlers::model_switch::apply(
-                    self,
-                    acp::SetSessionModelRequest::new(session_id.clone(), acp::ModelId::new(model_id)),
-                )
-                .await
-            });
-            if let Err(err) = apply_result {
-                tracing::warn!(
-                    session_id = %session_id.0,
-                    error = ?err,
-                    "new_session: initial model switch failed; reaping invalid session"
-                );
-                self.request_session_shutdown(&session_id);
-                self.remove_session(&session_id);
-                #[cfg(feature = "local-workspace")]
-                self.shutdown_gateway_bridge(&session_id);
-                return Err(err);
-            }
-            tracing::debug!(session_id = %session_id.0, "new_session: set_session_model");
         }
         if let Some(requested) = disallowed_custom {
             let current = self.models_manager.current_model_id();
@@ -2267,6 +2178,9 @@ impl acp::Agent for MvpAgent {
                         session_meta: request_meta.as_ref(),
                         managed_mcp_expires_at,
                         model_agent_type: persisted_agent_name.as_deref(),
+                        prepared_sampling_config: None,
+                        prepared_catalog_identity: None,
+                        prepared_model_entry: None,
                         persisted_catalog_identity: reconciled_catalog_identity,
                         session_model_id: spawn_model_id,
                         session_yolo_mode,

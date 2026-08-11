@@ -285,12 +285,28 @@ pub(crate) struct SessionSpawnOptions<'a> {
     pub managed_mcp_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub model_agent_type: Option<&'a str>,
     pub session_model_id: acp::ModelId,
+    /// Immutable model sampler selected by `/new` before its auth-selection seal.
+    pub prepared_sampling_config: Option<SamplingConfig>,
+    /// Catalog identity captured from the same entry as `prepared_sampling_config`.
+    pub prepared_catalog_identity: Option<xai_chat_state::CatalogIdentity>,
+    /// Exact catalog entry captured with the prepared sampler and identity.
+    pub prepared_model_entry: Option<ModelEntry>,
     pub persisted_catalog_identity: Option<xai_chat_state::CatalogIdentity>,
     pub session_yolo_mode: bool,
     pub session_auto_mode: bool,
     pub prompt_display_cwd: Option<String>,
     /// Sticky chat product kind for ACU / product skills sourcing.
     pub is_chat_kind: bool,
+}
+
+pub(crate) struct PreparedNewSessionModelPlan {
+    pub model_agent_type: Option<String>,
+    pub session_model_id: acp::ModelId,
+    pub sampling_config: SamplingConfig,
+    pub catalog_identity: xai_chat_state::CatalogIdentity,
+    pub model_entry: ModelEntry,
+    pub disallowed_custom: Option<String>,
+    pub unreadiness_custom: Option<(String, String)>,
 }
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
@@ -466,6 +482,9 @@ pub(crate) fn chat_session_spawn_options<'a>(
         managed_mcp_expires_at: None,
         model_agent_type,
         session_model_id,
+        prepared_sampling_config: None,
+        prepared_catalog_identity: None,
+        prepared_model_entry: None,
         persisted_catalog_identity: None,
         session_yolo_mode,
         session_auto_mode: false,
