@@ -1600,7 +1600,7 @@ impl MvpAgent {
         &self,
         session_id: &acp::SessionId,
         local_workspace_intent: bool,
-    ) -> Result<acp::ModelId, acp::Error> {
+    ) -> Result<(), acp::Error> {
         if !local_workspace_intent {
             return Ok(());
         }
@@ -4734,7 +4734,7 @@ impl MvpAgent {
         &self,
         init: &acp::InitializeRequest,
         spec: SessionSpawnOptions<'_>,
-    ) -> Result<(), acp::Error> {
+    ) -> Result<acp::ModelId, acp::Error> {
         let SessionSpawnOptions {
             session_info,
             cwd,
@@ -5787,11 +5787,11 @@ impl MvpAgent {
                 model_id = %model_id.0,
                 "session spawn selected an unready exact catalog entry; latching prompts"
             );
-            self.latch_unavailable_spawn_model(
+            self.session_registry.set_unavailable_model_with_identity(
                 &session_info.id,
                 model_id,
-                catalog_identity,
-                agent_name,
+                Some(catalog_identity),
+                Some(agent_name),
             );
         }
         self.spawn_managed_gateway_tool_catalog_fetch();
@@ -5801,20 +5801,6 @@ impl MvpAgent {
                 .await;
         });
         Ok(committed_model_id)
-    }
-    fn latch_unavailable_spawn_model(
-        &self,
-        session_id: &acp::SessionId,
-        model_id: acp::ModelId,
-        catalog_identity: xai_chat_state::CatalogIdentity,
-        agent_name: String,
-    ) {
-        self.session_registry.set_unavailable_model_with_identity(
-            session_id,
-            model_id,
-            Some(catalog_identity),
-            Some(agent_name),
-        );
     }
     /// Collects all pending permission events from a session's receiver.
     /// Returns only the events from the current turn (since last collection).

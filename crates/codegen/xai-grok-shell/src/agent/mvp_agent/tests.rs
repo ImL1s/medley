@@ -5010,7 +5010,7 @@ fn new_session_profile_pin_reports_the_committed_resident_model() {
         cfg.agent_profile_path = Some(profile);
         for (id, auth_scheme) in [
             ("prepared-model", xai_grok_sampler::AuthScheme::None),
-            ("pinned-model", xai_grok_sampler::AuthScheme::None),
+            ("pinned-model", xai_grok_sampler::AuthScheme::Bearer),
             ("unready-request", xai_grok_sampler::AuthScheme::Bearer),
         ] {
             cfg.config_models.insert(
@@ -5025,7 +5025,7 @@ fn new_session_profile_pin_reports_the_committed_resident_model() {
             );
         }
         let auth = std::sync::Arc::new(AuthManager::new(
-            tmp.path().join("auth"),
+            &tmp.path().join("auth"),
             GrokComConfig::default(),
         ));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -5069,6 +5069,25 @@ fn new_session_profile_pin_reports_the_committed_resident_model() {
                 .as_ref(),
             "pinned-model"
         );
+        assert_eq!(
+            agent.session_registry.unavailable_model(&response.session_id),
+            Some(acp::ModelId::new("pinned-model")),
+            "production spawn must latch the unready profile-pinned model"
+        );
+        let pinned_identity = agent
+            .session_registry
+            .unavailable_catalog_identity(&response.session_id)
+            .expect("spawn latch must retain exact catalog identity");
+        assert_eq!(pinned_identity.model_id, "pinned-model");
+        assert_eq!(pinned_identity.route, "pinned-model");
+        assert_eq!(
+            agent
+                .session_registry
+                .unavailable_agent_name(&response.session_id)
+                .as_deref(),
+            Some("grok-build"),
+            "spawn latch must retain the operative profile harness"
+        );
         let notification = std::iter::from_fn(|| rx.try_recv().ok())
             .filter_map(|message| match message {
                 xai_acp_lib::AcpClientMessage::ExtNotification(args)
@@ -5083,6 +5102,72 @@ fn new_session_profile_pin_reports_the_committed_resident_model() {
         assert!(notification.contains("unready-request"));
         assert!(notification.contains("pinned-model"));
         assert!(!notification.contains("prepared-model"));
+
+        let before_credentials = agent
+            .resident_handle(&response.session_id)
+            .expect("resident before recovery")
+            .chat_state_handle
+            .get_prepared_model_state()
+            .await
+            .expect("prepared state before recovery")
+            .2;
+        assert_eq!(before_credentials.api_key(), None);
+
+        // Same identity, but a harness incompatible with the persisted
+        // profile. This reaches the identity-backed recovery branch that must
+        // consult `unavailable_agent_name` and remain fail-closed.
+        let mut wrong_harness = agent.models_manager.models()["pinned-model"].clone();
+        wrong_harness.api_key = Some("wrong-harness-secret".to_owned());
+        wrong_harness.info.agent_type = "codex".to_owned();
+        agent
+            .models_manager
+            .insert_test_entry("pinned-model", wrong_harness);
+        let blocked = agent
+            .prompt(acp::PromptRequest::new(
+                response.session_id.clone(),
+                vec![acp::ContentBlock::from("recover with wrong harness")],
+            ))
+            .await
+            .expect("wrong-harness recovery blocks without transport failure");
+        assert_eq!(blocked.stop_reason, acp::StopReason::EndTurn);
+
+        // A ready entry reusing the catalog key on a different route must not
+        // replace the sealed identity or attach its credential on first prompt.
+        let mut replacement = agent.models_manager.models()["pinned-model"].clone();
+        replacement.info.model = "ready-replacement-route".to_owned();
+        replacement.info.agent_type = "grok-build".to_owned();
+        replacement.api_key = Some("replacement-credential-must-not-attach".to_owned());
+        agent
+            .models_manager
+            .insert_test_entry("pinned-model", replacement);
+        let blocked = agent
+            .prompt(acp::PromptRequest::new(
+                response.session_id.clone(),
+                vec![acp::ContentBlock::from("first prompt after replacement")],
+            ))
+            .await
+            .expect("same-key replacement blocks without transport failure");
+        assert_eq!(blocked.stop_reason, acp::StopReason::EndTurn);
+        assert_eq!(
+            agent
+                .session_registry
+                .unavailable_catalog_identity(&response.session_id),
+            Some(pinned_identity),
+            "replacement must not overwrite the sealed spawn identity"
+        );
+        let after_credentials = agent
+            .resident_handle(&response.session_id)
+            .expect("resident after blocked recovery")
+            .chat_state_handle
+            .get_prepared_model_state()
+            .await
+            .expect("prepared state after blocked recovery")
+            .2;
+        assert_eq!(
+            after_credentials.api_key(),
+            None,
+            "blocked recovery must not attach either replacement credential"
+        );
     });
 }
 
@@ -5143,56 +5228,6 @@ fn spawn_runtime_tuning_prefers_pinned_then_prepared_exact_entry() {
     assert_eq!(selected.info.max_retries, Some(4));
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn unready_spawn_latch_rejects_ready_same_key_replacement_on_first_prompt() {
-    use acp::Agent as _;
-
-    let agent = build_agent_with_model_for_tests("shared-key", "grok-build");
-    let sid = acp::SessionId::new("unready-spawn-exact-identity");
-    let mut handle = make_test_handle("shared-key", false, None);
-    handle.info.id = sid.clone();
-    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-    handle.cmd_tx = cmd_tx;
-    agent.session_registry.put_resident(&sid, handle);
-    let identity = xai_chat_state::CatalogIdentity {
-        model_id: "shared-key".to_owned(),
-        route: "prepared-unready-route".to_owned(),
-        lineage: xai_chat_state::CatalogResolutionLineage::ExactKey,
-        auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
-    };
-    agent.latch_unavailable_spawn_model(
-        &sid,
-        acp::ModelId::new("shared-key"),
-        identity.clone(),
-        "grok-build".to_owned(),
-    );
-    let mut replacement = agent.models_manager.models()["shared-key"].clone();
-    replacement.info.model = "ready-replacement-route".to_owned();
-    replacement.info.base_url = "https://replacement.invalid/v1".to_owned();
-    replacement.info.auth_scheme = xai_grok_sampler::AuthScheme::Bearer;
-    replacement.api_key = Some("replacement-credential-must-not-attach".to_owned());
-    agent
-        .models_manager
-        .insert_test_entry("shared-key", replacement);
-
-    let response = agent
-        .prompt(acp::PromptRequest::new(
-            sid.clone(),
-            vec![acp::ContentBlock::from("first prompt")],
-        ))
-        .await
-        .expect("identity mismatch blocks the prompt without failing transport");
-    assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
-    assert_eq!(
-        agent.session_registry.unavailable_catalog_identity(&sid),
-        Some(identity),
-        "the exact prepared route must remain authoritative"
-    );
-    assert!(
-        cmd_rx.try_recv().is_err(),
-        "first prompt must not switch the actor or attach the replacement credential"
-    );
-}
 /// Minimal agent whose `grok_com_config` engages the api-key kill switch
 /// (`disable_api_key_auth = true`), mirroring a forced-IdP deployment.
 fn build_agent_with_api_key_auth_disabled() -> MvpAgent {
