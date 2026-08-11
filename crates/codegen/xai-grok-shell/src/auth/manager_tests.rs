@@ -77,6 +77,29 @@ impl Drop for PostRenamePermissionFault {
     }
 }
 
+struct ParentSyncFault(PathBuf);
+
+impl ParentSyncFault {
+    fn install(path: &Path) -> Self {
+        crate::auth::storage::PARENT_SYNC_FAULT_PATHS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(path.to_owned());
+        Self(path.to_owned())
+    }
+}
+
+impl Drop for ParentSyncFault {
+    fn drop(&mut self) {
+        let mut faults = crate::auth::storage::PARENT_SYNC_FAULT_PATHS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(index) = faults.iter().rposition(|path| path == &self.0) {
+            faults.remove(index);
+        }
+    }
+}
+
 #[cfg(unix)]
 fn write_mixed_auth_store(path: &Path) {
     let xai_scope = GrokComConfig::default().auth_scope();
@@ -670,6 +693,197 @@ async fn codex_post_rename_unsafe_disk_clears_memory_before_generation_stabilize
         DiskAuthState::Unreadable,
         false,
         "codex-unsafe-rotated",
+    );
+}
+
+#[tokio::test]
+async fn codex_parent_sync_failure_reconciles_memory_to_visible_strict_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = AuthManager::new_openai_codex(dir.path());
+    manager
+        .save_without_enrichment(codex_auth("codex-parent-initial"))
+        .await
+        .unwrap();
+    let _fault = ParentSyncFault::install(manager.auth_json_path());
+
+    let error = manager
+        .save_without_enrichment(codex_auth("codex-parent-rotated"))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    assert_eq!(
+        manager.current_or_expired().unwrap().key,
+        "codex-parent-rotated",
+        "memory must reconcile to the complete visible credential"
+    );
+    let disk = read_auth_json_owner_only(manager.auth_json_path()).unwrap();
+    assert_eq!(
+        disk.get(crate::auth::openai_codex::AUTH_SCOPE).unwrap().key,
+        "codex-parent-rotated"
+    );
+    let log_bytes = xai_grok_telemetry::unified_log::snapshot_log()
+        .expect("reconciliation must emit unified telemetry");
+    let log = String::from_utf8_lossy(&log_bytes);
+    assert!(log.contains("strict credential write failed; durable state reconciled"));
+    assert!(
+        !log.contains("codex-parent-rotated"),
+        "durability diagnostics must not contain credential bytes"
+    );
+}
+
+/// A last-scope unlink is already visible when its parent-directory fsync
+/// fails. Durable logout must report that failure, but retaining the deleted
+/// credential in memory would be a fail-open disk/memory split.
+#[tokio::test]
+async fn codex_durable_clear_reconciles_memory_after_visible_parent_sync_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = AuthManager::new_openai_codex(dir.path());
+    manager
+        .save_without_enrichment(codex_auth("codex-delete-secret"))
+        .await
+        .unwrap();
+    let path = manager.auth_json_path().to_owned();
+    let _fault = ParentSyncFault::install(&path);
+
+    let error = manager
+        .clear_durable(StdDuration::from_secs(1))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    assert_eq!(
+        error.to_string(),
+        "injected auth parent-directory sync failure"
+    );
+    assert!(!path.exists(), "unlink must be visible before sync failure");
+    assert!(
+        manager.current_or_expired().is_none(),
+        "memory must reconcile to the visible deletion despite the durability error"
+    );
+    assert!(
+        !manager.selection_snapshot().has_auth,
+        "auth selection must fail closed after visible deletion"
+    );
+    let log_bytes = xai_grok_telemetry::unified_log::snapshot_log()
+        .expect("visible deletion failure must emit unified telemetry");
+    let log = String::from_utf8_lossy(&log_bytes);
+    assert!(log.contains("file deleted but directory sync failed"));
+    assert!(
+        !log.contains("codex-delete-secret"),
+        "durable deletion diagnostics must not contain credential bytes"
+    );
+}
+
+#[tokio::test]
+async fn codex_mixed_scope_clear_reconciles_after_visible_parent_sync_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = AuthManager::new_openai_codex(dir.path());
+    manager
+        .save_without_enrichment(codex_auth("codex-mixed-delete-secret"))
+        .await
+        .unwrap();
+    let mut store = read_auth_json_owner_only(manager.auth_json_path()).unwrap();
+    store.insert(
+        "sibling::scope".into(),
+        GrokAuth {
+            key: "sibling-secret".into(),
+            auth_mode: AuthMode::ApiKey,
+            ..GrokAuth::test_default()
+        },
+    );
+    write_auth_json_strict(manager.auth_json_path(), &store).unwrap();
+    let _fault = ParentSyncFault::install(manager.auth_json_path());
+
+    let error = manager
+        .clear_durable(StdDuration::from_secs(1))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    assert!(
+        manager.current_or_expired().is_none(),
+        "memory must drop the visibly removed current scope"
+    );
+    let durable = read_auth_json_owner_only(manager.auth_json_path()).unwrap();
+    assert!(!durable.contains_key(crate::auth::openai_codex::AUTH_SCOPE));
+    assert_eq!(
+        durable.get("sibling::scope").map(|auth| auth.key.as_str()),
+        Some("sibling-secret"),
+        "the sibling scope must survive the atomic replacement"
+    );
+    let log_bytes = xai_grok_telemetry::unified_log::snapshot_log()
+        .expect("mixed-scope sync failure must emit unified telemetry");
+    let log = String::from_utf8_lossy(&log_bytes);
+    assert!(log.contains("entry removed but final durability proof failed"));
+    assert!(!log.contains("codex-mixed-delete-secret"));
+    assert!(!log.contains("sibling-secret"));
+}
+
+#[tokio::test]
+async fn codex_mixed_scope_clear_reconciles_after_post_rename_permission_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = AuthManager::new_openai_codex(dir.path());
+    manager
+        .save_without_enrichment(codex_auth("codex-permission-delete-secret"))
+        .await
+        .unwrap();
+    let mut store = read_auth_json_owner_only(manager.auth_json_path()).unwrap();
+    store.insert(
+        "permission::sibling".into(),
+        GrokAuth {
+            key: "permission-sibling-secret".into(),
+            auth_mode: AuthMode::ApiKey,
+            ..GrokAuth::test_default()
+        },
+    );
+    write_auth_json_strict(manager.auth_json_path(), &store).unwrap();
+    let _fault = PostRenamePermissionFault::install(manager.auth_json_path());
+
+    let error = manager
+        .clear_durable(StdDuration::from_secs(1))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(
+        manager.current_or_expired().is_none(),
+        "post-rename classification must clear the visibly removed credential without reread"
+    );
+    let durable = read_auth_json(manager.auth_json_path()).unwrap();
+    assert!(!durable.contains_key(crate::auth::openai_codex::AUTH_SCOPE));
+    assert!(durable.contains_key("permission::sibling"));
+    let log_bytes = xai_grok_telemetry::unified_log::snapshot_log()
+        .expect("permission failure must emit unified telemetry");
+    let log = String::from_utf8_lossy(&log_bytes);
+    assert!(log.contains("entry removed but final durability proof failed"));
+    assert!(!log.contains("codex-permission-delete-secret"));
+    assert!(!log.contains("permission-sibling-secret"));
+}
+
+/// Windows has no documented directory fsync. Last-scope provider logout uses
+/// the write-through atomic replacement path and leaves a safe empty store.
+#[cfg(windows)]
+#[tokio::test]
+async fn codex_windows_last_scope_clear_replaces_with_empty_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = AuthManager::new_openai_codex(dir.path());
+    manager
+        .save_without_enrichment(codex_auth("codex-windows-delete-secret"))
+        .await
+        .unwrap();
+
+    manager
+        .clear_durable(StdDuration::from_secs(1))
+        .await
+        .unwrap();
+
+    assert!(manager.current_or_expired().is_none());
+    assert!(manager.auth_json_path().exists());
+    assert!(
+        read_auth_json_owner_only(manager.auth_json_path())
+            .unwrap()
+            .is_empty()
     );
 }
 

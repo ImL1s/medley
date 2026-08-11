@@ -41,9 +41,10 @@ use super::model::{
 };
 use super::refresh::{RefreshOutcome, TokenRefresher, resolve_refresh_credential};
 use super::storage::{
-    AuthFileLock, ensure_auth_json_owner_only, read_auth_json,
+    AuthFileLock, AuthWriteFailure, ensure_auth_json_owner_only, read_auth_json,
     read_auth_json_or_empty_recovering_corrupt, read_auth_json_owner_only,
-    read_auth_json_owner_only_or_empty_recovering_corrupt, write_auth_json, write_auth_json_strict,
+    read_auth_json_owner_only_or_empty_recovering_corrupt, sync_auth_parent_directory,
+    write_auth_json, write_auth_json_strict, write_auth_json_strict_classified,
 };
 
 use super::storage::read_auth_json_or_empty;
@@ -409,10 +410,33 @@ enum ScopeRemoval {
     EntryRemoved,
     /// Last scope dropped; auth.json deleted.
     FileDeleted,
+    /// Last scope was visibly unlinked, but the containing directory barrier
+    /// failed. Memory must still reconcile to logged-out while success is not
+    /// reported to the caller.
+    FileDeletedSyncFailed,
+    /// Windows durable provider logout replaced the last credential with an
+    /// empty owner-only store through `MOVEFILE_WRITE_THROUGH`.
+    #[cfg(windows)]
+    FileCleared,
+    /// The empty-store replacement is visible, but a final durability or
+    /// permission proof failed.
+    #[cfg(windows)]
+    FileClearedDurabilityFailed,
+    /// Scope removal is visible in a remaining multi-scope store, but a final
+    /// durability or permission proof failed.
+    EntryRemovedDurabilityFailed,
     /// Lock unavailable (held by another process); disk left untouched.
     SkippedLockUnavailable,
     /// Lock held but auth.json was unreadable; disk left untouched.
     SkippedUnreadable,
+}
+
+/// A durable removal may become visible before its final directory barrier
+/// fails. Callers must then reconcile memory to the visible removal while
+/// still returning the durability error to the user.
+struct DurableScopeRemoval {
+    mutation: ScopeRemoval,
+    durability_error: Option<std::io::Error>,
 }
 
 impl ScopeRemoval {
@@ -421,6 +445,12 @@ impl ScopeRemoval {
         match self {
             Self::EntryRemoved => "entry removed",
             Self::FileDeleted => "file deleted (no scopes left)",
+            Self::FileDeletedSyncFailed => "file deleted but directory sync failed",
+            #[cfg(windows)]
+            Self::FileCleared => "file replaced with empty credential store",
+            #[cfg(windows)]
+            Self::FileClearedDurabilityFailed => "file cleared but final durability proof failed",
+            Self::EntryRemovedDurabilityFailed => "entry removed but final durability proof failed",
             Self::SkippedLockUnavailable => "skipped (lock unavailable)",
             Self::SkippedUnreadable => "skipped (auth.json unreadable)",
         }
@@ -770,9 +800,12 @@ impl AuthManager {
             ));
         }
 
-        let disk_mutation = self.write_scope_removal_durable(&self.scope)?;
-        self.finish_scope_removal(&self.scope, disk_mutation);
-        Ok(())
+        let outcome = self.write_scope_removal_durable(&self.scope)?;
+        self.finish_scope_removal(&self.scope, outcome.mutation);
+        match outcome.durability_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Remove a scope entry from auth.json. When `scope == self.scope`, also
@@ -838,31 +871,108 @@ impl AuthManager {
     /// Strict counterpart used by provider logout: missing auth.json is an
     /// already-logged-out success, while unreadable data and write failures
     /// are surfaced so memory cannot diverge from durable state.
-    fn write_scope_removal_durable(&self, scope: &str) -> std::io::Result<ScopeRemoval> {
-        let mut auth_store = if self.xai_session {
-            read_auth_json_or_empty(&self.path)?
+    fn write_scope_removal_durable(&self, scope: &str) -> std::io::Result<DurableScopeRemoval> {
+        let (mut auth_store, file_existed) = if self.xai_session {
+            match read_auth_json(&self.path) {
+                Ok(store) => (store, true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    (AuthStore::new(), false)
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             match read_auth_json_owner_only(&self.path) {
-                Ok(store) => store,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => AuthStore::new(),
+                Ok(store) => (store, true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    (AuthStore::new(), false)
+                }
                 Err(error) => return Err(error),
             }
         };
+        #[cfg(not(windows))]
+        let _ = file_existed;
         auth_store.remove(scope);
         if auth_store.is_empty() {
-            match std::fs::remove_file(&self.path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            #[cfg(windows)]
+            if !self.xai_session && file_existed {
+                return self.persist_scope_removal_store(
+                    scope,
+                    &auth_store,
+                    ScopeRemoval::FileCleared,
+                    ScopeRemoval::FileClearedDurabilityFailed,
+                );
+            }
+
+            let removed = match std::fs::remove_file(&self.path) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
                 Err(error) => return Err(error),
-            }
-            Ok(ScopeRemoval::FileDeleted)
-        } else {
-            if self.xai_session {
-                write_auth_json(&self.path, &auth_store)?;
+            };
+            let durability_error = if removed {
+                sync_auth_parent_directory(&self.path).err()
             } else {
-                write_auth_json_strict(&self.path, &auth_store)?;
+                None
+            };
+            Ok(DurableScopeRemoval {
+                mutation: if durability_error.is_some() {
+                    ScopeRemoval::FileDeletedSyncFailed
+                } else {
+                    ScopeRemoval::FileDeleted
+                },
+                durability_error,
+            })
+        } else {
+            self.persist_scope_removal_store(
+                scope,
+                &auth_store,
+                ScopeRemoval::EntryRemoved,
+                ScopeRemoval::EntryRemovedDurabilityFailed,
+            )
+        }
+    }
+
+    fn persist_scope_removal_store(
+        &self,
+        removed_scope: &str,
+        auth_store: &AuthStore,
+        success: ScopeRemoval,
+        visible_failure: ScopeRemoval,
+    ) -> std::io::Result<DurableScopeRemoval> {
+        if !self.xai_session {
+            return match write_auth_json_strict_classified(&self.path, auth_store) {
+                Ok(()) => Ok(DurableScopeRemoval {
+                    mutation: success,
+                    durability_error: None,
+                }),
+                Err(AuthWriteFailure::AfterPublication(error)) => Ok(DurableScopeRemoval {
+                    mutation: visible_failure,
+                    durability_error: Some(error),
+                }),
+                Err(AuthWriteFailure::BeforePublication(error)) => Err(error),
+            };
+        }
+
+        match write_auth_json(&self.path, auth_store) {
+            Ok(()) => Ok(DurableScopeRemoval {
+                mutation: success,
+                durability_error: None,
+            }),
+            Err(error) => {
+                // A final permission/directory barrier can fail after rename.
+                // Reconcile only when a safe read proves the exact scope is
+                // absent; pre-publication failures leave the old entry present.
+                let visible = read_auth_json(&self.path)
+                    .ok()
+                    .is_some_and(|store| !store.contains_key(removed_scope));
+                if visible {
+                    Ok(DurableScopeRemoval {
+                        mutation: visible_failure,
+                        durability_error: Some(error),
+                    })
+                } else {
+                    Err(error)
+                }
             }
-            Ok(ScopeRemoval::EntryRemoved)
         }
     }
 
