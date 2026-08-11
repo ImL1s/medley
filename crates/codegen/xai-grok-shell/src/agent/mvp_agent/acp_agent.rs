@@ -6,6 +6,12 @@ use super::*;
 use crate::auth::SilentRefresh;
 use crate::leader::protocol::InternalMethod;
 
+pub(super) fn has_advertised_auth_provider_command(
+    config: &crate::auth::GrokComConfig,
+) -> bool {
+    crate::auth::has_nonblank_auth_provider_command(config.auth_provider_command.as_deref())
+}
+
 /// The single model-restore edge used by `session/load` after registration and
 /// before its load guard is released. Keeping this wrapper in the load module
 /// prevents restore callers from accidentally taking the external wait path.
@@ -382,7 +388,7 @@ impl acp::Agent for MvpAgent {
             let issuer = cfg.grok_com_config.oidc.as_ref().map(|o| o.issuer.clone());
             (
                 cfg.grok_com_config.auth_provider_label.clone(),
-                cfg.grok_com_config.auth_provider_command.is_some(),
+                has_advertised_auth_provider_command(&cfg.grok_com_config),
                 cfg.grok_com_config.oidc.is_some(),
                 issuer,
             )
