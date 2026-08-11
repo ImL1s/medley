@@ -3638,6 +3638,121 @@ fn invalid_env_probe_preserves_explicit_and_user_picked_grok() {
 }
 
 #[test]
+#[serial_test::serial]
+fn invalid_env_probe_preserves_other_usable_xai_routes() {
+    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    use crate::auth::{
+        AuthMode, FirstPartySessionEligibility, GrokAuth, PreferredAuthMethod, XAI_OAUTH2_ISSUER,
+    };
+    use xai_grok_test_support::EnvGuard;
+    let _g = EnvGuard::set(XAI_API_KEY_ENV_VAR, "invalid-xai-key");
+    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+    let _default = EnvGuard::unset("GROK_DEFAULT_MODEL");
+
+    let tmp = tempfile::tempdir().expect("temp home");
+    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
+    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
+    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
+    catalog.insert(
+        crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string(),
+        codex,
+    );
+    let auth_manager = |suffix: &str| {
+        let home = tmp.path().join(suffix);
+        std::fs::create_dir_all(&home).unwrap();
+        Arc::new(AuthManager::new(&home, GrokComConfig::default()))
+    };
+    let manager = |cfg: config::Config, auth: Arc<AuthManager>| {
+        ModelsManagerBuilder::new(
+            None,
+            catalog.clone(),
+            acp::ModelId::new("grok-4.5"),
+            auth,
+            cfg,
+        )
+        .cache(test_cache_manager(tmp.path()))
+        .build()
+    };
+    let assert_preserved = |mgr: ModelsManager, label: &str| {
+        mgr.apply_first_party_env_api_key_probe_result(false);
+        assert_eq!(
+            mgr.current_model_id().0.as_ref(),
+            "grok-4.5",
+            "{label} must preserve Grok after the failed env probe"
+        );
+        assert!(
+            !mgr.inner.auth_manager.first_party_env_api_key_ok(),
+            "{label} must still publish the failed env-key verdict"
+        );
+    };
+
+    let mut deployment = config::Config::default();
+    deployment.endpoints.deployment_key = Some("deployment-key".to_string());
+    assert_preserved(
+        manager(deployment, auth_manager("xai-deployment-probe")),
+        "nonblank deployment key",
+    );
+
+    let mut api_key_pin = config::Config::default();
+    api_key_pin.grok_com_config.preferred_method = Some(PreferredAuthMethod::ApiKey);
+    assert_preserved(
+        manager(api_key_pin, auth_manager("xai-api-key-pin-probe")),
+        "preferred_method=api_key",
+    );
+
+    let mut oidc_pin = config::Config::default();
+    oidc_pin.grok_com_config.preferred_method = Some(PreferredAuthMethod::Oidc);
+    assert_preserved(
+        manager(oidc_pin, auth_manager("xai-oidc-pin-probe")),
+        "preferred_method=oidc",
+    );
+
+    let wire_usable = auth_manager("xai-wire-usable-probe");
+    wire_usable.hot_swap(GrokAuth {
+        key: "live-access".into(),
+        auth_mode: AuthMode::Oidc,
+        expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        refresh_token: Some("live-refresh".into()),
+        oidc_issuer: Some(XAI_OAUTH2_ISSUER.to_owned()),
+        oidc_client_id: Some("client".into()),
+        user_id: "u".into(),
+        ..GrokAuth::test_default()
+    });
+    assert_eq!(
+        wire_usable.first_party_session_eligibility(),
+        FirstPartySessionEligibility::WireUsable
+    );
+    assert_preserved(
+        manager(config::Config::default(), wire_usable),
+        "wire-usable xAI session",
+    );
+
+    let refreshable = auth_manager("xai-refreshable-probe");
+    refreshable.hot_swap(GrokAuth {
+        key: "expired-access".into(),
+        auth_mode: AuthMode::Oidc,
+        create_time: chrono::Utc::now() - chrono::Duration::hours(2),
+        expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+        refresh_token: Some("refresh-complete".into()),
+        oidc_issuer: Some(XAI_OAUTH2_ISSUER.to_owned()),
+        oidc_client_id: Some("client".into()),
+        user_id: "u".into(),
+        ..GrokAuth::test_default()
+    });
+    assert_eq!(
+        refreshable.first_party_session_eligibility(),
+        FirstPartySessionEligibility::Refreshable
+    );
+    assert_preserved(
+        manager(config::Config::default(), refreshable),
+        "complete-refreshable expired OIDC session",
+    );
+}
+
+#[test]
 fn byok_unchanged_when_codex_ready() {
     use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
     use xai_grok_test_support::EnvGuard;

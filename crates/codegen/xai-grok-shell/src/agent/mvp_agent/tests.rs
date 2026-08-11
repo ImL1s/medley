@@ -8454,9 +8454,8 @@ mod soft_default_settings_emit {
     }
 }
 
-/// #131 B3: the deliverable is the `initialize` response `_meta` key, not the
-/// in-memory lock. Deleting the insert in `AcpAgent::initialize` must fail
-/// this test; asserting only on `substituted_preference()` would not.
+/// #303: production initialize must probe an ambient xAI env key even when a
+/// ready Codex account route exists, then repair the implicit Grok default.
 #[test]
 #[serial_test::serial]
 fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex() {
@@ -8588,6 +8587,9 @@ fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex() {
     });
 }
 
+/// #131 B3: the deliverable is the `initialize` response `_meta` key, not the
+/// in-memory lock. Deleting the insert in `AcpAgent::initialize` must fail
+/// this test; asserting only on `substituted_preference()` would not.
 #[test]
 fn initialize_publishes_substituted_default_model_meta() {
     run_local_for_bridge_test(|| async {
