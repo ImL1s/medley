@@ -4089,13 +4089,22 @@ fn build_agent_with_model_for_tests(
 }
 
 fn build_cross_provider_agent_for_tests(target_api_key: Option<&str>) -> MvpAgent {
+    build_cross_provider_agent_with_gateway_for_tests(target_api_key).0
+}
+
+fn build_cross_provider_agent_with_gateway_for_tests(
+    target_api_key: Option<&str>,
+) -> (
+    MvpAgent,
+    tokio::sync::mpsc::UnboundedReceiver<xai_acp_lib::AcpClientMessage>,
+) {
     use crate::agent::config::{Config as AgentConfig, ConfigModelOverride};
     use crate::auth::{AuthManager, GrokComConfig};
 
     let temp_dir = tempfile::tempdir().unwrap();
     let auth_manager =
         std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let gateway = GatewaySender::new(tx);
     let mut cfg = AgentConfig::default();
     cfg.models.default = Some("source-provider".to_owned());
@@ -4130,7 +4139,263 @@ fn build_cross_provider_agent_for_tests(target_api_key: Option<&str>) -> MvpAgen
     agent
         .models_manager
         .set_current_model_id(acp::ModelId::new("source-provider"));
+    (agent, rx)
+}
+
+#[derive(Clone, Copy)]
+enum PromptRecoveryQuarantineRace {
+    NewerDifferentLatch,
+    ClearedLatch,
+}
+
+async fn assert_prompt_recovery_quarantines_stale_actor_receipt(
+    race: PromptRecoveryQuarantineRace,
+) {
+    let source_model = "source-provider";
+    let target_model = "target-provider";
+    let newer_unavailable_model = "newer-unavailable-provider";
+    let session_name = match race {
+        PromptRecoveryQuarantineRace::NewerDifferentLatch => "prompt-recovery-newer-quarantine",
+        PromptRecoveryQuarantineRace::ClearedLatch => "prompt-recovery-rebuilt-quarantine",
+    };
+    let sid = acp::SessionId::new(session_name);
+    let _ = crate::agent::handlers::model_switch::take_captured_success_telemetry(session_name);
+    let _ = crate::agent::handlers::model_switch::take_captured_failure_telemetry(session_name);
+    let (agent, mut gateway_rx) =
+        build_cross_provider_agent_with_gateway_for_tests(Some("target-test-key"));
+    let agent = std::rc::Rc::new(agent);
+    agent.sync_process_static_api_key(Some(source_model));
+    assert_eq!(
+        agent.auth_manager.static_api_key_for_export().as_deref(),
+        Some("source-test-key")
+    );
+
+    let (mut handle, _cmd_tx, mut cmd_rx) = make_live_session_handle(&sid, None);
+    handle.model_id = acp::ModelId::new(source_model);
+    handle.agent_name = "grok-build".to_owned();
+    handle.auxiliary_model_provenance = crate::session::AuxiliaryModelProvenance {
+        session_summary_follows_default: true,
+        web_search_follows_default: true,
+        web_search_model: source_model.to_owned(),
+        image_description_follows_default: true,
+        image_description_model: source_model.to_owned(),
+    };
+    agent.insert_resident(&sid, handle);
+    let source_notice = crate::session::WebSearchDisabledNotice {
+        model_id: source_model.to_owned(),
+        reason: "source web search remains disabled".to_owned(),
+        message: "source-provider web search remains disabled".to_owned(),
+    };
     agent
+        .web_search_disabled
+        .borrow_mut()
+        .insert(sid.clone(), source_notice.clone());
+    let target_identity = crate::agent::models::resolve_catalog_identity(
+        &agent.models_manager.models(),
+        &acp::ModelId::new(target_model),
+    )
+    .expect("target catalog identity");
+    agent.session_registry.set_unavailable_model_with_identity(
+        &sid,
+        acp::ModelId::new(target_model),
+        Some(target_identity.clone()),
+        Some("grok-build".to_owned()),
+    );
+
+    let apply_count = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let actor_apply_count = apply_count.clone();
+    let prompt_count = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let actor_prompt_count = prompt_count.clone();
+    let actor_agent = agent.clone();
+    let actor_sid = sid.clone();
+    let actor = tokio::task::spawn_local(async move {
+        while let Some(command) = cmd_rx.recv().await {
+            match command {
+                TestSessionCommand::GetActiveAgent { responds_to } => {
+                    let _ = responds_to.send(Some("grok-build".to_owned()));
+                }
+                TestSessionCommand::ApplyModelSwitch {
+                    prepared,
+                    responds_to,
+                } => {
+                    actor_apply_count.set(actor_apply_count.get() + 1);
+                    assert_eq!(prepared.catalog_identity.model_id, target_model);
+                    match race {
+                        PromptRecoveryQuarantineRace::NewerDifferentLatch => {
+                            actor_agent
+                                .session_registry
+                                .set_unavailable_model_with_identity(
+                                    &actor_sid,
+                                    acp::ModelId::new(newer_unavailable_model),
+                                    None,
+                                    Some("newer-agent".to_owned()),
+                                );
+                        }
+                        PromptRecoveryQuarantineRace::ClearedLatch => {
+                            assert_eq!(
+                                actor_agent
+                                    .session_registry
+                                    .take_unavailable_model(&actor_sid),
+                                Some(acp::ModelId::new(target_model))
+                            );
+                        }
+                    }
+                    let target_notice = crate::session::WebSearchDisabledNotice {
+                        model_id: target_model.to_owned(),
+                        reason: "actor target web-search result".to_owned(),
+                        message: "target-provider actor web-search notice".to_owned(),
+                    };
+                    let _ = responds_to.send(Ok(crate::session::AppliedModelSwitch {
+                        previous_model_id: acp::ModelId::new(source_model),
+                        catalog_model_id: acp::ModelId::new(target_model),
+                        did_rebuild: false,
+                        active_agent_type: Some("grok-build".to_owned()),
+                        web_search: Some(crate::session::AppliedWebSearchState {
+                            enabled: false,
+                            disable_notice: Some(target_notice),
+                        }),
+                    }));
+                }
+                TestSessionCommand::Prompt { respond_to, .. } => {
+                    actor_prompt_count.set(actor_prompt_count.get() + 1);
+                    let _ = respond_to.send(crate::session::ok_end_turn(0, None));
+                }
+                _ => panic!("unexpected command during quarantined prompt recovery"),
+            }
+        }
+    });
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        <MvpAgent as acp::Agent>::prompt(
+            &agent,
+            acp::PromptRequest::new(
+                sid.clone(),
+                vec![acp::ContentBlock::from(
+                    "a stale recovery receipt must remain quarantined",
+                )],
+            ),
+        ),
+    )
+    .await
+    .expect("quarantined prompt recovery must not hang")
+    .expect("quarantined prompt recovery must block cleanly");
+
+    assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
+    assert_eq!(apply_count.get(), 1);
+    assert_eq!(prompt_count.get(), 0, "no Prompt command may be dispatched");
+    assert_eq!(
+        agent.resident_handle(&sid).unwrap().model_id,
+        acp::ModelId::new(target_model),
+        "the resident mirror must reconcile to the actor-owned target"
+    );
+    match race {
+        PromptRecoveryQuarantineRace::NewerDifferentLatch => {
+            assert_eq!(
+                agent.session_registry.unavailable_model(&sid),
+                Some(acp::ModelId::new(newer_unavailable_model))
+            );
+            assert_eq!(
+                agent.session_registry.unavailable_catalog_identity(&sid),
+                None
+            );
+            assert_eq!(
+                agent
+                    .session_registry
+                    .unavailable_agent_name(&sid)
+                    .as_deref(),
+                Some("newer-agent")
+            );
+        }
+        PromptRecoveryQuarantineRace::ClearedLatch => {
+            assert_eq!(
+                agent.session_registry.unavailable_model(&sid),
+                Some(acp::ModelId::new(target_model)),
+                "a concurrent take must be replaced by a target quarantine latch"
+            );
+            assert_eq!(
+                agent.session_registry.unavailable_catalog_identity(&sid),
+                Some(target_identity)
+            );
+            assert_eq!(
+                agent
+                    .session_registry
+                    .unavailable_agent_name(&sid)
+                    .as_deref(),
+                Some("grok-build")
+            );
+        }
+    }
+    assert_eq!(
+        agent.models_manager.current_model_id(),
+        acp::ModelId::new(source_model),
+        "a quarantined recovery must not publish the target globally"
+    );
+    assert_eq!(
+        agent.auth_manager.static_api_key_for_export().as_deref(),
+        Some("source-test-key"),
+        "a quarantined recovery must not publish the target API key"
+    );
+    assert_eq!(
+        agent.web_search_disabled.borrow().get(&sid),
+        Some(&source_notice),
+        "a quarantined recovery must not publish the actor target web notice"
+    );
+    while let Ok(message) = gateway_rx.try_recv() {
+        if let xai_acp_lib::AcpClientMessage::ExtNotification(args) = message {
+            if args.request.method.as_ref() == "x.ai/session_notification" {
+                let notification: crate::extensions::notification::SessionNotification =
+                    serde_json::from_str(args.request.params.get())
+                        .expect("valid session notification");
+                if let crate::extensions::notification::SessionUpdate::ModelChanged {
+                    model_id,
+                    ..
+                } = notification.update
+                {
+                    assert_ne!(
+                        model_id, target_model,
+                        "a quarantined recovery must not broadcast target ModelChanged"
+                    );
+                }
+            }
+            let _ = args.response_tx.send(Ok(()));
+        }
+    }
+    assert!(
+        crate::agent::handlers::model_switch::take_captured_success_telemetry(session_name)
+            .is_empty(),
+        "a quarantined recovery must not emit model-switch success telemetry"
+    );
+    let _ = crate::agent::handlers::model_switch::take_captured_failure_telemetry(session_name);
+    actor.abort();
+}
+
+#[test]
+#[serial_test::serial]
+fn production_prompt_recovery_with_newer_latch_reconciles_only_internal_resident() {
+    let _xai_api_key = xai_grok_test_support::EnvGuard::unset("XAI_API_KEY");
+    let _grok_code_xai_api_key =
+        xai_grok_test_support::EnvGuard::unset("GROK_CODE_XAI_API_KEY");
+    run_local_for_bridge_test(|| async {
+        assert_prompt_recovery_quarantines_stale_actor_receipt(
+            PromptRecoveryQuarantineRace::NewerDifferentLatch,
+        )
+        .await;
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn production_prompt_recovery_rebuilds_quarantine_after_concurrent_take() {
+    let _xai_api_key = xai_grok_test_support::EnvGuard::unset("XAI_API_KEY");
+    let _grok_code_xai_api_key =
+        xai_grok_test_support::EnvGuard::unset("GROK_CODE_XAI_API_KEY");
+    run_local_for_bridge_test(|| async {
+        assert_prompt_recovery_quarantines_stale_actor_receipt(
+            PromptRecoveryQuarantineRace::ClearedLatch,
+        )
+        .await;
+    });
 }
 
 #[test]

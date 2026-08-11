@@ -16,17 +16,23 @@ pub(crate) struct UnavailableRecoverySnapshot {
     pub(crate) revision: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum UnavailableModelCommitPolicy {
     ClearIfRevision(u64),
+    RecoverIfRevision {
+        expected_revision: u64,
+        quarantine_model: acp::ModelId,
+        quarantine_catalog_identity: xai_chat_state::CatalogIdentity,
+    },
     Preserve,
 }
 
 pub(crate) enum ModelSwitchCommitOutcome {
     Committed {
         cleared_unavailable_model: Option<acp::ModelId>,
-        unavailable_model_revision_matched: bool,
     },
+    CommittedPreservingUnavailable,
+    CommittedQuarantined,
     Superseded,
 }
 /// Turn activity of a resident actor. Split from [`SessionLiveState`] so a
@@ -486,13 +492,7 @@ impl SessionRegistry {
         let Some(entry) = entries.get_mut(id) else {
             return ModelSwitchCommitOutcome::Superseded;
         };
-        let unavailable_model_revision_matched = match unavailable_model_policy {
-            UnavailableModelCommitPolicy::ClearIfRevision(expected) => {
-                entry.unavailable_model_revision == expected
-            }
-            UnavailableModelCommitPolicy::Preserve => true,
-        };
-        {
+        let committed_agent_name = {
             let handle = match entry.presence.as_mut() {
                 Some(SessionPresence::Resident {
                     handle: Some(handle),
@@ -507,23 +507,47 @@ impl SessionRegistry {
             if !handle.cmd_tx.same_channel(expected_cmd_tx) {
                 return ModelSwitchCommitOutcome::Superseded;
             }
-            update(handle)
-        }
-        let clear_unavailable_model = matches!(
-            unavailable_model_policy,
-            UnavailableModelCommitPolicy::ClearIfRevision(_)
-        ) && unavailable_model_revision_matched;
-        let unavailable_model = if clear_unavailable_model {
-            entry.unavailable_model_revision = entry.unavailable_model_revision.saturating_add(1);
-            entry.unavailable_catalog_identity = None;
-            entry.unavailable_agent_name = None;
-            entry.unavailable_model.take()
-        } else {
-            None
+            update(handle);
+            handle.agent_name.clone()
         };
-        ModelSwitchCommitOutcome::Committed {
-            cleared_unavailable_model: unavailable_model,
-            unavailable_model_revision_matched,
+        match unavailable_model_policy {
+            UnavailableModelCommitPolicy::Preserve => {
+                ModelSwitchCommitOutcome::CommittedPreservingUnavailable
+            }
+            UnavailableModelCommitPolicy::ClearIfRevision(expected_revision)
+                if entry.unavailable_model_revision != expected_revision =>
+            {
+                ModelSwitchCommitOutcome::CommittedPreservingUnavailable
+            }
+            UnavailableModelCommitPolicy::RecoverIfRevision {
+                expected_revision,
+                quarantine_model,
+                quarantine_catalog_identity,
+            } if entry.unavailable_model_revision != expected_revision => {
+                // The actor has committed, so the resident handle must mirror it.
+                // A newer unavailable decision still owns prompt admission. If
+                // that decision was a concurrent `take`, rebuild a quarantine
+                // latch for the actor target rather than publishing a usable
+                // model while the recovery snapshot is stale.
+                if entry.unavailable_model.is_none() {
+                    entry.unavailable_model_revision =
+                        entry.unavailable_model_revision.saturating_add(1);
+                    entry.unavailable_model = Some(quarantine_model);
+                    entry.unavailable_catalog_identity = Some(quarantine_catalog_identity);
+                    entry.unavailable_agent_name = Some(committed_agent_name);
+                }
+                ModelSwitchCommitOutcome::CommittedQuarantined
+            }
+            UnavailableModelCommitPolicy::ClearIfRevision(_)
+            | UnavailableModelCommitPolicy::RecoverIfRevision { .. } => {
+                entry.unavailable_model_revision =
+                    entry.unavailable_model_revision.saturating_add(1);
+                entry.unavailable_catalog_identity = None;
+                entry.unavailable_agent_name = None;
+                ModelSwitchCommitOutcome::Committed {
+                    cleared_unavailable_model: entry.unavailable_model.take(),
+                }
+            }
         }
     }
     /// Place a handle on the current presence without changing live kind.

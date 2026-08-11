@@ -85,6 +85,14 @@ fn emit_failure_telemetry(event: xai_grok_telemetry::events::ModelSwitched) {
     xai_grok_telemetry::session_ctx::log_event(event);
 }
 
+fn emit_success_telemetry(event: xai_grok_telemetry::events::ModelSwitched) {
+    #[cfg(test)]
+    if let Ok(value) = serde_json::to_value(&event) {
+        CAPTURED_SUCCESS_TELEMETRY.lock().unwrap().push(value);
+    }
+    xai_grok_telemetry::session_ctx::log_event(event);
+}
+
 fn resolve_model_switch_auto_compact_threshold_percent(
     cfg: &config::Config,
     catalog_model_id: &acp::ModelId,
@@ -99,6 +107,10 @@ fn resolve_model_switch_auto_compact_threshold_percent(
 
 #[cfg(test)]
 static CAPTURED_FAILURE_TELEMETRY: std::sync::LazyLock<std::sync::Mutex<Vec<serde_json::Value>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+#[cfg(test)]
+static CAPTURED_SUCCESS_TELEMETRY: std::sync::LazyLock<std::sync::Mutex<Vec<serde_json::Value>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
 #[cfg(test)]
@@ -135,6 +147,21 @@ fn run_dispatch_boundary_hook(session_id: &acp::SessionId) {
 #[cfg(test)]
 pub(crate) fn take_captured_failure_telemetry(session_id: &str) -> Vec<serde_json::Value> {
     let mut captured = CAPTURED_FAILURE_TELEMETRY.lock().unwrap();
+    let mut matching = Vec::new();
+    captured.retain(|event| {
+        if event.get("session_id").and_then(serde_json::Value::as_str) == Some(session_id) {
+            matching.push(event.clone());
+            false
+        } else {
+            true
+        }
+    });
+    matching
+}
+
+#[cfg(test)]
+pub(crate) fn take_captured_success_telemetry(session_id: &str) -> Vec<serde_json::Value> {
+    let mut captured = CAPTURED_SUCCESS_TELEMETRY.lock().unwrap();
     let mut matching = Vec::new();
     captured.retain(|event| {
         if event.get("session_id").and_then(serde_json::Value::as_str) == Some(session_id) {
@@ -429,6 +456,7 @@ async fn apply_with_load_gate(
         let cfg = agent.cfg.borrow();
         resolve_model_switch_auto_compact_threshold_percent(&cfg, &catalog_model_id, &model)
     };
+    let committed_catalog_identity = catalog_identity.clone();
     let (tx, rx) = oneshot::channel();
     agent
         .models_manager
@@ -474,6 +502,12 @@ async fn apply_with_load_gate(
     let updated_model = receipt.catalog_model_id;
     let unavailable_model_policy = if load_guard.is_some() {
         UnavailableModelCommitPolicy::Preserve
+    } else if recovery_expectation.is_some() {
+        UnavailableModelCommitPolicy::RecoverIfRevision {
+            expected_revision: unavailable_model_revision,
+            quarantine_model: catalog_model_id.clone(),
+            quarantine_catalog_identity: committed_catalog_identity,
+        }
     } else {
         UnavailableModelCommitPolicy::ClearIfRevision(unavailable_model_revision)
     };
@@ -492,14 +526,29 @@ async fn apply_with_load_gate(
             );
         },
     );
-    let (cleared_unavailable_model, unavailable_model_revision_matched) = match commit_outcome {
+    let cleared_unavailable_model = match commit_outcome {
         ModelSwitchCommitOutcome::Committed {
             cleared_unavailable_model,
-            unavailable_model_revision_matched,
-        } => (
-            cleared_unavailable_model,
-            unavailable_model_revision_matched,
-        ),
+        } => cleared_unavailable_model,
+        ModelSwitchCommitOutcome::CommittedPreservingUnavailable => {
+            if load_guard.is_none() {
+                tracing::info!(
+                    session_id = %session_id.0,
+                    model_id = %catalog_model_id.0,
+                    "model switch preserved a newer unavailable-model decision"
+                );
+            }
+            None
+        }
+        ModelSwitchCommitOutcome::CommittedQuarantined => {
+            tracing::info!(
+                session_id = %session_id.0,
+                model_id = %catalog_model_id.0,
+                "prompt recovery actor commit remains quarantined by a newer unavailable-model decision"
+            );
+            failure_telemetry.disarm();
+            return Ok(None);
+        }
         ModelSwitchCommitOutcome::Superseded => {
             if recovery_expectation.is_some() {
                 failure_telemetry.disarm();
@@ -510,15 +559,6 @@ async fn apply_with_load_gate(
                 .data("model_switch: resident session changed before outer commit"));
         }
     };
-    let recovery_superseded_after_actor =
-        recovery_expectation.is_some() && !unavailable_model_revision_matched;
-    if !unavailable_model_revision_matched {
-        tracing::info!(
-            session_id = %session_id.0,
-            model_id = %catalog_model_id.0,
-            "model switch preserved a newer unavailable-model decision"
-        );
-    }
     if let Some(unavailable_model) = cleared_unavailable_model {
         tracing::info!(
             session_id = %session_id.0,
@@ -540,7 +580,7 @@ async fn apply_with_load_gate(
         Some(session_id.0.as_ref()),
         Some(serde_json::json!({"model": catalog_model_id.0.as_ref()})),
     );
-    xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::ModelSwitched {
+    emit_success_telemetry(xai_grok_telemetry::events::ModelSwitched {
         session_id: session_id.0.to_string(),
         previous_model_id: committed_previous_model_id,
         new_model_id: catalog_model_id.0.to_string(),
@@ -556,14 +596,6 @@ async fn apply_with_load_gate(
     }
     agent.sync_process_static_api_key(Some(catalog_model_id.0.as_ref()));
     failure_telemetry.disarm();
-    if recovery_superseded_after_actor {
-        tracing::info!(
-            session_id = %session_id.0,
-            model_id = %catalog_model_id.0,
-            "prompt recovery actor commit preserved a newer unavailable-model decision"
-        );
-        return Ok(None);
-    }
     Ok(Some(
         acp::SetSessionModelResponse::new().meta(
             serde_json::json!({
