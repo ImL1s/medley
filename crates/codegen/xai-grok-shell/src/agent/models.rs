@@ -739,6 +739,36 @@ impl ModelsManager {
             .any(|entry| resolution::is_ready_selectable_openai_codex_entry(entry, is_session_auth))
     }
 
+    /// Whether a campaign may nudge a newly-created session to `model_id`.
+    ///
+    /// Campaign defaults are soft nudges, not user choices. After a first-party
+    /// xAI env key is proven unusable, a later `/new` must not revive an
+    /// ambient Grok route when the same catalog snapshot contains a ready
+    /// official Codex account route. All other campaign targets and usable xAI
+    /// routes retain their existing behavior.
+    pub(crate) fn campaign_default_is_eligible(&self, model_id: &str) -> bool {
+        // Match the config -> catalog order used by the #303 repair paths so a
+        // concurrent config reload cannot mix its auth policy with an older
+        // catalog snapshot.
+        let cfg = self.inner.cfg.read();
+        let usable_xai = self.usable_ambient_xai(&cfg);
+        let is_session_auth = self.is_session_auth();
+        let catalog = self.inner.catalog.read();
+        let models = &catalog.models;
+        let Some(key) = resolve_catalog_key(models, &acp::ModelId::new(model_id)) else {
+            // Preserve the existing unknown-campaign fallback and diagnostics.
+            return true;
+        };
+        let entry = models
+            .get(key.0.as_ref())
+            .expect("resolve_catalog_key returns a present key");
+        usable_xai
+            || !resolution::is_first_party_ambient_xai_entry(entry)
+            || !models.values().any(|candidate| {
+                resolution::is_ready_selectable_openai_codex_entry(candidate, is_session_auth)
+            })
+    }
+
     /// ACP-visible (non-hidden) projection of the catalog.
     pub fn available(&self) -> IndexMap<acp::ModelId, acp::ModelInfo> {
         self.models_and_available().1

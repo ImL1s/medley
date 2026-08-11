@@ -3629,6 +3629,114 @@ fn invalid_env_probe_reseats_only_after_unusable_verdict() {
 
 #[test]
 #[serial_test::serial]
+fn new_session_campaign_rejects_only_stranded_ambient_grok() {
+    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    use xai_grok_test_support::EnvGuard;
+    let _g = EnvGuard::set(XAI_API_KEY_ENV_VAR, "invalid-xai-key");
+    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+    let tmp = tempfile::tempdir().expect("temp home");
+    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
+    let codex_key = crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string();
+    let mut byok = ready_entry("grok-byok");
+    byok.api_key = Some("sk-test".to_string());
+    let mut catalog = IndexMap::new();
+    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
+    catalog.insert("grok-byok".to_string(), byok);
+    catalog.insert(codex_key.clone(), codex);
+
+    let xai_home = tmp.path().join("xai-campaign-gate");
+    std::fs::create_dir_all(&xai_home).unwrap();
+    let manager = ModelsManagerBuilder::new(
+        None,
+        catalog,
+        acp::ModelId::new("grok-4.5"),
+        Arc::new(AuthManager::new(&xai_home, GrokComConfig::default())),
+        config::Config::default(),
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+
+    manager.apply_first_party_env_api_key_probe_result(false);
+    assert!(
+        !manager.campaign_default_is_eligible("grok-4.5"),
+        "a campaign must not revive ambient Grok after its only env key failed"
+    );
+    assert!(
+        manager.campaign_default_is_eligible(&codex_key),
+        "the ready official Codex route remains campaign-eligible"
+    );
+    assert!(
+        manager.campaign_default_is_eligible("grok-byok"),
+        "a provider-owned credential is not ambient xAI and must be preserved"
+    );
+    assert!(
+        manager.campaign_default_is_eligible("missing-campaign-model"),
+        "unknown campaign ids retain the existing resolution fallback"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn new_session_campaign_preserves_usable_xai_and_no_codex_fallback() {
+    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    use xai_grok_test_support::EnvGuard;
+    let _g = EnvGuard::set(XAI_API_KEY_ENV_VAR, "probe-key");
+    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+    let tmp = tempfile::tempdir().expect("temp home");
+    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
+    let mut catalog = IndexMap::new();
+    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
+    catalog.insert(
+        crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string(),
+        codex,
+    );
+    let manager_with =
+        |cfg: config::Config, catalog: IndexMap<String, ModelEntry>, suffix: &str| {
+            let home = tmp.path().join(suffix);
+            std::fs::create_dir_all(&home).unwrap();
+            ModelsManagerBuilder::new(
+                None,
+                catalog,
+                acp::ModelId::new("grok-4.5"),
+                Arc::new(AuthManager::new(&home, GrokComConfig::default())),
+                cfg,
+            )
+            .cache(test_cache_manager(&home))
+            .build()
+        };
+
+    let successful_probe = manager_with(config::Config::default(), catalog.clone(), "probe-ok");
+    successful_probe.apply_first_party_env_api_key_probe_result(true);
+    assert!(successful_probe.campaign_default_is_eligible("grok-4.5"));
+
+    let mut deployment_cfg = config::Config::default();
+    deployment_cfg.endpoints.deployment_key = Some("deployment-key".to_string());
+    let deployment = manager_with(deployment_cfg, catalog.clone(), "deployment");
+    deployment.apply_first_party_env_api_key_probe_result(false);
+    assert!(deployment.campaign_default_is_eligible("grok-4.5"));
+
+    let grok_only = manager_with(
+        config::Config::default(),
+        IndexMap::from([("grok-4.5".to_string(), ready_entry("grok-4.5"))]),
+        "no-codex",
+    );
+    grok_only.apply_first_party_env_api_key_probe_result(false);
+    assert!(
+        grok_only.campaign_default_is_eligible("grok-4.5"),
+        "without a ready official Codex fallback, retain the existing campaign behavior"
+    );
+}
+
+#[test]
+#[serial_test::serial]
 fn invalid_env_probe_does_not_overwrite_user_pick_at_commit_boundary() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()

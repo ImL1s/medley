@@ -336,6 +336,9 @@ impl MvpAgent {
                 build_custom_model_id.is_none()
                     || build_custom_model_id == c.pre_campaign.as_deref()
                     || build_custom_model_id == Some(c.value.as_str())
+            }).filter(|c| {
+                self.models_manager
+                    .campaign_default_is_eligible(&c.value)
             })
         };
         let campaign_nudged = campaign_nudge.is_some();

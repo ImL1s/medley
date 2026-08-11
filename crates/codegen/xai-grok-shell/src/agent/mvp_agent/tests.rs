@@ -8454,8 +8454,9 @@ mod soft_default_settings_emit {
     }
 }
 
-/// #303: production initialize must probe an ambient xAI env key even when a
-/// ready Codex account route exists, then repair the implicit Grok default.
+/// #303 / #320: production initialize must probe an ambient xAI env key even
+/// when a ready Codex account route exists, repair the implicit Grok default,
+/// and keep `/new` on Codex when a later soft campaign nudges back to Grok.
 #[test]
 #[serial_test::serial]
 fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex() {
@@ -8500,6 +8501,7 @@ fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex() {
             .env_remove("GROK_OAUTH2_PRINCIPAL_TYPE")
             .env_remove("GROK_OAUTH2_PRINCIPAL_ID")
             .env_remove("GROK_OAUTH2_REFERRER")
+            .env_remove("GROK_CAMPAIGNS_OVERRIDE")
             .stdin(std::process::Stdio::null());
         xai_tty_utils::detach_std_command(&mut command);
         let output = command.output().expect("spawn invalid-probe child test");
@@ -8674,6 +8676,78 @@ fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex() {
             agent.models_manager.current_model_id().0.as_ref(),
             crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID,
             "invalid ambient xAI key must not leave the implicit cold-start model stranded on Grok when Codex OAuth is ready"
+        );
+
+        let _campaign = EnvGuard::set(
+            "GROK_CAMPAIGNS_OVERRIDE",
+            r#"[{"id":"issue-320-new-session","models":{"default":"grok-4.5"}}]"#,
+        );
+        let session_cwd = tempfile::tempdir().expect("new-session cwd");
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            <MvpAgent as acp::Agent>::new_session(
+                &agent,
+                acp::NewSessionRequest::new(session_cwd.path().to_path_buf()),
+            ),
+        )
+        .await
+        .expect("production /new must not hang")
+        .expect("production /new must succeed on the repaired Codex route");
+        let advertised = response.models.expect("/new must advertise its model state");
+        assert_eq!(
+            advertised.current_model_id.0.as_ref(),
+            crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID,
+            "an active Grok campaign must not revive the proven-invalid ambient xAI route"
+        );
+        let handle = agent
+            .resident_handle(&response.session_id)
+            .expect("new session must remain resident");
+        assert_eq!(
+            handle.model_id.0.as_ref(),
+            crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID,
+            "the persisted/session sampling identity must match the advertised Codex model"
+        );
+        let sampling = handle
+            .chat_state_handle
+            .get_sampling_config()
+            .await
+            .expect("resident session must expose its live sampling config");
+        assert_eq!(
+            sampling.model,
+            crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID,
+            "the live sampler must stay pinned to Codex under the rejected Grok campaign"
+        );
+
+        let inner_cwd = tempfile::tempdir().expect("new-session-inner cwd");
+        let inner_response = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            agent.new_session_inner(acp::NewSessionRequest::new(
+                inner_cwd.path().to_path_buf(),
+            )),
+        )
+        .await
+        .expect("new_session_inner must not hang")
+        .expect("new_session_inner must preserve the repaired Codex route");
+        let inner_advertised = inner_response
+            .models
+            .expect("new_session_inner must advertise its model state");
+        assert_eq!(
+            inner_advertised.current_model_id.0.as_ref(),
+            crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID,
+            "the dormant session-setup path must match active ACP campaign gating"
+        );
+        let inner_handle = agent
+            .resident_handle(&inner_response.session_id)
+            .expect("inner-created session must remain resident");
+        assert_eq!(
+            inner_handle
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("inner-created session sampling config")
+                .model,
+            crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID,
+            "the dormant path's live sampler must also stay on Codex"
         );
     });
     println!("{CHILD_PASS}");
