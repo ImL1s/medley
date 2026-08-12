@@ -359,7 +359,7 @@ impl SettingsModalState {
         let highlighted_dynamic_choice = match &self.state.mode {
             SettingsMode::PickingEnum {
                 key, choices_idx, ..
-            } => self.registry.find(*key).and_then(|meta| {
+            } => self.registry.find(key).and_then(|meta| {
                 let SettingKind::DynamicEnum { source, .. } = &meta.kind else {
                     return None;
                 };

@@ -57,7 +57,7 @@ impl FetchedSession {
 
 #[derive(Debug)]
 pub(crate) enum FetchResult {
-    Fetched(FetchedSession),
+    Fetched(Box<FetchedSession>),
     NotFound,
 }
 
@@ -84,9 +84,9 @@ pub(crate) async fn fetch_session(
         Err(BackendError::SessionNotFound { .. }) => return Ok(FetchResult::NotFound),
         Err(error) => return Err(error.into()),
     };
-    Ok(FetchResult::Fetched(FetchedSession::validate(
+    Ok(FetchResult::Fetched(Box::new(FetchedSession::validate(
         session_id, loaded,
-    )?))
+    )?)))
 }
 
 pub(crate) mod hydrate {

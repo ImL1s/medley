@@ -232,13 +232,11 @@ pub(crate) async fn fetch_lanes(
         .map(str::trim)
         .filter(|q| uuid::Uuid::try_parse(q).is_ok())
         && !local.iter().any(|s| s.info.id.0.as_ref() == id)
-    {
-        if let Ok(Some(session)) =
+        && let Ok(Some(session)) =
             crate::session::persistence::acquire_published_session_read(id, None).await
-            && let Ok(summary) = session.read_summary()
-        {
-            local.push(summary);
-        }
+        && let Ok(summary) = session.read_summary()
+    {
+        local.push(summary);
     }
     SessionLanes {
         local,

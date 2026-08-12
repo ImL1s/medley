@@ -991,11 +991,10 @@ mod tests {
             "an unrecordable root reports was_trusted=false"
         );
         assert!(
-            DECISIONS
+            !DECISIONS
                 .lock()
                 .decisions
-                .get(&workspace_key(home.path()))
-                .is_none(),
+                .contains_key(&workspace_key(home.path())),
             "revoke must record no cache deny for an unrecordable root"
         );
         assert!(
@@ -1778,11 +1777,10 @@ mod tests {
         // Empty repo: nothing to gate => allowed, but left UNRECORDED (provisional).
         assert!(resolve_and_record(tmp.path(), None, false));
         assert!(
-            DECISIONS
+            !DECISIONS
                 .lock()
                 .decisions
-                .get(&workspace_key(tmp.path()))
-                .is_none(),
+                .contains_key(&workspace_key(tmp.path())),
             "provisional no-configs allow must not be cached as a durable grant"
         );
 
@@ -1820,11 +1818,10 @@ mod tests {
         let empty = repo_tmp();
         let lt = resolve_launch_dir_trust(empty.path(), None);
         assert!(
-            DECISIONS
+            !DECISIONS
                 .lock()
                 .decisions
-                .get(&workspace_key(empty.path()))
-                .is_none(),
+                .contains_key(&workspace_key(empty.path())),
             "provisional no-configs allow must not be cached by resolve_launch_dir_trust"
         );
         assert_eq!(lt, resolve_and_record(empty.path(), None, false));

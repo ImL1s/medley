@@ -92,13 +92,13 @@ impl SlashCommand for ModelCommand {
         // (not persisted as default). Resolve via the shared gate so a rejected
         // level (e.g. `none` on grok-4.5) surfaces the effort error with the
         // model's offered ids — not "Unknown model: … none".
-        if let Some((prefix, _token)) = split_trailing_token(trimmed) {
-            if matches!(
+        if let Some((prefix, _token)) = split_trailing_token(trimmed)
+            && matches!(
                 ctx.models.resolve_unique_by_name_or_id(prefix),
                 ModelNameResolution::Ambiguous
-            ) {
-                return ambiguous_model_error(prefix);
-            }
+            )
+        {
+            return ambiguous_model_error(prefix);
         }
         if let Some((prefix, token)) = split_trailing_token(trimmed)
             && let Some(id) = resolve_model(ctx.models, prefix)

@@ -3537,7 +3537,7 @@ pub(crate) struct SessionIdLock {
 
 impl SessionIdLock {
     fn transition_exclusive_to_lifetime_shared(&mut self) -> io::Result<()> {
-        self.transition_exclusive_to_lifetime_shared_with(|mutation| FileExt::lock_shared(mutation))
+        self.transition_exclusive_to_lifetime_shared_with(FileExt::lock_shared)
     }
 
     fn transition_exclusive_to_lifetime_shared_with(
@@ -4219,7 +4219,7 @@ pub(crate) async fn acquire_published_session_write_in_root(
 
 enum CanonicalSessionClaim {
     Existing(PublishedSessionRead),
-    Vacant(PublishedSessionWrite),
+    Vacant(Box<PublishedSessionWrite>),
 }
 
 fn acquire_canonical_session_claim_sync(
@@ -4249,16 +4249,18 @@ fn acquire_canonical_session_claim_sync(
     }
 
     FileExt::lock_exclusive(&mutation)?;
-    Ok(CanonicalSessionClaim::Vacant(PublishedSessionWrite {
-        session_id_lock: Some(SessionIdLock {
-            namespace: Some(namespace),
-            mutation: Some(mutation),
-        }),
-        sessions_root: sessions_root.to_path_buf(),
-        session_id: session_id.to_owned(),
-        published_dir: None,
-        stage: None,
-    }))
+    Ok(CanonicalSessionClaim::Vacant(Box::new(
+        PublishedSessionWrite {
+            session_id_lock: Some(SessionIdLock {
+                namespace: Some(namespace),
+                mutation: Some(mutation),
+            }),
+            sessions_root: sessions_root.to_path_buf(),
+            session_id: session_id.to_owned(),
+            published_dir: None,
+            stage: None,
+        },
+    )))
 }
 
 async fn acquire_canonical_session_claim(
@@ -7502,10 +7504,9 @@ mod fresh_session_claim_tests {
         .expect("fresh claim");
 
         let result = claim.into_published_lease_with(|lease| {
-            lease.transition_exclusive_to_lifetime_shared_with_unlock(
-                |mutation| FileExt::lock_shared(mutation),
-                |_| Err(io::Error::other("injected namespace-unlock failure")),
-            )
+            lease.transition_exclusive_to_lifetime_shared_with_unlock(FileExt::lock_shared, |_| {
+                Err(io::Error::other("injected namespace-unlock failure"))
+            })
         });
         let failure = result.unwrap_err();
         assert_eq!(failure.error.kind(), io::ErrorKind::Other);

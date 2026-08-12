@@ -381,7 +381,7 @@ impl CopyPublication {
                         ))
                     })?;
                     crate::session::persistence::write_staged_cwd_metadata_if_needed(
-                        &container,
+                        container,
                         &self.target_parent_name,
                         &self.target_cwd,
                     )
@@ -458,12 +458,10 @@ impl CopyPublication {
         self.cleanup_armed = false;
         self.verify_canonical_publication(&published_parent_anchor, &published_anchor)
             .map_err(CopyPublicationFinalizeError::CommittedUnreachable)?;
-        if !whole_parent_published {
-            if let Some(container) = self.stage_container_anchor.take() {
-                container
-                    .remove_tree_self()
-                    .map_err(CopyPublicationFinalizeError::CommittedDurability)?;
-            }
+        if !whole_parent_published && let Some(container) = self.stage_container_anchor.take() {
+            container
+                .remove_tree_self()
+                .map_err(CopyPublicationFinalizeError::CommittedDurability)?;
         }
         self.staging_anchor
             .sync()
@@ -539,14 +537,14 @@ impl Drop for CopyPublication {
         // entire retained tree rather than assuming it becomes empty after the
         // session child is removed.
         drop(self.stage_dir_anchor.take());
-        if let Some(container) = self.stage_container_anchor.take() {
-            if let Err(error) = container.remove_tree_self() {
-                tracing::warn!(
-                    stage = %self.stage_name,
-                    %error,
-                    "failed to reclaim private fork stage through retained handles"
-                );
-            }
+        if let Some(container) = self.stage_container_anchor.take()
+            && let Err(error) = container.remove_tree_self()
+        {
+            tracing::warn!(
+                stage = %self.stage_name,
+                %error,
+                "failed to reclaim private fork stage through retained handles"
+            );
         }
     }
 }
