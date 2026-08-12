@@ -1084,9 +1084,11 @@ mod tests {
                         .await
                         .expect("aborting publication must resolve the queued acknowledgement")
                         .expect_err("aborted bridge must fail the queued acknowledgement");
+                // Dispatch succeeded before abort; dropping the queued envelope
+                // closes its receipt without a consumer acknowledgement.
                 assert_eq!(
                     error,
-                    xai_grok_tools::notification::NotificationAcknowledgementError::DispatchClosed(
+                    xai_grok_tools::notification::NotificationAcknowledgementError::AcknowledgementDropped(
                         1
                     )
                 );
