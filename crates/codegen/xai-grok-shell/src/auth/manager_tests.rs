@@ -27,6 +27,96 @@ fn test_manager(grok_home: &Path, config: GrokComConfig) -> AuthManager {
     AuthManager::new_for_test_path(&grok_home.join("auth.json"), config)
 }
 
+#[test]
+fn exact_test_path_ignores_ambient_auth_carriers_without_changing_production_precedence() {
+    const CHILD_MARKER: &str = "GROK_TEST_EXACT_AUTH_PATH_CHILD";
+    const EXACT_PATH_ENV: &str = "GROK_TEST_EXACT_AUTH_PATH";
+    const AMBIENT_PATH_ENV: &str = "GROK_TEST_AMBIENT_AUTH_PATH";
+
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        let exact_path = PathBuf::from(
+            std::env::var_os(EXACT_PATH_ENV).expect("child exact auth path must be present"),
+        );
+        let ambient_path = PathBuf::from(
+            std::env::var_os(AMBIENT_PATH_ENV).expect("child ambient auth path must be present"),
+        );
+
+        let exact = AuthManager::new_for_test_path(&exact_path, GrokComConfig::default());
+        assert!(
+            exact.auth_json_path() == exact_path,
+            "the test-only constructor must retain its explicit path"
+        );
+        assert!(
+            exact
+                .current()
+                .is_some_and(|auth| auth.key == "fixture-token"),
+            "the test-only constructor must ignore ambient credentials"
+        );
+
+        let production = AuthManager::new(
+            exact_path.parent().expect("exact auth path has a parent"),
+            GrokComConfig::default(),
+        );
+        assert!(
+            production.auth_json_path() == ambient_path,
+            "the production constructor must retain ambient path precedence"
+        );
+        assert!(
+            production
+                .current()
+                .is_some_and(|auth| auth.key == "ambient-token"),
+            "the production constructor must retain inline credential precedence"
+        );
+        return;
+    }
+
+    let exact_dir = tempfile::tempdir().unwrap();
+    let exact_path = exact_dir.path().join("auth.json");
+    let scope = GrokComConfig::default().auth_scope();
+    let mut store = AuthStore::new();
+    store.insert(
+        scope,
+        GrokAuth {
+            key: "fixture-token".into(),
+            expires_at: Some(Utc::now() + Duration::hours(1)),
+            ..GrokAuth::test_default()
+        },
+    );
+    write_auth_json(&exact_path, &store).unwrap();
+
+    let ambient_dir = tempfile::tempdir().unwrap();
+    let ambient_path = ambient_dir.path().join("ambient-auth.json");
+    let inline = serde_json::to_string(&GrokAuth {
+        key: "ambient-token".into(),
+        expires_at: Some(Utc::now() + Duration::hours(1)),
+        ..GrokAuth::test_default()
+    })
+    .unwrap();
+
+    let mut command =
+        std::process::Command::new(std::env::current_exe().expect("current test binary"));
+    command
+        .args([
+            "--exact",
+            "auth::manager::tests::exact_test_path_ignores_ambient_auth_carriers_without_changing_production_precedence",
+            "--nocapture",
+        ])
+        .env(CHILD_MARKER, "1")
+        .env(EXACT_PATH_ENV, &exact_path)
+        .env(AMBIENT_PATH_ENV, &ambient_path)
+        .env("GROK_AUTH_PATH", &ambient_path)
+        .env("GROK_AUTH", inline)
+        .stdin(std::process::Stdio::null());
+    xai_tty_utils::detach_std_command(&mut command);
+    let output = command
+        .output()
+        .expect("spawn hostile credential subprocess");
+    assert!(
+        output.status.success(),
+        "hostile credential subprocess failed"
+    );
+}
+
 #[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
