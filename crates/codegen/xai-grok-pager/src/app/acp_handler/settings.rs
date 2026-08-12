@@ -14,9 +14,9 @@ pub(super) fn handle_models_update(notif: &acp::ExtNotification, app: &mut AppVi
         let shell_fallback_current = new_models.current.clone();
 
         for agent in app.agents.values_mut() {
-            // Log when an update drops the agent's active model — this is the
-            // moment the status bar visibly "switches model mid-conversation"
-            // (the agent falls back to the shell's current model below).
+            // A machine-wide catalog update is not proof that this resident
+            // session actor switched. Preserve a display-only placeholder
+            // until a per-session ModelChanged/ModelAutoSwitched says it did.
             if let Some(ref current) = agent.session.models.current
                 && !new_models.available.contains_key(current)
                 && !agent
@@ -30,13 +30,13 @@ pub(super) fn handle_models_update(notif: &acp::ExtNotification, app: &mut AppVi
                     current_model = %current.0,
                     fallback = ?shell_fallback_current.as_ref().map(|m| m.0.as_ref()),
                     available_count = new_models.available.len(),
-                    "models update removed this agent's current model; falling back"
+                    "models update removed this agent's current model; preserving resident display"
                 );
             }
-            agent
-                .session
-                .models
-                .update_catalog(new_models.available.clone(), shell_fallback_current.clone());
+            agent.session.models.update_catalog_preserving_resident(
+                new_models.available.clone(),
+                shell_fallback_current.clone(),
+            );
         }
 
         // Override the app-level default with the active agent's effective
@@ -57,6 +57,10 @@ pub(super) fn handle_models_update(notif: &acp::ExtNotification, app: &mut AppVi
             app_models.reasoning_effort = agent.session.models.reasoning_effort;
         }
         app.models = app_models;
+        // Settings rows snapshot each agent's catalog when the modal opens.
+        // A live catalog update must rebuild those snapshots immediately so a
+        // removed model cannot remain selectable from a stale modal row.
+        crate::app::dispatch::refresh_open_settings_modals(app);
         true
     } else {
         tracing::warn!("Failed to parse x.ai/models/update");

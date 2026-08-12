@@ -474,11 +474,14 @@ impl AgentView {
             workflow_runs: std::mem::take(&mut self.workflow_runs),
             workflow_run_revisions: std::mem::take(&mut self.workflow_run_revisions),
             cleared_workflow_runs: std::mem::take(&mut self.cleared_workflow_runs),
+            subagent_sessions: self.subagent_sessions.clone(),
             last_seen_event_id: self.last_seen_event_id.clone(),
             last_applied_event_seq: self.last_applied_event_seq,
             last_applied_xai_event_seq: self.last_applied_xai_event_seq,
             saw_replay: false,
             saw_todo_update: false,
+            replayed_subagent_spawns: HashSet::new(),
+            live_subagents_seen: HashSet::new(),
         });
         self.loading_placeholder_id = Some(self.scrollback.push_block(
             crate::scrollback::block::RenderBlock::system("Reloading session after reconnect..."),
@@ -498,6 +501,31 @@ impl AgentView {
     pub(crate) fn mark_reload_todo_update(&mut self) {
         if let Some(reload) = self.session_reload.as_mut() {
             reload.saw_todo_update = true;
+        }
+    }
+    /// Record a child spawn reconstructed from durable replay.
+    pub(crate) fn mark_reload_subagent_spawn_replayed(&mut self, child_session_id: &str) {
+        if let Some(reload) = self.session_reload.as_mut() {
+            reload
+                .replayed_subagent_spawns
+                .insert(child_session_id.to_string());
+        }
+    }
+    /// Record authoritative live child activity during reconnect. A later
+    /// live notification also revives a row retired by an earlier reload.
+    pub(crate) fn mark_subagent_live(&mut self, child_session_id: &str) {
+        if let Some(reload) = self.session_reload.as_mut() {
+            reload
+                .live_subagents_seen
+                .insert(child_session_id.to_string());
+        }
+        if let Some(info) = self.subagent_sessions.get_mut(child_session_id)
+            && info.status.as_deref() == Some("unknown_after_reconnect")
+        {
+            info.finished = false;
+            info.status = None;
+            info.error = None;
+            info.last_progress_at = Instant::now();
         }
     }
     /// Start a locally-tracked turn: enter TurnRunning with the turn-scoped
@@ -688,6 +716,11 @@ impl AgentView {
         if let Some(pid) = self.loading_placeholder_id.take() {
             self.scrollback.remove_entry(pid);
         }
+        let unresolved_replay_subagents: Vec<String> = reload
+            .replayed_subagent_spawns
+            .difference(&reload.live_subagents_seen)
+            .cloned()
+            .collect();
         let dropped_heavy;
         if success && reload.saw_replay {
             self.scrollback.end_batch();
@@ -728,6 +761,16 @@ impl AgentView {
             }
             dropped_heavy = false;
         } else {
+            let live_subagents: HashMap<_, _> = reload
+                .live_subagents_seen
+                .iter()
+                .filter_map(|id| {
+                    self.subagent_sessions
+                        .get(id)
+                        .cloned()
+                        .map(|info| (id.clone(), info))
+                })
+                .collect();
             let floor = self.scrollback.id_floor();
             let staging_generations = self.scrollback.invalidation_generations();
             self.scrollback = reload.scrollback;
@@ -740,6 +783,8 @@ impl AgentView {
             self.workflow_runs = reload.workflow_runs;
             self.workflow_run_revisions = reload.workflow_run_revisions;
             self.cleared_workflow_runs = reload.cleared_workflow_runs;
+            self.subagent_sessions = reload.subagent_sessions;
+            self.subagent_sessions.extend(live_subagents);
             self.last_seen_event_id = reload.last_seen_event_id;
             self.last_applied_event_seq = reload.last_applied_event_seq;
             self.last_applied_xai_event_seq = reload.last_applied_xai_event_seq;
@@ -757,6 +802,28 @@ impl AgentView {
         self.activity_started_at = None;
         self.last_activity = None;
         self.reset_follow_ups_for_reload();
+        for child_session_id in unresolved_replay_subagents.into_iter().filter(|_| success) {
+            let Some(info) = self.subagent_sessions.get_mut(&child_session_id) else {
+                continue;
+            };
+            if info.finished {
+                continue;
+            }
+            info.finished = true;
+            info.status = Some(std::sync::Arc::from("unknown_after_reconnect"));
+            info.error = None;
+            info.activity_label = None;
+            info.pending_kill = false;
+            info.kill_requested_at = None;
+            info.last_progress_at = Instant::now();
+            if let Some(entry_id) = info.scrollback_entry_id {
+                self.scrollback.finish_running(entry_id);
+            }
+            if let Some(child_view) = self.subagent_views.get_mut(&child_session_id) {
+                child_view.session.finish_turn(&mut child_view.scrollback);
+                child_view.mark_turn_finished();
+            }
+        }
         dropped_heavy
     }
     /// Effective turn elapsed time, excluding time spent in question views

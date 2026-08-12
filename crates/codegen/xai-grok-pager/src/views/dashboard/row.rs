@@ -437,6 +437,7 @@ pub fn classify_subagent(info: &SubagentInfo) -> RowState {
     if info.finished {
         match info.status.as_deref() {
             Some("failed") | Some("cancelled") | Some("error") => RowState::Failed,
+            Some("unknown_after_reconnect") => RowState::Inactive,
             _ => RowState::Completed,
         }
     } else {
@@ -818,6 +819,9 @@ fn top_level_activity(agent: &AgentView, state: RowState) -> Option<String> {
     }
 }
 fn subagent_activity(info: &SubagentInfo, state: RowState) -> Option<String> {
+    if state == RowState::Inactive && info.status.as_deref() == Some("unknown_after_reconnect") {
+        return Some("Status unknown after reconnect".to_string());
+    }
     if state == RowState::Working {
         if let Some(label) = info
             .activity_label

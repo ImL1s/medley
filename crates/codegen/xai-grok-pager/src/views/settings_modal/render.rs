@@ -553,7 +553,7 @@ pub(super) fn render_rows(
     let mut values: Vec<Option<SettingValue>> = Vec::with_capacity(visible_filtered.len());
     for &row_idx in &visible_filtered {
         let v = match state.rows.get(row_idx) {
-            Some(RowEntry::Setting { key, .. }) => state.value_for(key),
+            Some(RowEntry::Setting { key, .. }) => state.display_value_for(key),
             _ => None,
         };
         values.push(v);
@@ -985,6 +985,7 @@ pub(super) fn render_picking_enum(
                     canonical: c.canonical.to_string(),
                     display: c.display.to_string(),
                     description: c.description.to_string(),
+                    disabled_reason: None,
                 })
                 .collect()
         }

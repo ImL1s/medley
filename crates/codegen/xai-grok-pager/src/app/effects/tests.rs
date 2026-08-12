@@ -768,16 +768,23 @@ fn parse_session_web_search_disabled_absent_key_is_none() {
     assert!(parse_session_web_search_disabled(Some(&meta)).is_none());
     assert!(parse_session_web_search_disabled(None).is_none());
 }
-/// Present-but-malformed collapses to None (with a warn), not a panic — and
-/// must not be mistaken for a successful disable notice.
+/// Present-but-malformed fails closed with a generic actionable notice. This
+/// is deliberately distinct from an absent key, which means available.
 #[test]
-fn parse_session_web_search_disabled_malformed_is_none() {
+fn parse_session_web_search_disabled_malformed_fails_closed() {
     let mut meta = acp::Meta::new();
     meta.insert(
         xai_grok_shell::session::WEB_SEARCH_DISABLED_META_KEY.into(),
         serde_json::json!("not-an-object"),
     );
-    assert!(parse_session_web_search_disabled(Some(&meta)).is_none());
+    let notice = parse_session_web_search_disabled(Some(&meta))
+        .expect("present malformed metadata must not mean available");
+    assert_eq!(notice.model_id, "unknown");
+    assert_eq!(notice.reason, "invalid availability metadata");
+    assert_eq!(
+        notice.message,
+        "web_search availability could not be verified because the session returned invalid metadata. Restart the session or check the provider and model configuration."
+    );
 }
 /// Unknown keys return a descriptive error.
 #[tokio::test]
