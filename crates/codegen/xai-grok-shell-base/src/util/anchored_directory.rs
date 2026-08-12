@@ -1,0 +1,1621 @@
+//! Directory operations anchored to a retained operating-system handle.
+//!
+//! Once opened, an [`AnchoredDirectory`] never resolves children through the
+//! original pathname again. This prevents a concurrently renamed or replaced
+//! parent pathname from redirecting a mutation into another tree.
+
+use std::ffi::{OsStr, OsString};
+use std::fs::File;
+use std::io;
+use std::path::{Component, Path};
+
+/// A real directory retained by file descriptor/handle.
+#[derive(Debug)]
+pub struct AnchoredDirectory {
+    file: File,
+    parent: Option<File>,
+    name: Option<OsString>,
+}
+
+/// A failed retained rename together with the still-live source anchor.
+#[derive(Debug)]
+pub struct AnchoredRenameError {
+    pub error: io::Error,
+    pub source: AnchoredDirectory,
+}
+
+impl AnchoredDirectory {
+    /// Open and retain `path`, rejecting symlinks and Windows reparse points.
+    pub fn open_root(path: &Path) -> io::Result<Self> {
+        platform::open_root(path).map(|file| Self {
+            file,
+            parent: None,
+            name: None,
+        })
+    }
+
+    /// Open a real direct child directory without following its final link.
+    pub fn open_child_dir(&self, name: &OsStr) -> io::Result<Self> {
+        validate_child_name(name)?;
+        let parent = self.file.try_clone()?;
+        platform::open_child_dir(&self.file, name).map(|file| Self {
+            file,
+            parent: Some(parent),
+            name: Some(name.to_owned()),
+        })
+    }
+
+    /// Create a direct child directory with owner-only permissions and retain it.
+    ///
+    /// This is exclusive: an existing child is reported as `AlreadyExists`.
+    pub fn create_child_dir(&self, name: &OsStr) -> io::Result<Self> {
+        validate_child_name(name)?;
+        let parent = self.file.try_clone()?;
+        platform::create_child_dir(&self.file, name).map(|file| Self {
+            file,
+            parent: Some(parent),
+            name: Some(name.to_owned()),
+        })
+    }
+
+    /// Exclusively create an owner-only direct child regular file.
+    pub fn create_child_file_new(&self, name: &OsStr) -> io::Result<File> {
+        validate_child_name(name)?;
+        platform::create_child_file_new(&self.file, name)
+    }
+
+    /// Open an existing direct child regular file without following links.
+    pub fn open_child_file(&self, name: &OsStr) -> io::Result<File> {
+        validate_child_name(name)?;
+        platform::open_child_file(&self.file, name)
+    }
+
+    /// Remove a named empty direct child directory without following links.
+    pub fn remove_empty_child_dir(&self, name: &OsStr) -> io::Result<()> {
+        validate_child_name(name)?;
+        platform::remove_empty_child_dir(&self.file, name)
+    }
+
+    /// Remove a named direct child marker file without following links.
+    pub fn remove_marker(&self, name: &OsStr) -> io::Result<()> {
+        validate_child_name(name)?;
+        platform::remove_marker(&self.file, name)
+    }
+
+    /// Flush directory metadata to stable storage where the platform supports it.
+    pub fn sync(&self) -> io::Result<()> {
+        self.file.sync_all()
+    }
+
+    /// Verify that the retained directory belongs to the current user and
+    /// tighten its permissions to owner-only using this same handle.
+    pub fn ensure_owner_only(&self) -> io::Result<()> {
+        platform::ensure_owner_only(&self.file)
+    }
+
+    /// Return whether this retained directory is already private to its owner.
+    pub fn is_owner_only(&self) -> io::Result<bool> {
+        platform::is_owner_only(&self.file)
+    }
+
+    /// Compare the stable filesystem identity of two retained directories.
+    pub fn same_identity(&self, other: &Self) -> io::Result<bool> {
+        platform::same_identity(&self.file, &other.file)
+    }
+
+    /// Remove this retained child directory through its original anchored parent.
+    ///
+    /// Root anchors cannot remove themselves. Unix verifies that the source name
+    /// still resolves to this retained directory before unlinking. Windows marks
+    /// this retained handle for deletion directly.
+    pub fn remove_self(self) -> io::Result<()> {
+        let parent = self.parent.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "root anchor has no parent")
+        })?;
+        let name = self.name.as_deref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "root anchor has no child name")
+        })?;
+        platform::remove_retained_child_dir(parent, name, &self.file)
+    }
+
+    /// Recursively remove this retained child directory without resolving any
+    /// descendant through a pathname.
+    ///
+    /// Real descendant directories are opened without following their final
+    /// link. Symlinks and Windows reparse points are removed as leaf entries and
+    /// are never traversed. Root anchors cannot remove themselves.
+    pub fn remove_tree_self(self) -> io::Result<()> {
+        platform::remove_tree_contents(&self.file)?;
+        self.remove_self()
+    }
+
+    /// List direct child names through the retained directory handle.
+    pub fn child_names(&self) -> io::Result<Vec<OsString>> {
+        platform::child_names(&self.file)
+    }
+
+    /// Rename this retained child directory without replacement.
+    ///
+    /// This consumes and returns the source anchor with its lineage updated to
+    /// the target parent/name. The retained child handle itself is unchanged, so
+    /// callers can compare it with a newly opened public pathname after commit.
+    /// On Windows the already-open child handle is renamed directly, avoiding an
+    /// incompatible second open with `DELETE`.
+    pub fn try_rename_self_no_replace(
+        mut self,
+        target_parent: &Self,
+        target_name: &OsStr,
+    ) -> Result<Self, AnchoredRenameError> {
+        if let Err(error) = validate_child_name(target_name) {
+            return Err(AnchoredRenameError {
+                error,
+                source: self,
+            });
+        }
+        let new_parent = match target_parent.file.try_clone() {
+            Ok(parent) => parent,
+            Err(error) => {
+                return Err(AnchoredRenameError {
+                    error,
+                    source: self,
+                });
+            }
+        };
+        let new_name = target_name.to_owned();
+        let Some(source_parent) = self.parent.as_ref() else {
+            return Err(AnchoredRenameError {
+                error: io::Error::new(io::ErrorKind::InvalidInput, "root anchor has no parent"),
+                source: self,
+            });
+        };
+        let Some(source_name) = self.name.as_deref() else {
+            return Err(AnchoredRenameError {
+                error: io::Error::new(io::ErrorKind::InvalidInput, "root anchor has no child name"),
+                source: self,
+            });
+        };
+        if let Err(error) = platform::rename_retained_child_dir_no_replace(
+            source_parent,
+            source_name,
+            &self.file,
+            &target_parent.file,
+            target_name,
+        ) {
+            return Err(AnchoredRenameError {
+                error,
+                source: self,
+            });
+        }
+        self.parent = Some(new_parent);
+        self.name = Some(new_name);
+        Ok(self)
+    }
+
+    /// Rename this retained child directory without replacement.
+    ///
+    /// Prefer [`Self::try_rename_self_no_replace`] when the source must survive
+    /// a collision. This compatibility form drops the source on error.
+    pub fn rename_self_no_replace(
+        self,
+        target_parent: &Self,
+        target_name: &OsStr,
+    ) -> io::Result<Self> {
+        self.try_rename_self_no_replace(target_parent, target_name)
+            .map_err(|failure| failure.error)
+    }
+
+    /// Rename a child directory between retained parents without replacement.
+    pub fn rename_child_dir_no_replace(
+        &self,
+        source_name: &OsStr,
+        target_parent: &Self,
+        target_name: &OsStr,
+    ) -> io::Result<()> {
+        validate_child_name(source_name)?;
+        validate_child_name(target_name)?;
+        platform::rename_child_dir_no_replace(
+            &self.file,
+            source_name,
+            &target_parent.file,
+            target_name,
+        )
+    }
+}
+
+fn validate_child_name(name: &OsStr) -> io::Result<()> {
+    let path = Path::new(name);
+    let mut components = path.components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(component)), None) if !component.is_empty() => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "anchored child name must be exactly one normal path component",
+        )),
+    }
+}
+
+#[cfg(unix)]
+mod platform {
+    use super::*;
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    fn c_name(name: &OsStr) -> io::Result<CString> {
+        CString::new(name.as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "child name contains a NUL byte",
+            )
+        })
+    }
+
+    fn open_directory_at(parent: RawFd, name: &OsStr) -> io::Result<File> {
+        let name = c_name(name)?;
+        let fd = unsafe {
+            libc::openat(
+                parent,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(unsafe { File::from_raw_fd(fd) })
+        }
+    }
+
+    fn open_regular_file_at(
+        parent: RawFd,
+        name: &OsStr,
+        flags: i32,
+        mode: u32,
+    ) -> io::Result<File> {
+        let name = c_name(name)?;
+        let fd = unsafe {
+            libc::openat(
+                parent,
+                name.as_ptr(),
+                flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                mode,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "anchored child is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+
+    pub(super) fn open_root(path: &Path) -> io::Result<File> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        if !file.metadata()?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "anchored root is not a directory",
+            ));
+        }
+        Ok(file)
+    }
+
+    pub(super) fn open_child_dir(parent: &File, name: &OsStr) -> io::Result<File> {
+        open_directory_at(parent.as_raw_fd(), name)
+    }
+
+    pub(super) fn open_child_file(parent: &File, name: &OsStr) -> io::Result<File> {
+        open_regular_file_at(parent.as_raw_fd(), name, libc::O_RDONLY, 0)
+    }
+
+    pub(super) fn create_child_file_new(parent: &File, name: &OsStr) -> io::Result<File> {
+        let file = open_regular_file_at(
+            parent.as_raw_fd(),
+            name,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        )?;
+        let metadata = file.metadata()?;
+        if std::os::unix::fs::MetadataExt::uid(&metadata) != unsafe { libc::geteuid() } {
+            drop(file);
+            let _ = unlink(parent, name, 0);
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "created file is not owned by the current user",
+            ));
+        }
+        let result = unsafe { libc::fchmod(file.as_raw_fd(), 0o600) };
+        if result != 0 {
+            let error = io::Error::last_os_error();
+            drop(file);
+            let _ = unlink(parent, name, 0);
+            return Err(error);
+        }
+        Ok(file)
+    }
+
+    pub(super) fn create_child_dir(parent: &File, name: &OsStr) -> io::Result<File> {
+        let name = c_name(name)?;
+        let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let file = match open_directory_at(parent.as_raw_fd(), OsStr::from_bytes(name.as_bytes())) {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = unsafe {
+                    libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR)
+                };
+                return Err(error);
+            }
+        };
+        let secure_result = (|| {
+            let metadata = file.metadata()?;
+            if std::os::unix::fs::MetadataExt::uid(&metadata) != unsafe { libc::geteuid() } {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "created directory is not owned by the current user",
+                ));
+            }
+            let chmod_result = unsafe { libc::fchmod(file.as_raw_fd(), 0o700) };
+            if chmod_result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        })();
+        if let Err(error) = secure_result {
+            drop(file);
+            let _ =
+                unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+            return Err(error);
+        }
+        Ok(file)
+    }
+
+    pub(super) fn ensure_owner_only(file: &File) -> io::Result<()> {
+        let metadata = file.metadata()?;
+        if std::os::unix::fs::MetadataExt::uid(&metadata) != unsafe { libc::geteuid() } {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "anchored directory is not owned by the current user",
+            ));
+        }
+        let result = unsafe { libc::fchmod(file.as_raw_fd(), 0o700) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    pub(super) fn is_owner_only(file: &File) -> io::Result<bool> {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let metadata = file.metadata()?;
+        Ok(metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.permissions().mode() & 0o077 == 0)
+    }
+
+    pub(super) fn same_identity(left: &File, right: &File) -> io::Result<bool> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let left = left.metadata()?;
+        let right = right.metadata()?;
+        Ok(left.dev() == right.dev() && left.ino() == right.ino())
+    }
+
+    fn unlink(parent: &File, name: &OsStr, flags: i32) -> io::Result<()> {
+        let name = c_name(name)?;
+        let result = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    struct DirectoryStream(*mut libc::DIR);
+
+    impl Drop for DirectoryStream {
+        fn drop(&mut self) {
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+
+    fn errno_location() -> *mut libc::c_int {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        unsafe {
+            libc::__error()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        unsafe {
+            libc::__errno_location()
+        }
+    }
+
+    pub(super) fn child_names(directory: &File) -> io::Result<Vec<OsString>> {
+        let dot = CString::new(".").expect("static child name");
+        let enumeration = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                dot.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if enumeration < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let stream = unsafe { libc::fdopendir(enumeration) };
+        if stream.is_null() {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::close(enumeration);
+            }
+            return Err(error);
+        }
+        let stream = DirectoryStream(stream);
+        let mut names = Vec::new();
+        loop {
+            unsafe {
+                *errno_location() = 0;
+            }
+            let entry = unsafe { libc::readdir(stream.0) };
+            if entry.is_null() {
+                let errno = unsafe { *errno_location() };
+                return if errno == 0 {
+                    Ok(names)
+                } else {
+                    Err(io::Error::from_raw_os_error(errno))
+                };
+            }
+            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if name != b"." && name != b".." {
+                names.push(OsStr::from_bytes(name).to_owned());
+            }
+        }
+    }
+
+    pub(super) fn remove_tree_contents(directory: &File) -> io::Result<()> {
+        for name in child_names(directory)? {
+            let name_c = c_name(&name)?;
+            let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+            let result = unsafe {
+                libc::fstatat(
+                    directory.as_raw_fd(),
+                    name_c.as_ptr(),
+                    metadata.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let metadata = unsafe { metadata.assume_init() };
+            if metadata.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                let child = open_directory_at(directory.as_raw_fd(), &name)?;
+                remove_tree_contents(&child)?;
+                remove_retained_child_dir(directory, &name, &child)?;
+            } else {
+                unlink(directory, &name, 0)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn remove_empty_child_dir(parent: &File, name: &OsStr) -> io::Result<()> {
+        unlink(parent, name, libc::AT_REMOVEDIR)
+    }
+
+    pub(super) fn remove_marker(parent: &File, name: &OsStr) -> io::Result<()> {
+        unlink(parent, name, 0)
+    }
+
+    pub(super) fn remove_retained_child_dir(
+        parent: &File,
+        name: &OsStr,
+        retained_child: &File,
+    ) -> io::Result<()> {
+        let current = open_directory_at(parent.as_raw_fd(), name)?;
+        if !same_identity(&current, retained_child)? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "retained child identity no longer matches its anchored name",
+            ));
+        }
+        unlink(parent, name, libc::AT_REMOVEDIR)
+    }
+
+    pub(super) fn rename_child_dir_no_replace(
+        source_parent: &File,
+        source_name: &OsStr,
+        target_parent: &File,
+        target_name: &OsStr,
+    ) -> io::Result<()> {
+        let source_name = c_name(source_name)?;
+        let target_name = c_name(target_name)?;
+
+        #[cfg(target_os = "linux")]
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                source_parent.as_raw_fd(),
+                source_name.as_ptr(),
+                target_parent.as_raw_fd(),
+                target_name.as_ptr(),
+                1_u32, // RENAME_NOREPLACE
+            ) as libc::c_int
+        };
+
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let result = unsafe {
+            unsafe extern "C" {
+                fn renameatx_np(
+                    fromfd: libc::c_int,
+                    from: *const libc::c_char,
+                    tofd: libc::c_int,
+                    to: *const libc::c_char,
+                    flags: libc::c_uint,
+                ) -> libc::c_int;
+            }
+            const RENAME_EXCL: libc::c_uint = 0x0000_0004;
+            renameatx_np(
+                source_parent.as_raw_fd(),
+                source_name.as_ptr(),
+                target_parent.as_raw_fd(),
+                target_name.as_ptr(),
+                RENAME_EXCL,
+            )
+        };
+
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+        {
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "anchored no-replace rename is unsupported on this Unix platform",
+            ))
+        }
+    }
+
+    pub(super) fn rename_retained_child_dir_no_replace(
+        source_parent: &File,
+        source_name: &OsStr,
+        retained_child: &File,
+        target_parent: &File,
+        target_name: &OsStr,
+    ) -> io::Result<()> {
+        let current = open_directory_at(source_parent.as_raw_fd(), source_name)?;
+        if !same_identity(&current, retained_child)? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "retained child identity no longer matches its anchored name",
+            ));
+        }
+        rename_child_dir_no_replace(source_parent, source_name, target_parent, target_name)
+    }
+}
+
+#[cfg(windows)]
+mod platform {
+    use super::*;
+    use std::mem::{MaybeUninit, offset_of, size_of};
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{
+        GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
+    };
+    use windows::Win32::Security::GetTokenInformation;
+    use windows::Win32::Security::{
+        ACL, ACL_REVISION, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
+        EqualSid, GetLengthSid, InitializeAcl, InitializeSecurityDescriptor, OBJECT_INHERIT_ACE,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        PSID, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR, SetSecurityDescriptorControl,
+        SetSecurityDescriptorDacl, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY,
+        FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_DATA, FileDispositionInfo,
+        FileIdBothDirectoryInfo, FileRenameInfo, GetFileInformationByHandle,
+        GetFileInformationByHandleEx, ReOpenFile, SYNCHRONIZE, SetFileInformationByHandle,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    const FILE_OPEN: u32 = 1;
+    const FILE_CREATE: u32 = 2;
+    const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+    const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+    const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+    const FILE_OPEN_REPARSE_POINT_NT: u32 = 0x0020_0000;
+    const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
+    const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+
+    #[repr(C)]
+    struct ObjectAttributes {
+        length: u32,
+        root_directory: HANDLE,
+        object_name: *mut UnicodeString,
+        attributes: u32,
+        security_descriptor: *mut core::ffi::c_void,
+        security_quality_of_service: *mut core::ffi::c_void,
+    }
+
+    #[repr(C)]
+    struct IoStatusBlock {
+        status_or_pointer: usize,
+        information: usize,
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtCreateFile(
+            file_handle: *mut HANDLE,
+            desired_access: u32,
+            object_attributes: *mut ObjectAttributes,
+            io_status_block: *mut IoStatusBlock,
+            allocation_size: *mut i64,
+            file_attributes: u32,
+            share_access: u32,
+            create_disposition: u32,
+            create_options: u32,
+            ea_buffer: *mut core::ffi::c_void,
+            ea_length: u32,
+        ) -> i32;
+        fn RtlNtStatusToDosError(status: i32) -> u32;
+    }
+
+    fn nt_error(status: i32) -> io::Error {
+        io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32)
+    }
+
+    fn open_relative(
+        parent: &File,
+        name: &OsStr,
+        disposition: u32,
+        object_options: u32,
+        desired_access: u32,
+        security_descriptor: Option<*mut core::ffi::c_void>,
+    ) -> io::Result<File> {
+        let mut wide: Vec<u16> = name.encode_wide().collect();
+        let byte_len = wide
+            .len()
+            .checked_mul(2)
+            .and_then(|length| u16::try_from(length).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "child name is too long"))?;
+        let mut unicode = UnicodeString {
+            length: byte_len,
+            maximum_length: byte_len,
+            buffer: wide.as_mut_ptr(),
+        };
+        let mut attributes = ObjectAttributes {
+            length: size_of::<ObjectAttributes>() as u32,
+            root_directory: HANDLE(parent.as_raw_handle()),
+            object_name: &mut unicode,
+            attributes: OBJ_CASE_INSENSITIVE,
+            security_descriptor: security_descriptor.unwrap_or(std::ptr::null_mut()),
+            security_quality_of_service: std::ptr::null_mut(),
+        };
+        let mut status_block = IoStatusBlock {
+            status_or_pointer: 0,
+            information: 0,
+        };
+        let mut handle = HANDLE::default();
+        let status = unsafe {
+            NtCreateFile(
+                &mut handle,
+                desired_access,
+                &mut attributes,
+                &mut status_block,
+                std::ptr::null_mut(),
+                0,
+                (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0,
+                disposition,
+                object_options | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT_NT,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if status < 0 {
+            Err(nt_error(status))
+        } else {
+            Ok(unsafe { File::from_raw_handle(handle.0) })
+        }
+    }
+
+    fn file_information(file: &File) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }
+            .map_err(io::Error::other)?;
+        Ok(info)
+    }
+
+    fn reject_reparse_directory(file: File) -> io::Result<File> {
+        let info = file_information(&file)?;
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "anchored directory is a reparse point",
+            ));
+        }
+        if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "anchored root is not a directory",
+            ));
+        }
+        Ok(file)
+    }
+
+    fn reject_reparse_regular_file(file: File) -> io::Result<File> {
+        let info = file_information(&file)?;
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+            || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "anchored child is not a real regular file",
+            ));
+        }
+        Ok(file)
+    }
+
+    pub(super) fn open_root(path: &Path) -> io::Result<File> {
+        let file = std::fs::OpenOptions::new()
+            .access_mode(
+                (FILE_LIST_DIRECTORY
+                    | FILE_READ_ATTRIBUTES
+                    | FILE_TRAVERSE
+                    | FILE_WRITE_DATA
+                    | windows::Win32::Storage::FileSystem::READ_CONTROL
+                    | windows::Win32::Storage::FileSystem::WRITE_DAC
+                    | SYNCHRONIZE)
+                    .0,
+            )
+            .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+            .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
+            .open(path)?;
+        reject_reparse_directory(file)
+    }
+
+    pub(super) fn open_child_dir(parent: &File, name: &OsStr) -> io::Result<File> {
+        let file = open_relative(
+            parent,
+            name,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE,
+            (FILE_LIST_DIRECTORY
+                | FILE_READ_ATTRIBUTES
+                | FILE_TRAVERSE
+                | FILE_WRITE_DATA
+                | DELETE
+                | windows::Win32::Storage::FileSystem::READ_CONTROL
+                | windows::Win32::Storage::FileSystem::WRITE_DAC
+                | SYNCHRONIZE)
+                .0,
+            None,
+        )?;
+        reject_reparse_directory(file)
+    }
+
+    pub(super) fn open_child_file(parent: &File, name: &OsStr) -> io::Result<File> {
+        let file = open_relative(
+            parent,
+            name,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE,
+            (FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE).0,
+            None,
+        )?;
+        reject_reparse_regular_file(file)
+    }
+
+    pub(super) fn create_child_file_new(parent: &File, name: &OsStr) -> io::Result<File> {
+        let file = open_relative(
+            parent,
+            name,
+            FILE_CREATE,
+            FILE_NON_DIRECTORY_FILE,
+            (FILE_READ_DATA
+                | FILE_READ_ATTRIBUTES
+                | FILE_WRITE_DATA
+                | SYNCHRONIZE
+                | DELETE
+                | windows::Win32::Storage::FileSystem::READ_CONTROL
+                | windows::Win32::Storage::FileSystem::WRITE_DAC)
+                .0,
+            None,
+        )?;
+        let file = reject_reparse_regular_file(file)?;
+        if let Err(error) = crate::util::secure_file::ensure_owner_only_permissions_for_file(&file)
+        {
+            let _ = delete_by_handle(&file);
+            return Err(error);
+        }
+        Ok(file)
+    }
+
+    pub(super) fn create_child_dir(parent: &File, name: &OsStr) -> io::Result<File> {
+        let mut security = OwnerOnlySecurity::new()?;
+        let file = open_relative(
+            parent,
+            name,
+            FILE_CREATE,
+            FILE_DIRECTORY_FILE,
+            (FILE_LIST_DIRECTORY
+                | FILE_READ_ATTRIBUTES
+                | FILE_TRAVERSE
+                | FILE_WRITE_DATA
+                | SYNCHRONIZE
+                | DELETE
+                | windows::Win32::Storage::FileSystem::READ_CONTROL
+                | windows::Win32::Storage::FileSystem::WRITE_DAC)
+                .0,
+            Some((&mut security.descriptor as *mut SECURITY_DESCRIPTOR).cast()),
+        )?;
+        let file = reject_reparse_directory(file)?;
+        if let Err(error) = ensure_owner_only(&file) {
+            let _ = delete_by_handle(&file);
+            return Err(error);
+        }
+        Ok(file)
+    }
+
+    struct OwnerOnlySecurity {
+        _token_info: Vec<usize>,
+        _acl: Vec<usize>,
+        descriptor: SECURITY_DESCRIPTOR,
+    }
+
+    impl OwnerOnlySecurity {
+        fn new() -> io::Result<Self> {
+            unsafe {
+                let mut token = HANDLE::default();
+                OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+                    .map_err(io::Error::other)?;
+                struct Token(HANDLE);
+                impl Drop for Token {
+                    fn drop(&mut self) {
+                        let _ = unsafe { CloseHandle(self.0) };
+                    }
+                }
+                let token = Token(token);
+                let mut required = 0;
+                let _ = GetTokenInformation(token.0, TokenUser, None, 0, &mut required);
+                if required == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let mut token_info =
+                    vec![0_usize; (required as usize).div_ceil(size_of::<usize>())];
+                GetTokenInformation(
+                    token.0,
+                    TokenUser,
+                    Some(token_info.as_mut_ptr().cast()),
+                    required,
+                    &mut required,
+                )
+                .map_err(io::Error::other)?;
+                let sid = (*(token_info.as_ptr().cast::<TOKEN_USER>())).User.Sid;
+                let sid_len = GetLengthSid(sid);
+                let acl_len = size_of::<ACL>()
+                    + size_of::<windows::Win32::Security::ACCESS_ALLOWED_ACE>()
+                    - size_of::<u32>()
+                    + sid_len as usize;
+                let mut acl_storage = vec![0_usize; acl_len.div_ceil(size_of::<usize>())];
+                let acl = acl_storage.as_mut_ptr().cast::<ACL>();
+                InitializeAcl(acl, acl_len as u32, ACL_REVISION).map_err(io::Error::other)?;
+                AddAccessAllowedAceEx(
+                    acl,
+                    ACL_REVISION,
+                    CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+                    FILE_ALL_ACCESS.0,
+                    sid,
+                )
+                .map_err(io::Error::other)?;
+                let mut descriptor = SECURITY_DESCRIPTOR::default();
+                let descriptor_pointer = windows::Win32::Security::PSECURITY_DESCRIPTOR(
+                    (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
+                );
+                InitializeSecurityDescriptor(descriptor_pointer, SECURITY_DESCRIPTOR_REVISION)
+                    .map_err(io::Error::other)?;
+                SetSecurityDescriptorDacl(descriptor_pointer, true, Some(acl), false)
+                    .map_err(io::Error::other)?;
+                SetSecurityDescriptorControl(
+                    descriptor_pointer,
+                    SE_DACL_PROTECTED,
+                    SE_DACL_PROTECTED,
+                )
+                .map_err(io::Error::other)?;
+                Ok(Self {
+                    _token_info: token_info,
+                    _acl: acl_storage,
+                    descriptor,
+                })
+            }
+        }
+
+        fn sid(&self) -> PSID {
+            unsafe { (*(self._token_info.as_ptr().cast::<TOKEN_USER>())).User.Sid }
+        }
+
+        fn acl(&self) -> *const ACL {
+            self._acl.as_ptr().cast()
+        }
+    }
+
+    pub(super) fn ensure_owner_only(file: &File) -> io::Result<()> {
+        let security = OwnerOnlySecurity::new()?;
+        unsafe {
+            let mut owner = PSID::default();
+            let mut descriptor = PSECURITY_DESCRIPTOR::default();
+            let status = GetSecurityInfo(
+                HANDLE(file.as_raw_handle()),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                Some(&mut owner),
+                None,
+                None,
+                None,
+                Some(&mut descriptor),
+            );
+            if status.0 != 0 {
+                return Err(io::Error::from_raw_os_error(status.0 as i32));
+            }
+            struct LocalDescriptor(PSECURITY_DESCRIPTOR);
+            impl Drop for LocalDescriptor {
+                fn drop(&mut self) {
+                    unsafe {
+                        let _ = LocalFree(Some(HLOCAL(self.0.0)));
+                    }
+                }
+            }
+            let descriptor = LocalDescriptor(descriptor);
+            let owner_matches = EqualSid(owner, security.sid()).is_ok();
+            drop(descriptor);
+            if !owner_matches {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "anchored directory is not owned by the current user",
+                ));
+            }
+
+            let status = SetSecurityInfo(
+                HANDLE(file.as_raw_handle()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(security.acl()),
+                None,
+            );
+            if status.0 == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(status.0 as i32))
+            }
+        }
+    }
+
+    pub(super) fn is_owner_only(file: &File) -> io::Result<bool> {
+        // Windows private staging directories are created with a protected,
+        // current-user-only DACL. Reapplying that policy via the retained
+        // handle also verifies ownership and cannot be redirected by a path
+        // replacement.
+        ensure_owner_only(file).map(|()| true)
+    }
+
+    pub(super) fn same_identity(left: &File, right: &File) -> io::Result<bool> {
+        let left = file_information(left)?;
+        let right = file_information(right)?;
+        Ok(left.dwVolumeSerialNumber == right.dwVolumeSerialNumber
+            && left.nFileIndexHigh == right.nFileIndexHigh
+            && left.nFileIndexLow == right.nFileIndexLow)
+    }
+
+    fn delete_by_handle(file: &File) -> io::Result<()> {
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        unsafe {
+            SetFileInformationByHandle(
+                HANDLE(file.as_raw_handle()),
+                FileDispositionInfo,
+                (&raw const disposition).cast(),
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        }
+        .map_err(io::Error::other)
+    }
+
+    pub(super) fn child_names(directory: &File) -> io::Result<Vec<OsString>> {
+        let enumeration = unsafe {
+            ReOpenFile(
+                HANDLE(directory.as_raw_handle()),
+                (FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE).0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+        }
+        .map(|handle| unsafe { File::from_raw_handle(handle.0) })
+        .map_err(io::Error::other)?;
+        let mut names = Vec::new();
+        loop {
+            let mut storage = vec![0_usize; 64 * 1024 / size_of::<usize>()];
+            let result = unsafe {
+                GetFileInformationByHandleEx(
+                    HANDLE(enumeration.as_raw_handle()),
+                    FileIdBothDirectoryInfo,
+                    storage.as_mut_ptr().cast(),
+                    (storage.len() * size_of::<usize>()) as u32,
+                )
+            };
+            if let Err(error) = result {
+                if error.code()
+                    == windows::core::HRESULT::from_win32(
+                        windows::Win32::Foundation::ERROR_NO_MORE_FILES.0,
+                    )
+                {
+                    return Ok(names);
+                }
+                return Err(io::Error::other(error));
+            }
+
+            let mut offset = 0_usize;
+            loop {
+                let info = unsafe {
+                    &*storage
+                        .as_ptr()
+                        .cast::<u8>()
+                        .add(offset)
+                        .cast::<FILE_ID_BOTH_DIR_INFO>()
+                };
+                let name_len = info.FileNameLength as usize / size_of::<u16>();
+                let name = unsafe { std::slice::from_raw_parts(info.FileName.as_ptr(), name_len) };
+                if name != [b'.' as u16] && name != [b'.' as u16, b'.' as u16] {
+                    names.push(OsString::from_wide(name));
+                }
+                if info.NextEntryOffset == 0 {
+                    break;
+                }
+                offset = offset
+                    .checked_add(info.NextEntryOffset as usize)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "directory entry offset overflow",
+                        )
+                    })?;
+                if offset >= storage.len() * size_of::<usize>() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "directory entry offset exceeds enumeration buffer",
+                    ));
+                }
+            }
+        }
+    }
+
+    pub(super) fn remove_tree_contents(directory: &File) -> io::Result<()> {
+        for name in child_names(directory)? {
+            let entry = open_relative(
+                directory,
+                &name,
+                FILE_OPEN,
+                0,
+                (FILE_LIST_DIRECTORY
+                    | FILE_READ_ATTRIBUTES
+                    | FILE_TRAVERSE
+                    | FILE_WRITE_DATA
+                    | DELETE
+                    | SYNCHRONIZE)
+                    .0,
+                None,
+            )?;
+            let information = file_information(&entry)?;
+            let is_directory = information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
+            let is_reparse = information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0;
+            if is_directory && !is_reparse {
+                remove_tree_contents(&entry)?;
+            }
+            delete_by_handle(&entry)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn remove_empty_child_dir(parent: &File, name: &OsStr) -> io::Result<()> {
+        let file = open_relative(
+            parent,
+            name,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE,
+            (DELETE | SYNCHRONIZE).0,
+            None,
+        )?;
+        delete_by_handle(&file)
+    }
+
+    pub(super) fn remove_marker(parent: &File, name: &OsStr) -> io::Result<()> {
+        let file = open_relative(
+            parent,
+            name,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE,
+            (DELETE | SYNCHRONIZE).0,
+            None,
+        )?;
+        delete_by_handle(&file)
+    }
+
+    pub(super) fn remove_retained_child_dir(
+        _parent: &File,
+        _name: &OsStr,
+        retained_child: &File,
+    ) -> io::Result<()> {
+        delete_by_handle(retained_child)
+    }
+
+    pub(super) fn rename_child_dir_no_replace(
+        source_parent: &File,
+        source_name: &OsStr,
+        target_parent: &File,
+        target_name: &OsStr,
+    ) -> io::Result<()> {
+        let source = open_relative(
+            source_parent,
+            source_name,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE,
+            (DELETE | SYNCHRONIZE).0,
+            None,
+        )?;
+        rename_retained_handle_no_replace(&source, target_parent, target_name)
+    }
+
+    fn rename_retained_handle_no_replace(
+        source: &File,
+        target_parent: &File,
+        target_name: &OsStr,
+    ) -> io::Result<()> {
+        let wide: Vec<u16> = target_name.encode_wide().collect();
+        let name_bytes = wide
+            .len()
+            .checked_mul(2)
+            .and_then(|length| u32::try_from(length).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "child name is too long"))?;
+        let header_len = offset_of!(FILE_RENAME_INFO, FileName);
+        let total_len = header_len
+            .checked_add(name_bytes as usize)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "child name is too long"))?;
+        let api_len = u32::try_from(total_len)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "child name is too long"))?;
+
+        // `FILE_RENAME_INFO` has a variable-length trailing UTF-16 name. A
+        // `Vec<u8>` is not sufficiently aligned for a typed dereference of its
+        // header, so allocate zeroed slots of the header type itself and use
+        // only the exact byte prefix required by the Windows API.
+        let slot_count = total_len.div_ceil(size_of::<FILE_RENAME_INFO>());
+        let mut storage = Vec::<MaybeUninit<FILE_RENAME_INFO>>::new();
+        storage.try_reserve_exact(slot_count).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!("failed to allocate rename information: {error}"),
+            )
+        })?;
+        storage.resize_with(slot_count, MaybeUninit::zeroed);
+        let storage_bytes = storage.as_mut_ptr().cast::<u8>();
+        let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        unsafe {
+            (*info).Anonymous.ReplaceIfExists = false;
+            (*info).RootDirectory = HANDLE(target_parent.as_raw_handle());
+            (*info).FileNameLength = name_bytes;
+            std::ptr::copy_nonoverlapping(
+                wide.as_ptr().cast::<u8>(),
+                storage_bytes.add(header_len),
+                name_bytes as usize,
+            );
+            SetFileInformationByHandle(
+                HANDLE(source.as_raw_handle()),
+                FileRenameInfo,
+                storage.as_ptr().cast(),
+                api_len,
+            )
+        }
+        .map_err(io::Error::other)
+    }
+
+    pub(super) fn rename_retained_child_dir_no_replace(
+        _source_parent: &File,
+        _source_name: &OsStr,
+        retained_child: &File,
+        target_parent: &File,
+        target_name: &OsStr,
+    ) -> io::Result<()> {
+        rename_retained_handle_no_replace(retained_child, target_parent, target_name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn rejects_non_component_child_names() {
+        let invalid = ["", ".", "..", "a/b"];
+        for name in invalid {
+            assert_eq!(
+                validate_child_name(OsStr::new(name)).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "unexpectedly accepted {name:?}"
+            );
+        }
+        validate_child_name(OsStr::new("child")).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_parent_prevents_path_swap_from_redirecting_mutations() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        let retained_path = temp.path().join("retained");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(root_path.join("marker"), b"retained").unwrap();
+        std::fs::write(outside.join("marker"), b"outside sentinel").unwrap();
+
+        let root = AnchoredDirectory::open_root(&root_path).unwrap();
+        root.ensure_owner_only().unwrap();
+        std::fs::rename(&root_path, &retained_path).unwrap();
+        symlink(&outside, &root_path).unwrap();
+
+        root.remove_marker(OsStr::new("marker")).unwrap();
+        root.create_child_dir(OsStr::new("created")).unwrap();
+
+        assert!(!retained_path.join("marker").exists());
+        assert!(retained_path.join("created").is_dir());
+        assert_eq!(
+            std::fs::read(outside.join("marker")).unwrap(),
+            b"outside sentinel"
+        );
+        assert!(!outside.join("created").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn anchored_rename_is_no_replace_and_preserves_both_trees_on_collision() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("source-parent");
+        let target_path = temp.path().join("target-parent");
+        std::fs::create_dir(&source_path).unwrap();
+        std::fs::create_dir(&target_path).unwrap();
+        std::fs::create_dir(source_path.join("session")).unwrap();
+        std::fs::write(source_path.join("session/source"), b"source").unwrap();
+        std::fs::create_dir(target_path.join("session")).unwrap();
+        std::fs::write(target_path.join("session/target"), b"target").unwrap();
+
+        let source = AnchoredDirectory::open_root(&source_path).unwrap();
+        let target = AnchoredDirectory::open_root(&target_path).unwrap();
+        let error = source
+            .rename_child_dir_no_replace(OsStr::new("session"), &target, OsStr::new("session"))
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(source_path.join("session/source")).unwrap(),
+            b"source"
+        );
+        assert_eq!(
+            std::fs::read(target_path.join("session/target")).unwrap(),
+            b"target"
+        );
+
+        std::fs::create_dir(source_path.join("fresh")).unwrap();
+        source
+            .rename_child_dir_no_replace(OsStr::new("fresh"), &target, OsStr::new("published"))
+            .unwrap();
+        assert!(!source_path.join("fresh").exists());
+        assert!(target_path.join("published").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_child_rename_remove_files_and_identity_are_anchored() {
+        use std::io::{Read as _, Write as _};
+
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("source");
+        let target_path = temp.path().join("target");
+        std::fs::create_dir(&source_path).unwrap();
+        std::fs::create_dir(&target_path).unwrap();
+        let source = AnchoredDirectory::open_root(&source_path).unwrap();
+        let target = AnchoredDirectory::open_root(&target_path).unwrap();
+        let child = source.create_child_dir(OsStr::new("stage")).unwrap();
+        let reopened = source.open_child_dir(OsStr::new("stage")).unwrap();
+        assert!(child.same_identity(&reopened).unwrap());
+        assert!(!child.same_identity(&target).unwrap());
+
+        let mut marker = child
+            .create_child_file_new(OsStr::new(".unpublished"))
+            .unwrap();
+        marker.write_all(b"marker").unwrap();
+        drop(marker);
+        assert_eq!(
+            child
+                .create_child_file_new(OsStr::new(".unpublished"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        let mut marker = child.open_child_file(OsStr::new(".unpublished")).unwrap();
+        let mut contents = Vec::new();
+        marker.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"marker");
+        drop(marker);
+        child.remove_marker(OsStr::new(".unpublished")).unwrap();
+
+        let published = child
+            .rename_self_no_replace(&target, OsStr::new("published"))
+            .unwrap();
+        assert!(!source_path.join("stage").exists());
+        let public_path = target.open_child_dir(OsStr::new("published")).unwrap();
+        assert!(published.same_identity(&public_path).unwrap());
+        drop(public_path);
+        published.remove_self().unwrap();
+        assert!(!target_path.join("published").exists());
+    }
+
+    #[test]
+    fn failed_retained_rename_returns_the_live_source_anchor() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("source-retained-error");
+        let target_path = temp.path().join("target-retained-error");
+        std::fs::create_dir(&source_path).unwrap();
+        std::fs::create_dir(&target_path).unwrap();
+        let source = AnchoredDirectory::open_root(&source_path).unwrap();
+        let target = AnchoredDirectory::open_root(&target_path).unwrap();
+        let retained = source.create_child_dir(OsStr::new("stage")).unwrap();
+        target.create_child_dir(OsStr::new("winner")).unwrap();
+
+        let failure = retained
+            .try_rename_self_no_replace(&target, OsStr::new("winner"))
+            .unwrap_err();
+        assert_eq!(failure.error.kind(), io::ErrorKind::AlreadyExists);
+        let reopened = source.open_child_dir(OsStr::new("stage")).unwrap();
+        assert!(failure.source.same_identity(&reopened).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_child_remove_rejects_replaced_source_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent_path = temp.path().join("parent");
+        std::fs::create_dir(&parent_path).unwrap();
+        let parent = AnchoredDirectory::open_root(&parent_path).unwrap();
+        let retained = parent.create_child_dir(OsStr::new("child")).unwrap();
+        std::fs::rename(parent_path.join("child"), parent_path.join("detached")).unwrap();
+        std::fs::create_dir(parent_path.join("child")).unwrap();
+
+        assert_eq!(
+            retained.remove_self().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(parent_path.join("child").is_dir());
+        assert!(parent_path.join("detached").is_dir());
+
+        let retained = parent.create_child_dir(OsStr::new("rename-child")).unwrap();
+        std::fs::rename(
+            parent_path.join("rename-child"),
+            parent_path.join("rename-detached"),
+        )
+        .unwrap();
+        std::fs::create_dir(parent_path.join("rename-child")).unwrap();
+        let target_path = temp.path().join("target");
+        std::fs::create_dir(&target_path).unwrap();
+        let target = AnchoredDirectory::open_root(&target_path).unwrap();
+        assert_eq!(
+            retained
+                .try_rename_self_no_replace(&target, OsStr::new("published"))
+                .unwrap_err()
+                .error
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(parent_path.join("rename-child").is_dir());
+        assert!(parent_path.join("rename-detached").is_dir());
+        assert!(!target_path.join("published").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_tree_removal_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent_path = temp.path().join("parent");
+        let outside_path = temp.path().join("outside");
+        std::fs::create_dir(&parent_path).unwrap();
+        std::fs::create_dir(&outside_path).unwrap();
+        std::fs::write(outside_path.join("sentinel"), b"preserve").unwrap();
+        let parent = AnchoredDirectory::open_root(&parent_path).unwrap();
+        let tree = parent.create_child_dir(OsStr::new("tree")).unwrap();
+        let nested = tree.create_child_dir(OsStr::new("nested")).unwrap();
+        std::fs::write(parent_path.join("tree/nested/data"), b"data").unwrap();
+        drop(nested);
+        symlink(&outside_path, parent_path.join("tree/link")).unwrap();
+
+        let first = tree.child_names().unwrap();
+        let second = tree.child_names().unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first.len(), second.len(), "enumeration must be repeatable");
+        tree.remove_tree_self().unwrap();
+
+        assert!(!parent_path.join("tree").exists());
+        assert_eq!(
+            std::fs::read(outside_path.join("sentinel")).unwrap(),
+            b"preserve"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_retained_handle_survives_root_rename_and_replacement_by_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        let moved_path = temp.path().join("moved");
+        std::fs::create_dir(&root_path).unwrap();
+        let root = AnchoredDirectory::open_root(&root_path).unwrap();
+        root.ensure_owner_only().unwrap();
+        std::fs::rename(&root_path, &moved_path).unwrap();
+        std::fs::create_dir(&root_path).unwrap();
+        let replacement = AnchoredDirectory::open_root(&root_path).unwrap();
+        let moved = AnchoredDirectory::open_root(&moved_path).unwrap();
+        assert!(root.same_identity(&moved).unwrap());
+        assert!(!root.same_identity(&replacement).unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_child_creation_and_no_replace_are_handle_relative() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("source");
+        let target_path = temp.path().join("target");
+        std::fs::create_dir(&source_path).unwrap();
+        std::fs::create_dir(&target_path).unwrap();
+        let source = AnchoredDirectory::open_root(&source_path).unwrap();
+        let target = AnchoredDirectory::open_root(&target_path).unwrap();
+        source.create_child_dir(OsStr::new("session")).unwrap();
+        target.create_child_dir(OsStr::new("session")).unwrap();
+        std::fs::write(source_path.join("marker"), b"marker").unwrap();
+        source.remove_marker(OsStr::new("marker")).unwrap();
+        assert!(!source_path.join("marker").exists());
+        assert_eq!(
+            source
+                .rename_child_dir_no_replace(OsStr::new("session"), &target, OsStr::new("session"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert!(source.open_child_dir(OsStr::new("session")).is_ok());
+        assert!(target.open_child_dir(OsStr::new("session")).is_ok());
+
+        let retained = source.create_child_dir(OsStr::new("retained")).unwrap();
+        let reopened = source.open_child_dir(OsStr::new("retained")).unwrap();
+        assert!(retained.same_identity(&reopened).unwrap());
+        drop(reopened);
+        let published = retained
+            .rename_self_no_replace(&target, OsStr::new("published"))
+            .unwrap();
+        let public_path = target.open_child_dir(OsStr::new("published")).unwrap();
+        assert!(published.same_identity(&public_path).unwrap());
+        drop(public_path);
+        published.remove_self().unwrap();
+        assert!(!target_path.join("published").exists());
+
+        use std::io::{Read as _, Write as _};
+        let mut marker = source.create_child_file_new(OsStr::new("marker")).unwrap();
+        marker.write_all(b"marker").unwrap();
+        drop(marker);
+        assert!(source.create_child_file_new(OsStr::new("marker")).is_err());
+        let mut marker = source.open_child_file(OsStr::new("marker")).unwrap();
+        let mut contents = Vec::new();
+        marker.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"marker");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_open_root_and_child_reject_reparse_points() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        let root_path = temp.path().join("root");
+        let junction = root_path.join("junction");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::create_dir(&root_path).unwrap();
+        let mut command = std::process::Command::new("cmd");
+        command
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&real);
+        xai_tty_utils::detach_std_command(&mut command);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "mklink failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert!(AnchoredDirectory::open_root(&junction).is_err());
+        let root = AnchoredDirectory::open_root(&root_path).unwrap();
+        assert!(root.open_child_dir(OsStr::new("junction")).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_retained_tree_removal_does_not_follow_junctions() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent_path = temp.path().join("parent");
+        let outside_path = temp.path().join("outside");
+        std::fs::create_dir(&parent_path).unwrap();
+        std::fs::create_dir(&outside_path).unwrap();
+        std::fs::write(outside_path.join("sentinel"), b"preserve").unwrap();
+        let parent = AnchoredDirectory::open_root(&parent_path).unwrap();
+        let tree = parent.create_child_dir(OsStr::new("tree")).unwrap();
+        tree.create_child_dir(OsStr::new("nested")).unwrap();
+        std::fs::write(parent_path.join("tree/nested/data"), b"data").unwrap();
+        let junction = parent_path.join("tree/junction");
+        let mut command = std::process::Command::new("cmd");
+        command
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&outside_path);
+        xai_tty_utils::detach_std_command(&mut command);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "mklink failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert_eq!(tree.child_names().unwrap().len(), 2);
+        assert_eq!(tree.child_names().unwrap().len(), 2);
+        tree.remove_tree_self().unwrap();
+
+        assert!(!parent_path.join("tree").exists());
+        assert_eq!(
+            std::fs::read(outside_path.join("sentinel")).unwrap(),
+            b"preserve"
+        );
+    }
+}

@@ -41,7 +41,6 @@ use xai_grok_workspace::trust::{TrustStore, is_unsafe_trust_root, workspace_key}
 // re-export is deliberately avoided: it would silently re-publish the
 // cache-SKIPPING `revoke_folder_trust_store` next to the real
 // `revoke_folder_trust` wrapper, inviting a stale-untrust security bug.
-pub use xai_grok_workspace::folder_trust::grant_folder_trust;
 use xai_grok_workspace::folder_trust::{
     DecideInputs, TrustOutcome, claude_project_mcp_names, decide, decide_inputs,
     decide_inputs_with_interactive, feature_enabled, folder_trust_inert, persist_trust,
@@ -60,8 +59,165 @@ use crate::util::config::{MCP_SCOPE_PROJECT, RemoteSettings};
 
 /// Per-workspace resolved decision: `true` = repo-local (project-scoped)
 /// servers are allowed to spawn. Keyed by canonical workspace key.
-static DECISIONS: LazyLock<Mutex<HashMap<PathBuf, bool>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+#[derive(Default)]
+struct DecisionCache {
+    decisions: HashMap<PathBuf, bool>,
+    generations: HashMap<PathBuf, u64>,
+}
+
+static DECISIONS: LazyLock<Mutex<DecisionCache>> =
+    LazyLock::new(|| Mutex::new(DecisionCache::default()));
+
+/// Persist and publish an explicit trust grant as one cache-generation change.
+pub fn grant_folder_trust(cwd: &Path) {
+    // Match the workspace-side grant contract: local/dev builds are fully inert.
+    // In particular, do not publish a cache decision or advance its generation;
+    // either mutation would make an otherwise inert provisional session stale.
+    if folder_trust_inert() {
+        return;
+    }
+    let key = workspace_key(cwd);
+    let mut cache = DECISIONS.lock();
+    xai_grok_workspace::folder_trust::grant_folder_trust(cwd);
+    cache.decisions.insert(key.clone(), true);
+    bump_generation(&mut cache, &key);
+}
+
+/// Request-scoped folder-trust verdict used while an auth-sealed `/new`
+/// session is still provisional. Computing it may read the durable trust store
+/// and repository markers, but never mutates the process-global decision
+/// cache. Seal it immediately before the final resident publication transaction.
+#[derive(Clone, Debug)]
+pub(crate) struct FolderTrustSnapshot {
+    cwd: PathBuf,
+    key: PathBuf,
+    allowed: bool,
+    record_on_publish: bool,
+    generation: u64,
+    store_trusted: bool,
+    repo_configs_present: bool,
+    key_recordable: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct StaleFolderTrustSnapshot;
+
+pub(crate) struct ValidatedFolderTrustSnapshot {
+    snapshot: FolderTrustSnapshot,
+    cache: parking_lot::MutexGuard<'static, DecisionCache>,
+}
+
+impl FolderTrustSnapshot {
+    pub(crate) fn allowed(&self) -> bool {
+        self.allowed
+    }
+
+    pub(crate) fn validate_current(
+        self,
+    ) -> Result<ValidatedFolderTrustSnapshot, StaleFolderTrustSnapshot> {
+        // An inert build deliberately gathered no store/filesystem inputs and
+        // has no trust mutations to seal. Keep validation equally inert rather
+        // than comparing its sentinel fields with live decision inputs.
+        if folder_trust_inert() {
+            return Ok(ValidatedFolderTrustSnapshot {
+                snapshot: self,
+                cache: DECISIONS.lock(),
+            });
+        }
+        // Gather filesystem/store inputs before taking the cache seal. Shell
+        // trust mutations take this same cache lock around their store write,
+        // avoiding lock inversion while the generation comparison closes the
+        // mutation race.
+        let current_inputs = decide_inputs_with_interactive(&self.cwd, &self.key, false);
+        let cache = DECISIONS.lock();
+        let current = cache.generations.get(&self.key).copied().unwrap_or(0);
+        if current != self.generation
+            || current_inputs.store_trusted != self.store_trusted
+            || current_inputs.repo_configs_present != self.repo_configs_present
+            || current_inputs.key_recordable != self.key_recordable
+        {
+            return Err(StaleFolderTrustSnapshot);
+        }
+        Ok(ValidatedFolderTrustSnapshot {
+            snapshot: self,
+            cache,
+        })
+    }
+}
+
+impl ValidatedFolderTrustSnapshot {
+    /// Infallible half of the seal. The retained cache lock prevents any trust
+    /// mutation between validation and the caller's atomic publication commit.
+    pub(crate) fn commit(mut self) {
+        if self.snapshot.record_on_publish {
+            self.cache
+                .decisions
+                .insert(self.snapshot.key.clone(), self.snapshot.allowed);
+            bump_generation(&mut self.cache, &self.snapshot.key);
+        }
+    }
+}
+
+pub(crate) fn snapshot(cwd: &Path, remote: Option<&RemoteSettings>) -> FolderTrustSnapshot {
+    let key = workspace_key(cwd);
+    if folder_trust_inert() {
+        return FolderTrustSnapshot {
+            cwd: cwd.to_path_buf(),
+            key,
+            allowed: true,
+            record_on_publish: false,
+            generation: 0,
+            store_trusted: false,
+            repo_configs_present: false,
+            key_recordable: false,
+        };
+    }
+
+    let inputs = decide_inputs_with_interactive(cwd, &key, false);
+    let cache = DECISIONS.lock();
+    let generation = cache.generations.get(&key).copied().unwrap_or(0);
+    let cached = cache.decisions.get(&key).copied();
+    drop(cache);
+    match cached {
+        Some(true) => FolderTrustSnapshot {
+            cwd: cwd.to_path_buf(),
+            key,
+            allowed: true,
+            record_on_publish: false,
+            generation,
+            store_trusted: inputs.store_trusted,
+            repo_configs_present: inputs.repo_configs_present,
+            key_recordable: inputs.key_recordable,
+        },
+        Some(false) => {
+            let allowed = inputs.store_trusted;
+            FolderTrustSnapshot {
+                cwd: cwd.to_path_buf(),
+                key,
+                allowed,
+                record_on_publish: allowed,
+                generation,
+                store_trusted: allowed,
+                repo_configs_present: inputs.repo_configs_present,
+                key_recordable: inputs.key_recordable,
+            }
+        }
+        None => {
+            let feature = feature_enabled(remote);
+            let (allowed, durable) = compute_from_inputs(&inputs, feature, &key, false);
+            FolderTrustSnapshot {
+                cwd: cwd.to_path_buf(),
+                key,
+                allowed,
+                record_on_publish: durable,
+                generation,
+                store_trusted: inputs.store_trusted,
+                repo_configs_present: inputs.repo_configs_present,
+                key_recordable: inputs.key_recordable,
+            }
+        }
+    }
+}
 
 /// Revoke trust for `cwd`'s workspace: downgrade the in-process decision cache
 /// so a mid-session untrust takes effect immediately, while the store half —
@@ -93,13 +249,15 @@ pub(crate) fn revoke_folder_trust(cwd: &Path) -> bool {
         );
         return false;
     }
+    let mut cache = DECISIONS.lock();
     let was_trusted = xai_grok_workspace::folder_trust::revoke_folder_trust_store(cwd);
     // Always downgrade the in-process cache so a mid-session untrust takes effect
     // immediately for this process, even for a cached grant with no backing store
     // record (e.g. a kill-switch / feature-off resolve). A later legitimate grant
     // reconciles it: the `Some(false)` arm of `resolve_and_record_inner` re-checks
     // the store.
-    record(&key, false);
+    cache.decisions.insert(key.clone(), false);
+    bump_generation(&mut cache, &key);
     was_trusted
 }
 
@@ -127,7 +285,7 @@ pub(crate) fn project_scope_allowed(cwd: &Path) -> bool {
     let key = workspace_key(cwd);
     // Copy out of the lock so the Some(false) reconcile can re-acquire it
     // (parking_lot mutexes are not re-entrant).
-    let cached = DECISIONS.lock().get(&key).copied();
+    let cached = DECISIONS.lock().decisions.get(&key).copied();
     match cached {
         Some(true) => true,
         // Re-read the store so a grant issued after the untrusted resolve is
@@ -201,9 +359,14 @@ pub(crate) fn agent_inline_hooks_allowed(
 }
 
 fn record(workspace_key: &Path, allowed: bool) {
-    DECISIONS
-        .lock()
-        .insert(workspace_key.to_path_buf(), allowed);
+    let mut cache = DECISIONS.lock();
+    cache.decisions.insert(workspace_key.to_path_buf(), allowed);
+    bump_generation(&mut cache, workspace_key);
+}
+
+fn bump_generation(cache: &mut DecisionCache, key: &Path) {
+    let generation = cache.generations.entry(key.to_path_buf()).or_default();
+    *generation = generation.wrapping_add(1);
 }
 
 /// Test-only: force the recorded decision for `cwd`'s workspace key.
@@ -215,6 +378,11 @@ fn record(workspace_key: &Path, allowed: bool) {
 #[cfg(test)]
 pub(crate) fn record_for_test(cwd: &Path, allowed: bool) {
     record(&workspace_key(cwd), allowed);
+}
+
+#[cfg(test)]
+fn cached_for_test(cwd: &Path) -> Option<bool> {
+    DECISIONS.lock().decisions.get(&workspace_key(cwd)).copied()
 }
 
 /// Resolve the trust decision for `cwd` ONCE and record it for the loaders.
@@ -311,7 +479,7 @@ fn resolve_and_record_inner(
 ) -> bool {
     // Copy out of the lock so `record` below can re-acquire it (parking_lot
     // mutexes are not re-entrant).
-    let cached = DECISIONS.lock().get(key).copied();
+    let cached = DECISIONS.lock().decisions.get(key).copied();
     match cached {
         Some(true) => true,
         Some(false) => {
@@ -479,6 +647,21 @@ pub(crate) fn filter_untrusted_project_mcp(
         .collect()
 }
 
+pub(crate) fn filter_untrusted_project_mcp_with_verdict(
+    cwd: &Path,
+    merged: Vec<acp::McpServer>,
+    project_scope_allowed: bool,
+) -> Vec<acp::McpServer> {
+    if project_scope_allowed {
+        return merged;
+    }
+    let project = project_scoped_mcp_names(cwd);
+    merged
+        .into_iter()
+        .filter(|server| !project.contains(mcp_server_name(server)))
+        .collect()
+}
+
 /// Drop repo-local (project-scoped) LSP servers from a sourced LSP map when
 /// `cwd`'s workspace is untrusted. Mirrors the MCP session gate; user- and
 /// plugin-scoped servers are retained. No-op when project scope is allowed.
@@ -503,6 +686,23 @@ pub(crate) fn filter_untrusted_project_lsp(
     )
 }
 
+pub(crate) fn filter_untrusted_project_lsp_with_verdict(
+    sourced: std::collections::BTreeMap<
+        String,
+        (
+            xai_grok_tools::implementations::lsp::config::LspServerConfig,
+            xai_grok_tools::types::config_source::ConfigSource,
+        ),
+    >,
+    project_scope_allowed: bool,
+) -> std::collections::BTreeMap<String, xai_grok_tools::implementations::lsp::config::LspServerConfig>
+{
+    xai_grok_tools::implementations::lsp::config::filter_project_lsp_when_untrusted(
+        sourced,
+        project_scope_allowed,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,6 +724,112 @@ mod tests {
     /// returned guard for the test body (drop restores the prior value).
     fn simulate_release_build() -> EnvGuard {
         EnvGuard::set(xai_grok_version::TEST_VERSION_ENV, "0.0.0-sim")
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn provisional_snapshot_records_only_when_published() {
+        let _sim = simulate_release_build();
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set("GROK_HOME", home.path());
+
+        let aborted = repo_tmp();
+        std::fs::write(aborted.path().join(".mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+        let aborted_snapshot = snapshot(aborted.path(), None);
+        assert!(!aborted_snapshot.allowed());
+        assert_eq!(cached_for_test(aborted.path()), None);
+        drop(aborted_snapshot);
+        assert_eq!(cached_for_test(aborted.path()), None);
+
+        let published = repo_tmp();
+        std::fs::write(published.path().join(".mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+        let published_snapshot = snapshot(published.path(), None);
+        assert!(!published_snapshot.allowed());
+        assert_eq!(cached_for_test(published.path()), None);
+        published_snapshot.validate_current().unwrap().commit();
+        assert_eq!(cached_for_test(published.path()), Some(false));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn inert_local_grant_keeps_provisional_snapshot_current_without_mutation() {
+        let _local = EnvGuard::unset(xai_grok_version::TEST_VERSION_ENV);
+        if option_env!("GROK_VERSION").is_some() {
+            return; // a release-stamped test binary cannot exercise the inert branch
+        }
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set("GROK_HOME", home.path());
+        let workspace = repo_tmp();
+        std::fs::write(workspace.path().join(".mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+        let key = workspace_key(workspace.path());
+        let store_path = home.path().join(xai_grok_workspace::trust::TRUST_FILE_NAME);
+
+        let provisional = snapshot(workspace.path(), None);
+        assert!(
+            provisional.allowed(),
+            "local snapshot must be inert/trusted"
+        );
+
+        grant_folder_trust(workspace.path());
+        provisional
+            .validate_current()
+            .expect("an inert local grant must not stale the snapshot")
+            .commit();
+
+        let cache = DECISIONS.lock();
+        assert_eq!(cache.decisions.get(&key), None);
+        assert_eq!(cache.generations.get(&key), None);
+        drop(cache);
+        assert!(
+            !store_path.exists(),
+            "an inert local grant must not create the durable trust store"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn provisional_snapshot_seal_rejects_a_newer_trust_decision() {
+        let _sim = simulate_release_build();
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set("GROK_HOME", home.path());
+        let workspace = repo_tmp();
+        std::fs::write(workspace.path().join(".mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+
+        let stale = snapshot(workspace.path(), None);
+        assert!(!stale.allowed());
+        record(&workspace_key(workspace.path()), true);
+
+        assert!(
+            stale.validate_current().is_err(),
+            "final publication must fail closed when trust changed after construction"
+        );
+        assert_eq!(
+            cached_for_test(workspace.path()),
+            Some(true),
+            "a stale provisional verdict must not overwrite the newer decision"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn provisional_snapshot_seal_rejects_new_project_code_exec_config() {
+        let _sim = simulate_release_build();
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set("GROK_HOME", home.path());
+        let workspace = repo_tmp();
+
+        let stale_allow = snapshot(workspace.path(), None);
+        assert!(
+            stale_allow.allowed(),
+            "an empty workspace is provisionally allowed"
+        );
+        std::fs::write(workspace.path().join(".mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+
+        assert!(
+            stale_allow.validate_current().is_err(),
+            "adding repo-controlled executable configuration must invalidate the final seal"
+        );
+        assert_eq!(cached_for_test(workspace.path()), None);
     }
 
     #[test]
@@ -685,7 +991,11 @@ mod tests {
             "an unrecordable root reports was_trusted=false"
         );
         assert!(
-            DECISIONS.lock().get(&workspace_key(home.path())).is_none(),
+            DECISIONS
+                .lock()
+                .decisions
+                .get(&workspace_key(home.path()))
+                .is_none(),
             "revoke must record no cache deny for an unrecordable root"
         );
         assert!(
@@ -1468,7 +1778,11 @@ mod tests {
         // Empty repo: nothing to gate => allowed, but left UNRECORDED (provisional).
         assert!(resolve_and_record(tmp.path(), None, false));
         assert!(
-            DECISIONS.lock().get(&workspace_key(tmp.path())).is_none(),
+            DECISIONS
+                .lock()
+                .decisions
+                .get(&workspace_key(tmp.path()))
+                .is_none(),
             "provisional no-configs allow must not be cached as a durable grant"
         );
 
@@ -1506,7 +1820,11 @@ mod tests {
         let empty = repo_tmp();
         let lt = resolve_launch_dir_trust(empty.path(), None);
         assert!(
-            DECISIONS.lock().get(&workspace_key(empty.path())).is_none(),
+            DECISIONS
+                .lock()
+                .decisions
+                .get(&workspace_key(empty.path()))
+                .is_none(),
             "provisional no-configs allow must not be cached by resolve_launch_dir_trust"
         );
         assert_eq!(lt, resolve_and_record(empty.path(), None, false));

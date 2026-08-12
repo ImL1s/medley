@@ -106,6 +106,28 @@ pub(crate) fn merge_managed_mcp_servers(
     .collect()
 }
 
+pub(crate) fn merge_managed_mcp_servers_with_trust_snapshot(
+    client_mcp_servers: Vec<acp::McpServer>,
+    cwd: &std::path::Path,
+    managed_configs: &[ManagedMcpConfig],
+    plugin_registry: Option<&xai_grok_agent::plugins::PluginRegistry>,
+    compat: &xai_grok_tools::types::compat::CompatConfig,
+    project_trusted: bool,
+) -> Vec<acp::McpServer> {
+    merge_managed_mcp_servers_with_policy_and_trust(
+        client_mcp_servers,
+        cwd,
+        managed_configs,
+        plugin_registry,
+        compat,
+        Some(project_trusted),
+    )
+    .into_iter()
+    .filter(|s| s.disabled_reason.is_none())
+    .map(|s| s.server)
+    .collect()
+}
+
 /// Merge the managed catalog into ONE live session's MCP set and push the
 /// result via [`crate::session::SessionCommand::UpdateMcpServers`]; returns
 /// `true` if the command was enqueued (session still alive).
@@ -185,6 +207,24 @@ pub(crate) fn merge_managed_mcp_servers_with_policy(
     plugin_registry: Option<&xai_grok_agent::plugins::PluginRegistry>,
     compat: &xai_grok_tools::types::compat::CompatConfig,
 ) -> Vec<McpServerWithPolicy> {
+    merge_managed_mcp_servers_with_policy_and_trust(
+        client_mcp_servers,
+        cwd,
+        managed_configs,
+        plugin_registry,
+        compat,
+        None,
+    )
+}
+
+fn merge_managed_mcp_servers_with_policy_and_trust(
+    client_mcp_servers: Vec<acp::McpServer>,
+    cwd: &std::path::Path,
+    managed_configs: &[ManagedMcpConfig],
+    plugin_registry: Option<&xai_grok_agent::plugins::PluginRegistry>,
+    compat: &xai_grok_tools::types::compat::CompatConfig,
+    trust_snapshot: Option<bool>,
+) -> Vec<McpServerWithPolicy> {
     let mut servers: HashMap<String, acp::McpServer> =
         merge_managed_mcp_servers_sourced(cwd, plugin_registry, compat)
             .into_iter()
@@ -214,7 +254,12 @@ pub(crate) fn merge_managed_mcp_servers_with_policy(
     // repo-local (project-scoped) servers before they can be spawned. No-op for
     // a trusted/unrecorded workspace. Composes with the managed-deny allowlist
     // applied next (both filters run on the survivors).
-    let merged = crate::agent::folder_trust::filter_untrusted_project_mcp(cwd, merged);
+    let merged = match trust_snapshot {
+        Some(trusted) => crate::agent::folder_trust::filter_untrusted_project_mcp_with_verdict(
+            cwd, merged, trusted,
+        ),
+        None => crate::agent::folder_trust::filter_untrusted_project_mcp(cwd, merged),
+    };
     let allowlist = &xai_grok_workspace::permission::resolution::managed_settings().mcp_allowlist;
     apply_mcp_server_policy(merged, &disabled, allowlist)
 }
