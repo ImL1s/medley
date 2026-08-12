@@ -643,6 +643,75 @@ mod tests {
         }
     }
 
+    /// #357: the chained `/model` picker is a distinct UI path from
+    /// `/effort`; lock both the Ultra row and the typed action it dispatches.
+    #[test]
+    fn chained_model_picker_renders_and_dispatches_ultra() {
+        let mut state = ModelState::default();
+        let (id, info) = model_with_meta(
+            "gpt-5.6-sol",
+            "GPT-5.6 Sol",
+            serde_json::json!({
+                "supportsReasoningEffort": true,
+                "reasoningEffort": "low",
+                "reasoningEfforts": [
+                    { "id": "low", "value": "low", "label": "Low", "default": true },
+                    { "id": "medium", "value": "medium", "label": "Medium" },
+                    { "id": "high", "value": "high", "label": "High" },
+                    { "id": "xhigh", "value": "xhigh", "label": "Xhigh" },
+                    { "id": "max", "value": "max", "label": "Max" },
+                    {
+                        "id": "ultra",
+                        "value": "ultra",
+                        "label": "Ultra",
+                        "description": "Maximum reasoning with proactive multi-agent guidance"
+                    }
+                ]
+            })
+            .as_object()
+            .expect("Codex ACP metadata")
+            .clone(),
+        );
+        state.available.insert(id.clone(), info);
+
+        let app_ctx = AppCtx {
+            models: &state,
+            cwd: std::path::Path::new("."),
+            has_session_announcements: false,
+            billing_surface_visible: true,
+            usage_command_visible: true,
+            workflows_available: true,
+            screen_mode: crate::app::ScreenMode::Fullscreen,
+        };
+        let model_rows = ModelCommand
+            .suggest_args(&app_ctx, "")
+            .expect("model picker rows");
+        assert_eq!(model_rows.len(), 1);
+        assert_eq!(model_rows[0].insert_text, "gpt-5.6-sol ");
+
+        let effort_rows = ModelCommand
+            .suggest_args(&app_ctx, "gpt-5.6-sol ")
+            .expect("chained effort rows");
+        let ultra = effort_rows
+            .iter()
+            .find(|row| row.insert_text == "gpt-5.6-sol ultra")
+            .expect("Ultra row");
+        assert_eq!(ultra.display, "Ultra");
+        assert_eq!(
+            ultra.description,
+            "Maximum reasoning with proactive multi-agent guidance"
+        );
+
+        let mut exec_ctx = dummy_exec_ctx(&state);
+        match ModelCommand.run(&mut exec_ctx, "GPT-5.6 Sol ultra") {
+            CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+                assert_eq!(model_id, id);
+                assert_eq!(effort, Some(ReasoningEffort::Ultra));
+            }
+            other => panic!("expected Ultra SwitchModel action, got {other:?}"),
+        }
+    }
+
     #[test]
     fn run_rejects_unoffered_effort_with_effort_error_not_unknown_model() {
         // Regression: previously `resolve_effort_token_for` returned None and

@@ -5713,6 +5713,181 @@ fn load_restore_apply_bypasses_own_marker_and_preserves_request_order() {
         }));
 }
 
+/// #357: the active `session/load` path must restore a persisted Ultra effort
+/// into the actor request and the resident mirror when the refreshed catalog
+/// still advertises it.
+#[test]
+fn load_restore_preserves_advertised_persisted_ultra_effort() {
+    use crate::agent::config::EndpointsConfig;
+    use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption};
+
+    run_local_for_bridge_test(|| async {
+        let model_id = "gpt-5.6-sol";
+        let agent = build_agent_with_model_for_tests(model_id, "grok-build");
+        let mut entry = agent
+            .models_manager
+            .models()
+            .get(model_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                crate::agent::config::ModelEntry::fallback(
+                    model_id,
+                    &EndpointsConfig::default(),
+                )
+            });
+        entry.info.supports_reasoning_effort = true;
+        entry.info.reasoning_effort = Some(ReasoningEffort::Low);
+        entry.info.reasoning_efforts = vec![
+            ReasoningEffortOption {
+                id: "low".into(),
+                value: ReasoningEffort::Low,
+                label: "Low".into(),
+                description: None,
+                default: true,
+            },
+            ReasoningEffortOption {
+                id: "ultra".into(),
+                value: ReasoningEffort::Ultra,
+                label: "Ultra".into(),
+                description: None,
+                default: false,
+            },
+        ];
+        agent
+            .models_manager
+            .insert_test_entry(model_id, entry);
+
+        let session_id = acp::SessionId::new("resume-ultra-advertised");
+        let guard = agent.begin_session_load(&session_id).expect("load claim");
+        let mut handle = make_test_handle(model_id, false, None);
+        handle.info.id = session_id.clone();
+        let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
+        handle.cmd_tx = command_tx;
+        agent.session_registry.put_resident(&session_id, handle);
+
+        tokio::task::spawn_local(async move {
+            while let Some(command) = command_rx.recv().await {
+                match command {
+                    TestSessionCommand::GetActiveAgent { responds_to } => {
+                        let _ = responds_to.send(Some("grok-build".to_owned()));
+                    }
+                    TestSessionCommand::ApplyModelSwitch {
+                        prepared,
+                        responds_to,
+                    } => {
+                        assert_eq!(
+                            prepared.sampling_config.reasoning_effort,
+                            Some(ReasoningEffort::Ultra),
+                            "session/load must send the persisted Ultra tier to the actor"
+                        );
+                        let _ = responds_to.send(Ok(crate::session::AppliedModelSwitch {
+                            previous_model_id: acp::ModelId::new(model_id),
+                            catalog_model_id: acp::ModelId::new(model_id),
+                            did_rebuild: false,
+                            active_agent_type: Some("grok-build".to_owned()),
+                            web_search: None,
+                        }));
+                    }
+                    _ => panic!("unexpected command during Ultra restore"),
+                }
+            }
+        });
+
+        let info = crate::session::info::Info {
+            id: session_id.clone(),
+            cwd: "/tmp/resume-ultra-advertised".to_owned(),
+        };
+        let mut summary =
+            crate::session::persistence::Summary::new(&info, acp::ModelId::new(model_id))
+                .expect("summary");
+        summary.reasoning_effort = Some(ReasoningEffort::Ultra);
+
+        agent
+            .restore_persisted_model(&session_id, &summary, &guard)
+            .await;
+        let resident = agent.resident_handle(&session_id).expect("resident handle");
+        assert_eq!(resident.model_id.0.as_ref(), model_id);
+        assert_eq!(resident.reasoning_effort, Some(ReasoningEffort::Ultra));
+        assert_eq!(agent.session_registry.unavailable_model(&session_id), None);
+        drop(guard);
+    });
+}
+
+/// #357: a saved Ultra tier is no longer valid when the refreshed model menu
+/// stops at Max. The attach must latch the session instead of silently running
+/// with the model default.
+#[test]
+fn load_restore_latches_when_persisted_ultra_is_no_longer_advertised() {
+    use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption};
+
+    run_local_for_bridge_test(|| async {
+        let model_id = "gpt-5.6-luna";
+        let agent = build_agent_with_model_for_tests(model_id, "grok-build");
+        let mut entry = agent.models_manager.models()[model_id].clone();
+        entry.info.supports_reasoning_effort = true;
+        entry.info.reasoning_effort = Some(ReasoningEffort::Medium);
+        entry.info.reasoning_efforts = vec![ReasoningEffortOption {
+            id: "max".into(),
+            value: ReasoningEffort::Max,
+            label: "Max".into(),
+            description: None,
+            default: false,
+        }];
+        agent
+            .models_manager
+            .insert_test_entry(model_id, entry);
+
+        let session_id = acp::SessionId::new("resume-ultra-stale");
+        let guard = agent.begin_session_load(&session_id).expect("load claim");
+        let mut handle = make_test_handle(model_id, false, None);
+        handle.info.id = session_id.clone();
+        let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
+        handle.cmd_tx = command_tx;
+        agent.session_registry.put_resident(&session_id, handle);
+
+        tokio::task::spawn_local(async move {
+            while let Some(command) = command_rx.recv().await {
+                match command {
+                    TestSessionCommand::GetActiveAgent { responds_to } => {
+                        let _ = responds_to.send(Some("grok-build".to_owned()));
+                    }
+                    TestSessionCommand::ApplyModelSwitch { .. } => {
+                        panic!("stale persisted Ultra must fail before actor dispatch")
+                    }
+                    _ => panic!("unexpected command during stale Ultra restore"),
+                }
+            }
+        });
+
+        let info = crate::session::info::Info {
+            id: session_id.clone(),
+            cwd: "/tmp/resume-ultra-stale".to_owned(),
+        };
+        let mut summary =
+            crate::session::persistence::Summary::new(&info, acp::ModelId::new(model_id))
+                .expect("summary");
+        summary.reasoning_effort = Some(ReasoningEffort::Ultra);
+
+        agent
+            .restore_persisted_model(&session_id, &summary, &guard)
+            .await;
+        assert_eq!(
+            agent.session_registry.unavailable_model(&session_id),
+            Some(acp::ModelId::new(model_id)),
+            "invalid persisted effort must latch prompts"
+        );
+        assert_eq!(
+            agent
+                .resident_handle(&session_id)
+                .expect("resident remains for diagnostics")
+                .reasoning_effort,
+            None,
+            "stale Ultra must not silently become the model default"
+        );
+        drop(guard);
+    });
+}
+
 /// A failed load (guard dropped WITHOUT registering the session) also
 /// wakes waiters — they re-check, find nothing, and the caller surfaces
 /// the regular "unknown session id" error rather than hanging.

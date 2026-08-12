@@ -4,7 +4,6 @@
 //! internal callers (`new_session`, `load_session`, prompt restore) cannot
 //! race auth visibility, `allowed_models`, catalog replacement, or readiness.
 use crate::agent::config;
-use crate::agent::models::model_offers_reasoning_effort;
 use crate::agent::mvp_agent::{
     ModelSwitchCommitOutcome, MvpAgent, SessionLoadGuard, UnavailableModelCommitPolicy,
     UnavailableRecoverySnapshot, agent_name_after_model_switch, apply_session_cli_clamps,
@@ -13,13 +12,66 @@ use crate::agent::mvp_agent::{
 use crate::session::SessionCommand;
 use agent_client_protocol::{self as acp};
 use tokio::sync::oneshot;
-use xai_grok_sampling_types::{ReasoningEffort, parse_reasoning_effort_meta};
+use xai_grok_sampling_types::{REASONING_EFFORT_META_KEY, ReasoningEffort};
 
-fn model_switch_offers_reasoning_effort(
+fn model_switch_reasoning_efforts(model: &config::ModelEntry) -> Vec<ReasoningEffort> {
+    let info = model.info();
+    if !info.supports_reasoning_effort {
+        Vec::new()
+    } else if info.reasoning_efforts.is_empty() {
+        crate::agent::session_config::SELECTABLE_REASONING_EFFORTS.to_vec()
+    } else {
+        info.reasoning_efforts
+            .iter()
+            .map(|option| option.value)
+            .collect()
+    }
+}
+
+fn validate_model_switch_reasoning_effort(
+    model_id: &acp::ModelId,
     model: &config::ModelEntry,
     effort: ReasoningEffort,
-) -> bool {
-    model_offers_reasoning_effort(model.info(), effort)
+) -> Result<(), acp::Error> {
+    let offered_reasoning_efforts = model_switch_reasoning_efforts(model);
+    if offered_reasoning_efforts.contains(&effort) {
+        return Ok(());
+    }
+
+    Err(acp::Error::invalid_params().data(serde_json::json!({
+        "code": config::MODEL_SWITCH_VALIDATION_FAILED,
+        "reason": "reasoning_effort_not_offered",
+        "modelId": model_id.0.as_ref(),
+        "requestedReasoningEffort": effort.to_string(),
+        "offeredReasoningEfforts": offered_reasoning_efforts
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+    })))
+}
+
+fn parse_model_switch_reasoning_effort_meta(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Result<Option<ReasoningEffort>, acp::Error> {
+    let Some(raw) = meta.and_then(|meta| meta.get(REASONING_EFFORT_META_KEY)) else {
+        return Ok(None);
+    };
+    let Some(token) = raw.as_str() else {
+        return Err(acp::Error::invalid_params().data(serde_json::json!({
+            "code": config::MODEL_SWITCH_VALIDATION_FAILED,
+            "reason": "invalid_reasoning_effort_meta",
+            "field": REASONING_EFFORT_META_KEY,
+            "requestedReasoningEffort": raw,
+        })));
+    };
+    token.parse().map(Some).map_err(|_| {
+        acp::Error::invalid_params().data(serde_json::json!({
+            "code": config::MODEL_SWITCH_VALIDATION_FAILED,
+            "reason": "invalid_reasoning_effort_meta",
+            "field": REASONING_EFFORT_META_KEY,
+            "requestedReasoningEffort": token,
+        }))
+    })
 }
 
 pub(crate) struct FailureTelemetry {
@@ -241,15 +293,16 @@ async fn apply_with_load_gate(
 ) -> Result<Option<acp::SetSessionModelResponse>, acp::Error> {
     tracing::info!("Received set session model request {args:?}");
     tracing::debug!("session_session_model::mvp_agent: {:?}", &args);
-    let effort_override = parse_reasoning_effort_meta(args.meta.as_ref());
     let acp::SetSessionModelRequest {
         session_id,
         model_id: requested_model_id,
+        meta,
         ..
     } = args;
     // Armed until the complete actor receipt and outer mirrors have committed.
     // Every early return therefore emits exactly one sanitized failure event.
     let mut failure_telemetry = FailureTelemetry::new(&session_id, &requested_model_id);
+    let effort_override = parse_model_switch_reasoning_effort_meta(meta.as_ref())?;
     let _load_resolved_handle = match load_guard {
         Some(guard) => agent.session_handle_during_load(&session_id, guard),
         None => agent.session_handle_waiting_for_load(&session_id).await,
@@ -397,22 +450,13 @@ async fn apply_with_load_gate(
     let mut model_sampling =
         agent.prepare_sampling_config_for_model(&model, handle.origin_client.clone());
     if let Some(eff) = effort_override {
-        if model_switch_offers_reasoning_effort(&model, eff) {
-            tracing::info!(
-                session_id = %session_id.0,
-                effort = %eff,
-                "set_session_model: applying reasoning_effort override from meta"
-            );
-            model_sampling.reasoning_effort = Some(eff);
-        } else {
-            tracing::warn!(
-                session_id = %session_id.0,
-                model_id = %catalog_model_id.0,
-                model_slug = %model.info().model,
-                effort = %eff,
-                "set_session_model: ignoring reasoning_effort override — model does not offer it"
-            );
-        }
+        validate_model_switch_reasoning_effort(&catalog_model_id, &model, eff)?;
+        tracing::info!(
+            session_id = %session_id.0,
+            effort = %eff,
+            "set_session_model: applying reasoning_effort override from meta"
+        );
+        model_sampling.reasoning_effort = Some(eff);
     }
     let applied_effort = model_sampling.reasoning_effort;
     let summary_follows_default = handle
@@ -642,9 +686,63 @@ mod tests {
     use xai_grok_sampling_types::ReasoningEffortOption;
 
     #[test]
-    fn model_switch_rejects_effort_outside_model_menu() {
+    fn model_switch_reasoning_effort_meta_absence_preserves_default() {
+        assert_eq!(
+            parse_model_switch_reasoning_effort_meta(None).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_model_switch_reasoning_effort_meta(Some(&serde_json::Map::new())).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn model_switch_rejects_non_string_reasoning_effort_meta() {
+        let meta = serde_json::json!({ REASONING_EFFORT_META_KEY: 3 })
+            .as_object()
+            .cloned()
+            .unwrap();
+
+        let error = parse_model_switch_reasoning_effort_meta(Some(&meta)).unwrap_err();
+
+        assert_eq!(error.code, acp::ErrorCode::InvalidParams);
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({
+                "code": config::MODEL_SWITCH_VALIDATION_FAILED,
+                "reason": "invalid_reasoning_effort_meta",
+                "field": REASONING_EFFORT_META_KEY,
+                "requestedReasoningEffort": 3,
+            }))
+        );
+    }
+
+    #[test]
+    fn model_switch_rejects_unknown_reasoning_effort_meta() {
+        let meta = serde_json::json!({ REASONING_EFFORT_META_KEY: "future" })
+            .as_object()
+            .cloned()
+            .unwrap();
+
+        let error = parse_model_switch_reasoning_effort_meta(Some(&meta)).unwrap_err();
+
+        assert_eq!(error.code, acp::ErrorCode::InvalidParams);
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({
+                "code": config::MODEL_SWITCH_VALIDATION_FAILED,
+                "reason": "invalid_reasoning_effort_meta",
+                "field": REASONING_EFFORT_META_KEY,
+                "requestedReasoningEffort": "future",
+            }))
+        );
+    }
+
+    #[test]
+    fn model_switch_returns_structured_invalid_params_for_effort_outside_model_menu() {
         let mut model =
-            config::ModelEntry::fallback("catalog-model", &config::EndpointsConfig::default());
+            config::ModelEntry::fallback("gpt-5.6-luna", &config::EndpointsConfig::default());
         model.info.supports_reasoning_effort = true;
         model.info.reasoning_efforts = vec![ReasoningEffortOption {
             id: "low".into(),
@@ -654,13 +752,74 @@ mod tests {
             default: true,
         }];
 
-        assert!(model_switch_offers_reasoning_effort(
+        let error = validate_model_switch_reasoning_effort(
+            &acp::ModelId::new("codex-luna"),
             &model,
-            ReasoningEffort::Low
-        ));
+            ReasoningEffort::Ultra,
+        )
+        .unwrap_err();
+
+        assert!(error.code == acp::ErrorCode::InvalidParams);
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({
+                "code": config::MODEL_SWITCH_VALIDATION_FAILED,
+                "reason": "reasoning_effort_not_offered",
+                "modelId": "codex-luna",
+                "requestedReasoningEffort": "ultra",
+                "offeredReasoningEfforts": ["low"],
+            }))
+        );
+    }
+
+    #[test]
+    fn model_switch_accepts_catalog_advertised_ultra_effort() {
+        let mut model =
+            config::ModelEntry::fallback("gpt-5.6-sol", &config::EndpointsConfig::default());
+        model.info.supports_reasoning_effort = true;
+        model.info.reasoning_efforts = vec![ReasoningEffortOption {
+            id: "ultra".into(),
+            value: ReasoningEffort::Ultra,
+            label: "Ultra".into(),
+            description: None,
+            default: false,
+        }];
+
         assert!(
-            !model_switch_offers_reasoning_effort(&model, ReasoningEffort::Xhigh),
-            "set_session_model metadata must not bypass the model-specific catalog menu"
+            validate_model_switch_reasoning_effort(
+                &acp::ModelId::new("codex-sol"),
+                &model,
+                ReasoningEffort::Ultra,
+            )
+            .is_ok(),
+            "an explicit Ultra request must succeed when the catalog advertises it"
+        );
+    }
+
+    #[test]
+    fn model_switch_invalid_effort_reports_effective_legacy_menu() {
+        let mut model =
+            config::ModelEntry::fallback("legacy-reasoning", &config::EndpointsConfig::default());
+        model.info.supports_reasoning_effort = true;
+        model.info.reasoning_efforts.clear();
+
+        let error = validate_model_switch_reasoning_effort(
+            &acp::ModelId::new("legacy-reasoning"),
+            &model,
+            ReasoningEffort::Ultra,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, acp::ErrorCode::InvalidParams);
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({
+                "code": config::MODEL_SWITCH_VALIDATION_FAILED,
+                "reason": "reasoning_effort_not_offered",
+                "modelId": "legacy-reasoning",
+                "requestedReasoningEffort": "ultra",
+                "offeredReasoningEfforts": ["minimal", "low", "medium", "high", "xhigh"],
+            }))
         );
     }
 

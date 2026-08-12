@@ -1314,10 +1314,20 @@ mod is_hidden_tests {
         let back: Summary = serde_json::from_str(&json).unwrap();
         assert_eq!(back.reasoning_effort, None);
 
-        s.reasoning_effort = Some(ReasoningEffort::Xhigh);
-        let json = serde_json::to_string(&s).unwrap();
-        let back: Summary = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.reasoning_effort, Some(ReasoningEffort::Xhigh));
+        for (effort, serialized) in [
+            (ReasoningEffort::Xhigh, "xhigh"),
+            (ReasoningEffort::Max, "max"),
+            (ReasoningEffort::Ultra, "ultra"),
+        ] {
+            s.reasoning_effort = Some(effort);
+            let json = serde_json::to_string(&s).unwrap();
+            assert!(
+                json.contains(&format!(r#""reasoning_effort":"{serialized}""#)),
+                "{effort:?} must serialize as {serialized}: {json}"
+            );
+            let back: Summary = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.reasoning_effort, Some(effort));
+        }
     }
 
     #[test]
@@ -6761,7 +6771,7 @@ mod resumed_sandbox_profile_tests {
 #[cfg(test)]
 mod session_exists_for_cwd_tests {
     use super::{
-        UNPUBLISHED_SESSION_MARKER, resolve_local_session_any_cwd_in_root,
+        ReasoningEffort, UNPUBLISHED_SESSION_MARKER, resolve_local_session_any_cwd_in_root,
         session_exists_for_cwd_in_root, session_exists_in_root,
     };
     use std::fs;
@@ -6927,6 +6937,7 @@ mod session_exists_for_cwd_tests {
                 "num_messages": 2,
                 "num_chat_messages": 1,
                 "current_model_id": "test",
+                "reasoning_effort": "ultra",
             })
             .to_string(),
         )
@@ -6937,6 +6948,7 @@ mod session_exists_for_cwd_tests {
         assert_eq!(summary.info.id.0.as_ref(), session_id);
         assert_eq!(summary.info.cwd, cwd);
         assert_eq!(summary.session_summary, "cross-cwd hit");
+        assert_eq!(summary.reasoning_effort, Some(ReasoningEffort::Ultra));
     }
 }
 

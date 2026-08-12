@@ -981,14 +981,42 @@ impl MvpAgent {
                 );
                 map
             });
-            let _ = super::acp_agent::restore_registered_session_model(
+            let apply_result = super::acp_agent::restore_registered_session_model(
                 self,
-                acp::SetSessionModelRequest::new(session_id.to_owned(), model_id)
+                acp::SetSessionModelRequest::new(session_id.to_owned(), model_id.clone())
                     .meta(restore_meta),
                 load_guard,
                 restored_model,
             )
             .await;
+            if let Err(error) = apply_result {
+                tracing::warn!(
+                    session_id = %session_id.0,
+                    model_id = %model_id.0,
+                    error = ?error,
+                    "load_session: persisted model or effort restore failed; latching prompts"
+                );
+                xai_grok_telemetry::unified_log::warn(
+                    "load_session: persisted model or effort restore failed",
+                    Some(session_id.0.as_ref()),
+                    Some(serde_json::json!({
+                        "model_id": model_id.0.as_ref(),
+                        "reasoning_effort_present": summary.reasoning_effort.is_some(),
+                    })),
+                );
+                self.session_registry.set_unavailable_model_with_identity(
+                    &session_id,
+                    model_id.clone(),
+                    summary
+                        .catalog_identity
+                        .clone()
+                        .filter(|identity| identity.model_id == model_id.0.as_ref()),
+                    summary.agent_name.clone().or_else(|| {
+                        self.resident_handle(&session_id)
+                            .map(|handle| handle.agent_name)
+                    }),
+                );
+            }
         }
     }
     /// Response phase: assemble the attach `_meta`, including the running

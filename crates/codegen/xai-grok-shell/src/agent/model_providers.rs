@@ -13,26 +13,12 @@ pub const OPENAI_CODEX_PROVIDER_ID: &str = "openai-codex";
 /// replaces the preset in place instead of adding a second entry.
 pub const OPENAI_CODEX_PRESET_MODEL_ID: &str = "gpt-5.6-sol";
 
-/// Conservative context window for the preset, and a guess.
+/// Conservative context window for the built-in fallback preset.
 ///
-/// Under-reporting only makes auto-compact fire earlier, which is the safe
-/// direction — but the figure is far enough off that the context bar reads as
-/// the model's real capacity and sessions compact long before they need to
-/// (#122). A user can correct it with a metadata-only `[model."gpt-5.6-sol"]`
-/// override; the custom-models guide documents how.
-///
-/// This comment used to assert that "Codex-side metadata is not discoverable
-/// from the CLI". **That is false.** Codex exposes `GET {base}/models` against
-/// the same `chatgpt.com/backend-api/codex` base this fork already uses, and
-/// its payload carries `context_window` and `max_context_window`. This fork
-/// does not fetch that catalog — the Codex path only hardcodes this constant.
-/// Fetching it would remove the guess rather than move it, and costs one
-/// authenticated probe to confirm the payload shape.
-///
-/// It also used to say the value "matches the value the custom-models guide
-/// has always used in its Codex example". Nothing enforced that coupling and
-/// the guide's example has since changed, so the claim is dropped rather than
-/// re-stated.
+/// A successful account-scoped catalog refresh replaces this estimate with
+/// the server's `context_window` metadata. Under-reporting is the safe degraded
+/// behavior when neither a live nor saved catalog is available because it only
+/// makes auto-compaction start earlier.
 const OPENAI_CODEX_PRESET_CONTEXT_WINDOW: u64 = 200_000;
 const OPENAI_CODEX_MODELS_CATALOG_DESCRIPTION: &str = "OpenAI Codex via a ChatGPT subscription";
 const OPENAI_CODEX_CATALOG_CACHE_DIR: &str = "codex-model-catalog";
@@ -2777,6 +2763,225 @@ mod tests {
         assert_eq!(b_meta["reasoningEfforts"][0]["value"], "medium");
         assert_eq!(b_meta["reasoningEfforts"][1]["value"], "xhigh");
         assert_eq!(b_meta["reasoningEffort"], "xhigh");
+    }
+
+    /// #357: keep the shipped Codex picker aligned with the complete live
+    /// catalog snapshot. This is intentionally an exact matrix: accepting
+    /// Ultra on Luna (or omitting it from Terra) is a release-blocking
+    /// capability mismatch, not a harmless presentation difference.
+    #[test]
+    fn codex_live_catalog_reasoning_capability_matrix_is_exact() {
+        use xai_grok_sampling_types::ReasoningEffort;
+
+        let payload = serde_json::json!({
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "display_name": "GPT-5.6-Sol",
+                    "default_reasoning_level": "low",
+                    "supported_reasoning_levels": [
+                        { "effort": "low" }, { "effort": "medium" },
+                        { "effort": "high" }, { "effort": "xhigh" },
+                        { "effort": "max" }, { "effort": "ultra" }
+                    ]
+                },
+                {
+                    "slug": "gpt-5.6-sol-wm",
+                    "display_name": "GPT-5.6-Sol-WM",
+                    "default_reasoning_level": "low",
+                    "supported_reasoning_levels": [
+                        { "effort": "low" }, { "effort": "medium" },
+                        { "effort": "high" }, { "effort": "xhigh" },
+                        { "effort": "max" }, { "effort": "ultra" }
+                    ]
+                },
+                {
+                    "slug": "gpt-5.6-terra",
+                    "display_name": "GPT-5.6-Terra",
+                    "default_reasoning_level": "medium",
+                    "supported_reasoning_levels": [
+                        { "effort": "low" }, { "effort": "medium" },
+                        { "effort": "high" }, { "effort": "xhigh" },
+                        { "effort": "max" }, { "effort": "ultra" }
+                    ]
+                },
+                {
+                    "slug": "gpt-5.6-luna",
+                    "display_name": "GPT-5.6-Luna",
+                    "default_reasoning_level": "medium",
+                    "supported_reasoning_levels": [
+                        { "effort": "low" }, { "effort": "medium" },
+                        { "effort": "high" }, { "effort": "xhigh" },
+                        { "effort": "max" }
+                    ]
+                },
+                {
+                    "slug": "gpt-5.5",
+                    "display_name": "GPT-5.5",
+                    "default_reasoning_level": "medium",
+                    "supported_reasoning_levels": [
+                        { "effort": "low" }, { "effort": "medium" },
+                        { "effort": "high" }, { "effort": "xhigh" }
+                    ]
+                },
+                {
+                    "slug": "gpt-5.4",
+                    "display_name": "GPT-5.4",
+                    "default_reasoning_level": "medium",
+                    "supported_reasoning_levels": [
+                        { "effort": "low" }, { "effort": "medium" },
+                        { "effort": "high" }, { "effort": "xhigh" }
+                    ]
+                },
+                {
+                    "slug": "gpt-5.4-mini",
+                    "display_name": "GPT-5.4-Mini",
+                    "default_reasoning_level": "medium",
+                    "supported_reasoning_levels": [
+                        { "effort": "low" }, { "effort": "medium" },
+                        { "effort": "high" }, { "effort": "xhigh" }
+                    ]
+                },
+                {
+                    "slug": "gpt-5.3-codex-spark",
+                    "display_name": "GPT-5.3-Codex-Spark",
+                    "default_reasoning_level": "high",
+                    "supported_reasoning_levels": [
+                        { "effort": "low" }, { "effort": "medium" },
+                        { "effort": "high" }, { "effort": "xhigh" }
+                    ]
+                },
+                {
+                    "slug": "codex-auto-review",
+                    "display_name": "Codex Auto Review",
+                    "default_reasoning_level": "medium",
+                    "supported_reasoning_levels": [
+                        { "effort": "low" }, { "effort": "medium" },
+                        { "effort": "high" }, { "effort": "xhigh" },
+                        { "effort": "max" }
+                    ]
+                }
+            ]
+        });
+
+        let six = vec![
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Xhigh,
+            ReasoningEffort::Max,
+            ReasoningEffort::Ultra,
+        ];
+        let five = vec![
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Xhigh,
+            ReasoningEffort::Max,
+        ];
+        let four = vec![
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Xhigh,
+        ];
+        let expected = [
+            ("gpt-5.6-sol", ReasoningEffort::Low, six.as_slice()),
+            ("gpt-5.6-sol-wm", ReasoningEffort::Low, six.as_slice()),
+            ("gpt-5.6-terra", ReasoningEffort::Medium, six.as_slice()),
+            ("gpt-5.6-luna", ReasoningEffort::Medium, five.as_slice()),
+            ("gpt-5.5", ReasoningEffort::Medium, four.as_slice()),
+            ("gpt-5.4", ReasoningEffort::Medium, four.as_slice()),
+            ("gpt-5.4-mini", ReasoningEffort::Medium, four.as_slice()),
+            (
+                "gpt-5.3-codex-spark",
+                ReasoningEffort::High,
+                four.as_slice(),
+            ),
+            (
+                "codex-auto-review",
+                ReasoningEffort::Medium,
+                five.as_slice(),
+            ),
+        ];
+
+        let presets = parse_openai_codex_catalog_models(&payload);
+        assert_eq!(presets.len(), expected.len());
+        assert_eq!(
+            presets.keys().map(String::as_str).collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|(slug, _, _)| *slug)
+                .collect::<Vec<_>>()
+        );
+
+        for (slug, default, efforts) in expected {
+            let preset = presets
+                .get(slug)
+                .unwrap_or_else(|| panic!("missing {slug}"));
+            assert_eq!(
+                preset.supports_reasoning_effort,
+                Some(true),
+                "{slug} must advertise reasoning support"
+            );
+            assert_eq!(
+                preset
+                    .reasoning_efforts
+                    .iter()
+                    .map(|option| option.value)
+                    .collect::<Vec<_>>(),
+                efforts.to_vec(),
+                "{slug} effort menu drifted"
+            );
+            assert_eq!(preset.reasoning_effort, Some(default), "{slug} default");
+            let defaults = preset
+                .reasoning_efforts
+                .iter()
+                .filter(|option| option.default)
+                .collect::<Vec<_>>();
+            assert_eq!(defaults.len(), 1, "{slug} must have one default");
+            assert_eq!(defaults[0].value, default, "{slug} default marker");
+        }
+    }
+
+    #[test]
+    fn codex_catalog_preserves_ultra_as_an_authoritative_default() {
+        let payload = serde_json::json!({
+            "models": [{
+                "slug": "gpt-5.6-sol",
+                "default_reasoning_level": "ultra",
+                "supported_reasoning_levels": [
+                    { "effort": "max", "description": "Maximum reasoning" },
+                    {
+                        "effort": "ultra",
+                        "description": "Maximum reasoning with proactive multi-agent guidance"
+                    }
+                ]
+            }]
+        });
+
+        let presets = parse_openai_codex_catalog_models(&payload);
+        let sol = presets.get("gpt-5.6-sol").expect("Sol catalog entry");
+        assert_eq!(
+            sol.reasoning_efforts
+                .iter()
+                .map(|option| option.value)
+                .collect::<Vec<_>>(),
+            vec![
+                xai_grok_sampling_types::ReasoningEffort::Max,
+                xai_grok_sampling_types::ReasoningEffort::Ultra,
+            ]
+        );
+        assert_eq!(
+            sol.reasoning_effort,
+            Some(xai_grok_sampling_types::ReasoningEffort::Ultra)
+        );
+        assert!(!sol.reasoning_efforts[0].default);
+        assert!(sol.reasoning_efforts[1].default);
+        assert_eq!(
+            sol.reasoning_efforts[1].description.as_deref(),
+            Some("Maximum reasoning with proactive multi-agent guidance")
+        );
     }
 
     #[test]

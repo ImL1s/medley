@@ -823,6 +823,124 @@ mod tests {
         );
     }
 
+    /// #357: the TUI/CLI resolver must consume the complete live Codex
+    /// capability matrix without inventing Ultra for models that stop at Max
+    /// or Xhigh.
+    #[test]
+    fn codex_live_effort_matrix_resolves_ultra_only_for_advertised_models() {
+        let matrix: [(&str, &str, &[&str]); 9] = [
+            (
+                "gpt-5.6-sol",
+                "low",
+                &["low", "medium", "high", "xhigh", "max", "ultra"],
+            ),
+            (
+                "gpt-5.6-sol-wm",
+                "low",
+                &["low", "medium", "high", "xhigh", "max", "ultra"],
+            ),
+            (
+                "gpt-5.6-terra",
+                "medium",
+                &["low", "medium", "high", "xhigh", "max", "ultra"],
+            ),
+            (
+                "gpt-5.6-luna",
+                "medium",
+                &["low", "medium", "high", "xhigh", "max"],
+            ),
+            ("gpt-5.5", "medium", &["low", "medium", "high", "xhigh"]),
+            ("gpt-5.4", "medium", &["low", "medium", "high", "xhigh"]),
+            (
+                "gpt-5.4-mini",
+                "medium",
+                &["low", "medium", "high", "xhigh"],
+            ),
+            (
+                "gpt-5.3-codex-spark",
+                "high",
+                &["low", "medium", "high", "xhigh"],
+            ),
+            (
+                "codex-auto-review",
+                "medium",
+                &["low", "medium", "high", "xhigh", "max"],
+            ),
+        ];
+
+        let mut state = ModelState::default();
+        for &(slug, default, efforts) in &matrix {
+            let id = acp::ModelId::new(Arc::from(slug));
+            let menu = efforts
+                .iter()
+                .map(|effort| {
+                    serde_json::json!({
+                        "id": effort,
+                        "value": effort,
+                        "label": effort,
+                        "default": *effort == default,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let meta = serde_json::json!({
+                "supportsReasoningEffort": true,
+                "reasoningEffort": default,
+                "reasoningEfforts": menu,
+            })
+            .as_object()
+            .expect("Codex effort metadata")
+            .clone();
+            state.available.insert(
+                id.clone(),
+                acp::ModelInfo::new(id.clone(), slug.to_string()).meta(Some(meta)),
+            );
+
+            let options = state.reasoning_effort_options_for(&id);
+            let expected = efforts
+                .iter()
+                .map(|effort| effort.parse::<ReasoningEffort>().expect("known effort"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                options
+                    .iter()
+                    .map(|option| option.value)
+                    .collect::<Vec<_>>(),
+                expected,
+                "{slug} picker menu"
+            );
+            assert_eq!(
+                options.iter().filter(|option| option.default).count(),
+                1,
+                "{slug} picker default count"
+            );
+
+            state.set_current(id.clone(), None);
+            assert_eq!(
+                state.reasoning_effort,
+                Some(default.parse().expect("known default")),
+                "{slug} selected default"
+            );
+
+            if efforts.contains(&"ultra") {
+                assert_eq!(
+                    state.resolve_effort_for_model(&id, "ultra"),
+                    Ok(ReasoningEffort::Ultra),
+                    "{slug} advertises Ultra"
+                );
+            } else {
+                assert_eq!(
+                    state.resolve_effort_for_model(&id, "ultra"),
+                    Err(EffortTokenError::UnknownToken {
+                        token: "ultra".to_string(),
+                        offered: efforts.iter().map(|effort| (*effort).to_string()).collect(),
+                    }),
+                    "{slug} must reject unadvertised Ultra"
+                );
+            }
+        }
+        assert_eq!(state.available.len(), matrix.len());
+    }
+
     #[test]
     fn unsupported_effort_message_names_config_switch() {
         let msg = EffortTokenError::Unsupported.message();

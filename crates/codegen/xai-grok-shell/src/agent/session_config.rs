@@ -60,6 +60,7 @@ fn effort_label(effort: ReasoningEffort) -> String {
         ReasoningEffort::High => "High",
         ReasoningEffort::Xhigh => "X-High",
         ReasoningEffort::Max => "Max",
+        ReasoningEffort::Ultra => "Ultra",
     }
     .to_string()
 }
@@ -195,6 +196,19 @@ mod tests {
                 .as_deref()
                 .is_some_and(|description| description.contains("no longer offered"))
         );
+    }
+
+    #[test]
+    fn active_ultra_effort_keeps_its_label_when_catalog_menu_disappears() {
+        let models = [model("gpt-5.6-sol", "GPT-5.6 Sol")];
+        let current = acp::ModelId::from("gpt-5.6-sol");
+        let opts =
+            build_session_config_options(&models, &current, &[], Some(ReasoningEffort::Ultra));
+        let modes: Vec<_> = opts.iter().filter(|o| o.category == "mode").collect();
+        assert_eq!(modes.len(), 1);
+        assert_eq!(modes[0].id, "ultra");
+        assert_eq!(modes[0].label, "Ultra");
+        assert!(modes[0].selected);
     }
 
     #[test]

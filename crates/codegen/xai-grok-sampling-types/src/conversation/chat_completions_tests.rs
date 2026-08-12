@@ -402,6 +402,7 @@ fn test_chat_completion_request_carries_reasoning_effort_top_level() {
         (crate::ReasoningEffort::High, "high"),
         (crate::ReasoningEffort::Xhigh, "xhigh"),
         (crate::ReasoningEffort::Max, "max"),
+        (crate::ReasoningEffort::Ultra, "ultra"),
     ] {
         let req =
             ConversationRequest::from_items(vec![ConversationItem::user("hi")]).with_model("test");

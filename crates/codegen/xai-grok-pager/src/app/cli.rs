@@ -2020,6 +2020,23 @@ mod tests {
         assert_eq!(deep.reasoning_effort.as_deref(), Some("deep"));
     }
     #[test]
+    fn top_level_headless_invocation_parses_codex_ultra() {
+        let args = PagerArgs::try_parse_from([
+            "grok",
+            "--model",
+            "gpt-5.6-sol",
+            "--effort",
+            "ultra",
+            "-p",
+            "ping",
+        ])
+        .expect("top-level Codex Ultra headless invocation parses");
+
+        assert_eq!(args.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(args.reasoning_effort.as_deref(), Some("ultra"));
+        assert_eq!(args.single.as_deref(), Some("ping"));
+    }
+    #[test]
     fn reasoning_effort_last_flag_wins_when_both_names_set() {
         let args =
             PagerArgs::try_parse_from(["grok", "--reasoning-effort", "low", "--effort", "high"])
