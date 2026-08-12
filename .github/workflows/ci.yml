@@ -324,6 +324,56 @@ jobs:
           shared-key: providers-test
           cache-targets: true
 
+      # #343: temp-store fixtures must bind to their requested path even when
+      # the caller already has an ambient auth override. Run both fixture-heavy
+      # modules with the normal libtest parallelism so process-wide env leakage
+      # cannot hide behind a serial harness.
+      - name: Codex auth fixtures ignore hostile ambient auth path
+        run: |
+          set -o pipefail
+          umask 077
+          hostile_auth_dir="$(mktemp -d "${TMPDIR:-/tmp}/medley-hostile-auth.XXXXXX")"
+          hostile_auth="$hostile_auth_dir/auth.json"
+          test_output=""
+          cleanup() {
+            if [ -n "$test_output" ]; then
+              rm -f "$test_output" 2>/dev/null || true
+            fi
+            rm -f "$hostile_auth" 2>/dev/null || true
+            rmdir "$hostile_auth_dir" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          trap 'exit 129' HUP
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          chmod 700 "$hostile_auth_dir"
+          printf '%s\n' '{}' >"$hostile_auth"
+          chmod 600 "$hostile_auth"
+          export GROK_AUTH_PATH="$hostile_auth"
+
+          run_nonzero() {
+            test_output="$(mktemp "$hostile_auth_dir/test-output.XXXXXX")"
+            cargo test "$@" 2>&1 | tee "$test_output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then
+              rm -f "$test_output"
+              test_output=""
+              return "$status"
+            fi
+            if grep -qE '^test result: ok\. 0 passed' "$test_output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$test_output"
+              test_output=""
+              return 1
+            fi
+            rm -f "$test_output"
+            test_output=""
+          }
+          run_nonzero -p xai-grok-shell --lib \
+            auth::openai_codex::tests:: -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            auth::manager::tests:: -- --nocapture
+
       # #356: the unit fixtures prove private staging in-process, but only the
       # production binary crosses config loading, auth-provider minting,
       # session publication, and the first authenticated Responses request.
