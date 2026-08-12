@@ -34,6 +34,9 @@ fn test_actor_with_remote_sync(
             remote_sync,
             // Resumed-style actor for these tests; upgrade backfill is fresh-only.
             created_fresh: false,
+            fresh_claim: None,
+            pending_publication_gate: None,
+            fresh_publication_aborted: false,
             relay_sync: None,
             summary: crate::session::summary::SummaryGenerator::new(
                 crate::session::summary::SummaryConfig {

@@ -297,6 +297,20 @@ mod capture {
     where
         S: Subscriber + for<'a> LookupSpan<'a>,
     {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _ctx: Context<'_, S>,
+        ) {
+            let mut v = Visitor::default();
+            attrs.record(&mut v);
+            let _ = self.tx.send(CapturedEvent {
+                level: *attrs.metadata().level(),
+                fields: v.out,
+            });
+        }
+
         fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
             let mut v = Visitor::default();
             event.record(&mut v);
@@ -1241,11 +1255,7 @@ fn harnesses_are_compatible_rejects_strict_mismatches() {
     let codex = xai_grok_agent::AgentDefinition::codex();
     let stock = xai_grok_agent::AgentDefinition::grok_build_plan();
     assert!(harnesses_are_compatible(&codex, "codex", None));
-    assert!(!harnesses_are_compatible(
-        &stock,
-        "codex",
-        Some(&codex),
-    ));
+    assert!(!harnesses_are_compatible(&stock, "codex", Some(&codex),));
     assert!(!harnesses_are_compatible(
         &stock,
         "missing-custom-harness",
@@ -1351,8 +1361,7 @@ fn cold_spawn_unresolved_model_uses_catalog_compatible_fallback_without_latch() 
     let persisted = acp::ModelId::new("persisted-unresolved");
     let compatible = acp::ModelId::new("second-ready-compatible");
 
-    let selection =
-        cold_spawn_fallback_selection(&persisted, Some(compatible.clone()), None);
+    let selection = cold_spawn_fallback_selection(&persisted, Some(compatible.clone()), None);
 
     assert_eq!(selection.model_id, compatible);
     assert_eq!(selection.unavailable_model, None);
@@ -1426,8 +1435,7 @@ fn cold_spawn_current_only_fallback_keeps_persisted_model_latched() {
     let persisted = acp::ModelId::new("persisted-unready");
     let current = acp::ModelId::new("current-compatible-but-not-selectable");
 
-    let selection =
-        cold_spawn_fallback_selection(&persisted, None, Some(current.clone()));
+    let selection = cold_spawn_fallback_selection(&persisted, None, Some(current.clone()));
 
     assert_eq!(selection.model_id, current);
     assert_eq!(selection.unavailable_model, Some(persisted));
@@ -1500,11 +1508,7 @@ fn harnesses_are_compatible_rejects_different_plugin_and_custom_prompt_sources()
     };
     let project = custom("/repo/.grok/agents/reviewer.md", "Project review prompt");
     let user = custom("/home/.grok/agents/reviewer.md", "User review prompt");
-    assert!(!harnesses_are_compatible(
-        &project,
-        "reviewer",
-        Some(&user),
-    ));
+    assert!(!harnesses_are_compatible(&project, "reviewer", Some(&user),));
 
     let mut inline = xai_grok_agent::AgentDefinition::default_grok_build();
     inline.name = "grok-build".to_owned();
@@ -1601,11 +1605,7 @@ fn harnesses_are_compatible_rejects_changed_strict_system_prompt() {
         "Different strict system prompt".to_owned(),
     );
 
-    assert!(!harnesses_are_compatible(
-        &active,
-        "codex",
-        Some(&required),
-    ));
+    assert!(!harnesses_are_compatible(&active, "codex", Some(&required),));
 }
 #[test]
 fn explicit_agent_type_wins_over_session_default() {
@@ -1757,6 +1757,9 @@ fn make_test_handle(
         capability_mode: None,
         resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         hunk_tracker_handle,
+        workspace_toolset: std::sync::Arc::new(
+            xai_grok_tools::registry::types::FinalizedToolset::empty_for_test(),
+        ),
         chat_state_handle: xai_chat_state::ChatStateHandle::noop(),
         signals_handle: crate::session::signals::SessionSignalsHandle::new(),
         gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -2299,15 +2302,10 @@ fn production_prompt_recovery_does_not_undo_a_concurrent_user_model_switch() {
     run_local_for_bridge_test(|| async {
         let old_model = "prompt-recovery-old";
         let new_model = "prompt-recovery-new";
-        let agent = std::rc::Rc::new(build_agent_with_model_for_tests(
-            old_model,
-            "grok-build",
-        ));
+        let agent = std::rc::Rc::new(build_agent_with_model_for_tests(old_model, "grok-build"));
         let mut new_entry = agent.models_manager.models()[old_model].clone();
         new_entry.info.model = new_model.to_owned();
-        agent
-            .models_manager
-            .insert_test_entry(new_model, new_entry);
+        agent.models_manager.insert_test_entry(new_model, new_entry);
 
         let sid = acp::SessionId::new("prompt-recovery-user-switch-race");
         let (mut handle, _cmd_tx, mut cmd_rx) = make_live_session_handle(&sid, None);
@@ -2330,17 +2328,14 @@ fn production_prompt_recovery_does_not_undo_a_concurrent_user_model_switch() {
         let (prompt_captured_tx, prompt_captured_rx) = tokio::sync::oneshot::channel();
         let hook_agent = agent.clone();
         let hook_sid = sid.clone();
-        super::acp_agent::install_prompt_recovery_boundary_hook(
-            &sid,
-            move |restore_model_id| {
-                assert_eq!(restore_model_id.0.as_ref(), old_model);
-                assert_eq!(
-                    hook_agent.session_registry.unavailable_model(&hook_sid),
-                    Some(acp::ModelId::new(old_model))
-                );
-                let _ = prompt_captured_tx.send(());
-            },
-        );
+        super::acp_agent::install_prompt_recovery_boundary_hook(&sid, move |restore_model_id| {
+            assert_eq!(restore_model_id.0.as_ref(), old_model);
+            assert_eq!(
+                hook_agent.session_registry.unavailable_model(&hook_sid),
+                Some(acp::ModelId::new(old_model))
+            );
+            let _ = prompt_captured_tx.send(());
+        });
 
         let apply_targets = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let actor_apply_targets = apply_targets.clone();
@@ -2356,8 +2351,7 @@ fn production_prompt_recovery_does_not_undo_a_concurrent_user_model_switch() {
             while let Some(command) = cmd_rx.recv().await {
                 match command {
                     TestSessionCommand::GetActiveAgent { responds_to } => {
-                        actor_get_active_agent_count
-                            .set(actor_get_active_agent_count.get() + 1);
+                        actor_get_active_agent_count.set(actor_get_active_agent_count.get() + 1);
                         if let Some(tx) = switch_holds_lock_tx.take() {
                             let _ = tx.send(());
                             prompt_captured_rx
@@ -2424,10 +2418,7 @@ fn production_prompt_recovery_does_not_undo_a_concurrent_user_model_switch() {
         let switch_task = tokio::task::spawn_local(async move {
             <MvpAgent as acp::Agent>::set_session_model(
                 &switch_agent,
-                acp::SetSessionModelRequest::new(
-                    switch_sid,
-                    acp::ModelId::new(new_model),
-                ),
+                acp::SetSessionModelRequest::new(switch_sid, acp::ModelId::new(new_model)),
             )
             .await
         });
@@ -2448,16 +2439,13 @@ fn production_prompt_recovery_does_not_undo_a_concurrent_user_model_switch() {
             .await
         });
 
-        let switch_result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            async {
-                let switch_result = switch_task.await.expect("switch task");
-                prompt_dispatched_rx
-                    .await
-                    .expect("the prompt must reach the actor after the user switch");
-                switch_result
-            },
-        )
+        let switch_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let switch_result = switch_task.await.expect("switch task");
+            prompt_dispatched_rx
+                .await
+                .expect("the prompt must reach the actor after the user switch");
+            switch_result
+        })
         .await
         .expect("the serialized switch and prompt must complete without deadlock");
         switch_result.expect("user model switch");
@@ -2492,10 +2480,7 @@ fn production_prompt_recovery_superseded_by_a_new_block_remains_fail_closed() {
         let old_model = "prompt-recovery-old-block";
         let ready_fallback = "prompt-recovery-ready-fallback";
         let new_unavailable_model = "prompt-recovery-new-block";
-        let agent = std::rc::Rc::new(build_agent_with_model_for_tests(
-            old_model,
-            "grok-build",
-        ));
+        let agent = std::rc::Rc::new(build_agent_with_model_for_tests(old_model, "grok-build"));
         let mut fallback_entry = agent.models_manager.models()[old_model].clone();
         fallback_entry.info.model = ready_fallback.to_owned();
         agent
@@ -2521,21 +2506,20 @@ fn production_prompt_recovery_superseded_by_a_new_block_remains_fail_closed() {
 
         let hook_agent = agent.clone();
         let hook_sid = sid.clone();
-        super::acp_agent::install_prompt_recovery_boundary_hook(
-            &sid,
-            move |restore_model_id| {
-                assert_eq!(restore_model_id.0.as_ref(), old_model);
-                hook_agent.with_resident_mut(&hook_sid, |resident| {
-                    resident.model_id = acp::ModelId::new(ready_fallback);
-                });
-                hook_agent.session_registry.set_unavailable_model_with_identity(
+        super::acp_agent::install_prompt_recovery_boundary_hook(&sid, move |restore_model_id| {
+            assert_eq!(restore_model_id.0.as_ref(), old_model);
+            hook_agent.with_resident_mut(&hook_sid, |resident| {
+                resident.model_id = acp::ModelId::new(ready_fallback);
+            });
+            hook_agent
+                .session_registry
+                .set_unavailable_model_with_identity(
                     &hook_sid,
                     acp::ModelId::new(new_unavailable_model),
                     None,
                     Some("grok-build".to_owned()),
                 );
-            },
-        );
+        });
 
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -2609,12 +2593,14 @@ fn production_prompt_recovery_preserves_an_aba_latch_written_during_actor_commit
                         actor_agent
                             .session_registry
                             .take_unavailable_model(&actor_sid);
-                        actor_agent.session_registry.set_unavailable_model_with_identity(
-                            &actor_sid,
-                            acp::ModelId::new(model_id),
-                            Some(actor_identity.clone()),
-                            Some("grok-build".to_owned()),
-                        );
+                        actor_agent
+                            .session_registry
+                            .set_unavailable_model_with_identity(
+                                &actor_sid,
+                                acp::ModelId::new(model_id),
+                                Some(actor_identity.clone()),
+                                Some("grok-build".to_owned()),
+                            );
                         let _ = responds_to.send(Ok(crate::session::AppliedModelSwitch {
                             previous_model_id: acp::ModelId::new(model_id),
                             catalog_model_id: acp::ModelId::new(model_id),
@@ -2674,10 +2660,9 @@ fn production_prompt_rechecks_a_new_latch_immediately_before_actor_dispatch() {
             while let Some(command) = cmd_rx.recv().await {
                 match command {
                     TestSessionCommand::GetCurrentPromptMode { responds_to } => {
-                        actor_agent.session_registry.set_unavailable_model(
-                            &actor_sid,
-                            acp::ModelId::new(model_id),
-                        );
+                        actor_agent
+                            .session_registry
+                            .set_unavailable_model(&actor_sid, acp::ModelId::new(model_id));
                         let _ = responds_to.send(Default::default());
                     }
                     TestSessionCommand::GetCurrentModel { responds_to } => {
@@ -2731,7 +2716,9 @@ struct TestSessionLoadMarker {
 impl TestSessionLoadMarker {
     fn begin(agent: &MvpAgent, session_id: &acp::SessionId) -> Self {
         let registry = agent.session_registry.clone();
-        let (tx, rx) = registry.begin_attach(session_id);
+        let (tx, rx) = registry
+            .begin_attach(session_id)
+            .expect("test load claim must be available");
         Self {
             registry,
             session_id: session_id.clone(),
@@ -2762,7 +2749,9 @@ fn production_prompt_fails_closed_when_load_starts_at_dispatch_boundary() {
         let registry_agent = agent.session_registry.clone();
         let hook_sid = sid.clone();
         super::acp_agent::install_prompt_dispatch_boundary_hook(&sid, move || {
-            let (tx, rx) = registry_agent.begin_attach(&hook_sid);
+            let (tx, rx) = registry_agent
+                .begin_attach(&hook_sid)
+                .expect("dispatch-boundary load claim must be available");
             *hook_marker.borrow_mut() = Some(TestSessionLoadMarker {
                 registry: registry_agent,
                 session_id: hook_sid,
@@ -2822,10 +2811,8 @@ fn production_prompt_rechecks_load_immediately_before_actor_dispatch() {
             while let Some(command) = cmd_rx.recv().await {
                 match command {
                     TestSessionCommand::GetCurrentPromptMode { responds_to } => {
-                        *actor_marker.borrow_mut() = Some(TestSessionLoadMarker::begin(
-                            &actor_agent,
-                            &actor_sid,
-                        ));
+                        *actor_marker.borrow_mut() =
+                            Some(TestSessionLoadMarker::begin(&actor_agent, &actor_sid));
                         let _ = responds_to.send(Default::default());
                     }
                     TestSessionCommand::GetCurrentModel { responds_to } => {
@@ -2878,9 +2865,7 @@ fn production_model_switch_rejects_load_started_while_waiting_for_dispatch_lock(
         let agent = build_agent_with_model_for_tests(old_model, "grok-build");
         let mut new_entry = agent.models_manager.models()[old_model].clone();
         new_entry.info.model = new_model.to_owned();
-        agent
-            .models_manager
-            .insert_test_entry(new_model, new_entry);
+        agent.models_manager.insert_test_entry(new_model, new_entry);
 
         let sid = acp::SessionId::new("switch-load-race");
         let (mut handle, _cmd_tx, mut cmd_rx) = make_live_session_handle(&sid, None);
@@ -2898,7 +2883,7 @@ fn production_model_switch_rejects_load_started_while_waiting_for_dispatch_lock(
             "the model switch must be waiting on the held dispatch lock"
         );
 
-        let load_guard = agent.begin_session_load(&sid);
+        let load_guard = agent.begin_session_load(&sid).expect("load claim");
         drop(dispatch_guard);
         let error = tokio::time::timeout(std::time::Duration::from_secs(5), switch)
             .await
@@ -2931,15 +2916,10 @@ fn production_user_model_switch_preserves_a_newer_unavailable_latch() {
         let old_model = "user-switch-old-model";
         let new_model = "user-switch-new-model";
         let concurrent_block = "user-switch-concurrent-block";
-        let agent = std::rc::Rc::new(build_agent_with_model_for_tests(
-            old_model,
-            "grok-build",
-        ));
+        let agent = std::rc::Rc::new(build_agent_with_model_for_tests(old_model, "grok-build"));
         let mut new_entry = agent.models_manager.models()[old_model].clone();
         new_entry.info.model = new_model.to_owned();
-        agent
-            .models_manager
-            .insert_test_entry(new_model, new_entry);
+        agent.models_manager.insert_test_entry(new_model, new_entry);
 
         let sid = acp::SessionId::new("user-switch-preserves-newer-latch");
         let (mut handle, _cmd_tx, mut cmd_rx) = make_live_session_handle(&sid, None);
@@ -2960,10 +2940,9 @@ fn production_user_model_switch_preserves_a_newer_unavailable_latch() {
                         responds_to,
                     } => {
                         assert_eq!(prepared.catalog_identity.model_id, new_model);
-                        actor_agent.session_registry.set_unavailable_model(
-                            &actor_sid,
-                            acp::ModelId::new(concurrent_block),
-                        );
+                        actor_agent
+                            .session_registry
+                            .set_unavailable_model(&actor_sid, acp::ModelId::new(concurrent_block));
                         let _ = responds_to.send(Ok(crate::session::AppliedModelSwitch {
                             previous_model_id: acp::ModelId::new(old_model),
                             catalog_model_id: acp::ModelId::new(new_model),
@@ -3007,15 +2986,10 @@ fn production_model_switch_rejects_a_receipt_from_a_replaced_resident() {
         let old_model = "replaced-resident-old-model";
         let new_model = "replaced-resident-new-model";
         let replacement_model = "replacement-resident-model";
-        let agent = std::rc::Rc::new(build_agent_with_model_for_tests(
-            old_model,
-            "grok-build",
-        ));
+        let agent = std::rc::Rc::new(build_agent_with_model_for_tests(old_model, "grok-build"));
         let mut new_entry = agent.models_manager.models()[old_model].clone();
         new_entry.info.model = new_model.to_owned();
-        agent
-            .models_manager
-            .insert_test_entry(new_model, new_entry);
+        agent.models_manager.insert_test_entry(new_model, new_entry);
 
         let sid = acp::SessionId::new("model-switch-replaced-resident");
         let (mut handle, _cmd_tx, mut cmd_rx) = make_live_session_handle(&sid, None);
@@ -3687,10 +3661,7 @@ async fn warm_gateway_catalog_does_not_reopen_session_admission() {
     agent.session_registry.put_resident(&sid, handle);
 
     assert!(
-        agent
-            .get_managed_mcp_gateway_tool_catalog()
-            .await
-            .is_some(),
+        agent.get_managed_mcp_gateway_tool_catalog().await.is_some(),
         "ready gateway catalog should use the warm cache"
     );
     assert!(
@@ -3758,16 +3729,17 @@ async fn explicit_gateway_cache_invalidation_waits_for_all_session_admissions() 
             let sid_second = acp::SessionId::new("sess-explicit-gateway-refresh-late");
             let (second_handle, _second_tx, mut second_rx) =
                 make_live_session_handle(&sid_second, None);
-            agent.session_registry.put_resident(&sid_second, second_handle);
-            first_ack.send(()).expect("first barrier receiver remains live");
+            agent
+                .session_registry
+                .put_resident(&sid_second, second_handle);
+            first_ack
+                .send(())
+                .expect("first barrier receiver remains live");
 
-            let second = tokio::time::timeout(
-                std::time::Duration::from_secs(1),
-                second_rx.recv(),
-            )
-            .await
-            .expect("session added during the wait must receive admission")
-            .expect("second session command channel must remain open");
+            let second = tokio::time::timeout(std::time::Duration::from_secs(1), second_rx.recv())
+                .await
+                .expect("session added during the wait must receive admission")
+                .expect("second session command channel must remain open");
             let SessionCommand::BeginManagedGatewayAdmission {
                 respond_to: second_ack,
             } = second
@@ -3787,7 +3759,9 @@ async fn explicit_gateway_cache_invalidation_waits_for_all_session_admissions() 
                 .send(())
                 .expect("second barrier receiver remains live");
 
-            invalidate.await.expect("cache invalidation task must finish");
+            invalidate
+                .await
+                .expect("cache invalidation task must finish");
             let state = cache.lock().await;
             assert!(state.gateway_refresh_in_progress);
             assert!(matches!(
@@ -3908,10 +3882,7 @@ async fn ineligible_gateway_auth_queues_barrier_before_revoking_catalog() {
             agent.session_registry.put_resident(&sid, handle);
 
             assert!(
-                agent
-                    .get_managed_mcp_gateway_tool_catalog()
-                    .await
-                    .is_none(),
+                agent.get_managed_mcp_gateway_tool_catalog().await.is_none(),
                 "API-key auth is not eligible for managed gateway tools"
             );
             let barrier = cmd_rx.recv().await.expect("revocation barrier");
@@ -3958,8 +3929,11 @@ async fn issue39_aborted_explicit_gateway_refresh_recovers_waiters() {
                 auth_mode: crate::auth::AuthMode::WebLogin,
                 ..crate::auth::GrokAuth::test_default()
             };
-            let (agent, _rx) =
-                build_agent_with_auth_and_proxy(auth, base_url, crate::agent::config::AgentMode::Leader);
+            let (agent, _rx) = build_agent_with_auth_and_proxy(
+                auth,
+                base_url,
+                crate::agent::config::AgentMode::Leader,
+            );
             agent.cfg.borrow_mut().managed_mcp_gateway_tools_enabled = true;
             let sid = acp::SessionId::new("sess-issue39-refresh-cancel");
             let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
@@ -3968,7 +3942,9 @@ async fn issue39_aborted_explicit_gateway_refresh_recovers_waiters() {
             let agent = std::rc::Rc::new(agent);
             let refresh_agent = agent.clone();
             let refresh = tokio::task::spawn_local(async move {
-                refresh_agent.refresh_managed_mcp_gateway_tool_catalog().await
+                refresh_agent
+                    .refresh_managed_mcp_gateway_tool_catalog()
+                    .await
             });
 
             let barrier = tokio::time::timeout(std::time::Duration::from_secs(1), cmd_rx.recv())
@@ -4009,11 +3985,10 @@ async fn issue39_aborted_explicit_gateway_refresh_recovers_waiters() {
             refresh.abort();
             let _ = refresh.await;
 
-            let waiter_result =
-                tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
-                    .await
-                    .expect("aborted refresh must wake gateway waiters")
-                    .expect("waiter task should not panic");
+            let waiter_result = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+                .await
+                .expect("aborted refresh must wake gateway waiters")
+                .expect("waiter task should not panic");
             assert!(
                 waiter_result.is_none(),
                 "auth-less waiter should wake and fail closed instead of hanging"
@@ -4057,10 +4032,7 @@ fn initialize_advertises_only_nonblank_external_auth_provider_commands() {
     assert!(advertised(Some("acme-auth --token")));
 }
 
-fn build_agent_with_model_for_tests(
-    model_id: &str,
-    agent_type: &str,
-) -> MvpAgent {
+fn build_agent_with_model_for_tests(model_id: &str, agent_type: &str) -> MvpAgent {
     use crate::agent::config::{Config as AgentConfig, ConfigModelOverride};
     use crate::auth::{AuthManager, GrokComConfig};
 
@@ -4374,8 +4346,7 @@ async fn assert_prompt_recovery_quarantines_stale_actor_receipt(
 #[serial_test::serial]
 fn production_prompt_recovery_with_newer_latch_reconciles_only_internal_resident() {
     let _xai_api_key = xai_grok_test_support::EnvGuard::unset("XAI_API_KEY");
-    let _grok_code_xai_api_key =
-        xai_grok_test_support::EnvGuard::unset("GROK_CODE_XAI_API_KEY");
+    let _grok_code_xai_api_key = xai_grok_test_support::EnvGuard::unset("GROK_CODE_XAI_API_KEY");
     run_local_for_bridge_test(|| async {
         assert_prompt_recovery_quarantines_stale_actor_receipt(
             PromptRecoveryQuarantineRace::NewerDifferentLatch,
@@ -4388,8 +4359,7 @@ fn production_prompt_recovery_with_newer_latch_reconciles_only_internal_resident
 #[serial_test::serial]
 fn production_prompt_recovery_rebuilds_quarantine_after_concurrent_take() {
     let _xai_api_key = xai_grok_test_support::EnvGuard::unset("XAI_API_KEY");
-    let _grok_code_xai_api_key =
-        xai_grok_test_support::EnvGuard::unset("GROK_CODE_XAI_API_KEY");
+    let _grok_code_xai_api_key = xai_grok_test_support::EnvGuard::unset("GROK_CODE_XAI_API_KEY");
     run_local_for_bridge_test(|| async {
         assert_prompt_recovery_quarantines_stale_actor_receipt(
             PromptRecoveryQuarantineRace::ClearedLatch,
@@ -4484,14 +4454,14 @@ fn model_overrides_live_cross_provider_switch_rebuilds_inherited_auxiliary_lanes
 
         crate::agent::handlers::model_switch::apply(
             &agent,
-            acp::SetSessionModelRequest::new(
-                sid.clone(),
-                acp::ModelId::new("target-provider"),
-            ),
+            acp::SetSessionModelRequest::new(sid.clone(), acp::ModelId::new("target-provider")),
         )
         .await
         .expect("cross-provider model switch");
-        assert_eq!(agent.resident_handle(&sid).unwrap().model_id.0.as_ref(), "target-provider");
+        assert_eq!(
+            agent.resident_handle(&sid).unwrap().model_id.0.as_ref(),
+            "target-provider"
+        );
         assert!(
             !agent.web_search_disabled.borrow().contains_key(&sid),
             "an applied policy-disabled state must clear the prior availability notice"
@@ -4603,9 +4573,8 @@ fn model_overrides_cold_web_search_notice_describes_operative_session_model() {
                         let disable_notice = crate::session::WebSearchDisabledNotice {
                             model_id: "target-provider".to_owned(),
                             reason: "actor-applied unavailable state".to_owned(),
-                            message:
-                                "web_search target-provider is unavailable after actor commit"
-                                    .to_owned(),
+                            message: "web_search target-provider is unavailable after actor commit"
+                                .to_owned(),
                         };
                         let _ = responds_to.send(Ok(crate::session::AppliedModelSwitch {
                             previous_model_id: acp::ModelId::new("source-provider"),
@@ -4682,7 +4651,11 @@ fn acp_model_switch_validation_and_apply_handoff_emit_one_failure_event() {
             assert_eq!(events.len(), 1, "{rejection}: {events:?}");
             let event = &events[0];
             assert_eq!(event["session_id"], session_id.0.as_ref(), "{rejection}");
-            assert_eq!(event["new_model_id"], requested_model.0.as_ref(), "{rejection}");
+            assert_eq!(
+                event["new_model_id"],
+                requested_model.0.as_ref(),
+                "{rejection}"
+            );
             assert_eq!(event["success"], false, "{rejection}");
             assert_eq!(
                 event["error_code"],
@@ -4722,16 +4695,15 @@ fn zero_turn_model_switch_fails_closed_when_required_harness_is_unresolved() {
                             prepared.required_definition.is_none(),
                             "the missing required harness must stay unresolved"
                         );
-                        let _ = responds_to.send(Err(
-                            crate::agent::config::ModelSwitchHarnessError {
+                        let _ =
+                            responds_to.send(Err(crate::agent::config::ModelSwitchHarnessError {
                                 code: crate::agent::config::MODEL_SWITCH_REBUILD_FAILED.to_owned(),
                                 active_agent_type: "grok-build".to_owned(),
                                 required_agent_type: "missing-custom-harness".to_owned(),
                                 model_id: prepared.catalog_identity.model_id.clone(),
                                 reason: "agent_definition_unresolved".to_owned(),
                             }
-                            .into_acp_error(),
-                        ));
+                            .into_acp_error()));
                     }
                     _ => panic!("unexpected model-switch command"),
                 }
@@ -4751,7 +4723,9 @@ fn zero_turn_model_switch_fails_closed_when_required_harness_is_unresolved() {
                 .and_then(|code| code.as_str()),
             Some(crate::agent::config::MODEL_SWITCH_REBUILD_FAILED),
         );
-        let handle = agent.resident_handle(&sid).expect("session remains registered");
+        let handle = agent
+            .resident_handle(&sid)
+            .expect("session remains registered");
         assert_eq!(handle.model_id.0.as_ref(), "previous-model");
         assert_eq!(handle.agent_name, "grok-build");
     });
@@ -4805,10 +4779,8 @@ fn new_session_explicit_model_fails_before_spawn_when_harness_is_unresolved() {
 fn new_session_unknown_model_fallback_still_preflights_default_harness() {
     run_local_for_bridge_test(|| async {
         let default_model_id = "unresolved-fallback-harness-model";
-        let agent = build_agent_with_model_for_tests(
-            default_model_id,
-            "missing-default-custom-harness",
-        );
+        let agent =
+            build_agent_with_model_for_tests(default_model_id, "missing-default-custom-harness");
         agent
             .auth_manager
             .hot_swap(crate::auth::GrokAuth::test_default());
@@ -4943,7 +4915,9 @@ async fn session_meta_publishes_the_web_search_disable_notice_per_session() {
     let mut other = serde_json::Map::new();
     agent.insert_session_config_meta(&mut other, &untold, "/tmp".to_string(), None, &model_state);
     assert!(
-        other.get(crate::session::WEB_SEARCH_DISABLED_META_KEY).is_none(),
+        other
+            .get(crate::session::WEB_SEARCH_DISABLED_META_KEY)
+            .is_none(),
         "a session with no notice must publish no key"
     );
 }
@@ -4991,8 +4965,8 @@ async fn session_load_recompute_updates_web_search_notice_for_ready_unusable_and
             config_validation_errors: Vec::new(),
         },
     );
-    let agent =
-        MvpAgent::new(gateway, &cfg, auth_manager, Some(runtime_catalog)).expect("valid test config");
+    let agent = MvpAgent::new(gateway, &cfg, auth_manager, Some(runtime_catalog))
+        .expect("valid test config");
 
     let sid = acp::SessionId::new("ws-warm-201");
     let mut handle = make_test_handle("test-model", false, None);
@@ -5134,10 +5108,10 @@ async fn session_meta_keeps_web_search_notices_session_scoped() {
         first.clone(),
         notice_for("grok-4-fast", "no API key or session credential available"),
     );
-    agent
-        .web_search_disabled
-        .borrow_mut()
-        .insert(second.clone(), notice_for("vendor-large", "model is not ready"));
+    agent.web_search_disabled.borrow_mut().insert(
+        second.clone(),
+        notice_for("vendor-large", "model is not ready"),
+    );
 
     let published_for = |sid: &acp::SessionId| {
         let model_state = agent.model_state(Some(sid));
@@ -5197,9 +5171,7 @@ fn build_agent_with_auth(auth: crate::auth::GrokAuth) -> MvpAgent {
 #[tokio::test(flavor = "current_thread")]
 async fn seeded_ambient_key_must_not_keep_a_post_strip_explicit_header_label() {
     let local = tokio::task::LocalSet::new();
-    local
-        .run_until(seeded_ambient_key_body())
-        .await;
+    local.run_until(seeded_ambient_key_body()).await;
 }
 
 async fn seeded_ambient_key_body() {
@@ -5384,7 +5356,7 @@ async fn wait_for_in_flight_load_blocks_until_load_completes() {
         .run_until(async {
             let agent = std::rc::Rc::new(build_minimal_agent_for_tests());
             let sid = acp::SessionId::new("sess-loading");
-            let guard = agent.begin_session_load(&sid);
+            let guard = agent.begin_session_load(&sid).expect("load claim");
             let waiter_agent = agent.clone();
             let waiter_sid = sid.clone();
             let waiter = tokio::task::spawn_local(async move {
@@ -5422,7 +5394,7 @@ async fn registered_session_stays_gated_until_restored_model_is_final() {
     let sid = acp::SessionId::new("sess-registered-while-loading");
     let persisted = acp::ModelId::new("persisted-model");
     let fallback = acp::ModelId::new("ready-fallback");
-    let guard = agent.begin_session_load(&sid);
+    let guard = agent.begin_session_load(&sid).expect("load claim");
     let mut handle = make_test_handle(persisted.0.as_ref(), false, None);
     handle.info.id = sid.clone();
     agent.session_registry.put_resident(&sid, handle);
@@ -5442,7 +5414,8 @@ async fn registered_session_stays_gated_until_restored_model_is_final() {
         "the racing request must observe the restored fallback, never the persisted model"
     );
     assert_eq!(
-        agent.resident_handle(&sid).unwrap().model_id, observed.model_id,
+        agent.resident_handle(&sid).unwrap().model_id,
+        observed.model_id,
         "the registered handle and racing request must agree on the final model ordering"
     );
 }
@@ -5515,7 +5488,7 @@ fn attach_restore_rejects_catalog_change_between_prepare_and_actor_dispatch() {
             lineage: xai_chat_state::CatalogResolutionLineage::UniqueRoute,
             auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
         });
-        let guard = agent.begin_session_load(&sid);
+        let guard = agent.begin_session_load(&sid).expect("load claim");
         agent.restore_persisted_model(&sid, &summary, &guard).await;
         assert!(
             !apply_dispatched.get(),
@@ -5575,11 +5548,9 @@ fn attach_restore_blocks_exact_key_reuse_and_unique_route_ambiguity() {
                 id: sid.clone(),
                 cwd: format!("/tmp/{label}"),
             };
-            let mut summary = crate::session::persistence::Summary::new(
-                &info,
-                acp::ModelId::new("removed-key"),
-            )
-            .unwrap();
+            let mut summary =
+                crate::session::persistence::Summary::new(&info, acp::ModelId::new("removed-key"))
+                    .unwrap();
             summary.catalog_identity = Some(xai_chat_state::CatalogIdentity {
                 model_id: "removed-key".to_owned(),
                 route: "retained-route".to_owned(),
@@ -5587,7 +5558,7 @@ fn attach_restore_blocks_exact_key_reuse_and_unique_route_ambiguity() {
                 auth_scheme: Some(xai_chat_state::CatalogAuthScheme::Bearer),
             });
             summary.agent_name = (label != "exact-reuse").then(|| "grok-build".to_owned());
-            let guard = agent.begin_session_load(&sid);
+            let guard = agent.begin_session_load(&sid).expect("load claim");
             agent.restore_persisted_model(&sid, &summary, &guard).await;
             assert_eq!(
                 agent.session_registry.unavailable_model(&sid),
@@ -5657,7 +5628,7 @@ fn load_restore_apply_bypasses_own_marker_and_preserves_request_order() {
                 .insert_test_entry(later_model, later_entry);
 
             let sid = acp::SessionId::new("sess-load-restore-order");
-            let guard = agent.begin_session_load(&sid);
+            let guard = agent.begin_session_load(&sid).expect("load claim");
             let mut handle = make_test_handle("persisted-model", false, None);
             handle.info.id = sid.clone();
             let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -5751,7 +5722,7 @@ async fn wait_for_in_flight_load_wakes_on_failed_load() {
         .run_until(async {
             let agent = std::rc::Rc::new(build_minimal_agent_for_tests());
             let sid = acp::SessionId::new("sess-load-fails");
-            let guard = agent.begin_session_load(&sid);
+            let guard = agent.begin_session_load(&sid).expect("load claim");
             let waiter_agent = agent.clone();
             let waiter_sid = sid.clone();
             let waiter = tokio::task::spawn_local(async move {
@@ -5777,8 +5748,8 @@ async fn wait_for_in_flight_load_wakes_on_failed_load() {
 async fn concurrent_load_guards_do_not_clobber_each_other() {
     let agent = build_minimal_agent_for_tests();
     let sid = acp::SessionId::new("sess-concurrent");
-    let guard_one = agent.begin_session_load(&sid);
-    let guard_two = agent.begin_session_load(&sid);
+    let guard_one = agent.begin_session_load(&sid).expect("load claim");
+    let guard_two = agent.begin_session_load(&sid).expect("load claim");
     drop(guard_one);
     assert!(
         agent.session_registry.is_attaching(&sid),
@@ -5798,8 +5769,8 @@ async fn concurrent_load_guards_do_not_clobber_each_other() {
 async fn dropping_newer_duplicate_load_keeps_older_wait_marker_alive() {
     let agent = build_minimal_agent_for_tests();
     let sid = acp::SessionId::new("sess-concurrent-newer-drops-first");
-    let guard_one = agent.begin_session_load(&sid);
-    let guard_two = agent.begin_session_load(&sid);
+    let guard_one = agent.begin_session_load(&sid).expect("load claim");
+    let guard_two = agent.begin_session_load(&sid).expect("load claim");
 
     // Superseded load finishes first.
     drop(guard_two);
@@ -5822,7 +5793,7 @@ async fn dropping_newer_duplicate_load_keeps_older_wait_marker_alive() {
 async fn older_load_cannot_borrow_newer_loads_marker() {
     let agent = build_minimal_agent_for_tests();
     let sid = acp::SessionId::new("sess-duplicate-load");
-    let guard_one = agent.begin_session_load(&sid);
+    let guard_one = agent.begin_session_load(&sid).expect("load claim");
     let mut handle = make_test_handle("test-model", false, None);
     handle.info.id = sid.clone();
     agent.session_registry.put_resident(&sid, handle);
@@ -5834,7 +5805,7 @@ async fn older_load_cannot_borrow_newer_loads_marker() {
     );
 
     // A duplicate load begins and replaces the marker.
-    let guard_two = agent.begin_session_load(&sid);
+    let guard_two = agent.begin_session_load(&sid).expect("load claim");
     assert!(
         agent.session_handle_during_load(&sid, &guard_one).is_none(),
         "the older load must not ride the newer load's marker"
@@ -5861,7 +5832,7 @@ async fn older_load_cannot_borrow_newer_loads_marker() {
 async fn load_wait_timeout_fails_closed_on_mid_restore_handle() {
     let agent = build_minimal_agent_for_tests();
     let sid = acp::SessionId::new("sess-load-timeout");
-    let _guard = agent.begin_session_load(&sid);
+    let _guard = agent.begin_session_load(&sid).expect("load claim");
     // Registration lands before restoration finishes — the exact window the
     // timeout must not expose.
     let mut handle = make_test_handle("test-model", false, None);
@@ -6481,14 +6452,15 @@ async fn prepared_new_session_plan_survives_same_key_catalog_swap() {
     let mut replacement_catalog = original_catalog;
     replacement_catalog.insert(current.0.to_string(), replacement);
     let swapped = std::cell::Cell::new(false);
-    let plan = agent.prepare_new_session_model_plan_with_before_seal(None, None, || {
-        if !swapped.replace(true) {
-            agent
-                .models_manager
-                .apply_catalog_for_test(replacement_catalog.clone());
-        }
-    })
-    .expect("same-key plan must resolve");
+    let plan = agent
+        .prepare_new_session_model_plan_with_before_seal(None, None, || {
+            if !swapped.replace(true) {
+                agent
+                    .models_manager
+                    .apply_catalog_for_test(replacement_catalog.clone());
+            }
+        })
+        .expect("same-key plan must resolve");
     assert_eq!(plan.catalog_identity.route, original_route);
     assert_eq!(plan.model_entry.info().model, original_route);
     assert_eq!(plan.sampling_config.model, original_route);
@@ -6520,9 +6492,9 @@ async fn prepared_new_session_plan_survives_same_key_catalog_swap() {
 #[test]
 fn new_session_profile_pin_reports_the_committed_resident_model() {
     run_local_for_bridge_test(|| async {
-        use acp::Agent as _;
         use crate::agent::config::{Config as AgentConfig, ConfigModelOverride};
         use crate::auth::{AuthManager, GrokComConfig};
+        use acp::Agent as _;
 
         let tmp = tempfile::tempdir().expect("profile fixture");
         let profile = tmp.path().join("pinned.md");
@@ -6575,14 +6547,14 @@ fn new_session_profile_pin_reports_the_committed_resident_model() {
         let cwd = tempfile::tempdir().expect("session cwd");
         let response = <MvpAgent as acp::Agent>::new_session(
             &agent,
-                acp::NewSessionRequest::new(cwd.path().to_path_buf()).meta(
-                    serde_json::json!({ "modelId": "unready-request" })
-                        .as_object()
-                        .cloned(),
-                ),
-            )
-            .await
-            .expect("spawn profile-pinned session");
+            acp::NewSessionRequest::new(cwd.path().to_path_buf()).meta(
+                serde_json::json!({ "modelId": "unready-request" })
+                    .as_object()
+                    .cloned(),
+            ),
+        )
+        .await
+        .expect("spawn profile-pinned session");
         assert_eq!(
             response
                 .models
@@ -6615,6 +6587,1127 @@ fn new_session_profile_pin_reports_the_committed_resident_model() {
         assert!(notification.contains("unready-request"));
         assert!(notification.contains("pinned-model"));
         assert!(!notification.contains("prepared-model"));
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn new_session_api_key_auth_rejects_ready_session_only_explicit_model() {
+    use acp::Agent as _;
+
+    run_local_for_bridge_test(|| async {
+        use crate::agent::config::{Config as AgentConfig, ConfigModelOverride};
+        use crate::auth::{AuthManager, AuthMode, GrokComConfig};
+        use xai_grok_test_support::EnvGuard;
+
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000101";
+        let grok_home = tempfile::tempdir().expect("isolated grok home");
+        let _home = EnvGuard::set("GROK_HOME", grok_home.path());
+        let _xai_key = EnvGuard::unset("XAI_API_KEY");
+        let _grok_code_key = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
+        let tmp = tempfile::tempdir().expect("auth visibility fixture");
+        let mut cfg = AgentConfig::default();
+        cfg.models.default = Some("api-visible-default".to_owned());
+        for (id, supported_in_api) in [("api-visible-default", true), ("ready-session-only", false)]
+        {
+            cfg.config_models.insert(
+                id.to_owned(),
+                ConfigModelOverride {
+                    model: Some(id.to_owned()),
+                    base_url: Some("http://localhost".to_owned()),
+                    api_key: Some(format!("{id}-credential")),
+                    auth_scheme: Some(xai_grok_sampler::AuthScheme::Bearer),
+                    supported_in_api: Some(supported_in_api),
+                    agent_type: Some("grok-build".to_owned()),
+                    ..Default::default()
+                },
+            );
+        }
+        let auth = std::sync::Arc::new(AuthManager::new(
+            &tmp.path().join("auth"),
+            GrokComConfig::default(),
+        ));
+        auth.hot_swap(crate::auth::GrokAuth {
+            auth_mode: AuthMode::ApiKey,
+            ..crate::auth::GrokAuth::test_default()
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let agent = MvpAgent::new(GatewaySender::new(tx), &cfg, auth, None).expect("agent");
+        agent
+            .initialize_request
+            .set(
+                acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_capabilities(
+                    acp::ClientCapabilities::new()
+                        .fs(acp::FileSystemCapabilities::new())
+                        .terminal(false),
+                ),
+            )
+            .expect("initialize once");
+        agent.set_auth_method(acp::AuthMethodId::new(
+            crate::agent::auth_method::XAI_API_KEY_METHOD_ID,
+        ));
+        let expected_fallback = agent.models_manager.current_model_id();
+        assert_ne!(expected_fallback.0.as_ref(), "ready-session-only");
+        let cwd = tempfile::tempdir().expect("session cwd");
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            <MvpAgent as acp::Agent>::new_session(
+                &agent,
+                acp::NewSessionRequest::new(cwd.path().to_path_buf()).meta(
+                    serde_json::json!({
+                        "sessionId": SESSION_ID,
+                        "modelId": "ready-session-only",
+                    })
+                    .as_object()
+                    .cloned(),
+                ),
+            ),
+        )
+        .await
+        .expect("new_session must not hang")
+        .expect("fall back to API-visible default");
+
+        assert_eq!(response.session_id.0.as_ref(), SESSION_ID);
+        assert_eq!(
+            response
+                .models
+                .expect("advertised model")
+                .current_model_id
+                .0
+                .as_ref(),
+            expected_fallback.0.as_ref()
+        );
+        assert_eq!(
+            agent
+                .resident_handle(&response.session_id)
+                .expect("resident")
+                .model_id
+                .0
+                .as_ref(),
+            expected_fallback.0.as_ref()
+        );
+        let notice = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|message| match message {
+                xai_acp_lib::AcpClientMessage::ExtNotification(args)
+                    if args.request.method.as_ref() == "x.ai/session_notification" =>
+                {
+                    serde_json::from_str::<crate::extensions::notification::SessionNotification>(
+                        args.request.params.get(),
+                    )
+                    .ok()
+                }
+                _ => None,
+            })
+            .find_map(|notification| match notification.update {
+                crate::extensions::notification::SessionUpdate::ModelAutoSwitched {
+                    previous_model_id,
+                    new_model_id,
+                    reason,
+                } => Some((previous_model_id, new_model_id, reason)),
+                _ => None,
+            })
+            .expect("authentication-mode fallback notice");
+        assert_eq!(notice.0, "ready-session-only");
+        assert_eq!(notice.1, expected_fallback.0.as_ref());
+        assert!(notice.2.contains("authentication mode"), "{}", notice.2);
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn new_session_api_key_auth_skips_ready_session_only_profile_pin() {
+    use acp::Agent as _;
+
+    run_local_for_bridge_test(|| async {
+        use crate::agent::config::{Config as AgentConfig, ConfigModelOverride};
+        use crate::auth::{AuthManager, AuthMode, GrokComConfig};
+        use xai_grok_test_support::EnvGuard;
+
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000102";
+        let grok_home = tempfile::tempdir().expect("isolated grok home");
+        let _home = EnvGuard::set("GROK_HOME", grok_home.path());
+        let _xai_key = EnvGuard::unset("XAI_API_KEY");
+        let _grok_code_key = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
+        let tmp = tempfile::tempdir().expect("profile auth visibility fixture");
+        let profile = tmp.path().join("session-only-pin.md");
+        std::fs::write(
+            &profile,
+            "---\nname: grok-build\ndescription: session-only pin\nmodel: ready-session-only-pin\n---\n",
+        )
+        .expect("write profile");
+        let mut cfg = AgentConfig::default();
+        cfg.models.default = Some("api-visible-default".to_owned());
+        cfg.agent_profile_path = Some(profile);
+        for (id, supported_in_api) in [
+            ("api-visible-default", true),
+            ("ready-session-only-pin", false),
+        ] {
+            cfg.config_models.insert(
+                id.to_owned(),
+                ConfigModelOverride {
+                    model: Some(id.to_owned()),
+                    base_url: Some("http://localhost".to_owned()),
+                    api_key: Some(format!("{id}-credential")),
+                    auth_scheme: Some(xai_grok_sampler::AuthScheme::Bearer),
+                    supported_in_api: Some(supported_in_api),
+                    agent_type: Some("grok-build".to_owned()),
+                    ..Default::default()
+                },
+            );
+        }
+        let auth = std::sync::Arc::new(AuthManager::new(
+            &tmp.path().join("auth"),
+            GrokComConfig::default(),
+        ));
+        auth.hot_swap(crate::auth::GrokAuth {
+            auth_mode: AuthMode::ApiKey,
+            ..crate::auth::GrokAuth::test_default()
+        });
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let agent = MvpAgent::new(GatewaySender::new(tx), &cfg, auth, None).expect("agent");
+        agent
+            .initialize_request
+            .set(
+                acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_capabilities(
+                    acp::ClientCapabilities::new()
+                        .fs(acp::FileSystemCapabilities::new())
+                        .terminal(false),
+                ),
+            )
+            .expect("initialize once");
+        agent.set_auth_method(acp::AuthMethodId::new(
+            crate::agent::auth_method::XAI_API_KEY_METHOD_ID,
+        ));
+        let expected_fallback = agent.models_manager.current_model_id();
+        assert_ne!(expected_fallback.0.as_ref(), "ready-session-only-pin");
+        let cwd = tempfile::tempdir().expect("session cwd");
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            <MvpAgent as acp::Agent>::new_session(
+                &agent,
+                acp::NewSessionRequest::new(cwd.path().to_path_buf()).meta(
+                    serde_json::json!({ "sessionId": SESSION_ID })
+                        .as_object()
+                        .cloned(),
+                ),
+            ),
+        )
+        .await
+        .expect("new_session must not hang")
+        .expect("spawn API-visible default");
+
+        assert_eq!(response.session_id.0.as_ref(), SESSION_ID);
+        assert_eq!(
+            response
+                .models
+                .expect("advertised model")
+                .current_model_id
+                .0
+                .as_ref(),
+            expected_fallback.0.as_ref()
+        );
+        assert_eq!(
+            agent
+                .resident_handle(&response.session_id)
+                .expect("resident")
+                .model_id
+                .0
+                .as_ref(),
+            expected_fallback.0.as_ref()
+        );
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn new_session_duplicate_id_rejects_before_spawn_and_preserves_existing_resident() {
+    use acp::Agent as _;
+
+    run_local_for_bridge_test(|| async {
+        use crate::agent::config::{Config as AgentConfig, ConfigModelOverride};
+        use crate::auth::{AuthManager, AuthMode, GrokComConfig};
+        use xai_grok_test_support::EnvGuard;
+
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000104";
+        let grok_home = tempfile::tempdir().expect("isolated grok home");
+        let _home = EnvGuard::set("GROK_HOME", grok_home.path());
+        let _xai_key = EnvGuard::unset("XAI_API_KEY");
+        let _grok_code_key = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
+        let tmp = tempfile::tempdir().expect("resident collision fixture");
+        let mut cfg = AgentConfig::default();
+        cfg.models.default = Some("session-only-default".to_owned());
+        cfg.config_models.insert(
+            "session-only-default".to_owned(),
+            ConfigModelOverride {
+                model: Some("session-only-default".to_owned()),
+                base_url: Some("http://localhost".to_owned()),
+                auth_scheme: Some(xai_grok_sampler::AuthScheme::Bearer),
+                supported_in_api: Some(false),
+                agent_type: Some("grok-build".to_owned()),
+                ..Default::default()
+            },
+        );
+        let auth = std::sync::Arc::new(AuthManager::new(
+            &tmp.path().join("auth"),
+            GrokComConfig::default(),
+        ));
+        auth.hot_swap(crate::auth::GrokAuth {
+            key: "session-auth".to_owned(),
+            auth_mode: AuthMode::WebLogin,
+            ..crate::auth::GrokAuth::test_default()
+        });
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let agent = MvpAgent::new(GatewaySender::new(tx), &cfg, auth, None).expect("agent");
+        agent
+            .initialize_request
+            .set(
+                acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_capabilities(
+                    acp::ClientCapabilities::new()
+                        .fs(acp::FileSystemCapabilities::new())
+                        .terminal(false),
+                ),
+            )
+            .expect("initialize once");
+        agent.set_auth_method(acp::AuthMethodId::new(
+            crate::agent::auth_method::GROK_COM_METHOD_ID,
+        ));
+
+        let sid = acp::SessionId::new(SESSION_ID);
+        let (mut existing, existing_tx, _existing_rx) = make_live_session_handle(&sid, None);
+        existing.model_id = acp::ModelId::new("existing-resident-model");
+        agent.insert_resident(&sid, existing);
+        let final_commit_hook_ran = std::rc::Rc::new(std::cell::Cell::new(false));
+        let hook_probe = final_commit_hook_ran.clone();
+        let commit_hook = agent_ops::install_new_session_before_resident_commit_hook(move || {
+            hook_probe.set(true);
+        });
+        let cwd = tempfile::tempdir().expect("session cwd");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            <MvpAgent as acp::Agent>::new_session(
+                &agent,
+                acp::NewSessionRequest::new(cwd.path().to_path_buf()).meta(
+                    serde_json::json!({
+                        "sessionId": SESSION_ID,
+                        "modelId": "session-only-default",
+                    })
+                    .as_object()
+                    .cloned(),
+                ),
+            ),
+        )
+        .await
+        .expect("new_session must not hang")
+        .expect_err("duplicate session id must be rejected before replacement spawn");
+        drop(commit_hook);
+        assert!(
+            !final_commit_hook_ran.get(),
+            "an occupied id must fail at the creation claim, before final publication"
+        );
+
+        let surviving = agent
+            .resident_handle(&sid)
+            .expect("failed replacement must preserve the prior resident");
+        assert_eq!(
+            surviving.model_id.0.as_ref(),
+            "existing-resident-model",
+            "the unpublished replacement must not overwrite the prior handle"
+        );
+        assert!(
+            surviving.cmd_tx.same_channel(&existing_tx),
+            "the surviving resident must retain the prior actor channel"
+        );
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn new_session_auth_flip_before_resident_commit_leaves_no_session_state() {
+    use acp::Agent as _;
+
+    run_local_for_bridge_test(|| async {
+        use crate::agent::config::{Config as AgentConfig, ConfigModelOverride};
+        use crate::auth::{AuthManager, AuthMode, GrokComConfig, XAI_OAUTH2_ISSUER};
+        use xai_grok_test_support::{EnvGuard, MockInferenceServer};
+
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000103";
+        let grok_home = tempfile::tempdir().expect("isolated grok home");
+        let _home = EnvGuard::set("GROK_HOME", grok_home.path());
+        std::fs::write(
+            grok_home.path().join("config.toml"),
+            "[features]\nremote_fetch = false\n",
+        )
+        .expect("disable catalog fetch for fixture");
+        let _xai_key = EnvGuard::unset("XAI_API_KEY");
+        let _grok_code_key = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
+        let _session_registry = EnvGuard::set("GROK_SESSION_REGISTRY", "true");
+        let _relay_sync = EnvGuard::set("GROK_RELAY_SYNC_ENABLED", "true");
+        let registry_server = MockInferenceServer::start()
+            .await
+            .expect("remote persistence probe");
+        let tmp = tempfile::tempdir().expect("auth flip fixture");
+        let mut cfg = AgentConfig::default();
+        cfg.mode = crate::agent::config::AgentMode::Tui;
+        cfg.storage_mode = StorageMode::Writeback;
+        cfg.endpoints.cli_chat_proxy_base_url = Some(registry_server.url());
+        cfg.remote_settings = Some(crate::util::config::RemoteSettings {
+            session_registry_enabled: Some(true),
+            ..Default::default()
+        });
+        cfg.grok_com_config.grok_ws_url = "ws://127.0.0.1:9".to_owned();
+        cfg.models.default = Some("session-only-default".to_owned());
+        cfg.config_models.insert(
+            "session-only-default".to_owned(),
+            ConfigModelOverride {
+                model: Some("session-only-default".to_owned()),
+                base_url: Some("http://localhost".to_owned()),
+                auth_scheme: Some(xai_grok_sampler::AuthScheme::Bearer),
+                supported_in_api: Some(false),
+                agent_type: Some("grok-build".to_owned()),
+                ..Default::default()
+            },
+        );
+        let auth = std::sync::Arc::new(AuthManager::new(
+            &tmp.path().join("auth"),
+            GrokComConfig::default(),
+        ));
+        auth.hot_swap(crate::auth::GrokAuth {
+            key: "session-auth".to_owned(),
+            auth_mode: AuthMode::Oidc,
+            oidc_issuer: Some(XAI_OAUTH2_ISSUER.to_owned()),
+            ..crate::auth::GrokAuth::test_default()
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut agent = MvpAgent::new(GatewaySender::new(tx), &cfg, auth, None).expect("agent");
+        let mut memory = crate::config::MemoryConfig::default();
+        memory.enabled = true;
+        agent.set_memory_config(memory);
+        agent.start_subagent_coordinator();
+        agent
+            .initialize_request
+            .set(
+                acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_capabilities(
+                    acp::ClientCapabilities::new()
+                        .fs(acp::FileSystemCapabilities::new())
+                        .terminal(false),
+                ),
+            )
+            .expect("initialize once");
+        agent.set_auth_method(acp::AuthMethodId::new(
+            crate::agent::auth_method::GROK_COM_METHOD_ID,
+        ));
+        let auth_manager = agent.auth_manager.clone();
+        let commit_hook = agent_ops::install_new_session_before_resident_commit_hook(move || {
+            auth_manager.clear_in_memory();
+        });
+        let cwd = tempfile::tempdir().expect("session cwd");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            <MvpAgent as acp::Agent>::new_session(
+                &agent,
+                acp::NewSessionRequest::new(cwd.path().to_path_buf()).meta(
+                    serde_json::json!({
+                        "sessionId": SESSION_ID,
+                        "modelId": "session-only-default",
+                    })
+                    .as_object()
+                    .cloned(),
+                ),
+            ),
+        )
+        .await
+        .expect("new_session must not hang")
+        .expect_err("auth drift at resident commit must reject the session");
+        drop(commit_hook);
+
+        let sid = acp::SessionId::new(SESSION_ID);
+        assert!(!agent.is_resident(&sid));
+        assert!(agent.resident_handle(&sid).is_none());
+        assert!(agent.session_live_state_for(&sid).is_none());
+        let snapshot = agent.registry_snapshot().await;
+        assert_eq!(snapshot.sessions, 0);
+        assert_eq!(snapshot.loading_sessions, 0);
+        assert_eq!(snapshot.session_registry_entries, 0);
+        assert_eq!(snapshot.session_threads, 0);
+        assert_eq!(snapshot.resident_resources, 0);
+        assert_eq!(snapshot.retained_resources, 0);
+        assert_eq!(snapshot.dispatch_locks, 0);
+        assert_eq!(snapshot.session_turn_numbers, 0);
+        assert_eq!(snapshot.permission_event_receivers, 0);
+        assert_eq!(snapshot.model_unavailable_sessions, 0);
+        assert_eq!(snapshot.session_live_state, 0);
+        assert_eq!(snapshot.session_index_claims, 0);
+        assert_eq!(snapshot.require_gateway_sessions, 0);
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        while let Ok(message) = rx.try_recv() {
+            let rendered = format!("{message:?}");
+            assert!(
+                !rendered.contains(SESSION_ID),
+                "an unpublished session must emit no gateway or relay notification: {rendered}"
+            );
+            if let xai_acp_lib::AcpClientMessage::ExtNotification(args) = message {
+                let _ = args.response_tx.send(Ok(()));
+            }
+        }
+        let remote_session_requests: Vec<_> = registry_server
+            .requests()
+            .into_iter()
+            .filter(|request| request.path.contains("/sessions/"))
+            .collect();
+        assert!(
+            remote_session_requests.is_empty(),
+            "an unpublished session must never register or update remote persistence: \
+             {remote_session_requests:?}"
+        );
+        let telemetry =
+            xai_grok_telemetry::unified_log::snapshot_session_log(SESSION_ID).unwrap_or_default();
+        assert!(
+            telemetry.is_empty(),
+            "an unpublished session must emit no session-scoped telemetry: {}",
+            String::from_utf8_lossy(&telemetry)
+        );
+        assert!(
+            crate::session::persistence::find_any_session_dir_by_id_result(SESSION_ID)
+                .expect("scan persisted sessions")
+                .is_none(),
+            "failed commit must not persist a session directory"
+        );
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn cancelling_new_session_during_actor_init_leaves_no_session_state() {
+    use acp::Agent as _;
+
+    run_local_for_bridge_test(|| async {
+        use crate::agent::config::{Config as AgentConfig, ConfigModelOverride};
+        use crate::auth::{AuthManager, AuthMode, GrokComConfig};
+        use xai_grok_test_support::EnvGuard;
+
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000105";
+        let grok_home = tempfile::tempdir().expect("isolated grok home");
+        let _home = EnvGuard::set("GROK_HOME", grok_home.path());
+        std::fs::write(
+            grok_home.path().join("config.toml"),
+            "[features]\nremote_fetch = false\n",
+        )
+        .expect("disable catalog fetch for fixture");
+        let _xai_key = EnvGuard::unset("XAI_API_KEY");
+        let _grok_code_key = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
+        let _relay_sync = EnvGuard::set("GROK_RELAY_SYNC_ENABLED", "true");
+        let tmp = tempfile::tempdir().expect("cancelled spawn fixture");
+        let mut cfg = AgentConfig::default();
+        cfg.mode = crate::agent::config::AgentMode::Tui;
+        cfg.storage_mode = StorageMode::Writeback;
+        cfg.grok_com_config.grok_ws_url = "ws://127.0.0.1:9".to_owned();
+        cfg.models.default = Some("session-only-default".to_owned());
+        cfg.config_models.insert(
+            "session-only-default".to_owned(),
+            ConfigModelOverride {
+                model: Some("session-only-default".to_owned()),
+                base_url: Some("http://localhost".to_owned()),
+                auth_scheme: Some(xai_grok_sampler::AuthScheme::Bearer),
+                supported_in_api: Some(false),
+                agent_type: Some("grok-build".to_owned()),
+                ..Default::default()
+            },
+        );
+        let auth = std::sync::Arc::new(AuthManager::new(
+            &tmp.path().join("auth"),
+            GrokComConfig::default(),
+        ));
+        auth.hot_swap(crate::auth::GrokAuth {
+            key: "session-auth".to_owned(),
+            auth_mode: AuthMode::WebLogin,
+            ..crate::auth::GrokAuth::test_default()
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut agent = MvpAgent::new(GatewaySender::new(tx), &cfg, auth, None).expect("agent");
+        let mut memory = crate::config::MemoryConfig::default();
+        memory.enabled = true;
+        agent.set_memory_config(memory);
+        agent.start_subagent_coordinator();
+        agent
+            .initialize_request
+            .set(
+                acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_capabilities(
+                    acp::ClientCapabilities::new()
+                        .fs(acp::FileSystemCapabilities::new())
+                        .terminal(false),
+                ),
+            )
+            .expect("initialize once");
+        agent.set_auth_method(acp::AuthMethodId::new(
+            crate::agent::auth_method::GROK_COM_METHOD_ID,
+        ));
+        let agent = std::rc::Rc::new(agent);
+        let mut actor_init_hook =
+            crate::session::acp_session::install_spawn_actor_init_test_hook(SESSION_ID);
+        let cwd = tempfile::tempdir().expect("session cwd");
+        let request_agent = agent.clone();
+        let request = acp::NewSessionRequest::new(cwd.path().to_path_buf()).meta(
+            serde_json::json!({
+                "sessionId": SESSION_ID,
+                "modelId": "session-only-default",
+            })
+            .as_object()
+            .cloned(),
+        );
+        let request_task = tokio::task::spawn_local(async move {
+            <MvpAgent as acp::Agent>::new_session(&request_agent, request).await
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            actor_init_hook.wait_until_entered(),
+        )
+        .await
+        .expect("session thread must reach the actor-init boundary");
+        request_task.abort();
+        let cancelled = tokio::time::timeout(std::time::Duration::from_secs(10), request_task)
+            .await
+            .expect("cancellation must abort and join the provisional session thread")
+            .expect_err("aborted session/new request task must be cancelled");
+        assert!(cancelled.is_cancelled());
+
+        let sid = acp::SessionId::new(SESSION_ID);
+        assert!(!agent.is_resident(&sid));
+        assert!(agent.resident_handle(&sid).is_none());
+        assert!(agent.session_live_state_for(&sid).is_none());
+        let snapshot = agent.registry_snapshot().await;
+        assert_eq!(snapshot.sessions, 0);
+        assert_eq!(snapshot.loading_sessions, 0);
+        assert_eq!(snapshot.session_registry_entries, 0);
+        assert_eq!(snapshot.session_threads, 0);
+        assert_eq!(snapshot.resident_resources, 0);
+        assert_eq!(snapshot.retained_resources, 0);
+        assert_eq!(snapshot.dispatch_locks, 0);
+        assert_eq!(snapshot.session_turn_numbers, 0);
+        assert_eq!(snapshot.permission_event_receivers, 0);
+        assert_eq!(snapshot.model_unavailable_sessions, 0);
+        assert_eq!(snapshot.session_live_state, 0);
+        assert_eq!(snapshot.session_index_claims, 0);
+        assert_eq!(snapshot.require_gateway_sessions, 0);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if crate::session::persistence::find_any_session_dir_by_id_result(SESSION_ID)
+                    .expect("scan persisted sessions")
+                    .is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled session persistence must be deleted");
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        while let Ok(message) = rx.try_recv() {
+            let rendered = format!("{message:?}");
+            assert!(
+                !rendered.contains(SESSION_ID),
+                "a cancelled unpublished session must emit no gateway or relay notification: {rendered}"
+            );
+            if let xai_acp_lib::AcpClientMessage::ExtNotification(args) = message {
+                let _ = args.response_tx.send(Ok(()));
+            }
+        }
+        let telemetry =
+            xai_grok_telemetry::unified_log::snapshot_session_log(SESSION_ID).unwrap_or_default();
+        assert!(
+            telemetry.is_empty(),
+            "actor initialization, including memory init telemetry, must not run after request cancellation: {}",
+            String::from_utf8_lossy(&telemetry)
+        );
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn cancelling_after_actor_init_before_publish_ack_cleans_state_and_allows_retry() {
+    use acp::Agent as _;
+
+    run_local_for_bridge_test(|| async {
+        use crate::agent::config::{Config as AgentConfig, ConfigModelOverride};
+        use crate::auth::{AuthManager, AuthMode, GrokComConfig};
+        use xai_grok_test_support::{EnvGuard, MockInferenceServer};
+
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000107";
+        let grok_home = tempfile::tempdir().expect("isolated grok home");
+        let _home = EnvGuard::set("GROK_HOME", grok_home.path());
+        std::fs::write(
+            grok_home.path().join("config.toml"),
+            "[features]\nremote_fetch = false\n",
+        )
+        .expect("disable catalog fetch for fixture");
+        let _xai_key = EnvGuard::unset("XAI_API_KEY");
+        let _grok_code_key = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
+        let _session_registry = EnvGuard::set("GROK_SESSION_REGISTRY", "true");
+        let _relay_sync = EnvGuard::set("GROK_RELAY_SYNC_ENABLED", "true");
+        let captured_tracing = capture::capture();
+        let registry_server = MockInferenceServer::start()
+            .await
+            .expect("remote persistence probe");
+        let tmp = tempfile::tempdir().expect("post-init cancellation fixture");
+        let memory_root = tmp.path().join("memory-root");
+        let gc_sentinel = memory_root.join("tmp-provisional-gc-sentinel");
+        std::fs::create_dir_all(&gc_sentinel).expect("create memory GC sentinel");
+        let mut cfg = AgentConfig::default();
+        cfg.mode = crate::agent::config::AgentMode::Tui;
+        cfg.storage_mode = StorageMode::Writeback;
+        cfg.endpoints.cli_chat_proxy_base_url = Some(registry_server.url());
+        cfg.remote_settings = Some(crate::util::config::RemoteSettings {
+            session_registry_enabled: Some(true),
+            ..Default::default()
+        });
+        cfg.grok_com_config.grok_ws_url = "ws://127.0.0.1:9".to_owned();
+        cfg.models.default = Some("session-only-default".to_owned());
+        cfg.config_models.insert(
+            "session-only-default".to_owned(),
+            ConfigModelOverride {
+                model: Some("session-only-default".to_owned()),
+                base_url: Some("http://localhost".to_owned()),
+                auth_scheme: Some(xai_grok_sampler::AuthScheme::Bearer),
+                supported_in_api: Some(false),
+                agent_type: Some("grok-build".to_owned()),
+                ..Default::default()
+            },
+        );
+        let auth = std::sync::Arc::new(AuthManager::new(
+            &tmp.path().join("auth"),
+            GrokComConfig::default(),
+        ));
+        auth.hot_swap(crate::auth::GrokAuth {
+            key: "session-auth".to_owned(),
+            auth_mode: AuthMode::WebLogin,
+            ..crate::auth::GrokAuth::test_default()
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut agent = MvpAgent::new(GatewaySender::new(tx), &cfg, auth, None).expect("agent");
+        let mut memory = crate::config::MemoryConfig::default();
+        memory.enabled = true;
+        memory.watcher.enabled = true;
+        memory.root_dir_override = Some(memory_root.clone());
+        agent.set_memory_config(memory);
+        agent.start_subagent_coordinator();
+        agent
+            .initialize_request
+            .set(
+                acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_capabilities(
+                    acp::ClientCapabilities::new()
+                        .fs(acp::FileSystemCapabilities::new())
+                        .terminal(false),
+                ),
+            )
+            .expect("initialize once");
+        agent.set_auth_method(acp::AuthMethodId::new(
+            crate::agent::auth_method::GROK_COM_METHOD_ID,
+        ));
+        let agent = std::rc::Rc::new(agent);
+        let mut actor_init_hook =
+            crate::session::acp_session::install_spawn_actor_init_test_hook(SESSION_ID);
+        let mut publish_ack_hook =
+            crate::session::persistence::install_publish_fresh_ack_test_hook(SESSION_ID);
+        let cwd = tempfile::tempdir().expect("session cwd");
+        let memory_storage =
+            crate::session::memory::MemoryStorage::new(cwd.path(), Some(memory_root.as_path()));
+        let request = acp::NewSessionRequest::new(cwd.path().to_path_buf()).meta(
+            serde_json::json!({
+                "sessionId": SESSION_ID,
+                "modelId": "session-only-default",
+            })
+            .as_object()
+            .cloned(),
+        );
+        let request_agent = agent.clone();
+        let request_task = tokio::task::spawn_local(async move {
+            <MvpAgent as acp::Agent>::new_session(&request_agent, request).await
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            actor_init_hook.wait_until_entered(),
+        )
+        .await
+        .expect("session thread must reach the actor-init boundary");
+        actor_init_hook.release();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            publish_ack_hook.wait_until_entered(),
+        )
+        .await
+        .expect("session/new must finish actor initialization and reach publish acknowledgement");
+        assert!(
+            gc_sentinel.is_dir(),
+            "provisional actor construction must not run shared-memory GC"
+        );
+        assert!(
+            !memory_storage.global_memory_file().exists()
+                && !memory_storage.workspace_dir().exists(),
+            "provisional actor construction must not create memory templates or workspace state"
+        );
+        assert!(
+            crate::session::acp_session::take_memory_session_init_test_observation(SESSION_ID)
+                .is_none(),
+            "MemorySessionInit must not be emitted before publication"
+        );
+
+        request_task.abort();
+        let cancelled = tokio::time::timeout(std::time::Duration::from_secs(10), request_task)
+            .await
+            .expect("cancelled session/new request must join")
+            .expect_err("aborted session/new request task must be cancelled");
+        assert!(cancelled.is_cancelled());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            actor_init_hook.wait_until_thread_exited(),
+        )
+        .await
+        .expect(
+            "publication abort must stop the initialized session thread before persistence resumes",
+        );
+        publish_ack_hook.release();
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if crate::session::persistence::find_any_session_dir_by_id_result(SESSION_ID)
+                    .expect("scan persisted sessions")
+                    .is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled post-init session persistence must be deleted");
+        assert!(
+            gc_sentinel.is_dir(),
+            "cancelling an unpublished session must leave shared-memory GC state untouched"
+        );
+        assert!(
+            !memory_storage.global_memory_file().exists()
+                && !memory_storage.workspace_dir().exists(),
+            "cancelling an unpublished session must create no memory files"
+        );
+        assert!(
+            crate::session::acp_session::take_memory_session_init_test_observation(SESSION_ID)
+                .is_none(),
+            "a cancelled unpublished session must emit no MemorySessionInit event"
+        );
+
+        let sid = acp::SessionId::new(SESSION_ID);
+        assert!(!agent.is_resident(&sid));
+        assert!(agent.resident_handle(&sid).is_none());
+        assert!(agent.session_live_state_for(&sid).is_none());
+        let snapshot = agent.registry_snapshot().await;
+        assert_eq!(snapshot.sessions, 0);
+        assert_eq!(snapshot.loading_sessions, 0);
+        assert_eq!(snapshot.session_registry_entries, 0);
+        assert_eq!(snapshot.session_threads, 0);
+        assert_eq!(snapshot.resident_resources, 0);
+        assert_eq!(snapshot.retained_resources, 0);
+        assert_eq!(snapshot.dispatch_locks, 0);
+        assert_eq!(snapshot.session_turn_numbers, 0);
+        assert_eq!(snapshot.permission_event_receivers, 0);
+        assert_eq!(snapshot.model_unavailable_sessions, 0);
+        assert_eq!(snapshot.session_live_state, 0);
+        assert_eq!(snapshot.session_index_claims, 0);
+        assert_eq!(snapshot.require_gateway_sessions, 0);
+        let workspace_binding_present = agent
+            .workspace_ops
+            .borrow()
+            .as_ref()
+            .and_then(xai_grok_workspace::WorkspaceOps::workspace_handle)
+            .and_then(|workspace| workspace.session(SESSION_ID))
+            .is_some();
+        assert!(
+            !workspace_binding_present,
+            "the provisional workspace binding and its toolset must be released before retry"
+        );
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        while let Ok(message) = rx.try_recv() {
+            let rendered = format!("{message:?}");
+            assert!(
+                !rendered.contains(SESSION_ID),
+                "a cancelled unpublished session must emit no gateway or relay notification: {rendered}"
+            );
+            if let xai_acp_lib::AcpClientMessage::ExtNotification(args) = message {
+                let _ = args.response_tx.send(Ok(()));
+            }
+        }
+        let remote_session_requests: Vec<_> = registry_server
+            .requests()
+            .into_iter()
+            .filter(|request| request.path.contains("/sessions/"))
+            .collect();
+        assert!(
+            remote_session_requests.is_empty(),
+            "a cancelled unpublished session must never register or update remote persistence: \
+             {remote_session_requests:?}"
+        );
+        let telemetry =
+            xai_grok_telemetry::unified_log::snapshot_session_log(SESSION_ID).unwrap_or_default();
+        assert!(
+            telemetry.is_empty(),
+            "a cancelled unpublished session must emit no session-scoped telemetry: {}",
+            String::from_utf8_lossy(&telemetry)
+        );
+        let mut captured_tracing_rx = captured_tracing.events_rx;
+        let mut trace_identity_leaks = Vec::new();
+        let session_id_prefix = &SESSION_ID[..8];
+        while let Ok(event) = captured_tracing_rx.try_recv() {
+            if event.fields.contains(SESSION_ID) || event.fields.contains(session_id_prefix) {
+                trace_identity_leaks.push(event.fields);
+            }
+        }
+        assert!(
+            trace_identity_leaks.is_empty(),
+            "a cancelled unpublished session UUID or truncated prefix must not escape through tracing spans/events: \
+             {trace_identity_leaks:#?}"
+        );
+
+        let retry = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            <MvpAgent as acp::Agent>::new_session(
+                &agent,
+                acp::NewSessionRequest::new(cwd.path().to_path_buf()).meta(
+                    serde_json::json!({
+                        "sessionId": SESSION_ID,
+                        "modelId": "session-only-default",
+                    })
+                    .as_object()
+                    .cloned(),
+                ),
+            ),
+        )
+        .await
+        .expect("same-id retry must not hang")
+        .expect("same-id retry must succeed after post-init cancellation cleanup");
+        assert_eq!(retry.session_id.0.as_ref(), SESSION_ID);
+        assert!(agent.is_resident(&retry.session_id));
+        let memory_init = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Some(observation) =
+                    crate::session::acp_session::take_memory_session_init_test_observation(
+                        SESSION_ID,
+                    )
+                {
+                    break observation;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("published retry must emit MemorySessionInit");
+        assert!(memory_init.watcher_config_enabled);
+        assert!(
+            memory_storage.global_memory_file().is_file(),
+            "published retry must activate the global memory template"
+        );
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn new_session_actor_spawn_failure_cleans_provisional_state_and_allows_same_id_retry() {
+    use acp::Agent as _;
+
+    run_local_for_bridge_test(|| async {
+        use crate::agent::config::{Config as AgentConfig, ConfigModelOverride};
+        use crate::auth::{AuthManager, AuthMode, GrokComConfig};
+        use xai_grok_test_support::{EnvGuard, MockInferenceServer};
+
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000106";
+        let grok_home = tempfile::tempdir().expect("isolated grok home");
+        let _home = EnvGuard::set("GROK_HOME", grok_home.path());
+        std::fs::write(
+            grok_home.path().join("config.toml"),
+            "[features]\nremote_fetch = false\n",
+        )
+        .expect("disable catalog fetch for fixture");
+        let _xai_key = EnvGuard::unset("XAI_API_KEY");
+        let _grok_code_key = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
+        let _session_registry = EnvGuard::set("GROK_SESSION_REGISTRY", "true");
+        let _relay_sync = EnvGuard::set("GROK_RELAY_SYNC_ENABLED", "true");
+        let registry_server = MockInferenceServer::start()
+            .await
+            .expect("remote persistence probe");
+        let tmp = tempfile::tempdir().expect("spawn failure fixture");
+        let mut cfg = AgentConfig::default();
+        cfg.mode = crate::agent::config::AgentMode::Tui;
+        cfg.storage_mode = StorageMode::Writeback;
+        cfg.endpoints.cli_chat_proxy_base_url = Some(registry_server.url());
+        cfg.remote_settings = Some(crate::util::config::RemoteSettings {
+            session_registry_enabled: Some(true),
+            ..Default::default()
+        });
+        cfg.grok_com_config.grok_ws_url = "ws://127.0.0.1:9".to_owned();
+        cfg.models.default = Some("session-only-default".to_owned());
+        cfg.config_models.insert(
+            "session-only-default".to_owned(),
+            ConfigModelOverride {
+                model: Some("session-only-default".to_owned()),
+                base_url: Some("http://localhost".to_owned()),
+                auth_scheme: Some(xai_grok_sampler::AuthScheme::Bearer),
+                supported_in_api: Some(false),
+                agent_type: Some("grok-build".to_owned()),
+                ..Default::default()
+            },
+        );
+        let auth = std::sync::Arc::new(AuthManager::new(
+            &tmp.path().join("auth"),
+            GrokComConfig::default(),
+        ));
+        auth.hot_swap(crate::auth::GrokAuth {
+            key: "session-auth".to_owned(),
+            auth_mode: AuthMode::WebLogin,
+            ..crate::auth::GrokAuth::test_default()
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let agent = MvpAgent::new(GatewaySender::new(tx), &cfg, auth, None).expect("agent");
+        agent.start_subagent_coordinator();
+        agent
+            .initialize_request
+            .set(
+                acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_capabilities(
+                    acp::ClientCapabilities::new()
+                        .fs(acp::FileSystemCapabilities::new())
+                        .terminal(false),
+                ),
+            )
+            .expect("initialize once");
+        agent.set_auth_method(acp::AuthMethodId::new(
+            crate::agent::auth_method::GROK_COM_METHOD_ID,
+        ));
+        let agent = std::rc::Rc::new(agent);
+        let mut failure_hook =
+            crate::session::acp_session::install_spawn_actor_failure_test_hook(SESSION_ID);
+        let cwd = tempfile::tempdir().expect("session cwd");
+        let request = acp::NewSessionRequest::new(cwd.path().to_path_buf()).meta(
+            serde_json::json!({
+                "sessionId": SESSION_ID,
+                "modelId": "session-only-default",
+            })
+            .as_object()
+            .cloned(),
+        );
+        let request_agent = agent.clone();
+        let request_task = tokio::task::spawn_local(async move {
+            <MvpAgent as acp::Agent>::new_session(&request_agent, request).await
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            failure_hook.wait_until_entered(),
+        )
+        .await
+        .expect("session thread must reach the injected actor failure");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            failure_hook.wait_until_thread_exited(),
+        )
+        .await
+        .expect("injected actor failure must exit the session thread");
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), request_task)
+            .await
+            .expect("failed session/new must complete")
+            .expect("session/new task must not panic")
+            .expect_err("injected actor failure must reject session/new");
+        let rendered_error = format!("{error:?}");
+        assert!(rendered_error.contains("provisional session initialization failed"));
+        assert!(!rendered_error.contains(SESSION_ID));
+        assert!(!rendered_error.contains("injected session actor initialization failure"));
+
+        let sid = acp::SessionId::new(SESSION_ID);
+        assert!(!agent.is_resident(&sid));
+        assert!(agent.resident_handle(&sid).is_none());
+        assert!(agent.session_live_state_for(&sid).is_none());
+        let snapshot = agent.registry_snapshot().await;
+        assert_eq!(snapshot.sessions, 0);
+        assert_eq!(snapshot.loading_sessions, 0);
+        assert_eq!(snapshot.session_registry_entries, 0);
+        assert_eq!(snapshot.session_threads, 0);
+        assert_eq!(snapshot.resident_resources, 0);
+        assert_eq!(snapshot.retained_resources, 0);
+        assert_eq!(snapshot.dispatch_locks, 0);
+        assert_eq!(snapshot.session_turn_numbers, 0);
+        assert_eq!(snapshot.permission_event_receivers, 0);
+        assert_eq!(snapshot.model_unavailable_sessions, 0);
+        assert_eq!(snapshot.session_live_state, 0);
+        assert_eq!(snapshot.session_index_claims, 0);
+        assert_eq!(snapshot.require_gateway_sessions, 0);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if crate::session::persistence::find_any_session_dir_by_id_result(SESSION_ID)
+                    .expect("scan persisted sessions")
+                    .is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("failed session persistence must be deleted");
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        while let Ok(message) = rx.try_recv() {
+            let rendered = format!("{message:?}");
+            assert!(
+                !rendered.contains(SESSION_ID),
+                "a failed unpublished session must emit no gateway or relay notification: {rendered}"
+            );
+            if let xai_acp_lib::AcpClientMessage::ExtNotification(args) = message {
+                let _ = args.response_tx.send(Ok(()));
+            }
+        }
+        let remote_session_requests: Vec<_> = registry_server
+            .requests()
+            .into_iter()
+            .filter(|request| request.path.contains("/sessions/"))
+            .collect();
+        assert!(
+            remote_session_requests.is_empty(),
+            "a failed unpublished session must never register or update remote persistence: \
+             {remote_session_requests:?}"
+        );
+        let telemetry =
+            xai_grok_telemetry::unified_log::snapshot_session_log(SESSION_ID).unwrap_or_default();
+        assert!(
+            telemetry.is_empty(),
+            "a failed unpublished session must emit no session-scoped telemetry: {}",
+            String::from_utf8_lossy(&telemetry)
+        );
+
+        drop(failure_hook);
+        let retry = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            <MvpAgent as acp::Agent>::new_session(
+                &agent,
+                acp::NewSessionRequest::new(cwd.path().to_path_buf()).meta(
+                    serde_json::json!({
+                        "sessionId": SESSION_ID,
+                        "modelId": "session-only-default",
+                    })
+                    .as_object()
+                    .cloned(),
+                ),
+            ),
+        )
+        .await
+        .expect("same-id retry must not hang")
+        .expect("same-id retry must succeed after failed spawn cleanup");
+        assert_eq!(retry.session_id.0.as_ref(), SESSION_ID);
+        assert!(agent.is_resident(&retry.session_id));
     });
 }
 
@@ -6674,18 +7767,20 @@ fn production_spawn_latches_post_seal_unready_prepared_identity() {
         let cwd = tempfile::tempdir().expect("session cwd");
         let response = <MvpAgent as acp::Agent>::new_session(
             &agent,
-                acp::NewSessionRequest::new(cwd.path().to_path_buf()).meta(
-                    serde_json::json!({ "modelId": "sealed-model" })
-                        .as_object()
-                        .cloned(),
-                ),
-            )
-            .await
-            .expect("spawn sealed prepared session");
+            acp::NewSessionRequest::new(cwd.path().to_path_buf()).meta(
+                serde_json::json!({ "modelId": "sealed-model" })
+                    .as_object()
+                    .cloned(),
+            ),
+        )
+        .await
+        .expect("spawn sealed prepared session");
         drop(seal_hook);
 
         assert_eq!(
-            agent.session_registry.unavailable_model(&response.session_id),
+            agent
+                .session_registry
+                .unavailable_model(&response.session_id),
             Some(acp::ModelId::new("sealed-model"))
         );
         let sealed_identity = agent
@@ -6804,15 +7899,24 @@ fn spawn_runtime_tuning_prefers_pinned_then_prepared_exact_entry() {
     assert_eq!(selected.info.model, "pinned-route");
     assert_eq!(selected.info.auto_compact_threshold_percent, Some(71));
     assert_eq!(selected.info.system_prompt_label.as_deref(), Some("Pinned"));
-    assert_eq!(resolve_inference_idle_timeout_secs(Some(selected), None), 41);
+    assert_eq!(
+        resolve_inference_idle_timeout_secs(Some(selected), None),
+        41
+    );
     assert_eq!(selected.info.max_retries, Some(2));
 
     let selected = select_spawn_model_entry(None, Some(&prepared), &catalog, &identity)
         .expect("prepared entry wins over a same-key replacement");
     assert_eq!(selected.info.model, "prepared-route");
     assert_eq!(selected.info.auto_compact_threshold_percent, Some(72));
-    assert_eq!(selected.info.system_prompt_label.as_deref(), Some("Prepared"));
-    assert_eq!(resolve_inference_idle_timeout_secs(Some(selected), None), 51);
+    assert_eq!(
+        selected.info.system_prompt_label.as_deref(),
+        Some("Prepared")
+    );
+    assert_eq!(
+        resolve_inference_idle_timeout_secs(Some(selected), None),
+        51
+    );
     assert_eq!(selected.info.max_retries, Some(3));
 
     let selected = select_spawn_model_entry(None, None, &catalog, &identity)
@@ -6823,7 +7927,10 @@ fn spawn_runtime_tuning_prefers_pinned_then_prepared_exact_entry() {
         selected.info.system_prompt_label.as_deref(),
         Some("Replacement")
     );
-    assert_eq!(resolve_inference_idle_timeout_secs(Some(selected), None), 61);
+    assert_eq!(
+        resolve_inference_idle_timeout_secs(Some(selected), None),
+        61
+    );
     assert_eq!(selected.info.max_retries, Some(4));
 }
 
@@ -10245,9 +11352,7 @@ mod direct_hub_cloud_removed {
     }
 }
 mod local_workspace_removed {
-    use super::super::{
-        LOCAL_WORKSPACE_REMOVED_MSG, reject_removed_local_workspace_meta,
-    };
+    use super::super::{LOCAL_WORKSPACE_REMOVED_MSG, reject_removed_local_workspace_meta};
     fn assert_local_workspace_removed_error(err: agent_client_protocol::Error) {
         assert_eq!(
             err.code,
@@ -10284,11 +11389,7 @@ mod local_workspace_removed {
                 serde_json::json!({ "x.ai/local_workspace": null }),
                 true,
             ),
-            (
-                "absent_key",
-                serde_json::json!({ "envId": "env-1" }),
-                false,
-            ),
+            ("absent_key", serde_json::json!({ "envId": "env-1" }), false),
         ];
         for (label, meta, expect_error) in cases {
             let outcome = reject_removed_local_workspace_meta(meta.as_object());
@@ -10616,7 +11717,9 @@ fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex() {
             2,
             "active ACP /new must rebuild after the pre-seal auth mutation"
         );
-        let advertised = response.models.expect("/new must advertise its model state");
+        let advertised = response
+            .models
+            .expect("/new must advertise its model state");
         assert_eq!(
             advertised.current_model_id.0.as_ref(),
             crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID,

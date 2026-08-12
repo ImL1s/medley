@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,6 +28,99 @@ use crate::extensions::notification::{
 };
 use crate::session::info::Info;
 use tokio::sync::{mpsc, watch};
+
+#[cfg(test)]
+struct PublishFreshAckTestHook {
+    entered_tx: tokio::sync::oneshot::Sender<()>,
+    release_rx: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+fn publish_fresh_ack_test_hooks()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, PublishFreshAckTestHook>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, PublishFreshAckTestHook>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) struct PublishFreshAckTestController {
+    session_id: String,
+    entered_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+    release_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[cfg(test)]
+impl PublishFreshAckTestController {
+    pub(crate) async fn wait_until_entered(&mut self) {
+        self.entered_rx
+            .take()
+            .expect("publish-fresh acknowledgement hook may be entered only once")
+            .await
+            .expect(
+                "persistence actor exited before reaching the publish-fresh acknowledgement hook",
+            );
+    }
+
+    pub(crate) fn release(&mut self) {
+        self.release_tx
+            .take()
+            .expect("publish-fresh acknowledgement hook may be released only once")
+            .send(())
+            .expect("persistence actor exited before publish-fresh acknowledgement hook release");
+    }
+}
+
+#[cfg(test)]
+impl Drop for PublishFreshAckTestController {
+    fn drop(&mut self) {
+        publish_fresh_ack_test_hooks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.session_id);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_publish_fresh_ack_test_hook(
+    session_id: &str,
+) -> PublishFreshAckTestController {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let previous = publish_fresh_ack_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            session_id.to_owned(),
+            PublishFreshAckTestHook {
+                entered_tx,
+                release_rx,
+            },
+        );
+    assert!(
+        previous.is_none(),
+        "only one publish-fresh acknowledgement hook may be installed per session id"
+    );
+    PublishFreshAckTestController {
+        session_id: session_id.to_owned(),
+        entered_rx: Some(entered_rx),
+        release_tx: Some(release_tx),
+    }
+}
+
+#[cfg(test)]
+async fn block_publish_fresh_ack_test_hook(session_id: &str) {
+    let hook = publish_fresh_ack_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(session_id);
+    let Some(hook) = hook else {
+        return;
+    };
+    let _ = hook.entered_tx.send(());
+    let _ = hook.release_rx.await;
+}
 
 /// Current chat history format version.
 /// - Version 0: Legacy ChatRequestMessage format (default for old sessions)
@@ -419,6 +513,20 @@ pub enum PersistenceMsg {
     /// or clears (`None`, on conversation rewind) the previous one in
     /// `summary.json`.
     LastTurnSummary(Option<(String, String)>),
+    /// Delete a provisional fresh session and stop without flushing or
+    /// remote writeback. Used only when `/new` fails its final auth seal.
+    AbortFreshAndDelete {
+        publication_gate: crate::session::SessionPublicationGate,
+        respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
+    },
+    /// Publish a provisional fresh session and release its cross-process id
+    /// claim when the supplied gate becomes published. The acknowledgement
+    /// only confirms that the actor has armed the gate; it does not release
+    /// the claim.
+    PublishFresh {
+        publication_gate: crate::session::SessionPublicationGate,
+        respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
+    },
     /// Enable remote writeback for a session created `Local` before remote
     /// settings resolved (non-blocking startup); backfills its local history.
     UpgradeToWriteback {
@@ -446,6 +554,10 @@ pub use xai_grok_shared::session::session_dir;
 type RelocationResult<T> = crate::session::storage::relocation::Result<T>;
 type SummaryReader = fn(&Path) -> RelocationResult<Summary>;
 
+/// Presence of this file keeps a freshly-created session out of every local
+/// discovery path until the final, synchronous publication commit.
+pub(crate) const UNPUBLISHED_SESSION_MARKER: &str = ".unpublished";
+
 fn storage_view(sessions_root: &Path) -> RelocationResult<RelocationView> {
     RelocationView::load_for_sessions_root(sessions_root)
 }
@@ -466,7 +578,11 @@ pub fn session_exists_for_cwd(session_id: &str, cwd: &str) -> bool {
 /// the resume/restore resolution path; `find_session_dir_by_id` intentionally
 /// stays dir-only for non-resume compatibility.
 fn is_persisted_session_dir(session_path: &Path) -> bool {
-    session_path.join("summary.json").is_file()
+    !has_unpublished_session_marker(session_path) && session_path.join("summary.json").is_file()
+}
+
+fn has_unpublished_session_marker(session_dir: &Path) -> bool {
+    std::fs::symlink_metadata(session_dir.join(UNPUBLISHED_SESSION_MARKER)).is_ok()
 }
 
 /// Inner implementation of `session_exists_for_cwd` with an injectable root.
@@ -600,6 +716,9 @@ fn find_local_child_for_remote_in_root(
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
+            continue;
+        }
+        if has_unpublished_session_marker(&path) {
             continue;
         }
         let summary_path = path.join("summary.json");
@@ -1655,6 +1774,72 @@ impl PersistenceHandle {
         self.disk_full_rx.clone()
     }
 
+    /// Abort a provisional fresh session, wait for gate-tracked session
+    /// threads to exit, delete local storage, and wait until the persistence
+    /// actor has stopped. No buffered state is flushed.
+    pub(crate) fn request_abort_fresh_and_delete(
+        tx: &mpsc::UnboundedSender<PersistenceMsg>,
+        publication_gate: crate::session::SessionPublicationGate,
+    ) -> io::Result<tokio::sync::oneshot::Receiver<io::Result<()>>> {
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        tx.send(PersistenceMsg::AbortFreshAndDelete {
+            publication_gate,
+            respond_to,
+        })
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "session persistence actor stopped before provisional abort",
+            )
+        })?;
+        Ok(response)
+    }
+
+    /// Abort a provisional fresh session, wait for gate-tracked session
+    /// threads to exit, delete local storage, and wait until the persistence
+    /// actor has stopped. No buffered state is flushed.
+    pub(crate) async fn abort_fresh_and_delete(
+        tx: &mpsc::UnboundedSender<PersistenceMsg>,
+        publication_gate: crate::session::SessionPublicationGate,
+    ) -> io::Result<()> {
+        let response = Self::request_abort_fresh_and_delete(tx, publication_gate)?;
+        response.await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "session persistence actor stopped before provisional abort acknowledgement",
+            )
+        })?
+    }
+
+    /// Arm publication of a provisional fresh session and wait until the
+    /// persistence actor has installed the supplied gate. The id claim remains
+    /// held until the gate becomes published; abort keeps it armed so cleanup
+    /// deletes provisional storage before releasing the lock. Before publishing
+    /// the gate, the caller must run [`finalize_fresh_publication_sync`] in the
+    /// same no-await final commit.
+    pub(crate) async fn publish_fresh(
+        tx: &mpsc::UnboundedSender<PersistenceMsg>,
+        publication_gate: crate::session::SessionPublicationGate,
+    ) -> io::Result<()> {
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        tx.send(PersistenceMsg::PublishFresh {
+            publication_gate,
+            respond_to,
+        })
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "session persistence actor stopped before provisional publication",
+            )
+        })?;
+        response.await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "session persistence actor stopped before provisional publication acknowledgement",
+            )
+        })?
+    }
+
     /// Append after older buffered updates and wait for the durable barrier.
     ///
     /// [`DurableAppendError::NotCommitted`] is safe to retry; [`DurableAppendError::Committed`]
@@ -1697,6 +1882,15 @@ enum PendingAppendOutcome {
     NotCommittedErr(acp::SessionNotification, io::Error),
 }
 
+async fn wait_for_armed_publication(
+    publication_gate: Option<crate::session::SessionPublicationGate>,
+) -> bool {
+    match publication_gate {
+        Some(gate) => gate.wait_until_published().await,
+        None => std::future::pending().await,
+    }
+}
+
 struct SessionPersistence {
     info: Info,
     storage: Arc<dyn StorageAdapter>,
@@ -1707,6 +1901,15 @@ struct SessionPersistence {
     /// True only for sessions created this run (not resumed); gates the
     /// writeback backfill so a resumed, already-synced session isn't re-sent.
     created_fresh: bool,
+    /// Held from fresh storage initialization through checked publication or
+    /// abort so another process cannot load provisional on-disk state.
+    fresh_claim: Option<FreshSessionClaim>,
+    /// Armed by the checked `PublishFresh` handshake. Terminal abort clears
+    /// the waiter but deliberately retains `fresh_claim` for locked cleanup.
+    pending_publication_gate: Option<crate::session::SessionPublicationGate>,
+    /// Terminal abort is fail-closed: once observed, a later message cannot
+    /// re-arm publication with a different gate while cleanup is pending.
+    fresh_publication_aborted: bool,
     /// WebSocket-based relay sync for real-time session sharing.
     /// This streams updates to the relay backend in addition to local persistence.
     relay_sync: Option<crate::relay::RelaySync>,
@@ -2055,13 +2258,111 @@ impl SessionPersistence {
         // re-open) stay out of gc expiry without per-message DB writes.
         // The constructors fire the t=0 touch, so this starts at now().
         let mut last_worktree_touch = std::time::Instant::now();
-        while let Some(msg) = self.rx.recv().await {
-            if last_worktree_touch.elapsed() >= WORKTREE_TOUCH_INTERVAL {
+        loop {
+            let publication_gate = self.pending_publication_gate.clone();
+            let msg = tokio::select! {
+                biased;
+                published = wait_for_armed_publication(publication_gate) => {
+                    self.pending_publication_gate = None;
+                    if published {
+                        if let Some(claim) = self.fresh_claim.take() {
+                            if has_unpublished_session_marker(&claim.session_dir) {
+                                tracing::error!(
+                                    session_id = %self.info.id,
+                                    "fresh publication gate completed before durable storage publication"
+                                );
+                                self.fresh_claim = Some(claim);
+                            } else {
+                                claim.disarm();
+                                // A fresh session must not touch worktree
+                                // liveness (which records its cwd) until its
+                                // durable publication marker is gone.
+                                spawn_worktree_touch(&self.info);
+                            }
+                        } else {
+                            tracing::error!(
+                                session_id = %self.info.id,
+                                "fresh publication gate completed without an id claim"
+                            );
+                        }
+                    } else {
+                        self.fresh_publication_aborted = true;
+                    }
+                    continue;
+                }
+                msg = self.rx.recv() => {
+                    let Some(msg) = msg else {
+                        break;
+                    };
+                    msg
+                }
+            };
+            if self.fresh_claim.is_none()
+                && last_worktree_touch.elapsed() >= WORKTREE_TOUCH_INTERVAL
+            {
                 last_worktree_touch = std::time::Instant::now();
                 // Detached on purpose: opportunistic refresh, no ordering need.
                 spawn_worktree_touch(&self.info);
             }
             match msg {
+                PersistenceMsg::AbortFreshAndDelete {
+                    publication_gate,
+                    respond_to,
+                } => {
+                    let is_provisional = self.created_fresh && self.fresh_claim.is_some();
+                    if is_provisional {
+                        self.fresh_publication_aborted = true;
+                        publication_gate.abort();
+                        publication_gate.wait_until_session_threads_exit().await;
+                        self.pending_publication_gate = None;
+                        self.pending_notification = None;
+                        self.remote_sync = None;
+                        self.relay_sync = None;
+                    }
+                    let result = if is_provisional {
+                        self.storage.delete_session(&self.info).await
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "refusing to delete a published or resumed session through provisional abort",
+                        ))
+                    };
+                    if result.is_ok() {
+                        crate::session::storage::search::notify_session_updated(
+                            &self.info.id.to_string(),
+                            &self.info.cwd,
+                        );
+                    }
+                    let _ = respond_to.send(result);
+                    if is_provisional {
+                        return;
+                    }
+                }
+                PersistenceMsg::PublishFresh {
+                    publication_gate,
+                    respond_to,
+                } => {
+                    let result = if !self.created_fresh
+                        || self.fresh_claim.is_none()
+                        || self.fresh_publication_aborted
+                    {
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "fresh session is published, aborted, or has no publication claim",
+                        ))
+                    } else if self.pending_publication_gate.is_some() {
+                        Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "fresh session publication is already armed",
+                        ))
+                    } else {
+                        self.pending_publication_gate = Some(publication_gate);
+                        Ok(())
+                    };
+                    #[cfg(test)]
+                    block_publish_fresh_ack_test_hook(&self.info.id.to_string()).await;
+                    let _ = respond_to.send(result);
+                }
                 PersistenceMsg::UpgradeToWriteback { auth_manager } => {
                     self.upgrade_to_writeback(auth_manager).await;
                 }
@@ -2791,6 +3092,269 @@ async fn touch_worktree_for_session(info: &Info) {
 /// Floor between activity-driven worktree touches from the persistence actor.
 const WORKTREE_TOUCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// Process-held ownership of the cross-process advisory lock for one fresh
+/// session id.
+///
+/// The lock file is deliberately reusable rather than deleted on drop. Its
+/// existence carries no state; only the OS lock does, so a crash releases the
+/// claim without leaving a tombstone that blocks a later retry.
+#[derive(Debug)]
+struct FreshSessionClaim {
+    _session_id_lock: SessionIdLock,
+    session_dir: PathBuf,
+    cleanup_armed: bool,
+}
+
+impl FreshSessionClaim {
+    fn disarm(mut self) {
+        self.cleanup_armed = false;
+    }
+}
+
+impl Drop for FreshSessionClaim {
+    fn drop(&mut self) {
+        if !self.cleanup_armed {
+            return;
+        }
+        if let Err(error) = std::fs::remove_dir_all(&self.session_dir)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %self.session_dir.display(),
+                %error,
+                "failed to clean up cancelled fresh-session initialization"
+            );
+        }
+    }
+}
+
+fn session_claim_lock_name(session_id: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(session_id.len() * 2 + ".lock".len());
+    for byte in session_id.as_bytes() {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded.push_str(".lock");
+    encoded
+}
+
+/// Exclusive cross-process ownership for one persisted session id.
+///
+/// Fresh creation holds this through publication or abort. Loading takes the
+/// same lock before opening local files, which prevents observing a
+/// provisional directory and makes an aborted creation appear as NotFound.
+#[derive(Debug)]
+struct SessionIdLock {
+    _lock_file: std::fs::File,
+}
+
+fn acquire_session_id_lock_sync(root_dir: &Path, session_id: &str) -> io::Result<SessionIdLock> {
+    let lock_dir = root_dir.join(".locks").join("session-ids");
+    std::fs::create_dir_all(&lock_dir)?;
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_dir.join(session_claim_lock_name(session_id)))?;
+    lock_file.lock_exclusive()?;
+    Ok(SessionIdLock {
+        _lock_file: lock_file,
+    })
+}
+
+async fn acquire_session_id_lock(root_dir: &Path, session_id: &str) -> io::Result<SessionIdLock> {
+    let root_dir = root_dir.to_path_buf();
+    let session_id = session_id.to_owned();
+    tokio::task::spawn_blocking(move || acquire_session_id_lock_sync(&root_dir, &session_id))
+        .await
+        .map_err(io::Error::other)?
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+fn create_unpublished_session_dir(session_dir: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(session_dir)?;
+    let marker_path = session_dir.join(UNPUBLISHED_SESSION_MARKER);
+    let marker = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&marker_path)?;
+    marker.sync_all()?;
+    sync_directory(session_dir)?;
+    if let Some(parent) = session_dir.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(())
+}
+
+fn reclaim_stale_unpublished_sessions(sessions_root: &Path, session_id: &str) -> io::Result<()> {
+    let cwd_entries = match std::fs::read_dir(sessions_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for cwd_entry in cwd_entries {
+        let cwd_entry = cwd_entry?;
+        let cwd_type = cwd_entry.file_type()?;
+        if !cwd_type.is_dir() || cwd_type.is_symlink() {
+            continue;
+        }
+        let session_dir = cwd_entry.path().join(session_id);
+        let session_metadata = match std::fs::symlink_metadata(&session_dir) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if !session_metadata.file_type().is_dir() || session_metadata.file_type().is_symlink() {
+            continue;
+        }
+        let marker_path = session_dir.join(UNPUBLISHED_SESSION_MARKER);
+        let marker_metadata = match std::fs::symlink_metadata(&marker_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if !marker_metadata.file_type().is_file() || marker_metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "stale fresh-session marker is not a regular file: {}",
+                    marker_path.display()
+                ),
+            ));
+        }
+        std::fs::remove_dir_all(&session_dir)?;
+        sync_directory(&cwd_entry.path())?;
+    }
+    Ok(())
+}
+
+fn finalize_fresh_publication_in_root_sync(root_dir: &Path, info: &Info) -> io::Result<()> {
+    let session_dir = root_dir
+        .join("sessions")
+        .join(crate::util::grok_home::encode_cwd_dirname(&info.cwd))
+        .join(info.id.to_string());
+    let marker_path = session_dir.join(UNPUBLISHED_SESSION_MARKER);
+    let metadata = std::fs::symlink_metadata(&marker_path)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "fresh-session publication marker is not a regular file: {}",
+                marker_path.display()
+            ),
+        ));
+    }
+    std::fs::remove_file(&marker_path)?;
+    sync_directory(&session_dir)
+}
+
+/// Complete the on-disk part of fresh-session publication without an await.
+///
+/// The caller must invoke this as the first operation in its final synchronous
+/// commit, then publish the session gate with no intervening fallible work.
+/// The persistence actor retains the exclusive id claim until it observes the
+/// published gate.
+pub(crate) fn finalize_fresh_publication_sync(info: &Info) -> io::Result<()> {
+    finalize_fresh_publication_in_root_sync(&grok_home(), info)
+}
+
+fn persisted_session_id_present(sessions_root: &Path, session_id: &str) -> io::Result<bool> {
+    let cwd_entries = match std::fs::read_dir(sessions_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    for cwd_entry in cwd_entries {
+        let cwd_entry = cwd_entry?;
+        let cwd_type = cwd_entry.file_type()?;
+        if !cwd_type.is_dir() || cwd_type.is_symlink() {
+            continue;
+        }
+        for session_entry in std::fs::read_dir(cwd_entry.path())? {
+            let session_entry = session_entry?;
+            if session_entry.file_name() != std::ffi::OsStr::new(session_id) {
+                continue;
+            }
+            let session_type = session_entry.file_type()?;
+            if !session_type.is_dir() || session_type.is_symlink() {
+                continue;
+            }
+            if has_unpublished_session_marker(&session_entry.path()) {
+                continue;
+            }
+            match std::fs::metadata(session_entry.path().join("summary.json")) {
+                Ok(metadata) if metadata.is_file() => return Ok(true),
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn claim_fresh_session_sync(
+    root_dir: &Path,
+    session_id: &str,
+    session_dir: PathBuf,
+) -> io::Result<FreshSessionClaim> {
+    let session_id_lock = acquire_session_id_lock_sync(root_dir, session_id)?;
+
+    reclaim_stale_unpublished_sessions(&root_dir.join("sessions"), session_id)?;
+
+    if persisted_session_id_present(&root_dir.join("sessions"), session_id)? {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("a persisted session with id {session_id} already exists"),
+        ));
+    }
+    if session_dir.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "session storage already exists at {}",
+                session_dir.display()
+            ),
+        ));
+    }
+
+    if let Err(error) = create_unpublished_session_dir(&session_dir) {
+        let _ = std::fs::remove_dir_all(&session_dir);
+        return Err(error);
+    }
+
+    Ok(FreshSessionClaim {
+        _session_id_lock: session_id_lock,
+        session_dir,
+        cleanup_armed: true,
+    })
+}
+
+async fn claim_fresh_session(root_dir: &Path, info: &Info) -> io::Result<FreshSessionClaim> {
+    let root_dir = root_dir.to_path_buf();
+    let session_id = info.id.to_string();
+    let session_dir = root_dir
+        .join("sessions")
+        .join(crate::util::grok_home::encode_cwd_dirname(&info.cwd))
+        .join(&session_id);
+    tokio::task::spawn_blocking(move || {
+        claim_fresh_session_sync(&root_dir, &session_id, session_dir)
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
 pub(crate) async fn new(
     info: &Info,
     model_id: acp::ModelId,
@@ -2803,11 +3367,12 @@ pub(crate) async fn new(
     registry_title_sync: Option<RegistryGeneratedTitleSync>,
 ) -> io::Result<PersistenceHandle> {
     let root_dir = grok_home();
-    let storage: Box<dyn StorageAdapter> = Box::new(JsonlStorageAdapter::with_root(root_dir));
+    let fresh_claim = claim_fresh_session(&root_dir, info).await?;
+    let storage: Box<dyn StorageAdapter> =
+        Box::new(JsonlStorageAdapter::with_root(root_dir.clone()));
 
     // Initialize session in storage
     let mut summary = storage.init_session(info, model_id.clone()).await?;
-    touch_worktree_for_session(info).await;
 
     // Update model if different
     if summary.current_model_id != model_id {
@@ -2828,6 +3393,9 @@ pub(crate) async fn new(
             rx,
             remote_sync: remote_sync.clone(),
             created_fresh: true,
+            fresh_claim: Some(fresh_claim),
+            pending_publication_gate: None,
+            fresh_publication_aborted: false,
             relay_sync,
             summary: crate::session::summary::SummaryGenerator::new(
                 crate::session::summary::SummaryConfig {
@@ -2896,6 +3464,9 @@ pub(crate) async fn new_with_explicit_dir(
             rx,
             remote_sync: None,
             created_fresh: false,
+            fresh_claim: None,
+            pending_publication_gate: None,
+            fresh_publication_aborted: false,
             relay_sync: None,
             summary: crate::session::summary::SummaryGenerator::new(
                 crate::session::summary::SummaryConfig {
@@ -2960,7 +3531,10 @@ async fn pull_on_miss(
     try_pull_from_remote(info, client).await.ok_or(err)
 }
 
-#[expect(dead_code, reason = "wired when session restore flow calls load")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired when session restore flow calls load")
+)]
 pub(crate) async fn load(
     info: &Info,
     sampling_client: OaiCompatClient,
@@ -2973,7 +3547,9 @@ pub(crate) async fn load(
     registry_title_sync: Option<RegistryGeneratedTitleSync>,
 ) -> io::Result<(PersistedInfo, PersistenceHandle)> {
     let root_dir = grok_home();
-    let storage: Box<dyn StorageAdapter> = Box::new(JsonlStorageAdapter::with_root(root_dir));
+    let _session_id_lock = acquire_session_id_lock(&root_dir, &info.id.to_string()).await?;
+    let storage: Box<dyn StorageAdapter> =
+        Box::new(JsonlStorageAdapter::with_root(root_dir.clone()));
 
     let (persisted, loaded_info) = match storage.load_session(info).await {
         Ok(p) => (p, info.clone()),
@@ -3023,6 +3599,9 @@ pub(crate) async fn load(
             rx,
             remote_sync: remote_sync.clone(),
             created_fresh: false,
+            fresh_claim: None,
+            pending_publication_gate: None,
+            fresh_publication_aborted: false,
             relay_sync,
             summary: summary_gen,
             registry_title_sync,
@@ -3051,6 +3630,7 @@ pub(crate) async fn load_light(
     registry_title_sync: Option<RegistryGeneratedTitleSync>,
 ) -> io::Result<(PersistedInfoLight, PersistenceHandle)> {
     let root_dir = grok_home();
+    let _session_id_lock = acquire_session_id_lock(&root_dir, &info.id.to_string()).await?;
     let storage: Box<dyn StorageAdapter> =
         Box::new(JsonlStorageAdapter::with_root(root_dir.clone()));
 
@@ -3108,6 +3688,9 @@ pub(crate) async fn load_light(
             rx,
             remote_sync: remote_sync.clone(),
             created_fresh: false,
+            fresh_claim: None,
+            pending_publication_gate: None,
+            fresh_publication_aborted: false,
             relay_sync,
             summary: summary_gen,
             registry_title_sync,
@@ -3441,6 +4024,10 @@ fn cleanup_stale_sessions_inner(
     level: CleanupLevel,
 ) -> CleanupStats {
     let mut stats = CleanupStats::default();
+
+    if has_unpublished_session_marker(root) {
+        return stats;
+    }
 
     if root
         .file_name()
@@ -4333,8 +4920,8 @@ mod resumed_sandbox_profile_tests {
 #[cfg(test)]
 mod session_exists_for_cwd_tests {
     use super::{
-        resolve_local_session_any_cwd_in_root, session_exists_for_cwd_in_root,
-        session_exists_in_root,
+        UNPUBLISHED_SESSION_MARKER, resolve_local_session_any_cwd_in_root,
+        session_exists_for_cwd_in_root, session_exists_in_root,
     };
     use std::fs;
     use tempfile::TempDir;
@@ -4352,6 +4939,27 @@ mod session_exists_for_cwd_tests {
         fs::write(dir.join("summary.json"), b"{}").unwrap();
 
         assert!(session_exists_for_cwd_in_root(session_id, cwd, &root));
+    }
+
+    #[test]
+    fn unpublished_session_is_hidden_from_direct_and_all_cwd_resolution() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("sessions");
+        let cwd = "/project/pending";
+        let session_id = "pending-session";
+        let dir = root
+            .join(crate::util::grok_home::encode_cwd_dirname(cwd))
+            .join(session_id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(UNPUBLISHED_SESSION_MARKER), b"").unwrap();
+        fs::write(dir.join("summary.json"), b"{}").unwrap();
+
+        assert!(!session_exists_for_cwd_in_root(session_id, cwd, &root));
+        assert!(!session_exists_in_root(session_id, &root));
+        assert_eq!(
+            resolve_local_session_any_cwd_in_root(session_id, &root).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -4493,7 +5101,7 @@ mod session_exists_for_cwd_tests {
 
 #[cfg(test)]
 mod find_local_child_tests {
-    use super::find_local_child_for_remote_in_root;
+    use super::{UNPUBLISHED_SESSION_MARKER, find_local_child_for_remote_in_root};
     use filetime::{self, FileTime};
     use std::fs;
     use tempfile::TempDir;
@@ -4519,6 +5127,21 @@ mod find_local_child_tests {
 
         let found = find_local_child_for_remote_in_root("remote-abc", "/work", &root);
         assert_eq!(found.as_deref(), Some("local-child-uuid"));
+    }
+
+    #[test]
+    fn unpublished_restored_child_is_not_resolved() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("sessions");
+        let cwd = "/work";
+        let child_id = "pending-local-child";
+        make_session_with_parent(root.as_path(), cwd, child_id, "remote-abc");
+        let dir = root
+            .join(crate::util::grok_home::encode_cwd_dirname(cwd))
+            .join(child_id);
+        fs::write(dir.join(UNPUBLISHED_SESSION_MARKER), b"").unwrap();
+
+        assert!(find_local_child_for_remote_in_root("remote-abc", cwd, &root).is_none());
     }
 
     #[test]
@@ -4945,6 +5568,616 @@ mod repo_wide_resolution_tests {
         assert_eq!(
             deser.resolution_kind,
             LocalSessionResolutionKind::SameRepoDifferentCwd
+        );
+    }
+}
+
+#[cfg(test)]
+mod fresh_session_claim_tests {
+    use super::*;
+    use std::io::{BufRead, Read, Write};
+    use std::time::Duration;
+
+    const CHILD_MODE_ENV: &str = "GROK_TEST_SESSION_CLAIM_MODE";
+    const CHILD_ROOT_ENV: &str = "GROK_TEST_SESSION_CLAIM_ROOT";
+    const CHILD_ID_ENV: &str = "GROK_TEST_SESSION_CLAIM_ID";
+    const CHILD_CWD_ENV: &str = "GROK_TEST_SESSION_CLAIM_CWD";
+    const CHILD_RELEASE_ENV: &str = "GROK_TEST_SESSION_CLAIM_RELEASE";
+    const CHILD_READY: &str = "__GROK_SESSION_CLAIM_READY__";
+    const CHILD_RESULT_PREFIX: &str = "__GROK_SESSION_CLAIM_RESULT__=";
+    const CHILD_FINISH_TIMEOUT: Duration = Duration::from_secs(15);
+
+    fn test_session_dir(root: &Path, cwd: &str, session_id: &str) -> PathBuf {
+        root.join("sessions")
+            .join(crate::util::grok_home::encode_cwd_dirname(cwd))
+            .join(session_id)
+    }
+
+    fn test_info(session_id: &str, cwd: &str) -> Info {
+        Info {
+            id: acp::SessionId::new(session_id),
+            cwd: cwd.to_owned(),
+        }
+    }
+
+    fn test_sampling_client() -> OaiCompatClient {
+        OaiCompatClient::new(xai_grok_sampler::SamplerConfig::default())
+            .expect("test sampling client")
+    }
+
+    async fn production_new(info: &Info) -> io::Result<PersistenceHandle> {
+        new(
+            info,
+            default_model_id(),
+            test_sampling_client(),
+            StorageMode::Local,
+            None,
+            None,
+            None,
+            String::new(),
+            None,
+        )
+        .await
+    }
+
+    fn print_child_ready() {
+        println!("{CHILD_READY}");
+        std::io::stdout().flush().expect("flush child ready marker");
+    }
+
+    fn wait_for_child_release(path: &Path) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !path.is_file() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "parent did not release production session child"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Re-executed libtest child for genuine cross-process flock coverage.
+    #[test]
+    #[ignore = "spawned by cross-process fresh-session claim tests"]
+    fn subprocess_session_claim_entry() {
+        let Ok(mode) = std::env::var(CHILD_MODE_ENV) else {
+            return;
+        };
+        let root = PathBuf::from(std::env::var_os(CHILD_ROOT_ENV).expect("child root"));
+        let session_id = std::env::var(CHILD_ID_ENV).expect("child session id");
+        let cwd = std::env::var(CHILD_CWD_ENV).expect("child cwd");
+        let release_path =
+            PathBuf::from(std::env::var_os(CHILD_RELEASE_ENV).expect("child release marker path"));
+
+        let result = match mode.as_str() {
+            "claim" => {
+                print_child_ready();
+                let session_dir = test_session_dir(&root, &cwd, &session_id);
+                match claim_fresh_session_sync(&root, &session_id, session_dir) {
+                    Ok(_claim) => "CLAIMED".to_owned(),
+                    Err(error) => format!("ERROR:{:?}", error.kind()),
+                }
+            }
+            "load" => {
+                print_child_ready();
+                match acquire_session_id_lock_sync(&root, &session_id) {
+                    Ok(_lock) => {
+                        if test_session_dir(&root, &cwd, &session_id)
+                            .join("summary.json")
+                            .is_file()
+                        {
+                            "PRESENT".to_owned()
+                        } else {
+                            "ABSENT".to_owned()
+                        }
+                    }
+                    Err(error) => format!("ERROR:{:?}", error.kind()),
+                }
+            }
+            "production-new" => {
+                print_child_ready();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("production new child runtime");
+                match runtime.block_on(production_new(&test_info(&session_id, &cwd))) {
+                    Ok(_handle) => "CREATED".to_owned(),
+                    Err(error) => format!("ERROR:{:?}", error.kind()),
+                }
+            }
+            "production-new-hold-publish" | "production-new-hold-abort" => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("production creator child runtime");
+                let handle = runtime
+                    .block_on(production_new(&test_info(&session_id, &cwd)))
+                    .expect("production PersistenceHandle::new");
+                let publication_gate = crate::session::SessionPublicationGate::pending();
+                runtime
+                    .block_on(PersistenceHandle::publish_fresh(
+                        &handle.tx,
+                        publication_gate.clone(),
+                    ))
+                    .expect("arm fresh publication gate");
+                print_child_ready();
+                wait_for_child_release(&release_path);
+                if mode == "production-new-hold-publish" {
+                    finalize_fresh_publication_in_root_sync(&root, &test_info(&session_id, &cwd))
+                        .expect("durably publish fresh storage");
+                    publication_gate.publish();
+                    let (respond_to, response) = tokio::sync::oneshot::channel();
+                    handle
+                        .tx
+                        .send(PersistenceMsg::ProbeWritable { respond_to })
+                        .expect("send post-publication persistence barrier");
+                    runtime
+                        .block_on(response)
+                        .expect("persistence actor stopped before publication barrier")
+                        .expect("post-publication persistence barrier");
+                    "PUBLISHED".to_owned()
+                } else {
+                    runtime
+                        .block_on(PersistenceHandle::abort_fresh_and_delete(
+                            &handle.tx,
+                            publication_gate,
+                        ))
+                        .expect("abort production fresh session");
+                    "ABORTED".to_owned()
+                }
+            }
+            "production-load" | "production-load-light" => {
+                print_child_ready();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("production load child runtime");
+                let info = test_info(&session_id, &cwd);
+                let load_result = if mode == "production-load" {
+                    runtime
+                        .block_on(load(
+                            &info,
+                            test_sampling_client(),
+                            StorageMode::Local,
+                            None,
+                            None,
+                            None,
+                            None,
+                            String::new(),
+                            None,
+                        ))
+                        .map(|(persisted, _handle)| persisted.summary.info.id)
+                } else {
+                    runtime
+                        .block_on(load_light(
+                            &info,
+                            test_sampling_client(),
+                            StorageMode::Local,
+                            None,
+                            None,
+                            None,
+                            None,
+                            String::new(),
+                            None,
+                        ))
+                        .map(|(persisted, _handle)| persisted.summary.info.id)
+                };
+                match load_result {
+                    Ok(loaded_id) if loaded_id == info.id => "PRESENT".to_owned(),
+                    Ok(loaded_id) => format!("WRONG_ID:{loaded_id}"),
+                    Err(error) => format!("ERROR:{:?}", error.kind()),
+                }
+            }
+            "production-list" => {
+                print_child_ready();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("production list child runtime");
+                match runtime.block_on(list_summaries(Some(&cwd))) {
+                    Ok(summaries)
+                        if summaries
+                            .iter()
+                            .any(|summary| summary.info.id.to_string() == session_id) =>
+                    {
+                        "PRESENT".to_owned()
+                    }
+                    Ok(_) => "ABSENT".to_owned(),
+                    Err(error) => format!("ERROR:{:?}", error.kind()),
+                }
+            }
+            "production-delete" => {
+                print_child_ready();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("production delete child runtime");
+                let auth_manager = Arc::new(crate::auth::AuthManager::new(
+                    &root,
+                    crate::auth::GrokComConfig::default(),
+                ));
+                match runtime.block_on(delete_session_history(
+                    &session_id,
+                    Some(&cwd),
+                    false,
+                    auth_manager,
+                )) {
+                    Ok(deletion)
+                        if !deletion.any_removed()
+                            && test_session_dir(&root, &cwd, &session_id).is_dir() =>
+                    {
+                        "ABSENT_PRESERVED".to_owned()
+                    }
+                    Ok(deletion) => format!(
+                        "REMOVED:{}:{}",
+                        deletion.local_removed, deletion.remote_removed
+                    ),
+                    Err(error) => format!("ERROR:{error}"),
+                }
+            }
+            other => panic!("unknown child session-claim mode: {other}"),
+        };
+        println!("{CHILD_RESULT_PREFIX}{result}");
+    }
+
+    fn child_test_filter() -> String {
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        format!("{module}::subprocess_session_claim_entry")
+    }
+
+    #[allow(clippy::disallowed_methods)] // isolated libtest subprocess fixture
+    fn spawn_claim_child(
+        mode: &str,
+        root: &Path,
+        session_id: &str,
+        cwd: &str,
+    ) -> std::process::Child {
+        let executable = std::env::current_exe().expect("current libtest executable");
+        let release_path = root.join("child-release");
+        let mut command = std::process::Command::new(executable);
+        command
+            .args(["--ignored", "--exact", "--nocapture", &child_test_filter()])
+            .env(CHILD_MODE_ENV, mode)
+            .env(CHILD_ROOT_ENV, root)
+            .env(CHILD_ID_ENV, session_id)
+            .env(CHILD_CWD_ENV, cwd)
+            .env(CHILD_RELEASE_ENV, &release_path)
+            .env("GROK_HOME", root)
+            .env_remove("MEDLEY_HOME")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        xai_tty_utils::detach_std_command(&mut command);
+        let mut child = command.spawn().expect("spawn session-claim child");
+
+        {
+            let stdout = child.stdout.as_mut().expect("child stdout");
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let bytes = reader.read_line(&mut line).expect("read child marker");
+                assert!(bytes > 0, "child exited before its ready marker");
+                if line.trim() == CHILD_READY {
+                    break;
+                }
+            }
+        }
+        child
+    }
+
+    fn release_claim_child(root: &Path) {
+        std::fs::write(root.join("child-release"), b"release")
+            .expect("release production session child");
+    }
+
+    fn assert_claim_child_is_blocked(child: &mut std::process::Child, operation: &str) {
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            child
+                .try_wait()
+                .unwrap_or_else(|error| panic!("poll {operation}: {error}"))
+                .is_none(),
+            "{operation} must remain blocked while fresh state is provisional"
+        );
+    }
+
+    fn finish_claim_child(mut child: std::process::Child) -> String {
+        let deadline = std::time::Instant::now() + CHILD_FINISH_TIMEOUT;
+        loop {
+            match child.try_wait().expect("poll session-claim child") {
+                Some(status) => {
+                    let mut stdout = String::new();
+                    child
+                        .stdout
+                        .take()
+                        .expect("child stdout")
+                        .read_to_string(&mut stdout)
+                        .expect("read child stdout");
+                    let mut stderr = String::new();
+                    child
+                        .stderr
+                        .take()
+                        .expect("child stderr")
+                        .read_to_string(&mut stderr)
+                        .expect("read child stderr");
+                    assert!(
+                        status.success(),
+                        "session-claim child failed ({status:?})\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                    );
+                    return stdout;
+                }
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("session-claim child did not finish after lock release");
+                }
+            }
+        }
+    }
+
+    fn assert_child_result(stdout: &str, expected: &str) {
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.trim() == format!("{CHILD_RESULT_PREFIX}{expected}")),
+            "missing child result {expected:?} in stdout:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn cross_process_duplicate_claim_rechecks_other_encoded_cwd_after_lock() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000104";
+        const CREATOR_CWD: &str = "/repo/concurrent-claim/creator";
+        const CONTENDER_CWD: &str = "/repo/concurrent-claim/other-worktree";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let session_dir = test_session_dir(root.path(), CREATOR_CWD, SESSION_ID);
+        let first_claim = claim_fresh_session_sync(root.path(), SESSION_ID, session_dir.clone())
+            .expect("first claim succeeds");
+
+        let mut contender = spawn_claim_child("claim", root.path(), SESSION_ID, CONTENDER_CWD);
+        assert!(
+            contender
+                .try_wait()
+                .expect("poll blocked contender")
+                .is_none(),
+            "the real second process must wait for the creator's id claim"
+        );
+
+        std::fs::create_dir_all(&session_dir).expect("create persisted session directory");
+        std::fs::write(session_dir.join("summary.json"), b"{}")
+            .expect("persist summary while first claim is held");
+
+        finalize_fresh_publication_in_root_sync(root.path(), &test_info(SESSION_ID, CREATOR_CWD))
+            .expect("durably publish first claim");
+        first_claim.disarm();
+        let stdout = finish_claim_child(contender);
+        assert_child_result(&stdout, "ERROR:AlreadyExists");
+
+        std::fs::remove_dir_all(&session_dir).expect("remove persisted session");
+        let retry = claim_fresh_session_sync(
+            root.path(),
+            SESSION_ID,
+            test_session_dir(root.path(), CONTENDER_CWD, SESSION_ID),
+        )
+        .expect("the reusable lock file is not a permanent tombstone");
+        drop(retry);
+    }
+
+    #[test]
+    fn fresh_claim_stages_marker_and_reclaims_stale_marked_dir_across_cwds() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000114";
+        const STALE_CWD: &str = "/repo/stale-creator";
+        const RETRY_CWD: &str = "/repo/retry-creator";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let stale_dir = test_session_dir(root.path(), STALE_CWD, SESSION_ID);
+        let stale = claim_fresh_session_sync(root.path(), SESSION_ID, stale_dir.clone())
+            .expect("initial fresh claim");
+        assert!(
+            stale_dir.join(UNPUBLISHED_SESSION_MARKER).is_file(),
+            "the marker must exist before any summary write"
+        );
+        std::fs::write(stale_dir.join("summary.json"), b"{}").expect("provisional summary");
+        stale.disarm();
+
+        let retry_dir = test_session_dir(root.path(), RETRY_CWD, SESSION_ID);
+        let retry = claim_fresh_session_sync(root.path(), SESSION_ID, retry_dir.clone())
+            .expect("new lock owner reclaims crashed provisional state");
+        assert!(!stale_dir.exists());
+        assert!(retry_dir.join(UNPUBLISHED_SESSION_MARKER).is_file());
+        drop(retry);
+    }
+
+    #[test]
+    fn cross_process_load_waits_for_fresh_publish() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000106";
+        const CWD: &str = "/repo/load-after-publish";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let session_dir = test_session_dir(root.path(), CWD, SESSION_ID);
+        let creator = claim_fresh_session_sync(root.path(), SESSION_ID, session_dir.clone())
+            .expect("creator claim");
+        let mut loader = spawn_claim_child("load", root.path(), SESSION_ID, CWD);
+        assert!(
+            loader.try_wait().expect("poll blocked loader").is_none(),
+            "load must remain blocked while fresh state is provisional"
+        );
+
+        std::fs::create_dir_all(&session_dir).expect("create fresh session directory");
+        std::fs::write(session_dir.join("summary.json"), b"{}").expect("write publication marker");
+        finalize_fresh_publication_in_root_sync(root.path(), &test_info(SESSION_ID, CWD))
+            .expect("durably publish creator");
+        creator.disarm();
+
+        let stdout = finish_claim_child(loader);
+        assert_child_result(&stdout, "PRESENT");
+    }
+
+    #[test]
+    fn cross_process_load_observes_not_found_after_fresh_abort() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000107";
+        const CWD: &str = "/repo/load-after-abort";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let session_dir = test_session_dir(root.path(), CWD, SESSION_ID);
+        let creator = claim_fresh_session_sync(root.path(), SESSION_ID, session_dir.clone())
+            .expect("creator claim");
+        std::fs::create_dir_all(&session_dir).expect("create provisional session directory");
+        std::fs::write(session_dir.join("summary.json"), b"{}").expect("write provisional summary");
+
+        let mut loader = spawn_claim_child("load", root.path(), SESSION_ID, CWD);
+        assert!(
+            loader.try_wait().expect("poll blocked loader").is_none(),
+            "load must remain blocked while fresh state is provisional"
+        );
+        drop(creator);
+
+        let stdout = finish_claim_child(loader);
+        assert_child_result(&stdout, "ABSENT");
+        assert!(
+            !session_dir.exists(),
+            "abort must remove provisional state before releasing the id claim"
+        );
+    }
+
+    #[test]
+    fn production_new_blocks_duplicate_creator_until_publish_then_rejects_it() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000108";
+        const CREATOR_CWD: &str = "/repo/production-new/creator";
+        const CONTENDER_CWD: &str = "/repo/production-new/contender";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let creator = spawn_claim_child(
+            "production-new-hold-publish",
+            root.path(),
+            SESSION_ID,
+            CREATOR_CWD,
+        );
+        let mut contender =
+            spawn_claim_child("production-new", root.path(), SESSION_ID, CONTENDER_CWD);
+        assert_claim_child_is_blocked(&mut contender, "production persistence::new");
+
+        release_claim_child(root.path());
+        assert_child_result(&finish_claim_child(creator), "PUBLISHED");
+        assert_child_result(&finish_claim_child(contender), "ERROR:AlreadyExists");
+    }
+
+    #[test]
+    fn cross_process_list_and_delete_ignore_pending_then_list_sees_publication() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000113";
+        const CWD: &str = "/repo/production-discovery/publication";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let creator =
+            spawn_claim_child("production-new-hold-publish", root.path(), SESSION_ID, CWD);
+
+        let pending_list = spawn_claim_child("production-list", root.path(), SESSION_ID, CWD);
+        assert_child_result(&finish_claim_child(pending_list), "ABSENT");
+
+        let pending_delete = spawn_claim_child("production-delete", root.path(), SESSION_ID, CWD);
+        assert_child_result(&finish_claim_child(pending_delete), "ABSENT_PRESERVED");
+
+        release_claim_child(root.path());
+        assert_child_result(&finish_claim_child(creator), "PUBLISHED");
+
+        let published_list = spawn_claim_child("production-list", root.path(), SESSION_ID, CWD);
+        assert_child_result(&finish_claim_child(published_list), "PRESENT");
+    }
+
+    #[test]
+    fn production_load_light_waits_for_publish_then_reads_session() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000109";
+        const CWD: &str = "/repo/production-load-light/publish";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let creator =
+            spawn_claim_child("production-new-hold-publish", root.path(), SESSION_ID, CWD);
+        let mut loader = spawn_claim_child("production-load-light", root.path(), SESSION_ID, CWD);
+        assert_claim_child_is_blocked(&mut loader, "production persistence::load_light");
+
+        release_claim_child(root.path());
+        assert_child_result(&finish_claim_child(creator), "PUBLISHED");
+        assert_child_result(&finish_claim_child(loader), "PRESENT");
+    }
+
+    #[test]
+    fn production_load_waits_for_publish_then_reads_session() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000111";
+        const CWD: &str = "/repo/production-load/publish";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let creator =
+            spawn_claim_child("production-new-hold-publish", root.path(), SESSION_ID, CWD);
+        let mut loader = spawn_claim_child("production-load", root.path(), SESSION_ID, CWD);
+        assert_claim_child_is_blocked(&mut loader, "production persistence::load");
+
+        release_claim_child(root.path());
+        assert_child_result(&finish_claim_child(creator), "PUBLISHED");
+        assert_child_result(&finish_claim_child(loader), "PRESENT");
+    }
+
+    #[test]
+    fn production_load_waits_for_abort_then_returns_not_found() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000110";
+        const CWD: &str = "/repo/production-load/abort";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let creator = spawn_claim_child("production-new-hold-abort", root.path(), SESSION_ID, CWD);
+        let mut loader = spawn_claim_child("production-load", root.path(), SESSION_ID, CWD);
+        assert_claim_child_is_blocked(&mut loader, "production persistence::load");
+
+        release_claim_child(root.path());
+        assert_child_result(&finish_claim_child(creator), "ABORTED");
+        assert_child_result(&finish_claim_child(loader), "ERROR:NotFound");
+    }
+
+    #[test]
+    fn production_load_light_waits_for_abort_then_returns_not_found() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000112";
+        const CWD: &str = "/repo/production-load-light/abort";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let creator = spawn_claim_child("production-new-hold-abort", root.path(), SESSION_ID, CWD);
+        let mut loader = spawn_claim_child("production-load-light", root.path(), SESSION_ID, CWD);
+        assert_claim_child_is_blocked(&mut loader, "production persistence::load_light");
+
+        release_claim_child(root.path());
+        assert_child_result(&finish_claim_child(creator), "ABORTED");
+        assert_child_result(&finish_claim_child(loader), "ERROR:NotFound");
+    }
+
+    #[test]
+    fn armed_claim_cleans_only_its_new_session_directory() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000105";
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let session_dir = test_session_dir(root.path(), "/repo/cancelled", SESSION_ID);
+
+        let claim = claim_fresh_session_sync(root.path(), SESSION_ID, session_dir.clone())
+            .expect("claim new path");
+        std::fs::create_dir_all(&session_dir).expect("simulate initialization");
+        std::fs::write(session_dir.join("summary.json"), b"{}")
+            .expect("simulate initialized summary");
+        drop(claim);
+        assert!(
+            !session_dir.exists(),
+            "dropping an armed claim must clean cancelled initialization"
+        );
+
+        std::fs::create_dir_all(&session_dir).expect("create pre-existing path");
+        std::fs::write(session_dir.join("owned-by-someone-else"), b"keep")
+            .expect("write pre-existing content");
+        let error = claim_fresh_session_sync(root.path(), SESSION_ID, session_dir.clone())
+            .expect_err("pre-existing storage must not be claimed for cleanup");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(
+            session_dir.join("owned-by-someone-else").is_file(),
+            "a failed claim must preserve pre-existing data"
         );
     }
 }

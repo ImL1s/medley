@@ -223,7 +223,9 @@ async fn nested_spawn_uses_immediate_parent_security_after_lifecycle_reparenting
     assert_eq!(ctx.model_id.0.as_ref(), "immediate-model");
     assert_eq!(ctx.parent_cwd, immediate_cwd);
     assert_eq!(
-        ctx.parent_session_info.as_ref().map(|info| info.cwd.as_str()),
+        ctx.parent_session_info
+            .as_ref()
+            .map(|info| info.cwd.as_str()),
         Some("/isolated-worktree")
     );
     assert_eq!(ctx.fs.root(), std::path::Path::new("/isolated-worktree"));
@@ -243,7 +245,10 @@ async fn nested_spawn_uses_immediate_parent_security_after_lifecycle_reparenting
             .live_count(),
         1
     );
-    assert_eq!(ctx.parent_capability_mode, Some(SubagentCapabilityMode::Execute));
+    assert_eq!(
+        ctx.parent_capability_mode,
+        Some(SubagentCapabilityMode::Execute)
+    );
     assert_eq!(ctx.parent_depth, 1);
     assert_eq!(ctx.inherited_tool_overrides, Some(cutoff));
     assert_eq!(

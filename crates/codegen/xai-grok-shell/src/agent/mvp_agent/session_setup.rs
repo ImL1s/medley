@@ -234,7 +234,7 @@ impl MvpAgent {
         arguments: acp::LoadSessionRequest,
         op: AttachOperation,
     ) -> Result<acp::LoadSessionResponse, acp::Error> {
-        let load_guard = self.begin_session_load(&arguments.session_id);
+        let load_guard = self.begin_session_load(&arguments.session_id)?;
         reject_chat_kind_without_feature(arguments.meta.as_ref())?;
         self.sweep_dead_sessions();
         if !self.is_resident(&arguments.session_id) {
@@ -316,7 +316,8 @@ impl MvpAgent {
             &self.models_manager.current_model_id(),
             origin_client.clone(),
         );
-        let (summary_client, summary_model) = self.build_summary_client(&load_session_sampling).await?;
+        let (summary_client, summary_model) =
+            self.build_summary_client(&load_session_sampling).await?;
         let relay_sync = self.start_relay_sync(&session_id, &session_info);
         let mut persistence_timer = crate::instrumentation_timer!("session.load_light");
         persistence_timer.with_field("session_id", session_id.0.as_ref());
@@ -463,10 +464,13 @@ impl MvpAgent {
                     prepared_sampling_config: None,
                     prepared_catalog_identity: None,
                     prepared_model_entry: None,
-                    persisted_catalog_identity: summary
-                        .catalog_identity
-                        .clone()
-                        .filter(|identity| identity.model_id == summary.current_model_id.0.as_ref()),
+                    new_session_auth_authority: None,
+                    publication_gate: None,
+                    deferred_relay_state_rx: None,
+                    upgrade_persistence_to_writeback: false,
+                    persisted_catalog_identity: summary.catalog_identity.clone().filter(
+                        |identity| identity.model_id == summary.current_model_id.0.as_ref(),
+                    ),
                     session_model_id: summary.current_model_id.clone(),
                     session_yolo_mode,
                     session_auto_mode: session_auto_mode && !session_yolo_mode,
@@ -822,16 +826,15 @@ impl MvpAgent {
                 persisted = %persisted_model.0,
                 "Persisted catalog identity no longer resolves safely; blocking prompts"
             );
-            self.session_registry
-                .set_unavailable_model_with_identity(
-                    &session_id,
-                    persisted_model,
-                    summary.catalog_identity.clone(),
-                    summary.agent_name.clone().or_else(|| {
-                        self.resident_handle(&session_id)
-                            .map(|handle| handle.agent_name)
-                    }),
-                );
+            self.session_registry.set_unavailable_model_with_identity(
+                &session_id,
+                persisted_model,
+                summary.catalog_identity.clone(),
+                summary.agent_name.clone().or_else(|| {
+                    self.resident_handle(&session_id)
+                        .map(|handle| handle.agent_name)
+                }),
+            );
             return;
         }
         let is_grok_build = persisted_model.0.starts_with("grok-build");
@@ -901,26 +904,22 @@ impl MvpAgent {
                 .await;
             fallback
         } else {
-            let fallback = available
-                .keys()
-                .next()
-                .cloned();
+            let fallback = available.keys().next().cloned();
             let Some(fallback) = fallback else {
                 tracing::warn!(
                     session_id = %session_id.0,
                     persisted = %persisted_model.0,
                     "Persisted catalog identity no longer resolves and no safe fallback exists; blocking prompts"
                 );
-                self.session_registry
-                    .set_unavailable_model_with_identity(
-                        &session_id,
-                        persisted_model,
-                        summary.catalog_identity.clone(),
-                        summary.agent_name.clone().or_else(|| {
-                            self.resident_handle(&session_id)
-                                .map(|handle| handle.agent_name)
-                        }),
-                    );
+                self.session_registry.set_unavailable_model_with_identity(
+                    &session_id,
+                    persisted_model,
+                    summary.catalog_identity.clone(),
+                    summary.agent_name.clone().or_else(|| {
+                        self.resident_handle(&session_id)
+                            .map(|handle| handle.agent_name)
+                    }),
+                );
                 return;
             };
             tracing::warn!(
@@ -947,16 +946,15 @@ impl MvpAgent {
             let empty_id = acp::ModelId::new(String::new());
             self.send_model_auto_switched(&session_id, &persisted_model, &empty_id, &reason)
                 .await;
-            self.session_registry
-                .set_unavailable_model_with_identity(
-                    &session_id,
-                    persisted_model.clone(),
-                    summary.catalog_identity.clone(),
-                    summary.agent_name.clone().or_else(|| {
-                        self.resident_handle(&session_id)
-                            .map(|handle| handle.agent_name)
-                    }),
-                );
+            self.session_registry.set_unavailable_model_with_identity(
+                &session_id,
+                persisted_model.clone(),
+                summary.catalog_identity.clone(),
+                summary.agent_name.clone().or_else(|| {
+                    self.resident_handle(&session_id)
+                        .map(|handle| handle.agent_name)
+                }),
+            );
             fallback
         };
         tracing::debug!(

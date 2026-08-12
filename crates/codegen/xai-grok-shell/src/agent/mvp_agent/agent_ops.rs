@@ -10,6 +10,8 @@ use xai_tty_utils::ProcessScope;
 thread_local! {
     static NEW_SESSION_PLAN_BEFORE_SEAL_HOOK: RefCell<Option<Box<dyn FnMut()>>> =
         RefCell::new(None);
+    static NEW_SESSION_BEFORE_RESIDENT_COMMIT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> =
+        RefCell::new(None);
 }
 #[cfg(test)]
 pub(super) struct NewSessionPlanSealHookGuard;
@@ -25,6 +27,88 @@ pub(super) fn install_new_session_plan_before_seal_hook(
 ) -> NewSessionPlanSealHookGuard {
     NEW_SESSION_PLAN_BEFORE_SEAL_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
     NewSessionPlanSealHookGuard
+}
+#[cfg(test)]
+pub(super) struct NewSessionResidentCommitHookGuard;
+#[cfg(test)]
+impl Drop for NewSessionResidentCommitHookGuard {
+    fn drop(&mut self) {
+        NEW_SESSION_BEFORE_RESIDENT_COMMIT_HOOK.with(|hook| *hook.borrow_mut() = None);
+    }
+}
+#[cfg(test)]
+pub(super) fn install_new_session_before_resident_commit_hook(
+    hook: impl FnOnce() + 'static,
+) -> NewSessionResidentCommitHookGuard {
+    NEW_SESSION_BEFORE_RESIDENT_COMMIT_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+    NewSessionResidentCommitHookGuard
+}
+#[cfg(test)]
+fn run_new_session_before_resident_commit_hook() {
+    let hook = NEW_SESSION_BEFORE_RESIDENT_COMMIT_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Cancellation-safe ownership of a fresh, unpublished session.
+///
+/// Explicit error paths await stronger cleanup and then disarm this guard.
+/// If the request future is simply dropped, `Drop` still rejects every gated
+/// task and queues deletion on the persistence actor without blocking.
+pub(super) struct ProvisionalNewSessionCleanup {
+    publication_gate: crate::session::SessionPublicationGate,
+    persistence_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::session::persistence::PersistenceMsg>>,
+}
+
+impl ProvisionalNewSessionCleanup {
+    fn new(
+        publication_gate: crate::session::SessionPublicationGate,
+        persistence_tx: tokio::sync::mpsc::UnboundedSender<crate::session::persistence::PersistenceMsg>,
+    ) -> Self {
+        Self {
+            publication_gate,
+            persistence_tx: Some(persistence_tx),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.persistence_tx = None;
+    }
+}
+
+impl Drop for ProvisionalNewSessionCleanup {
+    fn drop(&mut self) {
+        let Some(persistence_tx) = self.persistence_tx.take() else {
+            return;
+        };
+        self.publication_gate.abort();
+        let _ = crate::session::persistence::PersistenceHandle::request_abort_fresh_and_delete(
+            &persistence_tx,
+            self.publication_gate.clone(),
+        );
+    }
+}
+
+impl Drop for PreparedNewSession {
+    fn drop(&mut self) {
+        self.publication_gate.abort();
+        if let Some(handle) = self.handle.take() {
+            if let Some(scope) = &handle.tool_context.process_scope {
+                scope.kill_all();
+            }
+            let _ = handle
+                .cmd_tx
+                .send(SessionCommand::Shutdown(ShutdownKind::AbortUnpublished));
+        }
+        // Dropping a provisional SessionThread aborts its gate and reaps it on
+        // the dedicated cleanup thread. Dropping cleanup queues persistence
+        // deletion. Neither operation can block cancellation of `/new`.
+        drop(self.thread.take());
+        drop(self.cleanup.take());
+    }
 }
 /// `preferred` model, else catalog `current`, else first with own credentials.
 fn byok_from_models(
@@ -2527,6 +2611,10 @@ impl MvpAgent {
             let authority = self.models_manager.session_model_authority(
                 campaign_candidate.as_ref().map(|campaign| campaign.value.as_str()),
             );
+            let auth_authority = NewSessionAuthAuthority {
+                generation: authority.auth_generation,
+                is_session_auth: authority.is_session_auth,
+            };
             let fallback_model_id = authority.fallback_model_id;
             let default_reasoning_effort = authority.reasoning_effort;
             let campaign_nudge = campaign_candidate.filter(|_| authority.campaign_eligible);
@@ -2543,6 +2631,7 @@ impl MvpAgent {
                 .or_else(|| custom_model_id.map(str::to_owned));
             let catalog = authority.catalog;
             let mut disallowed_custom = None;
+            let mut auth_hidden_custom = None;
             let mut unreadiness_custom = None;
             let selected_custom = requested_model_id.as_deref().and_then(|requested| {
                 let requested_id = acp::ModelId::new(requested);
@@ -2561,6 +2650,16 @@ impl MvpAgent {
                     }
                     return None;
                 }
+                if !model.info.visible_for_auth(auth_authority.is_session_auth) {
+                    tracing::warn!(
+                        requested_model = requested,
+                        "Requested model is unavailable for the current authentication mode; falling back to current default model"
+                    );
+                    if !campaign_nudged {
+                        auth_hidden_custom = Some(requested.to_owned());
+                    }
+                    return None;
+                }
                 let (ready, reason) = crate::agent::config::model_readiness(&model);
                 if !ready {
                     let reason = reason.unwrap_or_else(|| "model is not ready".to_owned());
@@ -2575,7 +2674,9 @@ impl MvpAgent {
                 Some((requested_id, identity, model))
             });
             if requested_model_id.is_some() && selected_custom.is_none()
-                && disallowed_custom.is_none() && unreadiness_custom.is_none()
+                && disallowed_custom.is_none()
+                && auth_hidden_custom.is_none()
+                && unreadiness_custom.is_none()
             {
                 tracing::warn!(
                     requested_model = ?requested_model_id,
@@ -2635,7 +2736,9 @@ impl MvpAgent {
                 sampling_config,
                 catalog_identity,
                 model_entry: model,
+                auth_authority,
                 disallowed_custom,
+                auth_hidden_custom,
                 unreadiness_custom,
             };
             before_seal();
@@ -3316,14 +3419,36 @@ impl MvpAgent {
     pub(super) fn begin_session_load(
         &self,
         session_id: &acp::SessionId,
-    ) -> SessionLoadGuard<'_> {
-        let (tx, rx) = self.session_registry.begin_attach(session_id);
-        SessionLoadGuard {
+    ) -> Result<SessionLoadGuard<'_>, acp::Error> {
+        let Some((tx, rx)) = self.session_registry.begin_attach(session_id) else {
+            return Err(acp::Error::invalid_params()
+                .data("The requested sessionId is still being created and cannot be loaded"));
+        };
+        Ok(SessionLoadGuard {
             agent: self,
             session_id: session_id.clone(),
             rx,
             _tx: tx,
-        }
+        })
+    }
+
+    /// Reserve a caller-visible `/new` id without displacing an existing
+    /// session.  The guard is ownership-scoped: every error path merely drops
+    /// its own empty reservation, never resources owned by an older actor.
+    pub(super) fn begin_new_session_claim(
+        &self,
+        session_id: &acp::SessionId,
+    ) -> Result<SessionLoadGuard<'_>, acp::Error> {
+        let Some((tx, rx)) = self.session_registry.try_begin_new(session_id) else {
+            return Err(acp::Error::invalid_params()
+                .data("A session with the requested sessionId already exists"));
+        };
+        Ok(SessionLoadGuard {
+            agent: self,
+            session_id: session_id.clone(),
+            rx,
+            _tx: tx,
+        })
     }
     /// Session lookup that tolerates an in-flight `session/load`.
     ///
@@ -3639,6 +3764,24 @@ impl MvpAgent {
         session_id: &str,
         session_info: &crate::session::info::Info,
     ) -> Option<crate::relay::RelaySync> {
+        self.create_relay_sync_inner(session_id, session_info, None)
+    }
+
+    pub(super) fn create_deferred_relay_sync(
+        &self,
+        session_id: &str,
+        session_info: &crate::session::info::Info,
+        publication_gate: crate::session::SessionPublicationGate,
+    ) -> Option<crate::relay::RelaySync> {
+        self.create_relay_sync_inner(session_id, session_info, Some(publication_gate))
+    }
+
+    fn create_relay_sync_inner(
+        &self,
+        session_id: &str,
+        session_info: &crate::session::info::Info,
+        publication_gate: Option<crate::session::SessionPublicationGate>,
+    ) -> Option<crate::relay::RelaySync> {
         if !self.relay_sync_enabled {
             return None;
         }
@@ -3655,15 +3798,23 @@ impl MvpAgent {
             None,
         )?;
         let session_dir = crate::session::persistence::session_dir(session_info);
-        Some(
-            crate::relay::RelaySync::new(
+        Some(match publication_gate {
+            Some(publication_gate) => crate::relay::RelaySync::new_deferred(
+                session_id.to_string(),
+                relay_config,
+                crate::relay::AgentType::Tui,
+                Some(session_dir),
+                None,
+                publication_gate,
+            ),
+            None => crate::relay::RelaySync::new(
                 session_id.to_string(),
                 relay_config,
                 crate::relay::AgentType::Tui,
                 Some(session_dir),
                 None,
             ),
-        )
+        })
     }
     /// Spawn a local task that watches `ConnectionState` changes and forwards
     /// them to the TUI as `ExtNotification`s containing `RelaySyncStatus`.
@@ -3968,7 +4119,29 @@ impl MvpAgent {
     ) {
         let presentation = self.models_manager.presentation_snapshot();
         let resident = session_id.and_then(|sid| self.resident_handle(sid));
-        let resident_model_id = resident.as_ref().map(|handle| handle.model_id.clone());
+        self.model_state_from_presentation(resident.as_ref(), &presentation)
+    }
+
+    pub(super) fn prepared_model_state_with_presentation(
+        &self,
+        prepared: &PreparedNewSession,
+    ) -> (
+        acp::SessionModelState,
+        crate::agent::models::ModelPresentationSnapshot,
+    ) {
+        let presentation = self.models_manager.presentation_snapshot();
+        self.model_state_from_presentation(Some(prepared.handle()), &presentation)
+    }
+
+    fn model_state_from_presentation(
+        &self,
+        resident: Option<&SessionHandle>,
+        presentation: &crate::agent::models::ModelPresentationSnapshot,
+    ) -> (
+        acp::SessionModelState,
+        crate::agent::models::ModelPresentationSnapshot,
+    ) {
+        let resident_model_id = resident.map(|handle| handle.model_id.clone());
         let raw_model_id = lookup_session_model(resident_model_id.clone(), &presentation.current_model_id);
         let resolved_resident_model = resident_model_id
             .as_ref()
@@ -4001,7 +4174,7 @@ impl MvpAgent {
                 .meta(meta),
             );
         }
-        let session_effort = resident.as_ref().and_then(|handle| handle.reasoning_effort);
+        let session_effort = resident.and_then(|handle| handle.reasoning_effort);
         let model_entry = presentation
             .available
             .contains_key(&model_id)
@@ -4030,7 +4203,7 @@ impl MvpAgent {
         }
         (
             acp::SessionModelState::new(model_id, available_models),
-            presentation,
+            presentation.clone(),
         )
     }
     pub(super) fn session_config_options(
@@ -4044,6 +4217,20 @@ impl MvpAgent {
     fn session_config_options_from_presentation(
         &self,
         session_id: Option<&acp::SessionId>,
+        state: &acp::SessionModelState,
+        presentation: &crate::agent::models::ModelPresentationSnapshot,
+    ) -> Vec<session_config::SessionConfigOption> {
+        let resident = session_id.and_then(|sid| self.resident_handle(sid));
+        self.session_config_options_for_handle(
+            resident.as_ref(),
+            state,
+            presentation,
+        )
+    }
+
+    fn session_config_options_for_handle(
+        &self,
+        resident: Option<&SessionHandle>,
         state: &acp::SessionModelState,
         presentation: &crate::agent::models::ModelPresentationSnapshot,
     ) -> Vec<session_config::SessionConfigOption> {
@@ -4070,9 +4257,7 @@ impl MvpAgent {
         // A resident actor's sampling config is immutable for its lifetime.
         // Preserve that actual effort even if a later catalog refresh disables
         // reasoning; only process-global/default fallbacks obey the live gate.
-        let session_effort = session_id
-            .and_then(|sid| self.resident_handle(sid).map(|h| h.reasoning_effort))
-            .flatten();
+        let session_effort = resident.and_then(|handle| handle.reasoning_effort);
         let current_effort = session_effort.or_else(|| {
             if !supports_effort {
                 return None;
@@ -4274,6 +4459,46 @@ impl MvpAgent {
             meta.insert(
                 WEB_SEARCH_DISABLED_META_KEY.to_string(),
                 serde_json::json!(notice),
+            );
+        }
+    }
+
+    pub(super) fn insert_prepared_session_config_meta(
+        &self,
+        meta: &mut serde_json::Map<String, serde_json::Value>,
+        prepared: &PreparedNewSession,
+        cwd: String,
+        model_state: &acp::SessionModelState,
+        presentation: &crate::agent::models::ModelPresentationSnapshot,
+    ) {
+        let options = self.session_config_options_for_handle(
+            Some(prepared.handle()),
+            model_state,
+            presentation,
+        );
+        let detail = session_config::GrokSessionDetail::build(
+            prepared.session_info.id.0.to_string(),
+            cwd,
+            model_state.current_model_id.0.to_string(),
+            None,
+        );
+        meta.insert(
+            "x.ai/sessionConfig".to_string(),
+            serde_json::json!({ "options": options }),
+        );
+        meta.insert("x.ai/sessionDetail".to_string(), serde_json::json!(detail));
+        meta.insert(
+            SCHEDULER_BACKGROUND_LOOPS_META_KEY.to_string(),
+            serde_json::json!(prepared.handle().scheduler_background_loops),
+        );
+        if let Some(disabled) = prepared.web_search_disable_notice.as_ref() {
+            meta.insert(
+                WEB_SEARCH_DISABLED_META_KEY.to_string(),
+                serde_json::json!(crate::session::WebSearchDisabledNotice {
+                    model_id: disabled.model_id.clone(),
+                    reason: disabled.reason.clone(),
+                    message: disabled.user_notice(),
+                }),
             );
         }
     }
@@ -4809,11 +5034,289 @@ impl MvpAgent {
     /// Parameters are bundled in [`SessionSpawnOptions`] (named fields) rather than
     /// passed positionally: there are too many same-typed args (`bool`s,
     /// `Option<…>`s) for positional calls to be transposition-safe.
+    fn commit_new_session_resident<R>(
+        &self,
+        authority: Option<NewSessionAuthAuthority>,
+        winning_model: Option<&ModelEntry>,
+        publish: impl FnOnce() -> R,
+    ) -> Result<R, acp::Error> {
+        let Some(authority) = authority else {
+            return Ok(publish());
+        };
+        let Some(winning_model) = winning_model else {
+            return Err(acp::Error::internal_error().data(
+                "Prepared new session lost its winning model before publication",
+            ));
+        };
+        let Some(_auth_seal) = self
+            .auth_manager
+            .try_seal_selection(authority.generation)
+        else {
+            return Err(acp::Error::invalid_params().data(
+                "Authentication changed while creating the session; retry the request",
+            ));
+        };
+        if !winning_model
+            .info
+            .visible_for_auth(authority.is_session_auth)
+        {
+            return Err(acp::Error::invalid_params().data(
+                "The selected model is unavailable for the current authentication mode",
+            ));
+        }
+        Ok(publish())
+    }
+
+    async fn abort_unpublished_session(
+        &self,
+        handle: SessionHandle,
+        session_thread: SessionThread,
+        publication_gate: &crate::session::SessionPublicationGate,
+    ) -> Result<(), acp::Error> {
+        publication_gate.abort();
+        if let Some(scope) = &handle.tool_context.process_scope {
+            scope.kill_all();
+        }
+        let persistence_tx = handle.persistence_tx.clone();
+        let _ = handle
+            .cmd_tx
+            .send(SessionCommand::Shutdown(ShutdownKind::AbortUnpublished));
+        drop(handle);
+
+        let joined = tokio::task::spawn_blocking(move || session_thread.join()).await;
+        let deleted = crate::session::persistence::PersistenceHandle::abort_fresh_and_delete(
+            &persistence_tx,
+            publication_gate.clone(),
+        )
+        .await;
+        let thread_join_error = match &joined {
+            Ok(result) => result.is_err(),
+            Err(_) => true,
+        };
+        if thread_join_error || deleted.is_err() {
+            tracing::error!(
+                thread_join_error,
+                persistence_delete_failed = deleted.is_err(),
+                "failed to fully abort an unpublished session"
+            );
+            return Err(acp::Error::internal_error().data(
+                "Authentication changed during session creation and provisional cleanup failed",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Final no-await commit for an auth-sealed `/new` session.
+    ///
+    /// Every response-building await must have completed before this is called.
+    /// The only fallible operations run under the auth-selection seal and before
+    /// registry insertion/publication; after `publish()` this function performs
+    /// only infallible sends/spawns and returns the already-built response.
+    pub(super) fn commit_prepared_new_session(
+        &self,
+        mut prepared: Box<PreparedNewSession>,
+        response: acp::NewSessionResponse,
+    ) -> Result<acp::NewSessionResponse, (acp::Error, Box<PreparedNewSession>)> {
+        #[cfg(test)]
+        run_new_session_before_resident_commit_hook();
+
+        let winning_model = prepared.winning_model.clone();
+        let publication = self.commit_new_session_resident(
+            Some(prepared.auth_authority),
+            Some(&winning_model),
+            || -> Result<(SessionHandle, Option<SessionHandle>), acp::Error> {
+                let handle = prepared
+                    .handle
+                    .take()
+                    .expect("prepared commit consumes its handle once");
+                if let Err(error) = handle
+                    .workspace_ops
+                    .bind_new_local_session(
+                        prepared.session_info.id.0.as_ref(),
+                        handle.tool_context.cwd.as_path().to_path_buf(),
+                        handle.hunk_tracker_handle.clone(),
+                        handle.workspace_toolset.clone(),
+                    )
+                {
+                    prepared.handle = Some(handle);
+                    return Err(acp::Error::internal_error()
+                        .data(format!("Failed to bind session workspace: {error}")));
+                }
+                if let Err(error) =
+                    crate::session::persistence::finalize_fresh_publication_sync(
+                        &prepared.session_info,
+                    )
+                {
+                    handle
+                        .workspace_ops
+                        .end_local_session(prepared.session_info.id.0.as_ref());
+                    prepared.handle = Some(handle);
+                    return Err(acp::Error::internal_error().data(format!(
+                        "Failed to finalize provisional session persistence: {error}"
+                    )));
+                }
+
+                let thread = prepared
+                    .thread
+                    .take()
+                    .expect("prepared commit consumes its thread once")
+                    .into_published();
+                self.session_registry
+                    .set_thread(&prepared.session_info.id, thread);
+                let displaced = self.insert_resident(&prepared.session_info.id, handle.clone());
+                Ok((handle, displaced))
+            },
+        );
+        let publication = match publication {
+            Ok(Ok(publication)) => publication,
+            Ok(Err(error)) | Err(error) => return Err((error, prepared)),
+        };
+        let (committed_handle, displaced) = publication;
+
+        if let Some(old) = displaced
+            && let Some(scope) = &old.tool_context.process_scope
+        {
+            scope.kill_all();
+        }
+        if let Some(disabled) = prepared.web_search_disable_notice.take() {
+            self.web_search_disabled.borrow_mut().insert(
+                prepared.session_info.id.clone(),
+                crate::session::WebSearchDisabledNotice {
+                    model_id: disabled.model_id.clone(),
+                    reason: disabled.reason.clone(),
+                    message: disabled.user_notice(),
+                },
+            );
+        }
+        self.set_session_live_state(
+            &prepared.session_info.id,
+            SessionLiveState::IdleResident,
+        );
+        self.ensure_session_supervisor();
+        committed_handle
+            .gateway_enabled
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(system_prompt) = prepared.initialize_system_prompt.take() {
+            let _ = committed_handle
+                .cmd_tx
+                .send(SessionCommand::Initialize { system_prompt });
+        }
+        let _ = committed_handle
+            .cmd_tx
+            .send(SessionCommand::AdvertiseCommands);
+        if let Some(mut loc_rx) = prepared.loc_aggregate_rx.take() {
+            let signals = committed_handle.signals_handle.clone();
+            tokio::spawn(async move {
+                while let Some(agg) = loc_rx.recv().await {
+                    match agg {
+                        xai_hunk_tracker::LocAggregate::LinesChanged {
+                            author_type,
+                            lines_added,
+                            lines_removed,
+                            file_path,
+                        } => signals.record_loc_change(
+                            author_type == xai_hunk_tracker::AuthorType::Agent,
+                            lines_added,
+                            lines_removed,
+                            file_path,
+                        ),
+                        xai_hunk_tracker::LocAggregate::LinesReverted {
+                            lines_added_reverted,
+                            lines_removed_reverted,
+                        } => signals.record_loc_revert(
+                            lines_added_reverted,
+                            lines_removed_reverted,
+                        ),
+                    }
+                }
+            });
+        }
+        self.session_registry.set_permission_receiver(
+            &prepared.session_info.id,
+            prepared
+                .permission_events_rx
+                .take()
+                .expect("prepared commit consumes permission receiver once"),
+        );
+        self.activity
+            .register_session(&prepared.session_info.id.0, &committed_handle);
+        if let Some((model_id, catalog_identity, agent_name)) =
+            prepared.unavailable_spawn_model.take()
+        {
+            self.session_registry.set_unavailable_model_with_identity(
+                &prepared.session_info.id,
+                model_id,
+                Some(catalog_identity),
+                Some(agent_name),
+            );
+        }
+        // Final synchronous publication boundary. From the persistence marker
+        // finalizer through here there is no await/cancellation point.
+        prepared.publication_gate.publish();
+        if let Some(cleanup) = prepared.cleanup.as_mut() {
+            cleanup.disarm();
+        }
+
+        if let Some(state_rx) = prepared.deferred_relay_state_rx.take() {
+            Self::spawn_relay_state_forwarder(
+                state_rx,
+                prepared.session_info.id.0.to_string(),
+                self.gateway.clone(),
+            );
+        }
+        if prepared.upgrade_persistence_to_writeback {
+            let _ = committed_handle.persistence_tx.send(
+                crate::session::persistence::PersistenceMsg::UpgradeToWriteback {
+                    auth_manager: self.auth_manager.clone(),
+                },
+            );
+        }
+        self.heap_profile_set_session_id(&prepared.session_info.id.0);
+        self.push_roster_delta_upserted(&prepared.session_info.id);
+        self.notify_session_cwd_for_watch(std::path::Path::new(
+            &prepared.session_info.cwd,
+        ));
+        let _ = committed_handle
+            .cmd_tx
+            .send(SessionCommand::DispatchSessionStartHook {
+                source: "new".to_string(),
+            });
+        self.spawn_managed_gateway_tool_catalog_fetch();
+        let cwd_for_maintenance = prepared.session_info.cwd.clone();
+        tokio::spawn(async move {
+            crate::session::prompt_history::truncate_if_needed_async(cwd_for_maintenance).await;
+        });
+        Ok(response)
+    }
+
+    pub(super) async fn abort_prepared_new_session(
+        &self,
+        mut prepared: Box<PreparedNewSession>,
+    ) -> Result<(), acp::Error> {
+        let handle = prepared
+            .handle
+            .take()
+            .expect("failed prepared commit retains its handle");
+        let thread = prepared
+            .thread
+            .take()
+            .expect("failed prepared commit retains its thread");
+        let result = self
+            .abort_unpublished_session(handle, thread, &prepared.publication_gate)
+            .await;
+        if result.is_ok()
+            && let Some(cleanup) = prepared.cleanup.as_mut()
+        {
+            cleanup.disarm();
+        }
+        result
+    }
+
     pub(super) async fn spawn_and_register_session(
         &self,
         init: &acp::InitializeRequest,
         spec: SessionSpawnOptions<'_>,
-    ) -> Result<acp::ModelId, acp::Error> {
+    ) -> Result<SpawnedSession, acp::Error> {
         let SessionSpawnOptions {
             session_info,
             cwd,
@@ -4842,12 +5345,29 @@ impl MvpAgent {
             prepared_sampling_config,
             prepared_catalog_identity,
             prepared_model_entry,
+            new_session_auth_authority,
+            publication_gate,
+            deferred_relay_state_rx,
+            upgrade_persistence_to_writeback,
             persisted_catalog_identity,
             session_yolo_mode,
             session_auto_mode,
             prompt_display_cwd,
             is_chat_kind,
         } = spec;
+        let publication_gate = publication_gate
+            .unwrap_or_else(crate::session::SessionPublicationGate::published);
+        debug_assert_eq!(
+            new_session_auth_authority.is_some(),
+            !publication_gate.is_published(),
+            "only auth-sealed /new sessions may start provisionally"
+        );
+        let mut provisional_cleanup = new_session_auth_authority.map(|_| {
+            ProvisionalNewSessionCleanup::new(
+                publication_gate.clone(),
+                persistence.tx.clone(),
+            )
+        });
         let _timer = crate::instrumentation_timer!("session.spawn_and_register");
         reject_direct_hub_cloud_meta(session_meta)?;
         let spawn_remote_settings = self.cfg.borrow().remote_settings.clone();
@@ -4903,7 +5423,7 @@ impl MvpAgent {
             Arc::new(LocalFs::new(cwd.to_path_buf()))
         };
         let gateway_enabled = std::sync::Arc::new(
-            std::sync::atomic::AtomicBool::new(true),
+            std::sync::atomic::AtomicBool::new(publication_gate.is_published()),
         );
         let terminal: std::sync::Arc<dyn crate::terminal::AsyncTerminalRunner> = if client_terminal {
             std::sync::Arc::new(AcpTerminalRunner {
@@ -4958,13 +5478,25 @@ impl MvpAgent {
             Some(mode) => {
                 let cancel = CancellationToken::new();
                 let (hunk_event_tx, hunk_event_rx) = tokio::sync::mpsc::unbounded_channel();
-                let handle = HunkTrackerActor::spawn(
-                    session_info.id.0.to_string(),
-                    cwd.as_path().to_path_buf(),
-                    hunk_event_tx,
-                    mode,
-                    cancel.clone(),
-                );
+                let handle = if publication_gate.is_published() {
+                    HunkTrackerActor::spawn(
+                        session_info.id.0.to_string(),
+                        cwd.as_path().to_path_buf(),
+                        hunk_event_tx,
+                        mode,
+                        cancel.clone(),
+                    )
+                } else {
+                    let readiness_gate = publication_gate.clone();
+                    HunkTrackerActor::spawn_when_ready(
+                        session_info.id.0.to_string(),
+                        cwd.as_path().to_path_buf(),
+                        hunk_event_tx,
+                        mode,
+                        cancel.clone(),
+                        async move { readiness_gate.wait_until_published().await },
+                    )
+                };
                 (handle, Some((hunk_event_rx, cancel)))
             }
             None => (xai_hunk_tracker::HunkTrackerHandle::noop(), None),
@@ -5003,14 +5535,20 @@ impl MvpAgent {
                     user_id: self.auth_manager.current().map(|a| a.user_id.clone()),
                     aggregate_tx: Some(loc_agg_tx),
                 };
-                tokio::spawn(
+                let readiness_gate = publication_gate.clone();
+                tokio::spawn(async move {
+                    if !readiness_gate.wait_until_published().await {
+                        drop(hunk_event_rx);
+                        return;
+                    }
                     xai_hunk_tracker::run_loc_sink(
                         hunk_event_rx,
                         loc_writer,
                         loc_ctx,
                         loc_cancel,
-                    ),
-                );
+                    )
+                    .await;
+                });
                 Some(loc_agg_rx)
             }
             _ => None,
@@ -5134,11 +5672,15 @@ impl MvpAgent {
             return Err(acp::Error::auth_required().data("no auth method id provided"));
         }
         let auth_method_id = std::sync::Arc::clone(&self.auth_method_id);
-        tracing::info!(
-            session_id = %session_info.id.0,
-            ?startup_hints,
-            "startup hints"
-        );
+        if publication_gate.is_published() {
+            tracing::info!(
+                session_id = %session_info.id.0,
+                ?startup_hints,
+                "startup hints"
+            );
+        } else {
+            tracing::info!("provisional session startup hints resolved");
+        }
         let compaction_mode = self.cfg.borrow().resolve_compaction_mode();
         let compaction_verbatim_input = self
             .cfg
@@ -5159,12 +5701,20 @@ impl MvpAgent {
         } else {
             (None, None, None, None)
         };
-        tracing::info!(
-            session_id = %session_info.id.0,
-            feedback_url_configured = feedback_proxy_url.is_some(),
-            authenticated = feedback_user_token.is_some(),
-            "Initializing feedback manager for session"
-        );
+        if publication_gate.is_published() {
+            tracing::info!(
+                session_id = %session_info.id.0,
+                feedback_url_configured = feedback_proxy_url.is_some(),
+                authenticated = feedback_user_token.is_some(),
+                "Initializing feedback manager for session"
+            );
+        } else {
+            tracing::info!(
+                feedback_url_configured = feedback_proxy_url.is_some(),
+                authenticated = feedback_user_token.is_some(),
+                "Initializing feedback manager for provisional session"
+            );
+        }
         let skills = self.cfg.borrow().skills.clone();
         let compat = self.cfg.borrow().compat_resolved;
         let acp_agent_profile = parse_agent_profile_from_meta(session_meta);
@@ -5209,6 +5759,18 @@ impl MvpAgent {
                             .cloned()
                             .map(|entry| (identity, entry))
                     }) {
+                    Some((identity, entry))
+                        if new_session_auth_authority.is_some_and(|authority| {
+                            !entry.info.visible_for_auth(authority.is_session_auth)
+                        }) =>
+                    {
+                        tracing::warn!(
+                            agent = %agent_definition.name,
+                            model = %identity.model_id,
+                            "agent profile model override skipped: model unavailable for current authentication mode"
+                        );
+                        None
+                    }
                     Some((identity, entry)) if crate::agent::config::model_readiness(&entry).0 => {
                         Some((identity, entry))
                     }
@@ -5268,6 +5830,7 @@ impl MvpAgent {
             &catalog,
             &catalog_identity,
         );
+        let resident_publication_model = selected_model.cloned();
         let unavailable_spawn_model = selected_model
             .is_some_and(|entry| !crate::agent::config::model_readiness(entry).0)
             .then(|| {
@@ -5350,15 +5913,21 @@ impl MvpAgent {
             );
             tool_ctx.lsp_server_names = servers.keys().cloned().collect();
             if servers.is_empty() {
-                let user_path = xai_grok_tools::util::grok_home::grok_home()
-                    .join("lsp.json");
-                let project_path = tool_ctx.cwd.as_path().join(".grok").join("lsp.json");
-                tracing::debug!(
-                    cwd = %tool_ctx.cwd,
-                    user_lsp_path = %user_path.display(),
-                    project_lsp_path = %project_path.display(),
-                    "LSP tools enabled, but no language servers are configured"
-                );
+                if publication_gate.is_published() {
+                    let user_path = xai_grok_tools::util::grok_home::grok_home()
+                        .join("lsp.json");
+                    let project_path = tool_ctx.cwd.as_path().join(".grok").join("lsp.json");
+                    tracing::debug!(
+                        cwd = %tool_ctx.cwd,
+                        user_lsp_path = %user_path.display(),
+                        project_lsp_path = %project_path.display(),
+                        "LSP tools enabled, but no language servers are configured"
+                    );
+                } else {
+                    tracing::debug!(
+                        "LSP tools enabled for provisional session, but no language servers are configured"
+                    );
+                }
             } else {
                 use xai_grok_tools::implementations::lsp::{
                     LspBackend, LspBackendAdapter, LspManager,
@@ -5375,7 +5944,17 @@ impl MvpAgent {
                     ),
                 );
                 let adapter = std::sync::Arc::new(LspBackendAdapter::new(mgr));
-                adapter.ensure_started_background();
+                if publication_gate.is_published() {
+                    adapter.ensure_started_background();
+                } else {
+                    let readiness_gate = publication_gate.clone();
+                    let deferred_adapter = adapter.clone();
+                    tokio::spawn(async move {
+                        if readiness_gate.wait_until_published().await {
+                            deferred_adapter.ensure_started_background();
+                        }
+                    });
+                }
                 tool_ctx.lsp = Some(adapter as std::sync::Arc<dyn LspBackend>);
             }
         }
@@ -5501,19 +6080,32 @@ impl MvpAgent {
                 override_prompt,
             );
             if changed {
-                tracing::info!(
-                    session_id = %session_info.id.0,
-                    prompt_len = override_prompt.len(),
-                    "cold-load: applied systemPromptOverride to loaded head"
-                );
+                if publication_gate.is_published() {
+                    tracing::info!(
+                        session_id = %session_info.id.0,
+                        prompt_len = override_prompt.len(),
+                        "cold-load: applied systemPromptOverride to loaded head"
+                    );
+                } else {
+                    tracing::info!(
+                        prompt_len = override_prompt.len(),
+                        "provisional cold-load applied systemPromptOverride"
+                    );
+                }
             } else {
-                tracing::debug!(
-                    session_id = %session_info.id.0,
-                    "cold-load: systemPromptOverride already matches head, no-op"
-                );
+                if publication_gate.is_published() {
+                    tracing::debug!(
+                        session_id = %session_info.id.0,
+                        "cold-load: systemPromptOverride already matches head, no-op"
+                    );
+                } else {
+                    tracing::debug!("provisional cold-load systemPromptOverride no-op");
+                }
             }
         }
-        let (mut handle, permission_events_rx, agent_system_prompt, session_thread) = {
+        let provisional_persistence_tx = new_session_auth_authority
+            .map(|_| persistence.tx.clone());
+        let spawn_result = {
             let _timer = crate::instrumentation_timer!("session.spawn_actor_call");
             let session_key = self.auth_manager.current_or_expired().map(|a| a.key);
             let auth_type = crate::agent::config::resolve_chat_state_auth_type(
@@ -5658,6 +6250,7 @@ impl MvpAgent {
                     client_terminal,
                     client_fs_read && client_fs_write,
                     gateway_enabled,
+                    publication_gate.clone(),
                     agent_definition,
                     session_default_agent_profile,
                     skills,
@@ -5745,10 +6338,173 @@ impl MvpAgent {
                     None,
                     is_chat_kind,
                 )
-                .await?
+                .await
         };
-        self.session_registry.set_thread(&session_info.id, session_thread);
-        tracing::debug!(session_id = %session_info.id.0, "spawn_session_on_thread complete");
+        let (mut handle, permission_events_rx, agent_system_prompt, session_thread) =
+            match spawn_result {
+                Ok(spawned) => spawned,
+                Err(spawn_error) => {
+                    publication_gate.abort();
+                    if let Some(persistence_tx) = provisional_persistence_tx {
+                        match crate::session::persistence::PersistenceHandle::abort_fresh_and_delete(
+                            &persistence_tx,
+                            publication_gate.clone(),
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                if let Some(cleanup) = provisional_cleanup.as_mut() {
+                                    cleanup.disarm();
+                                }
+                            }
+                            Err(_) => {
+                                tracing::error!(
+                                    "failed to delete provisional persistence after session spawn error"
+                                );
+                                return Err(acp::Error::internal_error().data(
+                                    "Session initialization failed and provisional cleanup failed",
+                                ));
+                            }
+                        }
+                    }
+                    return Err(spawn_error);
+                }
+            };
+        if publication_gate.is_published() {
+            tracing::debug!(session_id = %session_info.id.0, "spawn_session_on_thread complete");
+        } else {
+            tracing::debug!("provisional session thread initialized");
+        }
+        if handle_display_cwd.is_some() {
+            handle.display_cwd = handle_display_cwd;
+        }
+        handle.auxiliary_model_provenance = {
+            let cfg = self.cfg.borrow();
+            crate::session::AuxiliaryModelProvenance {
+                session_summary_follows_default: cfg.session_summary_follows_default,
+                web_search_follows_default: cfg.web_search_follows_default,
+                web_search_model: cfg.web_search_model.clone(),
+                image_description_follows_default: cfg.image_description_follows_default,
+                image_description_model: cfg
+                    .image_description_model
+                    .as_deref()
+                    .unwrap_or(crate::models::default_image_description_model())
+                    .to_owned(),
+            }
+        };
+        let committed_model_id = handle.model_id.clone();
+        let committed_handle = handle.clone();
+        let mut unpublished_handle = Some(handle);
+        let mut unpublished_thread = Some(session_thread);
+        if new_session_auth_authority.is_some()
+            && let Err(publication_arm_error) =
+                crate::session::persistence::PersistenceHandle::publish_fresh(
+                    &committed_handle.persistence_tx,
+                    publication_gate.clone(),
+                )
+                .await
+        {
+            let handle = unpublished_handle
+                .take()
+                .expect("failed publication arming retains its unpublished handle");
+            let thread = unpublished_thread
+                .take()
+                .expect("failed publication arming retains its unpublished thread");
+            let abort_result = self
+                .abort_unpublished_session(handle, thread, &publication_gate)
+                .await;
+            if abort_result.is_ok()
+                && let Some(cleanup) = provisional_cleanup.as_mut()
+            {
+                cleanup.disarm();
+            }
+            abort_result?;
+            let _ = publication_arm_error;
+            return Err(acp::Error::internal_error()
+                .data("Failed to arm provisional session publication"));
+        }
+        if let Some(auth_authority) = new_session_auth_authority {
+            let winning_model = resident_publication_model.ok_or_else(|| {
+                acp::Error::internal_error()
+                    .data("Prepared new session lost its winning model before publication")
+            })?;
+            let initialize_system_prompt = chat_history.is_empty().then(|| {
+                build_spawn_system_prompt(session_meta, init_meta, &agent_system_prompt)
+            });
+            return Ok(SpawnedSession::Prepared(Box::new(PreparedNewSession {
+                session_info,
+                handle: unpublished_handle.take(),
+                thread: unpublished_thread.take(),
+                permission_events_rx: Some(permission_events_rx),
+                publication_gate,
+                cleanup: provisional_cleanup.take(),
+                auth_authority,
+                winning_model,
+                deferred_relay_state_rx,
+                upgrade_persistence_to_writeback,
+                web_search_disable_notice,
+                unavailable_spawn_model,
+                loc_aggregate_rx,
+                initialize_system_prompt,
+            })));
+        }
+        #[cfg(test)]
+        run_new_session_before_resident_commit_hook();
+        let publication = self.commit_new_session_resident(
+            new_session_auth_authority,
+            resident_publication_model.as_ref(),
+            || {
+                let thread = unpublished_thread
+                    .take()
+                    .expect("resident publication consumes its session thread once")
+                    .into_published();
+                let handle = unpublished_handle
+                    .take()
+                    .expect("resident publication consumes its session handle once");
+                self.session_registry.set_thread(&session_info.id, thread);
+                self.insert_resident(&session_info.id, handle)
+            },
+        );
+        let displaced = match publication {
+            Ok(displaced) => displaced,
+            Err(publication_error) => {
+                let handle = unpublished_handle
+                    .take()
+                    .expect("failed publication retains its unpublished handle");
+                let thread = unpublished_thread
+                    .take()
+                    .expect("failed publication retains its unpublished thread");
+                let abort_result = self
+                    .abort_unpublished_session(handle, thread, &publication_gate)
+                    .await;
+                if abort_result.is_ok()
+                    && let Some(cleanup) = provisional_cleanup.as_mut()
+                {
+                    cleanup.disarm();
+                }
+                abort_result?;
+                return Err(publication_error);
+            }
+        };
+        if let Some(old) = displaced
+            && let Some(scope) = &old.tool_context.process_scope
+        {
+            scope.kill_all();
+        }
+        if let Some(state_rx) = deferred_relay_state_rx {
+            Self::spawn_relay_state_forwarder(
+                state_rx,
+                session_info.id.0.to_string(),
+                self.gateway.clone(),
+            );
+        }
+        if upgrade_persistence_to_writeback {
+            let _ = committed_handle.persistence_tx.send(
+                crate::session::persistence::PersistenceMsg::UpgradeToWriteback {
+                    auth_manager: self.auth_manager.clone(),
+                },
+            );
+        }
         // #161: record it for this session instead of notifying. It is published
         // on this session's `session/new` / `session/load` response `_meta` by
         // `insert_session_config_meta`.
@@ -5771,6 +6527,13 @@ impl MvpAgent {
         }
         self.set_session_live_state(&session_info.id, SessionLiveState::IdleResident);
         self.ensure_session_supervisor();
+        committed_handle
+            .gateway_enabled
+            .store(true, std::sync::atomic::Ordering::Release);
+        publication_gate.publish();
+        if let Some(cleanup) = provisional_cleanup.as_mut() {
+            cleanup.disarm();
+        }
         self.heap_profile_set_session_id(&session_info.id.0);
         self.push_roster_delta_upserted(&session_info.id);
         if chat_history.is_empty() {
@@ -5784,16 +6547,18 @@ impl MvpAgent {
                 session_id = %session_info.id.0,
                 "built system prompt"
             );
-            let _ = handle
+            let _ = committed_handle
                 .cmd_tx
                 .send(SessionCommand::Initialize {
                     system_prompt,
                 });
             tracing::debug!(session_id = %session_info.id.0, "enqueued SessionCommand::Initialize");
         }
-        let _ = handle.cmd_tx.send(SessionCommand::AdvertiseCommands);
+        let _ = committed_handle
+            .cmd_tx
+            .send(SessionCommand::AdvertiseCommands);
         if let Some(mut loc_rx) = loc_aggregate_rx {
-            let signals = handle.signals_handle.clone();
+            let signals = committed_handle.signals_handle.clone();
             tokio::spawn(async move {
                 while let Some(agg) = loc_rx.recv().await {
                     match agg {
@@ -5829,37 +6594,15 @@ impl MvpAgent {
         }
         self.session_registry
             .set_permission_receiver(&session_info.id, permission_events_rx);
-        if handle_display_cwd.is_some() {
-            handle.display_cwd = handle_display_cwd;
-        }
-        handle.auxiliary_model_provenance = {
-            let cfg = self.cfg.borrow();
-            crate::session::AuxiliaryModelProvenance {
-                session_summary_follows_default: cfg.session_summary_follows_default,
-                web_search_follows_default: cfg.web_search_follows_default,
-                web_search_model: cfg.web_search_model.clone(),
-                image_description_follows_default: cfg.image_description_follows_default,
-                image_description_model: cfg
-                    .image_description_model
-                    .as_deref()
-                    .unwrap_or(crate::models::default_image_description_model())
-                    .to_owned(),
-            }
-        };
         let source = if chat_history.is_empty() { "new" } else { "load" };
-        let _ = handle
+        let _ = committed_handle
             .cmd_tx
             .send(SessionCommand::DispatchSessionStartHook {
                 source: source.to_string(),
             });
         self.notify_session_cwd_for_watch(std::path::Path::new(&session_info.cwd));
-        self.activity.register_session(&session_info.id.0, &handle);
-        let committed_model_id = handle.model_id.clone();
-        if let Some(old) = self.insert_resident(&session_info.id, handle)
-            && let Some(scope) = &old.tool_context.process_scope
-        {
-            scope.kill_all();
-        }
+        self.activity
+            .register_session(&session_info.id.0, &committed_handle);
         if let Some((model_id, catalog_identity, agent_name)) = unavailable_spawn_model {
             tracing::warn!(
                 session_id = %session_info.id.0,
@@ -5879,7 +6622,7 @@ impl MvpAgent {
             crate::session::prompt_history::truncate_if_needed_async(cwd_for_maintenance)
                 .await;
         });
-        Ok(committed_model_id)
+        Ok(SpawnedSession::Committed(committed_model_id))
     }
     /// Collects all pending permission events from a session's receiver.
     /// Returns only the events from the current turn (since last collection).
@@ -5919,6 +6662,40 @@ pub(crate) struct LocalWorkspaceReapGuard {
     generations: Rc<RefCell<HashMap<acp::SessionId, u64>>>,
     session_id: acp::SessionId,
     armed: bool,
+}
+
+/// Owns a newly started local workspace until `/new` publishes. Unlike the
+/// registered-session reap guard, this never installs a watcher or exposes the
+/// provisional session id. Cancellation shuts the child down asynchronously.
+#[cfg(all(feature = "local-workspace", unix))]
+pub(crate) struct PendingLocalWorkspaceGuard {
+    handle: Option<crate::gateway_bridge::local_workspace_supervisor::LocalWorkspaceHandle>,
+}
+
+#[cfg(all(feature = "local-workspace", unix))]
+impl PendingLocalWorkspaceGuard {
+    pub(crate) fn new(
+        handle: Option<crate::gateway_bridge::local_workspace_supervisor::LocalWorkspaceHandle>,
+    ) -> Self {
+        Self { handle }
+    }
+
+    pub(crate) fn take(
+        &mut self,
+    ) -> Option<crate::gateway_bridge::local_workspace_supervisor::LocalWorkspaceHandle> {
+        self.handle.take()
+    }
+}
+
+#[cfg(all(feature = "local-workspace", unix))]
+impl Drop for PendingLocalWorkspaceGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            tokio::spawn(async move {
+                handle.shutdown().await;
+            });
+        }
+    }
 }
 #[cfg(all(feature = "local-workspace", unix))]
 impl LocalWorkspaceReapGuard {

@@ -1396,6 +1396,34 @@ impl WorkspaceOps {
         session.replace(session.effective_tool_config(), toolset);
         Ok(())
     }
+    /// Strict, identity-silent first bind for a session publication
+    /// transaction.
+    ///
+    /// Local mode must create a new workspace session; an existing ID is a
+    /// collision and is never rebound. Proxy mode remains a no-op because the
+    /// remote workspace server owns its own session lifecycle. The caller is
+    /// expected to invoke this as its final fallible step, then publish the
+    /// matching shell session synchronously.
+    pub fn bind_new_local_session(
+        &self,
+        session_id: &str,
+        cwd: std::path::PathBuf,
+        hunk_tracker: xai_hunk_tracker::HunkTrackerHandle,
+        toolset: Arc<xai_grok_tools::registry::types::FinalizedToolset>,
+    ) -> WorkspaceResult<()> {
+        let Self::Local { handle } = self else {
+            return Ok(());
+        };
+        let capability_mode = toolset.capability_policy().mode().into();
+        handle.create_provisional_session_with_external_toolset(
+            session_id,
+            cwd,
+            hunk_tracker,
+            toolset,
+            capability_mode,
+        )?;
+        Ok(())
+    }
     /// Release the workspace session. No-op in proxy mode.
     pub fn end_local_session(&self, session_id: &str) {
         let Self::Local { handle } = self else {
@@ -1403,7 +1431,7 @@ impl WorkspaceOps {
         };
         handle.on_session_ended(session_id);
         if let Err(e) = handle.drop_session(session_id, session_id) {
-            tracing::debug!(%session_id, error = %e, "end_local_session: drop_session failed (expected if never bound)");
+            tracing::debug!(error = %e, "end_local_session: drop_session failed (expected if never bound)");
         }
     }
     pub async fn on_before_turn(
@@ -1893,6 +1921,46 @@ mod tests {
             weak.upgrade().is_none(),
             "end_local_session must drop the toolset (no leaked holder)"
         );
+    }
+    #[tokio::test]
+    async fn bind_new_local_session_is_strict_and_preserves_existing_owner() {
+        let ops = WorkspaceOps::for_test();
+        let WorkspaceOps::Local { handle } = &ops else {
+            unreachable!("for_test builds a local handle");
+        };
+        let sid = "strict-new-bind";
+        let cwd = handle.root_cwd().unwrap();
+        let first = std::sync::Arc::new(
+            xai_grok_tools::registry::types::FinalizedToolset::empty_for_test(),
+        );
+        ops.bind_new_local_session(
+            sid,
+            cwd.clone(),
+            xai_hunk_tracker::HunkTrackerHandle::noop(),
+            first.clone(),
+        )
+        .expect("first strict bind should create the session");
+        let original = handle.session(sid).expect("first owner remains resident");
+        assert!(std::sync::Arc::ptr_eq(&original.toolset(), &first));
+
+        let replacement = std::sync::Arc::new(
+            xai_grok_tools::registry::types::FinalizedToolset::empty_for_test(),
+        );
+        let error = ops
+            .bind_new_local_session(
+                sid,
+                cwd,
+                xai_hunk_tracker::HunkTrackerHandle::noop(),
+                replacement,
+            )
+            .expect_err("duplicate strict bind must fail closed");
+        assert!(matches!(
+            error,
+            crate::error::WorkspaceError::SessionAlreadyExists(ref id) if id == sid
+        ));
+        let still_original = handle.session(sid).expect("collision keeps original owner");
+        assert!(std::sync::Arc::ptr_eq(&still_original, &original));
+        assert!(std::sync::Arc::ptr_eq(&still_original.toolset(), &first));
     }
     #[tokio::test]
     async fn bind_local_session_preserves_restricted_capability_for_forks() {

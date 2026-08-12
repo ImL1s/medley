@@ -461,24 +461,27 @@ async fn apply_with_load_gate(
     agent
         .models_manager
         .commit_model_dispatch(&dispatch_authority, || {
-            handle.cmd_tx.send(SessionCommand::ApplyModelSwitch {
-                prepared: Box::new(crate::session::PreparedModelSwitch {
-                    catalog_identity,
-                    resolved_model: model.clone(),
-                    sampling_config: model_sampling,
-                    use_concise,
-                    auto_compact_threshold_percent: new_threshold,
-                    required_agent_type: required_agent_type.clone(),
-                    required_definition,
-                    summary_sampling_config,
-                    replace_inherited_web_search: web_search_follows_default,
-                    web_search_sampling_config,
-                    web_search_disable_notice,
-                    web_search_alpha_test_key: agent.alpha_test_key(),
-                    image_description_model,
-                }),
-                responds_to: tx,
-            })
+            handle
+                .cmd_tx
+                .send(SessionCommand::ApplyModelSwitch {
+                    prepared: Box::new(crate::session::PreparedModelSwitch {
+                        catalog_identity,
+                        resolved_model: model.clone(),
+                        sampling_config: model_sampling,
+                        use_concise,
+                        auto_compact_threshold_percent: new_threshold,
+                        required_agent_type: required_agent_type.clone(),
+                        required_definition,
+                        summary_sampling_config,
+                        replace_inherited_web_search: web_search_follows_default,
+                        web_search_sampling_config,
+                        web_search_disable_notice,
+                        web_search_alpha_test_key: agent.alpha_test_key(),
+                        image_description_model,
+                    }),
+                    responds_to: tx,
+                })
+                .map_err(|_| ())
         })
         .map_err(|reason| acp::Error::invalid_params().data(reason))?
         .map_err(|_| acp::Error::internal_error().data("model_switch: session actor closed"))?;

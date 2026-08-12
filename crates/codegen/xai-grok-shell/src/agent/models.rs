@@ -139,6 +139,7 @@ pub(crate) struct ResolvedModelCapabilities {
 /// means auth changed and the whole plan must be retried.
 pub(crate) struct SessionModelAuthoritySnapshot {
     pub(crate) auth_generation: u64,
+    pub(crate) is_session_auth: bool,
     pub(crate) catalog: IndexMap<String, ModelEntry>,
     pub(crate) fallback_model_id: acp::ModelId,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
@@ -1213,6 +1214,7 @@ impl ModelsManager {
             {
                 return SessionModelAuthoritySnapshot {
                     auth_generation: auth.generation,
+                    is_session_auth: auth.is_session_auth,
                     catalog: owned_catalog,
                     fallback_model_id,
                     reasoning_effort,

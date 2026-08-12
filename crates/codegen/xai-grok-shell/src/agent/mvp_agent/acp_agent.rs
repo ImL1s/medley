@@ -1125,20 +1125,50 @@ impl acp::Agent for MvpAgent {
             .map_err(|e| acp::Error::invalid_params().data(e.to_string()))?;
         let remote_settings = self.cfg.borrow().remote_settings.clone();
         folder_trust::resolve_and_record(cwd.as_path(), remote_settings.as_ref(), false);
-        let (initial_client_mcp_servers, mcp_servers, managed_mcp_expires_at) = self
-            .resolve_mcp_servers(arguments.mcp_servers, cwd.as_path())
-            .await;
-        let mcp_meta_config_map = parse_mcp_meta_config(arguments.meta.as_ref());
         let client_session_id = arguments
             .meta
             .as_ref()
             .and_then(|m| m.get("sessionId"))
             .and_then(|v| v.as_str());
+        let session_id = match client_session_id {
+            Some(s) => {
+                uuid::Uuid::try_parse(s).map_err(|e| {
+                    acp::Error::invalid_params().data(format!(
+                        "Invalid UUID format for _meta.sessionId '{}': {}",
+                        s, e
+                    ))
+                })?;
+                acp::SessionId::new(s.to_string())
+            }
+            None => acp::SessionId::new(uuid::Uuid::now_v7().to_string()),
+        };
+        // Claim before the first request-specific await.  This prevents two
+        // concurrent `/new` calls from both reaching persistence with the same
+        // caller-supplied id, and the RAII guard can only settle its own claim.
+        let new_session_claim = self.begin_new_session_claim(&session_id)?;
+        if crate::session::persistence::find_persisted_session_dir_by_id_result(
+            session_id.0.as_ref(),
+        )
+        .map_err(|error| {
+            acp::Error::internal_error()
+                .data(format!("Failed to check requested sessionId: {error}"))
+        })?
+        .is_some()
+        {
+            return Err(acp::Error::invalid_params()
+                .data("A persisted session with the requested sessionId already exists"));
+        }
+        let (initial_client_mcp_servers, mcp_servers, managed_mcp_expires_at) = self
+            .resolve_mcp_servers(arguments.mcp_servers, cwd.as_path())
+            .await;
+        let mcp_meta_config_map = parse_mcp_meta_config(arguments.meta.as_ref());
         let custom_model_id = arguments
             .meta
             .as_ref()
             .and_then(|m| m.get("modelId").and_then(|v| v.as_str()))
             .filter(|s| !s.is_empty());
+        #[allow(unused_mut)]
+        let mut session_meta_for_stamp = arguments.meta.clone();
         #[cfg(all(feature = "local-workspace", unix))]
         let pending_local_workspace = self
             .start_own_local_workspace_if_needed(
@@ -1146,6 +1176,9 @@ impl acp::Agent for MvpAgent {
                 cwd.as_path(),
             )
             .await?;
+        #[cfg(all(feature = "local-workspace", unix))]
+        let mut pending_local_workspace =
+            PendingLocalWorkspaceGuard::new(pending_local_workspace);
         #[cfg(all(feature = "local-workspace", not(unix)))]
         {
             use crate::gateway_bridge::local_workspace_supervisor::parse_local_workspace_intent;
@@ -1174,34 +1207,7 @@ impl acp::Agent for MvpAgent {
             self.default_auto_mode,
             session_yolo_mode,
         );
-        let session_id = match client_session_id {
-            Some(s) => {
-                uuid::Uuid::try_parse(s)
-                    .map_err(|e| {
-                        acp::Error::invalid_params()
-                            .data(
-                                format!(
-                        "Invalid UUID format for _meta.sessionId '{}': {}",
-                        s, e
-                    ),
-                            )
-                    })?;
-                acp::SessionId::new(s.to_string())
-            }
-            None => acp::SessionId::new(uuid::Uuid::now_v7().to_string()),
-        };
-        #[cfg(all(feature = "local-workspace", unix))]
-        let mut local_ws_reap_guard = self
-            .new_local_workspace_reap_guard(session_id.clone(), false);
-        #[cfg(all(feature = "local-workspace", unix))]
-        if let Some(handle) = pending_local_workspace {
-            self.register_local_workspace_supervisor(session_id.clone(), handle);
-            local_ws_reap_guard = self
-                .new_local_workspace_reap_guard(session_id.clone(), true);
-        }
         let mut session_timer = crate::instrumentation_timer!("session.new_session");
-        session_timer.with_field("session_id", session_id.0.as_ref());
-        session_timer.with_field("cwd", cwd.as_str());
         let client_identifier = arguments
             .meta
             .as_ref()
@@ -1217,9 +1223,6 @@ impl acp::Agent for MvpAgent {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
             });
-        xai_grok_telemetry::session_ctx::log_session_event(crate::agent::session_metrics::SessionStarted {
-            session_id: session_id.0.to_string(),
-        });
         let session_info = SessionInfo {
             id: session_id.clone(),
             cwd: cwd.as_str().to_owned(),
@@ -1240,9 +1243,15 @@ impl acp::Agent for MvpAgent {
         let disallowed_custom = prepared_model_plan
             .as_ref()
             .and_then(|plan| plan.disallowed_custom.clone());
+        let auth_hidden_custom = prepared_model_plan
+            .as_ref()
+            .and_then(|plan| plan.auth_hidden_custom.clone());
         let unreadiness_custom = prepared_model_plan
             .as_ref()
             .and_then(|plan| plan.unreadiness_custom.clone());
+        let publication_gate = prepared_model_plan
+            .as_ref()
+            .map(|_| crate::session::SessionPublicationGate::pending());
         let fallback_model_id = prepared_model_plan
             .as_ref()
             .map(|plan| plan.session_model_id.clone())
@@ -1306,23 +1315,22 @@ impl acp::Agent for MvpAgent {
         let (summary_client, summary_model) = self
             .build_summary_client(&session_sampling)
             .await?;
-        let relay_sync = if let Some(sync) = self
-            .create_relay_sync(&session_id.0, &session_info)
-        {
-            Self::spawn_relay_state_forwarder(
-                sync.subscribe_state(),
-                sync.session_id().to_owned(),
-                self.gateway.clone(),
-            );
-            Some(sync)
-        } else {
-            None
-        };
+        let relay_sync = publication_gate.as_ref().and_then(|gate| {
+            self.create_deferred_relay_sync(
+                &session_id.0,
+                &session_info,
+                gate.clone(),
+            )
+        });
+        let deferred_relay_state_rx = relay_sync
+            .as_ref()
+            .map(crate::relay::RelaySync::subscribe_state);
         let model_id = session_initial_model
             .as_ref()
             .map(|chat_model| acp::ModelId::new(chat_model.clone()))
             .unwrap_or_else(|| fallback_model_id.clone());
         let session_model_id = model_id.clone();
+        let requested_storage_mode = self.storage_mode.get();
         let persistence = if is_chat_kind {
             crate::session::persistence::PersistenceHandle::noop()
         } else {
@@ -1340,7 +1348,7 @@ impl acp::Agent for MvpAgent {
                     &session_info,
                     model_id,
                     summary_client,
-                    self.storage_mode.get(),
+                    StorageMode::Local,
                     Some(self.auth_manager.clone()),
                     relay_sync,
                     Some(self.gateway.clone()),
@@ -1348,9 +1356,16 @@ impl acp::Agent for MvpAgent {
                     registry_title_sync,
                 )
                 .await
-                .map_err(|e| crate::session::persistence::io_error_to_acp(&e))?
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        acp::Error::invalid_params().data(
+                            "A persisted session with the requested sessionId already exists",
+                        )
+                    } else {
+                        crate::session::persistence::io_error_to_acp(&error)
+                    }
+                })?
         };
-        self.set_turn_number(&session_id, 0u64);
         let chat_history = vec![];
         let client_code_nav_enabled = arguments
             .meta
@@ -1363,13 +1378,14 @@ impl acp::Agent for MvpAgent {
             init,
         );
         let spawn_res = {
-            let mut timer = crate::instrumentation_timer!("session.spawn_session_actor");
-            timer.with_field("session_id", session_id.0.as_ref());
+            // Keep provisional identity out of timing telemetry. The outer
+            // session timer receives session_id/cwd only after publication.
+            let _timer = crate::instrumentation_timer!("session.spawn_session_actor");
             let spawn_opts = if is_chat_kind {
                 chat_session_spawn_options(
                     session_info.clone(),
                     cwd.clone(),
-                    arguments.meta.as_ref(),
+                    session_meta_for_stamp.as_ref(),
                     model_agent_type.as_deref(),
                     session_model_id.clone(),
                     session_yolo_mode,
@@ -1396,7 +1412,7 @@ impl acp::Agent for MvpAgent {
                         persisted_goal_mode: None,
                         persisted_workflow_runs: Vec::new(),
                         persisted_announcement_state: None,
-                        session_meta: arguments.meta.as_ref(),
+                        session_meta: session_meta_for_stamp.as_ref(),
                         managed_mcp_expires_at,
                         model_agent_type: model_agent_type.as_deref(),
                         prepared_sampling_config: prepared_model_plan
@@ -1408,6 +1424,13 @@ impl acp::Agent for MvpAgent {
                         prepared_model_entry: prepared_model_plan
                             .as_ref()
                             .map(|plan| plan.model_entry.clone()),
+                        new_session_auth_authority: prepared_model_plan
+                            .as_ref()
+                            .map(|plan| plan.auth_authority),
+                        publication_gate,
+                        deferred_relay_state_rx,
+                        upgrade_persistence_to_writeback: requested_storage_mode
+                            == StorageMode::Writeback,
                         persisted_catalog_identity: None,
                         session_model_id: session_model_id.clone(),
                         session_yolo_mode,
@@ -1422,8 +1445,143 @@ impl acp::Agent for MvpAgent {
         if spawn_res.is_err() {
             self.shutdown_gateway_bridge(&session_id);
         }
-        let spawned_session_model_id = spawn_res?;
-        tracing::debug!(session_id = %session_id.0, "new_session: spawn_session_actor");
+        let (spawned_session_model_id, mut prepared_session) = match spawn_res? {
+            SpawnedSession::Committed(model_id) => (model_id, None),
+            SpawnedSession::Prepared(prepared) => (prepared.model_id().clone(), Some(prepared)),
+        };
+        let bridge_attach = BridgeAttach::NotAttached;
+        let indexed_roots = self.indexed_roots_for(cwd.as_path());
+        let (git_root, is_git_repo, discovery_failed) = match xai_grok_workspace::session::git::discover_git_root(
+            cwd.as_path(),
+        ) {
+            GitDiscoveryResult::Found(root) => {
+                let root_str = root.to_string_lossy().trim_end_matches('/').to_string();
+                (Some(root_str), true, false)
+            }
+            GitDiscoveryResult::NotARepo => {
+                tracing::debug!("new_session: not a git repository");
+                (None, false, false)
+            }
+            GitDiscoveryResult::DiscoveryFailed(e) => {
+                tracing::warn!(
+                        error = %e,
+                        "new_session: git repo discovery failed unexpectedly"
+                    );
+                (None, false, true)
+            }
+        };
+        let (show_non_git_warning, feedback_enabled) = {
+            let cfg = self.cfg.borrow();
+            let show_non_git_warning = !is_git_repo && !discovery_failed
+                && cfg
+                    .remote_settings
+                    .as_ref()
+                    .and_then(|s| s.non_git_warning)
+                    .unwrap_or(cfg.features.non_git_warning);
+            let feedback_enabled = cfg.is_feedback_enabled();
+            (show_non_git_warning, feedback_enabled)
+        };
+        let (models, model_presentation) = if is_chat_kind {
+            (
+                chat_new_session_model_state(
+                    self.chat_modes.model_state().await,
+                    session_initial_model
+                        .filter(|_| matches!(bridge_attach, BridgeAttach::Spawned)),
+                ),
+                self.models_manager.presentation_snapshot(),
+            )
+        } else if let Some(prepared) = prepared_session.as_deref() {
+            self.prepared_model_state_with_presentation(prepared)
+        } else {
+            self.model_state_with_presentation(Some(&session_id))
+        };
+        // `/new` still owns the provisional claim through response assembly so
+        // racing session-scoped requests cannot observe a session before its
+        // creation response. Use the owner-bound lookup rather than waiting on
+        // our own marker, which would self-deadlock until this future returns.
+        let applied_tool_overrides = if let Some(prepared) = prepared_session.as_deref() {
+            prepared
+                .handle()
+                .resolved_tool_overrides
+                .load_full()
+                .map(|overrides| (*overrides).clone())
+        } else {
+            match self.session_handle_during_load(&session_id, &new_session_claim) {
+                Some(handle) => read_applied_tool_overrides(&handle.cmd_tx).await,
+                None => {
+                tracing::warn!(
+                    session_id = %session_id.0,
+                    "session/new toolOverrides echo: session handle not found"
+                );
+                None
+                }
+            }
+        };
+        let mut meta = serde_json::json!({
+            "currentWorkingDirectory": cwd.as_str().to_owned(),
+            "codebaseIndexed": indexed_roots,
+            "isGitRepo": is_git_repo,
+            "gitRoot": git_root,
+            "showNonGitWarning": show_non_git_warning,
+            "feedbackEnabled": feedback_enabled,
+        });
+        if let Some(obj) = meta.as_object_mut() {
+            if let Some(prepared) = prepared_session.as_deref() {
+                self.insert_prepared_session_config_meta(
+                    obj,
+                    prepared,
+                    cwd.as_str().to_owned(),
+                    &models,
+                    &model_presentation,
+                );
+            } else {
+                self.insert_session_config_meta_with_presentation(
+                    obj,
+                    &session_id,
+                    cwd.as_str().to_owned(),
+                    None,
+                    &models,
+                    &model_presentation,
+                );
+            }
+            insert_applied_tool_overrides(obj, applied_tool_overrides.as_ref());
+        }
+        let response = acp::NewSessionResponse::new(session_id.clone())
+            .models(Some(models))
+            .meta(meta.as_object().cloned());
+        let response = if let Some(prepared) = prepared_session.take() {
+            match self.commit_prepared_new_session(prepared, response) {
+                Ok(response) => response,
+                Err((error, prepared)) => {
+                    self.abort_prepared_new_session(prepared).await?;
+                    return Err(error);
+                }
+            }
+        } else {
+            response
+        };
+
+        // Publication above is the final state transition. Everything below is
+        // synchronous or detached; there is no cancellation point before the
+        // already-built response is returned.
+        #[cfg(all(feature = "local-workspace", unix))]
+        if let Some(handle) = pending_local_workspace.take() {
+            self.register_local_workspace_supervisor(session_id.clone(), handle);
+        }
+        session_timer.with_field("session_id", session_id.0.as_ref());
+        session_timer.with_field("cwd", cwd.as_str());
+        xai_grok_telemetry::unified_log::info(
+            "session created",
+            Some(session_id.0.as_ref()),
+            Some(serde_json::json!({"cwd": cwd.as_str()})),
+        );
+        self.set_turn_number(&session_id, 0u64);
+        xai_grok_telemetry::session_ctx::log_session_event(
+            crate::agent::session_metrics::SessionStarted {
+                session_id: session_id.0.to_string(),
+            },
+        );
+        tracing::debug!(session_id = %session_id.0, "new_session: published session actor");
         #[cfg(feature = "local-workspace")]
         if local_workspace_intent_present(arguments.meta.as_ref()) {
             self.mark_local_workspace_bound(session_id.clone());
@@ -1433,11 +1591,10 @@ impl acp::Agent for MvpAgent {
             cwd.as_path(),
             remote_settings.as_ref(),
         );
-        let bridge_attach = BridgeAttach::NotAttached;
         let product_analytics = self.product_analytics_enabled();
         if product_analytics || xai_grok_telemetry::external::is_active() {
             let sid = session_id.0.to_string();
-            let ci = client_identifier.clone();
+            let ci = client_identifier;
             let cv = self.client_version();
             let cwd_str = cwd.as_str().to_owned();
             let perm = if session_yolo_mode {
@@ -1461,125 +1618,60 @@ impl acp::Agent for MvpAgent {
                 xai_grok_telemetry::session_ctx::log_event_dual(product_analytics, ev);
             });
         }
-        if let Some(requested) = disallowed_custom {
-            let reason = format!(
-                "\"{requested}\" isn't allowed by your allowed_models setting, so this session is using \"{}\".",
-                spawned_session_model_id.0
-            );
-            self.send_model_auto_switched(
-                    &session_id,
-                    &acp::ModelId::new(requested),
-                    &spawned_session_model_id,
-                    &reason,
-                )
-                .await;
-        }
-        if let Some((requested, readiness_reason)) = unreadiness_custom {
-            let reason = format!(
-                "\"{requested}\" isn't ready ({readiness_reason}), so this session is using \"{}\".",
-                spawned_session_model_id.0
-            );
-            self.send_model_auto_switched(
-                    &session_id,
-                    &acp::ModelId::new(requested),
-                    &spawned_session_model_id,
-                    &reason,
-                )
-                .await;
-        }
-        let indexed_roots = self.indexed_roots_for(cwd.as_path());
-        let (git_root, is_git_repo, discovery_failed) = match xai_grok_workspace::session::git::discover_git_root(
-            cwd.as_path(),
-        ) {
-            GitDiscoveryResult::Found(root) => {
-                let root_str = root.to_string_lossy().trim_end_matches('/').to_string();
-                (Some(root_str), true, false)
-            }
-            GitDiscoveryResult::NotARepo => {
-                tracing::debug!("new_session: not a git repository");
-                (None, false, false)
-            }
-            GitDiscoveryResult::DiscoveryFailed(e) => {
-                tracing::warn!(
-                        error = %e,
-                        cwd = %cwd.as_str(),
-                        "new_session: git repo discovery failed unexpectedly"
-                    );
-                (None, false, true)
-            }
-        };
-        let (show_non_git_warning, feedback_enabled) = {
-            let cfg = self.cfg.borrow();
-            let show_non_git_warning = !is_git_repo && !discovery_failed
-                && cfg
-                    .remote_settings
-                    .as_ref()
-                    .and_then(|s| s.non_git_warning)
-                    .unwrap_or(cfg.features.non_git_warning);
-            let feedback_enabled = cfg.is_feedback_enabled();
-            (show_non_git_warning, feedback_enabled)
-        };
-        xai_grok_telemetry::unified_log::info(
-            "session created",
-            Some(session_id.0.as_ref()),
-            Some(serde_json::json!({"cwd": cwd.as_str()})),
-        );
-        let (models, model_presentation) = if is_chat_kind {
-            (
-                chat_new_session_model_state(
-                    self.chat_modes.model_state().await,
-                    session_initial_model
-                        .filter(|_| matches!(bridge_attach, BridgeAttach::Spawned)),
-                ),
-                self.models_manager.presentation_snapshot(),
-            )
-        } else {
-            self.model_state_with_presentation(Some(&session_id))
-        };
-        let applied_tool_overrides = match self
-            .session_handle_waiting_for_load(&session_id)
-            .await
-        {
-            Some(handle) => read_applied_tool_overrides(&handle.cmd_tx).await,
-            None => {
-                tracing::warn!(
-                    session_id = %session_id.0,
-                    "session/new toolOverrides echo: session handle not found"
+        let auto_switch = disallowed_custom
+            .map(|requested| {
+                let reason = format!(
+                    "\"{requested}\" isn't allowed by your allowed_models setting, so this session is using \"{}\".",
+                    spawned_session_model_id.0
                 );
-                None
-            }
-        };
-        let mut meta = serde_json::json!({
-            "currentWorkingDirectory": cwd.as_str().to_owned(),
-            "codebaseIndexed": indexed_roots,
-            "isGitRepo": is_git_repo,
-            "gitRoot": git_root,
-            "showNonGitWarning": show_non_git_warning,
-            "feedbackEnabled": feedback_enabled,
-        });
-        if let Some(obj) = meta.as_object_mut() {
-            self.insert_session_config_meta_with_presentation(
-                obj,
-                &session_id,
-                cwd.as_str().to_owned(),
-                None,
-                &models,
-                &model_presentation,
-            );
-            insert_applied_tool_overrides(obj, applied_tool_overrides.as_ref());
+                (requested, reason)
+            })
+            .or_else(|| auth_hidden_custom.map(|requested| {
+                let reason = format!(
+                    "\"{requested}\" is unavailable for the current authentication mode, so this session is using \"{}\".",
+                    spawned_session_model_id.0
+                );
+                (requested, reason)
+            }))
+            .or_else(|| unreadiness_custom.map(|(requested, readiness_reason)| {
+                let reason = format!(
+                    "\"{requested}\" isn't ready ({readiness_reason}), so this session is using \"{}\".",
+                    spawned_session_model_id.0
+                );
+                (requested, reason)
+            }));
+        if let Some((requested, reason)) = auto_switch {
+            let gateway = self.gateway.clone();
+            let previous = acp::ModelId::new(requested);
+            let current = spawned_session_model_id;
+            let notify_session_id = session_id.clone();
+            tokio::task::spawn_local(async move {
+                let notification = crate::extensions::notification::SessionNotification {
+                    session_id: notify_session_id,
+                    update: crate::extensions::notification::SessionUpdate::ModelAutoSwitched {
+                        previous_model_id: previous.0.to_string(),
+                        new_model_id: current.0.to_string(),
+                        reason,
+                    },
+                    meta: None,
+                };
+                if let Ok(params) = serde_json::value::to_raw_value(&notification) {
+                    let _ = gateway
+                        .ext_notification(acp::ExtNotification::new(
+                            "x.ai/session_notification",
+                            params.into(),
+                        ))
+                        .await;
+                }
+            });
         }
-        #[cfg(all(feature = "local-workspace", unix))] local_ws_reap_guard.disarm();
-        Ok(
-            acp::NewSessionResponse::new(session_id)
-                .models(Some(models))
-                .meta(meta.as_object().cloned()),
-        )
+        Ok(response)
     }
     async fn load_session(
         &self,
         arguments: acp::LoadSessionRequest,
     ) -> Result<acp::LoadSessionResponse, acp::Error> {
-        let load_guard = self.begin_session_load(&arguments.session_id);
+        let load_guard = self.begin_session_load(&arguments.session_id)?;
         reject_chat_kind_without_feature(arguments.meta.as_ref())?;
         self.sweep_dead_sessions();
         self.drain_old_session_thread(&arguments.session_id).await;
@@ -2218,7 +2310,7 @@ impl acp::Agent for MvpAgent {
                 );
             }
             cold_spawn_selection = Some(spawn_selection);
-            self.spawn_and_register_session(
+            let spawned = self.spawn_and_register_session(
                     init,
                     SessionSpawnOptions {
                         session_info,
@@ -2247,6 +2339,10 @@ impl acp::Agent for MvpAgent {
                         prepared_sampling_config: None,
                         prepared_catalog_identity: None,
                         prepared_model_entry: None,
+                        new_session_auth_authority: None,
+                        publication_gate: None,
+                        deferred_relay_state_rx: None,
+                        upgrade_persistence_to_writeback: false,
                         persisted_catalog_identity: reconciled_catalog_identity,
                         session_model_id: spawn_model_id,
                         session_yolo_mode,
@@ -2256,6 +2352,10 @@ impl acp::Agent for MvpAgent {
                     },
                 )
                 .await?;
+            if !matches!(spawned, SpawnedSession::Committed(_)) {
+                return Err(acp::Error::internal_error()
+                    .data("load_session unexpectedly produced a provisional session"));
+            }
             if latch_persisted_unready {
                 self.session_registry
                     .set_unavailable_model_with_identity(
@@ -3566,14 +3666,14 @@ impl acp::Agent for MvpAgent {
         let prompt_dispatch = self
             .models_manager
             .commit_model_dispatch(&prompt_dispatch_authority, || {
-                handle.cmd_tx.send(prompt_command)
+                handle.cmd_tx.send(prompt_command).map_err(|_| ())
             });
         match prompt_dispatch {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(
-                acp::Error::internal_error()
-                    .data(format!("failed to dispatch prompt to session: {e}"))
-            ),
+            Ok(Err(())) => {
+                return Err(acp::Error::internal_error()
+                    .data("failed to dispatch prompt: session actor closed"));
+            }
             Err(reason) => {
                 self.session_registry.set_unavailable_model_with_identity(
                     &arguments.session_id,

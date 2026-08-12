@@ -823,6 +823,58 @@ impl WorkspaceHandle {
             system_notifications,
         )
     }
+    /// Create a local-bind session without emitting its identity while the
+    /// caller is still inside a larger publication transaction.
+    ///
+    /// Unlike the ordinary bind entry point, this is intentionally strict:
+    /// an existing session is an error rather than a rebind target. The
+    /// caller may therefore treat success as ownership of a newly-created
+    /// workspace session and proceed directly to its no-fail publication
+    /// steps.
+    pub(crate) fn create_provisional_session_with_external_toolset(
+        &self,
+        session_id: impl Into<String>,
+        cwd: std::path::PathBuf,
+        hunk_tracker: HunkTrackerHandle,
+        toolset: Arc<xai_grok_tools::registry::types::FinalizedToolset>,
+        capability: CapabilityMode,
+    ) -> WorkspaceResult<Arc<WorkspaceSession>> {
+        let session_id = session_id.into();
+        if session_id.is_empty() {
+            return Err(WorkspaceError::EmptyAgentId);
+        }
+        let mut sessions = self.shared.sessions.write();
+        if self.shared.activity_tracker.is_draining() {
+            return Err(WorkspaceError::ShuttingDown);
+        }
+        if sessions.contains_key(&session_id) {
+            return Err(WorkspaceError::SessionAlreadyExists(session_id));
+        }
+        // The external shell toolset owns its live terminal backend. Keep a
+        // separate, idle workspace backend solely as the teardown target,
+        // matching the established local-bind ownership contract without
+        // running the default toolset resolver (or logging provisional
+        // identity/path fields).
+        let terminal_backend = self.shared.session_factory.build_terminal_backend();
+        let session = Arc::new(WorkspaceSession::new(
+            session_id.clone(),
+            cwd,
+            Arc::new(std::collections::HashMap::new()),
+            capability,
+            0,
+            u32::MAX,
+            Arc::new(self.shared.default_tool_config.clone()),
+            toolset,
+            terminal_backend,
+            hunk_tracker,
+            None,
+            None,
+            false,
+            None,
+        ));
+        sessions.insert(session_id, session.clone());
+        Ok(session)
+    }
     /// Shared creation body. `hunk_tracker_cancel` is `Some` only for
     /// workspace-spawned trackers, whose actor lifetime the session then
     /// owns; externally owned trackers pass `None`.

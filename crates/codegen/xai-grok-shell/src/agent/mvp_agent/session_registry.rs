@@ -43,6 +43,14 @@ pub(super) enum Activity {
     Idle,
     Working,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AttachKind {
+    /// An ordinary load/resume. Concurrent loads may supersede one another.
+    Load,
+    /// An exclusive `/new` reservation. Loads must not displace this marker.
+    New,
+}
 /// Where a session is in its life. Each variant carries the evidence that
 /// makes it true, so a reader cannot observe a combination the type forbids.
 ///
@@ -69,6 +77,7 @@ pub(super) enum SessionPresence {
     /// before the attach finishes; only the last [`SessionRegistry::settle_attach`]
     /// retires this variant.
     Attaching {
+        kind: AttachKind,
         /// Marker currently allowed to use the during-load bypass.
         active: Option<tokio::sync::watch::Receiver<bool>>,
         /// All in-flight load markers for waiter-side gating.
@@ -136,6 +145,7 @@ impl SessionPresence {
             SessionLiveState::Attaching => {
                 let (_tx, waiter) = tokio::sync::watch::channel(false);
                 Self::Attaching {
+                    kind: AttachKind::Load,
                     active: Some(waiter.clone()),
                     waiters: vec![waiter],
                     displaced: None,
@@ -592,49 +602,102 @@ impl SessionRegistry {
     pub(super) fn begin_attach(
         &self,
         id: &acp::SessionId,
-    ) -> (
+    ) -> Option<(
         tokio::sync::watch::Sender<bool>,
         tokio::sync::watch::Receiver<bool>,
-    ) {
+    )> {
         let (tx, rx) = tokio::sync::watch::channel(false);
-        self.edit(id, |e| {
-            let previous = e.presence.take();
-            e.presence = match previous {
+        let mut entries = self.sessions.borrow_mut();
+        let entry = entries.entry(id.clone()).or_default();
+        if matches!(
+            &entry.presence,
+            Some(SessionPresence::Attaching {
+                kind: AttachKind::New,
+                ..
+            })
+        ) {
+            return None;
+        }
+        let previous = entry.presence.take();
+        entry.presence = match previous {
+            Some(SessionPresence::Attaching {
+                kind: AttachKind::Load,
+                mut waiters,
+                handle,
+                thread,
+                displaced,
+                settled_activity,
+                ..
+            }) => {
+                waiters.push(rx.clone());
                 Some(SessionPresence::Attaching {
-                    mut waiters,
+                    kind: AttachKind::Load,
+                    active: Some(rx.clone()),
+                    waiters,
+                    displaced,
                     handle,
                     thread,
-                    displaced,
                     settled_activity,
-                    ..
-                }) => {
-                    waiters.push(rx.clone());
-                    Some(SessionPresence::Attaching {
-                        active: Some(rx.clone()),
-                        waiters,
-                        displaced,
-                        handle,
-                        thread,
-                        settled_activity,
-                    })
-                }
-                other => {
-                    let handle = other
-                        .as_ref()
-                        .and_then(SessionPresence::hosted_handle)
-                        .cloned();
-                    Some(SessionPresence::Attaching {
-                        active: Some(rx.clone()),
-                        waiters: vec![rx.clone()],
-                        displaced: other.map(Box::new),
-                        handle,
-                        thread: None,
-                        settled_activity: None,
-                    })
-                }
-            };
-        });
-        (tx, rx)
+                })
+            }
+            Some(SessionPresence::Attaching {
+                kind: AttachKind::New,
+                ..
+            }) => unreachable!("exclusive creation claim was rejected before displacement"),
+            other => {
+                let handle = other
+                    .as_ref()
+                    .and_then(SessionPresence::hosted_handle)
+                    .cloned();
+                Some(SessionPresence::Attaching {
+                    kind: AttachKind::Load,
+                    active: Some(rx.clone()),
+                    waiters: vec![rx.clone()],
+                    displaced: other.map(Box::new),
+                    handle,
+                    thread: None,
+                    settled_activity: None,
+                })
+            }
+        };
+        Some((tx, rx))
+    }
+
+    /// Atomically reserve an entirely new session id.
+    ///
+    /// Unlike [`Self::begin_attach`], this never displaces an existing
+    /// presence or any other per-session resource.  `/new` holds the returned
+    /// marker across every await; dropping its guard removes an unpublished
+    /// empty reservation, while a successful resident commit retires the
+    /// `Attaching` presence through the normal settle path.
+    pub(super) fn try_begin_new(
+        &self,
+        id: &acp::SessionId,
+    ) -> Option<(
+        tokio::sync::watch::Sender<bool>,
+        tokio::sync::watch::Receiver<bool>,
+    )> {
+        let mut entries = self.sessions.borrow_mut();
+        if entries.contains_key(id) {
+            return None;
+        }
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        entries.insert(
+            id.clone(),
+            SessionResources {
+                presence: Some(SessionPresence::Attaching {
+                    kind: AttachKind::New,
+                    active: Some(rx.clone()),
+                    waiters: vec![rx.clone()],
+                    displaced: None,
+                    handle: None,
+                    thread: None,
+                    settled_activity: None,
+                }),
+                ..Default::default()
+            },
+        );
+        Some((tx, rx))
     }
     /// Clone of the newest in-flight attach waiter, if any. External waiters
     /// re-check via this; when concurrent loads exist the gate stays shut until
@@ -842,7 +905,8 @@ impl SessionRegistry {
             .flatten()
     }
     pub(super) fn unavailable_agent_name(&self, id: &acp::SessionId) -> Option<String> {
-        self.with(id, |e| e.unavailable_agent_name.clone()).flatten()
+        self.with(id, |e| e.unavailable_agent_name.clone())
+            .flatten()
     }
 
     pub(super) fn unavailable_recovery_snapshot(
@@ -853,12 +917,7 @@ impl SessionRegistry {
         let entry = entries.get(id)?;
         Some(UnavailableRecoverySnapshot {
             unavailable_model: entry.unavailable_model.clone()?,
-            resident_model_id: entry
-                .presence
-                .as_ref()?
-                .hosted_handle()?
-                .model_id
-                .clone(),
+            resident_model_id: entry.presence.as_ref()?.hosted_handle()?.model_id.clone(),
             catalog_identity: entry.unavailable_catalog_identity.clone(),
             agent_name: entry.unavailable_agent_name.clone(),
             revision: entry.unavailable_model_revision,
@@ -873,16 +932,12 @@ impl SessionRegistry {
         self.unavailable_recovery_snapshot(id).as_ref() == Some(expected)
     }
     pub(super) fn take_unavailable_model(&self, id: &acp::SessionId) -> Option<acp::ModelId> {
-        let model = self
-            .sessions
-            .borrow_mut()
-            .get_mut(id)
-            .and_then(|e| {
-                e.unavailable_model_revision = e.unavailable_model_revision.saturating_add(1);
-                e.unavailable_catalog_identity = None;
-                e.unavailable_agent_name = None;
-                e.unavailable_model.take()
-            });
+        let model = self.sessions.borrow_mut().get_mut(id).and_then(|e| {
+            e.unavailable_model_revision = e.unavailable_model_revision.saturating_add(1);
+            e.unavailable_catalog_identity = None;
+            e.unavailable_agent_name = None;
+            e.unavailable_model.take()
+        });
         self.drop_if_empty(id);
         model
     }

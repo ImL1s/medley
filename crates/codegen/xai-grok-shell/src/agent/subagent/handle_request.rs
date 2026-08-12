@@ -1509,6 +1509,7 @@ pub(crate) async fn run_shell_child(
         false,
         false,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        crate::session::SessionPublicationGate::published(),
         definition,
         subagent_session_default_agent_profile,
         if inherit_skills {

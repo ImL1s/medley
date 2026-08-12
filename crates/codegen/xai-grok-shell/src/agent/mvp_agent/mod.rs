@@ -291,6 +291,18 @@ pub(crate) struct SessionSpawnOptions<'a> {
     pub prepared_catalog_identity: Option<xai_chat_state::CatalogIdentity>,
     /// Exact catalog entry captured with the prepared sampler and identity.
     pub prepared_model_entry: Option<ModelEntry>,
+    /// Auth authority that must still hold at the final resident publication.
+    pub new_session_auth_authority: Option<NewSessionAuthAuthority>,
+    /// Pending only for `/new`; all externally visible actor startup and relay
+    /// work waits until the final auth-sealed resident commit publishes it.
+    pub publication_gate: Option<crate::session::SessionPublicationGate>,
+    /// Relay state forwarding is also publication: create its receiver while
+    /// the relay is provisional, but do not start forwarding until commit.
+    pub deferred_relay_state_rx: Option<
+        tokio::sync::watch::Receiver<crate::relay::ConnectionState>,
+    >,
+    /// Upgrade provisional local persistence only after resident publication.
+    pub upgrade_persistence_to_writeback: bool,
     pub persisted_catalog_identity: Option<xai_chat_state::CatalogIdentity>,
     pub session_yolo_mode: bool,
     pub session_auto_mode: bool,
@@ -299,14 +311,59 @@ pub(crate) struct SessionSpawnOptions<'a> {
     pub is_chat_kind: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct NewSessionAuthAuthority {
+    pub generation: u64,
+    pub is_session_auth: bool,
+}
+
 pub(crate) struct PreparedNewSessionModelPlan {
     pub model_agent_type: Option<String>,
     pub session_model_id: acp::ModelId,
     pub sampling_config: SamplingConfig,
     pub catalog_identity: xai_chat_state::CatalogIdentity,
     pub model_entry: ModelEntry,
+    pub auth_authority: NewSessionAuthAuthority,
     pub disallowed_custom: Option<String>,
+    pub auth_hidden_custom: Option<String>,
     pub unreadiness_custom: Option<(String, String)>,
+}
+
+/// Result of actor construction. Loads and chat sessions are already published;
+/// auth-sealed build `/new` sessions stay wholly provisional until the outer
+/// response has been assembled and calls the synchronous commit path.
+pub(crate) enum SpawnedSession {
+    Committed(acp::ModelId),
+    Prepared(Box<PreparedNewSession>),
+}
+
+pub(crate) struct PreparedNewSession {
+    session_info: SessionInfo,
+    handle: Option<SessionHandle>,
+    thread: Option<SessionThread>,
+    permission_events_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PermissionEvent>>,
+    publication_gate: crate::session::SessionPublicationGate,
+    cleanup: Option<agent_ops::ProvisionalNewSessionCleanup>,
+    auth_authority: NewSessionAuthAuthority,
+    winning_model: ModelEntry,
+    deferred_relay_state_rx:
+        Option<tokio::sync::watch::Receiver<crate::relay::ConnectionState>>,
+    upgrade_persistence_to_writeback: bool,
+    web_search_disable_notice: Option<config::WebSearchDisabled>,
+    unavailable_spawn_model:
+        Option<(acp::ModelId, xai_chat_state::CatalogIdentity, String)>,
+    loc_aggregate_rx: Option<tokio::sync::mpsc::UnboundedReceiver<xai_hunk_tracker::LocAggregate>>,
+    initialize_system_prompt: Option<String>,
+}
+
+impl PreparedNewSession {
+    pub(crate) fn model_id(&self) -> &acp::ModelId {
+        &self.handle.as_ref().expect("prepared session owns handle").model_id
+    }
+
+    pub(crate) fn handle(&self) -> &SessionHandle {
+        self.handle.as_ref().expect("prepared session owns handle")
+    }
 }
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
@@ -485,6 +542,10 @@ pub(crate) fn chat_session_spawn_options<'a>(
         prepared_sampling_config: None,
         prepared_catalog_identity: None,
         prepared_model_entry: None,
+        new_session_auth_authority: None,
+        publication_gate: None,
+        deferred_relay_state_rx: None,
+        upgrade_persistence_to_writeback: false,
         persisted_catalog_identity: None,
         session_yolo_mode,
         session_auto_mode: false,
