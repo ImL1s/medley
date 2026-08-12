@@ -342,27 +342,22 @@ pub async fn handle(
         .map(|m| m.client_id.clone())
         .unwrap_or_default();
 
-    let session_info = crate::session::info::Info {
-        id: acp::SessionId::new(request.session_id.clone()),
-        cwd: request.cwd.clone(),
-    };
-    let mut updates_path = crate::session::persistence::session_dir(&session_info)
-        .join(crate::session::storage::UPDATES_FILE);
-
-    // Subagents persist under their own cwd (may differ from the parent cwd
-    // passed here), so fall back to an id scan when the (id, cwd) path misses.
-    if !updates_path.exists()
-        && let Some(found_dir) =
-            crate::session::persistence::find_persisted_session_dir_by_id_result(
-                &request.session_id,
-            )
-            .map_err(|error| acp::Error::internal_error().data(error.to_string()))?
-    {
-        let candidate = found_dir.join(crate::session::storage::UPDATES_FILE);
-        if candidate.exists() {
-            updates_path = candidate;
+    // Hold the per-id visibility lease across resolution and every transcript
+    // read. Subagents may persist under a cwd different from the caller, so
+    // the capability tries the requested cwd first and then scans by id.
+    let Some(session) = crate::session::persistence::acquire_published_session_read(
+        &request.session_id,
+        Some(&request.cwd),
+    )
+    .await
+    .map_err(|error| acp::Error::internal_error().data(error.to_string()))?
+    else {
+        if request.stream {
+            return streamed_metadata_response(0, None, 0, &[]);
         }
-    }
+        return empty_response(0);
+    };
+    let updates_path = session.path().join(crate::session::storage::UPDATES_FILE);
 
     if !updates_path.exists() {
         if request.stream {
@@ -505,6 +500,14 @@ mod tests {
         xai_acp_lib::AcpAgentGatewaySender::new(tx)
     }
 
+    fn mark_published(session_dir: &Path) {
+        std::fs::write(
+            session_dir.join(crate::session::storage::SUMMARY_FILE),
+            b"{}",
+        )
+        .unwrap();
+    }
+
     fn make_request(
         session_id: &str,
         cwd: &str,
@@ -542,6 +545,7 @@ mod tests {
         };
         let session_dir = crate::session::persistence::session_dir(&session_info);
         std::fs::create_dir_all(&session_dir).unwrap();
+        mark_published(&session_dir);
         std::fs::write(
             session_dir.join("updates.jsonl"),
             [
@@ -581,6 +585,7 @@ mod tests {
         };
         let session_dir = crate::session::persistence::session_dir(&session_info);
         std::fs::create_dir_all(&session_dir).unwrap();
+        mark_published(&session_dir);
         std::fs::write(
             session_dir.join("updates.jsonl"),
             [
@@ -723,6 +728,7 @@ mod tests {
             cwd: cwd.clone(),
         });
         std::fs::create_dir_all(&session_dir).unwrap();
+        mark_published(&session_dir);
         std::fs::write(
             session_dir.join("updates.jsonl"),
             [
@@ -832,6 +838,7 @@ mod tests {
         };
         let session_dir = crate::session::persistence::session_dir(&session_info);
         std::fs::create_dir_all(&session_dir).unwrap();
+        mark_published(&session_dir);
         std::fs::write(session_dir.join("updates.jsonl"), lines.join("\n") + "\n").unwrap();
     }
 

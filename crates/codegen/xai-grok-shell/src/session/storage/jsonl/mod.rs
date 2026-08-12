@@ -19,7 +19,26 @@ mod copy;
 #[derive(Clone)]
 enum SessionDirMode {
     FromRoot(PathBuf),
-    Explicit(PathBuf),
+    Explicit(SessionPathBinding),
+}
+
+/// Shared physical path used by a fresh session while it moves from its
+/// private staging directory into the published session namespace.
+#[derive(Clone, Debug)]
+pub(crate) struct SessionPathBinding(std::sync::Arc<parking_lot::RwLock<PathBuf>>);
+
+impl SessionPathBinding {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self(std::sync::Arc::new(parking_lot::RwLock::new(path)))
+    }
+
+    pub(crate) fn path(&self) -> PathBuf {
+        self.0.read().clone()
+    }
+
+    pub(crate) fn rebind(&self, path: PathBuf) {
+        *self.0.write() = path;
+    }
 }
 #[derive(Clone, Copy)]
 pub(crate) enum AppendDurability {
@@ -77,8 +96,17 @@ impl JsonlStorageAdapter {
     /// Used for subagent child sessions whose files live under the parent's
     /// session directory: `{parent_session_dir}/subagents/{subagent_id}/`.
     pub fn with_explicit_session_dir(session_dir: PathBuf) -> Self {
+        Self::with_session_path_binding(SessionPathBinding::new(session_dir))
+    }
+
+    pub(crate) fn with_rebindable_session_dir(session_dir: PathBuf) -> (Self, SessionPathBinding) {
+        let binding = SessionPathBinding::new(session_dir);
+        (Self::with_session_path_binding(binding.clone()), binding)
+    }
+
+    pub(crate) fn with_session_path_binding(binding: SessionPathBinding) -> Self {
         Self {
-            dir_mode: SessionDirMode::Explicit(session_dir),
+            dir_mode: SessionDirMode::Explicit(binding),
             #[cfg(test)]
             update_append_probe: None,
             #[cfg(test)]
@@ -93,7 +121,7 @@ impl JsonlStorageAdapter {
         append_probe: impl Fn(AppendDurability) -> io::Result<()> + Send + Sync + 'static,
     ) -> Self {
         Self {
-            dir_mode: SessionDirMode::Explicit(session_dir),
+            dir_mode: SessionDirMode::Explicit(SessionPathBinding::new(session_dir)),
             update_append_probe: Some(std::sync::Arc::new(append_probe)),
             model_switch_probe: None,
             session_sync_probe: None,
@@ -117,7 +145,7 @@ impl JsonlStorageAdapter {
         probe: impl Fn() -> io::Result<()> + Send + Sync + 'static,
     ) -> Self {
         Self {
-            dir_mode: SessionDirMode::Explicit(session_dir),
+            dir_mode: SessionDirMode::Explicit(SessionPathBinding::new(session_dir)),
             update_append_probe: None,
             model_switch_probe: None,
             session_sync_probe: Some(std::sync::Arc::new(probe)),
@@ -139,7 +167,7 @@ impl JsonlStorageAdapter {
                 .join("sessions")
                 .join(crate::util::grok_home::encode_cwd_dirname(&info.cwd))
                 .join(info.id.to_string()),
-            SessionDirMode::Explicit(dir) => dir.clone(),
+            SessionDirMode::Explicit(binding) => binding.path(),
         }
     }
     pub(super) fn updates_file(&self, info: &Info) -> PathBuf {
@@ -253,6 +281,23 @@ impl JsonlStorageAdapter {
         let Some(_session_id_lock) = self.try_lock_session_for_listing(session_dir)? else {
             return Ok(None);
         };
+        self.read_summary_for_listing_locked(session_dir)
+    }
+
+    /// Read a listing candidate while the caller retains its per-session
+    /// shared visibility lock.
+    fn read_summary_for_listing_locked(&self, session_dir: &Path) -> io::Result<Option<Summary>> {
+        // Revalidate after taking the lock. The initial directory/mtime scan is
+        // intentionally unleased so a large history does not consume one file
+        // descriptor per session; a creator may have changed publication state
+        // while we waited.
+        if std::fs::symlink_metadata(
+            session_dir.join(crate::session::persistence::UNPUBLISHED_SESSION_MARKER),
+        )
+        .is_ok()
+        {
+            return Ok(None);
+        }
         if let Err(error) = self.recover_model_switch_in_dir_sync(session_dir) {
             tracing::warn!(
                 session_dir = %session_dir.display(),
@@ -279,40 +324,33 @@ impl JsonlStorageAdapter {
     /// this reduces cold-boot `workspace_list` from ~3s to ~200ms.
     /// Final order among candidates uses `last_active_at` else `updated_at`.
     pub async fn list_sessions_recent(&self, limit: usize) -> io::Result<Vec<Summary>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let session_dirs = self.scan_session_dirs(None)?;
-        let mut candidates: Vec<(PathBuf, std::time::SystemTime, SessionIdLock)> =
+        // Do not retain a lock (and therefore an open lock-file descriptor) for
+        // every historical session. A user with ~12K sessions can otherwise
+        // exhaust the process FD limit before we truncate to `limit`.
+        let mut candidates: Vec<(PathBuf, std::time::SystemTime)> =
             Vec::with_capacity(session_dirs.len());
         for session_dir in session_dirs {
-            let Some(session_id_lock) = self.try_lock_session_for_listing(&session_dir)? else {
-                continue;
-            };
-            if let Err(error) = self.recover_model_switch_in_dir_sync(&session_dir) {
-                tracing::warn!(
-                    session_dir = %session_dir.display(),
-                    ?error,
-                    "failed recovering pending model-switch intent before recent-session scan"
-                );
-                continue;
-            }
             let summary_path = session_dir.join(super::SUMMARY_FILE);
             if let Ok(meta) = std::fs::metadata(&summary_path)
                 && let Ok(mtime) = meta.modified()
             {
-                candidates.push((session_dir, mtime, session_id_lock));
+                candidates.push((session_dir, mtime));
             }
         }
         candidates.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-        candidates.truncate(limit);
-        let mut summaries = Vec::with_capacity(candidates.len());
-        for (session_dir, _, _session_id_lock) in candidates {
-            let summary_path = session_dir.join(super::SUMMARY_FILE);
-            let Some(bytes) = std::fs::read(&summary_path).ok() else {
+        let mut summaries = Vec::with_capacity(limit.min(candidates.len()));
+        for (session_dir, _) in candidates {
+            if summaries.len() == limit {
+                break;
+            }
+            let Some(_session_id_lock) = self.try_lock_session_for_listing(&session_dir)? else {
                 continue;
             };
-            let Some(summary) = serde_json::from_slice::<Summary>(&bytes).ok() else {
-                continue;
-            };
-            if !summary.is_hidden() {
+            if let Some(summary) = self.read_summary_for_listing_locked(&session_dir)? {
                 summaries.push(summary);
             }
         }

@@ -6,6 +6,21 @@ use super::*;
 use crate::auth::PreferredAuthMethod;
 use xai_grok_tools::implementations::grok_build::task::backend::SubagentBackend;
 use xai_tty_utils::ProcessScope;
+
+fn run_after_publication(
+    gate: crate::session::SessionPublicationGate,
+    action: impl FnOnce() + 'static,
+) {
+    if gate.is_published() {
+        action();
+    } else {
+        tokio::task::spawn_local(async move {
+            if gate.wait_until_published().await {
+                action();
+            }
+        });
+    }
+}
 #[cfg(test)]
 thread_local! {
     static NEW_SESSION_PLAN_BEFORE_SEAL_HOOK: RefCell<Option<Box<dyn FnMut()>>> =
@@ -874,6 +889,36 @@ impl MvpAgent {
             &managed,
             self.plugin_registry_handle.snapshot().as_deref(),
             &compat,
+        );
+        (admitted, merged, expires_at)
+    }
+
+    pub(super) async fn resolve_mcp_servers_with_trust_snapshot(
+        &self,
+        client_servers: Vec<acp::McpServer>,
+        cwd: &std::path::Path,
+        project_trusted: bool,
+    ) -> (
+        Vec<acp::McpServer>,
+        Vec<acp::McpServer>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        self.ensure_plugin_registry();
+        let managed = self.get_managed_mcp_configs().await;
+        let expires_at = managed.iter().filter_map(|c| c.token_expires_at).min();
+        let compat = self.cfg.borrow().compat_resolved;
+        let admitted = crate::session::managed_mcp::admit_client_mcp_servers(
+            client_servers,
+            cwd,
+            &compat,
+        );
+        let merged = crate::session::managed_mcp::merge_managed_mcp_servers_with_trust_snapshot(
+            admitted.clone(),
+            cwd,
+            &managed,
+            self.plugin_registry_handle.snapshot().as_deref(),
+            &compat,
+            project_trusted,
         );
         (admitted, merged, expires_at)
     }
@@ -5134,34 +5179,59 @@ impl MvpAgent {
                             .data(format!("Failed to reserve session workspace: {error}")));
                     }
                 };
-                match crate::session::persistence::finalize_fresh_publication_sync(
-                    &prepared.session_info,
-                ) {
-                    Ok(()) => {}
-                    Err(crate::session::persistence::FreshPublicationFinalizeError::NotCommitted(
-                        error,
-                    )) => {
-                        drop(reservation);
-                        prepared.handle = Some(handle);
-                        return Err(acp::Error::internal_error().data(format!(
-                            "Failed to finalize provisional session persistence: {error}"
-                        )));
-                    }
-                    Err(crate::session::persistence::FreshPublicationFinalizeError::Committed(
-                        error,
-                    )) => {
-                        tracing::error!(
-                            error_kind = ?error.kind(),
-                            "session persistence committed but its parent directory sync failed; continuing publication"
-                        );
-                    }
-                }
-
-                reservation.commit(
+                let validated_folder_trust = match prepared.folder_trust_snapshot.take() {
+                    Some(snapshot) => match snapshot.validate_current() {
+                        Ok(validated) => Some(validated),
+                        Err(_) => {
+                            drop(reservation);
+                            prepared.handle = Some(handle);
+                            return Err(acp::Error::internal_error()
+                                .data("Folder trust changed while the session was being created"));
+                        }
+                    },
+                    None => None,
+                };
+                let Some(fresh_publication) = handle.fresh_publication.clone() else {
+                    drop(reservation);
+                    prepared.handle = Some(handle);
+                    return Err(acp::Error::internal_error()
+                        .data("Fresh session is missing its private publication plan"));
+                };
+                let mut committed_sync_error = None;
+                if let Err(error) = reservation.commit_after(
                     handle.tool_context.cwd.as_path().to_path_buf(),
                     handle.hunk_tracker_handle.clone(),
                     handle.workspace_toolset.clone(),
-                );
+                    || match fresh_publication.finalize() {
+                        Ok(()) => Ok(()),
+                        Err(crate::session::persistence::FreshPublicationFinalizeError::NotCommitted(error)) => {
+                            Err(xai_grok_workspace::WorkspaceError::Finalize(error.to_string()))
+                        }
+                        Err(crate::session::persistence::FreshPublicationFinalizeError::CommittedDurability(error)) => {
+                            committed_sync_error = Some(error);
+                            Ok(())
+                        }
+                        Err(crate::session::persistence::FreshPublicationFinalizeError::CommittedIdentity(error)) => {
+                            Err(xai_grok_workspace::WorkspaceError::Finalize(format!(
+                                "session storage committed outside the canonical namespace: {error}"
+                            )))
+                        }
+                    }.map(|()| {
+                        if let Some(validated) = validated_folder_trust {
+                            validated.commit();
+                        }
+                    }),
+                ) {
+                    prepared.handle = Some(handle);
+                    return Err(acp::Error::internal_error()
+                        .data(format!("Failed to publish session workspace: {error}")));
+                }
+                if let Some(error) = committed_sync_error {
+                    tracing::error!(
+                        error_kind = ?error.kind(),
+                        "session persistence committed but its parent directory sync failed; continuing publication"
+                    );
+                }
 
                 let thread = prepared
                     .thread
@@ -5172,6 +5242,11 @@ impl MvpAgent {
                     .set_thread(&prepared.session_info.id, thread);
                 let displaced = self.insert_resident(&prepared.session_info.id, handle.clone());
                 prepared.publication_gate.publish();
+                // These mutate process-global auth/settings state and may
+                // start network refresh work. An aborted `/new` must not cause
+                // either side effect, so run them only after publication.
+                self.seed_client_config_auth_if_available();
+                self.spawn_settings_reapply();
                 Ok((handle, displaced))
             },
         );
@@ -5352,6 +5427,7 @@ impl MvpAgent {
             prepared_model_entry,
             new_session_auth_authority,
             publication_gate,
+            folder_trust_snapshot,
             deferred_relay_state_rx,
             upgrade_persistence_to_writeback,
             persisted_catalog_identity,
@@ -5376,11 +5452,16 @@ impl MvpAgent {
         let _timer = crate::instrumentation_timer!("session.spawn_and_register");
         reject_direct_hub_cloud_meta(session_meta)?;
         let spawn_remote_settings = self.cfg.borrow().remote_settings.clone();
-        folder_trust::resolve_and_record(
-            cwd.as_path(),
-            spawn_remote_settings.as_ref(),
-            false,
-        );
+        let project_trusted = folder_trust_snapshot
+            .as_ref()
+            .map(folder_trust::FolderTrustSnapshot::allowed)
+            .unwrap_or_else(|| {
+                folder_trust::resolve_and_record(
+                    cwd.as_path(),
+                    spawn_remote_settings.as_ref(),
+                    false,
+                )
+            });
         let use_acp_fs = client_fs_read && client_fs_write;
         let fs_notify_config = init
             .client_capabilities
@@ -5558,7 +5639,7 @@ impl MvpAgent {
             }
             _ => None,
         };
-        let project_env_trusted = folder_trust::project_scope_allowed(cwd.as_path());
+        let project_env_trusted = project_trusted;
         let mut session_env = xai_grok_workspace::permission::claude_settings::load_claude_env_with_project(
             cwd.as_path(),
             project_env_trusted,
@@ -5917,9 +5998,9 @@ impl MvpAgent {
                 &plugin_names,
                 &inline_names,
             );
-            let servers = folder_trust::filter_untrusted_project_lsp(
-                tool_ctx.cwd.as_path(),
+            let servers = folder_trust::filter_untrusted_project_lsp_with_verdict(
                 sourced,
+                project_trusted,
             );
             tool_ctx.lsp_server_names = servers.keys().cloned().collect();
             if servers.is_empty() {
@@ -6160,14 +6241,19 @@ impl MvpAgent {
                     ),
                         std::path::Path::new(&session_info.cwd),
                     );
-                    for e in &errors {
-                        tracing::warn!(agent = %agent_definition.name, error = ?e, "agent hook parse error");
-                    }
+                    let parse_errors: Vec<String> =
+                        errors.iter().map(ToString::to_string).collect();
+                    let warning_agent = agent_definition.name.clone();
+                    run_after_publication(publication_gate.clone(), move || {
+                        for error in parse_errors {
+                            tracing::warn!(agent = %warning_agent, error, "agent hook parse error");
+                        }
+                    });
                     if specs.is_empty() {
                         return None;
                     }
                     let cwd = std::path::Path::new(&session_info.cwd);
-                    let hooks_trusted = folder_trust::project_scope_allowed(cwd);
+                    let hooks_trusted = project_trusted;
                     let git_root = xai_grok_workspace::session::git::find_git_root_from_path(
                             cwd,
                         )
@@ -6177,9 +6263,13 @@ impl MvpAgent {
                         &compat,
                         hooks_trusted,
                     );
-                    for e in &disk_errors {
-                        tracing::warn!(error = ?e, "hook loading error");
-                    }
+                    let disk_errors: Vec<String> =
+                        disk_errors.iter().map(ToString::to_string).collect();
+                    run_after_publication(publication_gate.clone(), move || {
+                        for error in disk_errors {
+                            tracing::warn!(error, "hook loading error");
+                        }
+                    });
                     let mut merged = disk_registry;
                     if folder_trust::agent_inline_hooks_allowed(
                         agent_definition.scope,
@@ -6262,6 +6352,7 @@ impl MvpAgent {
                     client_fs_read && client_fs_write,
                     gateway_enabled,
                     publication_gate.clone(),
+                    project_trusted,
                     agent_definition,
                     session_default_agent_profile,
                     skills,
@@ -6319,7 +6410,7 @@ impl MvpAgent {
                                 session_cwd,
                                 &disk_cfg,
                                 &parse_session_plugin_dirs(session_meta),
-                                folder_trust::project_scope_allowed(session_cwd),
+                                project_trusted,
                             )
                     },
                     Some(self.plugin_registry_handle.clone()),
@@ -6450,6 +6541,7 @@ impl MvpAgent {
                 thread: unpublished_thread.take(),
                 permission_events_rx: Some(permission_events_rx),
                 publication_gate,
+                folder_trust_snapshot,
                 cleanup: provisional_cleanup.take(),
                 auth_authority,
                 deferred_relay_state_rx,

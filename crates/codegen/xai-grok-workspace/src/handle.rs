@@ -440,16 +440,66 @@ pub(crate) struct WorkspaceLocalSessionReservation {
 
 impl WorkspaceLocalSessionReservation {
     pub(crate) fn promote_with_external_toolset(
+        self,
+        cwd: std::path::PathBuf,
+        hunk_tracker: HunkTrackerHandle,
+        toolset: Arc<xai_grok_tools::registry::types::FinalizedToolset>,
+        capability: CapabilityMode,
+    ) -> WorkspaceResult<()> {
+        self.promote_with_external_toolset_after(cwd, hunk_tracker, toolset, capability, || Ok(()))
+    }
+
+    pub(crate) fn promote_with_external_toolset_after(
+        self,
+        cwd: std::path::PathBuf,
+        hunk_tracker: HunkTrackerHandle,
+        toolset: Arc<xai_grok_tools::registry::types::FinalizedToolset>,
+        capability: CapabilityMode,
+        before_publish: impl FnOnce() -> WorkspaceResult<()>,
+    ) -> WorkspaceResult<()> {
+        self.promote_with_external_toolset_after_lock_hook(
+            cwd,
+            hunk_tracker,
+            toolset,
+            capability,
+            || {},
+            before_publish,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn promote_with_external_toolset_after_lock_attempt_for_test(
+        self,
+        cwd: std::path::PathBuf,
+        hunk_tracker: HunkTrackerHandle,
+        toolset: Arc<xai_grok_tools::registry::types::FinalizedToolset>,
+        capability: CapabilityMode,
+        before_lock: impl FnOnce(),
+    ) -> WorkspaceResult<()> {
+        self.promote_with_external_toolset_after_lock_hook(
+            cwd,
+            hunk_tracker,
+            toolset,
+            capability,
+            before_lock,
+            || Ok(()),
+        )
+    }
+
+    fn promote_with_external_toolset_after_lock_hook(
         mut self,
         cwd: std::path::PathBuf,
         hunk_tracker: HunkTrackerHandle,
         toolset: Arc<xai_grok_tools::registry::types::FinalizedToolset>,
         capability: CapabilityMode,
-    ) {
+        before_lock: impl FnOnce(),
+        before_publish: impl FnOnce() -> WorkspaceResult<()>,
+    ) -> WorkspaceResult<()> {
         let shared = self
             .shared
             .as_ref()
-            .expect("reservation can only be promoted once");
+            .expect("reservation can only be promoted once")
+            .clone();
         // The external shell toolset owns its live terminal backend. Keep a
         // separate, idle workspace backend solely as the teardown target.
         let terminal_backend = shared.session_factory.build_terminal_backend();
@@ -469,14 +519,21 @@ impl WorkspaceLocalSessionReservation {
             false,
             None,
         ));
-        let shared = self
-            .shared
-            .take()
-            .expect("reservation can only be promoted once");
-        shared
-            .sessions
-            .write()
-            .promote(self.session_id.clone(), &self.claim, session);
+        before_lock();
+        let mut sessions = shared.sessions.write();
+        if shared.activity_tracker.is_draining() {
+            sessions.cancel_reservation(&self.session_id, &self.claim);
+            self.shared.take();
+            return Err(WorkspaceError::ShuttingDown);
+        }
+        if let Err(error) = before_publish() {
+            sessions.cancel_reservation(&self.session_id, &self.claim);
+            self.shared.take();
+            return Err(error);
+        }
+        sessions.promote(self.session_id.clone(), &self.claim, session);
+        self.shared.take();
+        Ok(())
     }
 }
 

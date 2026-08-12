@@ -1119,12 +1119,11 @@ impl acp::Agent for MvpAgent {
                 acp::Error::invalid_params()
                     .data("initialize must be called before new_session")
             })?;
-        self.seed_client_config_auth_if_available();
-        self.spawn_settings_reapply();
         let cwd = AbsPathBuf::new(arguments.cwd.clone())
             .map_err(|e| acp::Error::invalid_params().data(e.to_string()))?;
         let remote_settings = self.cfg.borrow().remote_settings.clone();
-        folder_trust::resolve_and_record(cwd.as_path(), remote_settings.as_ref(), false);
+        let folder_trust_snapshot =
+            folder_trust::snapshot(cwd.as_path(), remote_settings.as_ref());
         let client_session_id = arguments
             .meta
             .as_ref()
@@ -1159,7 +1158,11 @@ impl acp::Agent for MvpAgent {
                 .data("A persisted session with the requested sessionId already exists"));
         }
         let (initial_client_mcp_servers, mcp_servers, managed_mcp_expires_at) = self
-            .resolve_mcp_servers(arguments.mcp_servers, cwd.as_path())
+            .resolve_mcp_servers_with_trust_snapshot(
+                arguments.mcp_servers,
+                cwd.as_path(),
+                folder_trust_snapshot.allowed(),
+            )
             .await;
         let mcp_meta_config_map = parse_mcp_meta_config(arguments.meta.as_ref());
         let custom_model_id = arguments
@@ -1428,6 +1431,7 @@ impl acp::Agent for MvpAgent {
                             .as_ref()
                             .map(|plan| plan.auth_authority.clone()),
                         publication_gate,
+                        folder_trust_snapshot: Some(folder_trust_snapshot),
                         deferred_relay_state_rx,
                         upgrade_persistence_to_writeback: requested_storage_mode
                             == StorageMode::Writeback,
@@ -2336,6 +2340,7 @@ impl acp::Agent for MvpAgent {
                         prepared_model_entry: None,
                         new_session_auth_authority: None,
                         publication_gate: None,
+                        folder_trust_snapshot: None,
                         deferred_relay_state_rx: None,
                         upgrade_persistence_to_writeback: false,
                         persisted_catalog_identity: reconciled_catalog_identity,

@@ -85,6 +85,9 @@ pub struct SessionHandle {
     pub cmd_tx: mpsc::UnboundedSender<SessionCommand>,
     /// Persistence channel shared with the actor (used by extension handlers).
     pub(crate) persistence_tx: mpsc::UnboundedSender<PersistenceMsg>,
+    /// Private-to-public filesystem publication plan for a fresh session.
+    /// `None` for loaded, resumed, and subagent sessions.
+    pub(crate) fresh_publication: Option<super::persistence::FreshPublication>,
     /// Current running prompt/turn id, if any.
     ///
     /// Shared with the session actor so external cancellation paths can target

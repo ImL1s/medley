@@ -7,23 +7,28 @@
 //! context window.
 
 use std::collections::BTreeSet;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::ops::ControlFlow;
-use std::path::Path;
-
-use agent_client_protocol as acp;
+use std::path::{Path, PathBuf};
 
 use crate::sampling::{
-    ConversationItem, conversation_truncate_for_prompt, fork_filter_chat,
-    transform_conversation_cwd,
+    ContentPart, ConversationItem, SyntheticReason, conversation_truncate_for_prompt,
+    fork_filter_chat, transform_conversation_cwd,
 };
 use crate::session::info::Info;
-use crate::session::persistence::{CHAT_FORMAT_VERSION, Summary};
+use crate::session::persistence::{
+    CHAT_FORMAT_VERSION, SessionIdLock, Summary, acquire_ordered_copy_locks_sync,
+};
 use crate::session::storage::jsonl::{JsonlStorageAdapter, transform_session_id_in_update};
 use crate::session::storage::{
     CopySessionOptions, CopySessionResult, RewindStep, SessionUpdate, SessionUpdateEnvelope,
     filter_rewind_by, rewind_step_for_line, truncate_for_prompt_by,
 };
+use agent_client_protocol as acp;
+use xai_grok_shell_base::util::anchored_directory::AnchoredDirectory;
+
+use super::SessionDirMode;
 
 #[cfg(test)]
 #[path = "copy_tests.rs"]
@@ -41,6 +46,46 @@ fn is_orchestration_projection_update(update: &SessionUpdate) -> bool {
     )
 }
 
+/// Rebind only the canonical pointer block emitted by `CompactionMode`.
+///
+/// The referenced path or even a quoted hint can legitimately appear in the
+/// summary body. `build_compacted_history` appends the generated hint as the
+/// final suffix, so only that suffix is eligible for rebinding.
+fn rebind_compaction_hint(
+    items: &mut [ConversationItem],
+    mode: xai_chat_state::CompactionMode,
+    source_path: &Path,
+    target_path: &Path,
+) {
+    let source_path = source_path.to_string_lossy();
+    let target_path = target_path.to_string_lossy();
+    let (Some(source_hint), Some(target_hint)) = (
+        mode.transcript_hint(Some(source_path.as_ref())),
+        mode.transcript_hint(Some(target_path.as_ref())),
+    ) else {
+        return;
+    };
+    for item in items {
+        let ConversationItem::User(user) = item else {
+            continue;
+        };
+        if user.synthetic_reason != Some(SyntheticReason::CompactionMeta) {
+            continue;
+        }
+        for part in &mut user.content {
+            let ContentPart::Text { text } = part else {
+                continue;
+            };
+            if let Some(prefix) = text.strip_suffix(&source_hint) {
+                let mut rebound = String::with_capacity(prefix.len() + target_hint.len());
+                rebound.push_str(prefix);
+                rebound.push_str(&target_hint);
+                *text = rebound.into();
+            }
+        }
+    }
+}
+
 /// Updates written plus the `compaction_checkpoints/{uuid}.json` files the
 /// surviving records reference, collected in the same pass.
 #[derive(Default)]
@@ -54,6 +99,578 @@ struct CopiedUpdates {
 /// being buffered. Discarded lines consume no index in either pass, unlike
 /// torn lines, which classify as [`RewindStep::Other`] and end a user run.
 const MAX_UPDATE_LINE_BYTES: usize = 64 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_COPY_STAGE_AFTER_CONTAINER_CREATE: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+/// Locks and private publication state held for the complete copy.
+///
+/// The shared source lease prevents deletion/relocation while files are read.
+/// The exclusive target lease is retained while all target files are written
+/// under `.private/session-staging`; the finished directory is then published
+/// with an anchored no-replace rename. No incomplete fork is ever created in
+/// the public sessions namespace.
+struct CopyPublication {
+    _source_lock: SessionIdLock,
+    _target_lock: SessionIdLock,
+    root_dir: PathBuf,
+    root_anchor: AnchoredDirectory,
+    staging_anchor: AnchoredDirectory,
+    sessions_anchor: AnchoredDirectory,
+    stage_container_anchor: Option<AnchoredDirectory>,
+    stage_dir_anchor: Option<AnchoredDirectory>,
+    target_parent_name: OsString,
+    target_cwd: String,
+    stage_name: String,
+    target_name: String,
+    target_dir: PathBuf,
+    cleanup_armed: bool,
+}
+
+#[derive(Debug)]
+enum CopyPublicationFinalizeError {
+    NotCommitted(io::Error),
+    CommittedUnreachable(io::Error),
+    CommittedDurability(io::Error),
+}
+
+impl std::fmt::Display for CopyPublicationFinalizeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotCommitted(error) => {
+                write!(formatter, "fork publication not committed: {error}")
+            }
+            Self::CommittedUnreachable(error) => {
+                write!(
+                    formatter,
+                    "committed fork is not canonically reachable: {error}"
+                )
+            }
+            Self::CommittedDurability(error) => {
+                write!(
+                    formatter,
+                    "fork committed with durability acknowledgement failure: {error}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for CopyPublicationFinalizeError {}
+
+impl CopyPublication {
+    fn begin(
+        root_dir: &Path,
+        source_info: &Info,
+        target_info: &Info,
+        target_dir: PathBuf,
+    ) -> io::Result<Self> {
+        let source_id = source_info.id.to_string();
+        let target_id = target_info.id.to_string();
+        validate_session_path_component(&source_id)?;
+        validate_session_path_component(&target_id)?;
+        if source_id == target_id {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "fork target session id must differ from source session id",
+            ));
+        }
+
+        let (source_lock, target_lock) =
+            acquire_ordered_copy_locks_sync(root_dir, &source_id, &target_id)?;
+        crate::session::persistence::reclaim_abandoned_session_stages_in_root(
+            root_dir, &target_id,
+        )?;
+
+        let root_anchor = AnchoredDirectory::open_root(root_dir)?;
+        let sessions_anchor = open_or_create_child_dir(&root_anchor, OsStr::new("sessions"))?;
+        let sessions_root = root_dir.join("sessions");
+        let target_parent = target_dir
+            .parent()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "fork target has no parent directory",
+                )
+            })?
+            .to_path_buf();
+        if target_parent.parent() != Some(sessions_root.as_path()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "fork target parent is not a direct child of the sessions root",
+            ));
+        }
+        if persisted_session_id_present(&sessions_root, &target_id)? || target_dir.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("a session with id {target_id} already exists"),
+            ));
+        }
+
+        let target_parent_name = target_parent
+            .file_name()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "fork target parent has no directory name",
+                )
+            })?
+            .to_owned();
+        let expected_parent_name =
+            OsString::from(crate::util::grok_home::encode_cwd_dirname(&target_info.cwd));
+        if target_parent_name != expected_parent_name {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "fork target parent does not match the target cwd",
+            ));
+        }
+        let private_anchor = open_or_create_child_dir(&root_anchor, OsStr::new(".private"))?;
+        let staging_anchor =
+            open_or_create_child_dir(&private_anchor, OsStr::new("session-staging"))?;
+        private_anchor.ensure_owner_only()?;
+        staging_anchor.ensure_owner_only()?;
+        let stage_container_name =
+            crate::session::persistence::session_stage_container_name(&target_id);
+        let stage_name = stage_container_name.to_string_lossy().into_owned();
+        let stage_container_anchor = staging_anchor.create_child_dir(&stage_container_name)?;
+        if let Err(error) = stage_container_anchor.ensure_owner_only() {
+            let _ = stage_container_anchor.remove_self();
+            return Err(error);
+        }
+        #[cfg(test)]
+        if FAIL_COPY_STAGE_AFTER_CONTAINER_CREATE.with(|fail| fail.replace(false)) {
+            let error = io::Error::other("injected copy stage construction failure");
+            let _ = stage_container_anchor.remove_self();
+            return Err(error);
+        }
+        let stage_dir_anchor = match stage_container_anchor.create_child_dir(OsStr::new(&target_id))
+        {
+            Ok(directory) => {
+                if let Err(error) = directory.ensure_owner_only() {
+                    let _ = directory.remove_self();
+                    let _ = stage_container_anchor.remove_self();
+                    return Err(error);
+                }
+                directory
+            }
+            Err(error) => {
+                let _ = stage_container_anchor.remove_self();
+                return Err(error);
+            }
+        };
+        let stage_dir = root_dir
+            .join(".private/session-staging")
+            .join(&stage_name)
+            .join(&target_id);
+        let prepare_result = (|| {
+            let marker = stage_dir_anchor.create_child_file_new(OsStr::new(
+                crate::session::persistence::UNPUBLISHED_SESSION_MARKER,
+            ))?;
+            marker.sync_all()?;
+            stage_dir_anchor.sync()?;
+            stage_container_anchor.sync()
+        })();
+        if let Err(error) = prepare_result {
+            let _ = stage_dir_anchor.remove_marker(OsStr::new(
+                crate::session::persistence::UNPUBLISHED_SESSION_MARKER,
+            ));
+            if stage_dir_anchor.remove_self().is_ok() {
+                let _ = stage_container_anchor.remove_self();
+            }
+            return Err(error);
+        }
+        Ok(Self {
+            _source_lock: source_lock,
+            _target_lock: target_lock,
+            root_dir: root_dir.to_path_buf(),
+            root_anchor,
+            staging_anchor,
+            sessions_anchor,
+            stage_container_anchor: Some(stage_container_anchor),
+            stage_dir_anchor: Some(stage_dir_anchor),
+            target_parent_name,
+            target_cwd: target_info.cwd.clone(),
+            stage_name,
+            target_name: target_id,
+            target_dir: stage_dir,
+            cleanup_armed: true,
+        })
+    }
+
+    fn target_dir(&self) -> &Path {
+        &self.target_dir
+    }
+
+    fn publish(mut self) -> Result<(), CopyPublicationFinalizeError> {
+        self.publish_with(|| Ok(()), || {})
+    }
+
+    fn publish_with(
+        &mut self,
+        sync_after_commit: impl FnOnce() -> io::Result<()>,
+        after_rename: impl FnOnce(),
+    ) -> Result<(), CopyPublicationFinalizeError> {
+        let canonical_root = AnchoredDirectory::open_root(&self.root_dir)
+            .map_err(CopyPublicationFinalizeError::NotCommitted)?;
+        if !self
+            .root_anchor
+            .same_identity(&canonical_root)
+            .map_err(CopyPublicationFinalizeError::NotCommitted)?
+        {
+            return Err(CopyPublicationFinalizeError::NotCommitted(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fork root identity changed before publication",
+            )));
+        }
+        let canonical_sessions = canonical_root
+            .open_child_dir(OsStr::new("sessions"))
+            .map_err(CopyPublicationFinalizeError::NotCommitted)?;
+        if !self
+            .sessions_anchor
+            .same_identity(&canonical_sessions)
+            .map_err(CopyPublicationFinalizeError::NotCommitted)?
+        {
+            return Err(CopyPublicationFinalizeError::NotCommitted(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sessions root identity changed before fork publication",
+            )));
+        }
+        sync_tree(&self.target_dir).map_err(CopyPublicationFinalizeError::NotCommitted)?;
+        let marker = OsStr::new(crate::session::persistence::UNPUBLISHED_SESSION_MARKER);
+
+        let (published_parent_anchor, published_anchor, whole_parent_published) =
+            match canonical_sessions.open_child_dir(&self.target_parent_name) {
+                Ok(parent) => {
+                    crate::session::persistence::validate_existing_cwd_metadata(
+                        &parent,
+                        &self.target_parent_name,
+                        &self.target_cwd,
+                    )
+                    .map_err(CopyPublicationFinalizeError::NotCommitted)?;
+                    let stage_dir_anchor = self.stage_dir_anchor.as_ref().ok_or_else(|| {
+                        CopyPublicationFinalizeError::NotCommitted(io::Error::other(
+                            "fork stage anchor is unavailable",
+                        ))
+                    })?;
+                    stage_dir_anchor
+                        .remove_marker(marker)
+                        .map_err(CopyPublicationFinalizeError::NotCommitted)?;
+                    stage_dir_anchor
+                        .sync()
+                        .map_err(CopyPublicationFinalizeError::NotCommitted)?;
+                    let stage_dir_anchor = self.stage_dir_anchor.take().expect("checked above");
+                    let published = match stage_dir_anchor
+                        .try_rename_self_no_replace(&parent, OsStr::new(&self.target_name))
+                    {
+                        Ok(published) => published,
+                        Err(failure) => {
+                            self.stage_dir_anchor = Some(failure.source);
+                            return Err(CopyPublicationFinalizeError::NotCommitted(failure.error));
+                        }
+                    };
+                    (parent, published, false)
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    let container = self.stage_container_anchor.as_ref().ok_or_else(|| {
+                        CopyPublicationFinalizeError::NotCommitted(io::Error::other(
+                            "fork stage container anchor is unavailable",
+                        ))
+                    })?;
+                    crate::session::persistence::write_staged_cwd_metadata_if_needed(
+                        &container,
+                        &self.target_parent_name,
+                        &self.target_cwd,
+                    )
+                    .map_err(CopyPublicationFinalizeError::NotCommitted)?;
+                    let stage_dir_anchor = self.stage_dir_anchor.as_ref().ok_or_else(|| {
+                        CopyPublicationFinalizeError::NotCommitted(io::Error::other(
+                            "fork stage anchor is unavailable",
+                        ))
+                    })?;
+                    stage_dir_anchor
+                        .remove_marker(marker)
+                        .map_err(CopyPublicationFinalizeError::NotCommitted)?;
+                    stage_dir_anchor
+                        .sync()
+                        .map_err(CopyPublicationFinalizeError::NotCommitted)?;
+                    // Windows cannot rename an ancestor with its child handle open.
+                    let stage_dir_anchor = self.stage_dir_anchor.take().expect("checked above");
+                    drop(stage_dir_anchor);
+                    let container = self.stage_container_anchor.take().expect("checked above");
+                    match container
+                        .try_rename_self_no_replace(&canonical_sessions, &self.target_parent_name)
+                    {
+                        Ok(published_parent) => {
+                            let published = published_parent
+                                .open_child_dir(OsStr::new(&self.target_name))
+                                .map_err(CopyPublicationFinalizeError::CommittedUnreachable)?;
+                            (published_parent, published, true)
+                        }
+                        Err(failure) => {
+                            let container = failure.source;
+                            self.stage_container_anchor = Some(container);
+                            let child = self
+                                .stage_container_anchor
+                                .as_ref()
+                                .expect("restored above")
+                                .open_child_dir(OsStr::new(&self.target_name))
+                                .map_err(CopyPublicationFinalizeError::NotCommitted)?;
+                            self.stage_dir_anchor = Some(child);
+                            if failure.error.kind() != io::ErrorKind::AlreadyExists {
+                                return Err(CopyPublicationFinalizeError::NotCommitted(
+                                    failure.error,
+                                ));
+                            }
+                            let parent = canonical_sessions
+                                .open_child_dir(&self.target_parent_name)
+                                .map_err(CopyPublicationFinalizeError::NotCommitted)?;
+                            crate::session::persistence::validate_existing_cwd_metadata(
+                                &parent,
+                                &self.target_parent_name,
+                                &self.target_cwd,
+                            )
+                            .map_err(CopyPublicationFinalizeError::NotCommitted)?;
+                            let child = self.stage_dir_anchor.take().expect("restored above");
+                            let published = match child
+                                .try_rename_self_no_replace(&parent, OsStr::new(&self.target_name))
+                            {
+                                Ok(published) => published,
+                                Err(failure) => {
+                                    self.stage_dir_anchor = Some(failure.source);
+                                    return Err(CopyPublicationFinalizeError::NotCommitted(
+                                        failure.error,
+                                    ));
+                                }
+                            };
+                            (parent, published, false)
+                        }
+                    }
+                }
+                Err(error) => return Err(CopyPublicationFinalizeError::NotCommitted(error)),
+            };
+        after_rename();
+        // The no-replace rename publishes the fork. Never let a later sync
+        // failure re-arm Drop cleanup for a directory readers can observe.
+        self.cleanup_armed = false;
+        self.verify_canonical_publication(&published_parent_anchor, &published_anchor)
+            .map_err(CopyPublicationFinalizeError::CommittedUnreachable)?;
+        if !whole_parent_published {
+            if let Some(container) = self.stage_container_anchor.take() {
+                container
+                    .remove_tree_self()
+                    .map_err(CopyPublicationFinalizeError::CommittedDurability)?;
+            }
+        }
+        self.staging_anchor
+            .sync()
+            .map_err(CopyPublicationFinalizeError::CommittedDurability)?;
+        published_parent_anchor
+            .sync()
+            .map_err(CopyPublicationFinalizeError::CommittedDurability)?;
+        self.sessions_anchor
+            .sync()
+            .map_err(CopyPublicationFinalizeError::CommittedDurability)?;
+        self.verify_canonical_publication(&published_parent_anchor, &published_anchor)
+            .map_err(CopyPublicationFinalizeError::CommittedUnreachable)?;
+        sync_after_commit().map_err(CopyPublicationFinalizeError::CommittedDurability)
+    }
+
+    fn verify_canonical_publication(
+        &self,
+        published_parent_anchor: &AnchoredDirectory,
+        published_anchor: &AnchoredDirectory,
+    ) -> io::Result<()> {
+        let canonical_root = AnchoredDirectory::open_root(&self.root_dir).map_err(|error| {
+            io::Error::new(error.kind(), format!("open canonical root: {error}"))
+        })?;
+        if !self.root_anchor.same_identity(&canonical_root)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fork root identity changed after publication",
+            ));
+        }
+        let canonical_sessions = canonical_root
+            .open_child_dir(OsStr::new("sessions"))
+            .map_err(|error| {
+                io::Error::new(error.kind(), format!("open canonical sessions: {error}"))
+            })?;
+        if !self.sessions_anchor.same_identity(&canonical_sessions)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sessions root identity changed after fork publication",
+            ));
+        }
+        let current_parent = canonical_sessions
+            .open_child_dir(&self.target_parent_name)
+            .map_err(|error| {
+                io::Error::new(error.kind(), format!("open canonical parent: {error}"))
+            })?;
+        if !published_parent_anchor.same_identity(&current_parent)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fork target parent identity changed after publication",
+            ));
+        }
+        let reopened = current_parent
+            .open_child_dir(OsStr::new(&self.target_name))
+            .map_err(|error| {
+                io::Error::new(error.kind(), format!("open canonical fork: {error}"))
+            })?;
+        if !published_anchor.same_identity(&reopened)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "published fork identity does not match the committed stage",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CopyPublication {
+    fn drop(&mut self) {
+        if !self.cleanup_armed {
+            return;
+        }
+        // The container can also hold staged long-CWD metadata. Reclaim the
+        // entire retained tree rather than assuming it becomes empty after the
+        // session child is removed.
+        drop(self.stage_dir_anchor.take());
+        if let Some(container) = self.stage_container_anchor.take() {
+            if let Err(error) = container.remove_tree_self() {
+                tracing::warn!(
+                    stage = %self.stage_name,
+                    %error,
+                    "failed to reclaim private fork stage through retained handles"
+                );
+            }
+        }
+    }
+}
+
+fn reconcile_copy_publication(
+    target_id: &acp::SessionId,
+    result: CopySessionResult,
+    publication: Result<(), CopyPublicationFinalizeError>,
+) -> io::Result<CopySessionResult> {
+    match publication {
+        Ok(()) => Ok(result),
+        Err(CopyPublicationFinalizeError::NotCommitted(error)) => Err(error),
+        Err(CopyPublicationFinalizeError::CommittedUnreachable(error)) => Err(error),
+        Err(CopyPublicationFinalizeError::CommittedDurability(error)) => {
+            tracing::warn!(
+                session_id = %target_id,
+                %error,
+                "fork publication committed but durability acknowledgement failed"
+            );
+            Ok(result)
+        }
+    }
+}
+
+fn open_or_create_child_dir(
+    parent: &AnchoredDirectory,
+    name: &OsStr,
+) -> io::Result<AnchoredDirectory> {
+    match parent.create_child_dir(name) {
+        Ok(directory) => Ok(directory),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => parent.open_child_dir(name),
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_session_path_component(session_id: &str) -> io::Result<()> {
+    let path = Path::new(session_id);
+    let mut components = path.components();
+    let valid = matches!(components.next(), Some(std::path::Component::Normal(component)) if component == std::ffi::OsStr::new(session_id))
+        && components.next().is_none();
+    if !valid {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session id must be a single path component",
+        ));
+    }
+    Ok(())
+}
+
+fn require_real_directory(path: &Path) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("not a real directory: {}", path.display()),
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("directory is a reparse point: {}", path.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn persisted_session_id_present(sessions_root: &Path, session_id: &str) -> io::Result<bool> {
+    require_real_directory(sessions_root)?;
+    let cwd_entries = match std::fs::read_dir(sessions_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    for cwd_entry in cwd_entries {
+        let cwd_entry = cwd_entry?;
+        if !cwd_entry.file_type()?.is_dir() {
+            continue;
+        }
+        require_real_directory(&cwd_entry.path())?;
+        let candidate = cwd_entry.path().join(session_id);
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
+
+fn sync_tree(path: &Path) -> io::Result<()> {
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_dir() {
+            sync_tree(&entry.path())?;
+        } else if metadata.file_type().is_file() {
+            std::fs::File::open(entry.path())?.sync_all()?;
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unexpected non-file in fork target: {}",
+                    entry.path().display()
+                ),
+            ));
+        }
+    }
+    sync_directory(path)
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
 
 /// [`for_each_jsonl_line_capped`] with the production cap.
 fn for_each_jsonl_line<R: BufRead>(
@@ -288,8 +905,27 @@ impl JsonlStorageAdapter {
         target_info: &Info,
         options: CopySessionOptions,
     ) -> io::Result<CopySessionResult> {
-        let target_dir = self.session_dir(target_info);
-        std::fs::create_dir_all(&target_dir)?;
+        let public_target_dir = self.session_dir(target_info);
+        let publication = match &self.dir_mode {
+            SessionDirMode::FromRoot(root_dir) => Some(CopyPublication::begin(
+                root_dir,
+                source_info,
+                target_info,
+                public_target_dir.clone(),
+            )?),
+            // Explicit adapters address a caller-owned directory rather than a
+            // globally discoverable session identity. Preserve their existing
+            // direct-copy contract.
+            SessionDirMode::Explicit(_) => None,
+        };
+        let target_dir = publication
+            .as_ref()
+            .map(|publication| publication.target_dir().to_path_buf())
+            .unwrap_or_else(|| public_target_dir.clone());
+        if publication.is_none() {
+            std::fs::create_dir_all(&target_dir)?;
+        }
+        let target_adapter = JsonlStorageAdapter::with_explicit_session_dir(target_dir.clone());
 
         let source_summary = self.read_summary_sync(source_info)?;
         let chat_format_version = source_summary.chat_format_version;
@@ -308,8 +944,9 @@ impl JsonlStorageAdapter {
         }
 
         for target in [
-            self.workflows_dir(target_info),
-            self.goal_mode_state_file(target_info)
+            target_adapter.workflows_dir(target_info),
+            target_adapter
+                .goal_mode_state_file(target_info)
                 .parent()
                 .expect("goal state has a parent")
                 .to_path_buf(),
@@ -336,6 +973,44 @@ impl JsonlStorageAdapter {
             transform_conversation_cwd(&mut chat_to_copy, &source_info.cwd, &target_info.cwd);
         }
 
+        // Compaction summaries carry an absolute pointer to the source
+        // session's immutable segment archive. A fork copies that archive, so
+        // retarget the exact pointer to the child's final public location. Do
+        // this independently of the workspace CWD transform: source and target
+        // sessions commonly share a CWD, and the session archive lives under
+        // the storage root rather than inside that workspace.
+        if options.copy_compaction_segments {
+            let source_compaction_dir = self
+                .session_dir(source_info)
+                .join(xai_chat_state::compaction_transcript::COMPACTION_DIR);
+            let target_compaction_dir =
+                public_target_dir.join(xai_chat_state::compaction_transcript::COMPACTION_DIR);
+            rebind_compaction_hint(
+                &mut chat_to_copy,
+                xai_chat_state::CompactionMode::Segments(
+                    xai_chat_state::CompactionDetail::default(),
+                ),
+                &source_compaction_dir,
+                &target_compaction_dir,
+            );
+        }
+
+        // Transcript-mode summaries similarly point at the source session's
+        // updates.jsonl. Normal forks copy that transcript; bind the exact
+        // source file pointer to the child's public file. A fork-filter copy
+        // intentionally starts with an empty transcript, so it must not claim
+        // to preserve the parent's raw transcript.
+        if !options.fork_filter {
+            let source_updates = self.updates_file(source_info);
+            let target_updates = public_target_dir.join("updates.jsonl");
+            rebind_compaction_hint(
+                &mut chat_to_copy,
+                xai_chat_state::CompactionMode::Transcript,
+                &source_updates,
+                &target_updates,
+            );
+        }
+
         if options.strip_reasoning {
             chat_to_copy = xai_chat_state::compaction_utils::strip_reasoning_blocks(chat_to_copy);
         }
@@ -349,7 +1024,9 @@ impl JsonlStorageAdapter {
 
         // Release chat history before the (typically much larger) updates copy.
         {
-            let mut writer = BufWriter::new(std::fs::File::create(self.chat_file(target_info))?);
+            let mut writer = BufWriter::new(std::fs::File::create(
+                target_adapter.chat_file(target_info),
+            )?);
             for item in &chat_to_copy {
                 serde_json::to_writer(&mut writer, item).map_err(invalid_data)?;
                 writer.write_all(b"\n")?;
@@ -361,12 +1038,12 @@ impl JsonlStorageAdapter {
         // A fork_filter copy (subagent context bootstrap) starts the child with
         // an empty replay transcript, so the source updates are never read.
         let copied_updates = if options.fork_filter {
-            std::fs::write(self.updates_file(target_info), b"")?;
+            std::fs::write(target_adapter.updates_file(target_info), b"")?;
             CopiedUpdates::default()
         } else {
             copy_updates_streaming(
                 &self.updates_file(source_info),
-                &self.updates_file(target_info),
+                &target_adapter.updates_file(target_info),
                 &target_info.id,
                 options.target_prompt_index,
             )?
@@ -386,32 +1063,32 @@ impl JsonlStorageAdapter {
             },
         );
         let summary_bytes = serde_json::to_vec_pretty(&target_summary).map_err(invalid_data)?;
-        std::fs::write(self.summary_file(target_info), summary_bytes)?;
+        std::fs::write(target_adapter.summary_file(target_info), summary_bytes)?;
 
         let plan_copied = copy_sidecar_file(
             options.copy_plan_state,
             &self.plan_file(source_info),
-            &self.plan_file(target_info),
+            &target_adapter.plan_file(target_info),
         )?;
         let signals_copied = copy_sidecar_file(
             options.copy_signals,
             &self.signals_file(source_info),
-            &self.signals_file(target_info),
+            &target_adapter.signals_file(target_info),
         )?;
         let plan_mode_state_copied = copy_sidecar_file(
             options.copy_plan_mode_state,
             &self.plan_mode_state_file(source_info),
-            &self.plan_mode_state_file(target_info),
+            &target_adapter.plan_mode_state_file(target_info),
         )?;
         let tool_state_copied = copy_sidecar_file(
             options.copy_tool_state,
             &self.session_dir(source_info).join("tool_state.json"),
-            &self.session_dir(target_info).join("tool_state.json"),
+            &target_dir.join("tool_state.json"),
         )?;
         let announcement_state_copied = copy_sidecar_file(
             options.copy_announcement_state,
             &self.announcement_state_file(source_info),
-            &self.announcement_state_file(target_info),
+            &target_adapter.announcement_state_file(target_info),
         )?;
 
         // Copied verbatim: the archive is immutable, so no cwd rewrite.
@@ -421,9 +1098,8 @@ impl JsonlStorageAdapter {
                 .join(xai_chat_state::compaction_transcript::COMPACTION_DIR);
             let mut copied = 0usize;
             if src_dir.is_dir() {
-                let dst_dir = self
-                    .session_dir(target_info)
-                    .join(xai_chat_state::compaction_transcript::COMPACTION_DIR);
+                let dst_dir =
+                    target_dir.join(xai_chat_state::compaction_transcript::COMPACTION_DIR);
                 std::fs::create_dir_all(&dst_dir)?;
                 for entry in std::fs::read_dir(&src_dir)? {
                     let entry = entry?;
@@ -445,7 +1121,7 @@ impl JsonlStorageAdapter {
             &source_info.id,
         )?;
 
-        Ok(CopySessionResult {
+        let result = CopySessionResult {
             chat_messages_copied: num_chat_messages,
             updates_copied: num_messages,
             plan_state_copied: plan_copied,
@@ -455,7 +1131,13 @@ impl JsonlStorageAdapter {
             announcement_state_copied,
             compaction_segments_copied,
             compaction_checkpoints_copied,
-        })
+        };
+        match publication {
+            Some(publication) => {
+                reconcile_copy_publication(&target_info.id, result, publication.publish())
+            }
+            None => Ok(result),
+        }
     }
 }
 

@@ -300,7 +300,47 @@ pub(super) fn rename_no_replace(source: &Path, target: &Path) -> Result<()> {
     }
 }
 
-#[cfg(not(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")))]
+#[cfg(windows)]
+pub(super) fn rename_no_replace(source: &Path, target: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{MOVE_FILE_FLAGS, MoveFileExW};
+    use windows::core::PCWSTR;
+
+    fn wide(path: &Path) -> Result<Vec<u16>> {
+        let absolute = std::path::absolute(path).map_err(|e| io_error("resolve", path, e))?;
+        let mut value = absolute.as_os_str().encode_wide().collect::<Vec<_>>();
+        if value.contains(&0) {
+            return Err(RelocationError::Inconsistent("path contains NUL".into()));
+        }
+        value.push(0);
+        Ok(value)
+    }
+
+    let source_wide = wide(source)?;
+    let target_wide = wide(target)?;
+    // WRITE_THROUGH only. Deliberately omit REPLACE_EXISTING and COPY_ALLOWED:
+    // collisions and cross-volume moves must fail closed.
+    let result = unsafe {
+        MoveFileExW(
+            PCWSTR(source_wide.as_ptr()),
+            PCWSTR(target_wide.as_ptr()),
+            MOVE_FILE_FLAGS(8),
+        )
+    };
+    result.map_err(|error| {
+        let io_error_value = io::Error::from(error);
+        match io_error_value.raw_os_error() {
+            Some(80 | 183) => RelocationError::Collision(target.to_path_buf()),
+            _ => io_error("publish", target, io_error_value),
+        }
+    })
+}
+
+#[cfg(not(any(
+    all(target_os = "linux", target_env = "gnu"),
+    target_os = "macos",
+    windows
+)))]
 pub(super) fn rename_no_replace(_source: &Path, _target: &Path) -> Result<()> {
     Err(RelocationError::UnsupportedPublication)
 }
@@ -314,6 +354,65 @@ fn create_new_dir_durable(path: &Path) -> Result<()> {
         RelocationError::Inconsistent(format!("directory has no parent: {}", path.display()))
     })?;
     sync_dir(parent).map_err(|e| io_error("sync", parent, e))
+}
+
+#[cfg(all(
+    test,
+    any(
+        all(target_os = "linux", target_env = "gnu"),
+        target_os = "macos",
+        windows
+    )
+))]
+mod publication_tests {
+    use std::io::Write as _;
+
+    use super::*;
+
+    #[test]
+    fn no_replace_collision_preserves_source_and_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(source.join("payload"), b"source-bytes").unwrap();
+        fs::write(target.join("payload"), b"target-bytes").unwrap();
+
+        assert!(matches!(
+            rename_no_replace(&source, &target),
+            Err(RelocationError::Collision(path)) if path == target
+        ));
+        assert_eq!(fs::read(source.join("payload")).unwrap(), b"source-bytes");
+        assert_eq!(fs::read(target.join("payload")).unwrap(), b"target-bytes");
+    }
+
+    #[test]
+    fn no_replace_publish_keeps_open_child_writer_bound_to_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        fs::create_dir(&source).unwrap();
+        let event_path = source.join("events.jsonl");
+        let mut writer = fs::OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(&event_path)
+            .unwrap();
+        writer.write_all(b"before\n").unwrap();
+        writer.flush().unwrap();
+
+        rename_no_replace(&source, &target).unwrap();
+        writer.write_all(b"after\n").unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read_to_string(target.join("events.jsonl")).unwrap(),
+            "before\nafter\n"
+        );
+    }
 }
 
 pub(super) fn create_dir_durable(path: &Path) -> Result<()> {

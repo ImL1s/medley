@@ -29,6 +29,7 @@ fn test_actor_with_remote_sync(
         SessionPersistence {
             info,
             storage,
+            _published_session_lease: None,
             pending_notification: None,
             rx,
             remote_sync,
@@ -70,6 +71,7 @@ fn test_fresh_actor(
         SessionPersistence {
             info,
             storage,
+            _published_session_lease: None,
             pending_notification: None,
             rx,
             remote_sync: None,
@@ -197,6 +199,69 @@ async fn durable_prepare_failure_prevents_publication_arming() {
         .unwrap();
     actor.task.await.unwrap();
     assert!(!session_dir.exists());
+}
+
+#[tokio::test]
+async fn failed_fresh_lease_downgrade_keeps_actor_alive_and_exclusion_held() {
+    const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000145";
+    let root = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new(SESSION_ID),
+        cwd: "/test/fresh-lease-transition-failure".into(),
+    };
+    let published_session = root
+        .path()
+        .join("sessions")
+        .join(crate::util::grok_home::encode_cwd_dirname(&info.cwd))
+        .join(SESSION_ID);
+    let fresh_claim =
+        claim_fresh_session_sync(root.path(), SESSION_ID, published_session.clone()).unwrap();
+    let publication = fresh_claim.publication.clone();
+    let storage = Arc::new(JsonlStorageAdapter::with_session_path_binding(
+        publication.path_binding.clone(),
+    ));
+    storage
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let actor = test_fresh_actor(info.clone(), storage, fresh_claim);
+    let _failure = install_fresh_lease_transition_failure_test_hook(SESSION_ID);
+    let publication_gate = crate::session::SessionPublicationGate::pending();
+
+    PersistenceHandle::publish_fresh(&actor.handle.tx, publication_gate.clone())
+        .await
+        .unwrap();
+    publication.finalize().unwrap();
+    publication_gate.publish();
+
+    let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::FlushAndAck {
+            respond_to: barrier_tx,
+        })
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), barrier_rx)
+        .await
+        .expect("actor must continue after retaining the failed transition claim")
+        .expect("actor must acknowledge the post-publication barrier")
+        .unwrap();
+    assert!(
+        try_acquire_session_id_write_lock_sync(root.path(), SESSION_ID)
+            .unwrap()
+            .is_none(),
+        "the live actor must retain exclusive namespace protection after downgrade failure"
+    );
+
+    actor.stop().await;
+    assert!(published_session.is_dir());
+    assert!(
+        try_acquire_session_id_write_lock_sync(root.path(), SESSION_ID)
+            .unwrap()
+            .is_some(),
+        "stopping the actor must release its retained namespace claim"
+    );
 }
 
 #[test]

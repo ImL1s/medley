@@ -233,11 +233,9 @@ pub(crate) async fn fetch_lanes(
         .filter(|q| uuid::Uuid::try_parse(q).is_ok())
         && !local.iter().any(|s| s.info.id.0.as_ref() == id)
     {
-        let id = id.to_string();
-        if let Ok(Some(summary)) = tokio::task::spawn_blocking(move || {
-            crate::session::persistence::find_summary_by_session_id(&id)
-        })
-        .await
+        if let Ok(Some(session)) =
+            crate::session::persistence::acquire_published_session_read(id, None).await
+            && let Ok(summary) = session.read_summary()
         {
             local.push(summary);
         }

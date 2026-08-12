@@ -630,6 +630,20 @@ fn run_after_session_publication(
     });
 }
 
+/// Bind the workspace for a session that was already published when actor
+/// construction began. Fresh sessions use their `LocalSessionReservation`
+/// during the final publication commit instead, so a pending or aborted gate
+/// must never reach this fallback bind path.
+fn bind_loaded_session_if_published<E>(
+    publication_gate: &crate::session::SessionPublicationGate,
+    bind: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    if !publication_gate.is_published() {
+        return Ok(());
+    }
+    bind()
+}
+
 fn permission_manager_activation(
     publication_gate: crate::session::SessionPublicationGate,
 ) -> tokio::sync::oneshot::Receiver<bool> {
@@ -705,6 +719,7 @@ pub(crate) async fn spawn_session_actor(
     client_fs_capable: bool,
     gateway_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     publication_gate: crate::session::SessionPublicationGate,
+    project_trusted: bool,
     agent_definition: AgentDefinition,
     session_default_agent_profile: Option<String>,
     skills_config: SkillsConfig,
@@ -805,8 +820,6 @@ pub(crate) async fn spawn_session_actor(
             WebFetchConfig::Enabled { params } => params.allowed_domains(),
             WebFetchConfig::Disabled => vec![],
         };
-        let project_trusted =
-            crate::agent::folder_trust::project_scope_allowed(tool_context.cwd.as_path());
         let mut permission_config =
             xai_grok_workspace::permission::resolution::resolve_permission_config_with_fallback(
                 tool_context.cwd.as_path(),
@@ -819,14 +832,18 @@ pub(crate) async fn spawn_session_actor(
         if let Some(reason) = yolo_pin
             && !dropped_catchalls.is_empty()
         {
-            tracing::warn!(
-                reason,
-                dropped = dropped_catchalls.len(),
-                "CLI --allow catch-all ignored: always-approve disabled by managed policy"
-            );
-            if startup_hints.non_interactive {
-                eprintln!("grok: --allow catch-all ignored: {reason}");
-            }
+            let dropped = dropped_catchalls.len();
+            let non_interactive = startup_hints.non_interactive;
+            run_after_session_publication(publication_gate.clone(), move || {
+                tracing::warn!(
+                    reason,
+                    dropped,
+                    "CLI --allow catch-all ignored: always-approve disabled by managed policy"
+                );
+                if non_interactive {
+                    eprintln!("grok: --allow catch-all ignored: {reason}");
+                }
+            });
         }
         if !cli_permission_rules.is_empty() {
             match &mut permission_config {
@@ -1679,25 +1696,26 @@ pub(crate) async fn spawn_session_actor(
             Some(override_reg)
         } else {
             let cwd_path = std::path::Path::new(&session_info.cwd);
-            let project_trusted = crate::agent::folder_trust::resolve_and_record(
-                cwd_path,
-                remote_settings.as_ref(),
-                false,
-            );
             let git_root = xai_grok_workspace::session::git::find_git_root_from_path(cwd_path).ok();
             let (registry, errors) = crate::util::hooks::discover_hooks(
                 git_root.as_deref(),
                 &rebuild_spec.compat,
                 project_trusted,
             );
-            for e in &errors {
-                tracing::warn!(error = ?e, "hook loading error");
-            }
+            let warning_errors: Vec<String> = errors.iter().map(ToString::to_string).collect();
+            let hook_count = registry.len();
+            run_after_session_publication(publication_gate.clone(), move || {
+                for error in warning_errors {
+                    tracing::warn!(error, "hook loading error");
+                }
+                if hook_count != 0 {
+                    tracing::info!(hook_count, "loaded hooks");
+                }
+            });
             hook_discovery_errors = errors;
             if registry.is_empty() {
                 None
             } else {
-                tracing::info!(hook_count = registry.len(), "loaded hooks");
                 Some(Arc::new(registry))
             }
         };
@@ -2189,8 +2207,12 @@ pub(crate) async fn spawn_session_actor(
         hook_load_errors: std::cell::RefCell::new(_hook_load_errors),
         plugin_registry: std::cell::RefCell::new(plugin_registry.clone()),
         plugin_registry_handle,
+        // Fresh sessions write events through an already-open handle in the
+        // private staging tree. The directory publication rename preserves
+        // that handle (Windows opens share deletion by default), so there is
+        // no lossy pre-publication buffer and no public identity I/O.
         events: crate::session::events::EventTracker::new(
-            &crate::session::persistence::session_dir(&session_info),
+            &persistence.physical_session_dir(&session_info),
         ),
         observability_bridge: obs_bridge,
         current_turn_number: std::cell::Cell::new(0),
@@ -2441,15 +2463,15 @@ pub(crate) async fn spawn_session_actor(
     let (session_done_tx, session_done_rx) = tokio::sync::oneshot::channel::<()>();
     let workspace_toolset = session.agent.borrow().tool_bridge().toolset();
     let was_provisional = !publication_gate.is_published();
-    if !was_provisional
-        && let Err(error) = session.workspace_ops.bind_local_session(
+    if let Err(error) = bind_loaded_session_if_published(&publication_gate, || {
+        session.workspace_ops.bind_local_session(
             &session.session_info.id.0,
             session.tool_context.cwd.as_path().to_path_buf(),
             session.tool_context.hunk_tracker_handle.clone(),
             workspace_toolset.clone(),
             None,
         )
-    {
+    }) {
         tracing::warn!(error = %error, "failed to bind loaded local session toolset");
     }
     let gate = publication_gate;
@@ -2526,6 +2548,7 @@ pub(crate) async fn spawn_session_actor(
         SessionHandle {
             cmd_tx,
             persistence_tx: persistence.tx.clone(),
+            fresh_publication: persistence.fresh_publication(),
             current_prompt_id,
             pending_interactions,
             info: session_info,
@@ -2574,7 +2597,9 @@ pub(crate) async fn spawn_session_actor(
 
 #[cfg(test)]
 mod provisional_trace_privacy_tests {
-    use super::{run_after_session_publication, session_thread_name};
+    use super::{
+        bind_loaded_session_if_published, run_after_session_publication, session_thread_name,
+    };
 
     #[tokio::test]
     async fn provisional_side_effect_runs_only_after_publication() {
@@ -2622,15 +2647,6 @@ mod provisional_trace_privacy_tests {
             .await;
     }
 
-    #[test]
-    fn project_model_warning_is_routed_through_publication_gate() {
-        let source = include_str!("spawn.rs");
-        assert!(source.contains(concat!(
-            "run_after_session_publication(publication_gate.clone(), move || {\n",
-            "            crate::config::warn_inert_project_model_sections(permission_cwd.as_path());"
-        )));
-    }
-
     /// Provisional `/new` identity must not be attached to tracing spans or
     /// events while `spawn_session_actor` is still constructing the actor.
     /// That function returns before persistence publication is acknowledged,
@@ -2672,16 +2688,45 @@ mod provisional_trace_privacy_tests {
     }
 
     #[test]
-    fn workspace_bind_is_sequenced_after_publication_wait() {
-        let source = include_str!("spawn.rs");
-        let wait = source
-            .find("if !gate.wait_until_published().await")
-            .expect("publication wait");
-        let bind = source[wait..]
-            .find("session.workspace_ops.bind_local_session")
-            .map(|offset| wait + offset)
-            .expect("published workspace bind");
-        assert!(bind > wait);
+    fn loaded_workspace_bind_runs_only_for_an_already_published_session() {
+        let gate = crate::session::SessionPublicationGate::pending();
+        let calls = std::cell::Cell::new(0usize);
+
+        bind_loaded_session_if_published(&gate, || {
+            calls.set(calls.get() + 1);
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        assert_eq!(
+            calls.get(),
+            0,
+            "pending sessions bind through their reservation"
+        );
+
+        gate.publish();
+        bind_loaded_session_if_published(&gate, || {
+            calls.set(calls.get() + 1);
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        assert_eq!(
+            calls.get(),
+            1,
+            "a loaded published session binds exactly once"
+        );
+
+        let aborted = crate::session::SessionPublicationGate::pending();
+        aborted.abort();
+        bind_loaded_session_if_published(&aborted, || {
+            calls.set(calls.get() + 1);
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        assert_eq!(
+            calls.get(),
+            1,
+            "an aborted provisional session must never bind"
+        );
     }
 
     #[test]
@@ -2878,6 +2923,7 @@ pub(crate) async fn spawn_session_on_thread(
     client_fs_capable: bool,
     gateway_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     publication_gate: crate::session::SessionPublicationGate,
+    project_trusted: bool,
     agent_definition: AgentDefinition,
     session_default_agent_profile: Option<String>,
     skills_config: SkillsConfig,
@@ -3074,6 +3120,7 @@ pub(crate) async fn spawn_session_on_thread(
                     client_fs_capable,
                     gateway_enabled,
                     session_actor_publication_gate,
+                    project_trusted,
                     agent_definition,
                     session_default_agent_profile,
                     skills_config,

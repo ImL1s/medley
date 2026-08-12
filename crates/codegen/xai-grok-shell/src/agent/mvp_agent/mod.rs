@@ -296,6 +296,9 @@ pub(crate) struct SessionSpawnOptions<'a> {
     /// Pending only for `/new`; all externally visible actor startup and relay
     /// work waits until the final auth-sealed resident commit publishes it.
     pub publication_gate: Option<crate::session::SessionPublicationGate>,
+    /// Pure request-scoped verdict for auth-sealed `/new`; committed to the
+    /// process cache only by final resident publication.
+    pub folder_trust_snapshot: Option<folder_trust::FolderTrustSnapshot>,
     /// Relay state forwarding is also publication: create its receiver while
     /// the relay is provisional, but do not start forwarding until commit.
     pub deferred_relay_state_rx: Option<
@@ -346,6 +349,7 @@ pub(crate) struct PreparedNewSession {
     thread: Option<SessionThread>,
     permission_events_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PermissionEvent>>,
     publication_gate: crate::session::SessionPublicationGate,
+    folder_trust_snapshot: Option<folder_trust::FolderTrustSnapshot>,
     cleanup: Option<agent_ops::ProvisionalNewSessionCleanup>,
     auth_authority: NewSessionAuthAuthority,
     deferred_relay_state_rx:
@@ -546,6 +550,7 @@ pub(crate) fn chat_session_spawn_options<'a>(
         prepared_model_entry: None,
         new_session_auth_authority: None,
         publication_gate: None,
+        folder_trust_snapshot: None,
         deferred_relay_state_rx: None,
         upgrade_persistence_to_writeback: false,
         persisted_catalog_identity: None,

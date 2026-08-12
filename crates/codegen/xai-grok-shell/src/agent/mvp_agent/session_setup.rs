@@ -466,6 +466,7 @@ impl MvpAgent {
                     prepared_model_entry: None,
                     new_session_auth_authority: None,
                     publication_gate: None,
+                    folder_trust_snapshot: None,
                     deferred_relay_state_rx: None,
                     upgrade_persistence_to_writeback: false,
                     persisted_catalog_identity: summary.catalog_identity.clone().filter(

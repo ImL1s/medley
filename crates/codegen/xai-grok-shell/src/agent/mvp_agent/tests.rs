@@ -1745,6 +1745,7 @@ fn make_test_handle(
     crate::session::SessionHandle {
         cmd_tx,
         persistence_tx,
+        fresh_publication: None,
         current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
         pending_interactions: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),
@@ -8982,10 +8983,18 @@ fn cancel_does_not_forward_to_bridge_in_local_mode() {
 /// `test_cancel_ends_in_flight_turn_and_frees_slot` (grok-agent-sdk).
 #[test]
 fn cancel_never_overtakes_in_flight_prompt_intake() {
+    use crate::agent::config::{EndpointsConfig, ModelEntry};
     use crate::session::SessionCommand;
     use acp::Agent as _;
     run_local_for_bridge_test(|| async {
         let agent = build_minimal_agent_for_tests();
+        // Keep this mailbox-ordering regression independent from developer
+        // credentials and the remote-settings refresh path reached during
+        // prompt trace setup.
+        agent.cfg.borrow_mut().remote_settings = Some(Default::default());
+        let mut model = ModelEntry::fallback("test-model", &EndpointsConfig::default());
+        model.info.auth_scheme = xai_grok_sampler::AuthScheme::None;
+        agent.models_manager.insert_test_entry("test-model", model);
         let sid = acp::SessionId::new("sess-cancel-intake-race");
         let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
         agent.insert_resident(&sid, handle);
@@ -8997,14 +9006,55 @@ fn cancel_never_overtakes_in_flight_prompt_intake() {
             let mut intake_parked_tx = Some(intake_parked_tx);
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
-                    SessionCommand::GetCurrentPromptMode { .. } => {
+                    SessionCommand::GetCurrentPromptMode { responds_to } => {
                         if let Some(tx) = intake_parked_tx.take() {
                             let _ = tx.send(());
                             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                         }
+                        let _ = responds_to.send(Default::default());
                     }
-                    SessionCommand::Prompt { .. } => driver_order.borrow_mut().push("prompt"),
-                    SessionCommand::Cancel(..) => driver_order.borrow_mut().push("cancel"),
+                    SessionCommand::GetCurrentModel { responds_to } => {
+                        let _ = responds_to.send("test-model".to_owned());
+                    }
+                    SessionCommand::GetModelMetadata { responds_to } => {
+                        let _ = responds_to.send(Default::default());
+                    }
+                    SessionCommand::CopyFile { respond_to } => {
+                        let _ = respond_to.send(Err(anyhow::anyhow!(
+                            "session copy is unavailable in the fake actor"
+                        )));
+                    }
+                    SessionCommand::SetNextTraceTurn { .. } => {}
+                    SessionCommand::PersistGitHead { .. } => {}
+                    SessionCommand::TakeHarnessTraceTurns { respond_to } => {
+                        let _ = respond_to.send(Vec::new());
+                    }
+                    SessionCommand::TakeTurnMessages { respond_to } => {
+                        let _ = respond_to.send(None);
+                    }
+                    SessionCommand::TakeStreamingCapture { respond_to, .. } => {
+                        let _ = respond_to.send(None);
+                    }
+                    SessionCommand::Prompt { respond_to, .. } => {
+                        driver_order.borrow_mut().push("prompt");
+                        // Short-circuit the ACP turn-finalization path: this
+                        // regression is only about mailbox admission order,
+                        // and the minimal test agent has no subagent-event
+                        // backend to service the normal completed-turn query.
+                        let _ = respond_to.send(Ok(crate::session::commands::PromptTurnOk {
+                            stop_reason: acp::StopReason::Cancelled,
+                            total_tokens: 0,
+                            turn_snapshot: None,
+                            completion_kind:
+                                crate::session::commands::PromptCompletionKind::RemovedFromQueue,
+                            structured_output: None,
+                            usage: None,
+                            tool_overrides: None,
+                        }));
+                    }
+                    SessionCommand::Cancel(..) => {
+                        driver_order.borrow_mut().push("cancel");
+                    }
                     _ => {}
                 }
             }
@@ -9021,7 +9071,12 @@ fn cancel_never_overtakes_in_flight_prompt_intake() {
                 .cancel(acp::CancelNotification::new(sid.clone()))
                 .await;
         };
-        let _ = futures::join!(prompt_fut, cancel_fut);
+        let (prompt_result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            futures::join!(prompt_fut, cancel_fut)
+        })
+        .await
+        .expect("prompt/cancel ordering test must not hang");
+        prompt_result.expect("prompt completes after fake actor response");
         assert_eq!(
             order.borrow().as_slice(),
             ["prompt", "cancel"],

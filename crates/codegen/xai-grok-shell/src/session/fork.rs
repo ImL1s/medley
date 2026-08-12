@@ -61,6 +61,20 @@ fn generate_fork_session_id(_source_id: &str) -> String {
     uuid::Uuid::now_v7().to_string()
 }
 
+fn validate_fork_session_id(session_id: &str) -> io::Result<()> {
+    let path = std::path::Path::new(session_id);
+    let mut components = path.components();
+    let valid = matches!(components.next(), Some(std::path::Component::Normal(component)) if component == std::ffi::OsStr::new(session_id))
+        && components.next().is_none();
+    if !valid {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "newSessionId must be a single path component",
+        ));
+    }
+    Ok(())
+}
+
 /// Fork a saved session to a new working directory.
 pub async fn fork_session(
     request: ForkSessionRequest,
@@ -83,6 +97,7 @@ pub async fn fork_session(
         .new_session_id
         .clone()
         .unwrap_or_else(|| generate_fork_session_id(&request.source_session_id));
+    validate_fork_session_id(&new_session_id)?;
 
     let target_info = Info {
         id: acp::SessionId::new(new_session_id.clone()),
@@ -214,6 +229,14 @@ mod tests {
     }
 
     #[test]
+    fn caller_provided_fork_id_must_be_a_safe_path_component() {
+        assert!(validate_fork_session_id("../victim").is_err());
+        assert!(validate_fork_session_id("nested/victim").is_err());
+        assert!(validate_fork_session_id("custom-session-id").is_ok());
+        assert!(validate_fork_session_id("550e8400-e29b-41d4-a716-446655440000").is_ok());
+    }
+
+    #[test]
     fn fork_registration_remote_pull_preserves_inherited_model_identity_and_harness() {
         let info = Info {
             id: acp::SessionId::new("fork-target"),
@@ -260,7 +283,11 @@ mod tests {
             }),
         };
         let tmp = tempfile::TempDir::new().unwrap();
-        crate::remote::pull::hydrate::write_to_dir(tmp.path(), &remote).unwrap();
+        let fetched =
+            crate::remote::pull::FetchedSession::from_loaded_for_test("fork-target", remote)
+                .unwrap()
+                .unwrap();
+        crate::remote::pull::hydrate::write_to_dir(tmp.path(), &fetched).unwrap();
         let pulled: crate::session::persistence::Summary =
             serde_json::from_slice(&std::fs::read(tmp.path().join("summary.json")).unwrap())
                 .unwrap();
