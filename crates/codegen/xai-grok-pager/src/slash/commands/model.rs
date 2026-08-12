@@ -65,6 +65,12 @@ impl SlashCommand for ModelCommand {
         Some(build_model_items(ctx.models))
     }
 
+    fn initially_preferred_arg(&self, ctx: &AppCtx, item: &ArgItem) -> bool {
+        ctx.models
+            .current_model_id_str()
+            .is_some_and(|current| item.insert_text.trim_end() == current)
+    }
+
     fn run(&self, ctx: &mut CommandExecCtx, args: &str) -> CommandResult {
         let trimmed = args.trim();
         if trimmed.is_empty() {
