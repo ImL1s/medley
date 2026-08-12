@@ -833,8 +833,11 @@ jobs:
             agent::subscription_check:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             agent::update_chunk_merge:: -- --nocapture
+          # Auth-provider tests spawn credential-helper subprocesses. Keep them
+          # parallel, but bound libtest fan-out so host pressure cannot turn an
+          # unrelated helper's first mint into a resource-exhaustion flake.
           run_nonzero -p xai-grok-shell --lib \
-            auth:: -- --nocapture
+            auth:: -- --nocapture --test-threads=4
           # Codex fixtures previously changed GROK_AUTH_PATH process-wide.
           # Keep this broad filter on the default parallel harness: serial-only
           # execution masks cross-module auth-store contamination (#343).
