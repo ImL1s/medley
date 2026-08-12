@@ -1527,7 +1527,12 @@ pub(crate) async fn spawn_session_actor(
     let system_prompt = agent.system_prompt().to_string();
     let mut prompt_context = agent.prompt_context().clone();
     prompt_context.normalize_for_persistence();
-    save_prompt_context(&session_info, &prompt_context);
+    // A fresh session remains private until the final auth/catalog seal. Keep
+    // every eager artifact write in the same physical tree as summary.json;
+    // publishing that tree later rebinds subsequent persistence to the
+    // canonical session directory.
+    let physical_session_dir = persistence.physical_session_dir(&session_info);
+    save_prompt_context_in_dir(&physical_session_dir, &prompt_context);
     let is_subagent_spawn = startup_hints.is_subagent;
     install_system_prompt(
         &mut conversation,
@@ -1561,9 +1566,9 @@ pub(crate) async fn spawn_session_actor(
         }
     }
     if let Some(ConversationItem::System(sys)) = conversation.first() {
-        save_system_prompt(&session_info, &sys.content);
+        save_system_prompt_in_dir(&physical_session_dir, &sys.content);
     } else {
-        save_system_prompt(&session_info, &system_prompt);
+        save_system_prompt_in_dir(&physical_session_dir, &system_prompt);
     }
     let initial_prefix_carries_fallback_date = resumed_prefix_carries_fallback_date(
         agent
@@ -1572,7 +1577,7 @@ pub(crate) async fn spawn_session_actor(
             .surfaces_local_date(),
         &conversation,
     );
-    persist_chat_history_jsonl_sync(&session_info, &conversation);
+    persist_chat_history_jsonl_sync_in_dir(&session_info, &physical_session_dir, &conversation);
     chat_state_handle.replace_conversation(conversation);
     let feedback_client = feedback_proxy_url.map(|base_url| {
         let mut client =

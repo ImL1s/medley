@@ -324,6 +324,29 @@ jobs:
           shared-key: providers-test
           cache-targets: true
 
+      # #356: the unit fixtures prove private staging in-process, but only the
+      # production binary crosses config loading, auth-provider minting,
+      # session publication, and the first authenticated Responses request.
+      # Keep this exact ignored test in CI so a broad lib filter cannot report
+      # green while never executing the binary-level contract.
+      - name: Codex provider prompt publishes one complete session tree
+        env:
+          GROK_BINARY: ${{ github.workspace }}/target/debug/xai-grok-pager
+        run: |
+          set -o pipefail
+          cargo build --locked -p xai-grok-pager-bin
+          output="$(mktemp)"
+          cargo test --locked -p xai-grok-shell --test test_auth_provider_e2e \
+            codex_provider_prompt_publishes_one_complete_session_tree \
+            -- --ignored --nocapture 2>&1 | tee "$output"
+          status="${PIPESTATUS[0]}"
+          if [ "$status" -ne 0 ]; then rm -f "$output"; exit "$status"; fi
+          if grep -qE '^test result: ok\. 0 passed' "$output"; then
+            echo "::error::Codex publication E2E filter matched zero tests"
+            rm -f "$output"; exit 1
+          fi
+          rm -f "$output"
+
       - name: Sampler auth / wire tests
         run: |
           set -o pipefail

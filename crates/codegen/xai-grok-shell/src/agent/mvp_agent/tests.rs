@@ -6607,6 +6607,133 @@ fn new_session_profile_pin_reports_the_committed_resident_model() {
 
 #[test]
 #[serial_test::serial]
+fn new_session_publishes_one_complete_staged_tree() {
+    use acp::Agent as _;
+
+    run_local_for_bridge_test(|| async {
+        use crate::agent::config::{Config as AgentConfig, ConfigModelOverride};
+        use crate::auth::{AuthManager, GrokComConfig};
+        use xai_grok_test_support::EnvGuard;
+
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000156";
+        let grok_home = tempfile::tempdir().expect("isolated grok home");
+        let _home = EnvGuard::set("GROK_HOME", grok_home.path());
+        let _xai_key = EnvGuard::unset("XAI_API_KEY");
+        let _grok_code_key = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
+        let auth_root = tempfile::tempdir().expect("isolated auth root");
+        let mut cfg = AgentConfig::default();
+        cfg.models.default = Some("staged-publication-model".to_owned());
+        cfg.config_models.insert(
+            "staged-publication-model".to_owned(),
+            ConfigModelOverride {
+                model: Some("staged-publication-model".to_owned()),
+                base_url: Some("http://localhost".to_owned()),
+                auth_scheme: Some(xai_grok_sampler::AuthScheme::None),
+                agent_type: Some("grok-build".to_owned()),
+                ..Default::default()
+            },
+        );
+        let auth = std::sync::Arc::new(AuthManager::new(
+            &auth_root.path().join("auth"),
+            GrokComConfig::default(),
+        ));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let agent = MvpAgent::new(GatewaySender::new(tx), &cfg, auth, None).expect("agent");
+        agent
+            .initialize_request
+            .set(
+                acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_capabilities(
+                    acp::ClientCapabilities::new()
+                        .fs(acp::FileSystemCapabilities::new())
+                        .terminal(false),
+                ),
+            )
+            .expect("initialize once");
+        agent
+            .authenticate(acp::AuthenticateRequest::new(acp::AuthMethodId::new(
+                crate::agent::auth_method::LOCAL_NONE_METHOD_ID,
+            )))
+            .await
+            .expect("authenticate local fixture");
+
+        let cwd = tempfile::tempdir().expect("session cwd");
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            <MvpAgent as acp::Agent>::new_session(
+                &agent,
+                acp::NewSessionRequest::new(cwd.path().to_path_buf()).meta(
+                    serde_json::json!({ "sessionId": SESSION_ID })
+                        .as_object()
+                        .cloned(),
+                ),
+            ),
+        )
+        .await
+        .expect("new_session must not hang")
+        .expect("publish the complete staged session tree");
+        assert_eq!(response.session_id.0.as_ref(), SESSION_ID);
+
+        let cwd_string = cwd.path().to_string_lossy();
+        let published_session = grok_home
+            .path()
+            .join("sessions")
+            .join(crate::util::grok_home::encode_cwd_dirname(&cwd_string))
+            .join(SESSION_ID);
+        for artifact in [
+            "summary.json",
+            "prompt_context.json",
+            "system_prompt.txt",
+            "chat_history.jsonl",
+        ] {
+            assert!(
+                published_session.join(artifact).is_file(),
+                "published session is missing {artifact}"
+            );
+        }
+        assert!(
+            !published_session
+                .join(crate::session::persistence::UNPUBLISHED_SESSION_MARKER)
+                .exists(),
+            "the public session must not retain its staging marker"
+        );
+        serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(published_session.join("summary.json")).expect("read summary"),
+        )
+        .expect("published summary must be valid JSON");
+        serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(published_session.join("prompt_context.json"))
+                .expect("read prompt context"),
+        )
+        .expect("published prompt context must be valid JSON");
+        assert!(
+            !std::fs::read_to_string(published_session.join("system_prompt.txt"))
+                .expect("read system prompt")
+                .is_empty(),
+            "published system prompt must not be empty"
+        );
+        let history = std::fs::read_to_string(published_session.join("chat_history.jsonl"))
+            .expect("read chat history");
+        assert!(
+            !history.is_empty(),
+            "published chat history must not be empty"
+        );
+        for line in history.lines() {
+            serde_json::from_str::<serde_json::Value>(line)
+                .expect("each published chat-history line must be valid JSON");
+        }
+
+        let stage_container = grok_home.path().join(".private/session-staging").join(
+            crate::session::persistence::session_stage_container_name(SESSION_ID),
+        );
+        assert!(
+            !stage_container.exists(),
+            "the committed private stage container must be removed"
+        );
+    });
+}
+
+#[test]
+#[serial_test::serial]
 fn new_session_api_key_auth_rejects_ready_session_only_explicit_model() {
     use acp::Agent as _;
 
