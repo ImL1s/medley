@@ -907,9 +907,51 @@ fn classify_refresh_error(error: &TokenRequestError) -> Option<RefreshTokenFaile
 /// Convenience constructor that also installs the existing single-flight OIDC
 /// refresher used by proactive and bounded 401 recovery paths.
 pub fn manager(grok_home: &Path) -> Arc<AuthManager> {
+    #[cfg(test)]
+    let manager = TEST_MANAGER_AUTH_PATH.with(|override_path| {
+        override_path
+            .borrow()
+            .as_deref()
+            .map(AuthManager::new_openai_codex_for_test_path)
+            .map(Arc::new)
+            .unwrap_or_else(|| Arc::new(AuthManager::new_openai_codex(grok_home)))
+    });
+    #[cfg(not(test))]
     let manager = Arc::new(AuthManager::new_openai_codex(grok_home));
     manager.configure_refresher(None, None);
     manager
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_MANAGER_AUTH_PATH: std::cell::RefCell<Option<std::path::PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// Thread-local auth-path override for tests that exercise production model
+/// resolution. Unlike mutating `GROK_AUTH_PATH`, this cannot redirect unrelated
+/// parallel tests into the same credential file.
+#[cfg(test)]
+pub(crate) struct TestManagerAuthPathGuard(Option<std::path::PathBuf>);
+
+#[cfg(test)]
+impl TestManagerAuthPathGuard {
+    pub(crate) fn install(auth_json_path: &Path) -> Self {
+        let prior = TEST_MANAGER_AUTH_PATH
+            .with(|override_path| override_path.replace(Some(auth_json_path.to_owned())));
+        Self(prior)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestManagerAuthPathGuard {
+    fn drop(&mut self) {
+        let prior = self.0.take();
+        TEST_MANAGER_AUTH_PATH.with(|override_path| {
+            override_path.replace(prior);
+        });
+    }
 }
 
 #[cfg(test)]

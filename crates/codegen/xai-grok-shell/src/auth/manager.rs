@@ -602,6 +602,15 @@ impl AuthManager {
         let path = std::env::var("GROK_AUTH_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|_| grok_home.join("auth.json"));
+        Self::new_openai_codex_at_path(path)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_openai_codex_for_test_path(auth_json_path: &Path) -> Self {
+        Self::new_openai_codex_at_path(auth_json_path.to_owned())
+    }
+
+    fn new_openai_codex_at_path(path: PathBuf) -> Self {
         let scope = crate::auth::openai_codex::AUTH_SCOPE.to_owned();
         let (auth, disk_state) = match read_auth_json_owner_only(&path) {
             Ok(map) => {
