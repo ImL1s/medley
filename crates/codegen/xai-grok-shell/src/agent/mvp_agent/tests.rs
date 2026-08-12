@@ -6960,9 +6960,11 @@ fn new_session_auth_flip_before_resident_commit_leaves_no_session_state() {
             .await
             .expect("remote persistence probe");
         let tmp = tempfile::tempdir().expect("auth flip fixture");
-        let mut cfg = AgentConfig::default();
-        cfg.mode = crate::agent::config::AgentMode::Tui;
-        cfg.storage_mode = StorageMode::Writeback;
+        let mut cfg = AgentConfig {
+            mode: crate::agent::config::AgentMode::Tui,
+            storage_mode: StorageMode::Writeback,
+            ..Default::default()
+        };
         cfg.endpoints.cli_chat_proxy_base_url = Some(registry_server.url());
         cfg.remote_settings = Some(crate::util::config::RemoteSettings {
             session_registry_enabled: Some(true),
@@ -6993,8 +6995,10 @@ fn new_session_auth_flip_before_resident_commit_leaves_no_session_state() {
         });
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut agent = MvpAgent::new(GatewaySender::new(tx), &cfg, auth, None).expect("agent");
-        let mut memory = crate::config::MemoryConfig::default();
-        memory.enabled = true;
+        let memory = crate::config::MemoryConfig {
+            enabled: true,
+            ..Default::default()
+        };
         agent.set_memory_config(memory);
         agent.start_subagent_coordinator();
         agent
@@ -7113,9 +7117,11 @@ fn cancelling_new_session_during_actor_init_leaves_no_session_state() {
         let _grok_code_key = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
         let _relay_sync = EnvGuard::set("GROK_RELAY_SYNC_ENABLED", "true");
         let tmp = tempfile::tempdir().expect("cancelled spawn fixture");
-        let mut cfg = AgentConfig::default();
-        cfg.mode = crate::agent::config::AgentMode::Tui;
-        cfg.storage_mode = StorageMode::Writeback;
+        let mut cfg = AgentConfig {
+            mode: crate::agent::config::AgentMode::Tui,
+            storage_mode: StorageMode::Writeback,
+            ..Default::default()
+        };
         cfg.grok_com_config.grok_ws_url = "ws://127.0.0.1:9".to_owned();
         cfg.models.default = Some("session-only-default".to_owned());
         cfg.config_models.insert(
@@ -7140,8 +7146,10 @@ fn cancelling_new_session_during_actor_init_leaves_no_session_state() {
         });
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut agent = MvpAgent::new(GatewaySender::new(tx), &cfg, auth, None).expect("agent");
-        let mut memory = crate::config::MemoryConfig::default();
-        memory.enabled = true;
+        let memory = crate::config::MemoryConfig {
+            enabled: true,
+            ..Default::default()
+        };
         agent.set_memory_config(memory);
         agent.start_subagent_coordinator();
         agent
@@ -7271,9 +7279,11 @@ fn cancelling_after_actor_init_before_publish_ack_cleans_state_and_allows_retry(
         let memory_root = tmp.path().join("memory-root");
         let gc_sentinel = memory_root.join("tmp-provisional-gc-sentinel");
         std::fs::create_dir_all(&gc_sentinel).expect("create memory GC sentinel");
-        let mut cfg = AgentConfig::default();
-        cfg.mode = crate::agent::config::AgentMode::Tui;
-        cfg.storage_mode = StorageMode::Writeback;
+        let mut cfg = AgentConfig {
+            mode: crate::agent::config::AgentMode::Tui,
+            storage_mode: StorageMode::Writeback,
+            ..Default::default()
+        };
         cfg.endpoints.cli_chat_proxy_base_url = Some(registry_server.url());
         cfg.remote_settings = Some(crate::util::config::RemoteSettings {
             session_registry_enabled: Some(true),
@@ -7303,8 +7313,10 @@ fn cancelling_after_actor_init_before_publish_ack_cleans_state_and_allows_retry(
         });
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut agent = MvpAgent::new(GatewaySender::new(tx), &cfg, auth, None).expect("agent");
-        let mut memory = crate::config::MemoryConfig::default();
-        memory.enabled = true;
+        let mut memory = crate::config::MemoryConfig {
+            enabled: true,
+            ..Default::default()
+        };
         memory.watcher.enabled = true;
         memory.root_dir_override = Some(memory_root.clone());
         agent.set_memory_config(memory);
@@ -7555,9 +7567,11 @@ fn new_session_actor_spawn_failure_cleans_provisional_state_and_allows_same_id_r
             .await
             .expect("remote persistence probe");
         let tmp = tempfile::tempdir().expect("spawn failure fixture");
-        let mut cfg = AgentConfig::default();
-        cfg.mode = crate::agent::config::AgentMode::Tui;
-        cfg.storage_mode = StorageMode::Writeback;
+        let mut cfg = AgentConfig {
+            mode: crate::agent::config::AgentMode::Tui,
+            storage_mode: StorageMode::Writeback,
+            ..Default::default()
+        };
         cfg.endpoints.cli_chat_proxy_base_url = Some(registry_server.url());
         cfg.remote_settings = Some(crate::util::config::RemoteSettings {
             session_registry_enabled: Some(true),

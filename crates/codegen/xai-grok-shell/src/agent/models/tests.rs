@@ -4509,8 +4509,10 @@ fn invalid_env_probe_preserves_explicit_and_user_picked_grok() {
         .build()
     };
 
-    let mut cli = config::Config::default();
-    cli.default_model_override = Some("grok-4.5".to_string());
+    let cli = config::Config {
+        default_model_override: Some("grok-4.5".to_string()),
+        ..Default::default()
+    };
     let cli_mgr = manager(cli);
     cli_mgr.apply_first_party_env_api_key_probe_result(false);
     assert_eq!(cli_mgr.current_model_id().0.as_ref(), "grok-4.5");
@@ -4536,8 +4538,10 @@ fn invalid_env_probe_preserves_explicit_and_user_picked_grok() {
         "a genuine user config preference remains authoritative after a failed env probe"
     );
 
-    let mut missing = config::Config::default();
-    missing.default_model_override = Some("missing-explicit-model".to_string());
+    let missing = config::Config {
+        default_model_override: Some("missing-explicit-model".to_string()),
+        ..Default::default()
+    };
     let missing_mgr = manager(missing);
     missing_mgr.apply_first_party_env_api_key_probe_result(false);
     assert_eq!(

@@ -246,6 +246,20 @@ impl SessionMemory {
     }
 }
 
+/// Snapshot of memory telemetry counters for session-end logging.
+pub(crate) struct MemoryTelemetry {
+    pub flush_count: u64,
+    pub flush_success_count: u64,
+    pub flush_error_count: u64,
+    pub tool_search_count: u64,
+    pub injection_count: u64,
+    pub compaction_recovery_count: u64,
+    pub chunks_added: u64,
+    pub dream_count: u64,
+    pub dream_success_count: u64,
+    pub dream_error_count: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,18 +313,4 @@ mod tests {
         assert_eq!(active.global_dir(), global_dir);
         assert_eq!(active.workspace_dir(), workspace_dir);
     }
-}
-
-/// Snapshot of memory telemetry counters for session-end logging.
-pub(crate) struct MemoryTelemetry {
-    pub flush_count: u64,
-    pub flush_success_count: u64,
-    pub flush_error_count: u64,
-    pub tool_search_count: u64,
-    pub injection_count: u64,
-    pub compaction_recovery_count: u64,
-    pub chunks_added: u64,
-    pub dream_count: u64,
-    pub dream_success_count: u64,
-    pub dream_error_count: u64,
 }

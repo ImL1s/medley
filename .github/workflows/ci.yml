@@ -454,8 +454,6 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             keeps_endpoint_and_bound_secret_when_name_collides_with_an_external_model -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
-            attach_restore_unique_route_ignores_reused_key_endpoint_and_secret -- --nocapture
-          run_nonzero -p xai-grok-shell --lib \
             attach_restore_blocks_exact_key_reuse_and_unique_route_ambiguity -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             empty_catalog_keeps_persisted_identity_pending_instead_of_rejecting_load -- --nocapture

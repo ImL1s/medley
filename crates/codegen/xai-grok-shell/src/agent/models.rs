@@ -1438,9 +1438,9 @@ impl ModelsManager {
     #[cfg(test)]
     fn presentation_snapshot_with_after_catalog_snapshot(
         &self,
-        mut after_catalog_snapshot: impl FnMut(),
+        after_catalog_snapshot: impl FnMut(),
     ) -> ModelPresentationSnapshot {
-        self.presentation_snapshot_inner(|| after_catalog_snapshot())
+        self.presentation_snapshot_inner(after_catalog_snapshot)
     }
 
     pub(crate) fn task_model_error(&self, requested: &str) -> Option<String> {
