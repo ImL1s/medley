@@ -554,6 +554,21 @@ jobs:
             session::git:: -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
             workspace_ops:: -- --nocapture
+          # Session publication is intentionally side-effect free until the
+          # final gate opens. Keep every deferred subsystem on the hot-path
+          # lane so a renamed filter cannot silently drop this contract.
+          run_nonzero -p xai-grok-memory --lib \
+            deferred_watcher_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            deferred_relay_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            dropping_pending_relay_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            notification_bridge_ -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            acknowledged_removal_queued_before_abort_ -- --nocapture
+          run_nonzero -p xai-hunk-tracker --lib \
+            gated_spawn_cancelled_before_readiness_ -- --nocapture
           # `xai-fast-worktree` has no default features and its `db` module is
           # gated on `metadata`, so without this the filter compiles a crate
           # that contains none of the tests it names.
