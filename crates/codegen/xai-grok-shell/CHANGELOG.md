@@ -4,6 +4,11 @@
 
 ## Features
 
+- Codex model catalogs can now expose the distinct `ultra` client/session tier
+  through model selection, TUI and ACP menus, and persisted sessions. Only
+  models that advertise the tier can select it. Responses requests encode it
+  as `max`; authenticated Codex sessions also receive proactive multi-agent
+  guidance, while the model still decides whether a task warrants a subagent.
 - Dashboard rows now show a short summary of what the agent did in the previous turn.
 - The Extensions modal now shows items grouped and sorted alphabetically with collapsible sections for Skills.
 - When a subagent runs in the background the parent agent is now reminded to keep working on the original task.
@@ -18,6 +23,18 @@
 
 ## Bug Fixes
 
+- Provider credentials rejected by the identity provider are now removed with
+  an atomic, durable scoped-store update instead of a truncate fallback, while
+  preserving credentials for sibling providers.
+- New sessions now publish their summary, prompt context, system prompt, and
+  initial chat history as one complete tree instead of colliding with their own
+  eager artifact writes.
+- Per-session publication and mutation locks now live in an owner-only,
+  path-anchored namespace that rejects link indirection. Stop every older
+  Medley process before upgrading so old and new lock protocols never overlap.
+- Third-party web-search endpoints no longer receive xAI identity, compaction,
+  or tracing metadata; trusted xAI and Codex transports retain the headers they
+  require.
 - MCP tools that return images no longer drop or corrupt screenshots when output is large.
 - Resuming a restored child session after a remote parent restore no longer fails with 404.
 - The default branch is now correctly detected for hand-initialized repos that lack origin/HEAD.
@@ -2017,5 +2034,3 @@
 ## Performance
 
 - **Large chat sessions** now use substantially less memory and run faster during forks, rewinds, and compaction.
-
-
