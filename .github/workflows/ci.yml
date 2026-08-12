@@ -196,6 +196,7 @@ jobs:
           Run-Nonzero @('-p', 'xai-grok-shell-base', '--lib', 'windows_child_creation_and_no_replace_are_handle_relative', '--', '--nocapture')
           Run-Nonzero @('-p', 'xai-grok-shell-base', '--lib', 'windows_retained_tree_removal_does_not_follow_junctions', '--', '--nocapture')
           Run-Nonzero @('-p', 'xai-grok-shell-base', '--lib', 'windows_open_root_and_child_reject_reparse_points', '--', '--nocapture')
+          Run-Nonzero @('-p', 'xai-grok-shell-base', '--lib', 'windows_owner_only_lock_file_', '--', '--nocapture')
           Run-Nonzero @('-p', 'xai-grok-shell-base', '--lib', 'failed_retained_rename_returns_the_live_source_anchor', '--', '--nocapture')
           Run-Nonzero @('-p', 'xai-grok-shell', '--lib', 'codex_windows_last_scope_clear_replaces_with_empty_store', '--', '--nocapture')
           Run-Nonzero @('-p', 'xai-grok-shell', '--lib', 'fresh_claim_does_not_follow_staging_junctions', '--', '--nocapture')

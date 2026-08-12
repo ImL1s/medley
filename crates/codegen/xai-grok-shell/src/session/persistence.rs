@@ -4027,24 +4027,27 @@ impl Drop for PublishedSessionWrite {
     }
 }
 
-fn open_named_session_lock_file(root_dir: &Path, name: String) -> io::Result<std::fs::File> {
-    let lock_dir = root_dir.join(".locks").join("session-ids");
-    std::fs::create_dir_all(&lock_dir)?;
-    std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(lock_dir.join(name))
+fn open_session_id_lock_directory(root_dir: &Path) -> io::Result<AnchoredDirectory> {
+    let root = AnchoredDirectory::open_root(root_dir)?;
+    let locks = open_or_create_anchored_child(&root, OsStr::new(".locks"))?;
+    locks.ensure_owner_only()?;
+    let session_ids = open_or_create_anchored_child(&locks, OsStr::new("session-ids"))?;
+    session_ids.ensure_owner_only()?;
+    Ok(session_ids)
 }
 
 fn open_session_id_lock_files(
     root_dir: &Path,
     session_id: &str,
 ) -> io::Result<(std::fs::File, std::fs::File)> {
+    let lock_dir = open_session_id_lock_directory(root_dir)?;
     Ok((
-        open_named_session_lock_file(root_dir, session_claim_lock_name(session_id))?,
-        open_named_session_lock_file(root_dir, session_mutation_lock_name(session_id))?,
+        lock_dir.open_or_create_owner_only_child_file(OsStr::new(&session_claim_lock_name(
+            session_id,
+        )))?,
+        lock_dir.open_or_create_owner_only_child_file(OsStr::new(&session_mutation_lock_name(
+            session_id,
+        )))?,
     ))
 }
 
@@ -8837,6 +8840,54 @@ mod fresh_session_claim_tests {
             "a sessions/.locks split-brain lock would not exclude fresh creators"
         );
         drop(writer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_id_lock_namespace_is_owner_only_and_rejects_link_indirection() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000152";
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let locks = root.path().join(".locks");
+        let session_ids = locks.join("session-ids");
+        std::fs::create_dir(&locks).expect("legacy lock directory");
+        std::fs::set_permissions(&locks, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (namespace, mutation) =
+            open_session_id_lock_files(root.path(), SESSION_ID).expect("secure session lock files");
+        assert_eq!(
+            std::fs::metadata(&locks).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&session_ids)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            namespace.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            mutation.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop((namespace, mutation));
+
+        let linked_root = tempfile::tempdir().expect("linked grok home");
+        let outside = tempfile::tempdir().expect("outside lock target");
+        std::fs::write(outside.path().join("sentinel"), b"preserve").unwrap();
+        symlink(outside.path(), linked_root.path().join(".locks")).unwrap();
+        assert!(open_session_id_lock_files(linked_root.path(), SESSION_ID).is_err());
+        assert_eq!(
+            std::fs::read(outside.path().join("sentinel")).unwrap(),
+            b"preserve"
+        );
+        assert!(!outside.path().join("session-ids").exists());
     }
 
     #[test]

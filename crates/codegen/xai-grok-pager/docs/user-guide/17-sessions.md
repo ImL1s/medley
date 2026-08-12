@@ -38,6 +38,13 @@ Grok stores each session in its own directory, grouped by working directory. It 
 
 `summary.json` is the index entry. It records the session summary and generated title, the model ID, the creation and update timestamps, the message counts, and a parent session reference for forked or restored sessions. `updates.jsonl` is the authoritative conversation log that drives `/resume` and session restore.
 
+> **Upgrading Medley:** exit every running Medley process before replacing the
+> executable, then start the new version. Older builds do not participate in
+> the hardened per-session lock namespace, so an old and new process must not
+> write the same session tree during an upgrade. This one-time drain is
+> especially important when upgrading from a build older than
+> `v0.2.121+providers.1`.
+
 ---
 
 ## Starting and Ending Sessions

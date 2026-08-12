@@ -70,6 +70,18 @@ impl AnchoredDirectory {
         platform::open_child_file(&self.file, name)
     }
 
+    /// Open or create an owner-only direct child regular file for locking.
+    ///
+    /// The returned file is read-write, is opened relative to this retained
+    /// directory without following links or reparse points, and is validated
+    /// as owned by the current user. Unix additionally requires exactly one
+    /// hard link. On Windows, the held handle does not share delete access so
+    /// its directory entry cannot be replaced while an advisory lock is active.
+    pub fn open_or_create_owner_only_child_file(&self, name: &OsStr) -> io::Result<File> {
+        validate_child_name(name)?;
+        platform::open_or_create_owner_only_child_file(&self.file, name)
+    }
+
     /// Remove a named empty direct child directory without following links.
     pub fn remove_empty_child_dir(&self, name: &OsStr) -> io::Result<()> {
         validate_child_name(name)?;
@@ -341,6 +353,50 @@ mod platform {
             let _ = unlink(parent, name, 0);
             return Err(error);
         }
+        Ok(file)
+    }
+
+    fn validate_owner_only_lock_file(file: &File) -> io::Result<()> {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let metadata = file.metadata()?;
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "anchored lock file is not owned by the current user",
+            ));
+        }
+        if metadata.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "anchored lock file must have exactly one hard link",
+            ));
+        }
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(0o600);
+            file.set_permissions(permissions)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn open_or_create_owner_only_child_file(
+        parent: &File,
+        name: &OsStr,
+    ) -> io::Result<File> {
+        let file = match open_regular_file_at(
+            parent.as_raw_fd(),
+            name,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        ) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                open_regular_file_at(parent.as_raw_fd(), name, libc::O_RDWR, 0)?
+            }
+            Err(error) => return Err(error),
+        };
+        validate_owner_only_lock_file(&file)?;
         Ok(file)
     }
 
@@ -700,12 +756,13 @@ mod platform {
         io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32)
     }
 
-    fn open_relative(
+    fn open_relative_with_share(
         parent: &File,
         name: &OsStr,
         disposition: u32,
         object_options: u32,
         desired_access: u32,
+        share_access: u32,
         security_descriptor: Option<*mut core::ffi::c_void>,
     ) -> io::Result<File> {
         let mut wide: Vec<u16> = name.encode_wide().collect();
@@ -740,7 +797,7 @@ mod platform {
                 &mut status_block,
                 std::ptr::null_mut(),
                 0,
-                (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0,
+                share_access,
                 disposition,
                 object_options | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT_NT,
                 std::ptr::null_mut(),
@@ -752,6 +809,25 @@ mod platform {
         } else {
             Ok(unsafe { File::from_raw_handle(handle.0) })
         }
+    }
+
+    fn open_relative(
+        parent: &File,
+        name: &OsStr,
+        disposition: u32,
+        object_options: u32,
+        desired_access: u32,
+        security_descriptor: Option<*mut core::ffi::c_void>,
+    ) -> io::Result<File> {
+        open_relative_with_share(
+            parent,
+            name,
+            disposition,
+            object_options,
+            desired_access,
+            (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0,
+            security_descriptor,
+        )
     }
 
     fn file_information(file: &File) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
@@ -866,6 +942,164 @@ mod platform {
         Ok(file)
     }
 
+    fn ensure_owner_only_regular_file(file: &File) -> io::Result<()> {
+        let security =
+            OwnerOnlySecurity::new_with_inheritance(windows::Win32::Security::ACE_FLAGS(0))?;
+        unsafe {
+            let mut owner = PSID::default();
+            let mut descriptor = PSECURITY_DESCRIPTOR::default();
+            let status = GetSecurityInfo(
+                HANDLE(file.as_raw_handle()),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                Some(&mut owner),
+                None,
+                None,
+                None,
+                Some(&mut descriptor),
+            );
+            if status.0 != 0 {
+                return Err(io::Error::from_raw_os_error(status.0 as i32));
+            }
+            struct LocalDescriptor(PSECURITY_DESCRIPTOR);
+            impl Drop for LocalDescriptor {
+                fn drop(&mut self) {
+                    unsafe {
+                        let _ = LocalFree(Some(HLOCAL(self.0.0)));
+                    }
+                }
+            }
+            let descriptor = LocalDescriptor(descriptor);
+            let owner_matches = EqualSid(owner, security.sid()).is_ok();
+            drop(descriptor);
+            if !owner_matches {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "anchored lock file is not owned by the current user",
+                ));
+            }
+            let status = SetSecurityInfo(
+                HANDLE(file.as_raw_handle()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(security.acl()),
+                None,
+            );
+            if status.0 == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(status.0 as i32))
+            }
+        }
+    }
+
+    pub(super) fn open_or_create_owner_only_child_file(
+        parent: &File,
+        name: &OsStr,
+    ) -> io::Result<File> {
+        let desired_access = (FILE_READ_DATA
+            | FILE_READ_ATTRIBUTES
+            | FILE_WRITE_DATA
+            | SYNCHRONIZE
+            | windows::Win32::Storage::FileSystem::READ_CONTROL
+            | windows::Win32::Storage::FileSystem::WRITE_DAC)
+            .0;
+        let share_access = (FILE_SHARE_READ | FILE_SHARE_WRITE).0;
+        let mut security =
+            OwnerOnlySecurity::new_with_inheritance(windows::Win32::Security::ACE_FLAGS(0))?;
+        let file = match open_relative_with_share(
+            parent,
+            name,
+            FILE_CREATE,
+            FILE_NON_DIRECTORY_FILE,
+            desired_access,
+            share_access,
+            Some((&mut security.descriptor as *mut SECURITY_DESCRIPTOR).cast()),
+        ) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => open_relative_with_share(
+                parent,
+                name,
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE,
+                desired_access,
+                share_access,
+                None,
+            )?,
+            Err(error) => return Err(error),
+        };
+        let file = reject_reparse_regular_file(file)?;
+        ensure_owner_only_regular_file(&file)?;
+        Ok(file)
+    }
+
+    #[cfg(test)]
+    pub(super) fn owner_only_lock_file_security_is_current_user_protected(
+        file: &File,
+    ) -> io::Result<bool> {
+        let current_user =
+            OwnerOnlySecurity::new_with_inheritance(windows::Win32::Security::ACE_FLAGS(0))?;
+        unsafe {
+            let mut owner = PSID::default();
+            let mut dacl = std::ptr::null_mut();
+            let mut raw_descriptor = PSECURITY_DESCRIPTOR::default();
+            let status = GetSecurityInfo(
+                HANDLE(file.as_raw_handle()),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                Some(&mut owner),
+                None,
+                Some(&mut dacl),
+                None,
+                Some(&mut raw_descriptor),
+            );
+            if status.0 != 0 {
+                return Err(io::Error::from_raw_os_error(status.0 as i32));
+            }
+            struct LocalDescriptor(PSECURITY_DESCRIPTOR);
+            impl Drop for LocalDescriptor {
+                fn drop(&mut self) {
+                    unsafe {
+                        let _ = LocalFree(Some(HLOCAL(self.0.0)));
+                    }
+                }
+            }
+            let _descriptor = LocalDescriptor(raw_descriptor);
+
+            let mut control = 0u16;
+            let mut revision = 0u32;
+            windows::Win32::Security::GetSecurityDescriptorControl(
+                raw_descriptor,
+                &mut control,
+                &mut revision,
+            )
+            .map_err(io::Error::other)?;
+            if control & SE_DACL_PROTECTED.0 == 0
+                || EqualSid(owner, current_user.sid()).is_err()
+                || dacl.is_null()
+                || (*dacl).AceCount != 1
+            {
+                return Ok(false);
+            }
+
+            let mut raw_ace = std::ptr::null_mut();
+            if windows::Win32::Security::GetAce(dacl, 0, &mut raw_ace).is_err() || raw_ace.is_null()
+            {
+                return Ok(false);
+            }
+            let ace = &*(raw_ace as *const windows::Win32::Security::ACCESS_ALLOWED_ACE);
+            let ace_sid = PSID(std::ptr::addr_of!(ace.SidStart).cast_mut().cast());
+            let full_control =
+                ace.Mask == FILE_ALL_ACCESS.0 || ace.Mask & FILE_ALL_ACCESS.0 == FILE_ALL_ACCESS.0;
+            Ok(ace.Header.AceType == 0
+                && ace.Header.AceFlags == 0
+                && full_control
+                && EqualSid(ace_sid, current_user.sid()).is_ok())
+        }
+    }
+
     pub(super) fn create_child_dir(parent: &File, name: &OsStr) -> io::Result<File> {
         let mut security = OwnerOnlySecurity::new()?;
         let file = open_relative(
@@ -900,6 +1134,12 @@ mod platform {
 
     impl OwnerOnlySecurity {
         fn new() -> io::Result<Self> {
+            Self::new_with_inheritance(CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE)
+        }
+
+        fn new_with_inheritance(
+            inheritance: windows::Win32::Security::ACE_FLAGS,
+        ) -> io::Result<Self> {
             unsafe {
                 let mut token = HANDLE::default();
                 OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
@@ -935,14 +1175,8 @@ mod platform {
                 let mut acl_storage = vec![0_usize; acl_len.div_ceil(size_of::<usize>())];
                 let acl = acl_storage.as_mut_ptr().cast::<ACL>();
                 InitializeAcl(acl, acl_len as u32, ACL_REVISION).map_err(io::Error::other)?;
-                AddAccessAllowedAceEx(
-                    acl,
-                    ACL_REVISION,
-                    CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
-                    FILE_ALL_ACCESS.0,
-                    sid,
-                )
-                .map_err(io::Error::other)?;
+                AddAccessAllowedAceEx(acl, ACL_REVISION, inheritance, FILE_ALL_ACCESS.0, sid)
+                    .map_err(io::Error::other)?;
                 let mut descriptor = SECURITY_DESCRIPTOR::default();
                 let descriptor_pointer = windows::Win32::Security::PSECURITY_DESCRIPTOR(
                     (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
@@ -1314,6 +1548,114 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn owner_only_lock_file_is_private_read_write_and_retained_parent_anchored() {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        let retained_path = temp.path().join("retained");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let root = AnchoredDirectory::open_root(&root_path).unwrap();
+
+        std::fs::rename(&root_path, &retained_path).unwrap();
+        std::fs::write(retained_path.join("session.lock"), b"").unwrap();
+        std::fs::set_permissions(
+            retained_path.join("session.lock"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        symlink(&outside, &root_path).unwrap();
+
+        let mut lock = root
+            .open_or_create_owner_only_child_file(OsStr::new("session.lock"))
+            .unwrap();
+        lock.write_all(b"lock").unwrap();
+        lock.seek(SeekFrom::Start(0)).unwrap();
+        let mut contents = Vec::new();
+        lock.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"lock");
+        let metadata = lock.metadata().unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        assert!(retained_path.join("session.lock").is_file());
+        assert!(!outside.join("session.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_only_lock_file_rejects_symlinks_and_hardlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::write(&outside, b"sentinel").unwrap();
+        let root = AnchoredDirectory::open_root(&root_path).unwrap();
+
+        symlink(&outside, root_path.join("symlink.lock")).unwrap();
+        assert!(
+            root.open_or_create_owner_only_child_file(OsStr::new("symlink.lock"))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"sentinel");
+
+        std::fs::hard_link(&outside, root_path.join("hardlink.lock")).unwrap();
+        assert!(
+            root.open_or_create_owner_only_child_file(OsStr::new("hardlink.lock"))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"sentinel");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "spawned by owner_only_lock_file_creation_ignores_permissive_umask"]
+    fn subprocess_owner_only_lock_file_under_umask_zero() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let Ok(root_path) = std::env::var("GROK_TEST_OWNER_ONLY_LOCK_ROOT") else {
+            return;
+        };
+        unsafe {
+            libc::umask(0);
+        }
+        let root = AnchoredDirectory::open_root(std::path::Path::new(&root_path)).unwrap();
+        let lock = root
+            .open_or_create_owner_only_child_file(OsStr::new("session.lock"))
+            .unwrap();
+        let metadata = lock.metadata().unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(metadata.nlink(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_only_lock_file_creation_ignores_permissive_umask() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        std::fs::create_dir(&root_path).unwrap();
+
+        #[allow(clippy::disallowed_methods)] // isolated native umask probe
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "--nocapture",
+                "util::anchored_directory::tests::subprocess_owner_only_lock_file_under_umask_zero",
+            ])
+            .env("GROK_TEST_OWNER_ONLY_LOCK_ROOT", &root_path)
+            .status()
+            .expect("spawn owner-only lock subprocess");
+        assert!(status.success(), "umask subprocess failed: {status}");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn anchored_rename_is_no_replace_and_preserves_both_trees_on_collision() {
         let temp = tempfile::tempdir().unwrap();
         let source_path = temp.path().join("source-parent");
@@ -1579,6 +1921,60 @@ mod tests {
         assert!(AnchoredDirectory::open_root(&junction).is_err());
         let root = AnchoredDirectory::open_root(&root_path).unwrap();
         assert!(root.open_child_dir(OsStr::new("junction")).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owner_only_lock_file_blocks_rename_and_delete_while_held() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        std::fs::create_dir(&root_path).unwrap();
+        let root = AnchoredDirectory::open_root(&root_path).unwrap();
+        let lock = root
+            .open_or_create_owner_only_child_file(OsStr::new("session.lock"))
+            .unwrap();
+
+        let lock_path = root_path.join("session.lock");
+        let renamed_path = root_path.join("renamed.lock");
+        assert!(std::fs::rename(&lock_path, &renamed_path).is_err());
+        assert!(std::fs::remove_file(&lock_path).is_err());
+        drop(lock);
+        std::fs::rename(&lock_path, &renamed_path).unwrap();
+        std::fs::remove_file(renamed_path).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owner_only_lock_file_rejects_reparse_leaf_and_has_protected_user_dacl() {
+        use std::os::windows::fs::symlink_file;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::write(&outside, b"sentinel").unwrap();
+        let root = AnchoredDirectory::open_root(&root_path).unwrap();
+        // Native file symlinks require Developer Mode or SeCreateSymbolicLink
+        // privilege on some Windows runners. Keep the DACL assertion below
+        // unconditional, and exercise the reparse-leaf rejection whenever the
+        // host can create the fixture rather than failing the whole lane for a
+        // missing test-host privilege.
+        if symlink_file(&outside, root_path.join("symlink.lock")).is_ok() {
+            assert!(
+                root.open_or_create_owner_only_child_file(OsStr::new("symlink.lock"))
+                    .is_err(),
+                "a reparse-point lock leaf must be rejected"
+            );
+            assert_eq!(std::fs::read(&outside).unwrap(), b"sentinel");
+        }
+
+        let lock = root
+            .open_or_create_owner_only_child_file(OsStr::new("session.lock"))
+            .unwrap();
+        assert!(
+            platform::owner_only_lock_file_security_is_current_user_protected(&lock).unwrap(),
+            "new lock leaf must have the current user as owner and sole ACE in a protected DACL"
+        );
     }
 
     #[cfg(windows)]
