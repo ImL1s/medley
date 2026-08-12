@@ -341,6 +341,7 @@
         let mut scrollback = ScrollbackState::new();
         apply_retry_state(
             &RetryState::Failed {
+    http_status: None,
                 error_type: DISK_FULL_ERROR_TYPE.into(),
                 message: DISK_FULL_USER_MESSAGE.into(),
             },
@@ -400,6 +401,7 @@
         });
         apply_retry_state(
             &RetryState::Failed {
+    http_status: None,
                 error_type: "api".into(),
                 message: "status 403: run out of credits".into(),
             },
@@ -429,6 +431,7 @@
         });
         apply_retry_state(
             &RetryState::Failed {
+    http_status: None,
                 error_type: "api".into(),
                 message:
                     "API error (status 402 Payment Required): Grok Build usage balance exhausted"
@@ -456,6 +459,7 @@
         });
         apply_retry_state(
             &RetryState::Failed {
+    http_status: None,
                 error_type: "api".into(),
                 message: "internal server error".into(),
             },
@@ -507,6 +511,7 @@
         let mut scrollback = ScrollbackState::new();
         apply_retry_state(
             &RetryState::Failed {
+    http_status: None,
                 error_type: "auth".into(),
                 message: "Unauthorized (401) from https://cli-chat-proxy.grok.com/v1/messages: \
                           no auth context"
@@ -539,6 +544,7 @@
         });
         apply_retry_state(
             &RetryState::Failed {
+    http_status: None,
                 error_type: "auth".into(),
                 message: "Unauthorized (401) from https://proxy/v1/messages".into(),
             },
@@ -559,6 +565,7 @@
         let mut scrollback = ScrollbackState::new();
         apply_retry_state(
             &RetryState::Failed {
+    http_status: None,
                 error_type: "api".into(),
                 message: "Unauthorized (401) from https://proxy/v1/responses: invalid credentials"
                     .into(),
@@ -579,6 +586,7 @@
         let mut scrollback = ScrollbackState::new();
         apply_retry_state(
             &RetryState::Failed {
+    http_status: None,
                 error_type: "legacy_auth".into(),
                 message: format!(
                     "Unauthorized (401) ... deprecated authentication method (WebLogin) ... \
@@ -602,6 +610,7 @@
         let mut scrollback = ScrollbackState::new();
         apply_retry_state(
             &RetryState::Failed {
+    http_status: None,
                 error_type: "api".into(),
                 message: r#"API error (status 500 Internal Server Error): {"error":"upstream exploded"}"#.into(),
             },
@@ -625,11 +634,41 @@
     }
 
     #[test]
+    fn apply_retry_state_typed_400_preserves_safe_detail() {
+        let mut session = make_session(Some("s1"));
+        let mut scrollback = ScrollbackState::new();
+        apply_retry_state(
+            &RetryState::Failed {
+                error_type: "api".into(),
+                http_status: Some(400),
+                message: "Provider request failed (HTTP 400). invalid field `reasoning.effort`"
+                    .into(),
+            },
+            &mut session,
+            &mut scrollback,
+            false,
+        );
+        match last_session_event(&scrollback) {
+            Some(SessionEvent::RequestFailed {
+                status,
+                headline,
+                detail,
+            }) => {
+                assert_eq!(status, Some(400));
+                assert_eq!(headline, "Bad request (400)");
+                assert_eq!(detail, "invalid field `reasoning.effort`");
+            }
+            other => panic!("expected typed RequestFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn apply_retry_state_403_shows_clean_denied_banner() {
         let mut session = make_session(Some("s1"));
         let mut scrollback = ScrollbackState::new();
         apply_retry_state(
             &RetryState::Failed {
+    http_status: None,
                 error_type: "api".into(),
                 message: "API error (status 403 Forbidden): Access to the chat endpoint is denied"
                     .into(),
@@ -660,6 +699,7 @@
         let mut scrollback = ScrollbackState::new();
         apply_retry_state(
             &RetryState::Failed {
+    http_status: None,
                 error_type: "context_length".into(),
                 message: "API error (status 500): the prompt is too long for this model's \
                           context window"
@@ -684,6 +724,7 @@
         let mut scrollback = ScrollbackState::new();
         apply_retry_state(
             &RetryState::Failed {
+    http_status: None,
                 error_type: "api".into(),
                 message: "API error (status 500): the prompt is too long for this model's \
                           context window"
@@ -713,6 +754,7 @@
         }));
         apply_retry_state(
             &RetryState::Failed {
+    http_status: None,
                 error_type: "context_length".into(),
                 message: "the prompt is too long for this model's context window".into(),
             },
@@ -1084,6 +1126,7 @@
         assert!(!session.model_incompatible);
         apply_retry_state(
             &RetryState::Failed {
+    http_status: None,
                 error_type: "encrypted_content_mismatch".into(),
                 message: "incompatible history".into(),
             },
@@ -1103,6 +1146,7 @@
 
         apply_retry_state(
             &RetryState::Failed {
+    http_status: None,
                 error_type: "api_400".into(),
                 message: "bad request".into(),
             },
@@ -1113,4 +1157,3 @@
             "non-encrypted_content error types must not set model_incompatible"
         );
     }
-

@@ -2146,6 +2146,7 @@ impl SessionPersistence {
             session_id: self.info.id.clone(),
             update: XaiSessionUpdate::RetryState(RetryState::Failed {
                 error_type: DISK_FULL_ERROR_TYPE.to_string(),
+                http_status: None,
                 message: DISK_FULL_USER_MESSAGE.to_string(),
             }),
             meta: None,

@@ -1887,6 +1887,7 @@ async fn an_unusable_route_reports_on_the_turn_path_and_stays_quiet_on_the_aux_p
                                 crate::extensions::notification::RetryState::Failed {
                                     error_type,
                                     message,
+                                    ..
                                 },
                             ) = &notif.update
                         {

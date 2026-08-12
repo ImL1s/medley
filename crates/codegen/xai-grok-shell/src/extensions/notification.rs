@@ -1188,6 +1188,10 @@ pub enum RetryState {
     Failed {
         /// Category of the error (e.g., "auth", "invalid_params", "server")
         error_type: String,
+        /// Parsed HTTP status when the failure originated from a provider
+        /// response. Older persisted notifications omit this field.
+        #[serde(default)]
+        http_status: Option<u16>,
         /// Human-readable error message
         message: String,
     },
@@ -1807,7 +1811,20 @@ mod tests {
         let update: SessionUpdate = serde_json::from_str(json).unwrap();
         assert!(matches!(
             update,
-            SessionUpdate::RetryState(RetryState::Failed { .. })
+            SessionUpdate::RetryState(RetryState::Failed {
+                http_status: None,
+                ..
+            })
+        ));
+
+        let json = r#"{"sessionUpdate":"retry_state","type":"failed","error_type":"api","http_status":400,"message":"bad request"}"#;
+        let update: SessionUpdate = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            update,
+            SessionUpdate::RetryState(RetryState::Failed {
+                http_status: Some(400),
+                ..
+            })
         ));
     }
 

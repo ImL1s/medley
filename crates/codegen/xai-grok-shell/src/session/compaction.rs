@@ -776,6 +776,7 @@ impl SessionActor {
         self.send_xai_notification(XaiSessionUpdate::RetryState(
             crate::extensions::notification::RetryState::Failed {
                 error_type: "auth".to_string(),
+                http_status: crate::sampling::error::http_status_from_error(&err),
                 message: message.clone(),
             },
         ))
@@ -2865,6 +2866,7 @@ mod inline_auto_compact_flow_tests {
                             crate::extensions::notification::RetryState::Failed {
                                 error_type,
                                 message,
+                                ..
                             },
                         ) = &notif.update
                     {
@@ -3024,6 +3026,7 @@ mod inline_auto_compact_flow_tests {
                                 crate::extensions::notification::RetryState::Failed {
                                     error_type,
                                     message,
+                                    ..
                                 },
                             ) => {
                                 assert_eq!(error_type, "auth");
@@ -3110,6 +3113,7 @@ mod inline_auto_compact_flow_tests {
                             crate::extensions::notification::RetryState::Failed {
                                 error_type,
                                 message,
+                                ..
                             },
                         ) = &notif.update
                     {

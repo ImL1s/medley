@@ -1421,6 +1421,7 @@ pub(super) fn apply_retry_state(
         }
         RetryState::Failed {
             error_type,
+            http_status,
             message,
         } => {
             session.set_retry_activity(None);
@@ -1453,7 +1454,7 @@ pub(super) fn apply_retry_state(
             } else {
                 scrollback.push_block(RenderBlock::session_event(
                     crate::app::error_display::format_request_failure(
-                        None,
+                        *http_status,
                         Some(error_type.as_str()),
                         message,
                     )
