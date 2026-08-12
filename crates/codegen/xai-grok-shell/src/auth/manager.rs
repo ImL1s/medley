@@ -508,6 +508,28 @@ impl AuthManager {
             .map(PathBuf::from)
             .unwrap_or_else(|_| grok_home.join("auth.json"));
 
+        Self::new_xai_at_path(path, scope, grok_com_config, proxy_base_url)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_path(auth_json_path: &Path, grok_com_config: GrokComConfig) -> Self {
+        let scope = grok_com_config.auth_scope();
+        let proxy_base_url =
+            crate::agent::config::EndpointsConfig::from_effective_config().proxy_url();
+        Self::new_xai_at_path(
+            auth_json_path.to_owned(),
+            scope,
+            grok_com_config,
+            proxy_base_url,
+        )
+    }
+
+    fn new_xai_at_path(
+        path: PathBuf,
+        scope: String,
+        grok_com_config: GrokComConfig,
+        proxy_base_url: String,
+    ) -> Self {
         // GROK_AUTH: inline JSON credentials (highest priority, read-only).
         if let Ok(inline_json) = std::env::var("GROK_AUTH") {
             if let Ok(auth) = serde_json::from_str::<GrokAuth>(&inline_json) {

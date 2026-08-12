@@ -963,6 +963,18 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn test_manager(grok_home: &Path) -> Arc<AuthManager> {
+        let manager = Arc::new(AuthManager::new_openai_codex_for_test_path(
+            &grok_home.join("auth.json"),
+        ));
+        manager.configure_refresher(None, None);
+        manager
+    }
+
+    fn reload_test_manager(grok_home: &Path) -> AuthManager {
+        AuthManager::new_openai_codex_for_test_path(&grok_home.join("auth.json"))
+    }
+
     #[derive(Debug)]
     struct RotatingCodexRefresher {
         calls: Arc<AtomicUsize>,
@@ -1254,7 +1266,7 @@ mod tests {
         );
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let revoke_endpoint = format!("http://{addr}/revoke");
-        let manager = manager(dir.path());
+        let manager = test_manager(dir.path());
         manager
             .save_without_enrichment(GrokAuth {
                 key: "access-token".into(),
@@ -1282,7 +1294,7 @@ mod tests {
         );
         assert!(status(&manager).signed_in, "memory must remain coherent");
         assert!(
-            status(&AuthManager::new_openai_codex(dir.path())).signed_in,
+            status(&reload_test_manager(dir.path())).signed_in,
             "disk credential must remain available to another process"
         );
 
@@ -1291,7 +1303,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!status(&manager).signed_in);
-        assert!(!status(&AuthManager::new_openai_codex(dir.path())).signed_in);
+        assert!(!status(&reload_test_manager(dir.path())).signed_in);
         assert_eq!(revoke_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -1312,12 +1324,12 @@ mod tests {
         )
         .unwrap();
 
-        let logout_manager = manager(dir.path());
+        let logout_manager = test_manager(dir.path());
         logout_manager
             .save_without_enrichment(previous_codex_auth())
             .await
             .unwrap();
-        let rotating_manager = manager(dir.path());
+        let rotating_manager = test_manager(dir.path());
 
         let rotation_barrier = Arc::new(Barrier::new(2));
         let rotating_task = {
@@ -1543,7 +1555,7 @@ mod tests {
             &std::collections::BTreeMap::from([("xai::scope".to_owned(), xai)]),
         )
         .unwrap();
-        let manager = manager(dir.path());
+        let manager = test_manager(dir.path());
         manager
             .save_without_enrichment(previous_codex_auth())
             .await
@@ -1816,7 +1828,7 @@ mod tests {
         });
         std::fs::write(&path, serde_json::to_vec_pretty(&older).unwrap()).unwrap();
 
-        let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+        let manager = Arc::new(reload_test_manager(dir.path()));
         let auth = manager
             .current_or_expired()
             .expect("older Codex record loads");
@@ -1843,7 +1855,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_codex_refresh_is_single_flight_and_persists_rotation() {
         let dir = tempfile::tempdir().unwrap();
-        let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+        let manager = Arc::new(reload_test_manager(dir.path()));
         manager
             .save_without_enrichment(GrokAuth {
                 key: "expiring-access".into(),
@@ -1886,7 +1898,7 @@ mod tests {
     #[tokio::test]
     async fn near_expiry_terminal_rejection_makes_codex_unready() {
         let dir = tempfile::tempdir().unwrap();
-        let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+        let manager = Arc::new(reload_test_manager(dir.path()));
         manager
             .save_without_enrichment(GrokAuth {
                 key: "expiring-access".into(),
@@ -1916,7 +1928,7 @@ mod tests {
             RefreshTokenFailedReason::Other,
         ] {
             let dir = tempfile::tempdir().unwrap();
-            let manager = AuthManager::new_openai_codex(dir.path());
+            let manager = reload_test_manager(dir.path());
             let auth = previous_codex_auth();
             let key = auth.key.clone();
             manager.save_without_enrichment(auth).await.unwrap();
@@ -1959,7 +1971,7 @@ mod tests {
         };
         let store = std::collections::BTreeMap::from([("xai::scope".to_owned(), xai)]);
         super::super::storage::write_auth_json(&dir.path().join("auth.json"), &store).unwrap();
-        let manager = AuthManager::new_openai_codex(dir.path());
+        let manager = reload_test_manager(dir.path());
         assert!(manager.current_or_expired().is_none());
         let stored = super::super::storage::read_auth_json(&dir.path().join("auth.json")).unwrap();
         assert_eq!(stored.get("xai::scope").unwrap().key, "xai-secret");
@@ -2109,7 +2121,7 @@ mod tests {
     #[tokio::test]
     async fn access_token_only_refresh_preserves_id_token_workspace_metadata() {
         let dir = tempfile::tempdir().unwrap();
-        let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+        let manager = Arc::new(reload_test_manager(dir.path()));
         let previous = previous_codex_auth();
         manager
             .save_without_enrichment(previous.clone())
@@ -2159,7 +2171,7 @@ mod tests {
     #[tokio::test]
     async fn strict_provider_save_does_not_publish_when_atomic_write_fails() {
         let dir = tempfile::tempdir().unwrap();
-        let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+        let manager = Arc::new(reload_test_manager(dir.path()));
         let initial = GrokAuth {
             key: "initial-access".into(),
             refresh_token: Some("initial-refresh".into()),
