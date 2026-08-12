@@ -394,7 +394,10 @@ impl UnauthorizedRecovery {
                 })),
             );
             self.auth_manager.hot_swap(disk_auth.clone());
-            Some(disk_auth)
+            // A strict-removal failure can leave the rejected provider entry
+            // durably authoritative while a key-scoped verdict suppresses it.
+            // Disk adoption must honor that same wire boundary.
+            self.auth_manager.current_wire_valid()
         } else {
             tracing::debug!("auth recovery: disk token is same as rejected, skipping");
             xai_grok_telemetry::unified_log::debug(
@@ -419,7 +422,7 @@ impl UnauthorizedRecovery {
     /// here, not in `refresh_chain`, so paywall claims re-mints that call
     /// `refresh_chain(ServerRejected)` directly are unaffected.
     fn fresh_mint_guard(&self) -> Option<GrokAuth> {
-        let auth = self.auth_manager.current()?;
+        let auth = self.auth_manager.current_wire_valid()?;
         let mint_age_seconds = auth.mint_age_seconds();
         if !(-FRESH_MINT_GUARD_SECS..FRESH_MINT_GUARD_SECS).contains(&mint_age_seconds) {
             return None;

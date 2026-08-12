@@ -89,6 +89,28 @@ impl ParentSyncFault {
     }
 }
 
+struct StorageFullWriteFault(PathBuf);
+
+impl StorageFullWriteFault {
+    fn install(path: &Path) -> Self {
+        *crate::auth::storage::WRITE_STORAGE_FULL_FAULT_PATH
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(path.to_owned());
+        Self(path.to_owned())
+    }
+}
+
+impl Drop for StorageFullWriteFault {
+    fn drop(&mut self) {
+        let mut fault = crate::auth::storage::WRITE_STORAGE_FULL_FAULT_PATH
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if fault.as_ref() == Some(&self.0) {
+            *fault = None;
+        }
+    }
+}
+
 impl Drop for ParentSyncFault {
     fn drop(&mut self) {
         let mut faults = crate::auth::storage::PARENT_SYNC_FAULT_PATHS
@@ -861,6 +883,375 @@ async fn codex_mixed_scope_clear_reconciles_after_post_rename_permission_failure
     assert!(!log.contains("permission-sibling-secret"));
 }
 
+/// A rejected provider refresh token must use the strict writer. ENOSPC before
+/// publication therefore leaves both the rejected scope and its in-memory
+/// mirror intact instead of entering the legacy truncate-and-rewrite fallback.
+/// Even a hard-valid access token rejected on the request wire stays inert
+/// behind the key-scoped sticky verdict, including after a disk reload.
+#[tokio::test]
+async fn codex_rejected_refresh_mixed_scope_storage_full_retains_authoritative_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+    let mut rejected = codex_auth("codex-rejected-before-publication");
+    rejected.expires_at = Some(Utc::now() + Duration::hours(1));
+    manager
+        .save_without_enrichment(rejected.clone())
+        .await
+        .unwrap();
+    let mut store = read_auth_json_owner_only(manager.auth_json_path()).unwrap();
+    store.insert(
+        "sibling::scope".into(),
+        GrokAuth {
+            key: "sibling-before-publication".into(),
+            auth_mode: AuthMode::ApiKey,
+            ..GrokAuth::test_default()
+        },
+    );
+    write_auth_json_strict(manager.auth_json_path(), &store).unwrap();
+
+    struct Reject(GrokAuth);
+    #[async_trait::async_trait]
+    impl TokenRefresher for Reject {
+        async fn refresh(
+            &self,
+            _reason: crate::auth::manager::RefreshReason,
+        ) -> crate::auth::refresh::RefreshOutcome {
+            crate::auth::refresh::RefreshOutcome::permanent_for(
+                crate::auth::error::RefreshTokenFailedReason::RefreshTokenRejected,
+                &self.0,
+            )
+        }
+    }
+    manager.set_refresher(Arc::new(Reject(rejected.clone())));
+    let _fault = StorageFullWriteFault::install(manager.auth_json_path());
+
+    let error = manager
+        .refresh_chain(TokenType::OidcSession, RefreshReason::ServerRejected)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        AuthError::Refresh(RefreshTokenError::Permanent(_))
+    ));
+    assert_eq!(
+        manager.current_or_expired().map(|auth| auth.key),
+        Some(rejected.key.clone()),
+        "a before-publication failure must retain the disk-authoritative in-memory mirror"
+    );
+    assert!(
+        manager.permanent_failure().is_some(),
+        "retained bytes must remain inert behind the sticky rejection verdict"
+    );
+    assert!(
+        manager.current_wire_valid().is_none(),
+        "a server-rejected hard-valid bearer must not be exported after removal fails"
+    );
+    let provider = crate::auth::AuthProviderRef::openai_codex(Arc::clone(&manager));
+    let resolver = provider.bearer_resolver();
+    assert!(
+        resolver.current_bearer().is_none(),
+        "native Codex bearer resolver must honor the rejection verdict"
+    );
+    assert!(
+        resolver.current_credential().is_none(),
+        "native Codex credential resolver must honor the rejection verdict"
+    );
+    assert!(
+        resolver.current_credential_async().await.is_none(),
+        "async native Codex credential resolution must honor the rejection verdict"
+    );
+    assert!(
+        !resolver
+            .recover_rejected_credential_async("older-in-flight-codex-key")
+            .await,
+        "401 recovery must not substitute the retained rejected bearer for an older request"
+    );
+    let mut recovery = manager.unauthorized_recovery(
+        Some(codex_auth("older-in-flight-codex-key")),
+        crate::auth::recovery::RecoverySource::Background,
+    );
+    assert!(
+        recovery.next().await.is_err(),
+        "disk reload recovery must not hot-swap the retained rejected bearer back onto the wire"
+    );
+    assert!(
+        crate::auth::openai_codex::credential_snapshot(&manager).is_none(),
+        "catalog/request snapshots must not export the rejected bearer"
+    );
+    let auth_result = manager.auth().await;
+    assert!(
+        matches!(
+            auth_result,
+            Err(AuthError::Refresh(RefreshTokenError::Permanent(_)))
+        ),
+        "suppressed rejected bearer must surface its permanent verdict, got {}",
+        match &auth_result {
+            Ok(_) => "Ok(<redacted>)".to_owned(),
+            Err(error) => format!("Err({error})"),
+        }
+    );
+    let durable = read_auth_json_owner_only(manager.auth_json_path()).unwrap();
+    assert_eq!(
+        durable
+            .get(crate::auth::openai_codex::AUTH_SCOPE)
+            .map(|auth| auth.key.as_str()),
+        Some("codex-rejected-before-publication")
+    );
+    assert_eq!(
+        durable.get("sibling::scope").map(|auth| auth.key.as_str()),
+        Some("sibling-before-publication"),
+        "strict ENOSPC handling must not truncate or drop sibling scopes"
+    );
+
+    manager.force_reload_from_disk();
+    assert_eq!(
+        manager.current_or_expired().map(|auth| auth.key),
+        Some(rejected.key),
+        "disk remains authoritative even though its rejected bearer is suppressed"
+    );
+    assert!(
+        manager.current_wire_valid().is_none(),
+        "reloading the retained disk entry must not re-enable wire export"
+    );
+    assert!(resolver.current_bearer().is_none());
+    assert!(resolver.current_credential().is_none());
+    assert!(crate::auth::openai_codex::credential_snapshot(&manager).is_none());
+}
+
+/// Once the strict atomic replacement is visible, a final durability failure
+/// must reconcile memory to the published removal while preserving siblings.
+#[tokio::test]
+async fn codex_rejected_refresh_mixed_scope_reconciles_after_publication_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+    let mut rejected = codex_auth("codex-rejected-after-publication");
+    rejected.expires_at = Some(Utc::now() - Duration::hours(1));
+    manager
+        .save_without_enrichment(rejected.clone())
+        .await
+        .unwrap();
+    let mut store = read_auth_json_owner_only(manager.auth_json_path()).unwrap();
+    store.insert(
+        "sibling::scope".into(),
+        GrokAuth {
+            key: "sibling-after-publication".into(),
+            auth_mode: AuthMode::ApiKey,
+            ..GrokAuth::test_default()
+        },
+    );
+    write_auth_json_strict(manager.auth_json_path(), &store).unwrap();
+
+    struct Reject(GrokAuth);
+    #[async_trait::async_trait]
+    impl TokenRefresher for Reject {
+        async fn refresh(
+            &self,
+            _reason: crate::auth::manager::RefreshReason,
+        ) -> crate::auth::refresh::RefreshOutcome {
+            crate::auth::refresh::RefreshOutcome::permanent_for(
+                crate::auth::error::RefreshTokenFailedReason::RefreshTokenRejected,
+                &self.0,
+            )
+        }
+    }
+    manager.set_refresher(Arc::new(Reject(rejected)));
+    let _fault = ParentSyncFault::install(manager.auth_json_path());
+
+    let error = manager
+        .refresh_chain(TokenType::OidcSession, RefreshReason::ServerRejected)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        AuthError::Refresh(RefreshTokenError::Permanent(_))
+    ));
+    assert!(
+        manager.current_or_expired().is_none(),
+        "an after-publication failure must clear the visibly removed in-memory scope"
+    );
+    let durable = read_auth_json_owner_only(manager.auth_json_path()).unwrap();
+    assert!(!durable.contains_key(crate::auth::openai_codex::AUTH_SCOPE));
+    assert_eq!(
+        durable.get("sibling::scope").map(|auth| auth.key.as_str()),
+        Some("sibling-after-publication"),
+        "the strict replacement must preserve sibling scopes"
+    );
+}
+
+/// Readers racing the strict mixed-scope removal may observe either complete
+/// generation, never a truncated/intermediate JSON document and never a store
+/// that loses the unrelated sibling scope.
+#[tokio::test]
+async fn codex_rejected_refresh_mixed_scope_publication_is_atomic_for_readers() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+    let mut rejected = codex_auth("codex-atomic-removal-old");
+    rejected.expires_at = Some(Utc::now() - Duration::hours(1));
+    manager
+        .save_without_enrichment(rejected.clone())
+        .await
+        .unwrap();
+    let mut store = read_auth_json_owner_only(manager.auth_json_path()).unwrap();
+    store.insert(
+        "atomic::sibling".into(),
+        GrokAuth {
+            key: "atomic-sibling-secret".into(),
+            auth_mode: AuthMode::ApiKey,
+            ..GrokAuth::test_default()
+        },
+    );
+    write_auth_json_strict(manager.auth_json_path(), &store).unwrap();
+
+    struct Reject(GrokAuth);
+    #[async_trait::async_trait]
+    impl TokenRefresher for Reject {
+        async fn refresh(
+            &self,
+            _reason: crate::auth::manager::RefreshReason,
+        ) -> crate::auth::refresh::RefreshOutcome {
+            crate::auth::refresh::RefreshOutcome::permanent_for(
+                crate::auth::error::RefreshTokenFailedReason::RefreshTokenRejected,
+                &self.0,
+            )
+        }
+    }
+    manager.set_refresher(Arc::new(Reject(rejected)));
+
+    let reader_ready = Arc::new(std::sync::Barrier::new(2));
+    let writer_done = Arc::new(AtomicBool::new(false));
+    let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reader = std::thread::spawn({
+        let auth_path = manager.auth_json_path().to_owned();
+        let reader_ready = Arc::clone(&reader_ready);
+        let writer_done = Arc::clone(&writer_done);
+        let observations = Arc::clone(&observations);
+        move || {
+            let mut reads = 0usize;
+            let mut post_publication_reads = 0usize;
+            while reads < 10_000
+                && (!writer_done.load(Ordering::Acquire) || post_publication_reads < 100)
+            {
+                let result = read_auth_json_owner_only(&auth_path).and_then(|store| {
+                    let sibling = store.get("atomic::sibling").map(|auth| auth.key.as_str());
+                    if sibling != Some("atomic-sibling-secret") {
+                        return Err(std::io::Error::other(format!(
+                            "sibling missing or changed: {sibling:?}"
+                        )));
+                    }
+                    match store.get(crate::auth::openai_codex::AUTH_SCOPE) {
+                        Some(auth) if auth.key == "codex-atomic-removal-old" => Ok(true),
+                        None => Ok(false),
+                        Some(auth) => Err(std::io::Error::other(format!(
+                            "unexpected current-scope generation: {}",
+                            auth.key
+                        ))),
+                    }
+                });
+                observations.lock().unwrap().push(result);
+                reads += 1;
+                if reads == 100 {
+                    reader_ready.wait();
+                }
+                if writer_done.load(Ordering::Acquire) {
+                    post_publication_reads += 1;
+                }
+            }
+        }
+    });
+    reader_ready.wait();
+
+    let error = manager
+        .refresh_chain(TokenType::OidcSession, RefreshReason::ServerRejected)
+        .await
+        .unwrap_err();
+    writer_done.store(true, Ordering::Release);
+    reader.join().unwrap();
+
+    assert!(matches!(
+        error,
+        AuthError::Refresh(RefreshTokenError::Permanent(_))
+    ));
+    let observations = observations.lock().unwrap();
+    assert!(observations.len() >= 200);
+    for observation in observations.iter() {
+        observation
+            .as_ref()
+            .expect("every concurrent owner-only read must parse an old-or-new complete store");
+    }
+    assert!(
+        observations.iter().any(|result| matches!(result, Ok(true))),
+        "reader must observe the complete pre-removal generation"
+    );
+    assert!(
+        observations
+            .iter()
+            .any(|result| matches!(result, Ok(false))),
+        "reader must observe the complete post-removal generation"
+    );
+}
+
+#[tokio::test]
+async fn codex_rejected_refresh_mixed_scope_reconciles_after_permission_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = Arc::new(AuthManager::new_openai_codex(dir.path()));
+    let mut rejected = codex_auth("codex-rejected-after-permission-publication");
+    rejected.expires_at = Some(Utc::now() - Duration::hours(1));
+    manager
+        .save_without_enrichment(rejected.clone())
+        .await
+        .unwrap();
+    let mut store = read_auth_json_owner_only(manager.auth_json_path()).unwrap();
+    store.insert(
+        "permission::sibling".into(),
+        GrokAuth {
+            key: "sibling-after-permission-publication".into(),
+            auth_mode: AuthMode::ApiKey,
+            ..GrokAuth::test_default()
+        },
+    );
+    write_auth_json_strict(manager.auth_json_path(), &store).unwrap();
+
+    struct Reject(GrokAuth);
+    #[async_trait::async_trait]
+    impl TokenRefresher for Reject {
+        async fn refresh(
+            &self,
+            _reason: crate::auth::manager::RefreshReason,
+        ) -> crate::auth::refresh::RefreshOutcome {
+            crate::auth::refresh::RefreshOutcome::permanent_for(
+                crate::auth::error::RefreshTokenFailedReason::RefreshTokenRejected,
+                &self.0,
+            )
+        }
+    }
+    manager.set_refresher(Arc::new(Reject(rejected)));
+    let _fault = PostRenamePermissionFault::install(manager.auth_json_path());
+
+    let error = manager
+        .refresh_chain(TokenType::OidcSession, RefreshReason::ServerRejected)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        AuthError::Refresh(RefreshTokenError::Permanent(_))
+    ));
+    assert!(
+        manager.current_or_expired().is_none(),
+        "post-rename permission failure must clear the visibly removed in-memory scope"
+    );
+    let durable = read_auth_json(manager.auth_json_path()).unwrap();
+    assert!(!durable.contains_key(crate::auth::openai_codex::AUTH_SCOPE));
+    assert_eq!(
+        durable
+            .get("permission::sibling")
+            .map(|auth| auth.key.as_str()),
+        Some("sibling-after-permission-publication")
+    );
+}
+
 /// Windows has no documented directory fsync. Last-scope provider logout uses
 /// the write-through atomic replacement path and leaves a safe empty store.
 #[cfg(windows)]
@@ -1621,6 +2012,113 @@ fn hot_swap_updates_in_memory_without_disk() {
     assert_eq!(mgr.current().unwrap().key, "swapped");
     // Disk should NOT have the token
     assert!(mgr.read_disk_auth().is_none());
+}
+
+#[test]
+fn hot_swap_same_server_rejected_bearer_preserves_wire_suppression() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = AuthManager::new_openai_codex(dir.path());
+    let rejected = codex_auth("same-rejected-hot-swap");
+    mgr.record_permanent_failure_with_wire_policy(
+        rejected.key.clone(),
+        crate::auth::error::RefreshTokenFailedReason::RefreshTokenRejected.into(),
+        true,
+    );
+
+    mgr.hot_swap(rejected.clone());
+
+    assert_eq!(
+        mgr.current_or_expired().map(|auth| auth.key),
+        Some(rejected.key)
+    );
+    assert!(mgr.permanent_failure().is_some());
+    assert!(mgr.current_wire_valid().is_none());
+}
+
+#[test]
+fn bearer_reader_started_before_hot_swap_cannot_export_rejected_old_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(AuthManager::new_openai_codex(dir.path()));
+    let rejected = codex_auth("rejected-before-concurrent-swap");
+    mgr.hot_swap(rejected.clone());
+    mgr.record_permanent_failure_with_wire_policy(
+        rejected.key.clone(),
+        crate::auth::error::RefreshTokenFailedReason::RefreshTokenRejected.into(),
+        true,
+    );
+
+    let reader_entered = Arc::new(std::sync::Barrier::new(2));
+    let release_reader = Arc::new(std::sync::Barrier::new(2));
+    let hook_ran = Arc::new(AtomicBool::new(false));
+    mgr.set_auth_state_after_inner_read_hook(Some(Arc::new({
+        let reader_entered = Arc::clone(&reader_entered);
+        let release_reader = Arc::clone(&release_reader);
+        let hook_ran = Arc::clone(&hook_ran);
+        move || {
+            if !hook_ran.swap(true, Ordering::SeqCst) {
+                reader_entered.wait();
+                release_reader.wait();
+            }
+        }
+    })));
+
+    let reader = std::thread::spawn({
+        let mgr = Arc::clone(&mgr);
+        move || mgr.current_wire_valid()
+    });
+    reader_entered.wait();
+
+    let replacement = codex_auth("replacement-after-concurrent-swap");
+    let (writer_started_tx, writer_started_rx) = std::sync::mpsc::channel();
+    let (writer_done_tx, writer_done_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn({
+        let mgr = Arc::clone(&mgr);
+        let replacement = replacement.clone();
+        move || {
+            writer_started_tx.send(()).unwrap();
+            mgr.hot_swap(replacement);
+            writer_done_tx.send(()).unwrap();
+        }
+    });
+    writer_started_rx.recv().unwrap();
+    assert!(
+        writer_done_rx
+            .recv_timeout(StdDuration::from_millis(50))
+            .is_err(),
+        "writer must remain behind the reader's inner read guard"
+    );
+
+    release_reader.wait();
+    assert!(
+        reader.join().unwrap().is_none(),
+        "reader that cloned the rejected key must also observe its suppression verdict"
+    );
+    writer.join().unwrap();
+    mgr.set_auth_state_after_inner_read_hook(None);
+    assert_eq!(
+        mgr.current_wire_valid().map(|auth| auth.key),
+        Some(replacement.key)
+    );
+}
+
+#[tokio::test]
+async fn native_codex_provider_recovers_hard_expired_rejected_bearer_via_refresh_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(AuthManager::new_openai_codex(dir.path()));
+    let mut expired = codex_auth("hard-expired-rejected-codex");
+    expired.expires_at = Some(Utc::now() - Duration::hours(1));
+    mgr.hot_swap(expired.clone());
+    let calls = Arc::new(AtomicU32::new(0));
+    mgr.set_refresher(Arc::new(CountingRefresher {
+        call_count: Arc::clone(&calls),
+        delay: StdDuration::ZERO,
+    }));
+    let provider = crate::auth::AuthProviderRef::openai_codex(Arc::clone(&mgr));
+
+    let replacement = provider.recover_rejected_token(&expired.key).await;
+
+    assert_eq!(replacement.as_deref(), Some("fresh-token"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]

@@ -239,6 +239,11 @@ const RELOAD_RETRY_BACKOFF: StdDuration = StdDuration::from_millis(50);
 struct ScopedRefreshFailure {
     token_key: String,
     error: crate::auth::error::RefreshTokenFailedError,
+    /// The provider rejected this access token on the request path that
+    /// triggered refresh. A still-unexpired copy may remain in memory when a
+    /// strict disk removal fails before publication, but it must never be
+    /// exported again while this key-scoped verdict is active.
+    suppress_wire_bearer: bool,
     /// Two-clock timestamp (see [`DualClock`]): the TTL below is *real* time,
     /// so it must keep counting across a system sleep. The monotonic clock
     /// pauses during suspend — with it alone, a failure cached just before
@@ -259,12 +264,13 @@ const PERMANENT_FAILURE_TTL: StdDuration = StdDuration::from_secs(300);
 
 /// Single source of truth for `auth.json` + the in-memory bearer.
 ///
-/// Lock order: `refresh_lock` (async) -> the sync locks (`inner` / `refresher`
-/// / `permanent_failure` / `manual_auth`), never co-held; `permanent_failure()`
-/// reads `permanent_failure` first and only then `inner` (via
-/// `attempted_verdict_key`, when a verdict is stored), never co-held. Never hold
-/// a `parking_lot` guard across `.await`. Refreshers return [`RefreshOutcome`]
-/// for `refresh_chain` to apply.
+/// Lock order: `refresh_lock` (async) -> `inner` -> `permanent_failure`; the
+/// remaining sync locks (`refresher` / `manual_auth`) are never co-held with
+/// auth-state locks. Bearer-export readers keep the `inner` read guard while
+/// inspecting `permanent_failure`, and paired publications keep the `inner`
+/// write guard while updating the verdict. Never hold a `parking_lot` guard
+/// across `.await`. Refreshers return [`RefreshOutcome`] for `refresh_chain` to
+/// apply.
 /// Redacted `Debug` so `AuthManager` (held via `Arc` inside `Debug`-derived
 /// types like `PersistenceMsg`) never leaks credentials into logs or panics.
 impl std::fmt::Debug for AuthManager {
@@ -297,6 +303,10 @@ pub struct AuthManager {
     /// scheduled near it.
     #[cfg(test)]
     selection_snapshot_observed_odd_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Deterministic seam for pinning a bearer reader after it acquires
+    /// `inner` but before it reads `permanent_failure`.
+    #[cfg(test)]
+    auth_state_after_inner_read_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     path: PathBuf,
     scope: String,
     /// xAI-only policy and `/user` enrichment are forbidden for provider
@@ -667,6 +677,8 @@ impl AuthManager {
             selection_after_disk_before_memory_hook: parking_lot::Mutex::new(None),
             #[cfg(test)]
             selection_snapshot_observed_odd_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            auth_state_after_inner_read_hook: parking_lot::Mutex::new(None),
             path,
             scope,
             xai_session,
@@ -853,10 +865,12 @@ impl AuthManager {
             })),
         );
         if scope == self.scope {
-            self.clear_inner();
             // Intentional logout/scope removal: drop sticky permanent so the
             // next state is NotLoggedIn, not a retained invalid_grant verdict.
-            *self.permanent_failure.write() = None;
+            self.publish_auth_state(|inner, failure| {
+                *inner = None;
+                *failure = None;
+            });
         }
     }
 
@@ -1102,8 +1116,10 @@ impl AuthManager {
                 })),
             );
         }
-        self.clear_inner();
-        *self.permanent_failure.write() = None;
+        self.publish_auth_state(|inner, failure| {
+            *inner = None;
+            *failure = None;
+        });
     }
 
     // ── Read methods ─────────────────────────────────────────────────
@@ -1200,6 +1216,31 @@ impl AuthManager {
         let _mutation = self.begin_selection_mutation();
         let mut guard = self.inner.write();
         f(&mut guard)
+    }
+
+    /// Mutate the bearer and its key-scoped verdict as one publication.
+    ///
+    /// The caller must already own a selection mutation when model-selection
+    /// atomicity is required. The closure is synchronous so neither guard can
+    /// cross an `.await`.
+    #[inline]
+    fn with_auth_state_write<R>(
+        &self,
+        f: impl FnOnce(&mut Option<GrokAuth>, &mut Option<ScopedRefreshFailure>) -> R,
+    ) -> R {
+        let mut inner = self.inner.write();
+        let mut failure = self.permanent_failure.write();
+        f(&mut inner, &mut failure)
+    }
+
+    /// Selection-aware counterpart to [`Self::with_auth_state_write`].
+    #[inline]
+    fn publish_auth_state<R>(
+        &self,
+        f: impl FnOnce(&mut Option<GrokAuth>, &mut Option<ScopedRefreshFailure>) -> R,
+    ) -> R {
+        let _mutation = self.begin_selection_mutation();
+        self.with_auth_state_write(f)
     }
 
     fn begin_selection_mutation(&self) -> AuthSelectionMutationGuard<'_> {
@@ -1339,6 +1380,33 @@ impl AuthManager {
         f(guard.as_ref())
     }
 
+    /// Read bearer bytes and their key-scoped verdict from one linearizable
+    /// state. Lock order matches [`Self::with_auth_state_write`].
+    #[inline]
+    fn with_auth_state_read<R>(
+        &self,
+        f: impl FnOnce(Option<&GrokAuth>, Option<&ScopedRefreshFailure>) -> R,
+    ) -> R {
+        let inner = self.inner.read();
+        #[cfg(test)]
+        {
+            let hook = self.auth_state_after_inner_read_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let failure = self.permanent_failure.read();
+        f(inner.as_ref(), failure.as_ref())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_auth_state_after_inner_read_hook(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self.auth_state_after_inner_read_hook.lock() = hook;
+    }
+
     /// Returns true if credentials exist but have expired.
     pub(crate) fn is_expired(&self) -> bool {
         if !self.credential_store_is_safe() {
@@ -1358,17 +1426,19 @@ impl AuthManager {
 
     /// Cached token if still wire-valid ([`Self::is_token_hard_expired`]),
     /// ignoring the early-invalidation buffer. For sync callers that cannot
-    /// refresh and must not demote a still-accepted token.
+    /// refresh and must not demote a still-accepted token. A bearer already
+    /// rejected by the provider on a request path is excluded even when its
+    /// local expiry has not elapsed.
     pub(crate) fn current_wire_valid(&self) -> Option<GrokAuth> {
         if !self.credential_store_is_safe() {
             return None;
         }
-        let auth = self
-            .inner
-            .read()
-            .as_ref()
-            .filter(|a| !self.is_token_hard_expired(a))
-            .cloned()?;
+        let auth = self.with_auth_state_read(|inner, failure| {
+            inner
+                .filter(|a| !self.is_token_hard_expired(a))
+                .filter(|a| !Self::failure_suppresses_wire_bearer(failure, &a.key))
+                .cloned()
+        })?;
         self.vet_cached(auth)
     }
 
@@ -1491,8 +1561,10 @@ impl AuthManager {
         // current session work with fresh credentials while the user fixes the
         // filesystem (e.g. read-only disk). Without this, a disk failure leaves
         // the stale/dead token in memory and the user is completely stuck.
-        *self.permanent_failure.write() = None;
-        *self.inner.write() = Some(auth.clone());
+        self.with_auth_state_write(|inner, failure| {
+            *inner = Some(auth.clone());
+            *failure = None;
+        });
         drop(_selection_mutation);
         let elapsed_ms = update_started.elapsed().as_millis() as u64;
         match &write_result {
@@ -1561,8 +1633,10 @@ impl AuthManager {
             self.run_selection_after_disk_before_memory_hook();
         }
         // Always update in-memory, even if disk write failed (see update()).
-        *self.permanent_failure.write() = None;
-        *self.inner.write() = Some(auth.clone());
+        self.with_auth_state_write(|inner, failure| {
+            *inner = Some(auth.clone());
+            *failure = None;
+        });
         drop(_selection_mutation);
         let elapsed_ms = started.elapsed().as_millis() as u64;
         match &write_result {
@@ -1602,8 +1676,10 @@ impl AuthManager {
         self.run_selection_after_disk_before_memory_hook();
         match write_result {
             Ok(()) => {
-                *self.permanent_failure.write() = None;
-                *self.inner.write() = Some(auth.clone());
+                self.with_auth_state_write(|inner, failure| {
+                    *inner = Some(auth.clone());
+                    *failure = None;
+                });
                 Ok(auth)
             }
             Err(error) => {
@@ -1698,14 +1774,19 @@ impl AuthManager {
     }
 
     /// Hot-swap credentials (called by config watcher). Does NOT write to disk.
-    /// Clears a sticky permanent verdict only when the new bearer is wire-valid
-    /// (login / sibling adopt). Hard-expired swaps keep the sticky short-circuit
-    /// so a dead RT is not re-tried until a real login.
+    /// Clears a permanent verdict only when the new bearer is locally
+    /// wire-valid and is not the exact server-rejected bearer suppressed by
+    /// that verdict. Re-reading the same retained disk entry must never turn a
+    /// failed strict removal into a credential resurrection.
     pub(crate) fn hot_swap(&self, new_auth: GrokAuth) {
-        if !self.is_token_hard_expired(&new_auth) {
-            *self.permanent_failure.write() = None;
-        }
-        self.with_inner_write(|inner| *inner = Some(new_auth));
+        self.publish_auth_state(|inner, failure| {
+            *inner = Some(new_auth.clone());
+            if !self.is_token_hard_expired(&new_auth)
+                && !Self::failure_suppresses_wire_bearer(failure.as_ref(), &new_auth.key)
+            {
+                *failure = None;
+            }
+        });
     }
 
     /// Clear in-memory credentials. Does NOT touch disk. Sticky
@@ -1737,7 +1818,8 @@ impl AuthManager {
         }
         tracing::info!("auth: another process already refreshed, using disk token");
         self.hot_swap(disk_auth.clone());
-        Some(disk_auth.clone())
+        self.current_wire_valid()
+            .filter(|published| published.key == disk_auth.key)
     }
 
     /// Re-read disk and try to adopt a sibling-written token, emitting
@@ -2126,9 +2208,17 @@ impl AuthManager {
         if !self.credential_store_is_safe() {
             return Err(AuthError::NotLoggedIn);
         }
-        // Snapshot inner ONCE for dispatch atomicity (closes a TOCTOU
-        // where a concurrent `clear()` raced `token_type()` + `inner.read()`).
-        let snapshot: Option<GrokAuth> = self.with_inner_read(|inner| inner.cloned());
+        // Snapshot bearer bytes and their suppression verdict in one lock
+        // epoch. A concurrent login/sibling swap cannot clear the old key's
+        // verdict after we clone that old key but before its wire gate.
+        let (snapshot, snapshot_wire_suppressed): (Option<GrokAuth>, bool) = self
+            .with_auth_state_read(|inner, failure| {
+                let snapshot = inner.cloned();
+                let suppressed = snapshot
+                    .as_ref()
+                    .is_some_and(|auth| Self::failure_suppresses_wire_bearer(failure, &auth.key));
+                (snapshot, suppressed)
+            });
         // Kept alongside `snapshot`, which the grace arm below consumes: the
         // devbox arms still need to name the credential they gave up on.
         let snapshot_key: Option<String> = snapshot.as_ref().map(|a| a.key.clone());
@@ -2139,6 +2229,7 @@ impl AuthManager {
         // re-login isn't blocked by a stale failure).
         if let Some(ref auth) = snapshot
             && !self.is_token_expired(auth)
+            && !snapshot_wire_suppressed
         {
             return Ok(auth.clone());
         }
@@ -2146,9 +2237,13 @@ impl AuthManager {
         if let Some(err) = self.permanent_failure() {
             // The verdict is about the *refresh* token; a cached access token
             // that is still wire-valid ([`Self::is_token_hard_expired`]) is
-            // usable regardless (no IdP).
+            // normally usable regardless (no IdP). The exception is a refresh
+            // triggered by this same bearer being rejected on the request
+            // wire: retaining bytes after a pre-publication disk failure must
+            // not re-send a credential the provider already refused.
             if let Some(ref auth) = snapshot
                 && !self.is_token_hard_expired(auth)
+                && !snapshot_wire_suppressed
             {
                 return Ok(auth.clone());
             }
@@ -2217,6 +2312,7 @@ impl AuthManager {
                                     == crate::auth::error::RefreshTokenFailedReason::RefreshTokenRejected
                         );
                         if !deny_grace
+                            && !snapshot_wire_suppressed
                             && let Some(auth) = snapshot
                             && !self.is_token_hard_expired(&auth)
                         {
@@ -2789,22 +2885,54 @@ impl AuthManager {
                         (None, _, _) => (true, true),
                     };
                     if let Some(key) = tried_key.or(attempted_key) {
-                        self.record_permanent_failure(key, error);
+                        self.record_permanent_failure_with_wire_policy(
+                            key,
+                            error,
+                            reason == RefreshReason::ServerRejected,
+                        );
                     }
                     let mut disk_mutation = "unchanged";
+                    let mut clear_mem_after_disk = clear_mem;
                     if clear_disk {
-                        disk_mutation = match self.write_scope_removal(&self.scope) {
-                            Ok(m) => m.label(),
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "auth: failed to clear credentials after permanent refresh failure"
-                                );
-                                "write_failed"
+                        if self.xai_session {
+                            disk_mutation = match self.write_scope_removal(&self.scope) {
+                                Ok(m) => m.label(),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "auth: failed to clear credentials after permanent refresh failure"
+                                    );
+                                    "write_failed"
+                                }
+                            };
+                        } else {
+                            match self.write_scope_removal_durable(&self.scope) {
+                                Ok(outcome) => {
+                                    disk_mutation = outcome.mutation.label();
+                                    if let Some(error) = outcome.durability_error {
+                                        tracing::warn!(
+                                            error = %error,
+                                            "auth: rejected provider credential removal is visible but not durably proven"
+                                        );
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        error = %error,
+                                        "auth: failed to publish rejected provider credential removal"
+                                    );
+                                    disk_mutation = "write_failed_before_publication";
+                                    // The strict provider writer guarantees the
+                                    // old store is still authoritative on this
+                                    // path. Keep memory aligned with it; the
+                                    // sticky rejection verdict still prevents
+                                    // the known-bad credential from being used.
+                                    clear_mem_after_disk = false;
+                                }
                             }
-                        };
+                        }
                     }
-                    if clear_mem {
+                    if clear_mem_after_disk {
                         self.clear_inner();
                     }
                     xai_grok_telemetry::unified_log::warn(
@@ -2813,12 +2941,16 @@ impl AuthManager {
                         Some(serde_json::json!({
                             "reason": format!("{failed_reason:?}"),
                             "disk_mutation": disk_mutation,
-                            "cleared_mem": clear_mem,
+                            "cleared_mem": clear_mem_after_disk,
                             "cleared_disk": clear_disk,
                         })),
                     );
                 } else if let Some(key) = tried_key.or(attempted_key) {
-                    self.record_permanent_failure(key, error);
+                    self.record_permanent_failure_with_wire_policy(
+                        key,
+                        error,
+                        reason == RefreshReason::ServerRejected,
+                    );
                 }
                 Err(AuthError::permanent(failed_reason))
             }
@@ -2881,6 +3013,15 @@ impl AuthManager {
         token_key: String,
         error: crate::auth::error::RefreshTokenFailedError,
     ) {
+        self.record_permanent_failure_with_wire_policy(token_key, error, false);
+    }
+
+    fn record_permanent_failure_with_wire_policy(
+        &self,
+        token_key: String,
+        error: crate::auth::error::RefreshTokenFailedError,
+        suppress_wire_bearer: bool,
+    ) {
         // Don't advertise a TTL for a sticky (never-expiring) verdict.
         let ttl_seconds = (!error.reason.is_sticky()).then(|| PERMANENT_FAILURE_TTL.as_secs());
         xai_grok_telemetry::unified_log::warn(
@@ -2892,11 +3033,31 @@ impl AuthManager {
                 "ttl_seconds": ttl_seconds,
             })),
         );
-        *self.permanent_failure.write() = Some(ScopedRefreshFailure {
-            token_key,
-            error,
-            recorded_at: DualClock::now(),
+        self.publish_auth_state(|_, failure| {
+            *failure = Some(ScopedRefreshFailure {
+                token_key,
+                error,
+                suppress_wire_bearer,
+                recorded_at: DualClock::now(),
+            });
         });
+    }
+
+    fn failure_suppresses_wire_bearer(
+        failure: Option<&ScopedRefreshFailure>,
+        token_key: &str,
+    ) -> bool {
+        let Some(failure) = failure else {
+            return false;
+        };
+        if !failure.suppress_wire_bearer || failure.token_key != token_key {
+            return false;
+        }
+        if failure.error.reason.is_sticky() {
+            return true;
+        }
+        let (monotonic, wall) = failure.recorded_at.elapsed();
+        monotonic < PERMANENT_FAILURE_TTL && wall < PERMANENT_FAILURE_TTL
     }
 
     /// Key the sticky verdict is scoped to: the credential a refresh for

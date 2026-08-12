@@ -799,7 +799,11 @@ pub fn status(manager: &AuthManager) -> CodexAuthStatus {
 
 /// Atomically snapshot the access token and account id from one credential.
 pub fn credential_snapshot(manager: &AuthManager) -> Option<ProviderCredentialSnapshot> {
-    let auth = manager.current()?;
+    // This snapshot feeds live catalog and sampler requests.  Use the same
+    // wire-valid view as request authentication so a server-rejected bearer
+    // retained after a failed durable removal cannot escape through a sync
+    // credential reader.
+    let auth = manager.current_wire_valid()?;
     Some(ProviderCredentialSnapshot {
         access_token: auth.key,
         expires_at: auth.expires_at,
