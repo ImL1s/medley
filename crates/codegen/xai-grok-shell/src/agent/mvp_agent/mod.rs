@@ -311,10 +311,13 @@ pub(crate) struct SessionSpawnOptions<'a> {
     pub is_chat_kind: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct NewSessionAuthAuthority {
     pub generation: u64,
     pub is_session_auth: bool,
+    pub catalog_generation: u64,
+    pub catalog_identity: xai_chat_state::CatalogIdentity,
+    pub model_ready: bool,
 }
 
 pub(crate) struct PreparedNewSessionModelPlan {
@@ -345,7 +348,6 @@ pub(crate) struct PreparedNewSession {
     publication_gate: crate::session::SessionPublicationGate,
     cleanup: Option<agent_ops::ProvisionalNewSessionCleanup>,
     auth_authority: NewSessionAuthAuthority,
-    winning_model: ModelEntry,
     deferred_relay_state_rx:
         Option<tokio::sync::watch::Receiver<crate::relay::ConnectionState>>,
     upgrade_persistence_to_writeback: bool,

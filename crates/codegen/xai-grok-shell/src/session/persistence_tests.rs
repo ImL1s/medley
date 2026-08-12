@@ -58,6 +58,46 @@ fn test_actor_with_remote_sync(
     }
 }
 
+fn test_fresh_actor(
+    info: Info,
+    storage: Arc<dyn StorageAdapter>,
+    fresh_claim: FreshSessionClaim,
+) -> ActorGuard {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let (disk_full_tx, disk_full_rx) = tokio::sync::watch::channel(false);
+    let sampling_client = OaiCompatClient::new(xai_grok_sampler::SamplerConfig::default()).unwrap();
+    let task = tokio::spawn(
+        SessionPersistence {
+            info,
+            storage,
+            pending_notification: None,
+            rx,
+            remote_sync: None,
+            created_fresh: true,
+            fresh_claim: Some(fresh_claim),
+            pending_publication_gate: None,
+            fresh_publication_aborted: false,
+            relay_sync: None,
+            summary: crate::session::summary::SummaryGenerator::new(
+                crate::session::summary::SummaryConfig {
+                    sampling_client,
+                    model: String::new(),
+                    persistence_tx: tx.downgrade(),
+                },
+            ),
+            registry_title_sync: None,
+            gateway: None,
+            disk_full_tx,
+            disk_full_notified: false,
+        }
+        .run(),
+    );
+    ActorGuard {
+        handle: PersistenceHandle::from_parts_for_test(tx, disk_full_rx),
+        task,
+    }
+}
+
 fn notification(info: &Info, text: &str) -> acp::SessionNotification {
     acp::SessionNotification::new(
         info.id.clone(),
@@ -115,6 +155,48 @@ async fn recv_observed(
         .await
         .expect("remote sync timed out")
         .expect("remote sync observer closed")
+}
+
+#[tokio::test]
+async fn durable_prepare_failure_prevents_publication_arming() {
+    let root = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("durable-prepare-failure"),
+        cwd: "/test/durable-prepare".into(),
+    };
+    let session_dir = root.path().join("session");
+    let fresh_claim =
+        claim_fresh_session_sync(root.path(), info.id.0.as_ref(), session_dir.clone()).unwrap();
+    let storage = Arc::new(JsonlStorageAdapter::with_session_sync_probe(
+        session_dir.clone(),
+        || Err(io::Error::other("injected durable prepare failure")),
+    ));
+    storage
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let actor = test_fresh_actor(info.clone(), storage.clone(), fresh_claim);
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Update(neutral_update(&info, "pending")))
+        .unwrap();
+    let publication_gate = crate::session::SessionPublicationGate::pending();
+
+    let error = PersistenceHandle::publish_fresh(&actor.handle.tx, publication_gate.clone())
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.to_string(), "injected durable prepare failure");
+    assert_eq!(storage.load_summary(&info).await.unwrap().num_messages, 1);
+    publication_gate.publish();
+    tokio::task::yield_now().await;
+    assert!(session_dir.join(UNPUBLISHED_SESSION_MARKER).is_file());
+    PersistenceHandle::abort_fresh_and_delete(&actor.handle.tx, publication_gate)
+        .await
+        .unwrap();
+    actor.task.await.unwrap();
+    assert!(!session_dir.exists());
 }
 
 #[test]

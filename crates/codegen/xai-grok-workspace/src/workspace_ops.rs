@@ -1303,6 +1303,39 @@ impl WorkspaceOp for WorktreeDbStatsReq {
 ///
 /// - **`Proxy`** — wraps a [`WorkspaceClient`] connected to a remote hub.
 ///   Everything routes through hub WebSocket to a remote workspace server.
+#[must_use = "dropping a local session reservation cancels it"]
+pub struct LocalSessionReservation {
+    local: Option<crate::handle::WorkspaceLocalSessionReservation>,
+}
+
+impl std::fmt::Debug for LocalSessionReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalSessionReservation")
+            .field("local", &self.local.is_some())
+            .finish()
+    }
+}
+
+impl LocalSessionReservation {
+    /// Build and publish the reserved local workspace session.
+    ///
+    /// Reservation established every fallible precondition, so this final
+    /// operation is deliberately synchronous and infallible. Proxy-mode
+    /// reservations remain no-ops.
+    pub fn commit(
+        self,
+        cwd: std::path::PathBuf,
+        hunk_tracker: xai_hunk_tracker::HunkTrackerHandle,
+        toolset: Arc<xai_grok_tools::registry::types::FinalizedToolset>,
+    ) {
+        let Some(local) = self.local else {
+            return;
+        };
+        let capability_mode = toolset.capability_policy().mode().into();
+        local.promote_with_external_toolset(cwd, hunk_tracker, toolset, capability_mode);
+    }
+}
+
 #[derive(Clone)]
 pub enum WorkspaceOps {
     /// Local in-process mode — extensions through the handle, tool calls
@@ -1396,33 +1429,21 @@ impl WorkspaceOps {
         session.replace(session.effective_tool_config(), toolset);
         Ok(())
     }
-    /// Strict, identity-silent first bind for a session publication
-    /// transaction.
+    /// Reserve a new local session identity without exposing it through the
+    /// workspace's live-session APIs.
     ///
-    /// Local mode must create a new workspace session; an existing ID is a
-    /// collision and is never rebound. Proxy mode remains a no-op because the
-    /// remote workspace server owns its own session lifecycle. The caller is
-    /// expected to invoke this as its final fallible step, then publish the
-    /// matching shell session synchronously.
-    pub fn bind_new_local_session(
+    /// A local collision (including another unpublished reservation) fails
+    /// closed and preserves the current owner. Dropping the returned value
+    /// silently cancels the claim. Proxy mode returns a no-op reservation.
+    pub fn reserve_new_local_session(
         &self,
         session_id: &str,
-        cwd: std::path::PathBuf,
-        hunk_tracker: xai_hunk_tracker::HunkTrackerHandle,
-        toolset: Arc<xai_grok_tools::registry::types::FinalizedToolset>,
-    ) -> WorkspaceResult<()> {
-        let Self::Local { handle } = self else {
-            return Ok(());
+    ) -> WorkspaceResult<LocalSessionReservation> {
+        let local = match self {
+            Self::Local { handle } => Some(handle.reserve_new_local_session(session_id)?),
+            Self::Proxy { .. } => None,
         };
-        let capability_mode = toolset.capability_policy().mode().into();
-        handle.create_provisional_session_with_external_toolset(
-            session_id,
-            cwd,
-            hunk_tracker,
-            toolset,
-            capability_mode,
-        )?;
-        Ok(())
+        Ok(LocalSessionReservation { local })
     }
     /// Release the workspace session. No-op in proxy mode.
     pub fn end_local_session(&self, session_id: &str) {
@@ -1923,44 +1944,76 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn bind_new_local_session_is_strict_and_preserves_existing_owner() {
+    async fn local_session_reservation_is_invisible_exclusive_and_atomic() {
         let ops = WorkspaceOps::for_test();
         let WorkspaceOps::Local { handle } = &ops else {
             unreachable!("for_test builds a local handle");
         };
-        let sid = "strict-new-bind";
-        let cwd = handle.root_cwd().unwrap();
-        let first = std::sync::Arc::new(
-            xai_grok_tools::registry::types::FinalizedToolset::empty_for_test(),
-        );
-        ops.bind_new_local_session(
-            sid,
-            cwd.clone(),
-            xai_hunk_tracker::HunkTrackerHandle::noop(),
-            first.clone(),
-        )
-        .expect("first strict bind should create the session");
-        let original = handle.session(sid).expect("first owner remains resident");
-        assert!(std::sync::Arc::ptr_eq(&original.toolset(), &first));
-
-        let replacement = std::sync::Arc::new(
-            xai_grok_tools::registry::types::FinalizedToolset::empty_for_test(),
-        );
-        let error = ops
-            .bind_new_local_session(
-                sid,
-                cwd,
-                xai_hunk_tracker::HunkTrackerHandle::noop(),
-                replacement,
-            )
-            .expect_err("duplicate strict bind must fail closed");
+        let existing_sid = "existing-owner";
+        let existing = handle
+            .create_session(existing_sid)
+            .expect("existing owner should be created");
+        let collision = ops
+            .reserve_new_local_session(existing_sid)
+            .expect_err("a live session identity cannot be reserved");
         assert!(matches!(
-            error,
+            collision,
+            crate::error::WorkspaceError::SessionAlreadyExists(ref id) if id == existing_sid
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &handle.session(existing_sid).expect("owner remains live"),
+            &existing
+        ));
+
+        let sid = "reserved-new-bind";
+        let cwd = handle.root_cwd().unwrap();
+        let baseline_count = handle.session_count();
+        let reservation = ops
+            .reserve_new_local_session(sid)
+            .expect("new identity should be reserved");
+        assert!(handle.session(sid).is_none());
+        assert!(!handle.session_ids().iter().any(|id| id == sid));
+        assert_eq!(handle.session_count(), baseline_count);
+
+        let duplicate = ops
+            .reserve_new_local_session(sid)
+            .expect_err("a second reservation must lose");
+        assert!(matches!(
+            duplicate,
             crate::error::WorkspaceError::SessionAlreadyExists(ref id) if id == sid
         ));
-        let still_original = handle.session(sid).expect("collision keeps original owner");
-        assert!(std::sync::Arc::ptr_eq(&still_original, &original));
-        assert!(std::sync::Arc::ptr_eq(&still_original.toolset(), &first));
+        let ordinary_creator = handle
+            .create_session(sid)
+            .expect_err("ordinary creators must also respect reservations");
+        assert!(matches!(
+            ordinary_creator,
+            crate::error::WorkspaceError::SessionAlreadyExists(ref id) if id == sid
+        ));
+        assert!(handle.session(sid).is_none());
+
+        drop(reservation);
+        assert!(handle.session(sid).is_none());
+        assert_eq!(handle.session_count(), baseline_count);
+
+        let reservation = ops
+            .reserve_new_local_session(sid)
+            .expect("cancelled claim should be reusable");
+        let toolset = std::sync::Arc::new(
+            xai_grok_tools::registry::types::FinalizedToolset::empty_for_test(),
+        );
+        reservation.commit(
+            cwd.clone(),
+            xai_hunk_tracker::HunkTrackerHandle::noop(),
+            toolset.clone(),
+        );
+        let committed = handle.session(sid).expect("commit publishes the session");
+        assert!(handle.session_ids().iter().any(|id| id == sid));
+        assert_eq!(handle.session_count(), baseline_count + 1);
+        assert!(std::sync::Arc::ptr_eq(&committed.toolset(), &toolset));
+        assert!(std::sync::Arc::ptr_eq(
+            &handle.session(existing_sid).expect("owner remains live"),
+            &existing
+        ));
     }
     #[tokio::test]
     async fn bind_local_session_preserves_restricted_capability_for_forks() {

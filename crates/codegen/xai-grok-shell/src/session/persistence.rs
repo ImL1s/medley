@@ -519,10 +519,10 @@ pub enum PersistenceMsg {
         publication_gate: crate::session::SessionPublicationGate,
         respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
     },
-    /// Publish a provisional fresh session and release its cross-process id
-    /// claim when the supplied gate becomes published. The acknowledgement
-    /// only confirms that the actor has armed the gate; it does not release
-    /// the claim.
+    /// Durably prepare a provisional fresh session for publication, then release
+    /// its cross-process id claim when the supplied gate becomes published. The
+    /// acknowledgement confirms all pending state and existing session files are
+    /// durable and that the actor has armed the gate; it does not release the claim.
     PublishFresh {
         publication_gate: crate::session::SessionPublicationGate,
         respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
@@ -1811,12 +1811,10 @@ impl PersistenceHandle {
         })?
     }
 
-    /// Arm publication of a provisional fresh session and wait until the
-    /// persistence actor has installed the supplied gate. The id claim remains
-    /// held until the gate becomes published; abort keeps it armed so cleanup
-    /// deletes provisional storage before releasing the lock. Before publishing
-    /// the gate, the caller must run [`finalize_fresh_publication_sync`] in the
-    /// same no-await final commit.
+    /// Durably prepare and arm publication of a provisional fresh session.
+    /// A successful acknowledgement is a strict barrier: pending state has been
+    /// drained and all existing session files and directory entries have been
+    /// synced. The id claim remains held until the gate becomes published.
     pub(crate) async fn publish_fresh(
         tx: &mpsc::UnboundedSender<PersistenceMsg>,
         publication_gate: crate::session::SessionPublicationGate,
@@ -2342,7 +2340,7 @@ impl SessionPersistence {
                     publication_gate,
                     respond_to,
                 } => {
-                    let result = if !self.created_fresh
+                    let eligibility = if !self.created_fresh
                         || self.fresh_claim.is_none()
                         || self.fresh_publication_aborted
                     {
@@ -2356,9 +2354,18 @@ impl SessionPersistence {
                             "fresh session publication is already armed",
                         ))
                     } else {
-                        self.pending_publication_gate = Some(publication_gate);
                         Ok(())
                     };
+                    let result = match eligibility {
+                        Ok(()) => match self.flush_pending().await {
+                            Ok(()) => self.storage.sync_session_files(&self.info).await,
+                            Err(error) => Err(error),
+                        },
+                        Err(error) => Err(error),
+                    };
+                    if result.is_ok() {
+                        self.pending_publication_gate = Some(publication_gate);
+                    }
                     #[cfg(test)]
                     block_publish_fresh_ack_test_hook(&self.info.id.to_string()).await;
                     let _ = respond_to.send(result);
@@ -3139,26 +3146,41 @@ fn session_claim_lock_name(session_id: &str) -> String {
     encoded
 }
 
-/// Exclusive cross-process ownership for one persisted session id.
+/// Cross-process ownership for one persisted session id.
 ///
-/// Fresh creation holds this through publication or abort. Loading takes the
-/// same lock before opening local files, which prevents observing a
-/// provisional directory and makes an aborted creation appear as NotFound.
+/// Fresh creation and deletion take this exclusively. Loading and discovery
+/// take shared leases, so they can run together but cannot observe or mutate a
+/// provisional directory before publication releases the exclusive claim.
 #[derive(Debug)]
-struct SessionIdLock {
+pub(crate) struct SessionIdLock {
     _lock_file: std::fs::File,
 }
 
-fn acquire_session_id_lock_sync(root_dir: &Path, session_id: &str) -> io::Result<SessionIdLock> {
+fn open_session_id_lock_file(root_dir: &Path, session_id: &str) -> io::Result<std::fs::File> {
     let lock_dir = root_dir.join(".locks").join("session-ids");
     std::fs::create_dir_all(&lock_dir)?;
-    let lock_file = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(lock_dir.join(session_claim_lock_name(session_id)))?;
-    lock_file.lock_exclusive()?;
+        .open(lock_dir.join(session_claim_lock_name(session_id)))
+}
+
+fn acquire_session_id_lock_sync(root_dir: &Path, session_id: &str) -> io::Result<SessionIdLock> {
+    let lock_file = open_session_id_lock_file(root_dir, session_id)?;
+    FileExt::lock_exclusive(&lock_file)?;
+    Ok(SessionIdLock {
+        _lock_file: lock_file,
+    })
+}
+
+fn acquire_session_id_read_lock_sync(
+    root_dir: &Path,
+    session_id: &str,
+) -> io::Result<SessionIdLock> {
+    let lock_file = open_session_id_lock_file(root_dir, session_id)?;
+    FileExt::lock_shared(&lock_file)?;
     Ok(SessionIdLock {
         _lock_file: lock_file,
     })
@@ -3170,6 +3192,37 @@ async fn acquire_session_id_lock(root_dir: &Path, session_id: &str) -> io::Resul
     tokio::task::spawn_blocking(move || acquire_session_id_lock_sync(&root_dir, &session_id))
         .await
         .map_err(io::Error::other)?
+}
+
+async fn acquire_session_id_read_lock(
+    root_dir: &Path,
+    session_id: &str,
+) -> io::Result<SessionIdLock> {
+    let root_dir = root_dir.to_path_buf();
+    let session_id = session_id.to_owned();
+    tokio::task::spawn_blocking(move || acquire_session_id_read_lock_sync(&root_dir, &session_id))
+        .await
+        .map_err(io::Error::other)?
+}
+
+/// Attempt to take a shared per-session visibility lock without waiting.
+///
+/// Discovery paths use this to omit a fresh session while its creator still
+/// owns the lock. In particular, the lock remains held across the synchronous
+/// marker removal and [`crate::session::SessionPublicationGate::publish`], so a
+/// marker-free provisional directory cannot leak through a concurrent list.
+pub(crate) fn try_acquire_session_id_read_lock_sync(
+    root_dir: &Path,
+    session_id: &str,
+) -> io::Result<Option<SessionIdLock>> {
+    let lock_file = open_session_id_lock_file(root_dir, session_id)?;
+    match FileExt::try_lock_shared(&lock_file) {
+        Ok(()) => Ok(Some(SessionIdLock {
+            _lock_file: lock_file,
+        })),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(unix)]
@@ -3239,24 +3292,68 @@ fn reclaim_stale_unpublished_sessions(sessions_root: &Path, session_id: &str) ->
     Ok(())
 }
 
-fn finalize_fresh_publication_in_root_sync(root_dir: &Path, info: &Info) -> io::Result<()> {
+#[derive(Debug)]
+pub(crate) enum FreshPublicationFinalizeError {
+    /// The marker still exists, so provisional creation may be safely aborted.
+    NotCommitted(io::Error),
+    /// The marker was removed. Publication is committed even though its final
+    /// directory durability acknowledgement failed; the caller must publish.
+    Committed(io::Error),
+}
+
+impl std::fmt::Display for FreshPublicationFinalizeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotCommitted(error) => write!(formatter, "publication not committed: {error}"),
+            Self::Committed(error) => write!(formatter, "publication committed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for FreshPublicationFinalizeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NotCommitted(error) | Self::Committed(error) => Some(error),
+        }
+    }
+}
+
+fn finalize_fresh_publication_in_root_sync_with<B, A>(
+    root_dir: &Path,
+    info: &Info,
+    before_unlink: B,
+    sync_after_unlink: A,
+) -> Result<(), FreshPublicationFinalizeError>
+where
+    B: FnOnce(&Path) -> io::Result<()>,
+    A: FnOnce(&Path) -> io::Result<()>,
+{
     let session_dir = root_dir
         .join("sessions")
         .join(crate::util::grok_home::encode_cwd_dirname(&info.cwd))
         .join(info.id.to_string());
     let marker_path = session_dir.join(UNPUBLISHED_SESSION_MARKER);
-    let metadata = std::fs::symlink_metadata(&marker_path)?;
+    let metadata = std::fs::symlink_metadata(&marker_path)
+        .map_err(FreshPublicationFinalizeError::NotCommitted)?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return Err(io::Error::new(
+        return Err(FreshPublicationFinalizeError::NotCommitted(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "fresh-session publication marker is not a regular file: {}",
                 marker_path.display()
             ),
-        ));
+        )));
     }
-    std::fs::remove_file(&marker_path)?;
-    sync_directory(&session_dir)
+    before_unlink(&marker_path).map_err(FreshPublicationFinalizeError::NotCommitted)?;
+    std::fs::remove_file(&marker_path).map_err(FreshPublicationFinalizeError::NotCommitted)?;
+    sync_after_unlink(&session_dir).map_err(FreshPublicationFinalizeError::Committed)
+}
+
+fn finalize_fresh_publication_in_root_sync(
+    root_dir: &Path,
+    info: &Info,
+) -> Result<(), FreshPublicationFinalizeError> {
+    finalize_fresh_publication_in_root_sync_with(root_dir, info, |_| Ok(()), sync_directory)
 }
 
 /// Complete the on-disk part of fresh-session publication without an await.
@@ -3265,7 +3362,9 @@ fn finalize_fresh_publication_in_root_sync(root_dir: &Path, info: &Info) -> io::
 /// commit, then publish the session gate with no intervening fallible work.
 /// The persistence actor retains the exclusive id claim until it observes the
 /// published gate.
-pub(crate) fn finalize_fresh_publication_sync(info: &Info) -> io::Result<()> {
+pub(crate) fn finalize_fresh_publication_sync(
+    info: &Info,
+) -> Result<(), FreshPublicationFinalizeError> {
     finalize_fresh_publication_in_root_sync(&grok_home(), info)
 }
 
@@ -3547,7 +3646,7 @@ pub(crate) async fn load(
     registry_title_sync: Option<RegistryGeneratedTitleSync>,
 ) -> io::Result<(PersistedInfo, PersistenceHandle)> {
     let root_dir = grok_home();
-    let _session_id_lock = acquire_session_id_lock(&root_dir, &info.id.to_string()).await?;
+    let _session_id_lock = acquire_session_id_read_lock(&root_dir, &info.id.to_string()).await?;
     let storage: Box<dyn StorageAdapter> =
         Box::new(JsonlStorageAdapter::with_root(root_dir.clone()));
 
@@ -3630,7 +3729,7 @@ pub(crate) async fn load_light(
     registry_title_sync: Option<RegistryGeneratedTitleSync>,
 ) -> io::Result<(PersistedInfoLight, PersistenceHandle)> {
     let root_dir = grok_home();
-    let _session_id_lock = acquire_session_id_lock(&root_dir, &info.id.to_string()).await?;
+    let _session_id_lock = acquire_session_id_read_lock(&root_dir, &info.id.to_string()).await?;
     let storage: Box<dyn StorageAdapter> =
         Box::new(JsonlStorageAdapter::with_root(root_dir.clone()));
 
@@ -3729,8 +3828,9 @@ pub async fn list_summaries(cwd: Option<&str>) -> io::Result<Vec<Summary>> {
 /// on [`delete_session_history`]).
 #[derive(Debug, thiserror::Error)]
 pub enum DeleteSessionError {
-    /// Listing local summaries (to resolve the on-disk session dir) failed.
-    #[error("failed to list sessions: {0}")]
+    /// Acquiring the local visibility lock or resolving the on-disk session
+    /// directory failed.
+    #[error("failed to resolve local session: {0}")]
     List(#[source] io::Error),
     /// The remote (writeback) copy could not be deleted; local bits were
     /// left untouched so the operation can be retried.
@@ -3764,6 +3864,35 @@ impl SessionDeletion {
     }
 }
 
+fn find_deletable_local_info_in_root(
+    root_dir: &Path,
+    session_id: &str,
+    cwd: Option<&str>,
+) -> io::Result<Option<Info>> {
+    let sessions_root = root_dir.join("sessions");
+    let view = storage_view(&sessions_root).map_err(io::Error::other)?;
+    let session_dir = match cwd {
+        Some(cwd) => view
+            .session_dirs(Some(cwd))
+            .map_err(io::Error::other)?
+            .into_iter()
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name == std::ffi::OsStr::new(session_id))
+            }),
+        None => view
+            .find_persisted_session_dir(session_id)
+            .map_err(io::Error::other)?,
+    };
+    let Some(session_dir) = session_dir else {
+        return Ok(None);
+    };
+    Ok(read_summary_from_dir(&session_dir)
+        .ok()
+        .filter(|summary| summary.info.id.0.as_ref() == session_id && !summary.is_hidden())
+        .map(|summary| summary.info))
+}
+
 /// Permanently delete a session's history: the remote (writeback) copy
 /// when `needs_remote`, the local on-disk session directory, and the
 /// FTS search-index entry.
@@ -3785,18 +3914,16 @@ pub async fn delete_session_history(
     needs_remote: bool,
     auth_manager: Arc<crate::auth::AuthManager>,
 ) -> Result<SessionDeletion, DeleteSessionError> {
-    let sid = acp::SessionId::new(Arc::from(session_id));
-
-    // Resolve the local session info, scoping to cwd if provided. A
-    // remote-only session won't be found here — that's fine, the remote
-    // delete (if applicable) still runs.
-    let summaries = list_summaries(cwd)
+    let root_dir = crate::util::grok_home::grok_home();
+    let _session_id_lock = acquire_session_id_lock(&root_dir, session_id)
         .await
         .map_err(DeleteSessionError::List)?;
-    let local_info = summaries
-        .iter()
-        .find(|s| s.info.id == sid)
-        .map(|s| s.info.clone());
+
+    // Resolve under the same cross-process id lock held by fresh creation.
+    // This waits out the marker-free finalizer-to-gate window and prevents a
+    // delete from racing a creator that is still provisional.
+    let local_info = find_deletable_local_info_in_root(&root_dir, session_id, cwd)
+        .map_err(DeleteSessionError::List)?;
 
     // Remote delete first (authoritative for cloud history). A genuine
     // failure aborts before any local mutation so the row does not
@@ -5605,6 +5732,58 @@ mod fresh_session_claim_tests {
             .expect("test sampling client")
     }
 
+    #[test]
+    fn final_publication_failure_before_unlink_is_not_committed() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000120";
+        const CWD: &str = "/repo/publication/pre-unlink-failure";
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let info = test_info(SESSION_ID, CWD);
+        let session_dir = test_session_dir(root.path(), CWD, SESSION_ID);
+        let claim = claim_fresh_session_sync(root.path(), SESSION_ID, session_dir.clone())
+            .expect("fresh claim");
+
+        let result = finalize_fresh_publication_in_root_sync_with(
+            root.path(),
+            &info,
+            |_| Err(io::Error::other("injected pre-unlink failure")),
+            |_| Ok(()),
+        );
+
+        assert!(matches!(
+            result,
+            Err(FreshPublicationFinalizeError::NotCommitted(error))
+                if error.to_string() == "injected pre-unlink failure"
+        ));
+        assert!(session_dir.join(UNPUBLISHED_SESSION_MARKER).is_file());
+        drop(claim);
+    }
+
+    #[test]
+    fn final_publication_directory_sync_failure_is_committed() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000121";
+        const CWD: &str = "/repo/publication/post-unlink-failure";
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let info = test_info(SESSION_ID, CWD);
+        let session_dir = test_session_dir(root.path(), CWD, SESSION_ID);
+        let claim = claim_fresh_session_sync(root.path(), SESSION_ID, session_dir.clone())
+            .expect("fresh claim");
+
+        let result = finalize_fresh_publication_in_root_sync_with(
+            root.path(),
+            &info,
+            |_| Ok(()),
+            |_| Err(io::Error::other("injected directory sync failure")),
+        );
+
+        assert!(matches!(
+            result,
+            Err(FreshPublicationFinalizeError::Committed(error))
+                if error.to_string() == "injected directory sync failure"
+        ));
+        assert!(!session_dir.join(UNPUBLISHED_SESSION_MARKER).exists());
+        claim.disarm();
+    }
+
     async fn production_new(info: &Info) -> io::Result<PersistenceHandle> {
         new(
             info,
@@ -5685,7 +5864,9 @@ mod fresh_session_claim_tests {
                     Err(error) => format!("ERROR:{:?}", error.kind()),
                 }
             }
-            "production-new-hold-publish" | "production-new-hold-abort" => {
+            "production-new-hold-publish"
+            | "production-new-hold-finalized-publish"
+            | "production-new-hold-abort" => {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -5700,11 +5881,21 @@ mod fresh_session_claim_tests {
                         publication_gate.clone(),
                     ))
                     .expect("arm fresh publication gate");
+                let finalized_before_gate = mode == "production-new-hold-finalized-publish";
+                if finalized_before_gate {
+                    finalize_fresh_publication_in_root_sync(&root, &test_info(&session_id, &cwd))
+                        .expect("durably finalize fresh storage before holding the gate");
+                }
                 print_child_ready();
                 wait_for_child_release(&release_path);
-                if mode == "production-new-hold-publish" {
-                    finalize_fresh_publication_in_root_sync(&root, &test_info(&session_id, &cwd))
+                if mode != "production-new-hold-abort" {
+                    if !finalized_before_gate {
+                        finalize_fresh_publication_in_root_sync(
+                            &root,
+                            &test_info(&session_id, &cwd),
+                        )
                         .expect("durably publish fresh storage");
+                    }
                     publication_gate.publish();
                     let (respond_to, response) = tokio::sync::oneshot::channel();
                     handle
@@ -6069,7 +6260,7 @@ mod fresh_session_claim_tests {
     }
 
     #[test]
-    fn cross_process_list_and_delete_ignore_pending_then_list_sees_publication() {
+    fn cross_process_list_ignores_pending_then_sees_publication() {
         const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000113";
         const CWD: &str = "/repo/production-discovery/publication";
 
@@ -6080,14 +6271,76 @@ mod fresh_session_claim_tests {
         let pending_list = spawn_claim_child("production-list", root.path(), SESSION_ID, CWD);
         assert_child_result(&finish_claim_child(pending_list), "ABSENT");
 
-        let pending_delete = spawn_claim_child("production-delete", root.path(), SESSION_ID, CWD);
-        assert_child_result(&finish_claim_child(pending_delete), "ABSENT_PRESERVED");
-
         release_claim_child(root.path());
         assert_child_result(&finish_claim_child(creator), "PUBLISHED");
 
         let published_list = spawn_claim_child("production-list", root.path(), SESSION_ID, CWD);
         assert_child_result(&finish_claim_child(published_list), "PRESENT");
+    }
+
+    #[test]
+    fn cross_process_list_skips_and_delete_waits_between_finalizer_and_gate() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000122";
+        const CWD: &str = "/repo/production-discovery/finalizer-gate-gap";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let creator = spawn_claim_child(
+            "production-new-hold-finalized-publish",
+            root.path(),
+            SESSION_ID,
+            CWD,
+        );
+        let session_dir = test_session_dir(root.path(), CWD, SESSION_ID);
+        assert!(session_dir.join("summary.json").is_file());
+        assert!(
+            !session_dir.join(UNPUBLISHED_SESSION_MARKER).exists(),
+            "fixture must pause after marker removal and before gate publication"
+        );
+
+        let pending_list = spawn_claim_child("production-list", root.path(), SESSION_ID, CWD);
+        assert_child_result(&finish_claim_child(pending_list), "ABSENT");
+
+        let mut pending_delete =
+            spawn_claim_child("production-delete", root.path(), SESSION_ID, CWD);
+        assert_claim_child_is_blocked(
+            &mut pending_delete,
+            "production delete during finalizer-to-gate gap",
+        );
+
+        release_claim_child(root.path());
+        assert_child_result(&finish_claim_child(creator), "PUBLISHED");
+        assert_child_result(&finish_claim_child(pending_delete), "REMOVED:true:false");
+        assert!(
+            !session_dir.exists(),
+            "delete may remove the session only after publication releases the id lock"
+        );
+    }
+
+    #[test]
+    fn cross_process_load_waits_between_finalizer_and_gate() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000123";
+        const CWD: &str = "/repo/production-load/finalizer-gate-gap";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let creator = spawn_claim_child(
+            "production-new-hold-finalized-publish",
+            root.path(),
+            SESSION_ID,
+            CWD,
+        );
+        assert!(
+            !test_session_dir(root.path(), CWD, SESSION_ID)
+                .join(UNPUBLISHED_SESSION_MARKER)
+                .exists(),
+            "fixture must pause after marker removal and before gate publication"
+        );
+
+        let mut loader = spawn_claim_child("production-load", root.path(), SESSION_ID, CWD);
+        assert_claim_child_is_blocked(&mut loader, "production load during finalizer-to-gate gap");
+
+        release_claim_child(root.path());
+        assert_child_result(&finish_claim_child(creator), "PUBLISHED");
+        assert_child_result(&finish_claim_child(loader), "PRESENT");
     }
 
     #[test]

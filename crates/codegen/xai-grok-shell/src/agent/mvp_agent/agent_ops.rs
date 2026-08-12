@@ -2611,10 +2611,9 @@ impl MvpAgent {
             let authority = self.models_manager.session_model_authority(
                 campaign_candidate.as_ref().map(|campaign| campaign.value.as_str()),
             );
-            let auth_authority = NewSessionAuthAuthority {
-                generation: authority.auth_generation,
-                is_session_auth: authority.is_session_auth,
-            };
+            let auth_generation = authority.auth_generation;
+            let is_session_auth = authority.is_session_auth;
+            let catalog_generation = authority.catalog_generation;
             let fallback_model_id = authority.fallback_model_id;
             let default_reasoning_effort = authority.reasoning_effort;
             let campaign_nudge = campaign_candidate.filter(|_| authority.campaign_eligible);
@@ -2650,7 +2649,7 @@ impl MvpAgent {
                     }
                     return None;
                 }
-                if !model.info.visible_for_auth(auth_authority.is_session_auth) {
+                if !model.info.visible_for_auth(is_session_auth) {
                     tracing::warn!(
                         requested_model = requested,
                         "Requested model is unavailable for the current authentication mode; falling back to current default model"
@@ -2730,6 +2729,13 @@ impl MvpAgent {
             {
                 sampling_config.reasoning_effort = Some(effort);
             }
+            let auth_authority = NewSessionAuthAuthority {
+                generation: auth_generation,
+                is_session_auth,
+                catalog_generation,
+                catalog_identity: catalog_identity.clone(),
+                model_ready: crate::agent::config::model_readiness(&model).0,
+            };
             let plan = PreparedNewSessionModelPlan {
                 model_agent_type,
                 session_model_id,
@@ -2742,11 +2748,10 @@ impl MvpAgent {
                 unreadiness_custom,
             };
             before_seal();
-            if let Some(seal) = self
-                .auth_manager
-                .try_seal_selection(authority.auth_generation)
-            {
-                drop(seal);
+            if self.models_manager.new_session_generations_are_current(
+                auth_generation,
+                catalog_generation,
+            ) {
                 return Ok(plan);
             }
         }
@@ -5036,35 +5041,26 @@ impl MvpAgent {
     /// `Option<…>`s) for positional calls to be transposition-safe.
     fn commit_new_session_resident<R>(
         &self,
-        authority: Option<NewSessionAuthAuthority>,
-        winning_model: Option<&ModelEntry>,
+        authority: Option<&NewSessionAuthAuthority>,
         publish: impl FnOnce() -> R,
     ) -> Result<R, acp::Error> {
         let Some(authority) = authority else {
             return Ok(publish());
         };
-        let Some(winning_model) = winning_model else {
-            return Err(acp::Error::internal_error().data(
-                "Prepared new session lost its winning model before publication",
-            ));
-        };
-        let Some(_auth_seal) = self
-            .auth_manager
-            .try_seal_selection(authority.generation)
-        else {
-            return Err(acp::Error::invalid_params().data(
-                "Authentication changed while creating the session; retry the request",
-            ));
-        };
-        if !winning_model
-            .info
-            .visible_for_auth(authority.is_session_auth)
-        {
-            return Err(acp::Error::invalid_params().data(
-                "The selected model is unavailable for the current authentication mode",
-            ));
-        }
-        Ok(publish())
+        self.models_manager
+            .commit_new_session_model_authority(
+                authority.generation,
+                authority.is_session_auth,
+                authority.catalog_generation,
+                &authority.catalog_identity,
+                authority.model_ready,
+                publish,
+            )
+            .map_err(|error| {
+                acp::Error::invalid_params().data(format!(
+                    "{error}; retry the session creation request"
+                ))
+            })
     }
 
     async fn abort_unpublished_session(
@@ -5120,41 +5116,52 @@ impl MvpAgent {
         #[cfg(test)]
         run_new_session_before_resident_commit_hook();
 
-        let winning_model = prepared.winning_model.clone();
         let publication = self.commit_new_session_resident(
-            Some(prepared.auth_authority),
-            Some(&winning_model),
+            Some(&prepared.auth_authority),
             || -> Result<(SessionHandle, Option<SessionHandle>), acp::Error> {
                 let handle = prepared
                     .handle
                     .take()
                     .expect("prepared commit consumes its handle once");
-                if let Err(error) = handle
+                let reservation = match handle
                     .workspace_ops
-                    .bind_new_local_session(
-                        prepared.session_info.id.0.as_ref(),
-                        handle.tool_context.cwd.as_path().to_path_buf(),
-                        handle.hunk_tracker_handle.clone(),
-                        handle.workspace_toolset.clone(),
-                    )
+                    .reserve_new_local_session(prepared.session_info.id.0.as_ref())
                 {
-                    prepared.handle = Some(handle);
-                    return Err(acp::Error::internal_error()
-                        .data(format!("Failed to bind session workspace: {error}")));
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        prepared.handle = Some(handle);
+                        return Err(acp::Error::internal_error()
+                            .data(format!("Failed to reserve session workspace: {error}")));
+                    }
+                };
+                match crate::session::persistence::finalize_fresh_publication_sync(
+                    &prepared.session_info,
+                ) {
+                    Ok(()) => {}
+                    Err(crate::session::persistence::FreshPublicationFinalizeError::NotCommitted(
+                        error,
+                    )) => {
+                        drop(reservation);
+                        prepared.handle = Some(handle);
+                        return Err(acp::Error::internal_error().data(format!(
+                            "Failed to finalize provisional session persistence: {error}"
+                        )));
+                    }
+                    Err(crate::session::persistence::FreshPublicationFinalizeError::Committed(
+                        error,
+                    )) => {
+                        tracing::error!(
+                            error_kind = ?error.kind(),
+                            "session persistence committed but its parent directory sync failed; continuing publication"
+                        );
+                    }
                 }
-                if let Err(error) =
-                    crate::session::persistence::finalize_fresh_publication_sync(
-                        &prepared.session_info,
-                    )
-                {
-                    handle
-                        .workspace_ops
-                        .end_local_session(prepared.session_info.id.0.as_ref());
-                    prepared.handle = Some(handle);
-                    return Err(acp::Error::internal_error().data(format!(
-                        "Failed to finalize provisional session persistence: {error}"
-                    )));
-                }
+
+                reservation.commit(
+                    handle.tool_context.cwd.as_path().to_path_buf(),
+                    handle.hunk_tracker_handle.clone(),
+                    handle.workspace_toolset.clone(),
+                );
 
                 let thread = prepared
                     .thread
@@ -5164,6 +5171,7 @@ impl MvpAgent {
                 self.session_registry
                     .set_thread(&prepared.session_info.id, thread);
                 let displaced = self.insert_resident(&prepared.session_info.id, handle.clone());
+                prepared.publication_gate.publish();
                 Ok((handle, displaced))
             },
         );
@@ -5250,9 +5258,6 @@ impl MvpAgent {
                 Some(agent_name),
             );
         }
-        // Final synchronous publication boundary. From the persistence marker
-        // finalizer through here there is no await/cancellation point.
-        prepared.publication_gate.publish();
         if let Some(cleanup) = prepared.cleanup.as_mut() {
             cleanup.disarm();
         }
@@ -5362,7 +5367,7 @@ impl MvpAgent {
             !publication_gate.is_published(),
             "only auth-sealed /new sessions may start provisionally"
         );
-        let mut provisional_cleanup = new_session_auth_authority.map(|_| {
+        let mut provisional_cleanup = new_session_auth_authority.as_ref().map(|_| {
             ProvisionalNewSessionCleanup::new(
                 publication_gate.clone(),
                 persistence.tx.clone(),
@@ -5760,7 +5765,7 @@ impl MvpAgent {
                             .map(|entry| (identity, entry))
                     }) {
                     Some((identity, entry))
-                        if new_session_auth_authority.is_some_and(|authority| {
+                        if new_session_auth_authority.as_ref().is_some_and(|authority| {
                             !entry.info.visible_for_auth(authority.is_session_auth)
                         }) =>
                     {
@@ -5830,7 +5835,12 @@ impl MvpAgent {
             &catalog,
             &catalog_identity,
         );
-        let resident_publication_model = selected_model.cloned();
+        let resident_publication_identity = selected_model.map(|entry| {
+            (
+                catalog_identity.clone(),
+                crate::agent::config::model_readiness(entry).0,
+            )
+        });
         let unavailable_spawn_model = selected_model
             .is_some_and(|entry| !crate::agent::config::model_readiness(entry).0)
             .then(|| {
@@ -6104,6 +6114,7 @@ impl MvpAgent {
             }
         }
         let provisional_persistence_tx = new_session_auth_authority
+            .as_ref()
             .map(|_| persistence.tx.clone());
         let spawn_result = {
             let _timer = crate::instrumentation_timer!("session.spawn_actor_call");
@@ -6423,11 +6434,13 @@ impl MvpAgent {
             return Err(acp::Error::internal_error()
                 .data("Failed to arm provisional session publication"));
         }
-        if let Some(auth_authority) = new_session_auth_authority {
-            let winning_model = resident_publication_model.ok_or_else(|| {
+        if let Some(mut auth_authority) = new_session_auth_authority {
+            let (winning_identity, winning_ready) = resident_publication_identity.ok_or_else(|| {
                 acp::Error::internal_error()
                     .data("Prepared new session lost its winning model before publication")
             })?;
+            auth_authority.catalog_identity = winning_identity;
+            auth_authority.model_ready = winning_ready;
             let initialize_system_prompt = chat_history.is_empty().then(|| {
                 build_spawn_system_prompt(session_meta, init_meta, &agent_system_prompt)
             });
@@ -6439,7 +6452,6 @@ impl MvpAgent {
                 publication_gate,
                 cleanup: provisional_cleanup.take(),
                 auth_authority,
-                winning_model,
                 deferred_relay_state_rx,
                 upgrade_persistence_to_writeback,
                 web_search_disable_notice,
@@ -6451,8 +6463,7 @@ impl MvpAgent {
         #[cfg(test)]
         run_new_session_before_resident_commit_hook();
         let publication = self.commit_new_session_resident(
-            new_session_auth_authority,
-            resident_publication_model.as_ref(),
+            new_session_auth_authority.as_ref(),
             || {
                 let thread = unpublished_thread
                     .take()

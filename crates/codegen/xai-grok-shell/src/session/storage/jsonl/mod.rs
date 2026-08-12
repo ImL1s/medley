@@ -2,7 +2,7 @@ use super::{PersistedData, SessionUpdateEnvelope, StorageAdapter};
 use crate::sampling::types::ChatRequestMessage;
 use crate::sampling::{ContentPart, ConversationItem};
 use crate::session::info::Info;
-use crate::session::persistence::{CHAT_FORMAT_VERSION, Summary};
+use crate::session::persistence::{CHAT_FORMAT_VERSION, SessionIdLock, Summary};
 use crate::tools::todo::TodoState;
 use agent_client_protocol as acp;
 use async_trait::async_trait;
@@ -34,11 +34,15 @@ pub struct JsonlStorageAdapter {
     update_append_probe: Option<std::sync::Arc<AppendProbe>>,
     #[cfg(test)]
     model_switch_probe: Option<std::sync::Arc<ModelSwitchProbe>>,
+    #[cfg(test)]
+    session_sync_probe: Option<std::sync::Arc<SessionSyncProbe>>,
 }
 #[cfg(test)]
 type AppendProbe = dyn Fn(AppendDurability) -> io::Result<()> + Send + Sync;
 #[cfg(test)]
 type ModelSwitchProbe = dyn Fn(ModelSwitchCommitStep) -> io::Result<()> + Send + Sync;
+#[cfg(test)]
+type SessionSyncProbe = dyn Fn() -> io::Result<()> + Send + Sync;
 impl Default for JsonlStorageAdapter {
     fn default() -> Self {
         Self::new()
@@ -52,6 +56,8 @@ impl JsonlStorageAdapter {
             update_append_probe: None,
             #[cfg(test)]
             model_switch_probe: None,
+            #[cfg(test)]
+            session_sync_probe: None,
         }
     }
     pub fn with_root(root_dir: PathBuf) -> Self {
@@ -61,6 +67,8 @@ impl JsonlStorageAdapter {
             update_append_probe: None,
             #[cfg(test)]
             model_switch_probe: None,
+            #[cfg(test)]
+            session_sync_probe: None,
         }
     }
     /// Create an adapter that writes directly to `session_dir`, bypassing
@@ -75,6 +83,8 @@ impl JsonlStorageAdapter {
             update_append_probe: None,
             #[cfg(test)]
             model_switch_probe: None,
+            #[cfg(test)]
+            session_sync_probe: None,
         }
     }
     #[cfg(test)]
@@ -86,6 +96,7 @@ impl JsonlStorageAdapter {
             dir_mode: SessionDirMode::Explicit(session_dir),
             update_append_probe: Some(std::sync::Arc::new(append_probe)),
             model_switch_probe: None,
+            session_sync_probe: None,
         }
     }
     #[cfg(test)]
@@ -97,6 +108,19 @@ impl JsonlStorageAdapter {
             dir_mode: SessionDirMode::FromRoot(root_dir),
             update_append_probe: None,
             model_switch_probe: Some(std::sync::Arc::new(probe)),
+            session_sync_probe: None,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn with_session_sync_probe(
+        session_dir: PathBuf,
+        probe: impl Fn() -> io::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            dir_mode: SessionDirMode::Explicit(session_dir),
+            update_append_probe: None,
+            model_switch_probe: None,
+            session_sync_probe: Some(std::sync::Arc::new(probe)),
         }
     }
     /// Load chat history from a specific directory.
@@ -193,7 +217,7 @@ impl JsonlStorageAdapter {
         let session_dirs = self.scan_session_dirs(cwd)?;
         let mut summaries = Vec::new();
         for session_dir in session_dirs {
-            if let Some(summary) = self.read_summary_for_listing(&session_dir) {
+            if let Some(summary) = self.read_summary_for_listing(&session_dir)? {
                 summaries.push(summary);
             }
         }
@@ -206,19 +230,45 @@ impl JsonlStorageAdapter {
         Ok(summaries)
     }
 
-    fn read_summary_for_listing(&self, session_dir: &Path) -> Option<Summary> {
+    fn try_lock_session_for_listing(
+        &self,
+        session_dir: &Path,
+    ) -> io::Result<Option<SessionIdLock>> {
+        let SessionDirMode::FromRoot(root_dir) = &self.dir_mode else {
+            return Ok(None);
+        };
+        let Some(session_id) = session_dir.file_name().and_then(|name| name.to_str()) else {
+            return Ok(None);
+        };
+        crate::session::persistence::try_acquire_session_id_read_lock_sync(root_dir, session_id)
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("failed to check publication lock for session {session_id}: {error}"),
+                )
+            })
+    }
+
+    fn read_summary_for_listing(&self, session_dir: &Path) -> io::Result<Option<Summary>> {
+        let Some(_session_id_lock) = self.try_lock_session_for_listing(session_dir)? else {
+            return Ok(None);
+        };
         if let Err(error) = self.recover_model_switch_in_dir_sync(session_dir) {
             tracing::warn!(
                 session_dir = %session_dir.display(),
                 ?error,
                 "failed recovering pending model-switch intent before listing session summary"
             );
-            return None;
+            return Ok(None);
         }
         let summary_path = session_dir.join(super::SUMMARY_FILE);
-        let bytes = std::fs::read(&summary_path).ok()?;
-        let summary = serde_json::from_slice::<Summary>(&bytes).ok()?;
-        (!summary.is_hidden()).then_some(summary)
+        let Some(bytes) = std::fs::read(&summary_path).ok() else {
+            return Ok(None);
+        };
+        let Some(summary) = serde_json::from_slice::<Summary>(&bytes).ok() else {
+            return Ok(None);
+        };
+        Ok((!summary.is_hidden()).then_some(summary))
     }
     /// List the N most recently modified session summaries across all
     /// workspaces.
@@ -230,9 +280,12 @@ impl JsonlStorageAdapter {
     /// Final order among candidates uses `last_active_at` else `updated_at`.
     pub async fn list_sessions_recent(&self, limit: usize) -> io::Result<Vec<Summary>> {
         let session_dirs = self.scan_session_dirs(None)?;
-        let mut candidates: Vec<(PathBuf, std::time::SystemTime)> =
+        let mut candidates: Vec<(PathBuf, std::time::SystemTime, SessionIdLock)> =
             Vec::with_capacity(session_dirs.len());
         for session_dir in session_dirs {
+            let Some(session_id_lock) = self.try_lock_session_for_listing(&session_dir)? else {
+                continue;
+            };
             if let Err(error) = self.recover_model_switch_in_dir_sync(&session_dir) {
                 tracing::warn!(
                     session_dir = %session_dir.display(),
@@ -245,22 +298,22 @@ impl JsonlStorageAdapter {
             if let Ok(meta) = std::fs::metadata(&summary_path)
                 && let Ok(mtime) = meta.modified()
             {
-                candidates.push((summary_path, mtime));
+                candidates.push((session_dir, mtime, session_id_lock));
             }
         }
         candidates.sort_unstable_by(|a, b| b.1.cmp(&a.1));
         candidates.truncate(limit);
         let mut summaries = Vec::with_capacity(candidates.len());
-        for (summary_path, _) in candidates {
-            match std::fs::read(&summary_path) {
-                Ok(bytes) => {
-                    if let Ok(summary) = serde_json::from_slice::<Summary>(&bytes)
-                        && !summary.is_hidden()
-                    {
-                        summaries.push(summary);
-                    }
-                }
-                Err(_) => continue,
+        for (session_dir, _, _session_id_lock) in candidates {
+            let summary_path = session_dir.join(super::SUMMARY_FILE);
+            let Some(bytes) = std::fs::read(&summary_path).ok() else {
+                continue;
+            };
+            let Some(summary) = serde_json::from_slice::<Summary>(&bytes).ok() else {
+                continue;
+            };
+            if !summary.is_hidden() {
+                summaries.push(summary);
             }
         }
         summaries.sort_by_cached_key(|s| {
@@ -1045,6 +1098,66 @@ impl JsonlStorageAdapter {
         .map_err(io::Error::other)?
     }
 }
+
+fn sync_session_tree_durable(session_dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    fn sync_directory_entry(directory: &Path) -> io::Result<()> {
+        std::fs::File::open(directory)?.sync_all()
+    }
+
+    #[cfg(windows)]
+    fn sync_directory_entry(_directory: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn sync_directory_entry(_directory: &Path) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable directory sync is unsupported on this platform",
+        ))
+    }
+
+    fn visit(dir: &Path, directories: &mut Vec<PathBuf>) -> io::Result<()> {
+        directories.push(dir.to_path_buf());
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "refusing to sync symlink in session directory: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            if file_type.is_dir() {
+                visit(&path, directories)?;
+            } else if file_type.is_file() {
+                let file = std::fs::File::open(&path)?;
+                super::sync_file_durable(&file)?;
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "refusing to sync non-file session entry: {}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    let mut directories = Vec::new();
+    visit(session_dir, &mut directories)?;
+    for directory in directories.into_iter().rev() {
+        sync_directory_entry(&directory)?;
+    }
+    super::sync_parent_directory(session_dir)
+}
 /// Rewrite the session id an update carries. Shared by the fork copy and the
 fn transform_session_id_in_update(
     update: super::SessionUpdate,
@@ -1603,23 +1716,12 @@ impl StorageAdapter for JsonlStorageAdapter {
         let info_clone = info.clone();
         let adapter_clone = self.clone();
         tokio::task::spawn_blocking(move || -> io::Result<()> {
-            use std::fs::OpenOptions;
             let adapter = adapter_clone;
-            let files_to_sync = [
-                adapter.updates_file(&info_clone),
-                adapter.chat_file(&info_clone),
-                adapter.summary_file(&info_clone),
-                adapter.plan_file(&info_clone),
-                adapter.rewind_points_file(&info_clone),
-            ];
-            for file_path in &files_to_sync {
-                if file_path.exists()
-                    && let Ok(file) = OpenOptions::new().write(true).open(file_path)
-                {
-                    let _ = file.sync_all();
-                }
+            #[cfg(test)]
+            if let Some(probe) = &adapter.session_sync_probe {
+                probe()?;
             }
-            Ok(())
+            sync_session_tree_durable(&adapter.session_dir(&info_clone))
         })
         .await
         .map_err(io::Error::other)?

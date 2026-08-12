@@ -6436,7 +6436,7 @@ async fn auth_type_no_method_id_with_current_returns_session_token() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn prepared_new_session_plan_survives_same_key_catalog_swap() {
+async fn prepared_new_session_plan_rebuilds_after_same_key_catalog_swap_before_seal() {
     let agent = build_minimal_agent_for_tests();
     let current = agent.models_manager.current_model_id();
     let original_catalog = agent.models_manager.models();
@@ -6445,10 +6445,13 @@ async fn prepared_new_session_plan_survives_same_key_catalog_swap() {
         .expect("minimal agent current model must exist")
         .clone();
     let original_route = original.info().model.clone();
-    let original_base_url = original.info().base_url.clone();
+    let replacement_base_url = format!(
+        "{}/replacement",
+        original.info().base_url.trim_end_matches('/')
+    );
     let mut replacement = original.clone();
     replacement.info.model = "same-key-replacement-route".to_owned();
-    replacement.info.base_url = "https://replacement.invalid/v1".to_owned();
+    replacement.info.base_url = replacement_base_url.clone();
     let mut replacement_catalog = original_catalog;
     replacement_catalog.insert(current.0.to_string(), replacement);
     let swapped = std::cell::Cell::new(false);
@@ -6461,31 +6464,42 @@ async fn prepared_new_session_plan_survives_same_key_catalog_swap() {
             }
         })
         .expect("same-key plan must resolve");
-    assert_eq!(plan.catalog_identity.route, original_route);
-    assert_eq!(plan.model_entry.info().model, original_route);
-    assert_eq!(plan.sampling_config.model, original_route);
-    assert_eq!(plan.sampling_config.base_url, original_base_url);
-    assert_ne!(
+    assert_eq!(plan.catalog_identity.route, "same-key-replacement-route");
+    assert_eq!(plan.model_entry.info().model, "same-key-replacement-route");
+    assert_eq!(plan.sampling_config.model, "same-key-replacement-route");
+    assert_eq!(plan.sampling_config.base_url, replacement_base_url);
+    assert!(
         agent
             .models_manager
-            .models()
-            .get(current.0.as_ref())
-            .expect("replacement remains published")
-            .info()
-            .model,
-        original_route,
-        "test must actually replace the live entry under the same key"
+            .new_session_model_authority_is_current(&plan.auth_authority),
+        "the rebuilt plan must carry the replacement catalog authority"
     );
-    assert_eq!(
-        agent
+    assert_ne!(plan.catalog_identity.route, original_route);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn prepared_new_session_plan_rejects_same_key_catalog_swap_at_publication() {
+    let agent = build_minimal_agent_for_tests();
+    let current = agent.models_manager.current_model_id();
+    let mut replacement_catalog = agent.models_manager.models();
+    let replacement = replacement_catalog
+        .get_mut(current.0.as_ref())
+        .expect("minimal agent current model must exist");
+    replacement.info.model = "post-prepare-replacement-route".to_owned();
+    replacement.info.base_url = "https://post-prepare.invalid/v1".to_owned();
+    let plan = agent
+        .prepare_new_session_model_plan(None, None)
+        .expect("initial plan must resolve");
+
+    agent
+        .models_manager
+        .apply_catalog_for_test(replacement_catalog);
+
+    assert!(
+        !agent
             .models_manager
-            .models()
-            .get(current.0.as_ref())
-            .expect("replacement remains published")
-            .info()
-            .base_url,
-        "https://replacement.invalid/v1",
-        "test must replace the endpoint while the prepared sampler stays pinned"
+            .new_session_model_authority_is_current(&plan.auth_authority),
+        "a post-prepare same-key route replacement must invalidate publication"
     );
 }
 

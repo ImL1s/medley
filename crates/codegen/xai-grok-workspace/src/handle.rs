@@ -189,7 +189,7 @@ use crate::session::swap_policy::{
     record_swap_decision, record_toolset_swap,
 };
 use crate::session::tool_config::resolve_session_toolset;
-use crate::session::{WorkspaceSession, WorkspaceShared};
+use crate::session::{WorkspaceSession, WorkspaceSessionRegistry, WorkspaceShared};
 use crate::telemetry::dc_log;
 use crate::workspace_ops::{
     GetFileEntry, GetFileResult, GetFilesRes, PutFileEntry, PutFileResult, PutFilesRes,
@@ -425,6 +425,73 @@ pub(crate) enum SwapOutcome {
     /// changed. See `toolset_terminal_is_session_owned`.
     SkippedExternallyOwned,
 }
+
+/// An unpublished claim on one workspace session identity.
+///
+/// Only [`WorkspaceLocalSessionReservation::promote_with_external_toolset`]
+/// makes the session visible. Dropping the claim releases it without creating
+/// a session, emitting lifecycle events, or constructing session-path state.
+#[must_use = "dropping a workspace session reservation cancels it"]
+pub(crate) struct WorkspaceLocalSessionReservation {
+    shared: Option<Arc<WorkspaceShared>>,
+    session_id: String,
+    claim: Arc<()>,
+}
+
+impl WorkspaceLocalSessionReservation {
+    pub(crate) fn promote_with_external_toolset(
+        mut self,
+        cwd: std::path::PathBuf,
+        hunk_tracker: HunkTrackerHandle,
+        toolset: Arc<xai_grok_tools::registry::types::FinalizedToolset>,
+        capability: CapabilityMode,
+    ) {
+        let shared = self
+            .shared
+            .as_ref()
+            .expect("reservation can only be promoted once");
+        // The external shell toolset owns its live terminal backend. Keep a
+        // separate, idle workspace backend solely as the teardown target.
+        let terminal_backend = shared.session_factory.build_terminal_backend();
+        let session = Arc::new(WorkspaceSession::new(
+            self.session_id.clone(),
+            cwd,
+            Arc::new(std::collections::HashMap::new()),
+            capability,
+            0,
+            u32::MAX,
+            Arc::new(shared.default_tool_config.clone()),
+            toolset,
+            terminal_backend,
+            hunk_tracker,
+            None,
+            None,
+            false,
+            None,
+        ));
+        let shared = self
+            .shared
+            .take()
+            .expect("reservation can only be promoted once");
+        shared
+            .sessions
+            .write()
+            .promote(self.session_id.clone(), &self.claim, session);
+    }
+}
+
+impl Drop for WorkspaceLocalSessionReservation {
+    fn drop(&mut self) {
+        let Some(shared) = self.shared.take() else {
+            return;
+        };
+        shared
+            .sessions
+            .write()
+            .cancel_reservation(&self.session_id, &self.claim);
+    }
+}
+
 /// Public handle to a workspace instance. Owns shared state (sessions,
 /// MCP snapshot, tool config, event bus) and session lifecycle.
 #[derive(Clone)]
@@ -550,7 +617,6 @@ impl WorkspaceHandle {
         tool_defs_enabled: bool,
         identity: crate::upload::environment::WorkspaceIdentity,
     ) -> WorkspaceResult<Self> {
-        let sessions = std::collections::HashMap::new();
         let local_registry = xai_computer_hub_sdk::LocalRegistry::new();
         let capacity = if config.event_buffer_capacity == 0 {
             DEFAULT_EVENT_BUFFER_CAPACITY
@@ -644,7 +710,7 @@ impl WorkspaceHandle {
             require_explicit_toolset: config.require_explicit_toolset,
             confine_fs_to_workspace_root: config.confine_fs_to_workspace_root,
             root_cwd: config.root_cwd.clone(),
-            sessions: parking_lot::RwLock::new(sessions),
+            sessions: parking_lot::RwLock::new(WorkspaceSessionRegistry::new()),
             session_factory: config.session_factory,
             mcp_tools_snapshot: arc_swap::ArcSwap::new(Arc::new(vec![])),
             events,
@@ -823,22 +889,11 @@ impl WorkspaceHandle {
             system_notifications,
         )
     }
-    /// Create a local-bind session without emitting its identity while the
-    /// caller is still inside a larger publication transaction.
-    ///
-    /// Unlike the ordinary bind entry point, this is intentionally strict:
-    /// an existing session is an error rather than a rebind target. The
-    /// caller may therefore treat success as ownership of a newly-created
-    /// workspace session and proceed directly to its no-fail publication
-    /// steps.
-    pub(crate) fn create_provisional_session_with_external_toolset(
+    /// Claim a new local session identity without exposing a live session.
+    pub(crate) fn reserve_new_local_session(
         &self,
         session_id: impl Into<String>,
-        cwd: std::path::PathBuf,
-        hunk_tracker: HunkTrackerHandle,
-        toolset: Arc<xai_grok_tools::registry::types::FinalizedToolset>,
-        capability: CapabilityMode,
-    ) -> WorkspaceResult<Arc<WorkspaceSession>> {
+    ) -> WorkspaceResult<WorkspaceLocalSessionReservation> {
         let session_id = session_id.into();
         if session_id.is_empty() {
             return Err(WorkspaceError::EmptyAgentId);
@@ -850,30 +905,14 @@ impl WorkspaceHandle {
         if sessions.contains_key(&session_id) {
             return Err(WorkspaceError::SessionAlreadyExists(session_id));
         }
-        // The external shell toolset owns its live terminal backend. Keep a
-        // separate, idle workspace backend solely as the teardown target,
-        // matching the established local-bind ownership contract without
-        // running the default toolset resolver (or logging provisional
-        // identity/path fields).
-        let terminal_backend = self.shared.session_factory.build_terminal_backend();
-        let session = Arc::new(WorkspaceSession::new(
-            session_id.clone(),
-            cwd,
-            Arc::new(std::collections::HashMap::new()),
-            capability,
-            0,
-            u32::MAX,
-            Arc::new(self.shared.default_tool_config.clone()),
-            toolset,
-            terminal_backend,
-            hunk_tracker,
-            None,
-            None,
-            false,
-            None,
-        ));
-        sessions.insert(session_id, session.clone());
-        Ok(session)
+        let claim = sessions
+            .reserve(session_id.clone())
+            .expect("session occupancy checked under the same write lock");
+        Ok(WorkspaceLocalSessionReservation {
+            shared: Some(self.shared.clone()),
+            session_id,
+            claim,
+        })
     }
     /// Shared creation body. `hunk_tracker_cancel` is `Some` only for
     /// workspace-spawned trackers, whose actor lifetime the session then

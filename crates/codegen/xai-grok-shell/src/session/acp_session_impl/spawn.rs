@@ -614,6 +614,37 @@ mod cli_catchall_drop_tests {
         assert!(dropped.is_empty());
     }
 }
+
+fn run_after_session_publication(
+    publication_gate: crate::session::SessionPublicationGate,
+    action: impl FnOnce() + 'static,
+) {
+    if publication_gate.is_published() {
+        action();
+        return;
+    }
+    tokio::task::spawn_local(async move {
+        if publication_gate.wait_until_published().await {
+            action();
+        }
+    });
+}
+
+fn permission_manager_activation(
+    publication_gate: crate::session::SessionPublicationGate,
+) -> tokio::sync::oneshot::Receiver<bool> {
+    let (activation_tx, activation_rx) = tokio::sync::oneshot::channel();
+    if publication_gate.is_published() {
+        let _ = activation_tx.send(true);
+    } else {
+        tokio::task::spawn_local(async move {
+            let published = publication_gate.wait_until_published().await;
+            let _ = activation_tx.send(published);
+        });
+    }
+    activation_rx
+}
+
 /// Spawns a session actor and returns the session handle plus a receiver for permission events.
 ///
 /// The permission events receiver should be used to collect telemetry about permission
@@ -776,7 +807,6 @@ pub(crate) async fn spawn_session_actor(
         };
         let project_trusted =
             crate::agent::folder_trust::project_scope_allowed(tool_context.cwd.as_path());
-        crate::config::warn_inert_project_model_sections(tool_context.cwd.as_path());
         let mut permission_config =
             xai_grok_workspace::permission::resolution::resolve_permission_config_with_fallback(
                 tool_context.cwd.as_path(),
@@ -845,8 +875,13 @@ pub(crate) async fn spawn_session_actor(
         } else {
             None
         };
+        let permission_cwd = tool_context.cwd.clone();
+        run_after_session_publication(publication_gate.clone(), move || {
+            crate::config::warn_inert_project_model_sections(permission_cwd.as_path());
+        });
+        let permission_activation = permission_manager_activation(publication_gate.clone());
         let (permissions, permission_events_rx) =
-            xai_grok_workspace::permission::spawn_permission_manager_with_hub(
+            xai_grok_workspace::permission::spawn_permission_manager_with_hub_deferred(
                 session_info.id.clone(),
                 gateway.clone(),
                 tool_context.cwd.clone(),
@@ -857,7 +892,9 @@ pub(crate) async fn spawn_session_actor(
                 session_yolo_mode,
                 session_client_identifier.clone(),
                 crate::util::config::remember_tool_approvals_from_disk(),
+                yolo_pin,
                 hub_permission,
+                permission_activation,
             );
         if crate::util::config::auto_mode_session_active(
             crate::util::config::auto_permission_mode_enabled_from_disk(),
@@ -2537,7 +2574,62 @@ pub(crate) async fn spawn_session_actor(
 
 #[cfg(test)]
 mod provisional_trace_privacy_tests {
-    use super::session_thread_name;
+    use super::{run_after_session_publication, session_thread_name};
+
+    #[tokio::test]
+    async fn provisional_side_effect_runs_only_after_publication() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let gate = crate::session::SessionPublicationGate::pending();
+                let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let calls_for_action = calls.clone();
+                run_after_session_publication(gate.clone(), move || {
+                    calls_for_action.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                });
+                tokio::task::yield_now().await;
+                assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+                gate.publish();
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    while calls.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("published side effect did not run");
+                assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn aborted_provisional_side_effect_remains_silent() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let gate = crate::session::SessionPublicationGate::pending();
+                let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let calls_for_action = calls.clone();
+                run_after_session_publication(gate.clone(), move || {
+                    calls_for_action.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                });
+
+                gate.abort();
+                tokio::task::yield_now().await;
+                assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+            })
+            .await;
+    }
+
+    #[test]
+    fn project_model_warning_is_routed_through_publication_gate() {
+        let source = include_str!("spawn.rs");
+        assert!(source.contains(concat!(
+            "run_after_session_publication(publication_gate.clone(), move || {\n",
+            "            crate::config::warn_inert_project_model_sections(permission_cwd.as_path());"
+        )));
+    }
 
     /// Provisional `/new` identity must not be attached to tracing spans or
     /// events while `spawn_session_actor` is still constructing the actor.

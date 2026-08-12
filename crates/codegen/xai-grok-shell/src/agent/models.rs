@@ -140,6 +140,7 @@ pub(crate) struct ResolvedModelCapabilities {
 pub(crate) struct SessionModelAuthoritySnapshot {
     pub(crate) auth_generation: u64,
     pub(crate) is_session_auth: bool,
+    pub(crate) catalog_generation: u64,
     pub(crate) catalog: IndexMap<String, ModelEntry>,
     pub(crate) fallback_model_id: acp::ModelId,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
@@ -599,6 +600,89 @@ impl ModelsManager {
             return Err(reason.unwrap_or_else(|| "model is not ready".to_owned()));
         }
         Ok(dispatch())
+    }
+
+    /// Hold the catalog read guard and auth-selection seal across the final
+    /// synchronous publication of a freshly prepared build session.
+    ///
+    /// A `/new` plan owns its sampler, but it may not publish that sampler if
+    /// the catalog entry was replaced under the same key or if its auth/readiness
+    /// authorization changed after preparation. The lock order deliberately
+    /// matches [`Self::commit_model_dispatch`].
+    pub(crate) fn commit_new_session_model_authority<R>(
+        &self,
+        auth_generation: u64,
+        is_session_auth: bool,
+        catalog_generation: u64,
+        catalog_identity: &xai_chat_state::CatalogIdentity,
+        prepared_ready: bool,
+        publish: impl FnOnce() -> R,
+    ) -> Result<R, String> {
+        let catalog = self.inner.catalog.read();
+        let Some(_auth_seal) = self.inner.auth_manager.try_seal_selection(auth_generation) else {
+            return Err("authentication changed before session publication".to_owned());
+        };
+        if self.catalog_generation() != catalog_generation {
+            return Err("model catalog changed before session publication".to_owned());
+        }
+        let Some(current_identity) = resolve_catalog_identity(
+            &catalog.models,
+            &acp::ModelId::new(catalog_identity.model_id.clone()),
+        ) else {
+            return Err("selected model is no longer available".to_owned());
+        };
+        if current_identity != *catalog_identity {
+            return Err("selected model route changed before session publication".to_owned());
+        }
+        let model = catalog
+            .models
+            .get(current_identity.model_id.as_str())
+            .expect("resolved catalog identity has a catalog entry");
+        if !model.info().user_selectable || !model.info().visible_for_auth(is_session_auth) {
+            return Err("selected model is no longer allowed".to_owned());
+        }
+        let (ready, reason) = config::model_readiness(model);
+        if ready != prepared_ready {
+            return Err(reason.unwrap_or_else(|| {
+                "selected model readiness changed before session publication".to_owned()
+            }));
+        }
+        Ok(publish())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_session_model_authority_is_current(
+        &self,
+        authority: &crate::agent::mvp_agent::NewSessionAuthAuthority,
+    ) -> bool {
+        self.commit_new_session_model_authority(
+            authority.generation,
+            authority.is_session_auth,
+            authority.catalog_generation,
+            &authority.catalog_identity,
+            authority.model_ready,
+            || (),
+        )
+        .is_ok()
+    }
+
+    /// Validate only the generations captured while preparing a new-session
+    /// plan. This deliberately does not take the catalog lock again: the
+    /// preparation snapshot already holds that read guard until it returns.
+    pub(crate) fn new_session_generations_are_current(
+        &self,
+        auth_generation: u64,
+        catalog_generation: u64,
+    ) -> bool {
+        if self.catalog_generation() != catalog_generation {
+            return false;
+        }
+        let Some(seal) = self.inner.auth_manager.try_seal_selection(auth_generation) else {
+            return false;
+        };
+        let catalog_is_current = self.catalog_generation() == catalog_generation;
+        drop(seal);
+        catalog_is_current
     }
 
     fn bump_catalog_generation(&self) {
@@ -1156,6 +1240,7 @@ impl ModelsManager {
             let cfg = self.inner.cfg.read();
             let usable_xai = Self::usable_ambient_xai_from_snapshot(&cfg, auth);
             let catalog = self.inner.catalog.read();
+            let catalog_generation = self.catalog_generation();
             let models = &catalog.models;
             let ready_codex_exists = models.values().any(|candidate| {
                 resolution::is_ready_selectable_openai_codex_entry(candidate, auth.is_session_auth)
@@ -1205,24 +1290,26 @@ impl ModelsManager {
             let owned_catalog = models.clone();
             drop(current_guard);
             drop(selection_commit);
+            drop(catalog);
+            drop(cfg);
             #[cfg(test)]
             before_commit();
-            if self
-                .inner
-                .auth_manager
-                .selection_generation_is_current(auth.generation)
+            if self.catalog_generation() == catalog_generation
+                && self
+                    .inner
+                    .auth_manager
+                    .selection_generation_is_current(auth.generation)
             {
                 return SessionModelAuthoritySnapshot {
                     auth_generation: auth.generation,
                     is_session_auth: auth.is_session_auth,
+                    catalog_generation,
                     catalog: owned_catalog,
                     fallback_model_id,
                     reasoning_effort,
                     campaign_eligible,
                 };
             }
-            drop(catalog);
-            drop(cfg);
             retries += 1;
             if retries >= IMPLICIT_SELECTION_RETRY_YIELD_AFTER {
                 std::thread::yield_now();

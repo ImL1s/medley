@@ -1426,7 +1426,7 @@ impl acp::Agent for MvpAgent {
                             .map(|plan| plan.model_entry.clone()),
                         new_session_auth_authority: prepared_model_plan
                             .as_ref()
-                            .map(|plan| plan.auth_authority),
+                            .map(|plan| plan.auth_authority.clone()),
                         publication_gate,
                         deferred_relay_state_rx,
                         upgrade_persistence_to_writeback: requested_storage_mode
@@ -1641,29 +1641,24 @@ impl acp::Agent for MvpAgent {
                 (requested, reason)
             }));
         if let Some((requested, reason)) = auto_switch {
-            let gateway = self.gateway.clone();
             let previous = acp::ModelId::new(requested);
             let current = spawned_session_model_id;
             let notify_session_id = session_id.clone();
-            tokio::task::spawn_local(async move {
-                let notification = crate::extensions::notification::SessionNotification {
-                    session_id: notify_session_id,
-                    update: crate::extensions::notification::SessionUpdate::ModelAutoSwitched {
-                        previous_model_id: previous.0.to_string(),
-                        new_model_id: current.0.to_string(),
-                        reason,
-                    },
-                    meta: None,
-                };
-                if let Ok(params) = serde_json::value::to_raw_value(&notification) {
-                    let _ = gateway
-                        .ext_notification(acp::ExtNotification::new(
-                            "x.ai/session_notification",
-                            params.into(),
-                        ))
-                        .await;
-                }
-            });
+            let notification = crate::extensions::notification::SessionNotification {
+                session_id: notify_session_id,
+                update: crate::extensions::notification::SessionUpdate::ModelAutoSwitched {
+                    previous_model_id: previous.0.to_string(),
+                    new_model_id: current.0.to_string(),
+                    reason,
+                },
+                meta: None,
+            };
+            if let Ok(params) = serde_json::value::to_raw_value(&notification) {
+                self.gateway.forward_fire_and_forget(acp::ExtNotification::new(
+                    "x.ai/session_notification",
+                    params.into(),
+                ));
+            }
         }
         Ok(response)
     }
