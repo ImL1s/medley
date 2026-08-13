@@ -751,20 +751,34 @@ mod tests {
                 return Err(io::Error::from_raw_os_error(status.0 as i32));
             }
             let _descriptor = WindowsLocalAllocation::new(raw_descriptor.0);
-            if dacl.is_null() || (*dacl).AceCount != 1 {
+            if dacl.is_null() {
                 return Ok(false);
             }
-            let mut raw_ace = std::ptr::null_mut();
-            if GetAce(dacl, 0, &mut raw_ace).is_err() || raw_ace.is_null() {
-                return Ok(false);
+            let current_sid = current_user.sid();
+            let mut current_user_full_control = false;
+            let mut foreign_allow = false;
+            for index in 0..(*dacl).AceCount {
+                let mut raw_ace = std::ptr::null_mut();
+                if GetAce(dacl, u32::from(index), &mut raw_ace).is_err() || raw_ace.is_null() {
+                    continue;
+                }
+                let ace = &*(raw_ace as *const ACCESS_ALLOWED_ACE);
+                if ace.Header.AceType != 0 {
+                    continue;
+                }
+                let ace_sid = windows::Win32::Security::PSID(
+                    std::ptr::addr_of!(ace.SidStart).cast_mut().cast(),
+                );
+                let full_control = ace.Mask == 0x10000000 || ace.Mask & 0x001f01ff == 0x001f01ff;
+                if EqualSid(ace_sid, current_sid).is_ok() {
+                    if full_control {
+                        current_user_full_control = true;
+                    }
+                } else {
+                    foreign_allow = true;
+                }
             }
-            let ace = &*(raw_ace as *const ACCESS_ALLOWED_ACE);
-            let ace_sid =
-                windows::Win32::Security::PSID(std::ptr::addr_of!(ace.SidStart).cast_mut().cast());
-            let full_control = ace.Mask == 0x10000000 || ace.Mask & 0x001f01ff == 0x001f01ff;
-            Ok(ace.Header.AceType == 0
-                && full_control
-                && EqualSid(ace_sid, current_user.sid()).is_ok())
+            Ok(current_user_full_control && !foreign_allow)
         }
     }
 
