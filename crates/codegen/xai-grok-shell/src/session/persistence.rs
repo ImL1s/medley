@@ -3835,6 +3835,13 @@ impl PublishedSessionWrite {
                 return Err(PublishedSessionFinalizeError::NotCommitted(error));
             }
         };
+        if published_path_occupied(&stage.target_session) {
+            self.stage = Some(stage);
+            return Err(PublishedSessionFinalizeError::NotCommitted(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "no-replace publication collided",
+            )));
+        }
         let stage_session_anchor = stage
             .stage_session_anchor
             .as_ref()
@@ -4604,6 +4611,14 @@ fn require_real_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn published_path_occupied(path: &Path) -> bool {
+    match path.try_exists() {
+        Ok(true) => true,
+        Ok(false) => false,
+        Err(_) => true,
+    }
+}
+
 fn restore_fresh_stage_session(publication: &FreshPublication, anchor: AnchoredDirectory) {
     *publication
         .stage_session_anchor
@@ -4624,6 +4639,12 @@ fn finalize_fresh_publication_sync_with(
 ) -> Result<(), FreshPublicationFinalizeError> {
     let summary = read_valid_staged_summary(&publication.stage_session)
         .map_err(FreshPublicationFinalizeError::NotCommitted)?;
+    if published_path_occupied(&publication.published_session) {
+        return Err(FreshPublicationFinalizeError::NotCommitted(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "no-replace publication collided",
+        )));
+    }
     let stage_session_anchor = publication
         .stage_session_anchor
         .lock()

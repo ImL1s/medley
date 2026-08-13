@@ -692,12 +692,12 @@ mod platform {
         SetSecurityDescriptorDacl, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
     use windows::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED,
-        FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
-        FileDispositionInfo, FileRenameInfoEx, GetFileInformationByHandle,
+        BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+        FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_RENAME_INFO,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES,
+        FILE_WRITE_DATA, FileDispositionInfo, FileRenameInfoEx, GetFileInformationByHandle,
         GetFinalPathNameByHandleW, SYNCHRONIZE, SetFileInformationByHandle,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -775,8 +775,15 @@ mod platform {
     const FILE_NAMES_INFORMATION: u32 = 12;
     const FILE_RENAME_INFORMATION: u32 = 10;
     const FILE_RENAME_INFORMATION_EX: u32 = 65;
+    const FILE_RENAME_REPLACE_IF_EXISTS: u32 = 0x0000_0001;
     const FILE_RENAME_POSIX_SEMANTICS: u32 = 0x0000_0002;
     const FILE_RENAME_IGNORE_READONLY_ATTRIBUTE: u32 = 0x0000_0040;
+    // POSIX exclusive-without-replace is rejected on current GHA images.
+    // Collision is enforced by probing the destination first; REPLACE is
+    // required for POSIX semantics (open SHARE_DELETE children can follow).
+    const FILE_RENAME_POSIX_REPLACE: u32 = FILE_RENAME_REPLACE_IF_EXISTS
+        | FILE_RENAME_POSIX_SEMANTICS
+        | FILE_RENAME_IGNORE_READONLY_ATTRIBUTE;
     const FILE_DISPOSITION_INFORMATION_EX: u32 = 64;
     const FILE_DISPOSITION_DELETE: u32 = 0x0000_0001;
     const FILE_DISPOSITION_POSIX_SEMANTICS: u32 = 0x0000_0002;
@@ -908,6 +915,7 @@ mod platform {
                     | FILE_READ_ATTRIBUTES
                     | FILE_TRAVERSE
                     | FILE_WRITE_DATA
+                    | FILE_APPEND_DATA
                     | DELETE
                     | windows::Win32::Storage::FileSystem::READ_CONTROL
                     | windows::Win32::Storage::FileSystem::WRITE_DAC
@@ -925,6 +933,7 @@ mod platform {
             | FILE_READ_ATTRIBUTES
             | FILE_TRAVERSE
             | FILE_WRITE_DATA
+            | FILE_APPEND_DATA
             | DELETE
             | windows::Win32::Storage::FileSystem::READ_CONTROL
             | windows::Win32::Storage::FileSystem::WRITE_DAC
@@ -937,6 +946,7 @@ mod platform {
             | FILE_READ_ATTRIBUTES
             | FILE_TRAVERSE
             | FILE_WRITE_DATA
+            | FILE_APPEND_DATA
             | DELETE
             | SYNCHRONIZE)
             .0;
@@ -1167,6 +1177,7 @@ mod platform {
                 | FILE_READ_ATTRIBUTES
                 | FILE_TRAVERSE
                 | FILE_WRITE_DATA
+                | FILE_APPEND_DATA
                 | SYNCHRONIZE
                 | DELETE
                 | windows::Win32::Storage::FileSystem::READ_CONTROL
@@ -1618,12 +1629,64 @@ mod platform {
         Ok(buffer)
     }
 
+    fn enable_rename_privileges() {
+        let _ = crate::util::secure_file::enable_windows_privilege(windows::core::w!(
+            "SeBackupPrivilege"
+        ));
+        let _ = crate::util::secure_file::enable_windows_privilege(windows::core::w!(
+            "SeRestorePrivilege"
+        ));
+    }
+
     fn rename_retained_handle_no_replace(
         source: &File,
         target_parent: &File,
         target_name: &OsStr,
     ) -> io::Result<()> {
-        let posix_flags = FILE_RENAME_POSIX_SEMANTICS | FILE_RENAME_IGNORE_READONLY_ATTRIBUTE;
+        enable_rename_privileges();
+        let mut last_error = None;
+        for attempt in 0..5_u32 {
+            match rename_retained_handle_no_replace_once(source, target_parent, target_name) {
+                Ok(()) => return Ok(()),
+                Err(error) if destination_name_exists(target_parent, target_name) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "no-replace rename collided",
+                    ));
+                }
+                Err(error) if rename_access_denied(&error) && attempt + 1 < 5 => {
+                    last_error = Some(error);
+                    std::thread::sleep(std::time::Duration::from_millis(10 << attempt));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "no-replace rename failed after retries",
+            )
+        }))
+    }
+
+    fn rename_access_denied(error: &io::Error) -> bool {
+        error.kind() == io::ErrorKind::PermissionDenied
+            || error.raw_os_error() == Some(5)
+            || error.to_string().contains("0xc0000022")
+    }
+
+    fn rename_retained_handle_no_replace_once(
+        source: &File,
+        target_parent: &File,
+        target_name: &OsStr,
+    ) -> io::Result<()> {
+        if destination_name_exists(target_parent, target_name) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "no-replace rename collided",
+            ));
+        }
+
         let mut relative: Vec<u16> = target_name.encode_wide().collect();
         relative.push(0);
         let mut relative_storage = allocate_rename_storage(&relative)?;
@@ -1631,7 +1694,7 @@ mod platform {
             &mut relative_storage,
             &relative,
             HANDLE(target_parent.as_raw_handle()),
-            posix_flags,
+            FILE_RENAME_POSIX_REPLACE,
             false,
         );
         let mut status_block = IoStatusBlock {
@@ -1650,20 +1713,19 @@ mod platform {
         if posix >= 0 {
             return Ok(());
         }
-        if nt_status_is_no_replace_collision(posix) {
+        if nt_status_is_no_replace_collision(posix)
+            || destination_name_exists(target_parent, target_name)
+        {
             return Err(map_nt_no_replace_error(posix, target_parent, target_name));
         }
 
-        // Open child writers need POSIX exclusive rename by an extended DOS
-        // path. A Win32 RootDirectory handle is enough for collisions, but
-        // GHA denies that handle when a child file is still open.
         if let Ok(extended) = destination_extended_dos_path(target_parent, target_name) {
             let mut extended_storage = allocate_rename_storage(&extended)?;
             let extended_len = fill_rename_info(
                 &mut extended_storage,
                 &extended,
                 HANDLE::default(),
-                posix_flags,
+                FILE_RENAME_POSIX_REPLACE,
                 false,
             );
             if unsafe {
@@ -1677,6 +1739,12 @@ mod platform {
             .is_ok()
             {
                 return Ok(());
+            }
+            if destination_name_exists(target_parent, target_name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "no-replace rename collided",
+                ));
             }
         }
 

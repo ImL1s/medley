@@ -340,6 +340,12 @@ impl CopyPublication {
             )));
         }
         sync_tree(&self.target_dir).map_err(CopyPublicationFinalizeError::NotCommitted)?;
+        if publication_target_occupied(&self.root_dir, &self.target_parent_name, &self.target_name)
+        {
+            return Err(CopyPublicationFinalizeError::NotCommitted(
+                publication_collision_error(),
+            ));
+        }
         let marker = OsStr::new(crate::session::persistence::UNPUBLISHED_SESSION_MARKER);
 
         let (published_parent_anchor, published_anchor, whole_parent_published) =
@@ -369,7 +375,17 @@ impl CopyPublication {
                         Ok(published) => published,
                         Err(failure) => {
                             self.stage_dir_anchor = Some(failure.source);
-                            return Err(CopyPublicationFinalizeError::NotCommitted(failure.error));
+                            let error = if failure.error.kind() == io::ErrorKind::AlreadyExists
+                                || publication_target_occupied(
+                                    &self.root_dir,
+                                    &self.target_parent_name,
+                                    &self.target_name,
+                                ) {
+                                publication_collision_error()
+                            } else {
+                                failure.error
+                            };
+                            return Err(CopyPublicationFinalizeError::NotCommitted(error));
                         }
                     };
                     (parent, published, false)
@@ -411,12 +427,23 @@ impl CopyPublication {
                             (published_parent, published, true)
                         }
                         Err(failure) => {
+                            if publication_target_occupied(
+                                &self.root_dir,
+                                &self.target_parent_name,
+                                &self.target_name,
+                            ) {
+                                self.stage_container_anchor = Some(failure.source);
+                                return Err(CopyPublicationFinalizeError::NotCommitted(
+                                    publication_collision_error(),
+                                ));
+                            }
                             let parent_taken = failure.error.kind() == io::ErrorKind::AlreadyExists
                                 || self
                                     .root_dir
                                     .join("sessions")
                                     .join(&self.target_parent_name)
-                                    .exists();
+                                    .try_exists()
+                                    .unwrap_or(true);
                             let container = failure.source;
                             self.stage_container_anchor = Some(container);
                             let child = self
@@ -438,8 +465,19 @@ impl CopyPublication {
                                     .join(&self.target_parent_name);
                                 let _ = self.stage_dir_anchor.take();
                                 let _ = self.stage_container_anchor.take();
-                                std::fs::rename(&src, &dest)
-                                    .map_err(CopyPublicationFinalizeError::NotCommitted)?;
+                                if let Err(error) = std::fs::rename(&src, &dest) {
+                                    if publication_target_occupied(
+                                        &self.root_dir,
+                                        &self.target_parent_name,
+                                        &self.target_name,
+                                    ) || dest.try_exists().unwrap_or(true)
+                                    {
+                                        return Err(CopyPublicationFinalizeError::NotCommitted(
+                                            publication_collision_error(),
+                                        ));
+                                    }
+                                    return Err(CopyPublicationFinalizeError::NotCommitted(error));
+                                }
                                 let published_parent = canonical_sessions
                                     .open_child_dir(&self.target_parent_name)
                                     .map_err(CopyPublicationFinalizeError::CommittedUnreachable)?;
@@ -448,9 +486,27 @@ impl CopyPublication {
                                     .map_err(CopyPublicationFinalizeError::CommittedUnreachable)?;
                                 (published_parent, published, true)
                             } else {
-                                let parent = canonical_sessions
+                                let parent = match canonical_sessions
                                     .open_child_dir(&self.target_parent_name)
-                                    .map_err(CopyPublicationFinalizeError::NotCommitted)?;
+                                {
+                                    Ok(parent) => parent,
+                                    Err(error) => {
+                                        if publication_target_occupied(
+                                            &self.root_dir,
+                                            &self.target_parent_name,
+                                            &self.target_name,
+                                        ) {
+                                            return Err(
+                                                CopyPublicationFinalizeError::NotCommitted(
+                                                    publication_collision_error(),
+                                                ),
+                                            );
+                                        }
+                                        return Err(CopyPublicationFinalizeError::NotCommitted(
+                                            error,
+                                        ));
+                                    }
+                                };
                                 crate::session::persistence::validate_existing_cwd_metadata(
                                     &parent,
                                     &self.target_parent_name,
@@ -465,19 +521,14 @@ impl CopyPublication {
                                     Ok(published) => published,
                                     Err(failure) => {
                                         self.stage_dir_anchor = Some(failure.source);
-                                        let published_dest = self
-                                            .root_dir
-                                            .join("sessions")
-                                            .join(&self.target_parent_name)
-                                            .join(&self.target_name);
                                         let error = if failure.error.kind()
                                             == io::ErrorKind::AlreadyExists
-                                            || published_dest.exists()
-                                        {
-                                            io::Error::new(
-                                                io::ErrorKind::AlreadyExists,
-                                                "no-replace publication collided",
-                                            )
+                                            || publication_target_occupied(
+                                                &self.root_dir,
+                                                &self.target_parent_name,
+                                                &self.target_name,
+                                            ) {
+                                            publication_collision_error()
                                         } else {
                                             failure.error
                                         };
@@ -491,7 +542,18 @@ impl CopyPublication {
                         }
                     }
                 }
-                Err(error) => return Err(CopyPublicationFinalizeError::NotCommitted(error)),
+                Err(error) => {
+                    if publication_target_occupied(
+                        &self.root_dir,
+                        &self.target_parent_name,
+                        &self.target_name,
+                    ) {
+                        return Err(CopyPublicationFinalizeError::NotCommitted(
+                            publication_collision_error(),
+                        ));
+                    }
+                    return Err(CopyPublicationFinalizeError::NotCommitted(error));
+                }
             };
         after_rename();
         // The no-replace rename publishes the fork. Never let a later sync
@@ -607,6 +669,22 @@ fn reconcile_copy_publication(
             );
             Ok(result)
         }
+    }
+}
+
+fn publication_collision_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no-replace publication collided",
+    )
+}
+
+fn publication_target_occupied(root: &Path, parent: &OsStr, name: &str) -> bool {
+    let dest = root.join("sessions").join(parent).join(name);
+    match dest.try_exists() {
+        Ok(true) => true,
+        Ok(false) => false,
+        Err(_) => true,
     }
 }
 
