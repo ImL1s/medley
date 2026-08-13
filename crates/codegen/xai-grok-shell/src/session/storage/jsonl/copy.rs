@@ -448,34 +448,78 @@ impl CopyPublication {
                                 .map_err(CopyPublicationFinalizeError::NotCommitted)?;
                             self.stage_dir_anchor = Some(child);
                             if !parent_taken {
-                                let src = self
-                                    .root_dir
-                                    .join(".private")
-                                    .join("session-staging")
-                                    .join(&self.stage_name);
-                                let dest = self
-                                    .root_dir
-                                    .join("sessions")
-                                    .join(&self.target_parent_name);
-                                let _ = self.stage_dir_anchor.take();
-                                let _ = self.stage_container_anchor.take();
-                                if let Err(error) = publish_stage_dir_no_replace(&src, &dest) {
-                                    if public_session_occupied(&self.public_target_dir)
-                                        || dest.try_exists().unwrap_or(true)
-                                    {
+                                let Some(dest_parent) = self.public_target_dir.parent() else {
+                                    return Err(CopyPublicationFinalizeError::NotCommitted(
+                                        io::Error::new(
+                                            io::ErrorKind::InvalidInput,
+                                            "fork target has no parent directory",
+                                        ),
+                                    ));
+                                };
+                                // create_dir_all is the same API init_session uses
+                                // to build sessions/{cwd}/... on GHA temp dirs.
+                                // Renaming the owner-only container as a unit is
+                                // still ACCESS_DENIED there.
+                                if let Err(error) = std::fs::create_dir_all(dest_parent) {
+                                    if public_session_occupied(&self.public_target_dir) {
                                         return Err(CopyPublicationFinalizeError::NotCommitted(
                                             publication_collision_error(),
                                         ));
                                     }
                                     return Err(CopyPublicationFinalizeError::NotCommitted(error));
                                 }
-                                let published_parent = canonical_sessions
-                                    .open_child_dir(&self.target_parent_name)
-                                    .map_err(CopyPublicationFinalizeError::CommittedUnreachable)?;
-                                let published = published_parent
-                                    .open_child_dir(OsStr::new(&self.target_name))
-                                    .map_err(CopyPublicationFinalizeError::CommittedUnreachable)?;
-                                (published_parent, published, true)
+                                if public_session_occupied(&self.public_target_dir) {
+                                    return Err(CopyPublicationFinalizeError::NotCommitted(
+                                        publication_collision_error(),
+                                    ));
+                                }
+                                let src = self
+                                    .root_dir
+                                    .join(".private")
+                                    .join("session-staging")
+                                    .join(&self.stage_name)
+                                    .join(&self.target_name);
+                                let _ = self.stage_dir_anchor.take();
+                                if let Err(error) =
+                                    publish_stage_dir_no_replace(&src, &self.public_target_dir)
+                                {
+                                    if public_session_occupied(&self.public_target_dir)
+                                        && src.try_exists().unwrap_or(false)
+                                    {
+                                        return Err(CopyPublicationFinalizeError::NotCommitted(
+                                            publication_collision_error(),
+                                        ));
+                                    }
+                                    if public_session_occupied(&self.public_target_dir) {
+                                        let published_parent = canonical_sessions
+                                            .open_child_dir(&self.target_parent_name)
+                                            .map_err(
+                                                CopyPublicationFinalizeError::CommittedUnreachable,
+                                            )?;
+                                        let published = published_parent
+                                            .open_child_dir(OsStr::new(&self.target_name))
+                                            .map_err(
+                                                CopyPublicationFinalizeError::CommittedUnreachable,
+                                            )?;
+                                        (published_parent, published, false)
+                                    } else {
+                                        return Err(CopyPublicationFinalizeError::NotCommitted(
+                                            error,
+                                        ));
+                                    }
+                                } else {
+                                    let published_parent = canonical_sessions
+                                        .open_child_dir(&self.target_parent_name)
+                                        .map_err(
+                                            CopyPublicationFinalizeError::CommittedUnreachable,
+                                        )?;
+                                    let published = published_parent
+                                        .open_child_dir(OsStr::new(&self.target_name))
+                                        .map_err(
+                                            CopyPublicationFinalizeError::CommittedUnreachable,
+                                        )?;
+                                    (published_parent, published, false)
+                                }
                             } else {
                                 let parent = match canonical_sessions
                                     .open_child_dir(&self.target_parent_name)
