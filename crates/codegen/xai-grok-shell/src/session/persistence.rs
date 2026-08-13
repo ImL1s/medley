@@ -8352,21 +8352,20 @@ mod fresh_session_claim_tests {
         let (staging_path, _staging) =
             ensure_private_staging_hierarchy_anchored(root.path()).unwrap();
         let junction = staging_path.join("linked-container");
-        // One /C string with quoted paths. `cmd /C mklink /J <path>` lets
-        // cmd/mklink treat a `/session-staging/...` component as a switch
-        // ("Invalid switch - session-staging\\linked-container").
-        let cmdline = format!(
-            r#"mklink /J "{}" "{}""#,
-            junction.display(),
-            outside.path().display()
-        );
+        // cmd's argv quoting plus `\\?\` tempfile prefixes both break mklink.
+        // `/S /C` + raw_arg keeps one command string; dunce strips the prefix.
+        let link = dunce::simplified(&junction);
+        let target = dunce::simplified(outside.path());
+        let cmdline = format!(r#"mklink /J "{}" "{}""#, link.display(), target.display());
         let mut command = std::process::Command::new("cmd");
-        command.args(["/C", &cmdline]);
+        command.arg("/S").arg("/C");
+        std::os::windows::process::CommandExt::raw_arg(&mut command, &cmdline);
         xai_tty_utils::detach_std_command(&mut command);
         let output = command.output().unwrap();
         assert!(
             output.status.success(),
-            "mklink failed: {}",
+            "mklink failed: stdout={} stderr={} cmd={cmdline}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
 
