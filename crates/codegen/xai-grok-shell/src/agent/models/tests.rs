@@ -3563,11 +3563,13 @@ fn test_catalog_auth_schemes_and_override() {
     let last_auth_header = Arc::new(std::sync::Mutex::new(None));
     let last_custom_header = Arc::new(std::sync::Mutex::new(None));
     let last_extra_header = Arc::new(std::sync::Mutex::new(None));
+    let last_identity_headers = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
 
     let target_reqs_clone = target_requests.clone();
     let auth_header_clone = last_auth_header.clone();
     let custom_header_clone = last_custom_header.clone();
     let extra_header_clone = last_extra_header.clone();
+    let identity_headers_clone = last_identity_headers.clone();
 
     let app = axum::Router::new().route(
         "/v1/models",
@@ -3588,6 +3590,17 @@ fn test_catalog_auth_schemes_and_override() {
             {
                 *extra_header_clone.lock().unwrap() = Some(s.to_string());
             }
+            let mut seen = Vec::new();
+            for name in [
+                "x-grok-deployment-id",
+                "x-grok-user-id",
+                "x-grok-session-id",
+            ] {
+                if headers.get(name).is_some() {
+                    seen.push(name.to_string());
+                }
+            }
+            *identity_headers_clone.lock().unwrap() = seen;
             axum::Json(serde_json::json!({
                 "data": [
                     {
@@ -3627,6 +3640,7 @@ fn test_catalog_auth_schemes_and_override() {
 
         *last_auth_header.lock().unwrap() = None;
         *last_custom_header.lock().unwrap() = None;
+        last_identity_headers.lock().unwrap().clear();
 
         let result = fetch_models_blocking(
             &cfg.endpoints,
@@ -3636,6 +3650,10 @@ fn test_catalog_auth_schemes_and_override() {
         assert!(result.is_ok());
         assert_eq!(*last_auth_header.lock().unwrap(), None);
         assert_eq!(*last_custom_header.lock().unwrap(), None);
+        assert!(
+            last_identity_headers.lock().unwrap().is_empty(),
+            "auth_scheme=none catalog fetch must omit xAI identity headers"
+        );
     }
 
     // 2. Bearer auth scheme
@@ -3650,6 +3668,8 @@ fn test_catalog_auth_schemes_and_override() {
         cfg.endpoints.catalog_auth = catalog_auth;
 
         *last_auth_header.lock().unwrap() = None;
+        *last_custom_header.lock().unwrap() = None;
+        last_identity_headers.lock().unwrap().clear();
 
         let result = fetch_models_blocking(
             &cfg.endpoints,
@@ -3660,6 +3680,15 @@ fn test_catalog_auth_schemes_and_override() {
         assert_eq!(
             *last_auth_header.lock().unwrap(),
             Some("Bearer dummy-bearer-token".to_string())
+        );
+        assert_eq!(
+            *last_custom_header.lock().unwrap(),
+            None,
+            "bearer catalog fetch must not also send x-api-key"
+        );
+        assert!(
+            last_identity_headers.lock().unwrap().is_empty(),
+            "third-party catalog fetch must omit xAI identity headers"
         );
     }
 
@@ -3674,7 +3703,9 @@ fn test_catalog_auth_schemes_and_override() {
         let catalog_auth = cfg.models.catalog_auth_config().unwrap();
         cfg.endpoints.catalog_auth = catalog_auth;
 
+        *last_auth_header.lock().unwrap() = None;
         *last_custom_header.lock().unwrap() = None;
+        last_identity_headers.lock().unwrap().clear();
 
         let result = fetch_models_blocking(
             &cfg.endpoints,
@@ -3685,6 +3716,15 @@ fn test_catalog_auth_schemes_and_override() {
         assert_eq!(
             *last_custom_header.lock().unwrap(),
             Some("dummy-x-api-key".to_string())
+        );
+        assert_eq!(
+            *last_auth_header.lock().unwrap(),
+            None,
+            "x_api_key catalog fetch must not also send Authorization"
+        );
+        assert!(
+            last_identity_headers.lock().unwrap().is_empty(),
+            "third-party catalog fetch must omit xAI identity headers"
         );
     }
 
