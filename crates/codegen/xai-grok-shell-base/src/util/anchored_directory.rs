@@ -1463,7 +1463,27 @@ mod platform {
                 api_len,
             )
         }
-        .map_err(io::Error::other)
+        .map_err(map_windows_no_replace_error)
+    }
+
+    fn map_windows_no_replace_error(error: windows::core::Error) -> io::Error {
+        const ERROR_FILE_EXISTS: u32 = 80;
+        const ERROR_ALREADY_EXISTS: u32 = 183;
+        const ERROR_OBJECT_NAME_EXISTS: u32 = 698;
+        let hresult = error.code().0 as u32;
+        let win32 = if hresult & 0xFFFF_0000 == 0x8007_0000 {
+            hresult & 0xFFFF
+        } else {
+            hresult
+        };
+        if matches!(
+            win32,
+            ERROR_FILE_EXISTS | ERROR_ALREADY_EXISTS | ERROR_OBJECT_NAME_EXISTS
+        ) {
+            io::Error::new(io::ErrorKind::AlreadyExists, error)
+        } else {
+            io::Error::other(error)
+        }
     }
 
     pub(super) fn rename_retained_child_dir_no_replace(
