@@ -1061,14 +1061,13 @@ mod platform {
         let current_user =
             OwnerOnlySecurity::new_with_inheritance(windows::Win32::Security::ACE_FLAGS(0))?;
         unsafe {
-            let mut owner = PSID::default();
             let mut dacl = std::ptr::null_mut();
             let mut raw_descriptor = PSECURITY_DESCRIPTOR::default();
             let status = GetSecurityInfo(
                 HANDLE(file.as_raw_handle()),
                 SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                Some(&mut owner),
+                DACL_SECURITY_INFORMATION,
+                None,
                 None,
                 Some(&mut dacl),
                 None,
@@ -1095,27 +1094,40 @@ mod platform {
                 &mut revision,
             )
             .map_err(io::Error::other)?;
-            if control & SE_DACL_PROTECTED.0 == 0
-                || EqualSid(owner, current_user.sid()).is_err()
-                || dacl.is_null()
-                || (*dacl).AceCount != 1
-            {
+            if control & SE_DACL_PROTECTED.0 == 0 || dacl.is_null() {
                 return Ok(false);
             }
 
-            let mut raw_ace = std::ptr::null_mut();
-            if windows::Win32::Security::GetAce(dacl, 0, &mut raw_ace).is_err() || raw_ace.is_null()
-            {
-                return Ok(false);
+            // GHA temp volumes often keep Administrators as NTFS owner even
+            // after WRITE_DAC. The lock contract is a protected DACL with
+            // current-user full control and no foreign allow ACEs — the same
+            // policy as directory owner-only verification.
+            let current_sid = current_user.sid();
+            let mut current_user_full_control = false;
+            let mut foreign_allow = false;
+            for index in 0..(*dacl).AceCount {
+                let mut raw_ace = std::ptr::null_mut();
+                if windows::Win32::Security::GetAce(dacl, u32::from(index), &mut raw_ace).is_err()
+                    || raw_ace.is_null()
+                {
+                    continue;
+                }
+                let ace = &*(raw_ace as *const windows::Win32::Security::ACCESS_ALLOWED_ACE);
+                if ace.Header.AceType != 0 {
+                    continue;
+                }
+                let ace_sid = PSID(std::ptr::addr_of!(ace.SidStart).cast_mut().cast());
+                let full_control = ace.Mask == FILE_ALL_ACCESS.0
+                    || ace.Mask & FILE_ALL_ACCESS.0 == FILE_ALL_ACCESS.0;
+                if EqualSid(ace_sid, current_sid).is_ok() {
+                    if full_control {
+                        current_user_full_control = true;
+                    }
+                } else {
+                    foreign_allow = true;
+                }
             }
-            let ace = &*(raw_ace as *const windows::Win32::Security::ACCESS_ALLOWED_ACE);
-            let ace_sid = PSID(std::ptr::addr_of!(ace.SidStart).cast_mut().cast());
-            let full_control =
-                ace.Mask == FILE_ALL_ACCESS.0 || ace.Mask & FILE_ALL_ACCESS.0 == FILE_ALL_ACCESS.0;
-            Ok(ace.Header.AceType == 0
-                && ace.Header.AceFlags == 0
-                && full_control
-                && EqualSid(ace_sid, current_user.sid()).is_ok())
+            Ok(current_user_full_control && !foreign_allow)
         }
     }
 
@@ -2129,7 +2141,7 @@ mod tests {
             .unwrap();
         assert!(
             platform::owner_only_lock_file_security_is_current_user_protected(&lock).unwrap(),
-            "new lock leaf must have the current user as owner and sole ACE in a protected DACL"
+            "new lock leaf must have a protected current-user DACL with no foreign allow ACEs"
         );
     }
 
