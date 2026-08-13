@@ -302,38 +302,37 @@ pub(super) fn rename_no_replace(source: &Path, target: &Path) -> Result<()> {
 
 #[cfg(windows)]
 pub(super) fn rename_no_replace(source: &Path, target: &Path) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Storage::FileSystem::{MOVE_FILE_FLAGS, MoveFileExW};
-    use windows::core::PCWSTR;
+    use xai_grok_shell_base::util::anchored_directory::AnchoredDirectory;
 
-    fn wide(path: &Path) -> Result<Vec<u16>> {
-        let absolute = std::path::absolute(path).map_err(|e| io_error("resolve", path, e))?;
-        let mut value = absolute.as_os_str().encode_wide().collect::<Vec<_>>();
-        if value.contains(&0) {
-            return Err(RelocationError::Inconsistent("path contains NUL".into()));
-        }
-        value.push(0);
-        Ok(value)
-    }
+    let source_parent = source.parent().ok_or_else(|| {
+        RelocationError::Inconsistent(format!("source has no parent: {}", source.display()))
+    })?;
+    let source_name = source.file_name().ok_or_else(|| {
+        RelocationError::Inconsistent(format!("source has no name: {}", source.display()))
+    })?;
+    let target_parent = target.parent().ok_or_else(|| {
+        RelocationError::Inconsistent(format!("target has no parent: {}", target.display()))
+    })?;
+    let target_name = target.file_name().ok_or_else(|| {
+        RelocationError::Inconsistent(format!("target has no name: {}", target.display()))
+    })?;
 
-    let source_wide = wide(source)?;
-    let target_wide = wide(target)?;
-    // WRITE_THROUGH only. Deliberately omit REPLACE_EXISTING and COPY_ALLOWED:
-    // collisions and cross-volume moves must fail closed.
-    let result = unsafe {
-        MoveFileExW(
-            PCWSTR(source_wide.as_ptr()),
-            PCWSTR(target_wide.as_ptr()),
-            MOVE_FILE_FLAGS(8),
-        )
-    };
-    result.map_err(|error| {
-        let io_error_value = io::Error::from(error);
-        match io_error_value.raw_os_error() {
-            Some(80 | 183) => RelocationError::Collision(target.to_path_buf()),
-            _ => io_error("publish", target, io_error_value),
-        }
-    })
+    // MoveFileExW reports ACCESS_DENIED both for a no-replace collision and
+    // for a directory that still has an open child writer. The anchored
+    // NT rename is exclusive and keeps the child handle bound.
+    let source_root = AnchoredDirectory::open_root(source_parent)
+        .map_err(|e| io_error("open", source_parent, e))?;
+    let target_root = AnchoredDirectory::open_root(target_parent)
+        .map_err(|e| io_error("open", target_parent, e))?;
+    source_root
+        .rename_child_dir_no_replace(source_name, &target_root, target_name)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                RelocationError::Collision(target.to_path_buf())
+            } else {
+                io_error("publish", target, error)
+            }
+        })
 }
 
 #[cfg(not(any(

@@ -773,6 +773,9 @@ mod platform {
 
     const FILE_NAMES_INFORMATION: u32 = 12;
     const FILE_RENAME_INFORMATION: u32 = 10;
+    const FILE_RENAME_INFORMATION_EX: u32 = 65;
+    const FILE_RENAME_POSIX_SEMANTICS: u32 = 0x0000_0002;
+    const FILE_RENAME_IGNORE_READONLY_ATTRIBUTE: u32 = 0x0000_0040;
     const FILE_DISPOSITION_INFORMATION_EX: u32 = 64;
     const FILE_DISPOSITION_DELETE: u32 = 0x0000_0001;
     const FILE_DISPOSITION_POSIX_SEMANTICS: u32 = 0x0000_0002;
@@ -1558,7 +1561,6 @@ mod platform {
             information: 0,
         };
         let status = unsafe {
-            (*info).Anonymous.ReplaceIfExists = false;
             (*info).RootDirectory = HANDLE(target_parent.as_raw_handle());
             (*info).FileNameLength = name_bytes;
             std::ptr::copy_nonoverlapping(
@@ -1566,16 +1568,29 @@ mod platform {
                 storage_bytes.add(header_len),
                 wide.len() * 2,
             );
-            // `SetFileInformationByHandle` can fail without a usable
-            // `GetLastError`, which made the Win32 mapper report `Other` for a
-            // real no-replace collision. Ask ntdll for the NTSTATUS instead.
-            NtSetInformationFile(
+            // POSIX exclusive rename keeps open child writers bound to the
+            // directory. Do not set REPLACE_IF_EXISTS.
+            (*info).Anonymous.Flags =
+                FILE_RENAME_POSIX_SEMANTICS | FILE_RENAME_IGNORE_READONLY_ATTRIBUTE;
+            let posix = NtSetInformationFile(
                 HANDLE(source.as_raw_handle()),
                 &mut status_block,
                 storage.as_ptr().cast(),
                 api_len,
-                FILE_RENAME_INFORMATION,
-            )
+                FILE_RENAME_INFORMATION_EX,
+            );
+            if posix >= 0 || nt_status_is_no_replace_collision(posix) {
+                posix
+            } else {
+                (*info).Anonymous.ReplaceIfExists = false;
+                NtSetInformationFile(
+                    HANDLE(source.as_raw_handle()),
+                    &mut status_block,
+                    storage.as_ptr().cast(),
+                    api_len,
+                    FILE_RENAME_INFORMATION,
+                )
+            }
         };
         if status >= 0 {
             Ok(())
