@@ -84,6 +84,8 @@ jobs:
       # the real URLs — percent-encoding of `+` in a tag, say. One live install
       # covers exactly that, and nothing else does.
       - name: Install the published release for real
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eux
           home="$(mktemp -d)"
