@@ -364,23 +364,32 @@ fn verify_windows_directory_acl(
             .map_err(io::Error::other)?;
         let protected = control & SE_DACL_PROTECTED.0 != 0;
 
-        let valid_acl = !dacl.is_null() && (*dacl).AceCount == 1;
-        let mut raw_ace = std::ptr::null_mut();
-        let got_ace = valid_acl && GetAce(dacl, 0, &mut raw_ace).is_ok() && !raw_ace.is_null();
-        let valid_ace = if got_ace {
+        let ace_count = if dacl.is_null() { 0 } else { (*dacl).AceCount };
+        let required_flags = (CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE).0 as u8;
+        let mut current_user_full_control = false;
+        let mut foreign_allow = false;
+        for index in 0..ace_count {
+            let mut raw_ace = std::ptr::null_mut();
+            if GetAce(dacl, u32::from(index), &mut raw_ace).is_err() || raw_ace.is_null() {
+                continue;
+            }
             let ace = &*(raw_ace as *const ACCESS_ALLOWED_ACE);
-            let required_flags = (CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE).0 as u8;
+            if ace.Header.AceType != 0 {
+                continue;
+            }
             let ace_sid =
                 windows::Win32::Security::PSID(std::ptr::addr_of!(ace.SidStart).cast_mut().cast());
             let full_control = ace.Mask == 0x10000000 || ace.Mask & 0x001f01ff == 0x001f01ff;
-            ace.Header.AceType == 0
-                && ace.Header.AceFlags & required_flags == required_flags
-                && full_control
-                && EqualSid(ace_sid, current_sid).is_ok()
-        } else {
-            false
-        };
-        if !protected || !valid_ace {
+            let inherited = ace.Header.AceFlags & required_flags == required_flags;
+            if EqualSid(ace_sid, current_sid).is_ok() {
+                if full_control && inherited {
+                    current_user_full_control = true;
+                }
+            } else {
+                foreign_allow = true;
+            }
+        }
+        if !protected || !current_user_full_control || foreign_allow {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "owner-only directory ACL verification failed",
