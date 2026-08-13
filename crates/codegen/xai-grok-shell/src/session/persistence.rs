@@ -8352,11 +8352,16 @@ mod fresh_session_claim_tests {
         let (staging_path, _staging) =
             ensure_private_staging_hierarchy_anchored(root.path()).unwrap();
         let junction = staging_path.join("linked-container");
+        // One /C string with quoted paths. `cmd /C mklink /J <path>` lets
+        // cmd/mklink treat a `/session-staging/...` component as a switch
+        // ("Invalid switch - session-staging\\linked-container").
+        let cmdline = format!(
+            r#"mklink /J "{}" "{}""#,
+            junction.display(),
+            outside.path().display()
+        );
         let mut command = std::process::Command::new("cmd");
-        command
-            .args(["/C", "mklink", "/J"])
-            .arg(&junction)
-            .arg(outside.path());
+        command.args(["/C", &cmdline]);
         xai_tty_utils::detach_std_command(&mut command);
         let output = command.output().unwrap();
         assert!(
