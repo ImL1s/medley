@@ -1467,19 +1467,26 @@ mod platform {
     }
 
     fn map_windows_no_replace_error(error: windows::core::Error) -> io::Error {
+        const ERROR_ACCESS_DENIED: u32 = 5;
         const ERROR_FILE_EXISTS: u32 = 80;
         const ERROR_ALREADY_EXISTS: u32 = 183;
-        const ERROR_OBJECT_NAME_EXISTS: u32 = 698;
+        const ERROR_OBJECT_NAME_COLLISION: u32 = 698;
         let hresult = error.code().0 as u32;
-        let win32 = if hresult & 0xFFFF_0000 == 0x8007_0000 {
+        let from_hresult = if hresult & 0xFFFF_0000 == 0x8007_0000 {
             hresult & 0xFFFF
         } else {
             hresult
         };
-        if matches!(
-            win32,
-            ERROR_FILE_EXISTS | ERROR_ALREADY_EXISTS | ERROR_OBJECT_NAME_EXISTS
-        ) {
+        let last = unsafe { windows::Win32::Foundation::GetLastError().0 };
+        if [from_hresult, last].into_iter().any(|code| {
+            matches!(
+                code,
+                ERROR_ACCESS_DENIED
+                    | ERROR_FILE_EXISTS
+                    | ERROR_ALREADY_EXISTS
+                    | ERROR_OBJECT_NAME_COLLISION
+            )
+        }) {
             io::Error::new(io::ErrorKind::AlreadyExists, error)
         } else {
             io::Error::other(error)
