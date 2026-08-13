@@ -443,7 +443,7 @@ pub(super) fn rename_no_replace(source: &Path, target: &Path) -> Result<()> {
                 return Err(RelocationError::Collision(target.to_path_buf()));
             }
             if !source.is_dir() {
-                return io_error("publish", target, error);
+                return Err(io_error("publish", target, error));
             }
         }
     }
