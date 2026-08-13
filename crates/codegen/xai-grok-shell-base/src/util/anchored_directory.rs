@@ -675,29 +675,29 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use super::*;
-    use std::mem::{offset_of, size_of, MaybeUninit};
+    use std::mem::{MaybeUninit, offset_of, size_of};
     use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
     use std::os::windows::fs::OpenOptionsExt as _;
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
-    use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
     use windows::Win32::Security::Authorization::{
-        GetSecurityInfo, SetSecurityInfo, SE_FILE_OBJECT,
+        GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
     };
     use windows::Win32::Security::GetTokenInformation;
     use windows::Win32::Security::{
-        AddAccessAllowedAceEx, EqualSid, GetLengthSid, InitializeAcl, InitializeSecurityDescriptor,
-        SetSecurityDescriptorControl, SetSecurityDescriptorDacl, TokenUser, ACL, ACL_REVISION,
-        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
+        ACL, ACL_REVISION, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
+        EqualSid, GetLengthSid, InitializeAcl, InitializeSecurityDescriptor, OBJECT_INHERIT_ACE,
         OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-        PSID, SECURITY_DESCRIPTOR, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+        PSID, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR, SetSecurityDescriptorControl,
+        SetSecurityDescriptorDacl, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
     use windows::Win32::Storage::FileSystem::{
-        FileDispositionInfo, GetFileInformationByHandle, SetFileInformationByHandle,
         BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
         FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
-        FILE_WRITE_DATA, SYNCHRONIZE,
+        FILE_WRITE_DATA, FileDispositionInfo, GetFileInformationByHandle, SYNCHRONIZE,
+        SetFileInformationByHandle,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -1081,7 +1081,7 @@ mod platform {
             impl Drop for LocalDescriptor {
                 fn drop(&mut self) {
                     unsafe {
-                        let _ = LocalFree(Some(HLOCAL(self.0 .0)));
+                        let _ = LocalFree(Some(HLOCAL(self.0.0)));
                     }
                 }
             }
@@ -1691,7 +1691,7 @@ mod tests {
     #[test]
     fn owner_only_lock_file_is_private_read_write_and_retained_parent_anchored() {
         use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
-        use std::os::unix::fs::{symlink, MetadataExt as _, PermissionsExt as _};
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 
         let temp = tempfile::tempdir().unwrap();
         let root_path = temp.path().join("root");
@@ -1738,15 +1738,17 @@ mod tests {
         let root = AnchoredDirectory::open_root(&root_path).unwrap();
 
         symlink(&outside, root_path.join("symlink.lock")).unwrap();
-        assert!(root
-            .open_or_create_owner_only_child_file(OsStr::new("symlink.lock"))
-            .is_err());
+        assert!(
+            root.open_or_create_owner_only_child_file(OsStr::new("symlink.lock"))
+                .is_err()
+        );
         assert_eq!(std::fs::read(&outside).unwrap(), b"sentinel");
 
         std::fs::hard_link(&outside, root_path.join("hardlink.lock")).unwrap();
-        assert!(root
-            .open_or_create_owner_only_child_file(OsStr::new("hardlink.lock"))
-            .is_err());
+        assert!(
+            root.open_or_create_owner_only_child_file(OsStr::new("hardlink.lock"))
+                .is_err()
+        );
         assert_eq!(std::fs::read(&outside).unwrap(), b"sentinel");
     }
 
