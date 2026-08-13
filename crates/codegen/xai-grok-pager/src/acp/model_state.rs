@@ -942,6 +942,37 @@ mod tests {
     }
 
     #[test]
+    fn resolve_by_name_or_id_keeps_shared_route_catalog_keys() {
+        let mut state = ModelState::default();
+        for (id, name) in [
+            ("gpt-5.6-sol", "GPT-5.6-Sol"),
+            ("gpt-5.6-sol-wm", "GPT-5.6-Sol-WM"),
+            ("gpt-5.6-luna", "GPT-5.6-Luna"),
+            ("codex-auto-review", "Codex Auto Review"),
+        ] {
+            let model_id = acp::ModelId::new(Arc::from(id));
+            state.available.insert(
+                model_id.clone(),
+                acp::ModelInfo::new(model_id, name.to_string()),
+            );
+        }
+        assert_eq!(
+            state
+                .resolve_by_name_or_id("gpt-5.6-sol-wm")
+                .map(|id| id.0.to_string())
+                .as_deref(),
+            Some("gpt-5.6-sol-wm")
+        );
+        assert_eq!(
+            state
+                .resolve_by_name_or_id("codex-auto-review")
+                .map(|id| id.0.to_string())
+                .as_deref(),
+            Some("codex-auto-review")
+        );
+    }
+
+    #[test]
     fn unsupported_effort_message_names_config_switch() {
         let msg = EffortTokenError::Unsupported.message();
         assert!(

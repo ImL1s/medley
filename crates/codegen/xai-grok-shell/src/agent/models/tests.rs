@@ -2656,6 +2656,35 @@ fn resolve_default_model_prefers_id_over_model_slug() {
     assert_eq!(key, "grok-build", "must match id, not first slug hit");
 }
 
+/// Headless `-m` stamps `default_model_override`. Codex catalog keys such as
+/// `gpt-5.6-sol-wm` and `codex-auto-review` share a wire route with another
+/// selectable row. The seated current id must stay the requested catalog key.
+#[test]
+fn resolve_default_model_cli_override_keeps_shared_route_catalog_key() {
+    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
+    catalog.insert("gpt-5.6-sol".to_string(), make_model_entry("gpt-5.6-sol"));
+    catalog.insert(
+        "gpt-5.6-sol-wm".to_string(),
+        make_model_entry("gpt-5.6-sol"),
+    );
+    catalog.insert("gpt-5.6-luna".to_string(), make_model_entry("gpt-5.6-luna"));
+    catalog.insert(
+        "codex-auto-review".to_string(),
+        make_model_entry("gpt-5.6-luna"),
+    );
+
+    let mut cfg = config::Config::default();
+    cfg.default_model_override = Some("gpt-5.6-sol-wm".to_string());
+    let (key, entry, _, _) = resolve_default_model(&cfg, &catalog, true);
+    assert_eq!(key, "gpt-5.6-sol-wm");
+    assert_eq!(entry.info.model, "gpt-5.6-sol");
+
+    cfg.default_model_override = Some("codex-auto-review".to_string());
+    let (key, entry, _, _) = resolve_default_model(&cfg, &catalog, true);
+    assert_eq!(key, "codex-auto-review");
+    assert_eq!(entry.info.model, "gpt-5.6-luna");
+}
+
 /// #131: an explicit configured default that is catalogued-but-unusable must
 /// be kept (no silent substitute), with the readiness reason returned.
 #[test]
