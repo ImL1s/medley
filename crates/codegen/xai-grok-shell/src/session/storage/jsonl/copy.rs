@@ -321,8 +321,9 @@ impl CopyPublication {
                 publication_collision_error(),
             ));
         }
-        let canonical_root = AnchoredDirectory::open_root(&self.root_dir)
-            .map_err(CopyPublicationFinalizeError::NotCommitted)?;
+        let canonical_root = AnchoredDirectory::open_root(&self.root_dir).map_err(|error| {
+            CopyPublicationFinalizeError::NotCommitted(io_step("open canonical root", error))
+        })?;
         if !self
             .root_anchor
             .same_identity(&canonical_root)
@@ -335,7 +336,12 @@ impl CopyPublication {
         }
         let canonical_sessions = canonical_root
             .open_child_dir(OsStr::new("sessions"))
-            .map_err(CopyPublicationFinalizeError::NotCommitted)?;
+            .map_err(|error| {
+                CopyPublicationFinalizeError::NotCommitted(io_step(
+                    "open canonical sessions",
+                    error,
+                ))
+            })?;
         if !self
             .sessions_anchor
             .same_identity(&canonical_sessions)
@@ -346,7 +352,9 @@ impl CopyPublication {
                 "sessions root identity changed before fork publication",
             )));
         }
-        sync_tree(&self.target_dir).map_err(CopyPublicationFinalizeError::NotCommitted)?;
+        sync_tree(&self.target_dir).map_err(|error| {
+            CopyPublicationFinalizeError::NotCommitted(io_step("sync staged tree", error))
+        })?;
         let marker = OsStr::new(crate::session::persistence::UNPUBLISHED_SESSION_MARKER);
 
         let dest_parent_exists = matches!(
@@ -364,18 +372,29 @@ impl CopyPublication {
                         &self.target_parent_name,
                         &self.target_cwd,
                     )
-                    .map_err(CopyPublicationFinalizeError::NotCommitted)?;
+                    .map_err(|error| {
+                        CopyPublicationFinalizeError::NotCommitted(io_step(
+                            "validate existing dest parent cwd metadata",
+                            error,
+                        ))
+                    })?;
                     let stage_dir_anchor = self.stage_dir_anchor.as_ref().ok_or_else(|| {
                         CopyPublicationFinalizeError::NotCommitted(io::Error::other(
                             "fork stage anchor is unavailable",
                         ))
                     })?;
-                    stage_dir_anchor
-                        .remove_marker(marker)
-                        .map_err(CopyPublicationFinalizeError::NotCommitted)?;
-                    stage_dir_anchor
-                        .sync()
-                        .map_err(CopyPublicationFinalizeError::NotCommitted)?;
+                    stage_dir_anchor.remove_marker(marker).map_err(|error| {
+                        CopyPublicationFinalizeError::NotCommitted(io_step(
+                            "remove unpublished marker on existing dest parent",
+                            error,
+                        ))
+                    })?;
+                    stage_dir_anchor.sync().map_err(|error| {
+                        CopyPublicationFinalizeError::NotCommitted(io_step(
+                            "sync stage before rename into existing dest parent",
+                            error,
+                        ))
+                    })?;
                     let stage_dir_anchor = self.stage_dir_anchor.take().expect("checked above");
                     let published = match stage_dir_anchor
                         .try_rename_self_no_replace(&parent, OsStr::new(&self.target_name))
@@ -388,7 +407,7 @@ impl CopyPublication {
                             {
                                 publication_collision_error()
                             } else {
-                                failure.error
+                                io_step("rename session into existing dest parent", failure.error)
                             };
                             return Err(CopyPublicationFinalizeError::NotCommitted(error));
                         }
@@ -406,18 +425,29 @@ impl CopyPublication {
                         &self.target_parent_name,
                         &self.target_cwd,
                     )
-                    .map_err(CopyPublicationFinalizeError::NotCommitted)?;
+                    .map_err(|error| {
+                        CopyPublicationFinalizeError::NotCommitted(io_step(
+                            "write staged cwd metadata",
+                            error,
+                        ))
+                    })?;
                     let stage_dir_anchor = self.stage_dir_anchor.as_ref().ok_or_else(|| {
                         CopyPublicationFinalizeError::NotCommitted(io::Error::other(
                             "fork stage anchor is unavailable",
                         ))
                     })?;
-                    stage_dir_anchor
-                        .remove_marker(marker)
-                        .map_err(CopyPublicationFinalizeError::NotCommitted)?;
-                    stage_dir_anchor
-                        .sync()
-                        .map_err(CopyPublicationFinalizeError::NotCommitted)?;
+                    stage_dir_anchor.remove_marker(marker).map_err(|error| {
+                        CopyPublicationFinalizeError::NotCommitted(io_step(
+                            "remove unpublished marker before container rename",
+                            error,
+                        ))
+                    })?;
+                    stage_dir_anchor.sync().map_err(|error| {
+                        CopyPublicationFinalizeError::NotCommitted(io_step(
+                            "sync stage before container rename",
+                            error,
+                        ))
+                    })?;
                     // Windows cannot rename an ancestor with its child handle open.
                     let stage_dir_anchor = self.stage_dir_anchor.take().expect("checked above");
                     drop(stage_dir_anchor);
@@ -615,7 +645,13 @@ impl CopyPublication {
                             publication_collision_error(),
                         ));
                     }
-                    return Err(CopyPublicationFinalizeError::NotCommitted(error));
+                    return Err(CopyPublicationFinalizeError::NotCommitted(io_step(
+                        &format!(
+                            "open dest parent exists={dest_parent_exists} name={:?}",
+                            self.target_parent_name
+                        ),
+                        error,
+                    )));
                 }
             };
         after_rename();
