@@ -374,6 +374,24 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             auth::manager::tests:: -- --nocapture
 
+      # #361: parser and auth-store unit tests cannot prove that the shipped
+      # composition root dispatches the selected provider to Codex logout.
+      - name: Provider-scoped Codex logout dispatch
+        run: |
+          set -o pipefail
+          output="$(mktemp)"
+          cargo test --locked -p xai-grok-pager-bin \
+            --test auth_logout_dispatch \
+            openai_codex_logout_dispatch_removes_only_medleys_provider_scope_without_network \
+            -- --exact --nocapture 2>&1 | tee "$output"
+          status="${PIPESTATUS[0]}"
+          if [ "$status" -ne 0 ]; then rm -f "$output"; exit "$status"; fi
+          if ! grep -qE '^test result: ok\. 1 passed; 0 failed;' "$output"; then
+            echo "::error::Codex logout dispatch must run exactly one passing test"
+            rm -f "$output"; exit 1
+          fi
+          rm -f "$output"
+
       # #356: the unit fixtures prove private staging in-process, but only the
       # production binary crosses config loading, auth-provider minting,
       # session publication, and the first authenticated Responses request.
