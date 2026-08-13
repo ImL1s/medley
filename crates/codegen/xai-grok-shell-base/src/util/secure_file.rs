@@ -239,7 +239,7 @@ pub fn set_windows_secure_permissions(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn enable_windows_privilege(name: windows::core::PCWSTR) -> io::Result<()> {
+pub(crate) fn enable_windows_privilege(name: windows::core::PCWSTR) -> io::Result<()> {
     use windows::Win32::Foundation::LUID;
     use windows::Win32::Security::{
         AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,

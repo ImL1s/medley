@@ -945,41 +945,30 @@ mod platform {
     fn ensure_owner_only_regular_file(file: &File) -> io::Result<()> {
         let security =
             OwnerOnlySecurity::new_with_inheritance(windows::Win32::Security::ACE_FLAGS(0))?;
+        let _ = crate::util::secure_file::enable_windows_privilege(windows::core::w!(
+            "SeTakeOwnershipPrivilege"
+        ));
+        let _ = crate::util::secure_file::enable_windows_privilege(windows::core::w!(
+            "SeRestorePrivilege"
+        ));
         unsafe {
-            let mut owner = PSID::default();
-            let mut descriptor = PSECURITY_DESCRIPTOR::default();
-            let status = GetSecurityInfo(
-                HANDLE(file.as_raw_handle()),
+            let handle = HANDLE(file.as_raw_handle());
+            let owned = SetSecurityInfo(
+                handle,
                 SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION,
-                Some(&mut owner),
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                Some(security.sid()),
                 None,
+                Some(security.acl()),
                 None,
-                None,
-                Some(&mut descriptor),
             );
-            if status.0 != 0 {
-                return Err(io::Error::from_raw_os_error(status.0 as i32));
-            }
-            struct LocalDescriptor(PSECURITY_DESCRIPTOR);
-            impl Drop for LocalDescriptor {
-                fn drop(&mut self) {
-                    unsafe {
-                        let _ = LocalFree(Some(HLOCAL(self.0.0)));
-                    }
-                }
-            }
-            let descriptor = LocalDescriptor(descriptor);
-            let owner_matches = EqualSid(owner, security.sid()).is_ok();
-            drop(descriptor);
-            if !owner_matches {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "anchored lock file is not owned by the current user",
-                ));
+            if owned.0 == 0 {
+                return Ok(());
             }
             let status = SetSecurityInfo(
-                HANDLE(file.as_raw_handle()),
+                handle,
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
                 None,
@@ -1210,42 +1199,33 @@ mod platform {
 
     pub(super) fn ensure_owner_only(file: &File) -> io::Result<()> {
         let security = OwnerOnlySecurity::new()?;
+        let _ = crate::util::secure_file::enable_windows_privilege(windows::core::w!(
+            "SeTakeOwnershipPrivilege"
+        ));
+        let _ = crate::util::secure_file::enable_windows_privilege(windows::core::w!(
+            "SeRestorePrivilege"
+        ));
         unsafe {
-            let mut owner = PSID::default();
-            let mut descriptor = PSECURITY_DESCRIPTOR::default();
-            let status = GetSecurityInfo(
-                HANDLE(file.as_raw_handle()),
+            let handle = HANDLE(file.as_raw_handle());
+            let owned = SetSecurityInfo(
+                handle,
                 SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION,
-                Some(&mut owner),
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                Some(security.sid()),
                 None,
+                Some(security.acl()),
                 None,
-                None,
-                Some(&mut descriptor),
             );
-            if status.0 != 0 {
-                return Err(io::Error::from_raw_os_error(status.0 as i32));
+            if owned.0 == 0 {
+                return Ok(());
             }
-            struct LocalDescriptor(PSECURITY_DESCRIPTOR);
-            impl Drop for LocalDescriptor {
-                fn drop(&mut self) {
-                    unsafe {
-                        let _ = LocalFree(Some(HLOCAL(self.0.0)));
-                    }
-                }
-            }
-            let descriptor = LocalDescriptor(descriptor);
-            let owner_matches = EqualSid(owner, security.sid()).is_ok();
-            drop(descriptor);
-            if !owner_matches {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "anchored directory is not owned by the current user",
-                ));
-            }
-
+            // GHA temp directories may stay owned by Administrators even after
+            // privilege enable. WRITE_DAC can still install a protected
+            // current-user ACL; fail only if that also fails.
             let status = SetSecurityInfo(
-                HANDLE(file.as_raw_handle()),
+                handle,
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
                 None,
