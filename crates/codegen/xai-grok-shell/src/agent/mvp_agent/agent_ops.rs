@@ -2770,7 +2770,7 @@ impl MvpAgent {
             let mut sampling_config =
                 self.prepare_sampling_config_for_model(&model, origin_client.clone());
             if let Some(effort) = default_reasoning_effort
-                && model.info().reasoning_efforts.iter().any(|option| option.value == effort)
+                && crate::agent::models::model_offers_reasoning_effort(model.info(), effort)
             {
                 sampling_config.reasoning_effort = Some(effort);
             }

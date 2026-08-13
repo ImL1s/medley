@@ -6653,6 +6653,41 @@ async fn prepared_new_session_plan_rebuilds_after_same_key_catalog_swap_before_s
     assert_ne!(plan.catalog_identity.route, original_route);
 }
 
+/// #360: an empty `reasoning_efforts` list means the model uses Medley's
+/// built-in effort menu when support is explicit; `/new` must retain the
+/// selected effort under the same canonical capability semantics.
+#[tokio::test(flavor = "current_thread")]
+async fn prepared_new_session_plan_preserves_selected_effort_with_implicit_menu() {
+    use xai_grok_sampling_types::ReasoningEffort;
+
+    let agent = build_minimal_agent_for_tests();
+    let current = agent.models_manager.current_model_id();
+    let mut entry = agent.models_manager.models()[current.0.as_ref()].clone();
+    entry.info.supports_reasoning_effort = true;
+    entry.info.reasoning_effort = None;
+    entry.info.reasoning_efforts.clear();
+    agent
+        .models_manager
+        .insert_test_entry(current.0.to_string(), entry);
+    let inserted = agent.models_manager.models()[current.0.as_ref()].clone();
+    assert!(inserted.info.supports_reasoning_effort);
+    assert_eq!(inserted.info.reasoning_effort, None);
+    assert!(inserted.info.reasoning_efforts.is_empty());
+    agent
+        .models_manager
+        .set_current_reasoning_effort(Some(ReasoningEffort::High));
+
+    let plan = agent
+        .prepare_new_session_model_plan(None, None)
+        .expect("supported implicit effort menu must prepare");
+
+    assert_eq!(
+        plan.sampling_config.reasoning_effort,
+        Some(ReasoningEffort::High),
+        "/new must retain the selected built-in effort when the model omits an explicit menu"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn prepared_new_session_plan_rejects_same_key_catalog_swap_at_publication() {
     let agent = build_minimal_agent_for_tests();

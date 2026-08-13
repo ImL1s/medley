@@ -640,6 +640,10 @@ jobs:
             test_typed_response_max_reasoning_effort_stamped_on_assistant_as_max -- --nocapture
           run_nonzero -p xai-grok-sampling-types --lib \
             test_response_wrapper_keeps_client_ultra_separate_from_typed_max -- --nocapture
+          # #360: `/new` must use the same implicit built-in effort menu as
+          # model switching when support is explicit but the catalog list is empty.
+          run_nonzero -p xai-grok-shell --lib \
+            prepared_new_session_plan_preserves_selected_effort_with_implicit_menu -- --nocapture
 
       - name: Restricted subagent capability boundaries
         run: |
