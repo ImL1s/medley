@@ -411,6 +411,12 @@ impl CopyPublication {
                             (published_parent, published, true)
                         }
                         Err(failure) => {
+                            let parent_taken = failure.error.kind() == io::ErrorKind::AlreadyExists
+                                || self
+                                    .root_dir
+                                    .join("sessions")
+                                    .join(&self.target_parent_name)
+                                    .exists();
                             let container = failure.source;
                             self.stage_container_anchor = Some(container);
                             let child = self
@@ -420,33 +426,65 @@ impl CopyPublication {
                                 .open_child_dir(OsStr::new(&self.target_name))
                                 .map_err(CopyPublicationFinalizeError::NotCommitted)?;
                             self.stage_dir_anchor = Some(child);
-                            if failure.error.kind() != io::ErrorKind::AlreadyExists {
-                                return Err(CopyPublicationFinalizeError::NotCommitted(
-                                    failure.error,
-                                ));
-                            }
-                            let parent = canonical_sessions
-                                .open_child_dir(&self.target_parent_name)
+                            if !parent_taken {
+                                let src = self
+                                    .root_dir
+                                    .join(".private")
+                                    .join("session-staging")
+                                    .join(&self.stage_name);
+                                let dest = self
+                                    .root_dir
+                                    .join("sessions")
+                                    .join(&self.target_parent_name);
+                                let _ = self.stage_dir_anchor.take();
+                                let _ = self.stage_container_anchor.take();
+                                std::fs::rename(&src, &dest)
+                                    .map_err(CopyPublicationFinalizeError::NotCommitted)?;
+                                let published_parent = canonical_sessions
+                                    .open_child_dir(&self.target_parent_name)
+                                    .map_err(CopyPublicationFinalizeError::CommittedUnreachable)?;
+                                let published = published_parent
+                                    .open_child_dir(OsStr::new(&self.target_name))
+                                    .map_err(CopyPublicationFinalizeError::CommittedUnreachable)?;
+                                (published_parent, published, true)
+                            } else {
+                                let parent = canonical_sessions
+                                    .open_child_dir(&self.target_parent_name)
+                                    .map_err(CopyPublicationFinalizeError::NotCommitted)?;
+                                crate::session::persistence::validate_existing_cwd_metadata(
+                                    &parent,
+                                    &self.target_parent_name,
+                                    &self.target_cwd,
+                                )
                                 .map_err(CopyPublicationFinalizeError::NotCommitted)?;
-                            crate::session::persistence::validate_existing_cwd_metadata(
-                                &parent,
-                                &self.target_parent_name,
-                                &self.target_cwd,
-                            )
-                            .map_err(CopyPublicationFinalizeError::NotCommitted)?;
-                            let child = self.stage_dir_anchor.take().expect("restored above");
-                            let published = match child
-                                .try_rename_self_no_replace(&parent, OsStr::new(&self.target_name))
-                            {
-                                Ok(published) => published,
-                                Err(failure) => {
-                                    self.stage_dir_anchor = Some(failure.source);
-                                    return Err(CopyPublicationFinalizeError::NotCommitted(
-                                        failure.error,
-                                    ));
-                                }
-                            };
-                            (parent, published, false)
+                                let child = self.stage_dir_anchor.take().expect("restored above");
+                                let published = match child.try_rename_self_no_replace(
+                                    &parent,
+                                    OsStr::new(&self.target_name),
+                                ) {
+                                    Ok(published) => published,
+                                    Err(failure) => {
+                                        self.stage_dir_anchor = Some(failure.source);
+                                        let error = if failure.error.kind()
+                                            == io::ErrorKind::AlreadyExists
+                                            || parent
+                                                .open_child_dir(OsStr::new(&self.target_name))
+                                                .is_ok()
+                                        {
+                                            io::Error::new(
+                                                io::ErrorKind::AlreadyExists,
+                                                "no-replace publication collided",
+                                            )
+                                        } else {
+                                            failure.error
+                                        };
+                                        return Err(CopyPublicationFinalizeError::NotCommitted(
+                                            error,
+                                        ));
+                                    }
+                                };
+                                (parent, published, false)
+                            }
                         }
                     }
                 }

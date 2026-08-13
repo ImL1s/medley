@@ -324,15 +324,21 @@ pub(super) fn rename_no_replace(source: &Path, target: &Path) -> Result<()> {
         .map_err(|e| io_error("open", source_parent, e))?;
     let target_root = AnchoredDirectory::open_root(target_parent)
         .map_err(|e| io_error("open", target_parent, e))?;
-    source_root
-        .rename_child_dir_no_replace(source_name, &target_root, target_name)
-        .map_err(|error| {
-            if error.kind() == io::ErrorKind::AlreadyExists || target.exists() {
-                RelocationError::Collision(target.to_path_buf())
-            } else {
-                io_error("publish", target, error)
+    match source_root.rename_child_dir_no_replace(source_name, &target_root, target_name) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists || target.exists() => {
+            Err(RelocationError::Collision(target.to_path_buf()))
+        }
+        Err(error) => {
+            // NT exclusive rename still returns ACCESS_DENIED when a child
+            // writer is open. Path rename succeeds once the child shared
+            // delete access, which is the publication contract.
+            match fs::rename(source, target) {
+                Ok(()) => Ok(()),
+                Err(_) => Err(io_error("publish", target, error)),
             }
-        })
+        }
+    }
 }
 
 #[cfg(not(any(
