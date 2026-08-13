@@ -243,10 +243,12 @@ fn secure_windows_directory_on_handle(path: &Path) -> io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt as _;
     use std::os::windows::io::AsRawHandle as _;
     use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
+    use windows::Win32::Security::Authorization::{
+        GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
+    };
     use windows::Win32::Security::{
-        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetSecurityInfo,
-        OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
+        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, OBJECT_INHERIT_ACE,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
     };
     use windows::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
@@ -257,7 +259,7 @@ fn secure_windows_directory_on_handle(path: &Path) -> io::Result<()> {
     let directory = OpenOptions::new()
         .access_mode((READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES).0)
         .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
-        .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0 as i32)
+        .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
         .open(path)?;
     let handle = HANDLE(directory.as_raw_handle());
     unsafe {
@@ -706,7 +708,7 @@ mod tests {
         let object = OpenOptions::new()
             .access_mode(READ_CONTROL.0)
             .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
-            .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0 as i32)
+            .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
             .open(path)?;
         let current_user = current_windows_user()?;
         unsafe {
