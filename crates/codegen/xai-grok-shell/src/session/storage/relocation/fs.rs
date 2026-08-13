@@ -327,7 +327,7 @@ pub(super) fn rename_no_replace(source: &Path, target: &Path) -> Result<()> {
     source_root
         .rename_child_dir_no_replace(source_name, &target_root, target_name)
         .map_err(|error| {
-            if error.kind() == io::ErrorKind::AlreadyExists {
+            if error.kind() == io::ErrorKind::AlreadyExists || target.exists() {
                 RelocationError::Collision(target.to_path_buf())
             } else {
                 io_error("publish", target, error)
@@ -393,11 +393,19 @@ mod publication_tests {
         let target = temp.path().join("target");
         fs::create_dir(&source).unwrap();
         let event_path = source.join("events.jsonl");
-        let mut writer = fs::OpenOptions::new()
-            .create_new(true)
-            .append(true)
-            .open(&event_path)
-            .unwrap();
+        let mut writer = {
+            let mut options = fs::OpenOptions::new();
+            options.create_new(true).append(true);
+            // Windows cannot rename a directory while a child is open without
+            // delete sharing. Unix ignores this flag.
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt as _;
+                // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+                options.share_mode(0x0000_0007);
+            }
+            options.open(&event_path).unwrap()
+        };
         writer.write_all(b"before\n").unwrap();
         writer.flush().unwrap();
 

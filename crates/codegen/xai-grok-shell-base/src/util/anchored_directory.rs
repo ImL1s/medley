@@ -1620,15 +1620,18 @@ mod platform {
     }
 
     fn destination_name_exists(parent: &File, name: &OsStr) -> bool {
-        open_relative(
+        match open_relative(
             parent,
             name,
             FILE_OPEN,
             0,
             (FILE_READ_ATTRIBUTES | SYNCHRONIZE).0,
             None,
-        )
-        .is_ok()
+        ) {
+            Ok(_) => true,
+            // Occupied names we cannot open still block no-replace.
+            Err(error) => error.kind() != io::ErrorKind::NotFound,
+        }
     }
 
     fn map_nt_no_replace_error(
