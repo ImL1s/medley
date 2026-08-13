@@ -694,10 +694,11 @@ mod platform {
     use windows::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
-        FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
-        FILE_WRITE_DATA, FileDispositionInfo, GetFileInformationByHandle, SYNCHRONIZE,
-        SetFileInformationByHandle,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED,
+        FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+        FileDispositionInfo, FileRenameInfoEx, GetFileInformationByHandle,
+        GetFinalPathNameByHandleW, SYNCHRONIZE, SetFileInformationByHandle,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -900,21 +901,86 @@ mod platform {
         Ok(file)
     }
 
-    pub(super) fn open_root(path: &Path) -> io::Result<File> {
-        let file = std::fs::OpenOptions::new()
-            .access_mode(
-                (FILE_LIST_DIRECTORY
-                    | FILE_READ_ATTRIBUTES
-                    | FILE_TRAVERSE
-                    | FILE_WRITE_DATA
-                    | windows::Win32::Storage::FileSystem::READ_CONTROL
-                    | windows::Win32::Storage::FileSystem::WRITE_DAC
-                    | SYNCHRONIZE)
-                    .0,
+    fn dos_to_nt_path(path: &Path) -> io::Result<Vec<u16>> {
+        let raw: Vec<u16> = path.as_os_str().encode_wide().collect();
+        let prefix = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+        let mut nt = vec![b'\\' as u16, b'?' as u16, b'\\' as u16];
+        if raw.starts_with(&prefix) {
+            nt.extend_from_slice(&raw[4..]);
+        } else {
+            nt.extend_from_slice(&raw);
+        }
+        if nt.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path contains NUL",
+            ));
+        }
+        nt.push(0);
+        Ok(nt)
+    }
+
+    fn open_absolute(path: &Path, desired_access: u32, object_options: u32) -> io::Result<File> {
+        let mut nt = dos_to_nt_path(path)?;
+        let byte_len = (nt.len() - 1)
+            .checked_mul(2)
+            .and_then(|length| u16::try_from(length).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path is too long"))?;
+        let mut unicode = UnicodeString {
+            length: byte_len,
+            maximum_length: byte_len,
+            buffer: nt.as_mut_ptr(),
+        };
+        let mut attributes = ObjectAttributes {
+            length: size_of::<ObjectAttributes>() as u32,
+            root_directory: HANDLE::default(),
+            object_name: &mut unicode,
+            attributes: OBJ_CASE_INSENSITIVE,
+            security_descriptor: std::ptr::null_mut(),
+            security_quality_of_service: std::ptr::null_mut(),
+        };
+        let mut status_block = IoStatusBlock {
+            status_or_pointer: 0,
+            information: 0,
+        };
+        let mut handle = HANDLE::default();
+        let status = unsafe {
+            NtCreateFile(
+                &mut handle,
+                desired_access,
+                &mut attributes,
+                &mut status_block,
+                std::ptr::null_mut(),
+                0,
+                (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0,
+                FILE_OPEN,
+                object_options | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT_NT,
+                std::ptr::null_mut(),
+                0,
             )
-            .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
-            .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
-            .open(path)?;
+        };
+        if status < 0 {
+            Err(nt_error(status))
+        } else {
+            Ok(unsafe { File::from_raw_handle(handle.0) })
+        }
+    }
+
+    pub(super) fn open_root(path: &Path) -> io::Result<File> {
+        let absolute = std::path::absolute(path)?;
+        let file = open_absolute(
+            &absolute,
+            (FILE_LIST_DIRECTORY
+                | FILE_READ_ATTRIBUTES
+                | FILE_TRAVERSE
+                | FILE_WRITE_DATA
+                | DELETE
+                | windows::Win32::Storage::FileSystem::READ_CONTROL
+                | windows::Win32::Storage::FileSystem::WRITE_DAC
+                | SYNCHRONIZE)
+                .0,
+            FILE_DIRECTORY_FILE,
+        )?;
         reject_reparse_directory(file)
     }
 
@@ -1512,10 +1578,57 @@ mod platform {
             source_name,
             FILE_OPEN,
             FILE_DIRECTORY_FILE,
-            (DELETE | SYNCHRONIZE).0,
+            (DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE).0,
             None,
         )?;
         rename_retained_handle_no_replace(&source, target_parent, target_name)
+    }
+
+    fn destination_nt_path(parent: &File, name: &OsStr) -> io::Result<Vec<u16>> {
+        let mut buffer = vec![0_u16; 512];
+        let mut chars = unsafe {
+            GetFinalPathNameByHandleW(
+                HANDLE(parent.as_raw_handle()),
+                &mut buffer,
+                FILE_NAME_NORMALIZED,
+            )
+        };
+        if chars == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if chars as usize > buffer.len() {
+            buffer.resize(chars as usize, 0);
+            chars = unsafe {
+                GetFinalPathNameByHandleW(
+                    HANDLE(parent.as_raw_handle()),
+                    &mut buffer,
+                    FILE_NAME_NORMALIZED,
+                )
+            };
+            if chars == 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        buffer.truncate(chars as usize);
+        let prefix = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+        let mut nt = vec![b'\\' as u16, b'?' as u16, b'\\' as u16];
+        if buffer.starts_with(&prefix) {
+            nt.extend_from_slice(&buffer[4..]);
+        } else {
+            nt.extend_from_slice(&buffer);
+        }
+        if nt.last() != Some(&(b'\\' as u16)) {
+            nt.push(b'\\' as u16);
+        }
+        nt.extend(name.encode_wide());
+        if nt.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path contains NUL",
+            ));
+        }
+        nt.push(0);
+        Ok(nt)
     }
 
     fn rename_retained_handle_no_replace(
@@ -1523,11 +1636,11 @@ mod platform {
         target_parent: &File,
         target_name: &OsStr,
     ) -> io::Result<()> {
-        // Include a trailing NUL. The NT rename blob's FileNameLength excludes
-        // it, but the kernel still reads one past the counted bytes on some
-        // Windows builds.
-        let mut wide: Vec<u16> = target_name.encode_wide().collect();
-        wide.push(0);
+        // Full NT destination path with a NULL RootDirectory. Passing a Win32
+        // CreateFile handle as RootDirectory returns ACCESS_DENIED on GHA
+        // even when the name is free, and that blocked publishing a staging
+        // container that still had an open child writer.
+        let mut wide = destination_nt_path(target_parent, target_name)?;
         let name_bytes = (wide.len() - 1)
             .checked_mul(2)
             .and_then(|length| u32::try_from(length).ok())
@@ -1541,10 +1654,6 @@ mod platform {
         let api_len = u32::try_from(total_len)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "child name is too long"))?;
 
-        // `FILE_RENAME_INFO` has a variable-length trailing UTF-16 name. A
-        // `Vec<u8>` is not sufficiently aligned for a typed dereference of its
-        // header, so allocate zeroed slots of the header type itself and use
-        // only the exact byte prefix required by the Windows API.
         let slot_count = total_len.div_ceil(size_of::<FILE_RENAME_INFO>());
         let mut storage = Vec::<MaybeUninit<FILE_RENAME_INFO>>::new();
         storage.try_reserve_exact(slot_count).map_err(|error| {
@@ -1560,18 +1669,16 @@ mod platform {
             status_or_pointer: 0,
             information: 0,
         };
+        let posix_flags = FILE_RENAME_POSIX_SEMANTICS | FILE_RENAME_IGNORE_READONLY_ATTRIBUTE;
         let status = unsafe {
-            (*info).RootDirectory = HANDLE(target_parent.as_raw_handle());
+            (*info).Anonymous.Flags = posix_flags;
+            (*info).RootDirectory = HANDLE::default();
             (*info).FileNameLength = name_bytes;
             std::ptr::copy_nonoverlapping(
                 wide.as_ptr().cast::<u8>(),
                 storage_bytes.add(header_len),
                 wide.len() * 2,
             );
-            // POSIX exclusive rename keeps open child writers bound to the
-            // directory. Do not set REPLACE_IF_EXISTS.
-            (*info).Anonymous.Flags =
-                FILE_RENAME_POSIX_SEMANTICS | FILE_RENAME_IGNORE_READONLY_ATTRIBUTE;
             let posix = NtSetInformationFile(
                 HANDLE(source.as_raw_handle()),
                 &mut status_block,
@@ -1581,6 +1688,15 @@ mod platform {
             );
             if posix >= 0 || nt_status_is_no_replace_collision(posix) {
                 posix
+            } else if SetFileInformationByHandle(
+                HANDLE(source.as_raw_handle()),
+                FileRenameInfoEx,
+                storage.as_ptr().cast(),
+                api_len,
+            )
+            .is_ok()
+            {
+                0
             } else {
                 (*info).Anonymous.ReplaceIfExists = false;
                 NtSetInformationFile(

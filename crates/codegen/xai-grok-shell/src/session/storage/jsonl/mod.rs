@@ -9,6 +9,18 @@ use async_trait::async_trait;
 use fs2::FileExt;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, Write};
+
+fn jsonl_open_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    // Windows cannot publish (rename) a session directory while a child is
+    // open unless the child shares delete access.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        options.share_mode(0x0000_0007);
+    }
+    options
+}
 use std::path::{Path, PathBuf};
 use xai_chat_state::StrictAppendAck;
 use xai_grok_workspace::session::file_state::RewindPoint;
@@ -420,7 +432,7 @@ impl JsonlStorageAdapter {
         debug_assert!(line.ends_with(b"\n"), "JSONL record must end with \\n");
         let lock = Self::lock_append(path)?;
         let result = (|| {
-            let mut file = OpenOptions::new()
+            let mut file = jsonl_open_options()
                 .read(true)
                 .create(true)
                 .append(true)
@@ -536,7 +548,7 @@ impl JsonlStorageAdapter {
             {
                 return Ok(StrictAppendAck::AlreadyPresent(authoritative));
             }
-            let mut file = OpenOptions::new()
+            let mut file = jsonl_open_options()
                 .read(true)
                 .create(true)
                 .append(true)
@@ -580,7 +592,7 @@ impl JsonlStorageAdapter {
     /// Lock tail healing, append, and barriers through `<target>.jsonl.lock`.
     /// Full-file [`Self::write_jsonl`] atomic-rename rewrites bypass this append-only lock.
     fn lock_append(path: &Path) -> io::Result<std::fs::File> {
-        let lock = OpenOptions::new()
+        let lock = jsonl_open_options()
             .read(true)
             .write(true)
             .create(true)
