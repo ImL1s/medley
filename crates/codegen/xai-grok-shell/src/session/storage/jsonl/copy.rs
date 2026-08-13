@@ -349,6 +349,13 @@ impl CopyPublication {
         sync_tree(&self.target_dir).map_err(CopyPublicationFinalizeError::NotCommitted)?;
         let marker = OsStr::new(crate::session::persistence::UNPUBLISHED_SESSION_MARKER);
 
+        let dest_parent_exists = matches!(
+            self.root_dir
+                .join("sessions")
+                .join(&self.target_parent_name)
+                .try_exists(),
+            Ok(true)
+        );
         let (published_parent_anchor, published_anchor, whole_parent_published) =
             match canonical_sessions.open_child_dir(&self.target_parent_name) {
                 Ok(parent) => {
@@ -388,7 +395,7 @@ impl CopyPublication {
                     };
                     (parent, published, false)
                 }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Err(error) if error.kind() == io::ErrorKind::NotFound || !dest_parent_exists => {
                     let container = self.stage_container_anchor.as_ref().ok_or_else(|| {
                         CopyPublicationFinalizeError::NotCommitted(io::Error::other(
                             "fork stage container anchor is unavailable",

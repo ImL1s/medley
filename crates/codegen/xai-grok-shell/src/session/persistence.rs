@@ -3877,6 +3877,10 @@ impl PublishedSessionWrite {
                 }
             };
 
+        let dest_parent_exists = matches!(
+            stage.target_session.parent().map(Path::try_exists),
+            Some(Ok(true))
+        );
         let (published_parent_anchor, published_session_anchor) = match sessions_anchor
             .open_child_dir(&stage.target_parent_name)
         {
@@ -3910,7 +3914,7 @@ impl PublishedSessionWrite {
                 }
                 (parent, child)
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Err(error) if error.kind() == io::ErrorKind::NotFound || !dest_parent_exists => {
                 let container = stage
                     .stage_container_anchor
                     .take()
@@ -4680,6 +4684,10 @@ fn finalize_fresh_publication_sync_with(
         }
     };
 
+    let dest_parent_exists = matches!(
+        publication.published_session.parent().map(Path::try_exists),
+        Some(Ok(true))
+    );
     let (published_parent_anchor, published_session_anchor) = match sessions_anchor
         .open_child_dir(&publication.published_parent_name)
     {
@@ -4712,7 +4720,7 @@ fn finalize_fresh_publication_sync_with(
             }
             (parent, child)
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+        Err(error) if error.kind() == io::ErrorKind::NotFound || !dest_parent_exists => {
             let stage_container_anchor = match publication
                 .stage_container_anchor
                 .lock()
