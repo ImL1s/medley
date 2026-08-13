@@ -874,7 +874,7 @@ fn sync_tree(path: &Path) -> io::Result<()> {
         if metadata.file_type().is_dir() {
             sync_tree(&entry.path())?;
         } else if metadata.file_type().is_file() {
-            std::fs::File::open(entry.path())?.sync_all()?;
+            sync_file(&entry.path())?;
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -886,6 +886,27 @@ fn sync_tree(path: &Path) -> io::Result<()> {
         }
     }
     sync_directory(path)
+}
+
+fn sync_file(path: &Path) -> io::Result<()> {
+    // Windows FlushFileBuffers requires write access. A read-only File::open
+    // handle returns ACCESS_DENIED on GHA even for files we just wrote.
+    #[cfg(windows)]
+    {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+        {
+            Ok(file) => file.sync_all(),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::File::open(path)?.sync_all()
+    }
 }
 
 #[cfg(unix)]
