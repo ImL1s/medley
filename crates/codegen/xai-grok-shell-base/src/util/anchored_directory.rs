@@ -692,13 +692,12 @@ mod platform {
         PSID, SECURITY_DESCRIPTOR, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
     };
     use windows::Win32::Storage::FileSystem::{
-        FileDispositionInfo, FileIdBothDirectoryInfo, GetFileInformationByHandle,
-        GetFileInformationByHandleEx, ReOpenFile, SetFileInformationByHandle,
+        FileDispositionInfo, GetFileInformationByHandle, SetFileInformationByHandle,
         BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY,
-        FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_DATA, SYNCHRONIZE,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+        FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+        FILE_WRITE_DATA, SYNCHRONIZE,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -757,13 +756,29 @@ mod platform {
             length: u32,
             file_information_class: u32,
         ) -> i32;
+        fn NtQueryDirectoryFile(
+            file_handle: HANDLE,
+            event: HANDLE,
+            apc_routine: *mut core::ffi::c_void,
+            apc_context: *mut core::ffi::c_void,
+            io_status_block: *mut IoStatusBlock,
+            file_information: *mut core::ffi::c_void,
+            length: u32,
+            file_information_class: u32,
+            return_single_entry: u8,
+            file_name: *mut UnicodeString,
+            restart_scan: u8,
+        ) -> i32;
     }
 
+    const FILE_NAMES_INFORMATION: u32 = 12;
     const FILE_RENAME_INFORMATION: u32 = 10;
     const FILE_DISPOSITION_INFORMATION_EX: u32 = 64;
     const FILE_DISPOSITION_DELETE: u32 = 0x0000_0001;
     const FILE_DISPOSITION_POSIX_SEMANTICS: u32 = 0x0000_0002;
     const FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE: u32 = 0x0000_0010;
+    const STATUS_NO_MORE_FILES: i32 = 0x8000_0006_u32 as i32;
+    const STATUS_NO_SUCH_FILE: i32 = 0xC000_000F_u32 as i32;
     const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035_u32 as i32;
     const STATUS_DIRECTORY_NOT_EMPTY: i32 = 0xC000_0101_u32 as i32;
 
@@ -1322,69 +1337,92 @@ mod platform {
     }
 
     pub(super) fn child_names(directory: &File) -> io::Result<Vec<OsString>> {
-        let enumeration = unsafe {
-            ReOpenFile(
-                HANDLE(directory.as_raw_handle()),
-                (FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE).0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            )
+        // Names-only on the retained handle. ReOpenFile + FileIdBothDirectoryInfo
+        // returns ACCESS_DENIED on GHA once the directory contains a junction,
+        // because the file-id query follows the reparse target.
+        #[repr(C)]
+        struct FileNamesInformation {
+            next_entry_offset: u32,
+            file_index: u32,
+            file_name_length: u32,
+            file_name: [u16; 1],
         }
-        .map(|handle| unsafe { File::from_raw_handle(handle.0) })
-        .map_err(io::Error::other)?;
+        let name_offset = offset_of!(FileNamesInformation, file_name);
         let mut names = Vec::new();
+        let mut storage = vec![0_u8; 16 * 1024];
+        let mut restart_scan = 1_u8;
         loop {
-            let mut storage = vec![0_usize; 64 * 1024 / size_of::<usize>()];
-            let result = unsafe {
-                GetFileInformationByHandleEx(
-                    HANDLE(enumeration.as_raw_handle()),
-                    FileIdBothDirectoryInfo,
+            let mut status_block = IoStatusBlock {
+                status_or_pointer: 0,
+                information: 0,
+            };
+            let status = unsafe {
+                NtQueryDirectoryFile(
+                    HANDLE(directory.as_raw_handle()),
+                    HANDLE::default(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut status_block,
                     storage.as_mut_ptr().cast(),
-                    (storage.len() * size_of::<usize>()) as u32,
+                    storage.len() as u32,
+                    FILE_NAMES_INFORMATION,
+                    0,
+                    std::ptr::null_mut(),
+                    restart_scan,
                 )
             };
-            if let Err(error) = result {
-                if error.code()
-                    == windows::core::HRESULT::from_win32(
-                        windows::Win32::Foundation::ERROR_NO_MORE_FILES.0,
-                    )
-                {
-                    return Ok(names);
-                }
-                return Err(io::Error::other(error));
+            restart_scan = 0;
+            if status == STATUS_NO_MORE_FILES || status == STATUS_NO_SUCH_FILE {
+                return Ok(names);
+            }
+            if status < 0 {
+                return Err(nt_error(status));
             }
 
             let mut offset = 0_usize;
             loop {
-                let info = unsafe {
-                    &*storage
-                        .as_ptr()
-                        .cast::<u8>()
-                        .add(offset)
-                        .cast::<FILE_ID_BOTH_DIR_INFO>()
+                if offset
+                    .checked_add(name_offset)
+                    .is_none_or(|end| end > storage.len())
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "directory entry offset exceeds enumeration buffer",
+                    ));
+                }
+                let info = unsafe { &*storage.as_ptr().add(offset).cast::<FileNamesInformation>() };
+                let name_len = info.file_name_length as usize / size_of::<u16>();
+                let name_bytes = name_len.saturating_mul(size_of::<u16>());
+                if offset
+                    .checked_add(name_offset)
+                    .and_then(|start| start.checked_add(name_bytes))
+                    .is_none_or(|end| end > storage.len())
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "directory entry name exceeds enumeration buffer",
+                    ));
+                }
+                let name = unsafe {
+                    std::slice::from_raw_parts(
+                        storage.as_ptr().add(offset + name_offset).cast::<u16>(),
+                        name_len,
+                    )
                 };
-                let name_len = info.FileNameLength as usize / size_of::<u16>();
-                let name = unsafe { std::slice::from_raw_parts(info.FileName.as_ptr(), name_len) };
                 if name != [b'.' as u16] && name != [b'.' as u16, b'.' as u16] {
                     names.push(OsString::from_wide(name));
                 }
-                if info.NextEntryOffset == 0 {
+                if info.next_entry_offset == 0 {
                     break;
                 }
                 offset = offset
-                    .checked_add(info.NextEntryOffset as usize)
+                    .checked_add(info.next_entry_offset as usize)
                     .ok_or_else(|| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
                             "directory entry offset overflow",
                         )
                     })?;
-                if offset >= storage.len() * size_of::<usize>() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "directory entry offset exceeds enumeration buffer",
-                    ));
-                }
             }
         }
     }
@@ -2127,8 +2165,18 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
 
-        assert_eq!(tree.child_names().unwrap().len(), 2);
-        assert_eq!(tree.child_names().unwrap().len(), 2);
+        assert_eq!(
+            tree.child_names()
+                .expect("listing a tree that contains a junction")
+                .len(),
+            2
+        );
+        assert_eq!(
+            tree.child_names()
+                .expect("junction listing must be repeatable")
+                .len(),
+            2
+        );
         tree.remove_tree_self()
             .expect("remove_tree_self must delete the junction leaf without walking it");
 
