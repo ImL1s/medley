@@ -37,6 +37,7 @@ pub const AUTH_CLAIM_NAMESPACE: &str = "https://api.openai.com/auth";
 
 const CALLBACK_PATH: &str = "/auth/callback";
 const CALLBACK_TIMEOUT: StdDuration = StdDuration::from_secs(600);
+const STORE_LOCK_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(20);
 const REVOKE_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const EXPIRY_FALLBACK_SECONDS: i64 = 8 * 24 * 60 * 60;
@@ -330,14 +331,6 @@ async fn bind_callback() -> Result<(TcpListener, u16), CodexOAuthError> {
         }
     }
     Err(CodexOAuthError::BindLoopback)
-}
-
-async fn wait_for_callback(
-    listener: TcpListener,
-    cancellation: CancellationToken,
-    expected_state: &str,
-) -> Result<CallbackSession, CodexOAuthError> {
-    wait_for_callback_with_timeout(listener, cancellation, expected_state, CALLBACK_TIMEOUT).await
 }
 
 async fn wait_for_callback_with_timeout(
@@ -720,6 +713,30 @@ pub async fn login_with_manager<F>(
 where
     F: FnOnce(&str),
 {
+    login_with_manager_at(
+        manager,
+        cancellation,
+        open_browser,
+        announce_url,
+        TOKEN_ENDPOINT,
+        CALLBACK_TIMEOUT,
+        STORE_LOCK_TIMEOUT,
+    )
+    .await
+}
+
+async fn login_with_manager_at<F>(
+    manager: &Arc<AuthManager>,
+    cancellation: CancellationToken,
+    open_browser: bool,
+    announce_url: F,
+    token_endpoint: &str,
+    callback_timeout: StdDuration,
+    store_lock_timeout: StdDuration,
+) -> Result<GrokAuth, CodexOAuthError>
+where
+    F: FnOnce(&str),
+{
     let (listener, port) = bind_callback().await?;
     let redirect_uri = redirect_uri(port);
     let pkce = generate_pkce();
@@ -730,12 +747,14 @@ where
         let target = authorize_url.clone();
         tokio::task::spawn_blocking(move || webbrowser::open(&target));
     }
-    let mut callback_session = wait_for_callback(listener, cancellation.clone(), &state).await?;
+    let mut callback_session =
+        wait_for_callback_with_timeout(listener, cancellation.clone(), &state, callback_timeout)
+            .await?;
     let callback = callback_session.take_callback();
     let login_result: Result<GrokAuth, CodexOAuthError> = tokio::select! {
         result = async {
             let code = validated_callback_code(callback, &state)?;
-            let tokens = exchange_code_at(TOKEN_ENDPOINT, &code, &redirect_uri, &pkce.verifier)
+            let tokens = exchange_code_at(token_endpoint, &code, &redirect_uri, &pkce.verifier)
                 .await
                 .map_err(|error| match error.status {
                     Some(status) => CodexOAuthError::TokenHttp { status },
@@ -743,7 +762,7 @@ where
                 })?;
             let auth = build_login_auth(tokens)?;
             let lock = manager
-                .try_lock_auth_file_async(StdDuration::from_secs(10))
+                .try_lock_auth_file_async(store_lock_timeout)
                 .await
                 .ok_or(CodexOAuthError::StoreBusy)?;
             if !lock.still_live(manager.auth_json_path()) {
@@ -1210,6 +1229,220 @@ mod tests {
         callback_session.complete(CallbackPage::Success).await;
         let correct = correct.await.unwrap();
         assert_eq!(correct.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn full_login_flow_persists_provider_scoped_codex_credential() {
+        use axum::extract::Form;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = test_manager(dir.path());
+        let held_lock = manager
+            .try_lock_auth_file_async(StdDuration::from_secs(1))
+            .await
+            .expect("test lock acquired");
+        let token_request = Arc::new(std::sync::Mutex::new(None));
+        let captured_request = Arc::clone(&token_request);
+        let expected_id_token = jwt(serde_json::json!({
+            AUTH_CLAIM_NAMESPACE: {
+                "chatgpt_account_id": "workspace-fixture",
+                "chatgpt_account_is_fedramp": true
+            }
+        }));
+        let token_id_token = expected_id_token.clone();
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let token_router = Router::new().route(
+            "/token",
+            axum::routing::post(move |Form(form): Form<HashMap<String, String>>| {
+                let captured_request = Arc::clone(&captured_request);
+                let id_token = token_id_token.clone();
+                async move {
+                    *captured_request.lock().unwrap() = Some(form);
+                    axum::Json(serde_json::json!({
+                        "access_token": "login-access-SENTINEL",
+                        "refresh_token": "login-refresh-SENTINEL",
+                        "id_token": id_token,
+                        "expires_in": 3600
+                    }))
+                }
+            }),
+        );
+        let token_shutdown = CancellationToken::new();
+        let token_server = axum::serve(listener, token_router)
+            .with_graceful_shutdown(token_shutdown.clone().cancelled_owned());
+        let token_server = tokio::spawn(async move { token_server.await });
+
+        let (callback_tx, callback_rx) = tokio::sync::oneshot::channel();
+        let login_manager = Arc::clone(&manager);
+        let token_endpoint = format!("http://{addr}/token");
+        let mut login = tokio::spawn(async move {
+            login_with_manager_at(
+                &login_manager,
+                CancellationToken::new(),
+                false,
+                move |raw_url| {
+                    let authorize_url = url::Url::parse(raw_url).unwrap();
+                    assert_eq!(
+                        authorize_url.as_str().split('?').next(),
+                        Some(AUTHORIZE_ENDPOINT)
+                    );
+                    let query: HashMap<_, _> = authorize_url.query_pairs().into_owned().collect();
+                    assert_eq!(query.get("client_id").map(String::as_str), Some(CLIENT_ID));
+                    assert_eq!(
+                        query.get("originator").map(String::as_str),
+                        Some(ORIGINATOR)
+                    );
+                    assert_eq!(
+                        query.get("code_challenge_method").map(String::as_str),
+                        Some("S256")
+                    );
+                    assert!(
+                        query
+                            .get("code_challenge")
+                            .is_some_and(|value| !value.is_empty())
+                    );
+                    let state = query
+                        .get("state")
+                        .filter(|value| !value.is_empty())
+                        .unwrap();
+                    let mut callback_url =
+                        url::Url::parse(query.get("redirect_uri").unwrap()).unwrap();
+                    callback_url
+                        .query_pairs_mut()
+                        .append_pair("code", "login-code")
+                        .append_pair("state", state);
+                    let request = tokio::spawn(async move {
+                        reqwest::Client::new().get(callback_url).send().await
+                    });
+                    assert!(callback_tx.send(request).is_ok());
+                },
+                &token_endpoint,
+                StdDuration::from_secs(5),
+                StdDuration::from_secs(5),
+            )
+            .await
+        });
+        let mut callback_request = tokio::time::timeout(StdDuration::from_secs(2), callback_rx)
+            .await
+            .expect("login must announce the callback URL promptly")
+            .expect("login must start the callback request");
+        tokio::time::timeout(StdDuration::from_secs(2), async {
+            loop {
+                assert!(
+                    !callback_request.is_finished(),
+                    "callback transport failed or reported success before persistence"
+                );
+                assert!(
+                    !login.is_finished(),
+                    "login completed while durable persistence was blocked"
+                );
+                if token_request.lock().unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(StdDuration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("local token exchange must complete promptly");
+        tokio::select! {
+            callback = &mut callback_request => {
+                panic!("callback completed before durable persistence: {callback:?}");
+            }
+            result = &mut login => {
+                panic!("login completed while durable persistence was blocked: {result:?}");
+            }
+            _ = tokio::time::sleep(StdDuration::from_millis(100)) => {}
+        }
+        assert!(
+            reload_test_manager(dir.path())
+                .current_or_expired()
+                .is_none(),
+            "Codex credential must not appear before the held store lock is released"
+        );
+        drop(held_lock);
+
+        let auth = tokio::time::timeout(StdDuration::from_secs(5), &mut login)
+            .await
+            .expect("full login must not inherit the production callback timeout")
+            .unwrap()
+            .unwrap();
+        let callback_response =
+            tokio::time::timeout(StdDuration::from_secs(5), &mut callback_request)
+                .await
+                .expect("callback response must follow durable persistence")
+                .unwrap()
+                .unwrap();
+        assert_eq!(callback_response.status(), StatusCode::OK);
+        assert_eq!(
+            callback_response.text().await.unwrap(),
+            "Signed in. You can close this window."
+        );
+        token_shutdown.cancel();
+        token_server.await.unwrap().unwrap();
+
+        let token_request = token_request.lock().unwrap().take().unwrap();
+        assert_eq!(
+            token_request.get("grant_type").map(String::as_str),
+            Some("authorization_code")
+        );
+        assert_eq!(
+            token_request.get("code").map(String::as_str),
+            Some("login-code")
+        );
+        assert_eq!(
+            token_request.get("client_id").map(String::as_str),
+            Some(CLIENT_ID)
+        );
+        assert!(
+            token_request
+                .get("code_verifier")
+                .is_some_and(|value| value.len() >= 43)
+        );
+        assert!(
+            token_request
+                .get("redirect_uri")
+                .is_some_and(|value| value.starts_with("http://localhost:"))
+        );
+
+        assert_eq!(auth.auth_mode, AuthMode::OpenAiCodex);
+        assert!(is_codex_credential(&auth));
+        assert_eq!(auth.key, "login-access-SENTINEL");
+        assert_eq!(
+            auth.refresh_token.as_deref(),
+            Some("login-refresh-SENTINEL")
+        );
+        assert_eq!(auth.account_id.as_deref(), Some("workspace-fixture"));
+        assert!(auth.chatgpt_account_is_fedramp);
+        assert_eq!(auth.id_token.as_deref(), Some(expected_id_token.as_str()));
+        assert_eq!(auth.oidc_issuer.as_deref(), Some(ISSUER));
+        assert_eq!(auth.oidc_client_id.as_deref(), Some(CLIENT_ID));
+        assert!(auth.expires_at.is_some_and(|expiry| expiry > Utc::now()));
+        let debug = format!("{auth:?}");
+        assert!(!debug.contains("login-access-SENTINEL"));
+        assert!(!debug.contains("login-refresh-SENTINEL"));
+
+        let reloaded = reload_test_manager(dir.path());
+        let persisted = reloaded.current_or_expired().unwrap();
+        assert!(is_codex_credential(&persisted));
+        assert_eq!(persisted.auth_mode, AuthMode::OpenAiCodex);
+        assert_eq!(persisted.key, auth.key);
+        assert_eq!(persisted.refresh_token, auth.refresh_token);
+        assert_eq!(persisted.account_id, auth.account_id);
+        assert_eq!(persisted.id_token, auth.id_token);
+        assert_eq!(persisted.oidc_issuer.as_deref(), Some(ISSUER));
+        assert_eq!(persisted.oidc_client_id.as_deref(), Some(CLIENT_ID));
+        assert!(persisted.chatgpt_account_is_fedramp);
+        assert!(
+            persisted
+                .expires_at
+                .is_some_and(|expiry| expiry > Utc::now())
+        );
+        let store = super::super::storage::read_auth_json(&dir.path().join("auth.json")).unwrap();
+        assert_eq!(store.len(), 1);
+        assert!(store.contains_key(AUTH_SCOPE));
     }
 
     #[tokio::test]
