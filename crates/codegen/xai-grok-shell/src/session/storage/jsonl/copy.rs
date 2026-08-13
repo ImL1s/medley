@@ -431,13 +431,15 @@ impl CopyPublication {
                                     publication_collision_error(),
                                 ));
                             }
-                            let parent_taken = failure.error.kind() == io::ErrorKind::AlreadyExists
-                                || self
-                                    .root_dir
+                            // GHA probes of a missing sessions child can return
+                            // ACCESS_DENIED; that is not a real collision.
+                            let parent_taken = matches!(
+                                self.root_dir
                                     .join("sessions")
                                     .join(&self.target_parent_name)
-                                    .try_exists()
-                                    .unwrap_or(true);
+                                    .try_exists(),
+                                Ok(true)
+                            );
                             let container = failure.source;
                             self.stage_container_anchor = Some(container);
                             let child = self

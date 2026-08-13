@@ -1801,8 +1801,15 @@ mod platform {
             None,
         ) {
             Ok(_) => true,
-            // Occupied names we cannot open still block no-replace.
-            Err(error) => error.kind() != io::ErrorKind::NotFound,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(_) => match destination_extended_dos_path(parent, name) {
+                Ok(wide) => {
+                    let path = std::ffi::OsString::from_wide(&wide[..wide.len().saturating_sub(1)]);
+                    std::path::Path::new(&path).try_exists().unwrap_or(true)
+                }
+                // Occupied names we cannot resolve still block no-replace.
+                Err(_) => true,
+            },
         }
     }
 
