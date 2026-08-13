@@ -697,8 +697,8 @@ mod platform {
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY,
         FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
         FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_DATA, FileDispositionInfo,
-        FileIdBothDirectoryInfo, FileRenameInfo, GetFileInformationByHandle,
-        GetFileInformationByHandleEx, ReOpenFile, SYNCHRONIZE, SetFileInformationByHandle,
+        FileIdBothDirectoryInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+        ReOpenFile, SYNCHRONIZE, SetFileInformationByHandle,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -750,7 +750,18 @@ mod platform {
             ea_length: u32,
         ) -> i32;
         fn RtlNtStatusToDosError(status: i32) -> u32;
+        fn NtSetInformationFile(
+            file_handle: HANDLE,
+            io_status_block: *mut IoStatusBlock,
+            file_information: *const core::ffi::c_void,
+            length: u32,
+            file_information_class: u32,
+        ) -> i32;
     }
+
+    const FILE_RENAME_INFORMATION: u32 = 10;
+    const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035_u32 as i32;
+    const STATUS_DIRECTORY_NOT_EMPTY: i32 = 0xC000_0101_u32 as i32;
 
     fn nt_error(status: i32) -> io::Error {
         io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32)
@@ -1419,15 +1430,20 @@ mod platform {
         target_parent: &File,
         target_name: &OsStr,
     ) -> io::Result<()> {
-        let wide: Vec<u16> = target_name.encode_wide().collect();
-        let name_bytes = wide
-            .len()
+        // Include a trailing NUL. The NT rename blob's FileNameLength excludes
+        // it, but the kernel still reads one past the counted bytes on some
+        // Windows builds.
+        let mut wide: Vec<u16> = target_name.encode_wide().collect();
+        wide.push(0);
+        let name_bytes = (wide.len() - 1)
             .checked_mul(2)
             .and_then(|length| u32::try_from(length).ok())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "child name is too long"))?;
         let header_len = offset_of!(FILE_RENAME_INFO, FileName);
         let total_len = header_len
-            .checked_add(name_bytes as usize)
+            .checked_add(wide.len().checked_mul(2).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "child name is too long")
+            })?)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "child name is too long"))?;
         let api_len = u32::try_from(total_len)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "child name is too long"))?;
@@ -1447,50 +1463,90 @@ mod platform {
         storage.resize_with(slot_count, MaybeUninit::zeroed);
         let storage_bytes = storage.as_mut_ptr().cast::<u8>();
         let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-        unsafe {
+        let mut status_block = IoStatusBlock {
+            status_or_pointer: 0,
+            information: 0,
+        };
+        let status = unsafe {
             (*info).Anonymous.ReplaceIfExists = false;
             (*info).RootDirectory = HANDLE(target_parent.as_raw_handle());
             (*info).FileNameLength = name_bytes;
             std::ptr::copy_nonoverlapping(
                 wide.as_ptr().cast::<u8>(),
                 storage_bytes.add(header_len),
-                name_bytes as usize,
+                wide.len() * 2,
             );
-            SetFileInformationByHandle(
+            // `SetFileInformationByHandle` can fail without a usable
+            // `GetLastError`, which made the Win32 mapper report `Other` for a
+            // real no-replace collision. Ask ntdll for the NTSTATUS instead.
+            NtSetInformationFile(
                 HANDLE(source.as_raw_handle()),
-                FileRenameInfo,
+                &mut status_block,
                 storage.as_ptr().cast(),
                 api_len,
+                FILE_RENAME_INFORMATION,
             )
+        };
+        if status >= 0 {
+            Ok(())
+        } else {
+            Err(map_nt_no_replace_error(status, target_parent, target_name))
         }
-        .map_err(map_windows_no_replace_error)
     }
 
-    fn map_windows_no_replace_error(error: windows::core::Error) -> io::Error {
-        const ERROR_ACCESS_DENIED: u32 = 5;
+    pub(super) fn nt_status_is_no_replace_collision(status: i32) -> bool {
         const ERROR_FILE_EXISTS: u32 = 80;
+        const ERROR_DIR_NOT_EMPTY: u32 = 145;
         const ERROR_ALREADY_EXISTS: u32 = 183;
         const ERROR_OBJECT_NAME_COLLISION: u32 = 698;
-        let hresult = error.code().0 as u32;
-        let from_hresult = if hresult & 0xFFFF_0000 == 0x8007_0000 {
-            hresult & 0xFFFF
-        } else {
-            hresult
-        };
-        let last = unsafe { windows::Win32::Foundation::GetLastError().0 };
-        if [from_hresult, last].into_iter().any(|code| {
-            matches!(
-                code,
-                ERROR_ACCESS_DENIED
-                    | ERROR_FILE_EXISTS
-                    | ERROR_ALREADY_EXISTS
-                    | ERROR_OBJECT_NAME_COLLISION
-            )
-        }) {
-            io::Error::new(io::ErrorKind::AlreadyExists, error)
-        } else {
-            io::Error::other(error)
+        if matches!(
+            status,
+            STATUS_OBJECT_NAME_COLLISION | STATUS_DIRECTORY_NOT_EMPTY
+        ) {
+            return true;
         }
+        matches!(
+            unsafe { RtlNtStatusToDosError(status) },
+            ERROR_FILE_EXISTS
+                | ERROR_DIR_NOT_EMPTY
+                | ERROR_ALREADY_EXISTS
+                | ERROR_OBJECT_NAME_COLLISION
+        )
+    }
+
+    fn destination_name_exists(parent: &File, name: &OsStr) -> bool {
+        open_relative(
+            parent,
+            name,
+            FILE_OPEN,
+            0,
+            (FILE_READ_ATTRIBUTES | SYNCHRONIZE).0,
+            None,
+        )
+        .is_ok()
+    }
+
+    fn map_nt_no_replace_error(
+        status: i32,
+        target_parent: &File,
+        target_name: &OsStr,
+    ) -> io::Error {
+        // A collision NTSTATUS is enough. If Windows instead returns an
+        // unhelpful status, the no-replace contract is still "dest already
+        // occupies that name".
+        if nt_status_is_no_replace_collision(status)
+            || destination_name_exists(target_parent, target_name)
+        {
+            return io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("no-replace rename collided (ntstatus={status:#010x})"),
+            );
+        }
+        let win32 = unsafe { RtlNtStatusToDosError(status) };
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("no-replace rename failed (ntstatus={status:#010x}, win32={win32})"),
+        )
     }
 
     pub(super) fn rename_retained_child_dir_no_replace(
@@ -1856,6 +1912,20 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_no_replace_collision_ntstatus_is_already_exists() {
+        assert!(platform::nt_status_is_no_replace_collision(
+            0xC000_0035_u32 as i32
+        ));
+        assert!(platform::nt_status_is_no_replace_collision(
+            0xC000_0101_u32 as i32
+        ));
+        assert!(!platform::nt_status_is_no_replace_collision(
+            0xC000_000D_u32 as i32
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_child_creation_and_no_replace_are_handle_relative() {
         let temp = tempfile::tempdir().unwrap();
         let source_path = temp.path().join("source");
@@ -1869,12 +1939,13 @@ mod tests {
         std::fs::write(source_path.join("marker"), b"marker").unwrap();
         source.remove_marker(OsStr::new("marker")).unwrap();
         assert!(!source_path.join("marker").exists());
+        let collision = source
+            .rename_child_dir_no_replace(OsStr::new("session"), &target, OsStr::new("session"))
+            .unwrap_err();
         assert_eq!(
-            source
-                .rename_child_dir_no_replace(OsStr::new("session"), &target, OsStr::new("session"))
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::AlreadyExists
+            collision.kind(),
+            io::ErrorKind::AlreadyExists,
+            "no-replace collision should be AlreadyExists: {collision}"
         );
         assert!(source.open_child_dir(OsStr::new("session")).is_ok());
         assert!(target.open_child_dir(OsStr::new("session")).is_ok());
