@@ -4232,9 +4232,8 @@ impl MvpAgent {
             .flatten();
         let override_effort = session_effort.or_else(|| {
             let entry = model_entry?;
-            let selected = (presentation.current_model_id == model_id)
-                .then_some(presentation.reasoning_effort)
-                .flatten()
+            let selected = presentation
+                .reasoning_effort
                 .or(entry.info().reasoning_effort)?;
             crate::agent::models::model_offers_reasoning_effort(entry.info(), selected)
                 .then_some(selected)
