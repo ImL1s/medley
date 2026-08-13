@@ -2673,14 +2673,19 @@ fn resolve_default_model_cli_override_keeps_shared_route_catalog_key() {
         make_model_entry("gpt-5.6-luna"),
     );
 
-    let mut cfg = config::Config::default();
-    cfg.default_model_override = Some("gpt-5.6-sol-wm".to_string());
-    let (key, entry, _, _) = resolve_default_model(&cfg, &catalog, true);
+    let cfg_sol_wm = config::Config {
+        default_model_override: Some("gpt-5.6-sol-wm".to_string()),
+        ..config::Config::default()
+    };
+    let (key, entry, _, _) = resolve_default_model(&cfg_sol_wm, &catalog, true);
     assert_eq!(key, "gpt-5.6-sol-wm");
     assert_eq!(entry.info.model, "gpt-5.6-sol");
 
-    cfg.default_model_override = Some("codex-auto-review".to_string());
-    let (key, entry, _, _) = resolve_default_model(&cfg, &catalog, true);
+    let cfg_auto_review = config::Config {
+        default_model_override: Some("codex-auto-review".to_string()),
+        ..config::Config::default()
+    };
+    let (key, entry, _, _) = resolve_default_model(&cfg_auto_review, &catalog, true);
     assert_eq!(key, "codex-auto-review");
     assert_eq!(entry.info.model, "gpt-5.6-luna");
 }
