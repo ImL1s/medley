@@ -950,8 +950,10 @@ jobs:
             agent::model_providers:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             agent::models:: -- --nocapture
+          # EnvGuard tests in this module are #[serial], but sibling tests still
+          # mutate GROK_HOME / XAI_API_KEY in parallel and steal their isolation.
           run_nonzero -p xai-grok-shell --lib \
-            agent::mvp_agent:: -- --nocapture
+            agent::mvp_agent:: -- --nocapture --test-threads=1
           run_nonzero -p xai-grok-shell --lib \
             agent::otel_gate:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
