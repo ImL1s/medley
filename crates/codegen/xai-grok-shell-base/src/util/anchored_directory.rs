@@ -921,22 +921,42 @@ mod platform {
     }
 
     pub(super) fn open_child_dir(parent: &File, name: &OsStr) -> io::Result<File> {
-        let file = open_relative(
+        let privileged = (FILE_LIST_DIRECTORY
+            | FILE_READ_ATTRIBUTES
+            | FILE_TRAVERSE
+            | FILE_WRITE_DATA
+            | DELETE
+            | windows::Win32::Storage::FileSystem::READ_CONTROL
+            | windows::Win32::Storage::FileSystem::WRITE_DAC
+            | SYNCHRONIZE)
+            .0;
+        // GHA (and other Administrators-owned temp dirs) often deny WRITE_DAC
+        // on a directory created by create_dir_all. Publication only needs
+        // add-child / delete-child access.
+        let reduced = (FILE_LIST_DIRECTORY
+            | FILE_READ_ATTRIBUTES
+            | FILE_TRAVERSE
+            | FILE_WRITE_DATA
+            | DELETE
+            | SYNCHRONIZE)
+            .0;
+        let file = match open_relative(
             parent,
             name,
             FILE_OPEN,
             FILE_DIRECTORY_FILE,
-            (FILE_LIST_DIRECTORY
-                | FILE_READ_ATTRIBUTES
-                | FILE_TRAVERSE
-                | FILE_WRITE_DATA
-                | DELETE
-                | windows::Win32::Storage::FileSystem::READ_CONTROL
-                | windows::Win32::Storage::FileSystem::WRITE_DAC
-                | SYNCHRONIZE)
-                .0,
+            privileged,
             None,
-        )?;
+        ) {
+            Ok(file) => file,
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(5) =>
+            {
+                open_relative(parent, name, FILE_OPEN, FILE_DIRECTORY_FILE, reduced, None)?
+            }
+            Err(error) => return Err(error),
+        };
         reject_reparse_directory(file)
     }
 
