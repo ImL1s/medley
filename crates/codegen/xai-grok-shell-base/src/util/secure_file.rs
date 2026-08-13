@@ -253,11 +253,11 @@ fn secure_windows_directory_on_handle(path: &Path) -> io::Result<()> {
     use windows::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, GetFileInformationByHandle, READ_CONTROL, WRITE_DAC,
+        FILE_SHARE_WRITE, GetFileInformationByHandle, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
     };
 
     let directory = OpenOptions::new()
-        .access_mode((READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES).0)
+        .access_mode((READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES).0)
         .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
         .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
         .open(path)?;
@@ -293,10 +293,25 @@ fn secure_windows_directory_on_handle(path: &Path) -> io::Result<()> {
         let owner_matches = EqualSid(owner, current_sid).is_ok();
         drop(descriptor);
         if !owner_matches {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "owner-only directory is not owned by the current user",
-            ));
+            // Temp/stage directories on some Windows hosts (including GHA) are
+            // created with the Administrators group as owner. If this process
+            // has WRITE_OWNER, take ownership before locking the DACL; otherwise
+            // keep fail-closed.
+            let status = SetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                Some(current_sid),
+                None,
+                None,
+                None,
+            );
+            if status.0 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "owner-only directory is not owned by the current user",
+                ));
+            }
         }
 
         with_windows_owner_only_acl(CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE, |new_acl| {
