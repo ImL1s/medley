@@ -239,6 +239,39 @@ pub fn set_windows_secure_permissions(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
+fn enable_windows_privilege(name: windows::core::PCWSTR) -> io::Result<()> {
+    use windows::Win32::Foundation::LUID;
+    use windows::Win32::Security::{
+        AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
+        TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token = windows::Win32::Foundation::HANDLE::default();
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        )
+        .map_err(io::Error::other)?;
+        let token = WindowsHandle(token);
+        let mut luid = LUID::default();
+        LookupPrivilegeValueW(None, name, &mut luid).map_err(io::Error::other)?;
+        let privileges = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        AdjustTokenPrivileges(token.0, false, Some(&privileges), 0, None, None)
+            .map_err(io::Error::other)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn secure_windows_directory_on_handle(path: &Path) -> io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt as _;
     use std::os::windows::io::AsRawHandle as _;
@@ -246,7 +279,7 @@ fn secure_windows_directory_on_handle(path: &Path) -> io::Result<()> {
     use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
     use windows::Win32::Security::{
         CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
-        PROTECTED_DACL_SECURITY_INFORMATION,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
     };
     use windows::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
@@ -254,8 +287,14 @@ fn secure_windows_directory_on_handle(path: &Path) -> io::Result<()> {
         FILE_SHARE_WRITE, GetFileInformationByHandle, READ_CONTROL, WRITE_DAC,
     };
 
+    // Administrators tokens have these privileges assigned but disabled.
+    // Taking ownership of a GHA temp directory requires them to be enabled.
+    let _ = enable_windows_privilege(windows::core::w!("SeTakeOwnershipPrivilege"));
+    let _ = enable_windows_privilege(windows::core::w!("SeRestorePrivilege"));
+
+    const WRITE_OWNER: u32 = 0x0008_0000;
     let directory = OpenOptions::new()
-        .access_mode((READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES).0)
+        .access_mode((READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES).0 | WRITE_OWNER)
         .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
         .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
         .open(path)?;
@@ -272,16 +311,14 @@ fn secure_windows_directory_on_handle(path: &Path) -> io::Result<()> {
 
         let current_user = current_windows_user()?;
         let current_sid = current_user.sid();
-        // Do not require the NTFS owner SID to already match. GHA and some
-        // enterprise images create temp directories owned by Administrators
-        // while the process token is a different user. WRITE_DAC is enough to
-        // install a protected current-user-only ACL; verify that ACE instead.
         with_windows_owner_only_acl(CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE, |new_acl| {
             SetSecurityInfo(
                 handle,
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                None,
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                Some(current_sid),
                 None,
                 Some(new_acl),
                 None,
