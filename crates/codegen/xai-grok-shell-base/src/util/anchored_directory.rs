@@ -1520,7 +1520,51 @@ mod platform {
         rename_retained_handle_no_replace(&source, target_parent, target_name)
     }
 
-    fn destination_nt_path(parent: &File, name: &OsStr) -> io::Result<Vec<u16>> {
+    fn fill_rename_info(
+        storage: &mut [MaybeUninit<FILE_RENAME_INFO>],
+        wide: &[u16],
+        root: HANDLE,
+        flags: u32,
+        replace_if_exists: bool,
+    ) -> u32 {
+        let header_len = offset_of!(FILE_RENAME_INFO, FileName);
+        let name_bytes = ((wide.len() - 1) * 2) as u32;
+        let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        unsafe {
+            if flags != 0 {
+                (*info).Anonymous.Flags = flags;
+            } else {
+                (*info).Anonymous.ReplaceIfExists = replace_if_exists;
+            }
+            (*info).RootDirectory = root;
+            (*info).FileNameLength = name_bytes;
+            std::ptr::copy_nonoverlapping(
+                wide.as_ptr().cast::<u8>(),
+                storage.as_mut_ptr().cast::<u8>().add(header_len),
+                wide.len() * 2,
+            );
+        }
+        (header_len + wide.len() * 2) as u32
+    }
+
+    fn allocate_rename_storage(wide: &[u16]) -> io::Result<Vec<MaybeUninit<FILE_RENAME_INFO>>> {
+        let header_len = offset_of!(FILE_RENAME_INFO, FileName);
+        let total_len = header_len
+            .checked_add(wide.len().saturating_mul(2))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "child name is too long"))?;
+        let slot_count = total_len.div_ceil(size_of::<FILE_RENAME_INFO>());
+        let mut storage = Vec::<MaybeUninit<FILE_RENAME_INFO>>::new();
+        storage.try_reserve_exact(slot_count).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!("failed to allocate rename information: {error}"),
+            )
+        })?;
+        storage.resize_with(slot_count, MaybeUninit::zeroed);
+        Ok(storage)
+    }
+
+    fn destination_extended_dos_path(parent: &File, name: &OsStr) -> io::Result<Vec<u16>> {
         let mut buffer = vec![0_u16; 512];
         let mut chars = unsafe {
             GetFinalPathNameByHandleW(
@@ -1546,25 +1590,12 @@ mod platform {
             }
         }
         buffer.truncate(chars as usize);
-        let prefix = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
-        let mut nt = vec![b'\\' as u16, b'?' as u16, b'\\' as u16];
-        if buffer.starts_with(&prefix) {
-            nt.extend_from_slice(&buffer[4..]);
-        } else {
-            nt.extend_from_slice(&buffer);
+        if buffer.last() != Some(&(b'\\' as u16)) {
+            buffer.push(b'\\' as u16);
         }
-        if nt.last() != Some(&(b'\\' as u16)) {
-            nt.push(b'\\' as u16);
-        }
-        nt.extend(name.encode_wide());
-        if nt.contains(&0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "path contains NUL",
-            ));
-        }
-        nt.push(0);
-        Ok(nt)
+        buffer.extend(name.encode_wide());
+        buffer.push(0);
+        Ok(buffer)
     }
 
     fn rename_retained_handle_no_replace(
@@ -1572,77 +1603,78 @@ mod platform {
         target_parent: &File,
         target_name: &OsStr,
     ) -> io::Result<()> {
-        // Full NT destination path with a NULL RootDirectory. Passing a Win32
-        // CreateFile handle as RootDirectory returns ACCESS_DENIED on GHA
-        // even when the name is free, and that blocked publishing a staging
-        // container that still had an open child writer.
-        let mut wide = destination_nt_path(target_parent, target_name)?;
-        let name_bytes = (wide.len() - 1)
-            .checked_mul(2)
-            .and_then(|length| u32::try_from(length).ok())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "child name is too long"))?;
-        let header_len = offset_of!(FILE_RENAME_INFO, FileName);
-        let total_len = header_len
-            .checked_add(wide.len().checked_mul(2).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "child name is too long")
-            })?)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "child name is too long"))?;
-        let api_len = u32::try_from(total_len)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "child name is too long"))?;
-
-        let slot_count = total_len.div_ceil(size_of::<FILE_RENAME_INFO>());
-        let mut storage = Vec::<MaybeUninit<FILE_RENAME_INFO>>::new();
-        storage.try_reserve_exact(slot_count).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                format!("failed to allocate rename information: {error}"),
-            )
-        })?;
-        storage.resize_with(slot_count, MaybeUninit::zeroed);
-        let storage_bytes = storage.as_mut_ptr().cast::<u8>();
-        let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        let posix_flags = FILE_RENAME_POSIX_SEMANTICS | FILE_RENAME_IGNORE_READONLY_ATTRIBUTE;
+        let mut relative: Vec<u16> = target_name.encode_wide().collect();
+        relative.push(0);
+        let mut relative_storage = allocate_rename_storage(&relative)?;
+        let relative_len = fill_rename_info(
+            &mut relative_storage,
+            &relative,
+            HANDLE(target_parent.as_raw_handle()),
+            posix_flags,
+            false,
+        );
         let mut status_block = IoStatusBlock {
             status_or_pointer: 0,
             information: 0,
         };
-        let posix_flags = FILE_RENAME_POSIX_SEMANTICS | FILE_RENAME_IGNORE_READONLY_ATTRIBUTE;
-        let status = unsafe {
-            (*info).Anonymous.Flags = posix_flags;
-            (*info).RootDirectory = HANDLE::default();
-            (*info).FileNameLength = name_bytes;
-            std::ptr::copy_nonoverlapping(
-                wide.as_ptr().cast::<u8>(),
-                storage_bytes.add(header_len),
-                wide.len() * 2,
-            );
-            let posix = NtSetInformationFile(
+        let posix = unsafe {
+            NtSetInformationFile(
                 HANDLE(source.as_raw_handle()),
                 &mut status_block,
-                storage.as_ptr().cast(),
-                api_len,
+                relative_storage.as_ptr().cast(),
+                relative_len,
                 FILE_RENAME_INFORMATION_EX,
-            );
-            if posix >= 0 || nt_status_is_no_replace_collision(posix) {
-                posix
-            } else if SetFileInformationByHandle(
-                HANDLE(source.as_raw_handle()),
-                FileRenameInfoEx,
-                storage.as_ptr().cast(),
-                api_len,
             )
-            .is_ok()
-            {
-                0
-            } else {
-                (*info).Anonymous.ReplaceIfExists = false;
-                NtSetInformationFile(
+        };
+        if posix >= 0 {
+            return Ok(());
+        }
+        if nt_status_is_no_replace_collision(posix) {
+            return Err(map_nt_no_replace_error(posix, target_parent, target_name));
+        }
+
+        // Open child writers need POSIX exclusive rename by an extended DOS
+        // path. A Win32 RootDirectory handle is enough for collisions, but
+        // GHA denies that handle when a child file is still open.
+        if let Ok(extended) = destination_extended_dos_path(target_parent, target_name) {
+            let mut extended_storage = allocate_rename_storage(&extended)?;
+            let extended_len = fill_rename_info(
+                &mut extended_storage,
+                &extended,
+                HANDLE::default(),
+                posix_flags,
+                false,
+            );
+            if unsafe {
+                SetFileInformationByHandle(
                     HANDLE(source.as_raw_handle()),
-                    &mut status_block,
-                    storage.as_ptr().cast(),
-                    api_len,
-                    FILE_RENAME_INFORMATION,
+                    FileRenameInfoEx,
+                    extended_storage.as_ptr().cast(),
+                    extended_len,
                 )
             }
+            .is_ok()
+            {
+                return Ok(());
+            }
+        }
+
+        let classic = fill_rename_info(
+            &mut relative_storage,
+            &relative,
+            HANDLE(target_parent.as_raw_handle()),
+            0,
+            false,
+        );
+        let status = unsafe {
+            NtSetInformationFile(
+                HANDLE(source.as_raw_handle()),
+                &mut status_block,
+                relative_storage.as_ptr().cast(),
+                classic,
+                FILE_RENAME_INFORMATION,
+            )
         };
         if status >= 0 {
             Ok(())
