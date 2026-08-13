@@ -465,11 +465,14 @@ impl CopyPublication {
                                     Ok(published) => published,
                                     Err(failure) => {
                                         self.stage_dir_anchor = Some(failure.source);
+                                        let published_dest = self
+                                            .root_dir
+                                            .join("sessions")
+                                            .join(&self.target_parent_name)
+                                            .join(&self.target_name);
                                         let error = if failure.error.kind()
                                             == io::ErrorKind::AlreadyExists
-                                            || parent
-                                                .open_child_dir(OsStr::new(&self.target_name))
-                                                .is_ok()
+                                            || published_dest.exists()
                                         {
                                             io::Error::new(
                                                 io::ErrorKind::AlreadyExists,

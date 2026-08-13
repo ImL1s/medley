@@ -302,7 +302,68 @@ pub(super) fn rename_no_replace(source: &Path, target: &Path) -> Result<()> {
 
 #[cfg(windows)]
 pub(super) fn rename_no_replace(source: &Path, target: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileRenameInfoEx,
+        SYNCHRONIZE, SetFileInformationByHandle,
+    };
     use xai_grok_shell_base::util::anchored_directory::AnchoredDirectory;
+
+    if target.exists() {
+        return Err(RelocationError::Collision(target.to_path_buf()));
+    }
+
+    let source_file = fs::OpenOptions::new()
+        .access_mode((DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE).0)
+        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+        .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
+        .open(source)
+        .map_err(|e| io_error("open", source, e))?;
+
+    let mut dest: Vec<u16> = {
+        let absolute = std::path::absolute(target).map_err(|e| io_error("resolve", target, e))?;
+        let raw: Vec<u16> = absolute.as_os_str().encode_wide().collect();
+        let prefix = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+        if raw.starts_with(&prefix) {
+            raw
+        } else {
+            let mut extended = prefix.to_vec();
+            extended.extend(raw);
+            extended
+        }
+    };
+    dest.push(0);
+    let header_len = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let name_bytes = ((dest.len() - 1) * 2) as u32;
+    let total_len = header_len + dest.len() * 2;
+    let slot_count = total_len.div_ceil(std::mem::size_of::<FILE_RENAME_INFO>());
+    let mut storage = vec![std::mem::MaybeUninit::<FILE_RENAME_INFO>::zeroed(); slot_count];
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // FILE_RENAME_FLAG_POSIX_SEMANTICS | FILE_RENAME_FLAG_IGNORE_READONLY_ATTRIBUTE
+    const POSIX_EXCLUSIVE: u32 = 0x0000_0002 | 0x0000_0040;
+    let result = unsafe {
+        (*info).Anonymous.Flags = POSIX_EXCLUSIVE;
+        (*info).RootDirectory = HANDLE::default();
+        (*info).FileNameLength = name_bytes;
+        std::ptr::copy_nonoverlapping(
+            dest.as_ptr().cast::<u8>(),
+            storage.as_mut_ptr().cast::<u8>().add(header_len),
+            dest.len() * 2,
+        );
+        SetFileInformationByHandle(
+            HANDLE(source_file.as_raw_handle()),
+            FileRenameInfoEx,
+            storage.as_ptr().cast(),
+            total_len as u32,
+        )
+    };
+    if result.is_ok() {
+        return Ok(());
+    }
 
     let source_parent = source.parent().ok_or_else(|| {
         RelocationError::Inconsistent(format!("source has no parent: {}", source.display()))
@@ -316,29 +377,19 @@ pub(super) fn rename_no_replace(source: &Path, target: &Path) -> Result<()> {
     let target_name = target.file_name().ok_or_else(|| {
         RelocationError::Inconsistent(format!("target has no name: {}", target.display()))
     })?;
-
-    // MoveFileExW reports ACCESS_DENIED both for a no-replace collision and
-    // for a directory that still has an open child writer. The anchored
-    // NT rename is exclusive and keeps the child handle bound.
     let source_root = AnchoredDirectory::open_root(source_parent)
         .map_err(|e| io_error("open", source_parent, e))?;
     let target_root = AnchoredDirectory::open_root(target_parent)
         .map_err(|e| io_error("open", target_parent, e))?;
-    match source_root.rename_child_dir_no_replace(source_name, &target_root, target_name) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists || target.exists() => {
-            Err(RelocationError::Collision(target.to_path_buf()))
-        }
-        Err(error) => {
-            // NT exclusive rename still returns ACCESS_DENIED when a child
-            // writer is open. Path rename succeeds once the child shared
-            // delete access, which is the publication contract.
-            match fs::rename(source, target) {
-                Ok(()) => Ok(()),
-                Err(_) => Err(io_error("publish", target, error)),
+    source_root
+        .rename_child_dir_no_replace(source_name, &target_root, target_name)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists || target.exists() {
+                RelocationError::Collision(target.to_path_buf())
+            } else {
+                io_error("publish", target, error)
             }
-        }
-    }
+        })
 }
 
 #[cfg(not(any(
