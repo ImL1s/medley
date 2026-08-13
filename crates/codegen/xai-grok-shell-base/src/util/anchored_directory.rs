@@ -675,30 +675,30 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use super::*;
-    use std::mem::{MaybeUninit, offset_of, size_of};
+    use std::mem::{offset_of, size_of, MaybeUninit};
     use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
     use std::os::windows::fs::OpenOptionsExt as _;
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
+    use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
     use windows::Win32::Security::Authorization::{
-        GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
+        GetSecurityInfo, SetSecurityInfo, SE_FILE_OBJECT,
     };
     use windows::Win32::Security::GetTokenInformation;
     use windows::Win32::Security::{
-        ACL, ACL_REVISION, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
-        EqualSid, GetLengthSid, InitializeAcl, InitializeSecurityDescriptor, OBJECT_INHERIT_ACE,
+        AddAccessAllowedAceEx, EqualSid, GetLengthSid, InitializeAcl, InitializeSecurityDescriptor,
+        SetSecurityDescriptorControl, SetSecurityDescriptorDacl, TokenUser, ACL, ACL_REVISION,
+        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
         OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-        PSID, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR, SetSecurityDescriptorControl,
-        SetSecurityDescriptorDacl, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        PSID, SECURITY_DESCRIPTOR, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
     };
     use windows::Win32::Storage::FileSystem::{
+        FileDispositionInfo, FileIdBothDirectoryInfo, GetFileInformationByHandle,
+        GetFileInformationByHandleEx, ReOpenFile, SetFileInformationByHandle,
         BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY,
         FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_DATA, FileDispositionInfo,
-        FileIdBothDirectoryInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
-        ReOpenFile, SYNCHRONIZE, SetFileInformationByHandle,
+        FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_DATA, SYNCHRONIZE,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -760,6 +760,10 @@ mod platform {
     }
 
     const FILE_RENAME_INFORMATION: u32 = 10;
+    const FILE_DISPOSITION_INFORMATION_EX: u32 = 64;
+    const FILE_DISPOSITION_DELETE: u32 = 0x0000_0001;
+    const FILE_DISPOSITION_POSIX_SEMANTICS: u32 = 0x0000_0002;
+    const FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE: u32 = 0x0000_0010;
     const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035_u32 as i32;
     const STATUS_DIRECTORY_NOT_EMPTY: i32 = 0xC000_0101_u32 as i32;
 
@@ -1062,7 +1066,7 @@ mod platform {
             impl Drop for LocalDescriptor {
                 fn drop(&mut self) {
                     unsafe {
-                        let _ = LocalFree(Some(HLOCAL(self.0.0)));
+                        let _ = LocalFree(Some(HLOCAL(self.0 .0)));
                     }
                 }
             }
@@ -1269,6 +1273,37 @@ mod platform {
     }
 
     fn delete_by_handle(file: &File) -> io::Result<()> {
+        // Junctions and other reparse points often reject FileDispositionInfo
+        // with ERROR_ACCESS_DENIED (0x80070005) on GHA images. POSIX
+        // FileDispositionInformationEx unlinks the name immediately and
+        // ignores the read-only bit, which is what remove_tree needs so it
+        // can delete a junction leaf without walking its target.
+        #[repr(C)]
+        struct FileDispositionInformationEx {
+            flags: u32,
+        }
+        let info = FileDispositionInformationEx {
+            flags: FILE_DISPOSITION_DELETE
+                | FILE_DISPOSITION_POSIX_SEMANTICS
+                | FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE,
+        };
+        let mut status_block = IoStatusBlock {
+            status_or_pointer: 0,
+            information: 0,
+        };
+        let status = unsafe {
+            NtSetInformationFile(
+                HANDLE(file.as_raw_handle()),
+                &mut status_block,
+                (&raw const info).cast(),
+                size_of::<FileDispositionInformationEx>() as u32,
+                FILE_DISPOSITION_INFORMATION_EX,
+            )
+        };
+        if status >= 0 {
+            return Ok(());
+        }
+
         let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
         unsafe {
             SetFileInformationByHandle(
@@ -1278,7 +1313,12 @@ mod platform {
                 size_of::<FILE_DISPOSITION_INFO>() as u32,
             )
         }
-        .map_err(io::Error::other)
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("delete-by-handle failed (ntstatus={status:#010x}, win32={error})"),
+            )
+        })
     }
 
     pub(super) fn child_names(directory: &File) -> io::Result<Vec<OsString>> {
@@ -1613,7 +1653,7 @@ mod tests {
     #[test]
     fn owner_only_lock_file_is_private_read_write_and_retained_parent_anchored() {
         use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+        use std::os::unix::fs::{symlink, MetadataExt as _, PermissionsExt as _};
 
         let temp = tempfile::tempdir().unwrap();
         let root_path = temp.path().join("root");
@@ -1660,17 +1700,15 @@ mod tests {
         let root = AnchoredDirectory::open_root(&root_path).unwrap();
 
         symlink(&outside, root_path.join("symlink.lock")).unwrap();
-        assert!(
-            root.open_or_create_owner_only_child_file(OsStr::new("symlink.lock"))
-                .is_err()
-        );
+        assert!(root
+            .open_or_create_owner_only_child_file(OsStr::new("symlink.lock"))
+            .is_err());
         assert_eq!(std::fs::read(&outside).unwrap(), b"sentinel");
 
         std::fs::hard_link(&outside, root_path.join("hardlink.lock")).unwrap();
-        assert!(
-            root.open_or_create_owner_only_child_file(OsStr::new("hardlink.lock"))
-                .is_err()
-        );
+        assert!(root
+            .open_or_create_owner_only_child_file(OsStr::new("hardlink.lock"))
+            .is_err());
         assert_eq!(std::fs::read(&outside).unwrap(), b"sentinel");
     }
 
@@ -2091,7 +2129,8 @@ mod tests {
 
         assert_eq!(tree.child_names().unwrap().len(), 2);
         assert_eq!(tree.child_names().unwrap().len(), 2);
-        tree.remove_tree_self().unwrap();
+        tree.remove_tree_self()
+            .expect("remove_tree_self must delete the junction leaf without walking it");
 
         assert!(!parent_path.join("tree").exists());
         assert_eq!(
