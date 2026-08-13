@@ -243,21 +243,19 @@ fn secure_windows_directory_on_handle(path: &Path) -> io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt as _;
     use std::os::windows::io::AsRawHandle as _;
     use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::Security::Authorization::{
-        GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
-    };
+    use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
     use windows::Win32::Security::{
-        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, OBJECT_INHERIT_ACE,
-        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
+        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
+        PROTECTED_DACL_SECURITY_INFORMATION,
     };
     use windows::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, GetFileInformationByHandle, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+        FILE_SHARE_WRITE, GetFileInformationByHandle, READ_CONTROL, WRITE_DAC,
     };
 
     let directory = OpenOptions::new()
-        .access_mode((READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES).0)
+        .access_mode((READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES).0)
         .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
         .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
         .open(path)?;
@@ -274,46 +272,10 @@ fn secure_windows_directory_on_handle(path: &Path) -> io::Result<()> {
 
         let current_user = current_windows_user()?;
         let current_sid = current_user.sid();
-        let mut owner = PSID::default();
-        let mut descriptor = windows::Win32::Security::PSECURITY_DESCRIPTOR::default();
-        let status = GetSecurityInfo(
-            handle,
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION,
-            Some(&mut owner),
-            None,
-            None,
-            None,
-            Some(&mut descriptor),
-        );
-        if status.0 != 0 {
-            return Err(io::Error::from_raw_os_error(status.0 as i32));
-        }
-        let descriptor = WindowsLocalAllocation::new(descriptor.0);
-        let owner_matches = EqualSid(owner, current_sid).is_ok();
-        drop(descriptor);
-        if !owner_matches {
-            // Temp/stage directories on some Windows hosts (including GHA) are
-            // created with the Administrators group as owner. If this process
-            // has WRITE_OWNER, take ownership before locking the DACL; otherwise
-            // keep fail-closed.
-            let status = SetSecurityInfo(
-                handle,
-                SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION,
-                Some(current_sid),
-                None,
-                None,
-                None,
-            );
-            if status.0 != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "owner-only directory is not owned by the current user",
-                ));
-            }
-        }
-
+        // Do not require the NTFS owner SID to already match. GHA and some
+        // enterprise images create temp directories owned by Administrators
+        // while the process token is a different user. WRITE_DAC is enough to
+        // install a protected current-user-only ACL; verify that ACE instead.
         with_windows_owner_only_acl(CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE, |new_acl| {
             SetSecurityInfo(
                 handle,
