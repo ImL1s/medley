@@ -2067,8 +2067,15 @@ mod tests {
         let parent = AnchoredDirectory::open_root(&parent_path).unwrap();
         let tree = parent.create_child_dir(OsStr::new("tree")).unwrap();
         tree.create_child_dir(OsStr::new("nested")).unwrap();
-        std::fs::write(parent_path.join("tree/nested/data"), b"data").unwrap();
-        let junction = parent_path.join("tree/junction");
+        std::fs::write(
+            parent_path.join("tree").join("nested").join("data"),
+            b"data",
+        )
+        .unwrap();
+        // `join("tree/junction")` keeps a `/junction` component on Windows;
+        // mklink then treats `/junction` as a switch ("Parameter format not
+        // correct - \"junction\"").
+        let junction = parent_path.join("tree").join("junc");
         let mut command = std::process::Command::new("cmd");
         command
             .args(["/C", "mklink", "/J"])
