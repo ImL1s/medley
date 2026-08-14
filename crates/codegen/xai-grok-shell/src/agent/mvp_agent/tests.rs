@@ -8454,6 +8454,22 @@ mod soft_default_settings_emit {
     }
 }
 
+#[test]
+fn initialize_advertises_only_nonblank_external_auth_provider_commands() {
+    let advertised = |command: Option<&str>| {
+        let config = crate::auth::GrokComConfig {
+            auth_provider_command: command.map(str::to_owned),
+            ..Default::default()
+        };
+        super::acp_agent::has_advertised_auth_provider_command(&config)
+    };
+
+    assert!(!advertised(None));
+    assert!(!advertised(Some("")));
+    assert!(!advertised(Some(" \t\n")));
+    assert!(advertised(Some("acme-auth --token")));
+}
+
 /// #131 B3: the deliverable is the `initialize` response `_meta` key, not the
 /// in-memory lock. Deleting the insert in `AcpAgent::initialize` must fail
 /// this test; asserting only on `substituted_preference()` would not.
