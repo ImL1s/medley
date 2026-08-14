@@ -2603,10 +2603,11 @@ async fn read_parent_sampling_config_fallback_resolves_codex_wire_from_catalog()
     );
 }
 
-/// A catalog miss is not always "no capabilities". A runtime-only model
-/// (#159) can be absent from the config-derived catalog while the subagent
-/// inherits the parent's model, and returning `None` would silently strip
-/// capabilities the parent legitimately had.
+/// Fall back to the parent's wire only when this identity is absent from
+/// the catalog (a runtime-only model, #159). A present entry whose
+/// `codex_wire` is `None` is not a miss — that is authoritative empty
+/// metadata (#282); see
+/// `read_parent_sampling_config_fallback_present_none_does_not_keep_parent_wire`.
 #[tokio::test]
 async fn read_parent_sampling_config_catalog_miss_keeps_parent_wire_for_the_same_model() {
     let parent_caps = xai_grok_sampling_types::CodexWireCapabilities {
@@ -2631,6 +2632,42 @@ async fn read_parent_sampling_config_catalog_miss_keeps_parent_wire_for_the_same
         config.codex_wire,
         Some(parent_caps),
         "same model, catalog miss: the parent's value is the right one"
+    );
+}
+
+/// Same identity as the spawn baseline, but the catalog entry exists and
+/// advertises no wire capabilities. That `None` is authoritative: the
+/// actor-unavailable path must not keep the stale spawn-baseline `Some`.
+#[tokio::test]
+async fn read_parent_sampling_config_fallback_present_none_does_not_keep_parent_wire() {
+    let parent_caps = xai_grok_sampling_types::CodexWireCapabilities {
+        supports_reasoning_summary_parameter: Some(true),
+        ..Default::default()
+    };
+    let mut entry = test_model_entry("runtime-catalog-model");
+    entry.info.codex_wire = None;
+    let mut models = indexmap::IndexMap::new();
+    models.insert("runtime-catalog-model".to_string(), entry);
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.model_id = acp::ModelId::new("runtime-catalog-model");
+    ctx.sampling_config_model_id = acp::ModelId::new("runtime-catalog-model");
+    ctx.parent_chat_state = None;
+    ctx.sampling_config.model = "runtime-catalog-model".to_string();
+    ctx.sampling_config.codex_wire = Some(parent_caps);
+    ctx.available_models = models.clone();
+    ctx.models_manager = crate::agent::models::ModelsManager::new(
+        None,
+        models,
+        acp::ModelId::new("runtime-catalog-model"),
+        ctx.auth_manager.clone(),
+        crate::agent::config::Config::default(),
+    );
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(model_id.0.as_ref(), "runtime-catalog-model");
+    assert_eq!(
+        config.codex_wire,
+        None,
+        "a present entry with no wire metadata must not keep the parent's stale Some"
     );
 }
 
@@ -3385,9 +3422,9 @@ async fn read_parent_sampling_config_exact_stable_key_never_remaps_to_same_route
     assert_eq!(config.codex_wire, Some(baseline_caps));
 }
 
-/// A present catalog entry with no wire metadata is authoritative. After a
-/// session switch it must not fall through to the process startup model's
-/// baseline capabilities.
+/// A present catalog entry with no wire metadata is authoritative (#282).
+/// After a session switch it must not fall through to the process startup
+/// model's baseline capabilities.
 #[tokio::test]
 async fn read_parent_sampling_config_present_none_never_inherits_startup_model_wire() {
     let startup_caps = xai_grok_sampling_types::CodexWireCapabilities {
