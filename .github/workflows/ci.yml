@@ -344,6 +344,24 @@ jobs:
           # authoritative streamed items survive partial terminal output.
           run_nonzero -p xai-grok-tools --lib \
             codex_web_search_reconciles_partial_terminal_output_for_both_entry_points -- --nocapture
+          # #354: web-search must strip xAI identity / internal metadata at
+          # third-party origins after every header source has merged.
+          run_nonzero -p xai-grok-tools --lib \
+            third_party_request_build_strips_merged_identity_headers -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            mixed_case_extra_headers_cannot_bypass_request_build_scrub -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            mixed_case_env_header_names_cannot_bypass_third_party_scrub -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            trusted_xai_request_build_keeps_first_party_headers -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            trusted_proxy_request_build_keeps_first_party_headers -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            third_party_wire_request_has_no_internal_metadata -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            primary_subagent_and_model_switch_request_builds_share_boundary -- --nocapture
+          run_nonzero -p xai-grok-tools --lib \
+            codex_web_search_drops_internal_metadata_from_merged_headers -- --nocapture
           run_nonzero -p xai-grok-mcp --lib \
             callback_errors_never_echo_provider_controlled_credentials -- --nocapture
           # #151: an unlabelled chat-state credential reaching an external origin
@@ -570,6 +588,9 @@ jobs:
             subagent_trusted_tool_capabilities_render_in_human_and_json_views -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
             resolve_session_toolset_mcp_kind_none_dropped_under_readonly -- --nocapture
+          # #354: workspace proxy-header injection is first-party only.
+          run_nonzero -p xai-grok-workspace --lib \
+            build_proxy_headers_ -- --nocapture
           run_nonzero -p xai-computer-hub-sdk --lib \
             unavailable_handlers_are_absent_from_publish_and_dispatch -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
@@ -633,6 +654,8 @@ jobs:
             storage_client:: -- --nocapture
           run_nonzero -p xai-grok-auth --lib \
             bearer_fragment:: -- --nocapture
+          run_nonzero -p xai-grok-auth --lib \
+            internal_metadata:: -- --nocapture
           run_nonzero -p xai-grok-markdown --lib \
             render:: -- --nocapture
           run_nonzero -p xai-grok-pager-bin --bin xai-grok-pager \
@@ -708,6 +731,9 @@ jobs:
             agent::models:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             agent::mvp_agent:: -- --nocapture
+          # #354: identity headers are not injected for third-party origins.
+          run_nonzero -p xai-grok-shell --lib \
+            inject_proxy_headers_ -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             agent::otel_gate:: -- --nocapture
           run_nonzero -p xai-grok-shell --lib \

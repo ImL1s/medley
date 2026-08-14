@@ -155,17 +155,9 @@ fn is_loopback_url(url: &str) -> bool {
 
 /// First-party metadata namespaces that must never reach a non-xAI endpoint,
 /// regardless of how they were injected (defaults, extra_headers, env
-/// headers, or a per-request header injector).
+/// headers, or a per-request header injector). Shared with web search.
 fn is_internal_metadata_header(name: &HeaderName) -> bool {
-    let name = name.as_str();
-    name.starts_with("x-grok-")
-        || name.starts_with("x-xai-")
-        || name == "x-compactions-remaining"
-        || name == "x-compaction-at"
-        || name == "x-authenticateresponse"
-        || name == "traceparent"
-        || name == "tracestate"
-        || name == "baggage"
+    xai_grok_auth::is_internal_metadata_header(name)
 }
 
 /// Replace a stable first-party session identifier in `prompt_cache_key`

@@ -5096,6 +5096,50 @@ async fn prepare_image_gen_config_fails_open_without_auth() {
         "no resolved auth ⇒ fail open (tools not tier-restricted)"
     );
 }
+#[test]
+fn inject_proxy_headers_omits_identity_on_third_party_origin() {
+    let mut headers = indexmap::IndexMap::new();
+    super::inject_proxy_headers(
+        &mut headers,
+        Some("9.9.9"),
+        None,
+        "https://vendor.example/v1",
+    );
+    assert!(headers.get("x-grok-client-version").is_none());
+    assert!(headers.get("x-grok-client-identifier").is_none());
+    assert!(headers.get("X-XAI-Token-Auth").is_none());
+}
+
+#[test]
+fn inject_proxy_headers_keeps_identity_on_trusted_xai_origin() {
+    let mut headers = indexmap::IndexMap::new();
+    super::inject_proxy_headers(&mut headers, Some("9.9.9"), None, "https://api.x.ai/v1");
+    assert_eq!(
+        headers.get("x-grok-client-version").map(String::as_str),
+        Some("9.9.9")
+    );
+    assert!(headers.get("x-grok-client-identifier").is_some());
+}
+
+#[test]
+fn inject_proxy_headers_keeps_identity_on_production_proxy() {
+    let mut headers = indexmap::IndexMap::new();
+    super::inject_proxy_headers(
+        &mut headers,
+        Some("9.9.9"),
+        None,
+        crate::env::PROD_CLI_CHAT_PROXY_BASE_URL,
+    );
+    assert_eq!(
+        headers.get("x-grok-client-version").map(String::as_str),
+        Some("9.9.9")
+    );
+    assert_eq!(
+        headers.get("X-XAI-Token-Auth").map(String::as_str),
+        Some("xai-grok-cli")
+    );
+}
+
 /// The imagine tools bypass cli-chat-proxy (direct API calls), so the server
 /// can only scope the coding data-retention opt-out (`/privacy opt-out`) to
 /// Build traffic via the `x-grok-client-identifier` header. If this header is

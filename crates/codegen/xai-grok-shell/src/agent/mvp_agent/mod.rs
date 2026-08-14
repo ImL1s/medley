@@ -1494,9 +1494,9 @@ impl AuthRequestMeta {
 /// of remembering which headers the proxy expects.
 ///
 /// Headers injected:
-///  - `x-grok-client-version` -- required by the proxy's version-gate check.
-///    Uses `client_version` when provided, otherwise falls back to cli-chat-proxy
-///    compile-time `CARGO_PKG_VERSION`.
+///  - `x-grok-client-version` / `x-grok-client-identifier` -- first-party
+///    identity, injected only for trusted xAI / production-proxy origins.
+///    Uses `client_version` when provided, otherwise the compile-time version.
 ///  - `X-XAI-Token-Auth` / `x-authenticateresponse` -- required by the
 ///    cli-chat-proxy auth middleware when the `base_url` is a known proxy URL.
 ///  - optional extra access header -- only set when the corresponding key is
@@ -1510,16 +1510,20 @@ pub(crate) fn inject_proxy_headers(
     alpha_test_key: Option<&str>,
     base_url: &str,
 ) {
-    headers
-        .entry("x-grok-client-version".to_string())
-        .or_insert_with(|| {
-            client_version
-                .map(String::from)
-                .unwrap_or_else(|| xai_grok_version::VERSION.to_string())
-        });
-    headers
-        .entry("x-grok-client-identifier".to_string())
-        .or_insert_with(crate::http::process_client_identifier);
+    if xai_grok_tools::implementations::web_search::is_trusted_first_party_web_search_origin(
+        base_url,
+    ) {
+        headers
+            .entry("x-grok-client-version".to_string())
+            .or_insert_with(|| {
+                client_version
+                    .map(String::from)
+                    .unwrap_or_else(|| xai_grok_version::VERSION.to_string())
+            });
+        headers
+            .entry("x-grok-client-identifier".to_string())
+            .or_insert_with(crate::http::process_client_identifier);
+    }
     if crate::util::is_cli_chat_proxy_url(base_url) {
         headers
             .entry("X-XAI-Token-Auth".to_string())

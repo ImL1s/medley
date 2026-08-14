@@ -15,11 +15,11 @@ const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const MAX_CODEX_SSE_BYTES: usize = 16 * 1024 * 1024;
 const CODEX_SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Session-wide auth belongs only to xAI-operated endpoints. A custom model's
-/// static key is scoped to its configured endpoint and must never be replaced
-/// with the current xAI session bearer merely because the caller supplied a
-/// default provider.
-fn accepts_xai_session_provider(base_url: &str) -> bool {
+/// HTTPS `x.ai` / `*.x.ai` or the production cli-chat-proxy, with no userinfo
+/// and default port 443. Session-provider attach and first-party identity
+/// headers both use this predicate so injection and the final scrub cannot
+/// disagree about which origin is trusted.
+pub fn is_trusted_first_party_web_search_origin(base_url: &str) -> bool {
     let Ok(candidate) = reqwest::Url::parse(base_url) else {
         return false;
     };
@@ -50,6 +50,14 @@ fn accepts_xai_session_provider(base_url: &str) -> bool {
                 .is_some_and(|suffix| suffix.starts_with('/')))
 }
 
+/// Session-wide auth belongs only to xAI-operated endpoints. A custom model's
+/// static key is scoped to its configured endpoint and must never be replaced
+/// with the current xAI session bearer merely because the caller supplied a
+/// default provider.
+fn accepts_xai_session_provider(base_url: &str) -> bool {
+    is_trusted_first_party_web_search_origin(base_url)
+}
+
 fn has_declared_credential_header(
     extra_headers: &IndexMap<String, String>,
     env_http_headers: &IndexMap<String, String>,
@@ -73,6 +81,49 @@ fn strip_codex_routing_headers(headers: &mut HeaderMap) {
     headers.remove(CHATGPT_ACCOUNT_ID);
     headers.remove(OPENAI_FEDRAMP);
     headers.remove(ORIGINATOR);
+}
+
+/// Resolve `env_http_headers` (`header -> env var`) into `headers` via
+/// `getenv`, skipping unset/blank/invalid entries and trimming values.
+fn apply_env_http_headers(
+    env_http_headers: &IndexMap<String, String>,
+    getenv: impl Fn(&str) -> Option<String>,
+    headers: &mut HeaderMap,
+) {
+    for (key, env_var) in env_http_headers {
+        let Some(value) = getenv(env_var) else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let (Ok(header_name), Ok(header_value)) = (
+            HeaderName::from_bytes(key.as_bytes()),
+            HeaderValue::from_str(value),
+        ) else {
+            tracing::warn!(
+                header = %key,
+                env_var = %env_var,
+                "skipping env_http_header with an invalid header name or value"
+            );
+            continue;
+        };
+        headers.insert(header_name, header_value);
+    }
+}
+
+/// Final-boundary scrub after static, environment, and dynamic headers merge.
+///
+/// Trusted xAI / production-proxy origins keep first-party metadata. Every
+/// other origin loses the `x-grok-*` / `x-xai-*` family plus tracing,
+/// compaction, and leftover Codex routing headers. Codex traffic does not
+/// call this: [`retain_codex_headers`] is its allowlist.
+fn apply_web_search_header_boundary(headers: &mut HeaderMap, base_url: &str) {
+    strip_codex_routing_headers(headers);
+    if !is_trusted_first_party_web_search_origin(base_url) {
+        xai_grok_auth::strip_internal_metadata_headers(headers);
+    }
 }
 
 fn should_follow_redirect_with_dynamic_credential(
@@ -231,27 +282,11 @@ impl WebSearchClient {
         // and unrepresentable entries are skipped rather than failing the
         // build: a mapping to a variable the user has not exported is a
         // configuration the sampler already tolerates (#160).
-        for (key, env_var) in env_http_headers {
-            let Ok(value) = std::env::var(env_var) else {
-                continue;
-            };
-            let value = value.trim();
-            if value.is_empty() {
-                continue;
-            }
-            let (Ok(header_name), Ok(header_value)) = (
-                HeaderName::from_bytes(key.as_bytes()),
-                HeaderValue::from_str(value),
-            ) else {
-                tracing::warn!(
-                    header = %key,
-                    env_var = %env_var,
-                    "skipping env_http_header with an invalid header name or value"
-                );
-                continue;
-            };
-            headers.insert(header_name, header_value);
-        }
+        apply_env_http_headers(
+            env_http_headers,
+            |env_var| std::env::var(env_var).ok(),
+            &mut headers,
+        );
         let _ = alpha_test_key;
         let provider_scoped = api_key_provider.is_some();
         let transport_profile = api_key_provider
@@ -284,7 +319,7 @@ impl WebSearchClient {
                 })?,
             );
         } else {
-            strip_codex_routing_headers(&mut headers);
+            apply_web_search_header_boundary(&mut headers, &base_url);
         }
         let route_declares_credential_header =
             has_declared_credential_header(extra_headers, env_http_headers);
@@ -466,10 +501,12 @@ impl WebSearchClient {
                 })?;
             } else {
                 request.headers_mut().insert(AUTHORIZATION, authorization);
-                strip_codex_routing_headers(request.headers_mut());
+                apply_web_search_header_boundary(request.headers_mut(), &self.base_url);
             }
-        } else {
+        } else if self.transport_profile == ApiTransportProfile::CodexResponses {
             strip_codex_routing_headers(request.headers_mut());
+        } else {
+            apply_web_search_header_boundary(request.headers_mut(), &self.base_url);
         }
         Ok(request)
     }
@@ -2069,6 +2106,455 @@ mod tests {
                 "Codex-only routing header leaked to generic Responses: {name}"
             );
         }
+    }
+
+    const INTERNAL_METADATA: [&str; 11] = [
+        "traceparent",
+        "tracestate",
+        "baggage",
+        "x-grok-conv-id",
+        "x-grok-client-identifier",
+        "x-grok-client-version",
+        "x-compactions-remaining",
+        "x-compaction-at",
+        "x-authenticateresponse",
+        "x-xai-token-auth",
+        "x-grok-user-id",
+    ];
+
+    fn identity_smuggling_headers() -> IndexMap<String, String> {
+        let mut headers = IndexMap::new();
+        for name in INTERNAL_METADATA {
+            headers.insert(name.to_string(), "must-not-leak".to_string());
+        }
+        headers.insert(
+            "chatgpt-account-id".to_string(),
+            "must-not-leak".to_string(),
+        );
+        headers.insert("x-openai-fedramp".to_string(), "true".to_string());
+        headers.insert("originator".to_string(), "codex_cli_rs".to_string());
+        headers.insert("x-provider-key".to_string(), "configured".to_string());
+        headers
+    }
+
+    fn assert_no_internal_metadata(headers: &HeaderMap) {
+        for name in INTERNAL_METADATA {
+            assert!(
+                headers.get(name).is_none(),
+                "internal metadata leaked: {name}"
+            );
+        }
+        for name in ["chatgpt-account-id", "x-openai-fedramp", "originator"] {
+            assert!(
+                headers.get(name).is_none(),
+                "Codex routing header leaked: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn third_party_origin_strips_internal_metadata_after_merge() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer third-party"));
+        apply_env_http_headers(
+            &IndexMap::from([
+                (
+                    "X-Grok-Client-Version".to_string(),
+                    "WEB_SEARCH_TEST_VERSION".to_string(),
+                ),
+                (
+                    "Traceparent".to_string(),
+                    "WEB_SEARCH_TEST_TRACE".to_string(),
+                ),
+            ]),
+            |env_var| match env_var {
+                "WEB_SEARCH_TEST_VERSION" => Some(" 9.9.9 ".to_string()),
+                "WEB_SEARCH_TEST_TRACE" => Some("00-must-not-leak-00".to_string()),
+                _ => None,
+            },
+            &mut headers,
+        );
+        for (name, value) in identity_smuggling_headers() {
+            let header_name = HeaderName::from_bytes(name.as_bytes()).unwrap();
+            headers.insert(header_name, HeaderValue::from_str(&value).unwrap());
+        }
+        apply_web_search_header_boundary(&mut headers, "https://vendor.example/v1");
+        assert_no_internal_metadata(&headers);
+        assert_eq!(headers[AUTHORIZATION], "Bearer third-party");
+        assert_eq!(headers[HeaderName::from_static("x-provider-key")], "configured");
+    }
+
+    #[test]
+    fn mixed_case_env_header_names_cannot_bypass_third_party_scrub() {
+        let mut headers = HeaderMap::new();
+        apply_env_http_headers(
+            &IndexMap::from([
+                (
+                    "X-GROK-CLIENT-IDENTIFIER".to_string(),
+                    "WEB_SEARCH_TEST_ID".to_string(),
+                ),
+                (
+                    "X-XAI-Token-Auth".to_string(),
+                    "WEB_SEARCH_TEST_TOKEN_AUTH".to_string(),
+                ),
+                (
+                    "X-Compactions-Remaining".to_string(),
+                    "WEB_SEARCH_TEST_COMPACTIONS".to_string(),
+                ),
+            ]),
+            |env_var| match env_var {
+                "WEB_SEARCH_TEST_ID" => Some("grok-shell".to_string()),
+                "WEB_SEARCH_TEST_TOKEN_AUTH" => Some("xai-grok-cli".to_string()),
+                "WEB_SEARCH_TEST_COMPACTIONS" => Some("3".to_string()),
+                _ => None,
+            },
+            &mut headers,
+        );
+        assert!(headers.get("x-grok-client-identifier").is_some());
+        apply_web_search_header_boundary(&mut headers, "https://search.example/v1");
+        assert!(headers.get("x-grok-client-identifier").is_none());
+        assert!(headers.get("x-xai-token-auth").is_none());
+        assert!(headers.get("x-compactions-remaining").is_none());
+    }
+
+    #[test]
+    fn trusted_xai_origin_retains_first_party_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-grok-client-version"),
+            HeaderValue::from_static("9.9.9"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-grok-client-identifier"),
+            HeaderValue::from_static("grok-shell"),
+        );
+        headers.insert(CHATGPT_ACCOUNT_ID, HeaderValue::from_static("must-not-keep"));
+        apply_web_search_header_boundary(&mut headers, "https://api.x.ai/v1");
+        assert_eq!(headers["x-grok-client-version"], "9.9.9");
+        assert_eq!(headers["x-grok-client-identifier"], "grok-shell");
+        assert!(headers.get(CHATGPT_ACCOUNT_ID).is_none());
+    }
+
+    #[test]
+    fn trusted_proxy_origin_retains_first_party_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-grok-client-version"),
+            HeaderValue::from_static("9.9.9"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-xai-token-auth"),
+            HeaderValue::from_static("xai-grok-cli"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-authenticateresponse"),
+            HeaderValue::from_static("authenticate-response"),
+        );
+        apply_web_search_header_boundary(
+            &mut headers,
+            xai_grok_env::PROD_CLI_CHAT_PROXY_BASE_URL,
+        );
+        assert_eq!(headers["x-grok-client-version"], "9.9.9");
+        assert_eq!(headers["x-xai-token-auth"], "xai-grok-cli");
+        assert_eq!(headers["x-authenticateresponse"], "authenticate-response");
+    }
+
+    #[test]
+    fn primary_subagent_and_model_switch_configs_share_final_header_boundary() {
+        // Primary-agent, subagent, and post-model-switch assembly all fold
+        // extra_headers into WebSearchConfig and construct WebSearchClient.
+        // The shipped request path must hit the same scrub regardless of
+        // which caller assembled the map.
+        let assembled = [
+            ("primary", identity_smuggling_headers()),
+            ("subagent", identity_smuggling_headers()),
+            ("model-switch", identity_smuggling_headers()),
+        ];
+        for (path, extra_headers) in assembled {
+            let mut headers = HeaderMap::new();
+            for (name, value) in extra_headers {
+                headers.insert(
+                    HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    HeaderValue::from_str(&value).unwrap(),
+                );
+            }
+            apply_web_search_header_boundary(&mut headers, "https://vendor.example/v1");
+            assert_no_internal_metadata(&headers);
+            assert_eq!(
+                headers[HeaderName::from_static("x-provider-key")],
+                "configured",
+                "{path} must keep configured provider headers"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn third_party_request_build_strips_merged_identity_headers() {
+        let config = WebSearchConfig::Enabled {
+            api_key: Some("third-party-key".to_string()),
+            base_url: "https://vendor.example/v1".to_string(),
+            model: "search-model".to_string(),
+            extra_headers: identity_smuggling_headers(),
+            env_http_headers: Default::default(),
+            alpha_test_key: None,
+            api_key_provider: None,
+        };
+        let client = WebSearchClient::new(&config, None).expect("client should build");
+        let request = client
+            .build_authenticated_request(
+                "https://vendor.example/v1/responses",
+                &serde_json::json!({"model": "search-model"}),
+            )
+            .await
+            .expect("request should build");
+        assert_no_internal_metadata(request.headers());
+        assert_eq!(request.headers()[AUTHORIZATION], "Bearer third-party-key");
+        assert_eq!(
+            request.headers()[HeaderName::from_static("x-provider-key")],
+            "configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_case_extra_headers_cannot_bypass_request_build_scrub() {
+        let extra_headers = IndexMap::from([
+            (
+                "X-Grok-Client-Version".to_string(),
+                "must-not-leak".to_string(),
+            ),
+            ("X-XAI-Token-Auth".to_string(), "must-not-leak".to_string()),
+            ("Traceparent".to_string(), "must-not-leak".to_string()),
+            (
+                "X-Compactions-Remaining".to_string(),
+                "3".to_string(),
+            ),
+        ]);
+        let config = WebSearchConfig::Enabled {
+            api_key: Some("third-party-key".to_string()),
+            base_url: "https://vendor.example/v1".to_string(),
+            model: "search-model".to_string(),
+            extra_headers,
+            env_http_headers: Default::default(),
+            alpha_test_key: None,
+            api_key_provider: None,
+        };
+        let client = WebSearchClient::new(&config, None).expect("client should build");
+        let request = client
+            .build_authenticated_request(
+                "https://vendor.example/v1/responses",
+                &serde_json::json!({"model": "search-model"}),
+            )
+            .await
+            .expect("request should build");
+        assert_no_internal_metadata(request.headers());
+    }
+
+    #[tokio::test]
+    async fn trusted_xai_request_build_keeps_first_party_headers() {
+        let extra_headers = IndexMap::from([
+            (
+                "x-grok-client-version".to_string(),
+                "9.9.9".to_string(),
+            ),
+            (
+                "x-grok-client-identifier".to_string(),
+                "grok-shell".to_string(),
+            ),
+        ]);
+        let config = WebSearchConfig::Enabled {
+            api_key: Some("xai-key".to_string()),
+            base_url: "https://api.x.ai/v1".to_string(),
+            model: "search-model".to_string(),
+            extra_headers,
+            env_http_headers: Default::default(),
+            alpha_test_key: None,
+            api_key_provider: None,
+        };
+        let client = WebSearchClient::new(&config, None).expect("client should build");
+        let request = client
+            .build_authenticated_request(
+                "https://api.x.ai/v1/responses",
+                &serde_json::json!({"model": "search-model"}),
+            )
+            .await
+            .expect("request should build");
+        assert_eq!(request.headers()["x-grok-client-version"], "9.9.9");
+        assert_eq!(request.headers()["x-grok-client-identifier"], "grok-shell");
+    }
+
+    #[tokio::test]
+    async fn trusted_proxy_request_build_keeps_first_party_headers() {
+        let extra_headers = IndexMap::from([
+            (
+                "x-grok-client-version".to_string(),
+                "9.9.9".to_string(),
+            ),
+            (
+                "X-XAI-Token-Auth".to_string(),
+                "xai-grok-cli".to_string(),
+            ),
+            (
+                "x-authenticateresponse".to_string(),
+                "authenticate-response".to_string(),
+            ),
+        ]);
+        let config = WebSearchConfig::Enabled {
+            api_key: Some("proxy-key".to_string()),
+            base_url: xai_grok_env::PROD_CLI_CHAT_PROXY_BASE_URL.to_string(),
+            model: "search-model".to_string(),
+            extra_headers,
+            env_http_headers: Default::default(),
+            alpha_test_key: None,
+            api_key_provider: None,
+        };
+        let client = WebSearchClient::new(&config, None).expect("client should build");
+        let request = client
+            .build_authenticated_request(
+                &format!(
+                    "{}/responses",
+                    xai_grok_env::PROD_CLI_CHAT_PROXY_BASE_URL.trim_end_matches('/')
+                ),
+                &serde_json::json!({"model": "search-model"}),
+            )
+            .await
+            .expect("request should build");
+        assert_eq!(request.headers()["x-grok-client-version"], "9.9.9");
+        assert_eq!(request.headers()["x-xai-token-auth"], "xai-grok-cli");
+        assert_eq!(
+            request.headers()["x-authenticateresponse"],
+            "authenticate-response"
+        );
+    }
+
+    #[tokio::test]
+    async fn third_party_wire_request_has_no_internal_metadata() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(successful_search_response("third-party result")),
+            )
+            .mount(&server)
+            .await;
+        let config = WebSearchConfig::Enabled {
+            api_key: Some("third-party-key".to_string()),
+            base_url: server.uri(),
+            model: "search-model".to_string(),
+            extra_headers: identity_smuggling_headers(),
+            env_http_headers: Default::default(),
+            alpha_test_key: None,
+            api_key_provider: None,
+        };
+        let client = WebSearchClient::new(&config, None).expect("client should build");
+        client.search("query", None).await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        for name in INTERNAL_METADATA {
+            assert!(
+                requests[0].headers.get(name).is_none(),
+                "internal metadata reached the wire: {name}"
+            );
+        }
+        for name in ["chatgpt-account-id", "x-openai-fedramp", "originator"] {
+            assert!(
+                requests[0].headers.get(name).is_none(),
+                "Codex routing header reached the wire: {name}"
+            );
+        }
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("x-provider-key")
+                .map(|value| value.to_str().unwrap()),
+            Some("configured")
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_subagent_and_model_switch_request_builds_share_boundary() {
+        for path in ["primary", "subagent", "model-switch"] {
+            let config = WebSearchConfig::Enabled {
+                api_key: Some("third-party-key".to_string()),
+                base_url: "https://vendor.example/v1".to_string(),
+                model: "search-model".to_string(),
+                extra_headers: identity_smuggling_headers(),
+                env_http_headers: Default::default(),
+                alpha_test_key: None,
+                api_key_provider: None,
+            };
+            let client = WebSearchClient::new(&config, None).expect("client should build");
+            let request = client
+                .build_authenticated_request(
+                    "https://vendor.example/v1/responses",
+                    &serde_json::json!({"model": "search-model"}),
+                )
+                .await
+                .expect("request should build");
+            assert_no_internal_metadata(request.headers());
+            assert_eq!(
+                request.headers()[HeaderName::from_static("x-provider-key")],
+                "configured",
+                "{path} must keep configured provider headers"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_web_search_drops_internal_metadata_from_merged_headers() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("Authorization", "Bearer codex-key"))
+            .and(header("chatgpt-account-id", "codex-account"))
+            .and(header("originator", "grok_build"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(successful_search_sse("codex allowlist result")),
+            )
+            .mount(&server)
+            .await;
+
+        let scoped: SharedApiKeyProvider = std::sync::Arc::new(ScopedProvider);
+        let config = WebSearchConfig::Enabled {
+            api_key: Some("snapshot-codex-key".to_string()),
+            base_url: server.uri(),
+            model: "codex-model".to_string(),
+            extra_headers: identity_smuggling_headers(),
+            env_http_headers: Default::default(),
+            alpha_test_key: None,
+            api_key_provider: Some(scoped),
+        };
+        let client = WebSearchClient::new(&config, None).expect("client should build");
+        let (content, _) = client
+            .search("query", None)
+            .await
+            .expect("codex search should succeed");
+        assert_eq!(content, "codex allowlist result");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        for name in INTERNAL_METADATA {
+            assert!(
+                requests[0].headers.get(name).is_none(),
+                "internal metadata bypassed the Codex allowlist: {name}"
+            );
+        }
+        assert!(requests[0].headers.get("x-provider-key").is_none());
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("chatgpt-account-id")
+                .map(|value| value.to_str().unwrap()),
+            Some("codex-account")
+        );
     }
     /// When the dynamic provider returns `None`, the static `api_key`
     /// from config must still be sent as the Authorization header.
