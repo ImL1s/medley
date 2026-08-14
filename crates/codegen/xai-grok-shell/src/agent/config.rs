@@ -4441,9 +4441,13 @@ pub struct ModelEntryConfig {
     /// Example: { "x-anthropic-api-key" = "sk-ant-..." }
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub extra_headers: IndexMap<String, String>,
-    /// The total context window size in tokens for this model.
-    /// Used for auto-compact threshold calculations.
-    /// Required — BYOK users must explicitly set this in config.toml.
+    /// Session token budget (context bar + auto-compact), i.e. operative
+    /// capacity. Required — BYOK users must set this in config.toml.
+    ///
+    /// This is not the Codex catalog field of the same name. Catalog
+    /// `context_window` is a billing/pricing threshold (272_000 on gpt-5.4);
+    /// catalog `max_context_window` is the operative capacity (1_000_000 on
+    /// gpt-5.4) and is what `codex_catalog_context_window` writes here.
     pub context_window: NonZeroU64,
     /// Per-model auto-compact threshold (0-100). When the session's token
     /// usage exceeds this percentage of `context_window`, the conversation
@@ -4605,6 +4609,14 @@ pub struct ConfigModelOverride {
     pub query_params: IndexMap<String, String>,
     #[serde(default)]
     pub env_http_headers: IndexMap<String, String>,
+    /// Session token budget (context bar + auto-compact).
+    ///
+    /// When filled from the Codex catalog this is the operative token
+    /// capacity: `max_context_window` first, then `context_window` as
+    /// fallback. On `gpt-5.4` those differ — catalog `context_window` is the
+    /// 272_000 billing/pricing threshold, not capacity; catalog
+    /// `max_context_window` is the 1_000_000 operative capacity. Do not call
+    /// the catalog `context_window` field "capacity".
     pub context_window: Option<u64>,
     /// Per-model auto-compact threshold override (0-100) from `[model.<id>]`.
     /// Read directly by `resolve_auto_compact_threshold_percent`; intentionally
@@ -4870,6 +4882,10 @@ pub struct ModelInfo {
     pub query_params: IndexMap<String, String>,
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub env_http_headers: IndexMap<String, String>,
+    /// Session token budget (operative capacity). See
+    /// [`ConfigModelOverride::context_window`] for the Codex catalog split
+    /// between the `context_window` pricing threshold and
+    /// `max_context_window` capacity.
     pub context_window: NonZeroU64,
     /// Per-model auto-compact threshold (0-100). `None` defers to the
     /// global / default tiers in `resolve_auto_compact_threshold_percent`.

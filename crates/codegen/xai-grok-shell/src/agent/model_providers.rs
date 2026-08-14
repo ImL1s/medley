@@ -364,32 +364,39 @@ fn codex_catalog_string(
         .map(str::to_owned)
 }
 
+/// Keys tried in order when reading a Codex catalog entry's session budget.
+///
+/// `max_context_window` is the operative token capacity and is first.
+/// `context_window` is the billing/pricing threshold, not capacity: on
+/// `gpt-5.4` that is 272_000 against a 1_000_000 operative window. CamelCase
+/// aliases are tolerances for a shape this endpoint does not currently return.
+///
+/// This array *is* the selection order. A test asserts `max_context_window`
+/// precedes `context_window` so inverting the fields fails without having to
+/// rewrite the lookup.
+const CODEX_CATALOG_CONTEXT_WINDOW_KEYS: &[&str] = &[
+    "max_context_window",
+    "maxContextWindow",
+    "context_window",
+    "contextWindow",
+];
+
 /// The window a session is budgeted against.
 ///
-/// `context_window` is the operative one and is tried first. `max_context_window`
-/// is a ceiling the account may not have, and preferring it — which this did
-/// until #258 — makes auto-compact fire late by exactly the ratio between them.
+/// On the live Codex catalog, `max_context_window` is the operative token
+/// capacity and is tried first. `context_window` is the billing/pricing
+/// threshold, not capacity. Measured 2026-08-08: eight of nine models report
+/// the two fields equal, and `gpt-5.4` reports `context_window: 272000`
+/// against `max_context_window: 1000000`. Budgeting the pricing field — which
+/// #258 did — fires auto-compact at ~27% of the tokens the model accepts.
 ///
-/// Measured on the live catalog: eight of nine models report the two fields
-/// equal, and `gpt-5.4` reports `context_window: 272000` against
-/// `max_context_window: 1000000`. So the bug was invisible on every model but
-/// one, and on that one it budgets **3.7x** the real window — which does not
-/// fail early and quietly, it fails deep into a long session on the model most
-/// likely to be used for long sessions.
-///
-/// `max_context_window` stays as a fallback for an entry that reports only the
-/// ceiling, rather than being dropped: no window at all falls back to the
-/// preset constant, which is worse than a too-large one.
+/// `context_window` stays as a fallback for an entry that reports only the
+/// pricing threshold. No window at all falls back to the preset constant.
 fn codex_catalog_context_window(obj: &serde_json::Map<String, serde_json::Value>) -> Option<u64> {
-    [
-        "context_window",
-        "contextWindow",
-        "max_context_window",
-        "maxContextWindow",
-    ]
-    .into_iter()
-    .find_map(|key| obj.get(key).and_then(serde_json::Value::as_u64))
-    .filter(|value| *value > 0)
+    CODEX_CATALOG_CONTEXT_WINDOW_KEYS
+        .iter()
+        .find_map(|key| obj.get(*key).and_then(serde_json::Value::as_u64))
+        .filter(|value| *value > 0)
 }
 
 fn codex_catalog_bool(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<bool> {
@@ -3173,10 +3180,9 @@ mod tests {
     /// currently return. They are kept so a server-side change does not break
     /// the fetch, and pinned so nobody mistakes them for the observed shape.
     ///
-    /// This test was called `..._prefers_max_context_window` and asserted
-    /// exactly that, which is how the #258 bug survived review: the name read
-    /// like a contract, the assertion agreed with it, and both were wrong.
-    /// A passing test is only evidence about the thing it decided to check.
+    /// Mini reports both fields; the budget is `max_context_window` (operative
+    /// capacity), not `context_window` (pricing threshold). Small reports only
+    /// the pricing field, which remains the fallback.
     #[test]
     fn codex_catalog_parser_tolerates_other_shapes_and_budgets_the_operative_window() {
         let payload = serde_json::json!({
@@ -3200,25 +3206,34 @@ mod tests {
             mini.model_provider.as_deref(),
             Some(OPENAI_CODEX_PROVIDER_ID)
         );
-        // The operative window, not the ceiling. `gpt-5.4` is the live case:
-        // 272000 against a 1000000 maximum.
-        assert_eq!(mini.context_window, Some(64_000));
+        // Operative capacity, not the 64k pricing threshold. `gpt-5.4` is the
+        // live split: 272000 pricing vs 1000000 capacity.
+        assert_eq!(mini.context_window, Some(256_000));
         let small = presets
             .get("codex-small")
             .expect("fallback slug preset should parse");
         assert_eq!(small.context_window, Some(128_000));
     }
 
-    /// The live shape that made this a bug rather than a preference.
+    /// The live `gpt-5.4` shape (#266).
     ///
-    /// Eight of the nine models in the account catalog report `context_window`
-    /// and `max_context_window` equal, so preferring either one looked
-    /// identical. `gpt-5.4` does not, and it is the model whose sessions run
-    /// longest — budgeting it at the ceiling puts auto-compact 3.7x past the
-    /// window, which surfaces as a context-length rejection deep into a
-    /// session rather than as anything a short test would see.
+    /// Eight of nine models report `context_window` and `max_context_window`
+    /// equal, so preferring either one looked identical. `gpt-5.4` does not:
+    /// 272_000 is the billing/pricing threshold, 1_000_000 is operative token
+    /// capacity. Budgeting the pricing field (#258) fires auto-compact at ~27%
+    /// of the tokens the model accepts.
     #[test]
-    fn codex_catalog_uses_context_window_not_the_ceiling_for_gpt_5_4() {
+    fn codex_catalog_context_window_budgets_the_operative_window() {
+        let obj = serde_json::json!({
+            "context_window": 272_000,
+            "max_context_window": 1_000_000
+        });
+        assert_eq!(
+            codex_catalog_context_window(obj.as_object().expect("object")),
+            Some(1_000_000),
+            "gpt-5.4 is budgeted at max_context_window (operative capacity), not context_window (pricing threshold)"
+        );
+
         let payload = serde_json::json!({
             "models": [{
                 "slug": "gpt-5.4",
@@ -3231,8 +3246,36 @@ mod tests {
         let entry = presets.get("gpt-5.4").expect("slug is the catalog key");
         assert_eq!(
             entry.context_window,
-            Some(272_000),
-            "the operative window is what a session is budgeted against"
+            Some(1_000_000),
+            "the session budget is the operative capacity"
+        );
+    }
+
+    /// Cheap inversion lock: this array *is* the lookup order. Putting
+    /// `context_window` first is how #258 budgeted gpt-5.4 at the 272k
+    /// pricing threshold.
+    #[test]
+    fn codex_catalog_context_window_keys_prefer_operative_capacity() {
+        assert_eq!(
+            CODEX_CATALOG_CONTEXT_WINDOW_KEYS,
+            &[
+                "max_context_window",
+                "maxContextWindow",
+                "context_window",
+                "contextWindow",
+            ]
+        );
+        let max_idx = CODEX_CATALOG_CONTEXT_WINDOW_KEYS
+            .iter()
+            .position(|key| *key == "max_context_window")
+            .expect("max_context_window must be a candidate");
+        let pricing_idx = CODEX_CATALOG_CONTEXT_WINDOW_KEYS
+            .iter()
+            .position(|key| *key == "context_window")
+            .expect("context_window must remain as the pricing-threshold fallback");
+        assert!(
+            max_idx < pricing_idx,
+            "inverting this order budgets gpt-5.4 at the 272k pricing threshold"
         );
     }
 
