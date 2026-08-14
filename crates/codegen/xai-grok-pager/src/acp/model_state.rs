@@ -198,7 +198,7 @@ impl ModelState {
             .collect()
     }
 
-    /// Display names that must not be committed from the settings picker.
+    /// Catalog model IDs that must not be committed from the settings picker.
     pub fn catalog_unready_reasons(&self) -> Vec<(String, String)> {
         crate::slash::commands::model::unready_reasons_from_catalog(&self.available)
     }

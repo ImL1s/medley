@@ -124,11 +124,12 @@ pub fn dynamic_enum_choices(
                 disabled: false,
                 disabled_reason: String::new(),
             });
-            for (name, _id) in &snapshot.available_models {
+            for (name, id) in &snapshot.available_models {
+                let id_key = id.0.as_ref();
                 let reason = snapshot
                     .unavailable_model_reasons
                     .iter()
-                    .find(|(n, _)| n == name)
+                    .find(|(key, _)| key == id_key)
                     .map(|(_, r)| r.as_str());
                 out.push(OwnedEnumChoice {
                     canonical: name.clone(),
@@ -277,7 +278,7 @@ pub struct PagerLocalSnapshot {
     /// Cloned into the snapshot so the modal's validator/resolver is
     /// self-contained (the modal outlives the borrow on `app.agents`).
     pub available_models: Vec<(String, acp::ModelId)>,
-    /// Display names that are visible but not committable, with the
+    /// Catalog model IDs that are visible but not committable, with the
     /// readiness reason shown on the picker row.
     pub unavailable_model_reasons: Vec<(String, String)>,
     /// Whether the user has opted OUT of coding data sharing.

@@ -48,7 +48,14 @@ thread_local! {
 
 /// Process-wide lease: the first `EnvGuard` on a thread takes [`ENV_MUTEX`];
 /// nested guards on the same thread increment a count and share that hold.
-struct EnvLockLease;
+///
+/// `*const ()` keeps the lease (and therefore [`EnvGuard`]) `!Send`. The lock
+/// guard and nest count live in thread-local storage; moving the lease to
+/// another OS thread would drop it against a different TLS slot and leak the
+/// original `MutexGuard` (#383 Codex P2).
+struct EnvLockLease {
+    _not_send: std::marker::PhantomData<*const ()>,
+}
 
 impl EnvLockLease {
     fn acquire() -> Self {
@@ -59,7 +66,9 @@ impl EnvLockLease {
             }
             nest.set(nest.get() + 1);
         });
-        Self
+        Self {
+            _not_send: std::marker::PhantomData,
+        }
     }
 }
 

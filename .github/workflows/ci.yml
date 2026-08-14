@@ -1679,6 +1679,10 @@ jobs:
             openai_codex_path_constructor_ignores_grok_auth_path_env -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             inspect_model_route_line_is_secret_free -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            clone_drop_does_not_cancel_sibling_publication -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            dynamic_enum_choices_disables_by_model_id_not_display_name -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_credential_source_must_be_openai_codex_provider -- --nocapture
           # #262: last-good catalogs are account-isolated and degraded state is visible.

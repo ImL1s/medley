@@ -469,6 +469,10 @@ impl Drop for FreshPublication {
         if self.is_committed() {
             return;
         }
+        // Clones share the stage. Only the last owner may cancel it.
+        if Arc::strong_count(&self.committed) > 1 {
+            return;
+        }
         self.stage_session_anchor
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -593,6 +597,18 @@ mod tests {
             FreshPublication::prepare(root.path(), SESSION_ID, OsStr::new(PARENT)).unwrap();
         write_summary(publication.stage_session());
         (root, publication)
+    }
+
+    #[test]
+    fn clone_drop_does_not_cancel_sibling_publication() {
+        let (_root, publication) = prepare();
+        let clone = publication.clone();
+        drop(clone);
+        publication
+            .finalize()
+            .expect("surviving owner still publishes");
+        assert!(publication.is_committed());
+        assert!(publication.published_session().join(SUMMARY_FILE).is_file());
     }
 
     #[test]

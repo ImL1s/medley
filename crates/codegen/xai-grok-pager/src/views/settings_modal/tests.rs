@@ -8223,7 +8223,7 @@ fn unavailable_model_picker_state() -> SettingsModalState {
             ),
         ],
         unavailable_model_reasons: vec![(
-            "Grok 4.5".to_string(),
+            "grok-4.5".to_string(),
             "missing XAI_API_KEY".to_string(),
         )],
         current_model_name: Some("GPT-5.6 Sol".to_string()),
@@ -8258,6 +8258,45 @@ fn dynamic_enum_choices_marks_unavailable_models_disabled() {
 }
 
 #[test]
+fn dynamic_enum_choices_disables_by_model_id_not_display_name() {
+    use crate::settings::dynamic_enum_choices;
+    let snapshot = PagerLocalSnapshot {
+        available_models: vec![
+            (
+                "Shared Name".to_string(),
+                agent_client_protocol::ModelId::new(Arc::from("ready-id")),
+            ),
+            (
+                "Shared Name".to_string(),
+                agent_client_protocol::ModelId::new(Arc::from("unready-id")),
+            ),
+        ],
+        unavailable_model_reasons: vec![("unready-id".to_string(), "no credential".to_string())],
+        current_model_name: Some("Shared Name".to_string()),
+        ..PagerLocalSnapshot::default()
+    };
+    let choices = dynamic_enum_choices(
+        crate::settings::DynamicEnumSource::ActiveModelCatalog,
+        &snapshot,
+    );
+    let shared: Vec<_> = choices
+        .iter()
+        .filter(|c| c.display == "Shared Name")
+        .collect();
+    assert_eq!(shared.len(), 2);
+    assert!(
+        shared.iter().any(|c| !c.disabled),
+        "the ready ID that shares a display name must stay selectable"
+    );
+    assert!(
+        shared
+            .iter()
+            .any(|c| c.disabled && c.disabled_reason == "no credential"),
+        "only the unready ID must be disabled"
+    );
+}
+
+#[test]
 fn remap_picking_enum_preserves_canonical_after_catalog_insert() {
     let mut s = unavailable_model_picker_state();
     assert!(s.focus_key("default_model"));
@@ -8285,7 +8324,7 @@ fn remap_picking_enum_preserves_canonical_after_catalog_insert() {
     );
     snapshot
         .unavailable_model_reasons
-        .push(("Inserted Model".to_string(), "new".to_string()));
+        .push(("inserted-model".to_string(), "new".to_string()));
     s.pager_snapshot = snapshot;
     s.remap_picking_enum_after_catalog_refresh(Some(selected));
     match &s.mode() {

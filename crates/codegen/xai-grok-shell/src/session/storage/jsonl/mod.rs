@@ -225,6 +225,21 @@ impl JsonlStorageAdapter {
             Err(error) => Err(io::Error::other(error)),
         }
     }
+
+    fn delete_session_sync(&self, info: &Info) -> io::Result<()> {
+        use xai_grok_workspace::session::id_lock::acquire_session_id_lock_sync;
+        let session_id = info.id.to_string();
+        let _lease = match self.lock_root() {
+            Some(root) => Some(acquire_session_id_lock_sync(root, &session_id)?),
+            None => None,
+        };
+        let dir = self.session_dir(info);
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
     pub(super) fn updates_file(&self, info: &Info) -> PathBuf {
         self.session_dir(info).join(super::UPDATES_FILE)
     }
@@ -1677,12 +1692,11 @@ impl StorageAdapter for JsonlStorageAdapter {
             .map_err(io::Error::other)?
     }
     async fn delete_session(&self, info: &Info) -> io::Result<()> {
-        let dir = self.session_dir(info);
-        match tokio::fs::remove_dir_all(&dir).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        }
+        let adapter = self.clone();
+        let info = info.clone();
+        tokio::task::spawn_blocking(move || adapter.delete_session_sync(&info))
+            .await
+            .map_err(io::Error::other)?
     }
     async fn append_rewind_point(&self, info: &Info, point: &RewindPoint) -> io::Result<()> {
         self.append_jsonl(self.rewind_points_file(info), point)

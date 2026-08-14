@@ -199,15 +199,19 @@ pub(crate) fn auth_class_from_model_meta(
     parse_model_readiness(meta).auth_class
 }
 
-/// Display-name → readiness-reason pairs for settings picker disablement.
+/// Model-id → readiness-reason pairs for settings picker disablement.
+///
+/// Identity is the catalog `ModelId`. Display names may collide, so a
+/// name-only lookup would disable every row that shares an unready model's
+/// label.
 pub(crate) fn unready_reasons_from_catalog(
     available: &indexmap::IndexMap<acp::ModelId, acp::ModelInfo>,
 ) -> Vec<(String, String)> {
     available
-        .values()
-        .filter_map(|info| {
+        .iter()
+        .filter_map(|(id, info)| {
             unready_reason_from_model_meta(info.meta.as_ref())
-                .map(|reason| (info.name.clone(), reason))
+                .map(|reason| (id.0.to_string(), reason))
         })
         .collect()
 }
