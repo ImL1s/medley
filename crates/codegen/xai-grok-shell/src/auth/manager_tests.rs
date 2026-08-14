@@ -5737,8 +5737,10 @@ async fn permanent_codex_rejection_never_exposes_torn_json_to_readers() {
         "reader must have sampled the file during removal"
     );
     assert_xai_sibling_preserved(&path);
-    assert!(read_auth_json(&path)
-        .unwrap()
-        .get(crate::auth::openai_codex::AUTH_SCOPE)
-        .is_none());
+    assert!(
+        read_auth_json(&path)
+            .unwrap()
+            .get(crate::auth::openai_codex::AUTH_SCOPE)
+            .is_none()
+    );
 }

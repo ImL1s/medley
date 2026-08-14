@@ -2156,7 +2156,10 @@ mod tests {
     fn third_party_origin_strips_internal_metadata_after_merge() {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer third-party"));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer third-party"),
+        );
         apply_env_http_headers(
             &IndexMap::from([
                 (
@@ -2182,7 +2185,10 @@ mod tests {
         apply_web_search_header_boundary(&mut headers, "https://vendor.example/v1");
         assert_no_internal_metadata(&headers);
         assert_eq!(headers[AUTHORIZATION], "Bearer third-party");
-        assert_eq!(headers[HeaderName::from_static("x-provider-key")], "configured");
+        assert_eq!(
+            headers[HeaderName::from_static("x-provider-key")],
+            "configured"
+        );
     }
 
     #[test]
@@ -2229,7 +2235,10 @@ mod tests {
             HeaderName::from_static("x-grok-client-identifier"),
             HeaderValue::from_static("grok-shell"),
         );
-        headers.insert(CHATGPT_ACCOUNT_ID, HeaderValue::from_static("must-not-keep"));
+        headers.insert(
+            CHATGPT_ACCOUNT_ID,
+            HeaderValue::from_static("must-not-keep"),
+        );
         apply_web_search_header_boundary(&mut headers, "https://api.x.ai/v1");
         assert_eq!(headers["x-grok-client-version"], "9.9.9");
         assert_eq!(headers["x-grok-client-identifier"], "grok-shell");
@@ -2251,10 +2260,7 @@ mod tests {
             HeaderName::from_static("x-authenticateresponse"),
             HeaderValue::from_static("authenticate-response"),
         );
-        apply_web_search_header_boundary(
-            &mut headers,
-            xai_grok_env::PROD_CLI_CHAT_PROXY_BASE_URL,
-        );
+        apply_web_search_header_boundary(&mut headers, xai_grok_env::PROD_CLI_CHAT_PROXY_BASE_URL);
         assert_eq!(headers["x-grok-client-version"], "9.9.9");
         assert_eq!(headers["x-xai-token-auth"], "xai-grok-cli");
         assert_eq!(headers["x-authenticateresponse"], "authenticate-response");
@@ -2325,10 +2331,7 @@ mod tests {
             ),
             ("X-XAI-Token-Auth".to_string(), "must-not-leak".to_string()),
             ("Traceparent".to_string(), "must-not-leak".to_string()),
-            (
-                "X-Compactions-Remaining".to_string(),
-                "3".to_string(),
-            ),
+            ("X-Compactions-Remaining".to_string(), "3".to_string()),
         ]);
         let config = WebSearchConfig::Enabled {
             api_key: Some("third-party-key".to_string()),
@@ -2353,10 +2356,7 @@ mod tests {
     #[tokio::test]
     async fn trusted_xai_request_build_keeps_first_party_headers() {
         let extra_headers = IndexMap::from([
-            (
-                "x-grok-client-version".to_string(),
-                "9.9.9".to_string(),
-            ),
+            ("x-grok-client-version".to_string(), "9.9.9".to_string()),
             (
                 "x-grok-client-identifier".to_string(),
                 "grok-shell".to_string(),
@@ -2386,14 +2386,8 @@ mod tests {
     #[tokio::test]
     async fn trusted_proxy_request_build_keeps_first_party_headers() {
         let extra_headers = IndexMap::from([
-            (
-                "x-grok-client-version".to_string(),
-                "9.9.9".to_string(),
-            ),
-            (
-                "X-XAI-Token-Auth".to_string(),
-                "xai-grok-cli".to_string(),
-            ),
+            ("x-grok-client-version".to_string(), "9.9.9".to_string()),
+            ("X-XAI-Token-Auth".to_string(), "xai-grok-cli".to_string()),
             (
                 "x-authenticateresponse".to_string(),
                 "authenticate-response".to_string(),

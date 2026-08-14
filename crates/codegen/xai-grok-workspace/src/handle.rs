@@ -5040,13 +5040,9 @@ pub(crate) mod tests {
             .expect("reserve unpublished identity");
         let (cwd, tracker, toolset) = reservation_promote_parts(&handle, id);
         let err = reservation
-            .promote_with_external_toolset_after(
-                cwd,
-                tracker,
-                toolset,
-                CapabilityMode::All,
-                || Err(WorkspaceError::Finalize("publication failed".into())),
-            )
+            .promote_with_external_toolset_after(cwd, tracker, toolset, CapabilityMode::All, || {
+                Err(WorkspaceError::Finalize("publication failed".into()))
+            })
             .expect_err("callback error must fail promotion");
         assert!(matches!(err, WorkspaceError::Finalize(_)));
         assert!(handle.session(id).is_none());
