@@ -9,7 +9,7 @@ them from a fixture instead.
 Usage:  fixture_server.py <port> <scenario> <archive-dir>
 
 Scenarios:
-  ok             a normal published release
+  ok             a normal published release (covers /releases/latest resolution)
   no-release     404 from /releases/latest, repository itself exists
   no-repo        404 from both
   redirect-body  a final 300 whose body contains a tag (issue #83)

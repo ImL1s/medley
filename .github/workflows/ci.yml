@@ -83,11 +83,20 @@ jobs:
       # The fixture rewrites the GitHub hosts, so it cannot catch a mistake in
       # the real URLs — percent-encoding of `+` in a tag, say. One live install
       # covers exactly that, and nothing else does.
+      #
+      # Resolve the published tag with the job token. Anonymous
+      # /releases/latest shares a 60 req/h/IP budget across runners (#256).
+      # Pinning MEDLEY_VERSION still exercises download, checksums, extract,
+      # launcher, --version, and the ~/.grok assertion. Latest-lookup itself
+      # is covered by tests/installer/run_cases.sh `ok` / `no-release`.
       - name: Install the published release for real
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -eux
           home="$(mktemp -d)"
-          HOME="$home" sh install.sh
+          MEDLEY_VERSION="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
+          HOME="$home" MEDLEY_VERSION="$MEDLEY_VERSION" sh install.sh
           HOME="$home" "$home/.medley/bin/medley" --version
           test ! -e "$home/.grok"
 
