@@ -40,9 +40,10 @@ use super::model::{
 };
 use super::refresh::{RefreshOutcome, TokenRefresher, resolve_refresh_credential};
 use super::storage::{
-    AuthFileLock, ensure_auth_json_owner_only, read_auth_json,
-    read_auth_json_or_empty_recovering_corrupt, read_auth_json_owner_only,
+    AuthFileLock, DurableAuthWriteError, DurableAuthWritePhase, ensure_auth_json_owner_only,
+    read_auth_json, read_auth_json_or_empty_recovering_corrupt, read_auth_json_owner_only,
     read_auth_json_owner_only_or_empty_recovering_corrupt, write_auth_json, write_auth_json_strict,
+    write_auth_json_strict_classified,
 };
 
 use super::storage::read_auth_json_or_empty;
@@ -287,6 +288,10 @@ pub struct AuthManager {
     /// `DevboxRecovery` adopt a seeded valid token; `Some(_)` pins the result.
     #[cfg(test)]
     devbox_override: parking_lot::Mutex<Option<bool>>,
+    /// Last classified durable-removal failure from a permanent provider
+    /// rejection. `None` after a successful or skipped disk mutation.
+    #[cfg(test)]
+    last_rejected_scope_publication_phase: parking_lot::Mutex<Option<DurableAuthWritePhase>>,
 }
 
 /// Discriminated outcome of a disk read, for transition logging.
@@ -331,6 +336,12 @@ impl ScopeRemoval {
             Self::SkippedUnreadable => "skipped (auth.json unreadable)",
         }
     }
+}
+
+/// Disk/memory outcome of clearing a permanently rejected provider scope.
+struct PermanentRejectionRemoval {
+    disk_mutation: &'static str,
+    publication_phase: Option<DurableAuthWritePhase>,
 }
 
 /// Outcome of [`AuthManager::acquire_refresh_lock_or_adopt`] and
@@ -559,6 +570,8 @@ impl AuthManager {
             dark_wake_override: parking_lot::Mutex::new(None),
             #[cfg(test)]
             devbox_override: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            last_rejected_scope_publication_phase: parking_lot::Mutex::new(None),
         }
     }
 
@@ -737,30 +750,157 @@ impl AuthManager {
     /// already-logged-out success, while unreadable data and write failures
     /// are surfaced so memory cannot diverge from durable state.
     fn write_scope_removal_durable(&self, scope: &str) -> std::io::Result<ScopeRemoval> {
-        let mut auth_store = if self.xai_session {
-            read_auth_json_or_empty(&self.path)?
-        } else {
-            match read_auth_json_owner_only(&self.path) {
-                Ok(store) => store,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => AuthStore::new(),
-                Err(error) => return Err(error),
+        if self.xai_session {
+            let mut auth_store = read_auth_json_or_empty(&self.path)?;
+            auth_store.remove(scope);
+            if auth_store.is_empty() {
+                match std::fs::remove_file(&self.path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                Ok(ScopeRemoval::FileDeleted)
+            } else {
+                write_auth_json(&self.path, &auth_store)?;
+                Ok(ScopeRemoval::EntryRemoved)
             }
+        } else {
+            self.write_provider_scope_removal_durable(scope)
+                .map_err(Into::into)
+        }
+    }
+
+    /// Remove `scope` from the owner-only store without an in-place rewrite.
+    /// Failures are classified around atomic publication so the caller can
+    /// reconcile memory with whatever actually landed on disk.
+    fn write_provider_scope_removal_durable(
+        &self,
+        scope: &str,
+    ) -> Result<ScopeRemoval, DurableAuthWriteError> {
+        debug_assert!(!self.xai_session);
+        let mut auth_store = match read_auth_json_owner_only(&self.path) {
+            Ok(store) => store,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => AuthStore::new(),
+            Err(error) => return Err(DurableAuthWriteError::before(error)),
         };
         auth_store.remove(scope);
         if auth_store.is_empty() {
             match std::fs::remove_file(&self.path) {
                 Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(ScopeRemoval::FileDeleted);
+                }
+                Err(error) => return Err(DurableAuthWriteError::before(error)),
+            }
+            if let Err(error) = super::storage::sync_auth_parent_directory(&self.path) {
+                return Err(DurableAuthWriteError::after(error));
             }
             Ok(ScopeRemoval::FileDeleted)
         } else {
-            if self.xai_session {
-                write_auth_json(&self.path, &auth_store)?;
-            } else {
-                write_auth_json_strict(&self.path, &auth_store)?;
-            }
+            write_auth_json_strict_classified(&self.path, &auth_store)?;
             Ok(ScopeRemoval::EntryRemoved)
+        }
+    }
+
+    /// Drop a permanently rejected provider scope through the strict writer
+    /// and make in-memory state match the owner-only file after any failure.
+    fn apply_permanent_rejection_scope_removal(
+        &self,
+        clear_disk: bool,
+        clear_mem: bool,
+    ) -> PermanentRejectionRemoval {
+        let removal = if !clear_disk {
+            if clear_mem {
+                self.clear_inner();
+            }
+            PermanentRejectionRemoval {
+                disk_mutation: "unchanged",
+                publication_phase: None,
+            }
+        } else if self.xai_session {
+            let disk_mutation = match self.write_scope_removal(&self.scope) {
+                Ok(mutation) => mutation.label(),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "auth: failed to clear credentials after permanent refresh failure"
+                    );
+                    "write_failed"
+                }
+            };
+            if clear_mem {
+                self.clear_inner();
+            }
+            PermanentRejectionRemoval {
+                disk_mutation,
+                publication_phase: None,
+            }
+        } else {
+            match self.write_provider_scope_removal_durable(&self.scope) {
+                Ok(mutation) => {
+                    if clear_mem {
+                        self.clear_inner();
+                    }
+                    PermanentRejectionRemoval {
+                        disk_mutation: mutation.label(),
+                        publication_phase: None,
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        publication_phase = error.phase.as_str(),
+                        "auth: durable provider-scope removal failed after permanent refresh failure"
+                    );
+                    xai_grok_telemetry::unified_log::warn(
+                        "auth.refresh.rejected_scope_removal_failed",
+                        None,
+                        Some(serde_json::json!({
+                            "publication_phase": error.phase.as_str(),
+                            "error_kind": format!("{:?}", error.kind()),
+                        })),
+                    );
+                    self.reconcile_provider_scope_from_owner_only_disk();
+                    PermanentRejectionRemoval {
+                        disk_mutation: match error.phase {
+                            DurableAuthWritePhase::BeforePublication => {
+                                "write_failed_before_publication"
+                            }
+                            DurableAuthWritePhase::AfterPublication => {
+                                "write_failed_after_publication"
+                            }
+                        },
+                        publication_phase: Some(error.phase),
+                    }
+                }
+            }
+        };
+        #[cfg(test)]
+        {
+            *self.last_rejected_scope_publication_phase.lock() = removal.publication_phase;
+        }
+        removal
+    }
+
+    /// Align this provider manager's cache with the owner-only file after a
+    /// classified durable-removal failure. The sticky permanent verdict is
+    /// left in place so a rejected credential that remains on disk stays
+    /// unusable.
+    fn reconcile_provider_scope_from_owner_only_disk(&self) {
+        debug_assert!(!self.xai_session);
+        match read_auth_json_owner_only(&self.path) {
+            Ok(store) => match self.lookup_scoped_auth(&store) {
+                Some(auth) => self.with_inner_write(|inner| *inner = Some(auth)),
+                None => self.clear_inner(),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => self.clear_inner(),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "auth: failed to re-read owner-only auth.json while reconciling rejected scope"
+                );
+                self.clear_inner();
+            }
         }
     }
 
@@ -1865,6 +2005,11 @@ impl AuthManager {
         *self.devbox_override.lock() = Some(is_devbox);
     }
 
+    #[cfg(test)]
+    pub(crate) fn last_rejected_scope_publication_phase(&self) -> Option<DurableAuthWritePhase> {
+        *self.last_rejected_scope_publication_phase.lock()
+    }
+
     /// Last-resort devbox auth recovery: purge existing auth.json entirely
     /// and mint fresh OIDC credentials via the remote devbox login helper.
     /// Only callable on devboxes (where the local service-account token is
@@ -2391,30 +2536,19 @@ impl AuthManager {
                     if let Some(key) = tried_key.or(attempted_key) {
                         self.record_permanent_failure(key, error);
                     }
-                    let mut disk_mutation = "unchanged";
-                    if clear_disk {
-                        disk_mutation = match self.write_scope_removal(&self.scope) {
-                            Ok(m) => m.label(),
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "auth: failed to clear credentials after permanent refresh failure"
-                                );
-                                "write_failed"
-                            }
-                        };
-                    }
-                    if clear_mem {
-                        self.clear_inner();
-                    }
+                    let removal =
+                        self.apply_permanent_rejection_scope_removal(clear_disk, clear_mem);
                     xai_grok_telemetry::unified_log::warn(
                         "auth: cleared credentials after permanent refresh failure",
                         None,
                         Some(serde_json::json!({
                             "reason": format!("{failed_reason:?}"),
-                            "disk_mutation": disk_mutation,
+                            "disk_mutation": removal.disk_mutation,
                             "cleared_mem": clear_mem,
                             "cleared_disk": clear_disk,
+                            "publication_phase": removal
+                                .publication_phase
+                                .map(DurableAuthWritePhase::as_str),
                         })),
                     );
                 } else if let Some(key) = tried_key.or(attempted_key) {

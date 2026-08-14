@@ -346,6 +346,89 @@ pub(super) fn write_auth_json(auth_file: &Path, auth_store: &AuthStore) -> std::
     write_auth_json_with(auth_file, auth_store, write_auth_json_atomic)
 }
 
+/// Whether a strict auth.json write failed before or after the atomic rename.
+///
+/// Callers must re-read owner-only durable state after either class: a
+/// before-publication error leaves the previous file intact, while an
+/// after-publication error means the new bytes are already the live file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum DurableAuthWritePhase {
+    BeforePublication,
+    AfterPublication,
+}
+
+impl DurableAuthWritePhase {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::BeforePublication => "before_publication",
+            Self::AfterPublication => "after_publication",
+        }
+    }
+}
+
+impl std::fmt::Debug for DurableAuthWritePhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Classified failure from [`write_auth_json_strict_classified`].
+///
+/// `Debug` reports only the phase and `ErrorKind` so a persist failure cannot
+/// become a credential carrier if a future I/O message ever includes path
+/// contents.
+pub(super) struct DurableAuthWriteError {
+    pub(super) phase: DurableAuthWritePhase,
+    source: std::io::Error,
+}
+
+impl DurableAuthWriteError {
+    pub(super) fn before(source: std::io::Error) -> Self {
+        Self {
+            phase: DurableAuthWritePhase::BeforePublication,
+            source,
+        }
+    }
+
+    pub(super) fn after(source: std::io::Error) -> Self {
+        Self {
+            phase: DurableAuthWritePhase::AfterPublication,
+            source,
+        }
+    }
+
+    pub(super) fn kind(&self) -> std::io::ErrorKind {
+        self.source.kind()
+    }
+}
+
+impl std::fmt::Debug for DurableAuthWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DurableAuthWriteError")
+            .field("phase", &self.phase)
+            .field("kind", &self.kind())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for DurableAuthWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.phase.as_str(), self.source)
+    }
+}
+
+impl std::error::Error for DurableAuthWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+impl From<DurableAuthWriteError> for std::io::Error {
+    fn from(error: DurableAuthWriteError) -> Self {
+        std::io::Error::new(error.kind(), error)
+    }
+}
+
 /// Crash-safe writer for rotating provider credentials. Unlike the legacy
 /// session writer, this never falls back to a truncating in-place rewrite on
 /// ENOSPC: a rotated refresh token is not published unless atomic persistence
@@ -354,6 +437,14 @@ pub(super) fn write_auth_json_strict(
     auth_file: &Path,
     auth_store: &AuthStore,
 ) -> std::io::Result<()> {
+    write_auth_json_strict_classified(auth_file, auth_store).map_err(Into::into)
+}
+
+/// Strict atomic persist that classifies failures around the rename.
+pub(super) fn write_auth_json_strict_classified(
+    auth_file: &Path,
+    auth_store: &AuthStore,
+) -> Result<(), DurableAuthWriteError> {
     write_auth_json_atomic_with_permission_check(
         auth_file,
         auth_store,
@@ -446,12 +537,15 @@ pub(super) static WRITE_STORAGE_FULL_FAULT_PATH: std::sync::Mutex<Option<PathBuf
 #[cfg(test)]
 pub(super) static POST_RENAME_PERMISSION_FAULT_PATH: std::sync::Mutex<Option<PathBuf>> =
     std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(super) static PARENT_DIR_SYNC_FAULT_PATH: std::sync::Mutex<Option<PathBuf>> =
+    std::sync::Mutex::new(None);
 
 /// Atomic write: tmp + replace in one operation.
 /// Unix uses `rename(2)` replacement semantics; Windows uses
 /// `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`.
 fn write_auth_json_atomic(auth_file: &Path, auth_store: &AuthStore) -> std::io::Result<()> {
-    write_auth_json_atomic_with_permission_check(auth_file, auth_store, None)
+    write_auth_json_atomic_with_permission_check(auth_file, auth_store, None).map_err(Into::into)
 }
 
 /// Atomic write core with a pre-write permission proof. Legacy xAI writes
@@ -462,7 +556,7 @@ fn write_auth_json_atomic_with_permission_check(
     auth_file: &Path,
     auth_store: &AuthStore,
     prove_owner_only: Option<fn(&File) -> std::io::Result<()>>,
-) -> std::io::Result<()> {
+) -> Result<(), DurableAuthWriteError> {
     let strict_write = prove_owner_only.is_some();
     #[cfg(test)]
     if WRITE_STORAGE_FULL_FAULT_PATH
@@ -471,7 +565,9 @@ fn write_auth_json_atomic_with_permission_check(
         .as_deref()
         == Some(auth_file)
     {
-        return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        return Err(DurableAuthWriteError::before(std::io::Error::from(
+            std::io::ErrorKind::StorageFull,
+        )));
     }
     #[cfg(test)]
     if WRITE_FAULT_PATH
@@ -480,13 +576,14 @@ fn write_auth_json_atomic_with_permission_check(
         .as_deref()
         == Some(auth_file)
     {
-        return Err(std::io::Error::new(
+        return Err(DurableAuthWriteError::before(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "injected write fault (WRITE_FAULT_PATH)",
-        ));
+        )));
     }
     let (tmp, strict_file) = if prove_owner_only.is_some() {
-        let (tmp, file) = create_strict_atomic_temp(auth_file)?;
+        let (tmp, file) =
+            create_strict_atomic_temp(auth_file).map_err(DurableAuthWriteError::before)?;
         (tmp, Some(file))
     } else {
         (next_auth_temp_path(auth_file), None)
@@ -505,14 +602,20 @@ fn write_auth_json_atomic_with_permission_check(
     let mut tmp_reclaim = TmpReclaim(Some(&tmp));
 
     if let Some(file) = strict_file {
-        prove_owner_only.expect("strict temp file requires a permission proof")(&file)?;
-        write_store(file, auth_store)?;
+        prove_owner_only.expect("strict temp file requires a permission proof")(&file)
+            .map_err(DurableAuthWriteError::before)?;
+        write_store(file, auth_store).map_err(DurableAuthWriteError::before)?;
     } else {
-        write_store_to(&tmp, auth_store)?;
+        write_store_to(&tmp, auth_store).map_err(DurableAuthWriteError::before)?;
     }
-    replace_auth_file(&tmp, auth_file)?;
+    replace_auth_file(&tmp, auth_file).map_err(DurableAuthWriteError::before)?;
     tmp_reclaim.0 = None; // renamed into place; nothing to reclaim
     finalize_auth_file_permissions(auth_file, strict_write)
+        .map_err(DurableAuthWriteError::after)?;
+    if strict_write {
+        sync_auth_parent_directory(auth_file).map_err(DurableAuthWriteError::after)?;
+    }
+    Ok(())
 }
 
 fn replace_auth_file(tmp: &Path, auth_file: &Path) -> std::io::Result<()> {
@@ -576,6 +679,41 @@ fn finalize_auth_file_permissions(auth_file: &Path, strict_write: bool) -> std::
             );
             Ok(())
         }
+    }
+}
+
+/// Make the directory entry for `auth.json` durable. Injected failures are
+/// classified as after publication because the rename already replaced the
+/// live file.
+pub(super) fn sync_auth_parent_directory(auth_file: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if PARENT_DIR_SYNC_FAULT_PATH
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_deref()
+        == Some(auth_file)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected parent-directory sync failure",
+        ));
+    }
+
+    let Some(parent) = auth_file.parent() else {
+        return Ok(());
+    };
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    {
+        std::fs::File::open(parent)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+        Ok(())
     }
 }
 
@@ -791,6 +929,50 @@ mod write_fallback_tests {
         }
     }
 
+    struct ParentDirSyncFault(PathBuf);
+
+    impl ParentDirSyncFault {
+        fn install(path: &Path) -> Self {
+            *PARENT_DIR_SYNC_FAULT_PATH
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(path.to_owned());
+            Self(path.to_owned())
+        }
+    }
+
+    impl Drop for ParentDirSyncFault {
+        fn drop(&mut self) {
+            let mut guard = PARENT_DIR_SYNC_FAULT_PATH
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if guard.as_deref() == Some(self.0.as_path()) {
+                *guard = None;
+            }
+        }
+    }
+
+    struct StorageFullFault(PathBuf);
+
+    impl StorageFullFault {
+        fn install(path: &Path) -> Self {
+            *WRITE_STORAGE_FULL_FAULT_PATH
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(path.to_owned());
+            Self(path.to_owned())
+        }
+    }
+
+    impl Drop for StorageFullFault {
+        fn drop(&mut self) {
+            let mut guard = WRITE_STORAGE_FULL_FAULT_PATH
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if guard.as_deref() == Some(self.0.as_path()) {
+                *guard = None;
+            }
+        }
+    }
+
     fn sample_store() -> AuthStore {
         let mut map = AuthStore::new();
         map.insert(
@@ -990,6 +1172,7 @@ mod write_fallback_tests {
         .unwrap_err();
 
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(err.phase, DurableAuthWritePhase::BeforePublication);
         assert_eq!(
             std::fs::read(&path).unwrap(),
             prior,
@@ -1037,12 +1220,52 @@ mod write_fallback_tests {
         let path = dir.path().join("auth.json");
         let _fault = PostRenamePermissionFault::install(&path);
 
-        let err = write_auth_json_strict(&path, &sample_store()).unwrap_err();
+        let err = write_auth_json_strict_classified(&path, &sample_store()).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(err.phase, DurableAuthWritePhase::AfterPublication);
         assert_eq!(
             read_key(&path).as_deref(),
             Some("secret-key"),
             "strict write must surface the post-rename failure without tearing bytes"
+        );
+    }
+
+    #[test]
+    fn strict_write_classifies_enospc_as_before_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        write_auth_json_strict(&path, &sample_store()).unwrap();
+        let prior = std::fs::read(&path).unwrap();
+        let _fault = StorageFullFault::install(&path);
+
+        let err = write_auth_json_strict_classified(&path, &sample_store()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(err.phase, DurableAuthWritePhase::BeforePublication);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            prior,
+            "ENOSPC must not truncate or rewrite the previous durable file"
+        );
+        let debug = format!("{err:?}");
+        assert!(
+            !debug.contains("secret-key"),
+            "classified write error Debug must stay secret-free: {debug}"
+        );
+    }
+
+    #[test]
+    fn strict_write_classifies_parent_dir_sync_as_after_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let _fault = ParentDirSyncFault::install(&path);
+
+        let err = write_auth_json_strict_classified(&path, &sample_store()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(err.phase, DurableAuthWritePhase::AfterPublication);
+        assert_eq!(
+            read_key(&path).as_deref(),
+            Some("secret-key"),
+            "parent-directory sync failure must leave the newly published file in place"
         );
     }
 
