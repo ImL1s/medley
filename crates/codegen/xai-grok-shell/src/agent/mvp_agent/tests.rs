@@ -1,4 +1,23 @@
 use super::*;
+
+/// `grok_home()` is a process-wide OnceLock, so a tempfile `$MEDLEY_HOME`
+/// config cannot disarm catalog fetch after another test has resolved the
+/// home. Pin the thread-local offline path `MvpAgent::new` actually reads.
+struct ProcessRemoteFetchOff;
+
+impl ProcessRemoteFetchOff {
+    fn install() -> Self {
+        crate::util::config::override_remote_fetch_enabled(Some(false));
+        Self
+    }
+}
+
+impl Drop for ProcessRemoteFetchOff {
+    fn drop(&mut self) {
+        crate::util::config::override_remote_fetch_enabled(None);
+    }
+}
+
 /// Build an unsigned JWT with a `tier` claim (header.payload.sig base64url).
 fn jwt_with_tier(tier: u64) -> String {
     use base64::Engine;
@@ -6829,11 +6848,7 @@ fn new_session_publishes_one_complete_staged_tree() {
         let grok_home = tempfile::tempdir().expect("isolated grok home");
         let _medley = EnvGuard::set("MEDLEY_HOME", grok_home.path());
         let _home = EnvGuard::set("GROK_HOME", grok_home.path());
-        std::fs::write(
-            grok_home.path().join("config.toml"),
-            "[features]\nremote_fetch = false\n",
-        )
-        .expect("disable catalog fetch for fixture");
+        let _remote_fetch = ProcessRemoteFetchOff::install();
         let _xai_key = EnvGuard::unset("XAI_API_KEY");
         let _grok_code_key = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
         let auth_root = tempfile::tempdir().expect("isolated auth root");
@@ -6890,8 +6905,8 @@ fn new_session_publishes_one_complete_staged_tree() {
         assert_eq!(response.session_id.0.as_ref(), SESSION_ID);
 
         let cwd_string = cwd.path().to_string_lossy();
-        let published_session = grok_home
-            .path()
+        let state_home = xai_grok_config::grok_home();
+        let published_session = state_home
             .join("sessions")
             .join(crate::util::grok_home::encode_cwd_dirname(&cwd_string))
             .join(SESSION_ID);
@@ -6938,7 +6953,7 @@ fn new_session_publishes_one_complete_staged_tree() {
                 .expect("each published chat-history line must be valid JSON");
         }
 
-        let stage_container = grok_home.path().join(".private/session-staging").join(
+        let stage_container = state_home.join(".private/session-staging").join(
             crate::session::persistence::session_stage_container_name(SESSION_ID),
         );
         assert!(
@@ -7292,11 +7307,7 @@ fn new_session_auth_flip_before_resident_commit_leaves_no_session_state() {
         let grok_home = tempfile::tempdir().expect("isolated grok home");
         let _medley = EnvGuard::set("MEDLEY_HOME", grok_home.path());
         let _home = EnvGuard::set("GROK_HOME", grok_home.path());
-        std::fs::write(
-            grok_home.path().join("config.toml"),
-            "[features]\nremote_fetch = false\n",
-        )
-        .expect("disable catalog fetch for fixture");
+        let _remote_fetch = ProcessRemoteFetchOff::install();
         let _xai_key = EnvGuard::unset("XAI_API_KEY");
         let _grok_code_key = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
         let _session_registry = EnvGuard::set("GROK_SESSION_REGISTRY", "true");
@@ -7453,11 +7464,7 @@ fn cancelling_new_session_during_actor_init_leaves_no_session_state() {
         const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000105";
         let grok_home = tempfile::tempdir().expect("isolated grok home");
         let _home = EnvGuard::set("GROK_HOME", grok_home.path());
-        std::fs::write(
-            grok_home.path().join("config.toml"),
-            "[features]\nremote_fetch = false\n",
-        )
-        .expect("disable catalog fetch for fixture");
+        let _remote_fetch = ProcessRemoteFetchOff::install();
         let _xai_key = EnvGuard::unset("XAI_API_KEY");
         let _grok_code_key = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
         let _relay_sync = EnvGuard::set("GROK_RELAY_SYNC_ENABLED", "true");
@@ -7608,11 +7615,7 @@ fn cancelling_after_actor_init_before_publish_ack_cleans_state_and_allows_retry(
         let grok_home = tempfile::tempdir().expect("isolated grok home");
         let _medley = EnvGuard::set("MEDLEY_HOME", grok_home.path());
         let _home = EnvGuard::set("GROK_HOME", grok_home.path());
-        std::fs::write(
-            grok_home.path().join("config.toml"),
-            "[features]\nremote_fetch = false\n",
-        )
-        .expect("disable catalog fetch for fixture");
+        let _remote_fetch = ProcessRemoteFetchOff::install();
         let _xai_key = EnvGuard::unset("XAI_API_KEY");
         let _grok_code_key = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
         let _session_registry = EnvGuard::set("GROK_SESSION_REGISTRY", "true");
@@ -7901,11 +7904,7 @@ fn new_session_actor_spawn_failure_cleans_provisional_state_and_allows_same_id_r
         let grok_home = tempfile::tempdir().expect("isolated grok home");
         let _medley = EnvGuard::set("MEDLEY_HOME", grok_home.path());
         let _home = EnvGuard::set("GROK_HOME", grok_home.path());
-        std::fs::write(
-            grok_home.path().join("config.toml"),
-            "[features]\nremote_fetch = false\n",
-        )
-        .expect("disable catalog fetch for fixture");
+        let _remote_fetch = ProcessRemoteFetchOff::install();
         let _xai_key = EnvGuard::unset("XAI_API_KEY");
         let _grok_code_key = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
         let _session_registry = EnvGuard::set("GROK_SESSION_REGISTRY", "true");
