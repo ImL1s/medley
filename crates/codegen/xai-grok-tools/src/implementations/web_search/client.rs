@@ -206,6 +206,10 @@ fn retain_codex_headers(
 #[derive(Clone)]
 pub struct WebSearchClient {
     http: reqwest::Client,
+    /// Scrubbed static/env/extra headers. Reqwest only merges `default_headers`
+    /// at send time, so `build_authenticated_request` must apply these itself
+    /// before the final-boundary scrub.
+    static_headers: HeaderMap,
     base_url: String,
     model: String,
     api_key_provider: Option<SharedApiKeyProvider>,
@@ -330,6 +334,7 @@ impl WebSearchClient {
                 None
             }
         });
+        let static_headers = headers.clone();
         let mut http_builder = reqwest::Client::builder().default_headers(headers);
         if request_api_key_provider.is_some() {
             // A dynamic credential is valid only for the configured Responses
@@ -361,6 +366,7 @@ impl WebSearchClient {
             })?;
         Ok(Self {
             http,
+            static_headers,
             base_url,
             model: model.clone(),
             api_key_provider: request_api_key_provider,
@@ -476,6 +482,17 @@ impl WebSearchClient {
                 "Failed to build HTTP request.".to_string(),
             )
         })?;
+        // Reqwest merges Client default_headers at send time, not at build().
+        // Copy the already-scrubbed static set so the final-boundary scrub and
+        // tests observe the same headers that will go on the wire.
+        {
+            let dest = request.headers_mut();
+            for (name, value) in self.static_headers.iter() {
+                if !dest.contains_key(name) {
+                    dest.insert(name.clone(), value.clone());
+                }
+            }
+        }
         if let Some(credential) = live_credential {
             let authorization =
                 HeaderValue::from_str(&format!("Bearer {}", credential.access_token)).map_err(

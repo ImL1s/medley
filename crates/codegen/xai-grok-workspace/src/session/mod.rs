@@ -1025,6 +1025,7 @@ pub(crate) fn get_or_open_session_writer(
 mod tests {
     use super::get_or_open_session_writer;
     use dashmap::DashMap;
+    use std::sync::Arc;
     use xai_file_utils::events::{Event, EventWriter};
     fn count_lines(path: &std::path::Path) -> usize {
         std::fs::read_to_string(path)
