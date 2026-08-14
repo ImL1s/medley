@@ -343,6 +343,8 @@ jobs:
             final_401_relation_uses_final_wire_credential_and_post_response_snapshot -- --nocapture
           run_nonzero -p xai-file-utils --lib \
             upload_config_debug_redacts_all_secret_carriers -- --nocapture
+          run_nonzero -p xai-file-utils --lib \
+            git_ancestor_does_not_override_excluded_component -- --nocapture
 
       - name: Provider docs examples and fixtures
         run: |
