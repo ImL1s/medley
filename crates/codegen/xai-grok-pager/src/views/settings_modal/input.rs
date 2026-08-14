@@ -125,6 +125,13 @@ fn handle_picking_enum(state: &mut SettingsModalState, key: &KeyEvent) -> Settin
             )
         }
         KeyCode::Enter => {
+            // Disabled dynamic choices stay focusable so keyboard users can
+            // read their readiness reason, but Enter must not close the picker
+            // or dispatch an action. The dispatcher retains its fail-closed
+            // guard for catalog changes between this check and dispatch.
+            if picker_choice_is_disabled(state, setting_key, choices_idx) {
+                return SettingsKeyOutcome::Unchanged;
+            }
             // Commit: dispatch the typed COMMIT Action for the
             // currently-focused choice. This is the single place
             // per picker open → close cycle that fires
@@ -571,6 +578,20 @@ fn picker_choice_at_owned(
         }
         _ => None,
     }
+}
+
+/// Read the reason attached to a disabled runtime choice. Static enum choices
+/// have no disabled metadata and therefore always return `None`.
+fn picker_choice_is_disabled(state: &SettingsModalState, key: SettingKey, idx: usize) -> bool {
+    let Some(meta) = state.registry.find(key) else {
+        return false;
+    };
+    let SettingKind::DynamicEnum { source, .. } = &meta.kind else {
+        return false;
+    };
+    dynamic_enum_choices(*source, &state.pager_snapshot)
+        .get(idx)
+        .is_some_and(|choice| choice.disabled_reason.is_some())
 }
 
 /// F2 / Ctrl+, / Cmd+, are the modal-internal close keys.
@@ -1142,6 +1163,12 @@ fn handle_picker_mouse(
         // click commits" semantics; commit fires on Enter, not on
         // a re-click).
         return SettingsKeyOutcome::Unchanged;
+    }
+    if picker_choice_is_disabled(state, setting_key, target_idx) {
+        // Keep unavailable rows focusable so their readiness description is
+        // reachable with a mouse, but do not run preview/commit behavior.
+        state.transition_to_picking_enum(setting_key, target_idx, original_value, supports_preview);
+        return SettingsKeyOutcome::Changed;
     }
     // Reuse the keyboard nav helper to update `choices_idx` AND
     // fire the matching preview Action (when the kind supports it).

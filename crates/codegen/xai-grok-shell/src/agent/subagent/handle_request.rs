@@ -353,6 +353,7 @@ pub(crate) async fn run_shell_child(
         .parent_session_info
         .as_ref()
         .map(|i| std::path::Path::new(&i.cwd));
+    let has_explicit_reasoning_effort = request.runtime_overrides.reasoning_effort.is_some();
     let mut effective_runtime = xai_grok_subagent_resolution::resolve_runtime_config(
         &request.subagent_type,
         &request.runtime_overrides,
@@ -865,11 +866,22 @@ pub(crate) async fn run_shell_child(
             raw,
         ) {
             effective_sampling_config.reasoning_effort = Some(effort);
+        } else if has_explicit_reasoning_effort {
+            let msg = format!(
+                "Cannot spawn subagent '{}' with model '{}': reasoning_effort '{}' is not offered by that model.",
+                request.subagent_type, prepared_model.model_id.0, raw,
+            );
+            tracing::warn!(
+                value = raw,
+                model_id = %prepared_model.model_id.0,
+                "subagent reasoning_effort rejected because the selected model does not offer it"
+            );
+            return child_run_output(failure_result(&request, &msg), completion_data, None);
         } else {
             tracing::warn!(
                 value = raw,
                 model_id = %prepared_model.model_id.0,
-                "subagent reasoning_effort is invalid or unavailable for model; ignoring override"
+                "subagent reasoning_effort is invalid or unavailable for model; ignoring inherited default"
             );
         }
     }
@@ -1509,6 +1521,8 @@ pub(crate) async fn run_shell_child(
         false,
         false,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        crate::session::SessionPublicationGate::published(),
+        crate::agent::folder_trust::project_scope_allowed(&ctx.parent_cwd),
         definition,
         subagent_session_default_agent_profile,
         if inherit_skills {

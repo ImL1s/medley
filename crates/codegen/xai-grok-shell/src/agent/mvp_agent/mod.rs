@@ -285,12 +285,91 @@ pub(crate) struct SessionSpawnOptions<'a> {
     pub managed_mcp_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub model_agent_type: Option<&'a str>,
     pub session_model_id: acp::ModelId,
+    /// Immutable model sampler selected by `/new` before its auth-selection seal.
+    pub prepared_sampling_config: Option<SamplingConfig>,
+    /// Catalog identity captured from the same entry as `prepared_sampling_config`.
+    pub prepared_catalog_identity: Option<xai_chat_state::CatalogIdentity>,
+    /// Exact catalog entry captured with the prepared sampler and identity.
+    pub prepared_model_entry: Option<ModelEntry>,
+    /// Auth authority that must still hold at the final resident publication.
+    pub new_session_auth_authority: Option<NewSessionAuthAuthority>,
+    /// Pending only for `/new`; all externally visible actor startup and relay
+    /// work waits until the final auth-sealed resident commit publishes it.
+    pub publication_gate: Option<crate::session::SessionPublicationGate>,
+    /// Pure request-scoped verdict for auth-sealed `/new`; committed to the
+    /// process cache only by final resident publication.
+    pub folder_trust_snapshot: Option<folder_trust::FolderTrustSnapshot>,
+    /// Relay state forwarding is also publication: create its receiver while
+    /// the relay is provisional, but do not start forwarding until commit.
+    pub deferred_relay_state_rx: Option<
+        tokio::sync::watch::Receiver<crate::relay::ConnectionState>,
+    >,
+    /// Upgrade provisional local persistence only after resident publication.
+    pub upgrade_persistence_to_writeback: bool,
     pub persisted_catalog_identity: Option<xai_chat_state::CatalogIdentity>,
     pub session_yolo_mode: bool,
     pub session_auto_mode: bool,
     pub prompt_display_cwd: Option<String>,
     /// Sticky chat product kind for ACU / product skills sourcing.
     pub is_chat_kind: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct NewSessionAuthAuthority {
+    pub generation: u64,
+    pub is_session_auth: bool,
+    pub catalog_generation: u64,
+    pub catalog_identity: xai_chat_state::CatalogIdentity,
+    pub model_ready: bool,
+}
+
+pub(crate) struct PreparedNewSessionModelPlan {
+    pub model_agent_type: Option<String>,
+    pub session_model_id: acp::ModelId,
+    pub sampling_config: SamplingConfig,
+    pub catalog_identity: xai_chat_state::CatalogIdentity,
+    pub model_entry: ModelEntry,
+    pub auth_authority: NewSessionAuthAuthority,
+    pub disallowed_custom: Option<String>,
+    pub auth_hidden_custom: Option<String>,
+    pub unreadiness_custom: Option<(String, String)>,
+}
+
+/// Result of actor construction. Loads and chat sessions are already published;
+/// auth-sealed build `/new` sessions stay wholly provisional until the outer
+/// response has been assembled and calls the synchronous commit path.
+pub(crate) enum SpawnedSession {
+    Committed(acp::ModelId),
+    Prepared(Box<PreparedNewSession>),
+}
+
+pub(crate) struct PreparedNewSession {
+    session_info: SessionInfo,
+    handle: Option<SessionHandle>,
+    thread: Option<SessionThread>,
+    permission_events_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PermissionEvent>>,
+    publication_gate: crate::session::SessionPublicationGate,
+    folder_trust_snapshot: Option<folder_trust::FolderTrustSnapshot>,
+    cleanup: Option<agent_ops::ProvisionalNewSessionCleanup>,
+    auth_authority: NewSessionAuthAuthority,
+    deferred_relay_state_rx:
+        Option<tokio::sync::watch::Receiver<crate::relay::ConnectionState>>,
+    upgrade_persistence_to_writeback: bool,
+    web_search_disable_notice: Option<config::WebSearchDisabled>,
+    unavailable_spawn_model:
+        Option<(acp::ModelId, xai_chat_state::CatalogIdentity, String)>,
+    loc_aggregate_rx: Option<tokio::sync::mpsc::UnboundedReceiver<xai_hunk_tracker::LocAggregate>>,
+    initialize_system_prompt: Option<String>,
+}
+
+impl PreparedNewSession {
+    pub(crate) fn model_id(&self) -> &acp::ModelId {
+        &self.handle.as_ref().expect("prepared session owns handle").model_id
+    }
+
+    pub(crate) fn handle(&self) -> &SessionHandle {
+        self.handle.as_ref().expect("prepared session owns handle")
+    }
 }
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
@@ -466,6 +545,14 @@ pub(crate) fn chat_session_spawn_options<'a>(
         managed_mcp_expires_at: None,
         model_agent_type,
         session_model_id,
+        prepared_sampling_config: None,
+        prepared_catalog_identity: None,
+        prepared_model_entry: None,
+        new_session_auth_authority: None,
+        publication_gate: None,
+        folder_trust_snapshot: None,
+        deferred_relay_state_rx: None,
+        upgrade_persistence_to_writeback: false,
         persisted_catalog_identity: None,
         session_yolo_mode,
         session_auto_mode: false,
@@ -1179,6 +1266,21 @@ pub(crate) fn harnesses_are_compatible(
     !active.is_strict_harness() && !required.is_strict_harness()
 }
 
+/// Whether a discovered model harness carries an exact runtime contract.
+///
+/// Stock, non-strict harnesses deliberately allow an explicit ACP/CLI agent
+/// profile to keep its own prompt and tool configuration. Strict, plugin, and
+/// file-backed definitions do not: their wire contract and source identity are
+/// part of the model route and must be resolved exactly.
+pub(crate) fn definition_requires_exact_harness(
+    definition: &xai_grok_agent::AgentDefinition,
+) -> bool {
+    definition.is_strict_harness()
+        || definition.plugin_name.is_some()
+        || definition.source_path.is_some()
+        || definition.prompt_body.is_some()
+}
+
 /// Select the first ready model whose required harness can reuse the active
 /// session definition. Candidate order is preserved so catalog priority stays
 /// authoritative while incompatible strict harnesses are skipped.
@@ -1533,15 +1635,22 @@ pub(crate) fn inject_proxy_headers(
     }
     let _ = (alpha_test_key, base_url);
 }
+fn select_spawn_model_entry<'a>(
+    pinned: Option<&'a ModelEntry>,
+    prepared: Option<&'a ModelEntry>,
+    catalog: &'a indexmap::IndexMap<String, ModelEntry>,
+    catalog_identity: &xai_chat_state::CatalogIdentity,
+) -> Option<&'a ModelEntry> {
+    pinned
+        .or(prepared)
+        .or_else(|| catalog.get(catalog_identity.model_id.as_str()))
+}
+
 fn resolve_inference_idle_timeout_secs(
-    models: &indexmap::IndexMap<String, crate::agent::config::ModelEntry>,
-    model: &str,
+    model: Option<&crate::agent::config::ModelEntry>,
     remote_settings: Option<&crate::util::config::RemoteSettings>,
 ) -> u64 {
-    let per_model = models
-        .get(model)
-        .or_else(|| models.values().find(|entry| entry.info.model == model))
-        .and_then(|entry| entry.info.inference_idle_timeout_secs);
+    let per_model = model.and_then(|entry| entry.info.inference_idle_timeout_secs);
     let remote = remote_settings.and_then(|s| s.inference_idle_timeout_secs);
     per_model.or(remote).unwrap_or(600).max(10)
 }
@@ -1621,6 +1730,9 @@ mod agent_ops;
 mod acp_agent;
 mod session_setup;
 use session_registry::SessionRegistry;
+pub(crate) use session_registry::{
+    ModelSwitchCommitOutcome, UnavailableModelCommitPolicy, UnavailableRecoverySnapshot,
+};
 pub(crate) use session_lifecycle::RegistrySnapshot;
 pub(super) use super::ext_parsers;
 /// Emit the `auth.lifecycle` login span with optional user id and error

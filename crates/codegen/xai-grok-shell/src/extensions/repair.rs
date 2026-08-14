@@ -107,13 +107,23 @@ async fn handle_session_repair(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtR
 /// path's corruption-tolerant reader (legacy upgrades apply), repair, write
 /// back atomically. `grok_root` is injectable for tests.
 async fn repair_on_disk(grok_root: &std::path::Path, session_id: &str, dry_run: bool) -> ExtResult {
-    let summary = crate::session::persistence::find_summary_by_session_id_in_root(
-        session_id,
+    // Repair mutates the transcript, so retain an exclusive publication lease
+    // from path resolution through the atomic replacement.
+    let session = crate::session::persistence::acquire_published_session_write_in_root(
         &grok_root.join("sessions"),
+        session_id,
+        None,
     )
-    .ok_or_else(|| {
-        acp::Error::resource_not_found(Some(format!("session not found: {session_id}")))
-    })?;
+    .await
+    .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+    let summary = session
+        .read_summary()
+        .map_err(|error| {
+            acp::Error::internal_error().data(format!("failed to read session summary: {error}"))
+        })?
+        .ok_or_else(|| {
+            acp::Error::resource_not_found(Some(format!("session not found: {session_id}")))
+        })?;
     let info = summary.info.clone();
 
     let storage = JsonlStorageAdapter::with_root(grok_root.to_path_buf());

@@ -1,5 +1,7 @@
 use pretty_assertions::assert_eq;
 
+use crate::acp::ModelState;
+
 #[test]
 fn lifecycle_tracking_is_independent_of_wait_flag() {
     let mut pending = std::collections::HashSet::new();
@@ -774,6 +776,117 @@ fn unsupported_effort_user_note_names_model_and_switch() {
         note.contains("ignoring"),
         "soft-drop must still say the request was ignored: {note}"
     );
+}
+
+fn codex_model_state_with_efforts(slug: &str, default: &str, efforts: &[&str]) -> ModelState {
+    let id = acp::ModelId::new(slug);
+    let menu = efforts
+        .iter()
+        .map(|effort| {
+            serde_json::json!({
+                "id": effort,
+                "value": effort,
+                "label": effort,
+                "default": *effort == default,
+            })
+        })
+        .collect::<Vec<_>>();
+    let meta = serde_json::json!({
+        "supportsReasoningEffort": true,
+        "reasoningEffort": default,
+        "reasoningEfforts": menu,
+    })
+    .as_object()
+    .expect("Codex ACP metadata")
+    .clone();
+    let mut models = ModelState::default();
+    models.available.insert(
+        id.clone(),
+        acp::ModelInfo::new(id.clone(), slug.to_string()).meta(Some(meta)),
+    );
+    models.current = Some(id);
+    models
+}
+
+/// #357: the real headless post-catalog path must reject an explicit Ultra
+/// request before sending an ACP model switch when the selected model stops at
+/// Max. Clap accepting the string alone is not sufficient coverage.
+#[tokio::test(flavor = "current_thread")]
+async fn headless_rejects_ultra_for_luna_before_model_switch() {
+    let models = codex_model_state_with_efforts(
+        "gpt-5.6-luna",
+        "medium",
+        &["low", "medium", "high", "xhigh", "max"],
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpAgentMessage>();
+
+    let error = super::apply_headless_model_and_effort(
+        &tx,
+        &acp::SessionId::new("headless-luna"),
+        &models,
+        Some("gpt-5.6-luna"),
+        Some("ultra"),
+    )
+    .await
+    .expect_err("Luna must reject unadvertised Ultra");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("unknown effort level 'ultra'"),
+        "{message}"
+    );
+    assert!(
+        message.contains("use one of: low, medium, high, xhigh, max"),
+        "{message}"
+    );
+    assert!(
+        matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ),
+        "rejected effort must not reach the ACP agent"
+    );
+}
+
+/// #357: when Sol advertises Ultra, headless must carry the typed effort in
+/// the actual `SetSessionModel` ACP request rather than silently defaulting.
+#[tokio::test(flavor = "current_thread")]
+async fn headless_sends_advertised_ultra_in_model_switch_metadata() {
+    let models = codex_model_state_with_efforts(
+        "gpt-5.6-sol",
+        "low",
+        &["low", "medium", "high", "xhigh", "max", "ultra"],
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpAgentMessage>();
+    let responder = tokio::spawn(async move {
+        let message = rx.recv().await.expect("SetSessionModel request");
+        let args = match message {
+            xai_acp_lib::AcpAgentMessage::SetSessionModel(args) => args,
+            other => panic!("expected SetSessionModel request, got {other:?}"),
+        };
+        assert_eq!(args.request.session_id.0.as_ref(), "headless-sol");
+        assert_eq!(args.request.model_id.0.as_ref(), "gpt-5.6-sol");
+        assert_eq!(
+            args.request.meta.as_ref().and_then(
+                |meta| meta.get(xai_grok_shell::sampling::types::REASONING_EFFORT_META_KEY)
+            ),
+            Some(&serde_json::json!("ultra"))
+        );
+        args.response_tx
+            .send(Ok(acp::SetSessionModelResponse::new()))
+            .expect("return model-switch response");
+    });
+
+    super::apply_headless_model_and_effort(
+        &tx,
+        &acp::SessionId::new("headless-sol"),
+        &models,
+        Some("gpt-5.6-sol"),
+        Some("ultra"),
+    )
+    .await
+    .expect("Sol accepts advertised Ultra");
+    responder.await.expect("model-switch responder completes");
 }
 
 // ---- #161: headless surfaces the web_search disable notice ----

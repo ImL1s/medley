@@ -68,18 +68,28 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
         };
         if let Some(state) = state_opt {
             state.rebuild_rows();
-            state.ui_snapshot = ui_snapshot.clone();
-            state.pager_snapshot = crate::settings::PagerLocalSnapshot {
+            let pager_snapshot = crate::settings::PagerLocalSnapshot {
                 multiline_mode: agent.multiline_mode,
                 yolo_mode: agent.session.is_yolo(),
                 auto_mode: agent.session.is_auto(),
                 current_model_name: agent.session.models.current_model_name(),
+                current_model_id: agent.session.models.current.clone(),
                 available_models: agent
                     .session
                     .models
-                    .available
-                    .iter()
+                    .selectable_models()
                     .map(|(id, info)| (info.name.clone(), id.clone()))
+                    .collect(),
+                model_unready_reasons: agent
+                    .session
+                    .models
+                    .selectable_models()
+                    .filter_map(|(id, info)| {
+                        crate::slash::commands::model::unready_reason_from_model_meta(
+                            info.meta.as_ref(),
+                        )
+                        .map(|reason| (id.0.to_string(), reason))
+                    })
                     .collect(),
                 coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
                 coding_data_sharing_lock: coding_data_sharing_lock_from_app,
@@ -97,6 +107,7 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                     .scheduler_background_loops
                     .unwrap_or(scheduler_background_loops_seed),
             };
+            state.replace_snapshots(ui_snapshot.clone(), pager_snapshot);
         }
     }
 }
@@ -224,12 +235,21 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
         yolo_mode: agent.session.is_yolo(),
         auto_mode: agent.session.is_auto(),
         current_model_name: agent.session.models.current_model_name(),
+        current_model_id: agent.session.models.current.clone(),
         available_models: agent
             .session
             .models
-            .available
-            .iter()
+            .selectable_models()
             .map(|(id, info)| (info.name.clone(), id.clone()))
+            .collect(),
+        model_unready_reasons: agent
+            .session
+            .models
+            .selectable_models()
+            .filter_map(|(id, info)| {
+                crate::slash::commands::model::unready_reason_from_model_meta(info.meta.as_ref())
+                    .map(|reason| (id.0.to_string(), reason))
+            })
             .collect(),
         coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
         coding_data_sharing_lock: coding_data_sharing_lock_from_app,
@@ -700,6 +720,15 @@ fn agent_current_model_name(app: &AppView) -> Option<String> {
     None
 }
 
+fn agent_current_model_id(app: &AppView) -> Option<agent_client_protocol::ModelId> {
+    if let ActiveView::Agent(id) = app.active_view
+        && let Some(agent) = app.agents.get(&id)
+    {
+        return agent.session.models.current.clone();
+    }
+    None
+}
+
 /// Helper to clone the `(display_name, ModelId)` pairs from the
 /// active agent's catalog. Returns an empty `Vec` when no agent is
 /// active OR when the catalog is empty.
@@ -713,12 +742,28 @@ fn agent_available_models(app: &AppView) -> Vec<(String, acp::ModelId)> {
         return agent
             .session
             .models
-            .available
-            .iter()
+            .selectable_models()
             .map(|(id, info)| (info.name.clone(), id.clone()))
             .collect();
     }
     Vec::new()
+}
+
+fn agent_model_unready_reasons(app: &AppView) -> std::collections::HashMap<String, String> {
+    if let ActiveView::Agent(id) = app.active_view
+        && let Some(agent) = app.agents.get(&id)
+    {
+        return agent
+            .session
+            .models
+            .selectable_models()
+            .filter_map(|(id, info)| {
+                crate::slash::commands::model::unready_reason_from_model_meta(info.meta.as_ref())
+                    .map(|reason| (id.0.to_string(), reason))
+            })
+            .collect();
+    }
+    std::collections::HashMap::new()
 }
 
 /// Build a `PagerLocalSnapshot` from the current `AppView`.
@@ -728,7 +773,9 @@ pub(crate) fn build_pager_snapshot(app: &AppView) -> crate::settings::PagerLocal
         yolo_mode: agent_yolo_mode(app),
         auto_mode: agent_auto_mode(app),
         current_model_name: agent_current_model_name(app),
+        current_model_id: agent_current_model_id(app),
         available_models: agent_available_models(app),
+        model_unready_reasons: agent_model_unready_reasons(app),
         coding_data_sharing_opt_out: app.coding_data_retention_opt_out,
         coding_data_sharing_lock: app.coding_data_sharing_lock(),
         plan_mode_active: agent_plan_mode(app),

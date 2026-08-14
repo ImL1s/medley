@@ -181,6 +181,9 @@ pub enum ShutdownKind {
     /// Running work survives (idle unload, process quiesce, subagent teardown).
     Graceful,
     CancelRunningTurn,
+    /// Tear down an actor that never passed the resident publication gate.
+    /// Skips session-end hooks, memory, feedback, and normal persistence.
+    AbortUnpublished,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CancelTrigger {

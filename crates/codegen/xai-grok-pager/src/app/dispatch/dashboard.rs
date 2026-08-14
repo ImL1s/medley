@@ -1474,11 +1474,23 @@ pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String)
                 auto_mode: app.current_ui.permission_mode.as_deref() == Some("auto")
                     && !app.default_yolo,
                 current_model_name: app.models.current_model_name(),
+                current_model_id: app.models.current.clone(),
                 available_models: app
                     .models
                     .available
                     .iter()
                     .map(|(id, info)| (info.name.clone(), id.clone()))
+                    .collect(),
+                model_unready_reasons: app
+                    .models
+                    .available
+                    .iter()
+                    .filter_map(|(id, info)| {
+                        crate::slash::commands::model::unready_reason_from_model_meta(
+                            info.meta.as_ref(),
+                        )
+                        .map(|reason| (id.0.to_string(), reason))
+                    })
                     .collect(),
                 coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
                 coding_data_sharing_lock: coding_data_sharing_lock_from_app,
@@ -1722,6 +1734,7 @@ pub(super) fn apply_pending_dispatch_config(
                         effort: Some(effort),
                         // Effort-only push; no display change to roll back.
                         prev_model_id: None,
+                        prev_model_id_captured: false,
                     });
                 } else if let Some(agent) = app.agents.get_mut(&agent_id) {
                     // Refused at stash time: the request completes here, once,

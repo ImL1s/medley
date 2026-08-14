@@ -32,6 +32,9 @@ pub(crate) struct NotificationBridgeConfig {
     /// Shared gate: when false, suppress gateway forwarding.
     /// Events are still processed for hunk tracking and file state.
     pub gateway_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Prevent provisional `/new` actors from persisting or forwarding tool
+    /// notifications before their final auth-sealed resident commit.
+    pub publication_gate: crate::session::SessionPublicationGate,
     /// Persistence handle for FIFO ordinary writes and durable tombstone barriers.
     pub persistence: PersistenceHandle,
     /// When true, send incremental `output_delta` instead of full `output`
@@ -190,6 +193,9 @@ pub(crate) fn spawn_notification_bridge(
 ) -> ToolNotificationHandle {
     let (handle, mut rx) = ToolNotificationHandle::acknowledged_channel();
     tokio::task::spawn_local(async move {
+        if !config.publication_gate.wait_until_published().await {
+            return;
+        }
         let mut offsets: HashMap<String, usize> = HashMap::new();
         while let Some(delivery) = rx.recv().await {
             let acknowledgement = delivery.acknowledgement;
@@ -893,6 +899,7 @@ mod tests {
             prompt_index: Arc::new(TokioMutex::new(0)),
             cwd: PathBuf::from("/tmp"),
             gateway_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            publication_gate: crate::session::SessionPublicationGate::published(),
             persistence: PersistenceHandle::from_sender_for_test(persistence_tx),
             incremental_bash_output: false,
             plan_mode: Arc::new(parking_lot::Mutex::new(
@@ -943,6 +950,160 @@ mod tests {
             output_total_bytes: 0,
         }
     }
+
+    fn scheduled_task_created(task_id: &str) -> ToolNotification {
+        ToolNotification::ScheduledTaskCreated(
+            xai_grok_tools::notification::types::ScheduledTaskCreated {
+                task_id: task_id.to_owned(),
+                prompt: "run publication regression".to_owned(),
+                human_schedule: "once".to_owned(),
+                next_fire_at: None,
+                generation: "publication-test".to_owned(),
+                revision: 1,
+            },
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn notification_bridge_holds_queued_events_until_publication() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (mut config, mut gateway_rx, mut persistence_rx, _cmd_rx) =
+                    make_test_config_full();
+                let gate = crate::session::SessionPublicationGate::pending();
+                config.publication_gate = gate.clone();
+                let handle = spawn_notification_bridge(config);
+
+                handle.send(scheduled_task_created("pending-task"));
+                tokio::task::yield_now().await;
+                assert!(
+                    gateway_rx.try_recv().is_err(),
+                    "a provisional bridge must not forward queued notifications"
+                );
+                assert!(
+                    persistence_rx.try_recv().is_err(),
+                    "a provisional bridge must not persist queued notifications"
+                );
+
+                gate.publish();
+                let persisted =
+                    tokio::time::timeout(std::time::Duration::from_secs(1), persistence_rx.recv())
+                        .await
+                        .expect("published bridge must flush queued persistence")
+                        .expect("persistence channel must remain open");
+                assert!(matches!(
+                    persisted,
+                    PersistenceMsg::Update(crate::session::storage::SessionUpdate::Xai(_))
+                ));
+                assert!(matches!(
+                    tokio::time::timeout(std::time::Duration::from_secs(1), gateway_rx.recv())
+                        .await
+                        .expect("published bridge must flush queued gateway notification"),
+                    Some(xai_acp_lib::AcpClientMessage::ExtNotification(_))
+                ));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn notification_bridge_aborts_without_emitting_and_drops_receiver() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (mut config, mut gateway_rx, mut persistence_rx, _cmd_rx) =
+                    make_test_config_full();
+                let gate = crate::session::SessionPublicationGate::pending();
+                config.publication_gate = gate.clone();
+                let handle = spawn_notification_bridge(config);
+
+                handle.send(scheduled_task_created("aborted-task"));
+                gate.abort();
+                tokio::task::yield_now().await;
+                assert!(
+                    gateway_rx.try_recv().is_err(),
+                    "an aborted provisional bridge must emit no gateway notification"
+                );
+                assert!(
+                    persistence_rx.try_recv().is_err(),
+                    "an aborted provisional bridge must emit no persistence update"
+                );
+
+                let error = handle
+                    .send_scheduled_task_removed_acknowledged(
+                        xai_grok_tools::notification::ScheduledTaskRemoved {
+                            task_id: "after-abort".to_owned(),
+                            generation: "publication-test".to_owned(),
+                            revision: 2,
+                        },
+                    )
+                    .wait()
+                    .await
+                    .expect_err("aborted bridge must drop its notification receiver");
+                assert_eq!(
+                    error,
+                    xai_grok_tools::notification::NotificationAcknowledgementError::DispatchClosed(
+                        1
+                    )
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn acknowledged_removal_queued_before_abort_fails_closed_without_output() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (mut config, mut gateway_rx, mut persistence_rx, _cmd_rx) =
+                    make_test_config_full();
+                let gate = crate::session::SessionPublicationGate::pending();
+                config.publication_gate = gate.clone();
+                let handle = spawn_notification_bridge(config);
+
+                let acknowledgement = handle
+                    .send_scheduled_task_removed_acknowledged(
+                        xai_grok_tools::notification::ScheduledTaskRemoved {
+                            task_id: "queued-before-abort".to_owned(),
+                            generation: "publication-test".to_owned(),
+                            revision: 3,
+                        },
+                    )
+                    .wait();
+                tokio::pin!(acknowledgement);
+                assert!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(50),
+                        &mut acknowledgement
+                    )
+                    .await
+                    .is_err(),
+                    "acknowledgement must remain pending while publication is pending"
+                );
+
+                gate.abort();
+                let error =
+                    tokio::time::timeout(std::time::Duration::from_secs(1), &mut acknowledgement)
+                        .await
+                        .expect("aborting publication must resolve the queued acknowledgement")
+                        .expect_err("aborted bridge must fail the queued acknowledgement");
+                // Dispatch succeeded before abort; dropping the queued envelope
+                // closes its receipt without a consumer acknowledgement.
+                assert_eq!(
+                    error,
+                    xai_grok_tools::notification::NotificationAcknowledgementError::AcknowledgementDropped(
+                        1
+                    )
+                );
+                assert!(
+                    gateway_rx.try_recv().is_err(),
+                    "aborted queued acknowledgement must emit no gateway notification"
+                );
+                assert!(
+                    persistence_rx.try_recv().is_err(),
+                    "aborted queued acknowledgement must emit no persistence update"
+                );
+            })
+            .await;
+    }
+
     #[tokio::test]
     async fn bash_task_completed_injects_bash_task_completed_source() {
         let (config, mut cmd_rx) = make_test_config();

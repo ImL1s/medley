@@ -2437,6 +2437,147 @@ fn subagent_reasoning_override_obeys_authoritative_model_menu() {
 }
 
 #[test]
+fn subagent_reasoning_override_accepts_catalog_advertised_ultra() {
+    use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption};
+
+    let options = [ReasoningEffortOption {
+        id: "ultra".into(),
+        value: ReasoningEffort::Ultra,
+        label: "Ultra".into(),
+        description: Some("Maximum reasoning with proactive multi-agent guidance".into()),
+        default: true,
+    }];
+    assert_eq!(
+        resolve_subagent_reasoning_effort_override(true, &options, "ultra"),
+        Some(ReasoningEffort::Ultra)
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn explicit_ultra_rejected_for_child_model_without_ultra_before_inference() {
+    use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption};
+    use xai_grok_test_support::MockInferenceServer;
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let server = MockInferenceServer::start().await.unwrap();
+            let model_id = "codex-luna-like";
+            let mut entry = test_model_entry(model_id);
+            entry.info.base_url = server.url();
+            entry.info.supports_reasoning_effort = true;
+            entry.info.reasoning_efforts = vec![ReasoningEffortOption {
+                id: "max".into(),
+                value: ReasoningEffort::Max,
+                label: "Max".into(),
+                description: None,
+                default: true,
+            }];
+            let mut models = indexmap::IndexMap::new();
+            models.insert(model_id.to_owned(), entry);
+            let mut ctx = ctx_with_toggle(HashMap::new());
+            ctx.model_id = acp::ModelId::new(model_id);
+            ctx.sampling_config_model_id = acp::ModelId::new(model_id);
+            ctx.sampling_config.model = model_id.to_owned();
+            ctx.sampling_config.base_url = server.url();
+            ctx.available_models = models.clone();
+            ctx.models_manager = crate::agent::models::ModelsManager::new(
+                None,
+                models,
+                acp::ModelId::new(model_id),
+                ctx.auth_manager.clone(),
+                crate::agent::config::Config::default(),
+            );
+            let mut request = auto_wake_test_request("reject-child-ultra");
+            request.run_in_background = false;
+            request.surface_completion = false;
+            request.runtime_overrides.reasoning_effort = Some("ultra".into());
+
+            let result = run_issue39_spawn(request, ctx).await;
+
+            assert!(!result.success);
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("reasoning_effort 'ultra' is not offered")),
+                "explicit unavailable effort must return a failure_result: {:?}",
+                result.error
+            );
+            assert_eq!(
+                server.request_count(),
+                0,
+                "rejected explicit effort must not reach inference"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn explicit_ultra_advertised_by_child_model_reaches_responses_as_max() {
+    use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption};
+    use xai_grok_test_support::MockInferenceServer;
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let server = MockInferenceServer::start().await.unwrap();
+            let model_id = "codex-sol-like";
+            let mut entry = test_model_entry(model_id);
+            entry.info.base_url = server.url();
+            entry.info.api_backend = xai_grok_sampler::ApiBackend::Responses;
+            entry.info.auth_scheme = xai_grok_sampler::AuthScheme::None;
+            entry.info.supports_reasoning_effort = true;
+            entry.info.reasoning_efforts = vec![ReasoningEffortOption {
+                id: "ultra".into(),
+                value: ReasoningEffort::Ultra,
+                label: "Ultra".into(),
+                description: None,
+                default: true,
+            }];
+            let mut models = indexmap::IndexMap::new();
+            models.insert(model_id.to_owned(), entry);
+            let mut ctx = ctx_with_toggle(HashMap::new());
+            ctx.model_id = acp::ModelId::new(model_id);
+            ctx.sampling_config_model_id = acp::ModelId::new(model_id);
+            ctx.sampling_config.model = model_id.to_owned();
+            ctx.sampling_config.base_url = server.url();
+            ctx.sampling_config.api_backend = xai_grok_sampler::ApiBackend::Responses;
+            ctx.sampling_config.auth_scheme = xai_grok_sampler::AuthScheme::None;
+            ctx.available_models = models.clone();
+            ctx.models_manager = crate::agent::models::ModelsManager::new(
+                None,
+                models,
+                acp::ModelId::new(model_id),
+                ctx.auth_manager.clone(),
+                crate::agent::config::Config::default(),
+            );
+            let mut request = auto_wake_test_request("accept-child-ultra");
+            request.prompt = "answer briefly".into();
+            request.run_in_background = false;
+            request.surface_completion = false;
+            request.runtime_overrides.reasoning_effort = Some("ultra".into());
+
+            let result = run_issue39_spawn(request, ctx).await;
+
+            assert!(result.success, "child run failed: {:?}", result.error);
+            let bodies = server.request_bodies();
+            assert!(!bodies.is_empty(), "accepted effort must reach inference");
+            assert!(
+                bodies.iter().any(|body| {
+                    body.pointer("/reasoning/effort")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("max")
+                }),
+                "no Responses request carried Ultra's typed max wire effort: {bodies:?}"
+            );
+            assert!(
+                bodies.iter().all(|body| !body.to_string().contains("<multi_agent_mode>")),
+                "generic Responses must not receive Codex-only proactive guidance: {bodies:?}"
+            );
+        })
+        .await;
+}
+
+#[test]
 fn subagent_reasoning_override_uses_legacy_menu_when_catalog_menu_is_absent() {
     use xai_grok_sampling_types::ReasoningEffort;
 

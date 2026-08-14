@@ -364,6 +364,7 @@ fn e2e_compact_auth_failure_holds_prompt_and_resubmits_after_login() {
 
         apply_session_event_for_test(
             &XaiSessionUpdate::RetryState(RetryState::Failed {
+                http_status: None,
                 error_type: "auth".into(),
                 message: "Unauthorized (401): compaction failed".into(),
             }),

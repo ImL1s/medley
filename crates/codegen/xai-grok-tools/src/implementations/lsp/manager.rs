@@ -315,6 +315,12 @@ impl LspManager {
             .any(|pending| !pending.is_empty())
     }
 
+    fn has_unreported_pushes(&self) -> bool {
+        self.clients
+            .values()
+            .any(|client| client.diagnostics.has_unreported())
+    }
+
     /// Whether any pending server is still expected to answer. False once every
     /// server owing us one has been silent for longer than
     /// [`super::pending::SERVER_PATIENCE`], which lets the drain return immediately
@@ -431,6 +437,18 @@ impl LspManager {
             }
 
             for uri in pending.take_answered(&server_name, &client.diagnostics, now) {
+                client.diagnostics.clear_unreported(&uri);
+                collected.append_file(&uri, client.diagnostics.items(&uri));
+            }
+        }
+
+        let mut extra_servers: Vec<String> = self.clients.keys().cloned().collect();
+        extra_servers.sort_unstable();
+        for server_name in extra_servers {
+            let Some(client) = self.clients.get(&server_name) else {
+                continue;
+            };
+            for uri in client.diagnostics.take_unreported() {
                 collected.append_file(&uri, client.diagnostics.items(&uri));
             }
         }
@@ -608,7 +626,7 @@ pub async fn drain_lsp_diagnostics(
         // A refresh can land at any point, including during the wait below.
         lsp.reopen_refreshed_questions();
 
-        if !lsp.has_pending_diagnostics() {
+        if !lsp.has_pending_diagnostics() && !lsp.has_unreported_pushes() {
             return None;
         }
 

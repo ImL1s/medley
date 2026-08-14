@@ -1263,6 +1263,76 @@ fn spawn_permission_manager_with_pin(
     yolo_pin: Option<&'static str>,
     hub_permission: Option<Arc<dyn crate::permission::PermissionHookTransport>>,
 ) -> (PermissionHandle, mpsc::UnboundedReceiver<PermissionEvent>) {
+    spawn_permission_manager_with_pin_and_activation(
+        session_id,
+        gateway,
+        cwd,
+        client_type,
+        permission_config,
+        deny_read_globs,
+        web_fetch_allowed_domains,
+        initial_yolo,
+        client_identifier,
+        remember_tool_approvals,
+        yolo_pin,
+        hub_permission,
+        None,
+    )
+}
+
+/// Spawn a permission manager whose actor performs no state reads, migrations,
+/// or diagnostics until the caller confirms that its provisional session was
+/// published. Sending `false` (or dropping the sender) silently discards the
+/// actor and every command queued during provisional construction.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_permission_manager_with_hub_deferred(
+    session_id: acp::SessionId,
+    gateway: GatewaySender,
+    cwd: AbsPathBuf,
+    client_type: ClientType,
+    permission_config: Option<crate::permission::types::PermissionConfig>,
+    deny_read_globs: Vec<String>,
+    web_fetch_allowed_domains: Vec<String>,
+    initial_yolo: bool,
+    client_identifier: Option<String>,
+    remember_tool_approvals: bool,
+    yolo_pin: Option<&'static str>,
+    hub_permission: Option<Arc<dyn crate::permission::PermissionHookTransport>>,
+    activation: oneshot::Receiver<bool>,
+) -> (PermissionHandle, mpsc::UnboundedReceiver<PermissionEvent>) {
+    spawn_permission_manager_with_pin_and_activation(
+        session_id,
+        gateway,
+        cwd,
+        client_type,
+        permission_config,
+        deny_read_globs,
+        web_fetch_allowed_domains,
+        initial_yolo,
+        client_identifier,
+        remember_tool_approvals,
+        yolo_pin,
+        hub_permission,
+        Some(activation),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_permission_manager_with_pin_and_activation(
+    session_id: acp::SessionId,
+    gateway: GatewaySender,
+    cwd: AbsPathBuf,
+    client_type: ClientType,
+    permission_config: Option<crate::permission::types::PermissionConfig>,
+    deny_read_globs: Vec<String>,
+    web_fetch_allowed_domains: Vec<String>,
+    initial_yolo: bool,
+    client_identifier: Option<String>,
+    remember_tool_approvals: bool,
+    yolo_pin: Option<&'static str>,
+    hub_permission: Option<Arc<dyn crate::permission::PermissionHookTransport>>,
+    activation: Option<oneshot::Receiver<bool>>,
+) -> (PermissionHandle, mpsc::UnboundedReceiver<PermissionEvent>) {
     let (tx, mut rx) = mpsc::unbounded_channel::<PermissionCommand>();
     let (event_tx, event_rx) = mpsc::unbounded_channel::<PermissionEvent>();
     // Pin clamps the initial yolo however the client set it.
@@ -1276,18 +1346,10 @@ fn spawn_permission_manager_with_pin(
         && permission_config
             .as_ref()
             .is_some_and(|c| matches!(c.prompt_policy, PromptPolicy::Auto));
-    if initial_yolo
+    let yolo_conflicts_with_deny = initial_yolo
         && permission_config
             .as_ref()
-            .is_some_and(|c| matches!(c.prompt_policy, PromptPolicy::Deny))
-    {
-        tracing::warn!(
-            "always-approve is active while prompt_policy is dontAsk (Deny); \
-             unapproved tools will not be auto-denied until always-approve is off. \
-             Pin always-approve off with requirements.toml \
-             ([ui] disable_bypass_permissions_mode = true) to enforce managed dontAsk."
-        );
-    }
+            .is_some_and(|c| matches!(c.prompt_policy, PromptPolicy::Deny));
     let auto_state = Arc::new(AtomicBool::new(seed_auto));
     let auto_state_actor = auto_state.clone();
     let side_query_wired = Arc::new(AtomicBool::new(false));
@@ -1295,6 +1357,19 @@ fn spawn_permission_manager_with_pin(
     let in_flight_actor = in_flight.clone();
 
     let _task = tokio::task::spawn_local(async move {
+        if let Some(activation) = activation
+            && !matches!(activation.await, Ok(true))
+        {
+            return;
+        }
+        if yolo_conflicts_with_deny {
+            tracing::warn!(
+                "always-approve is active while prompt_policy is dontAsk (Deny); \
+                 unapproved tools will not be auto-denied until always-approve is off. \
+                 Pin always-approve off with requirements.toml \
+                 ([ui] disable_bypass_permissions_mode = true) to enforce managed dontAsk."
+            );
+        }
         let client_id_ref = client_identifier.as_deref();
         let mut state = load_state_from_disk(&cwd, client_id_ref).await;
 
@@ -2589,6 +2664,101 @@ mod tests {
             None,
             None,
         )
+    }
+
+    fn deferred_test_manager(
+        cwd: &AbsPathBuf,
+        activation: oneshot::Receiver<bool>,
+    ) -> (PermissionHandle, mpsc::UnboundedReceiver<PermissionEvent>) {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        spawn_permission_manager_with_hub_deferred(
+            acp::SessionId::new(Arc::from("test-session")),
+            GatewaySender::new(tx),
+            cwd.clone(),
+            ClientType::Generic,
+            None,
+            vec![],
+            vec![],
+            false,
+            None,
+            true,
+            None,
+            None,
+            activation,
+        )
+    }
+
+    #[tokio::test]
+    async fn deferred_manager_does_not_migrate_permission_state_when_aborted() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let state_dir = xai_grok_config::sessions_cwd_dir(cwd.as_str());
+                let legacy = PermissionState {
+                    edit_policy: EditPolicy::Allow,
+                    ..Default::default()
+                };
+                persist_state(&cwd, &legacy, None).await;
+
+                let (activation_tx, activation_rx) = oneshot::channel();
+                let (_handle, _events) = deferred_test_manager(&cwd, activation_rx);
+                tokio::task::yield_now().await;
+                assert_eq!(
+                    load_state_from_disk(&cwd, None).await.edit_policy,
+                    EditPolicy::Allow,
+                    "provisional actor must not migrate state before publication"
+                );
+
+                activation_tx.send(false).unwrap();
+                tokio::task::yield_now().await;
+                assert_eq!(
+                    load_state_from_disk(&cwd, None).await.edit_policy,
+                    EditPolicy::Allow,
+                    "aborted provisional actor must leave state untouched"
+                );
+                let _ = tokio::fs::remove_dir_all(state_dir).await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn deferred_manager_migrates_permission_state_after_publication() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let state_dir = xai_grok_config::sessions_cwd_dir(cwd.as_str());
+                let legacy = PermissionState {
+                    edit_policy: EditPolicy::Allow,
+                    ..Default::default()
+                };
+                persist_state(&cwd, &legacy, None).await;
+
+                let (activation_tx, activation_rx) = oneshot::channel();
+                let (_handle, _events) = deferred_test_manager(&cwd, activation_rx);
+                tokio::task::yield_now().await;
+                assert_eq!(
+                    load_state_from_disk(&cwd, None).await.edit_policy,
+                    EditPolicy::Allow
+                );
+
+                activation_tx.send(true).unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        if load_state_from_disk(&cwd, None).await.edit_policy == EditPolicy::Ask {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("published permission actor did not perform the legacy migration");
+                let _ = tokio::fs::remove_dir_all(state_dir).await;
+            })
+            .await;
     }
 
     #[tokio::test]

@@ -555,6 +555,9 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
                     // Re-derive the &str key to avoid making SessionMatch::Child
                     // carry an owned String (see find_session_match docs).
                     let child_key: &str = notif.request.session_id.0.as_ref();
+                    if !meta.is_replay {
+                        parent.mark_subagent_live(child_key);
+                    }
 
                     let activity_label = {
                         let child_view = parent

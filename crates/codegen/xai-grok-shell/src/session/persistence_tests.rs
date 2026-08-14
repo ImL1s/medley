@@ -29,11 +29,56 @@ fn test_actor_with_remote_sync(
         SessionPersistence {
             info,
             storage,
+            _published_session_lease: None,
             pending_notification: None,
             rx,
             remote_sync,
             // Resumed-style actor for these tests; upgrade backfill is fresh-only.
             created_fresh: false,
+            fresh_claim: None,
+            pending_publication_gate: None,
+            fresh_publication_aborted: false,
+            relay_sync: None,
+            summary: crate::session::summary::SummaryGenerator::new(
+                crate::session::summary::SummaryConfig {
+                    sampling_client,
+                    model: String::new(),
+                    persistence_tx: tx.downgrade(),
+                },
+            ),
+            registry_title_sync: None,
+            gateway: None,
+            disk_full_tx,
+            disk_full_notified: false,
+        }
+        .run(),
+    );
+    ActorGuard {
+        handle: PersistenceHandle::from_parts_for_test(tx, disk_full_rx),
+        task,
+    }
+}
+
+fn test_fresh_actor(
+    info: Info,
+    storage: Arc<dyn StorageAdapter>,
+    fresh_claim: FreshSessionClaim,
+) -> ActorGuard {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let (disk_full_tx, disk_full_rx) = tokio::sync::watch::channel(false);
+    let sampling_client = OaiCompatClient::new(xai_grok_sampler::SamplerConfig::default()).unwrap();
+    let task = tokio::spawn(
+        SessionPersistence {
+            info,
+            storage,
+            _published_session_lease: None,
+            pending_notification: None,
+            rx,
+            remote_sync: None,
+            created_fresh: true,
+            fresh_claim: Some(fresh_claim),
+            pending_publication_gate: None,
+            fresh_publication_aborted: false,
             relay_sync: None,
             summary: crate::session::summary::SummaryGenerator::new(
                 crate::session::summary::SummaryConfig {
@@ -112,6 +157,116 @@ async fn recv_observed(
         .await
         .expect("remote sync timed out")
         .expect("remote sync observer closed")
+}
+
+#[tokio::test]
+async fn durable_prepare_failure_prevents_publication_arming() {
+    let root = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("durable-prepare-failure"),
+        cwd: "/test/durable-prepare".into(),
+    };
+    let published_session = root
+        .path()
+        .join("sessions")
+        .join(crate::util::grok_home::encode_cwd_dirname(&info.cwd))
+        .join(info.id.0.as_ref());
+    let fresh_claim =
+        claim_fresh_session_sync(root.path(), info.id.0.as_ref(), published_session).unwrap();
+    let session_dir = fresh_claim.publication.stage_session.clone();
+    let storage = Arc::new(JsonlStorageAdapter::with_session_sync_probe(
+        session_dir.clone(),
+        || Err(io::Error::other("injected durable prepare failure")),
+    ));
+    storage
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let actor = test_fresh_actor(info.clone(), storage.clone(), fresh_claim);
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Update(neutral_update(&info, "pending")))
+        .unwrap();
+    let publication_gate = crate::session::SessionPublicationGate::pending();
+
+    let error = PersistenceHandle::publish_fresh(&actor.handle.tx, publication_gate.clone())
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.to_string(), "injected durable prepare failure");
+    assert_eq!(storage.load_summary(&info).await.unwrap().num_messages, 1);
+    publication_gate.publish();
+    tokio::task::yield_now().await;
+    assert!(session_dir.join(UNPUBLISHED_SESSION_MARKER).is_file());
+    PersistenceHandle::abort_fresh_and_delete(&actor.handle.tx, publication_gate)
+        .await
+        .unwrap();
+    actor.task.await.unwrap();
+    assert!(!session_dir.exists());
+}
+
+#[tokio::test]
+async fn failed_fresh_lease_downgrade_keeps_actor_alive_and_exclusion_held() {
+    const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000145";
+    let root = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new(SESSION_ID),
+        cwd: "/test/fresh-lease-transition-failure".into(),
+    };
+    let published_session = root
+        .path()
+        .join("sessions")
+        .join(crate::util::grok_home::encode_cwd_dirname(&info.cwd))
+        .join(SESSION_ID);
+    let fresh_claim =
+        claim_fresh_session_sync(root.path(), SESSION_ID, published_session.clone()).unwrap();
+    let publication = fresh_claim.publication.clone();
+    let storage = Arc::new(JsonlStorageAdapter::with_session_path_binding(
+        publication.path_binding.clone(),
+    ));
+    storage
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let actor = test_fresh_actor(info.clone(), storage, fresh_claim);
+    let _failure = install_fresh_lease_transition_failure_test_hook(SESSION_ID);
+    let publication_gate = crate::session::SessionPublicationGate::pending();
+
+    PersistenceHandle::publish_fresh(&actor.handle.tx, publication_gate.clone())
+        .await
+        .unwrap();
+    publication.finalize().unwrap();
+    publication_gate.publish();
+
+    let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::FlushAndAck {
+            respond_to: barrier_tx,
+        })
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), barrier_rx)
+        .await
+        .expect("actor must continue after retaining the failed transition claim")
+        .expect("actor must acknowledge the post-publication barrier")
+        .unwrap();
+    assert!(
+        try_acquire_session_id_write_lock_sync(root.path(), SESSION_ID)
+            .unwrap()
+            .is_none(),
+        "the live actor must retain exclusive namespace protection after downgrade failure"
+    );
+
+    actor.stop().await;
+    assert!(published_session.is_dir());
+    assert!(
+        try_acquire_session_id_write_lock_sync(root.path(), SESSION_ID)
+            .unwrap()
+            .is_some(),
+        "stopping the actor must release its retained namespace claim"
+    );
 }
 
 #[test]

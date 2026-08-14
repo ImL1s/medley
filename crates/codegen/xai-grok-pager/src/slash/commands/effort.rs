@@ -262,6 +262,56 @@ mod tests {
     }
 
     #[test]
+    fn ultra_is_rendered_and_dispatched_when_model_menu_offers_it() {
+        let mut state = ModelState::default();
+        let id = acp::ModelId::new(Arc::from("gpt-5.6-sol"));
+        let info = acp::ModelInfo::new(id.clone(), "GPT-5.6 Sol".to_string()).meta(
+            serde_json::json!({
+                "supportsReasoningEffort": true,
+                "reasoningEfforts": [{
+                    "value": "ultra",
+                    "label": "Ultra",
+                    "description": "Maximum reasoning with proactive multi-agent guidance",
+                    "default": true
+                }],
+            })
+            .as_object()
+            .cloned(),
+        );
+        state.available.insert(id.clone(), info);
+        state.current = Some(id.clone());
+
+        let app_ctx = AppCtx {
+            models: &state,
+            cwd: std::path::Path::new("."),
+            has_session_announcements: false,
+            billing_surface_visible: true,
+            usage_command_visible: true,
+            workflows_available: true,
+            screen_mode: crate::app::ScreenMode::Fullscreen,
+        };
+        let items = EffortCommand
+            .suggest_args(&app_ctx, "")
+            .expect("Ultra model has a menu");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].insert_text, "ultra");
+        assert_eq!(items[0].display, "Ultra");
+        assert_eq!(
+            items[0].description,
+            "Maximum reasoning with proactive multi-agent guidance"
+        );
+
+        let mut exec_ctx = dummy_exec_ctx(&state);
+        match EffortCommand.run(&mut exec_ctx, "ultra") {
+            CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+                assert_eq!(model_id, id);
+                assert_eq!(effort, Some(ReasoningEffort::Ultra));
+            }
+            other => panic!("expected SwitchModel Ultra, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn remap_id_dispatches_mapped_canonical_effort() {
         let mut state = ModelState::default();
         let id = acp::ModelId::new(Arc::from("reasoning-x"));

@@ -1,6 +1,23 @@
 use crate::util::config::RemoteSettings;
 use toml::Value as TomlValue;
 
+#[cfg(test)]
+std::thread_local! {
+    static REMOTE_FETCH_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Pin `[features] remote_fetch` for the current test thread.
+///
+/// `grok_home()` is process-wide `OnceLock`, so writing `remote_fetch = false`
+/// into a fresh `$MEDLEY_HOME` tempfile is ignored after another test has
+/// already resolved the home. This override is the offline path `MvpAgent::new`
+/// actually consults.
+#[cfg(test)]
+pub fn override_remote_fetch_enabled(value: Option<bool>) {
+    REMOTE_FETCH_TEST_OVERRIDE.with(|cell| cell.set(value));
+}
+
 /// Resolve whether ZDR users are allowed to use the product.
 ///
 /// Precedence: requirements > env > config.toml > managed > remote settings > default (false).
@@ -38,6 +55,10 @@ pub fn resolve_zdr_access_enabled(
 /// what is unreachable when this knob is needed (firewalled / air-gapped
 /// deployments), and an env var would be one more way to re-arm the fetches.
 pub fn resolve_remote_fetch_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(value) = REMOTE_FETCH_TEST_OVERRIDE.with(|cell| cell.get()) {
+        return value;
+    }
     match crate::config::ConfigLayers::load() {
         Ok(layers) => remote_fetch_enabled_from_layers(&layers),
         // The full-layer load is all-or-nothing, but the policy tiers load
@@ -260,5 +281,14 @@ mod tests {
             remote_fetch_enabled_from_policy_layers(None, None, None),
             "genuinely absent policy fails open"
         );
+    }
+
+    #[test]
+    fn test_override_disarms_remote_fetch_without_reading_layers() {
+        override_remote_fetch_enabled(Some(false));
+        assert!(!resolve_remote_fetch_enabled());
+        override_remote_fetch_enabled(Some(true));
+        assert!(resolve_remote_fetch_enabled());
+        override_remote_fetch_enabled(None);
     }
 }

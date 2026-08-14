@@ -36,7 +36,16 @@ Grok stores each session in its own directory, grouped by working directory. It 
   subagents/              # per-subagent metadata (meta.json); the child sessions live in the normal sessions tree
 ```
 
-`summary.json` is the index entry. It records the session summary and generated title, the model ID, the creation and update timestamps, the message counts, and a parent session reference for forked or restored sessions. `updates.jsonl` is the authoritative conversation log that drives `/resume` and session restore.
+`summary.json` is the index entry. It records the session summary and generated title, the model ID and selected reasoning effort, the creation and update timestamps, the message counts, and a parent session reference for forked or restored sessions. `updates.jsonl` is the authoritative conversation log that drives `/resume` and session restore.
+
+Reasoning effort is session state. For example, a catalog-advertised `ultra` selection is saved as `ultra` even though a Responses request encodes it as `max`. On resume, Grok restores the saved tier only when the current model menu still advertises it. If a refreshed catalog no longer offers the saved tier, Grok blocks prompts for that restored selection instead of silently downgrading the session.
+
+> **Upgrading Medley:** exit every running Medley process before replacing the
+> executable, then start the new version. Older builds do not participate in
+> the hardened per-session lock namespace, so an old and new process must not
+> write the same session tree during an upgrade. This one-time drain is
+> especially important when upgrading from a build older than
+> `v0.2.121+providers.1`.
 
 ---
 

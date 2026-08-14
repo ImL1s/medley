@@ -343,6 +343,63 @@ impl SettingsModalState {
         }
     }
 
+    /// Replace the live snapshots while keeping an open dynamic-enum picker
+    /// coherent with the refreshed catalog.
+    ///
+    /// Model catalogs can change asynchronously while the chooser is open. An
+    /// index alone is not stable across removals or reordering, so preserve the
+    /// highlighted canonical value when it still exists. If that value
+    /// disappeared, return to Browse instead of leaving an out-of-range focus
+    /// that renders no row and can close without committing on Enter.
+    pub(crate) fn replace_snapshots(
+        &mut self,
+        ui_snapshot: UiConfig,
+        pager_snapshot: PagerLocalSnapshot,
+    ) {
+        let highlighted_dynamic_choice = match &self.state.mode {
+            SettingsMode::PickingEnum {
+                key, choices_idx, ..
+            } => self.registry.find(key).and_then(|meta| {
+                let SettingKind::DynamicEnum { source, .. } = &meta.kind else {
+                    return None;
+                };
+                dynamic_enum_choices(*source, &self.pager_snapshot)
+                    .get(*choices_idx)
+                    .map(|choice| (*key, choice.canonical.clone()))
+            }),
+            _ => None,
+        };
+
+        self.ui_snapshot = ui_snapshot;
+        self.pager_snapshot = pager_snapshot;
+
+        let Some((key, canonical)) = highlighted_dynamic_choice else {
+            return;
+        };
+        let refreshed_idx = self.registry.find(key).and_then(|meta| {
+            let SettingKind::DynamicEnum { source, .. } = &meta.kind else {
+                return None;
+            };
+            dynamic_enum_choices(*source, &self.pager_snapshot)
+                .iter()
+                .position(|choice| choice.canonical == canonical)
+        });
+        match refreshed_idx {
+            Some(refreshed_idx) => {
+                if let SettingsMode::PickingEnum {
+                    key: active_key,
+                    choices_idx,
+                    ..
+                } = &mut self.state.mode
+                    && *active_key == key
+                {
+                    *choices_idx = refreshed_idx;
+                }
+            }
+            None => self.transition_to_browse(),
+        }
+    }
+
     pub fn mode(&self) -> SettingsModalMode {
         match &self.state.mode {
             SettingsMode::Browse => SettingsModalMode::Browse,
@@ -432,6 +489,48 @@ impl SettingsModalState {
     /// Read the current value for a setting key.
     pub fn value_for(&self, key: SettingKey) -> Option<SettingValue> {
         current_value_for(key, &self.ui_snapshot, &self.pager_snapshot)
+    }
+
+    /// Read a value projected for the browse-row UI. Dynamic enums persist
+    /// canonical ids, but the row should show the same catalog label and
+    /// availability annotation as the picker.
+    pub(super) fn display_value_for(&self, key: SettingKey) -> Option<SettingValue> {
+        let value = self.value_for(key)?;
+        let Some(SettingKind::DynamicEnum { source, .. }) =
+            self.registry.find(key).map(|meta| &meta.kind)
+        else {
+            return Some(value);
+        };
+        let SettingValue::String(canonical) = &value else {
+            return Some(value);
+        };
+        if canonical.is_empty() {
+            return Some(value);
+        }
+        let display = dynamic_enum_choices(*source, &self.pager_snapshot)
+            .into_iter()
+            .find(|choice| choice.canonical == *canonical)
+            .map(|choice| choice.display);
+        let display = display.or_else(|| {
+            (key == "default_model"
+                && self
+                    .pager_snapshot
+                    .current_model_id
+                    .as_ref()
+                    .is_some_and(|id| id.0.as_ref() == canonical))
+            .then(|| {
+                format!(
+                    "{} [unavailable]",
+                    self.pager_snapshot
+                        .current_model_name
+                        .as_deref()
+                        .unwrap_or(canonical)
+                )
+            })
+        });
+        Some(SettingValue::String(
+            display.unwrap_or_else(|| canonical.clone()),
+        ))
     }
 
     /// Move `selected` forward, skipping headers and filtered-out rows.
@@ -594,6 +693,7 @@ impl SettingsModalState {
                             canonical: c.canonical.to_string(),
                             display: c.display.to_string(),
                             description: c.description.to_string(),
+                            disabled_reason: None,
                         })
                         .collect(),
                 ),
@@ -1002,18 +1102,26 @@ pub(super) fn action_for_string(
             if value.is_empty() {
                 Some(Action::ClearDefaultModel)
             } else {
-                snapshot
-                    .resolve_model_name(&value)
-                    .map(Action::SetDefaultModel)
+                match snapshot.resolve_model_name(&value) {
+                    crate::settings::ModelResolution::Resolved(id) => {
+                        Some(Action::SetDefaultModel(id))
+                    }
+                    crate::settings::ModelResolution::Ambiguous
+                    | crate::settings::ModelResolution::Unknown => None,
+                }
             }
         }
         "fork_secondary_model" => {
             if value.is_empty() {
                 Some(Action::ClearForkSecondaryModel)
             } else {
-                snapshot
-                    .resolve_model_name(&value)
-                    .map(Action::SetForkSecondaryModel)
+                match snapshot.resolve_model_name(&value) {
+                    crate::settings::ModelResolution::Resolved(id) => {
+                        Some(Action::SetForkSecondaryModel(id))
+                    }
+                    crate::settings::ModelResolution::Ambiguous
+                    | crate::settings::ModelResolution::Unknown => None,
+                }
             }
         }
 
@@ -1062,13 +1170,22 @@ pub(super) fn validate_string(
             if available_models.is_empty() {
                 return Some("Model catalog still loading — try again".to_string());
             }
-            let matched = available_models
+            if available_models
                 .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case(buffer));
-            if matched {
-                None
-            } else {
-                Some(format!("Unknown model: \"{buffer}\""))
+                .any(|(_, id)| id.0.as_ref().eq_ignore_ascii_case(buffer))
+            {
+                return None;
+            }
+            let display_matches = available_models
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case(buffer))
+                .count();
+            match display_matches {
+                1 => None,
+                2.. => Some(format!(
+                    "Ambiguous model name: \"{buffer}\" — enter the model id"
+                )),
+                _ => Some(format!("Unknown model: \"{buffer}\"")),
             }
         }
     }

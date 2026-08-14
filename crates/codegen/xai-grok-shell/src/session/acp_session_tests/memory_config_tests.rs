@@ -65,6 +65,27 @@ async fn create_test_actor_with_memory(
     persistence_tx: mpsc::UnboundedSender<PersistenceMsg>,
     memory_config: Option<crate::config::MemoryConfig>,
 ) -> SessionActor {
+    create_test_actor_with_memory_and_events(
+        total_tokens,
+        context_window,
+        threshold_percent,
+        gateway_tx,
+        persistence_tx,
+        memory_config,
+    )
+    .await
+    .0
+}
+
+#[allow(clippy::field_reassign_with_default)]
+async fn create_test_actor_with_memory_and_events(
+    total_tokens: u64,
+    context_window: u64,
+    threshold_percent: u8,
+    gateway_tx: mpsc::UnboundedSender<xai_acp_lib::AcpClientMessage>,
+    persistence_tx: mpsc::UnboundedSender<PersistenceMsg>,
+    memory_config: Option<crate::config::MemoryConfig>,
+) -> (SessionActor, mpsc::UnboundedReceiver<SessionEvent>) {
     let tmp = tempfile::TempDir::new().unwrap();
     let cwd_path = tmp.path().to_path_buf();
     let cwd = AbsPathBuf::new(cwd_path.clone()).unwrap();
@@ -94,7 +115,7 @@ async fn create_test_actor_with_memory(
         nudges_used_this_session: 0,
     });
     let (chat_event_tx, _chat_event_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
     let chat_state_handle = xai_chat_state::ChatStateActor::spawn(
         vec![],
         xai_grok_sampling_types::SamplingConfig {
@@ -122,7 +143,7 @@ async fn create_test_actor_with_memory(
     let memory_initial_injection_config = memory_config
         .as_ref()
         .map_or_else(Default::default, |mc| mc.initial_injection.clone());
-    SessionActor {
+    let actor = SessionActor {
         session_info: SessionInfo {
             id: acp::SessionId::new("test-memory"),
             cwd: cwd.as_str().to_string(),
@@ -185,6 +206,7 @@ async fn create_test_actor_with_memory(
                 .map_or_else(Default::default, |mc| mc.flush.clone()),
             is_flushing: std::sync::atomic::AtomicBool::new(false),
             last_flush_compaction: std::sync::atomic::AtomicU64::new(0),
+            configured_storage: memory_storage.clone(),
             storage: std::cell::RefCell::new(memory_storage),
             save_on_end: true,
             backend_params: None,
@@ -316,7 +338,8 @@ async fn create_test_actor_with_memory(
         subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
         workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
         trace_config_template: std::cell::RefCell::new(None),
-    }
+    };
+    (actor, event_rx)
 }
 #[tokio::test(flavor = "current_thread")]
 async fn test_is_flushing_suppresses_auto_compact() {
@@ -531,6 +554,7 @@ async fn create_injection_ready_actor(
     .unwrap();
     idx.reindex_file(&note, "workspace").unwrap();
     drop(idx);
+    actor.memory.configured_storage = Some(storage.clone());
     actor.memory.storage = std::cell::RefCell::new(Some(storage));
     std::mem::forget(tmp);
     actor.memory.backend_params = Some(crate::session::memory::MemoryBackendParams {
@@ -671,6 +695,185 @@ async fn test_idle_flush_timeout_from_config() {
             )
             .await;
             assert_eq!(actor2.idle_flush_timeout, None);
+        })
+        .await;
+}
+
+/// Drain `event_tx` the way `run_session` does: capture slash-command
+/// `AgentMessageChunk` text and acknowledge `FlushReplay` so
+/// `send_host_turn_slash_command_output` can return.
+fn spawn_replay_slash_output_drain(
+    mut event_rx: mpsc::UnboundedReceiver<SessionEvent>,
+) -> Arc<std::sync::Mutex<Vec<String>>> {
+    let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = Arc::clone(&output);
+    tokio::task::spawn_local(async move {
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                SessionEvent::Notification(notification) => {
+                    if let SessionNotification::Acp(args) = notification
+                        && let acp::SessionUpdate::AgentMessageChunk(chunk) = &args.update
+                        && let acp::ContentBlock::Text(text) = &chunk.content
+                    {
+                        captured.lock().unwrap().push(text.text.clone());
+                    }
+                }
+                SessionEvent::FlushReplay { respond_to } => {
+                    if let Some(tx) = respond_to {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+        }
+    });
+    output
+}
+
+fn configure_disabled_memory_with_storage(
+    actor: &mut SessionActor,
+    storage: crate::session::memory::MemoryStorage,
+) {
+    actor.memory.configured_storage = Some(storage);
+    actor.memory.disable();
+    actor.memory.backend_params = Some(crate::session::memory::MemoryBackendParams {
+        session_id: "test-memory-toggle".to_owned(),
+        embed_config: None,
+        embed_base_url: "http://localhost".to_owned(),
+        embed_api_key: None,
+        search_config: crate::config::MemorySearchConfig::default(),
+        watcher: None,
+        stale_claim_secs: 60,
+        search_source: "tool",
+        embedding_credentials: crate::session::memory::EndpointScopedCredentials::none(),
+    });
+}
+
+fn memory_tool_name_count(
+    definitions: &[xai_grok_tools::types::definition::ToolDefinition],
+    name: &str,
+) -> usize {
+    definitions
+        .iter()
+        .filter(|definition| definition.function.name == name)
+        .count()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn memory_toggle_on_registers_both_tools_and_preserves_custom_storage_paths() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use xai_grok_tools::implementations::memory::{
+                MEMORY_GET_TOOL_NAME, MEMORY_SEARCH_TOOL_NAME,
+            };
+
+            let temp = tempfile::TempDir::new().unwrap();
+            let global_dir = temp.path().join("custom-global");
+            let workspace_dir = temp.path().join("custom-workspace").join("nested");
+            let storage = crate::session::memory::MemoryStorage::with_paths(
+                global_dir.clone(),
+                workspace_dir.clone(),
+            );
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+            let (mut actor, event_rx) = create_test_actor_with_memory_and_events(
+                0,
+                100_000,
+                85,
+                gateway_tx,
+                persistence_tx,
+                None,
+            )
+            .await;
+            let output = spawn_replay_slash_output_drain(event_rx);
+            configure_disabled_memory_with_storage(&mut actor, storage);
+            let actor = Arc::new(actor);
+
+            actor
+                .execute_builtin_slash_command(BuiltinAction::MemoryToggle { enabled: true })
+                .await
+                .unwrap();
+
+            assert!(actor.memory.is_enabled());
+            assert!(actor.memory.search_counter.borrow().is_some());
+            let active = actor.memory.storage().expect("memory must be active");
+            assert_eq!(active.global_dir(), global_dir.as_path());
+            assert_eq!(active.workspace_dir(), workspace_dir.as_path());
+            let bridge = actor.agent.borrow().tool_bridge().clone();
+            let definitions = bridge.tool_definitions().await;
+            assert_eq!(
+                memory_tool_name_count(&definitions, MEMORY_SEARCH_TOOL_NAME),
+                1
+            );
+            assert_eq!(
+                memory_tool_name_count(&definitions, MEMORY_GET_TOOL_NAME),
+                1
+            );
+            let output = output.lock().unwrap().join("\n");
+            assert!(output.contains("Memory enabled for this session."));
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn memory_toggle_on_rolls_back_new_search_when_get_registration_fails() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use xai_grok_tools::implementations::memory::{
+                MEMORY_GET_TOOL_NAME, MEMORY_SEARCH_TOOL_NAME,
+            };
+
+            let temp = tempfile::TempDir::new().unwrap();
+            let storage = crate::session::memory::MemoryStorage::with_paths(
+                temp.path().join("custom-global"),
+                temp.path().join("custom-workspace"),
+            );
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+            let (mut actor, event_rx) = create_test_actor_with_memory_and_events(
+                0,
+                100_000,
+                85,
+                gateway_tx,
+                persistence_tx,
+                None,
+            )
+            .await;
+            let output = spawn_replay_slash_output_drain(event_rx);
+            configure_disabled_memory_with_storage(&mut actor, storage);
+            let actor = Arc::new(actor);
+            let bridge = actor.agent.borrow().tool_bridge().clone();
+            bridge
+                .register_mcp_tools(
+                    MEMORY_GET_TOOL_NAME.to_owned(),
+                    xai_grok_tools::implementations::memory::get_tool::MemoryGetImpl,
+                    None,
+                )
+                .await
+                .unwrap();
+
+            actor
+                .execute_builtin_slash_command(BuiltinAction::MemoryToggle { enabled: true })
+                .await
+                .unwrap();
+
+            assert!(!actor.memory.is_enabled());
+            assert!(actor.memory.search_counter.borrow().is_none());
+            let definitions = bridge.tool_definitions().await;
+            assert_eq!(
+                memory_tool_name_count(&definitions, MEMORY_SEARCH_TOOL_NAME),
+                0,
+                "newly-added memory_search must be rolled back"
+            );
+            assert_eq!(
+                memory_tool_name_count(&definitions, MEMORY_GET_TOOL_NAME),
+                1,
+                "pre-existing memory_get must remain registered exactly once"
+            );
+            let output = output.lock().unwrap().join("\n");
+            assert!(output.contains("Memory could not be enabled:"));
+            assert!(!output.contains("Memory enabled for this session."));
         })
         .await;
 }

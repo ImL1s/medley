@@ -1,4 +1,6 @@
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,6 +12,7 @@ use crate::remote::RemoteSync;
 use crate::sampling::Client as OaiCompatClient;
 use crate::sampling::ConversationItem;
 use crate::session::export::ExportedMetadata;
+use xai_grok_shell_base::util::anchored_directory::AnchoredDirectory;
 use xai_grok_workspace::session::file_state::RewindPoint;
 
 use crate::session::signals::SessionSignals;
@@ -27,6 +30,147 @@ use crate::extensions::notification::{
 };
 use crate::session::info::Info;
 use tokio::sync::{mpsc, watch};
+
+#[cfg(test)]
+struct PublishFreshAckTestHook {
+    entered_tx: tokio::sync::oneshot::Sender<()>,
+    release_rx: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+fn publish_fresh_ack_test_hooks()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, PublishFreshAckTestHook>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, PublishFreshAckTestHook>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) struct PublishFreshAckTestController {
+    session_id: String,
+    entered_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+    release_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[cfg(test)]
+impl PublishFreshAckTestController {
+    pub(crate) async fn wait_until_entered(&mut self) {
+        self.entered_rx
+            .take()
+            .expect("publish-fresh acknowledgement hook may be entered only once")
+            .await
+            .expect(
+                "persistence actor exited before reaching the publish-fresh acknowledgement hook",
+            );
+    }
+
+    pub(crate) fn release(&mut self) {
+        self.release_tx
+            .take()
+            .expect("publish-fresh acknowledgement hook may be released only once")
+            .send(())
+            .expect("persistence actor exited before publish-fresh acknowledgement hook release");
+    }
+}
+
+#[cfg(test)]
+impl Drop for PublishFreshAckTestController {
+    fn drop(&mut self) {
+        publish_fresh_ack_test_hooks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.session_id);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_publish_fresh_ack_test_hook(
+    session_id: &str,
+) -> PublishFreshAckTestController {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let previous = publish_fresh_ack_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            session_id.to_owned(),
+            PublishFreshAckTestHook {
+                entered_tx,
+                release_rx,
+            },
+        );
+    assert!(
+        previous.is_none(),
+        "only one publish-fresh acknowledgement hook may be installed per session id"
+    );
+    PublishFreshAckTestController {
+        session_id: session_id.to_owned(),
+        entered_rx: Some(entered_rx),
+        release_tx: Some(release_tx),
+    }
+}
+
+#[cfg(test)]
+async fn block_publish_fresh_ack_test_hook(session_id: &str) {
+    let hook = publish_fresh_ack_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(session_id);
+    let Some(hook) = hook else {
+        return;
+    };
+    let _ = hook.entered_tx.send(());
+    let _ = hook.release_rx.await;
+}
+
+#[cfg(test)]
+fn fresh_lease_transition_failure_test_hooks()
+-> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static HOOKS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+#[cfg(test)]
+struct FreshLeaseTransitionFailureTestGuard {
+    session_id: String,
+}
+
+#[cfg(test)]
+impl Drop for FreshLeaseTransitionFailureTestGuard {
+    fn drop(&mut self) {
+        fresh_lease_transition_failure_test_hooks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.session_id);
+    }
+}
+
+#[cfg(test)]
+fn install_fresh_lease_transition_failure_test_hook(
+    session_id: &str,
+) -> FreshLeaseTransitionFailureTestGuard {
+    let inserted = fresh_lease_transition_failure_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(session_id.to_owned());
+    assert!(
+        inserted,
+        "only one lease transition failure hook may be installed per session id"
+    );
+    FreshLeaseTransitionFailureTestGuard {
+        session_id: session_id.to_owned(),
+    }
+}
+
+#[cfg(test)]
+fn take_fresh_lease_transition_failure_test_hook(session_id: &str) -> bool {
+    fresh_lease_transition_failure_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(session_id)
+}
 
 /// Current chat history format version.
 /// - Version 0: Legacy ChatRequestMessage format (default for old sessions)
@@ -419,6 +563,20 @@ pub enum PersistenceMsg {
     /// or clears (`None`, on conversation rewind) the previous one in
     /// `summary.json`.
     LastTurnSummary(Option<(String, String)>),
+    /// Delete a provisional fresh session and stop without flushing or
+    /// remote writeback. Used only when `/new` fails its final auth seal.
+    AbortFreshAndDelete {
+        publication_gate: crate::session::SessionPublicationGate,
+        respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
+    },
+    /// Durably prepare a provisional fresh session for publication, then release
+    /// its cross-process id claim when the supplied gate becomes published. The
+    /// acknowledgement confirms all pending state and existing session files are
+    /// durable and that the actor has armed the gate; it does not release the claim.
+    PublishFresh {
+        publication_gate: crate::session::SessionPublicationGate,
+        respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
+    },
     /// Enable remote writeback for a session created `Local` before remote
     /// settings resolved (non-blocking startup); backfills its local history.
     UpgradeToWriteback {
@@ -446,6 +604,10 @@ pub use xai_grok_shared::session::session_dir;
 type RelocationResult<T> = crate::session::storage::relocation::Result<T>;
 type SummaryReader = fn(&Path) -> RelocationResult<Summary>;
 
+/// Presence of this file keeps a freshly-created session out of every local
+/// discovery path until the final, synchronous publication commit.
+pub(crate) const UNPUBLISHED_SESSION_MARKER: &str = ".unpublished";
+
 fn storage_view(sessions_root: &Path) -> RelocationResult<RelocationView> {
     RelocationView::load_for_sessions_root(sessions_root)
 }
@@ -466,7 +628,11 @@ pub fn session_exists_for_cwd(session_id: &str, cwd: &str) -> bool {
 /// the resume/restore resolution path; `find_session_dir_by_id` intentionally
 /// stays dir-only for non-resume compatibility.
 fn is_persisted_session_dir(session_path: &Path) -> bool {
-    session_path.join("summary.json").is_file()
+    !has_unpublished_session_marker(session_path) && session_path.join("summary.json").is_file()
+}
+
+fn has_unpublished_session_marker(session_dir: &Path) -> bool {
+    std::fs::symlink_metadata(session_dir.join(UNPUBLISHED_SESSION_MARKER)).is_ok()
 }
 
 /// Inner implementation of `session_exists_for_cwd` with an injectable root.
@@ -600,6 +766,9 @@ fn find_local_child_for_remote_in_root(
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
+            continue;
+        }
+        if has_unpublished_session_marker(&path) {
             continue;
         }
         let summary_path = path.join("summary.json");
@@ -1145,10 +1314,20 @@ mod is_hidden_tests {
         let back: Summary = serde_json::from_str(&json).unwrap();
         assert_eq!(back.reasoning_effort, None);
 
-        s.reasoning_effort = Some(ReasoningEffort::Xhigh);
-        let json = serde_json::to_string(&s).unwrap();
-        let back: Summary = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.reasoning_effort, Some(ReasoningEffort::Xhigh));
+        for (effort, serialized) in [
+            (ReasoningEffort::Xhigh, "xhigh"),
+            (ReasoningEffort::Max, "max"),
+            (ReasoningEffort::Ultra, "ultra"),
+        ] {
+            s.reasoning_effort = Some(effort);
+            let json = serde_json::to_string(&s).unwrap();
+            assert!(
+                json.contains(&format!(r#""reasoning_effort":"{serialized}""#)),
+                "{effort:?} must serialize as {serialized}: {json}"
+            );
+            let back: Summary = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.reasoning_effort, Some(effort));
+        }
     }
 
     #[test]
@@ -1567,9 +1746,12 @@ pub struct PersistenceHandle {
     pub tx: mpsc::UnboundedSender<PersistenceMsg>,
     noop: bool,
     disk_full_rx: watch::Receiver<bool>,
+    fresh_publication: Option<FreshPublication>,
 }
 
-fn actor_channel() -> (
+fn actor_channel(
+    fresh_publication: Option<FreshPublication>,
+) -> (
     PersistenceHandle,
     mpsc::UnboundedReceiver<PersistenceMsg>,
     mpsc::WeakUnboundedSender<PersistenceMsg>,
@@ -1582,6 +1764,7 @@ fn actor_channel() -> (
         tx,
         noop: false,
         disk_full_rx,
+        fresh_publication,
     };
     (handle, rx, weak, disk_full_tx)
 }
@@ -1630,6 +1813,7 @@ impl PersistenceHandle {
             tx,
             noop: false,
             disk_full_rx,
+            fresh_publication: None,
         }
     }
 
@@ -1639,6 +1823,7 @@ impl PersistenceHandle {
             tx,
             noop: true,
             disk_full_rx: watch::channel(false).1,
+            fresh_publication: None,
         }
     }
 
@@ -1653,6 +1838,84 @@ impl PersistenceHandle {
 
     pub(crate) fn subscribe_disk_full(&self) -> watch::Receiver<bool> {
         self.disk_full_rx.clone()
+    }
+
+    pub(crate) fn fresh_publication(&self) -> Option<FreshPublication> {
+        self.fresh_publication.clone()
+    }
+
+    pub(crate) fn physical_session_dir(&self, info: &Info) -> PathBuf {
+        self.fresh_publication
+            .as_ref()
+            .map(FreshPublication::physical_path)
+            .unwrap_or_else(|| session_dir(info))
+    }
+
+    /// Abort a provisional fresh session, wait for gate-tracked session
+    /// threads to exit, delete local storage, and wait until the persistence
+    /// actor has stopped. No buffered state is flushed.
+    pub(crate) fn request_abort_fresh_and_delete(
+        tx: &mpsc::UnboundedSender<PersistenceMsg>,
+        publication_gate: crate::session::SessionPublicationGate,
+    ) -> io::Result<tokio::sync::oneshot::Receiver<io::Result<()>>> {
+        // Wake an actor that has acknowledged PublishFresh and is deliberately
+        // quiescent awaiting this gate before it can process the abort message.
+        publication_gate.abort();
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        tx.send(PersistenceMsg::AbortFreshAndDelete {
+            publication_gate,
+            respond_to,
+        })
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "session persistence actor stopped before provisional abort",
+            )
+        })?;
+        Ok(response)
+    }
+
+    /// Abort a provisional fresh session, wait for gate-tracked session
+    /// threads to exit, delete local storage, and wait until the persistence
+    /// actor has stopped. No buffered state is flushed.
+    pub(crate) async fn abort_fresh_and_delete(
+        tx: &mpsc::UnboundedSender<PersistenceMsg>,
+        publication_gate: crate::session::SessionPublicationGate,
+    ) -> io::Result<()> {
+        let response = Self::request_abort_fresh_and_delete(tx, publication_gate)?;
+        response.await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "session persistence actor stopped before provisional abort acknowledgement",
+            )
+        })?
+    }
+
+    /// Durably prepare and arm publication of a provisional fresh session.
+    /// A successful acknowledgement is a strict barrier: pending state has been
+    /// drained and all existing session files and directory entries have been
+    /// synced. The id claim remains held until the gate becomes published.
+    pub(crate) async fn publish_fresh(
+        tx: &mpsc::UnboundedSender<PersistenceMsg>,
+        publication_gate: crate::session::SessionPublicationGate,
+    ) -> io::Result<()> {
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        tx.send(PersistenceMsg::PublishFresh {
+            publication_gate,
+            respond_to,
+        })
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "session persistence actor stopped before provisional publication",
+            )
+        })?;
+        response.await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "session persistence actor stopped before provisional publication acknowledgement",
+            )
+        })?
     }
 
     /// Append after older buffered updates and wait for the durable barrier.
@@ -1700,6 +1963,10 @@ enum PendingAppendOutcome {
 struct SessionPersistence {
     info: Info,
     storage: Arc<dyn StorageAdapter>,
+    /// Shared visibility lease retained for the lifetime of a loaded actor so
+    /// repair/delete/import exclusive operations cannot replace its files
+    /// while it appends.
+    _published_session_lease: Option<SessionIdLock>,
     /// Pending ACP notification for merging consecutive text chunks
     pending_notification: Option<acp::SessionNotification>,
     rx: mpsc::UnboundedReceiver<PersistenceMsg>,
@@ -1707,6 +1974,15 @@ struct SessionPersistence {
     /// True only for sessions created this run (not resumed); gates the
     /// writeback backfill so a resumed, already-synced session isn't re-sent.
     created_fresh: bool,
+    /// Held from fresh storage initialization through checked publication or
+    /// abort so another process cannot load provisional on-disk state.
+    fresh_claim: Option<FreshSessionClaim>,
+    /// Armed by the checked `PublishFresh` handshake. Terminal abort clears
+    /// the waiter but deliberately retains `fresh_claim` for locked cleanup.
+    pending_publication_gate: Option<crate::session::SessionPublicationGate>,
+    /// Terminal abort is fail-closed: once observed, a later message cannot
+    /// re-arm publication with a different gate while cleanup is pending.
+    fresh_publication_aborted: bool,
     /// WebSocket-based relay sync for real-time session sharing.
     /// This streams updates to the relay backend in addition to local persistence.
     relay_sync: Option<crate::relay::RelaySync>,
@@ -1870,6 +2146,7 @@ impl SessionPersistence {
             session_id: self.info.id.clone(),
             update: XaiSessionUpdate::RetryState(RetryState::Failed {
                 error_type: DISK_FULL_ERROR_TYPE.to_string(),
+                http_status: None,
                 message: DISK_FULL_USER_MESSAGE.to_string(),
             }),
             meta: None,
@@ -2049,19 +2326,218 @@ impl SessionPersistence {
         }
     }
 
+    /// Once the publication gate aborts, the actor may only consume the
+    /// matching cleanup request. Every earlier queued mutation is discarded so
+    /// provisional storage and sync backends cannot observe post-seal work.
+    async fn await_fresh_abort_cleanup(&mut self) {
+        self.fresh_publication_aborted = true;
+        self.pending_notification = None;
+        self.remote_sync = None;
+        self.relay_sync = None;
+
+        while let Some(msg) = self.rx.recv().await {
+            let PersistenceMsg::AbortFreshAndDelete {
+                publication_gate,
+                respond_to,
+            } = msg
+            else {
+                continue;
+            };
+
+            publication_gate.abort();
+            publication_gate.wait_until_session_threads_exit().await;
+            let is_provisional = self.created_fresh
+                && self
+                    .fresh_claim
+                    .as_ref()
+                    .is_some_and(|claim| !claim.publication.is_committed());
+            if self.created_fresh
+                && self
+                    .fresh_claim
+                    .as_ref()
+                    .is_some_and(|claim| claim.publication.is_committed())
+                && let Some(claim) = self.fresh_claim.take()
+            {
+                match claim.into_published_lease() {
+                    Ok(lease) => self._published_session_lease = Some(lease),
+                    Err(failure) => {
+                        tracing::error!(
+                            session_id = %self.info.id,
+                            error = %failure.error,
+                            "failed retaining committed session lease after terminal abort"
+                        );
+                        self.fresh_claim = Some(failure.claim);
+                    }
+                }
+            }
+            let result = if is_provisional {
+                self.storage.delete_session(&self.info).await
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "refusing to delete a published or resumed session through provisional abort",
+                ))
+            };
+            if result.is_ok() {
+                crate::session::storage::search::notify_session_updated(
+                    &self.info.id.to_string(),
+                    &self.info.cwd,
+                );
+            }
+            let _ = respond_to.send(result);
+            return;
+        }
+    }
+
     async fn run(mut self) {
         // Persistence traffic counts as worktree activity; debounced so
         // long-resident sessions (leader/remote, active for days without a
         // re-open) stay out of gc expiry without per-message DB writes.
         // The constructors fire the t=0 touch, so this starts at now().
         let mut last_worktree_touch = std::time::Instant::now();
-        while let Some(msg) = self.rx.recv().await {
-            if last_worktree_touch.elapsed() >= WORKTREE_TOUCH_INTERVAL {
+        loop {
+            // Once PublishFresh is acknowledged, no later persistence message
+            // may mutate the staged tree before the synchronous namespace
+            // commit and path rebind. Abort wakes this wait by aborting gate.
+            if let Some(publication_gate) = self.pending_publication_gate.take() {
+                let published = publication_gate.wait_until_published().await;
+                if published {
+                    if let Some(claim) = self.fresh_claim.take() {
+                        if !claim.publication.is_committed() {
+                            tracing::error!(
+                                session_id = %self.info.id,
+                                "fresh publication gate completed before durable storage publication"
+                            );
+                            drop(claim);
+                            self.fresh_publication_aborted = true;
+                            return;
+                        } else {
+                            match claim.into_published_lease() {
+                                Ok(lease) => self._published_session_lease = Some(lease),
+                                Err(failure) => {
+                                    tracing::error!(
+                                        session_id = %self.info.id,
+                                        error = %failure.error,
+                                        "failed downgrading fresh publication lease; retaining exclusive namespace lease"
+                                    );
+                                    self.fresh_claim = Some(failure.claim);
+                                }
+                            }
+                            spawn_worktree_touch(&self.info);
+                        }
+                    } else {
+                        tracing::error!(
+                            session_id = %self.info.id,
+                            "fresh publication gate completed without an id claim"
+                        );
+                    }
+                } else {
+                    self.await_fresh_abort_cleanup().await;
+                    return;
+                }
+                continue;
+            }
+            let Some(msg) = self.rx.recv().await else {
+                break;
+            };
+            if self.fresh_claim.is_none()
+                && last_worktree_touch.elapsed() >= WORKTREE_TOUCH_INTERVAL
+            {
                 last_worktree_touch = std::time::Instant::now();
                 // Detached on purpose: opportunistic refresh, no ordering need.
                 spawn_worktree_touch(&self.info);
             }
             match msg {
+                PersistenceMsg::AbortFreshAndDelete {
+                    publication_gate,
+                    respond_to,
+                } => {
+                    let is_provisional = self.created_fresh
+                        && self
+                            .fresh_claim
+                            .as_ref()
+                            .is_some_and(|claim| !claim.publication.is_committed());
+                    if self.created_fresh
+                        && self
+                            .fresh_claim
+                            .as_ref()
+                            .is_some_and(|claim| claim.publication.is_committed())
+                        && let Some(claim) = self.fresh_claim.take()
+                    {
+                        match claim.into_published_lease() {
+                            Ok(lease) => self._published_session_lease = Some(lease),
+                            Err(failure) => {
+                                tracing::error!(
+                                    session_id = %self.info.id,
+                                    error = %failure.error,
+                                    "failed retaining committed session lease after rejected abort"
+                                );
+                                self.fresh_claim = Some(failure.claim);
+                            }
+                        }
+                    }
+                    if is_provisional {
+                        self.fresh_publication_aborted = true;
+                        publication_gate.abort();
+                        publication_gate.wait_until_session_threads_exit().await;
+                        self.pending_publication_gate = None;
+                        self.pending_notification = None;
+                        self.remote_sync = None;
+                        self.relay_sync = None;
+                    }
+                    let result = if is_provisional {
+                        self.storage.delete_session(&self.info).await
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "refusing to delete a published or resumed session through provisional abort",
+                        ))
+                    };
+                    if result.is_ok() {
+                        crate::session::storage::search::notify_session_updated(
+                            &self.info.id.to_string(),
+                            &self.info.cwd,
+                        );
+                    }
+                    let _ = respond_to.send(result);
+                    if is_provisional {
+                        return;
+                    }
+                }
+                PersistenceMsg::PublishFresh {
+                    publication_gate,
+                    respond_to,
+                } => {
+                    let eligibility = if !self.created_fresh
+                        || self.fresh_claim.is_none()
+                        || self.fresh_publication_aborted
+                    {
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "fresh session is published, aborted, or has no publication claim",
+                        ))
+                    } else if self.pending_publication_gate.is_some() {
+                        Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "fresh session publication is already armed",
+                        ))
+                    } else {
+                        Ok(())
+                    };
+                    let result = match eligibility {
+                        Ok(()) => match self.flush_pending().await {
+                            Ok(()) => self.storage.sync_session_files(&self.info).await,
+                            Err(error) => Err(error),
+                        },
+                        Err(error) => Err(error),
+                    };
+                    if result.is_ok() {
+                        self.pending_publication_gate = Some(publication_gate);
+                    }
+                    #[cfg(test)]
+                    block_publish_fresh_ack_test_hook(&self.info.id.to_string()).await;
+                    let _ = respond_to.send(result);
+                }
                 PersistenceMsg::UpgradeToWriteback { auth_manager } => {
                     self.upgrade_to_writeback(auth_manager).await;
                 }
@@ -2663,33 +3139,151 @@ fn init_remote_sync(
     }
 }
 
-/// Pull a session from the backend if not found locally. Returns the pulled
-/// session's [`Info`] (cwd may differ from caller's on different machines),
-/// or `None` if not found or on error.
-async fn try_pull_from_remote(info: &Info, client: &crate::remote::BackendClient) -> Option<Info> {
+struct PulledSession {
+    info: Info,
+    lifetime_lease: SessionIdLock,
+}
+
+/// Fetch, canonically claim, and marker-publish a remote session. Network I/O
+/// happens before any exclusive filesystem claim is taken.
+async fn try_pull_from_remote(
+    info: &Info,
+    client: &crate::remote::BackendClient,
+) -> io::Result<Option<PulledSession>> {
     // BackendClient resolves auth internally via its auth_manager.
-    client.auth_manager.as_ref()?;
+    if client.auth_manager.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "remote pull requires an authenticated backend client",
+        ));
+    }
 
     tracing::info!(session_id = %info.id, "Session not found locally, trying backend");
 
-    match crate::remote::pull_session_to_local(&info.id.0, client).await {
-        Ok(crate::remote::PullResult::Hydrated(pulled_info)) => {
-            tracing::info!(
-                session_id = %info.id,
-                pulled_cwd = %pulled_info.cwd,
-                "Pulled session from backend"
-            );
-            Some(pulled_info)
-        }
-        Ok(crate::remote::PullResult::NotFound) => {
+    let fetched = match crate::remote::pull::fetch_session(&info.id.0, client).await {
+        Ok(crate::remote::pull::FetchResult::Fetched(fetched)) => fetched,
+        Ok(crate::remote::pull::FetchResult::NotFound) => {
             tracing::debug!(session_id = %info.id, "Session not found on backend either");
-            None
+            return Ok(None);
         }
         Err(e) => {
             tracing::warn!(session_id = %info.id, error = %e, "Backend pull failed");
-            None
+            return Err(match e {
+                error @ (crate::remote::pull::PullError::SessionIdMismatch { .. }
+                | crate::remote::pull::PullError::MalformedSession { .. }) => {
+                    io::Error::new(io::ErrorKind::InvalidData, error)
+                }
+                error @ crate::remote::pull::PullError::Backend(_) => io::Error::other(error),
+            });
+        }
+    };
+
+    let sessions_root = grok_home().join("sessions");
+    let claim = acquire_canonical_session_claim(
+        &sessions_root,
+        &info.id.to_string(),
+        Some(&fetched.info().cwd),
+    )
+    .await
+    .inspect_err(|error| {
+        tracing::warn!(session_id = %info.id, %error, "Could not claim local session hydration");
+    })?;
+
+    match claim {
+        CanonicalSessionClaim::Existing(existing) => {
+            validate_existing_remote_pull(&sessions_root, &info.id.to_string(), existing).map(Some)
+        }
+        CanonicalSessionClaim::Vacant(mut writer) => {
+            let pulled_info = fetched.info().clone();
+            let session_dir = sessions_root
+                .join(crate::util::grok_home::encode_cwd_dirname(&pulled_info.cwd))
+                .join(info.id.to_string());
+            let stage = writer
+                .begin_new(session_dir)
+                .inspect_err(|error| {
+                    tracing::warn!(session_id = %info.id, %error, "Could not begin local session hydration");
+                })?
+                .to_path_buf();
+            let num_messages = crate::remote::pull::hydrate::write_to_dir(&stage, &fetched)
+                .and_then(|count| {
+                    crate::remote::pull::hydrate::sync_tree_durable(&stage).map(|()| count)
+                })
+                .map_err(|error| {
+                    tracing::warn!(session_id = %info.id, %error, "Backend session hydration failed");
+                    io::Error::other(error)
+                })?;
+            match writer.publish_new_classified() {
+                Ok(()) => {}
+                Err(PublishedSessionFinalizeError::NotCommitted(error)) => {
+                    tracing::warn!(session_id = %info.id, %error, "Backend session publication did not commit");
+                    return Err(error);
+                }
+                Err(PublishedSessionFinalizeError::CommittedDurability(error)) => {
+                    tracing::warn!(session_id = %info.id, %error, "Backend session publication committed but durability acknowledgement failed");
+                }
+                Err(PublishedSessionFinalizeError::CommittedIdentity(error)) => {
+                    tracing::error!(session_id = %info.id, %error, "Backend session publication committed but canonical identity verification failed");
+                    return Err(error);
+                }
+            }
+            let published = writer
+                .into_lifetime_read()
+                .inspect_err(|error| {
+                    tracing::warn!(session_id = %info.id, %error, "Backend session lease handoff failed");
+                })?;
+            tracing::info!(
+                session_id = %info.id,
+                pulled_cwd = %pulled_info.cwd,
+                num_messages,
+                "Pulled session from backend"
+            );
+            Ok(Some(PulledSession {
+                info: pulled_info,
+                lifetime_lease: published.into_lifetime_lease(),
+            }))
         }
     }
+}
+
+fn validate_existing_remote_pull(
+    sessions_root: &Path,
+    requested_session_id: &str,
+    existing: PublishedSessionRead,
+) -> io::Result<PulledSession> {
+    let summary = existing.read_summary().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("canonical pulled session has invalid summary: {error}"),
+        )
+    })?;
+    if summary.info.id.to_string() != requested_session_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "canonical pulled session id mismatch: requested {requested_session_id}, found {}",
+                summary.info.id
+            ),
+        ));
+    }
+    let expected_path = sessions_root
+        .join(crate::util::grok_home::encode_cwd_dirname(
+            &summary.info.cwd,
+        ))
+        .join(requested_session_id);
+    if existing.path() != expected_path {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "canonical pulled session path mismatch for {requested_session_id}: expected {}, found {}",
+                expected_path.display(),
+                existing.path().display()
+            ),
+        ));
+    }
+    Ok(PulledSession {
+        info: summary.info,
+        lifetime_lease: existing.into_lifetime_lease(),
+    })
 }
 
 pub(crate) fn is_disk_full_io_error(e: &io::Error) -> bool {
@@ -2791,6 +3385,1664 @@ async fn touch_worktree_for_session(info: &Info) {
 /// Floor between activity-driven worktree touches from the persistence actor.
 const WORKTREE_TOUCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// Physical publication plan for one fresh session.
+///
+/// Before final auth/catalog sealing, every write is bound to `stage_session`,
+/// below the owner-only private namespace. `finalize` performs the single
+/// no-replace namespace commit and then atomically rebinds future writes.
+#[derive(Clone, Debug)]
+pub(crate) struct FreshPublication {
+    root_dir: PathBuf,
+    stage_container: PathBuf,
+    stage_session: PathBuf,
+    published_parent: PathBuf,
+    published_session: PathBuf,
+    stage_container_anchor: Arc<std::sync::Mutex<Option<AnchoredDirectory>>>,
+    stage_session_anchor: Arc<std::sync::Mutex<Option<AnchoredDirectory>>>,
+    published_parent_name: OsString,
+    session_name: OsString,
+    path_binding: crate::session::storage::jsonl::SessionPathBinding,
+    committed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FreshPublication {
+    pub(crate) fn physical_path(&self) -> PathBuf {
+        self.path_binding.path()
+    }
+
+    fn is_committed(&self) -> bool {
+        self.committed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn finalize(&self) -> Result<(), FreshPublicationFinalizeError> {
+        finalize_fresh_publication_sync(self)
+    }
+}
+
+/// Process-held ownership of the cross-process advisory lock for one fresh
+/// session id.
+///
+/// The lock file is deliberately reusable rather than deleted on drop. Its
+/// existence carries no state; only the OS lock does, so a crash releases the
+/// claim without leaving a tombstone that blocks a later retry.
+#[derive(Debug)]
+struct FreshSessionClaim {
+    session_id_lock: Option<SessionIdLock>,
+    publication: FreshPublication,
+    cleanup_armed: bool,
+}
+
+#[derive(Debug)]
+struct FreshLeaseTransitionError {
+    error: io::Error,
+    claim: FreshSessionClaim,
+}
+
+impl FreshSessionClaim {
+    fn disarm(mut self) {
+        self.cleanup_armed = false;
+    }
+
+    fn into_published_lease(self) -> Result<SessionIdLock, FreshLeaseTransitionError> {
+        #[cfg(test)]
+        if self
+            .publication
+            .published_session
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(take_fresh_lease_transition_failure_test_hook)
+        {
+            return self.into_published_lease_with(|lease| {
+                lease.transition_exclusive_to_lifetime_shared_with(|_| {
+                    Err(io::Error::other("injected shared-lock transition failure"))
+                })
+            });
+        }
+        self.into_published_lease_with(|lease| lease.transition_exclusive_to_lifetime_shared())
+    }
+
+    fn into_published_lease_with(
+        mut self,
+        transition: impl FnOnce(&mut SessionIdLock) -> io::Result<()>,
+    ) -> Result<SessionIdLock, FreshLeaseTransitionError> {
+        // Do not take the lease before downgrade succeeds. Return the entire
+        // claim on failure so the actor can restore it and retain the exclusive
+        // namespace lock instead of silently dropping its last owner.
+        if let Err(error) = transition(
+            self.session_id_lock
+                .as_mut()
+                .expect("fresh claim owns one session id lease"),
+        ) {
+            return Err(FreshLeaseTransitionError { error, claim: self });
+        }
+        self.cleanup_armed = false;
+        Ok(self
+            .session_id_lock
+            .take()
+            .expect("successfully downgraded fresh lease"))
+    }
+}
+
+impl Drop for FreshSessionClaim {
+    fn drop(&mut self) {
+        if !self.cleanup_armed {
+            return;
+        }
+        if self.publication.is_committed() {
+            return;
+        }
+        // Start cleanup from the retained stage-container handle rather than
+        // the diagnostic pathname. Dropping the child handle first also
+        // permits ancestor removal on Windows. Recursive child cleanup is
+        // still best-effort against hostile same-UID entry swaps; see #342.
+        self.publication
+            .stage_session_anchor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let stage_container = self
+            .publication
+            .stage_container_anchor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(stage_container) = stage_container
+            && let Err(error) = stage_container.remove_tree_self()
+        {
+            tracing::warn!(
+                path = %self.publication.stage_container.display(),
+                %error,
+                "failed to remove cancelled private fresh-session stage"
+            );
+        }
+    }
+}
+
+fn session_claim_lock_stem(session_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(session_id.as_bytes()))
+}
+
+pub(crate) fn session_stage_container_name(session_id: &str) -> OsString {
+    OsString::from(format!("session-{}", session_claim_lock_stem(session_id)))
+}
+
+fn session_claim_lock_name(session_id: &str) -> String {
+    format!("{}.namespace.lock", session_claim_lock_stem(session_id))
+}
+
+fn session_mutation_lock_name(session_id: &str) -> String {
+    format!("{}.mutation.lock", session_claim_lock_stem(session_id))
+}
+
+/// Cross-process ownership for one persisted session id.
+///
+/// Fresh creation and deletion take this exclusively. Loading and discovery
+/// take shared leases, so they can run together but cannot observe or mutate a
+/// provisional directory before publication releases the exclusive claim.
+#[derive(Debug)]
+pub(crate) struct SessionIdLock {
+    namespace: Option<std::fs::File>,
+    mutation: Option<std::fs::File>,
+}
+
+impl SessionIdLock {
+    fn transition_exclusive_to_lifetime_shared(&mut self) -> io::Result<()> {
+        self.transition_exclusive_to_lifetime_shared_with(FileExt::lock_shared)
+    }
+
+    fn transition_exclusive_to_lifetime_shared_with(
+        &mut self,
+        lock_shared: impl FnOnce(&std::fs::File) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.transition_exclusive_to_lifetime_shared_with_unlock(lock_shared, |namespace| {
+            FileExt::unlock(namespace)
+        })
+    }
+
+    fn transition_exclusive_to_lifetime_shared_with_unlock(
+        &mut self,
+        lock_shared: impl FnOnce(&std::fs::File) -> io::Result<()>,
+        unlock_namespace: impl FnOnce(&std::fs::File) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mutation = self.mutation.as_ref().expect("mutation lease");
+        // Windows LockFileEx does not convert overlapping modes on one handle;
+        // explicitly unlock before acquiring shared. Namespace remains held
+        // exclusively on every failure path.
+        FileExt::unlock(mutation)?;
+        lock_shared(mutation)?;
+        if let Some(namespace) = self.namespace.as_ref() {
+            unlock_namespace(namespace)?;
+        }
+        self.namespace.take();
+        Ok(())
+    }
+
+    fn retain_lifetime_shared(mut self) -> io::Result<Self> {
+        if let Some(namespace) = self.namespace.as_ref() {
+            FileExt::unlock(namespace)?;
+        }
+        self.namespace.take();
+        Ok(self)
+    }
+}
+
+/// A published session resolved while holding its per-id shared visibility lock.
+///
+/// Keep this value alive for the entire filesystem read.  Resolving a path and
+/// then dropping the lock would allow a concurrent delete/import to replace the
+/// directory between the visibility check and the actual I/O.
+#[derive(Debug)]
+pub(crate) struct PublishedSessionRead {
+    _session_id_lock: SessionIdLock,
+    session_dir: PathBuf,
+}
+
+impl PublishedSessionRead {
+    pub(crate) fn path(&self) -> &Path {
+        &self.session_dir
+    }
+
+    pub(crate) fn read_summary(&self) -> io::Result<Summary> {
+        read_summary_from_dir(&self.session_dir).map_err(io::Error::other)
+    }
+
+    fn into_lifetime_lease(self) -> SessionIdLock {
+        self._session_id_lock
+    }
+}
+
+/// Exclusive access to one session id, used by import and out-of-band repair.
+///
+/// New content is always written below the owner-only private staging namespace.
+/// The public namespace changes only at the anchored no-replace rename commit.
+#[derive(Debug)]
+struct PublishedSessionStage {
+    stage_container: PathBuf,
+    stage_session: PathBuf,
+    stage_container_anchor: Option<AnchoredDirectory>,
+    stage_session_anchor: Option<AnchoredDirectory>,
+    target_parent_name: OsString,
+    target_session_name: OsString,
+    target_session: PathBuf,
+}
+
+#[derive(Debug)]
+pub(crate) enum PublishedSessionFinalizeError {
+    NotCommitted(io::Error),
+    CommittedDurability(io::Error),
+    CommittedIdentity(io::Error),
+}
+
+impl std::fmt::Display for PublishedSessionFinalizeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotCommitted(error) => write!(formatter, "publication not committed: {error}"),
+            Self::CommittedDurability(error) => {
+                write!(
+                    formatter,
+                    "publication committed with durability failure: {error}"
+                )
+            }
+            Self::CommittedIdentity(error) => {
+                write!(
+                    formatter,
+                    "publication committed but canonical identity is unverified: {error}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for PublishedSessionFinalizeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NotCommitted(error)
+            | Self::CommittedDurability(error)
+            | Self::CommittedIdentity(error) => Some(error),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PublishedSessionWrite {
+    session_id_lock: Option<SessionIdLock>,
+    sessions_root: PathBuf,
+    session_id: String,
+    published_dir: Option<PathBuf>,
+    stage: Option<PublishedSessionStage>,
+}
+
+impl PublishedSessionWrite {
+    pub(crate) fn published_path(&self) -> Option<&Path> {
+        self.published_dir.as_deref()
+    }
+
+    pub(crate) fn read_summary(&self) -> io::Result<Option<Summary>> {
+        self.published_dir
+            .as_deref()
+            .map(read_summary_from_dir)
+            .transpose()
+            .map_err(io::Error::other)
+    }
+
+    fn into_lifetime_read(mut self) -> io::Result<PublishedSessionRead> {
+        let session_dir = self
+            .published_dir
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "session was not published"))?;
+        let mut session_id_lock = self
+            .session_id_lock
+            .take()
+            .expect("published writer owns one session id lease");
+        session_id_lock.transition_exclusive_to_lifetime_shared()?;
+        Ok(PublishedSessionRead {
+            _session_id_lock: session_id_lock,
+            session_dir,
+        })
+    }
+
+    pub(crate) fn begin_new(&mut self, session_dir: PathBuf) -> io::Result<&Path> {
+        if self.published_dir.is_some() || self.stage.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "session id is already present",
+            ));
+        }
+        let target_parent = session_dir.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session directory has no parent",
+            )
+        })?;
+        if target_parent.parent() != Some(self.sessions_root.as_path())
+            || session_dir.file_name() != Some(OsStr::new(&self.session_id))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session directory does not match the locked session id",
+            ));
+        }
+        // Any public namespace entry with this id, including a legacy marker-
+        // bearing directory under another cwd, is preserved and fails closed.
+        if public_session_id_namespace_present(&self.sessions_root, &self.session_id)?
+            || std::fs::symlink_metadata(&session_dir).is_ok()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "public session target already exists: {}",
+                    session_dir.display()
+                ),
+            ));
+        }
+
+        let root_dir = session_id_lock_root_for_sessions_root(&self.sessions_root)?;
+        let (staging_root, staging_root_anchor) =
+            ensure_private_staging_hierarchy_anchored(root_dir)?;
+        reclaim_abandoned_session_stages(&staging_root_anchor, &self.session_id)?;
+        let stage_container_name = session_stage_container_name(&self.session_id);
+        let mut stage_container_anchor =
+            Some(staging_root_anchor.create_child_dir(&stage_container_name)?);
+        if let Err(error) = stage_container_anchor
+            .as_ref()
+            .expect("new stage container")
+            .ensure_owner_only()
+        {
+            let _ = stage_container_anchor
+                .take()
+                .expect("new stage container")
+                .remove_tree_self();
+            return Err(error);
+        }
+        let stage_container = staging_root.join(&stage_container_name);
+        let target_session_name = OsString::from(self.session_id.as_str());
+        let stage_session_anchor = match stage_container_anchor
+            .as_ref()
+            .expect("new stage container")
+            .create_child_dir(&target_session_name)
+        {
+            Ok(session) => session,
+            Err(error) => {
+                let _ = stage_container_anchor
+                    .take()
+                    .expect("new stage container")
+                    .remove_tree_self();
+                return Err(error);
+            }
+        };
+        if let Err(error) = stage_session_anchor.ensure_owner_only() {
+            drop(stage_session_anchor);
+            let _ = stage_container_anchor
+                .take()
+                .expect("new stage container")
+                .remove_tree_self();
+            return Err(error);
+        }
+        let stage_session = stage_container.join(&target_session_name);
+        if let Err(error) = create_unpublished_session_marker(&stage_session_anchor) {
+            drop(stage_session_anchor);
+            let _ = stage_container_anchor
+                .take()
+                .expect("new stage container")
+                .remove_tree_self();
+            return Err(error);
+        }
+        self.stage = Some(PublishedSessionStage {
+            stage_container,
+            stage_session,
+            stage_container_anchor,
+            stage_session_anchor: Some(stage_session_anchor),
+            target_parent_name: target_parent
+                .file_name()
+                .expect("validated direct child parent")
+                .to_os_string(),
+            target_session_name,
+            target_session: session_dir,
+        });
+        Ok(&self.stage.as_ref().expect("stage assigned").stage_session)
+    }
+
+    pub(crate) fn publish_new(&mut self) -> io::Result<()> {
+        self.publish_new_classified().map_err(|error| match error {
+            PublishedSessionFinalizeError::NotCommitted(error)
+            | PublishedSessionFinalizeError::CommittedDurability(error)
+            | PublishedSessionFinalizeError::CommittedIdentity(error) => error,
+        })
+    }
+
+    pub(crate) fn publish_new_classified(&mut self) -> Result<(), PublishedSessionFinalizeError> {
+        self.publish_new_with(|sessions_root, published_parent| {
+            sync_directory(sessions_root)?;
+            sync_directory(published_parent)
+        })
+    }
+
+    fn publish_new_with(
+        &mut self,
+        sync_after_commit: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    ) -> Result<(), PublishedSessionFinalizeError> {
+        let mut stage = self.stage.take().ok_or_else(|| {
+            PublishedSessionFinalizeError::NotCommitted(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no private staged session to publish",
+            ))
+        })?;
+        let summary = match read_valid_staged_summary(&stage.stage_session) {
+            Ok(summary) => summary,
+            Err(error) => {
+                self.stage = Some(stage);
+                return Err(PublishedSessionFinalizeError::NotCommitted(error));
+            }
+        };
+        if published_path_occupied(&stage.target_session) {
+            self.stage = Some(stage);
+            return Err(PublishedSessionFinalizeError::NotCommitted(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "no-replace publication collided",
+            )));
+        }
+        let stage_session_anchor = stage
+            .stage_session_anchor
+            .as_ref()
+            .expect("private stage session anchor");
+        if let Err(error) = stage_session_anchor
+            .remove_marker(OsStr::new(UNPUBLISHED_SESSION_MARKER))
+            .and_then(|()| stage_session_anchor.sync())
+        {
+            self.stage = Some(stage);
+            return Err(PublishedSessionFinalizeError::NotCommitted(error));
+        }
+
+        let root_dir = match session_id_lock_root_for_sessions_root(&self.sessions_root) {
+            Ok(root_dir) => root_dir,
+            Err(error) => {
+                self.stage = Some(stage);
+                return Err(PublishedSessionFinalizeError::NotCommitted(error));
+            }
+        };
+        let root_anchor = match AnchoredDirectory::open_root(root_dir) {
+            Ok(root) => root,
+            Err(error) => {
+                self.stage = Some(stage);
+                return Err(PublishedSessionFinalizeError::NotCommitted(error));
+            }
+        };
+        let sessions_anchor =
+            match open_or_create_anchored_child(&root_anchor, OsStr::new("sessions")) {
+                Ok(sessions) => sessions,
+                Err(error) => {
+                    self.stage = Some(stage);
+                    return Err(PublishedSessionFinalizeError::NotCommitted(error));
+                }
+            };
+
+        let dest_parent_exists = matches!(
+            stage.target_session.parent().map(Path::try_exists),
+            Some(Ok(true))
+        );
+        let (published_parent_anchor, published_session_anchor) = match sessions_anchor
+            .open_child_dir(&stage.target_parent_name)
+        {
+            Ok(parent) => {
+                if let Err(error) = validate_existing_cwd_metadata(
+                    &parent,
+                    &stage.target_parent_name,
+                    &summary.info.cwd,
+                ) {
+                    self.stage = Some(stage);
+                    return Err(PublishedSessionFinalizeError::NotCommitted(error));
+                }
+                let stage_session = stage
+                    .stage_session_anchor
+                    .take()
+                    .expect("private stage session anchor");
+                let child = match stage_session
+                    .try_rename_self_no_replace(&parent, &stage.target_session_name)
+                {
+                    Ok(child) => child,
+                    Err(failure) => {
+                        stage.stage_session_anchor = Some(failure.source);
+                        self.stage = Some(stage);
+                        return Err(PublishedSessionFinalizeError::NotCommitted(failure.error));
+                    }
+                };
+                if let Some(container) = stage.stage_container_anchor.take()
+                    && let Err(error) = container.remove_tree_self()
+                {
+                    tracing::warn!(%error, "failed to remove committed private stage container");
+                }
+                (parent, child)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound || !dest_parent_exists => {
+                let container = stage
+                    .stage_container_anchor
+                    .take()
+                    .expect("private stage container anchor");
+                if let Err(error) = write_staged_cwd_metadata_if_needed(
+                    &container,
+                    &stage.target_parent_name,
+                    &summary.info.cwd,
+                ) {
+                    stage.stage_container_anchor = Some(container);
+                    self.stage = Some(stage);
+                    return Err(PublishedSessionFinalizeError::NotCommitted(error));
+                }
+                // Windows cannot rename the ancestor while its child handle
+                // remains open. Drop it, then recover it from the returned
+                // container if a concurrent winner creates the parent.
+                drop(stage.stage_session_anchor.take());
+                match container
+                    .try_rename_self_no_replace(&sessions_anchor, &stage.target_parent_name)
+                {
+                    Ok(published_parent) => {
+                        self.published_dir = Some(stage.target_session.clone());
+                        let child = published_parent
+                            .open_child_dir(&stage.target_session_name)
+                            .map_err(PublishedSessionFinalizeError::CommittedIdentity)?;
+                        (published_parent, child)
+                    }
+                    Err(failure) if failure.error.kind() == io::ErrorKind::AlreadyExists => {
+                        let container = failure.source;
+                        let child = match container.open_child_dir(&stage.target_session_name) {
+                            Ok(child) => child,
+                            Err(error) => {
+                                stage.stage_container_anchor = Some(container);
+                                self.stage = Some(stage);
+                                return Err(PublishedSessionFinalizeError::NotCommitted(error));
+                            }
+                        };
+                        let parent = match sessions_anchor.open_child_dir(&stage.target_parent_name)
+                        {
+                            Ok(parent) => parent,
+                            Err(error) => {
+                                stage.stage_session_anchor = Some(child);
+                                stage.stage_container_anchor = Some(container);
+                                self.stage = Some(stage);
+                                return Err(PublishedSessionFinalizeError::NotCommitted(error));
+                            }
+                        };
+                        if let Err(error) = validate_existing_cwd_metadata(
+                            &parent,
+                            &stage.target_parent_name,
+                            &summary.info.cwd,
+                        ) {
+                            stage.stage_session_anchor = Some(child);
+                            stage.stage_container_anchor = Some(container);
+                            self.stage = Some(stage);
+                            return Err(PublishedSessionFinalizeError::NotCommitted(error));
+                        }
+                        let child = match child
+                            .try_rename_self_no_replace(&parent, &stage.target_session_name)
+                        {
+                            Ok(child) => child,
+                            Err(failure) => {
+                                stage.stage_session_anchor = Some(failure.source);
+                                stage.stage_container_anchor = Some(container);
+                                self.stage = Some(stage);
+                                return Err(PublishedSessionFinalizeError::NotCommitted(
+                                    failure.error,
+                                ));
+                            }
+                        };
+                        if let Err(error) = container.remove_tree_self() {
+                            tracing::warn!(%error, "failed to remove committed private stage container");
+                        }
+                        (parent, child)
+                    }
+                    Err(failure) => {
+                        stage.stage_container_anchor = Some(failure.source);
+                        self.stage = Some(stage);
+                        return Err(PublishedSessionFinalizeError::NotCommitted(failure.error));
+                    }
+                }
+            }
+            Err(error) => {
+                self.stage = Some(stage);
+                return Err(PublishedSessionFinalizeError::NotCommitted(error));
+            }
+        };
+
+        self.published_dir = Some(stage.target_session);
+        verify_canonical_publication_identity(
+            root_dir,
+            &root_anchor,
+            &sessions_anchor,
+            &stage.target_parent_name,
+            &published_parent_anchor,
+            &stage.target_session_name,
+            &published_session_anchor,
+        )
+        .map_err(PublishedSessionFinalizeError::CommittedIdentity)?;
+        sync_after_commit(
+            &self.sessions_root,
+            self.published_dir
+                .as_ref()
+                .expect("published path assigned")
+                .parent()
+                .expect("published session has parent"),
+        )
+        .and_then(|()| published_session_anchor.sync())
+        .and_then(|()| published_parent_anchor.sync())
+        .and_then(|()| sessions_anchor.sync())
+        .map_err(PublishedSessionFinalizeError::CommittedDurability)
+    }
+}
+
+impl Drop for PublishedSessionWrite {
+    fn drop(&mut self) {
+        if let Some(mut stage) = self.stage.take() {
+            // Start cleanup from the retained stage-container handle rather
+            // than the diagnostic pathname. Recursive child cleanup is still
+            // best-effort against hostile same-UID entry swaps; see #342.
+            drop(stage.stage_session_anchor.take());
+            if let Some(stage_container) = stage.stage_container_anchor.take()
+                && let Err(error) = stage_container.remove_tree_self()
+            {
+                tracing::warn!(
+                    path = %stage.stage_container.display(),
+                    %error,
+                    "failed to remove aborted private session stage"
+                );
+            }
+        }
+    }
+}
+
+fn open_session_id_lock_directory(root_dir: &Path) -> io::Result<AnchoredDirectory> {
+    let root = AnchoredDirectory::open_root(root_dir)?;
+    let locks = open_or_create_anchored_child(&root, OsStr::new(".locks"))?;
+    locks.ensure_owner_only()?;
+    let session_ids = open_or_create_anchored_child(&locks, OsStr::new("session-ids"))?;
+    session_ids.ensure_owner_only()?;
+    Ok(session_ids)
+}
+
+fn open_session_id_lock_files(
+    root_dir: &Path,
+    session_id: &str,
+) -> io::Result<(std::fs::File, std::fs::File)> {
+    let lock_dir = open_session_id_lock_directory(root_dir)?;
+    Ok((
+        lock_dir.open_or_create_owner_only_child_file(OsStr::new(&session_claim_lock_name(
+            session_id,
+        )))?,
+        lock_dir.open_or_create_owner_only_child_file(OsStr::new(&session_mutation_lock_name(
+            session_id,
+        )))?,
+    ))
+}
+
+fn session_id_lock_root_for_sessions_root(sessions_root: &Path) -> io::Result<&Path> {
+    sessions_root.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sessions root must have a grok-home parent",
+        )
+    })
+}
+
+fn acquire_session_id_lock_sync(root_dir: &Path, session_id: &str) -> io::Result<SessionIdLock> {
+    let (namespace, mutation) = open_session_id_lock_files(root_dir, session_id)?;
+    FileExt::lock_exclusive(&namespace)?;
+    FileExt::lock_exclusive(&mutation)?;
+    Ok(SessionIdLock {
+        namespace: Some(namespace),
+        mutation: Some(mutation),
+    })
+}
+
+fn acquire_session_id_read_lock_sync(
+    root_dir: &Path,
+    session_id: &str,
+) -> io::Result<SessionIdLock> {
+    let (namespace, mutation) = open_session_id_lock_files(root_dir, session_id)?;
+    FileExt::lock_shared(&namespace)?;
+    FileExt::lock_shared(&mutation)?;
+    Ok(SessionIdLock {
+        namespace: Some(namespace),
+        mutation: Some(mutation),
+    })
+}
+
+async fn acquire_session_id_lock(root_dir: &Path, session_id: &str) -> io::Result<SessionIdLock> {
+    let root_dir = root_dir.to_path_buf();
+    let session_id = session_id.to_owned();
+    tokio::task::spawn_blocking(move || acquire_session_id_lock_sync(&root_dir, &session_id))
+        .await
+        .map_err(io::Error::other)?
+}
+
+async fn acquire_session_id_read_lock(
+    root_dir: &Path,
+    session_id: &str,
+) -> io::Result<SessionIdLock> {
+    let root_dir = root_dir.to_path_buf();
+    let session_id = session_id.to_owned();
+    tokio::task::spawn_blocking(move || acquire_session_id_read_lock_sync(&root_dir, &session_id))
+        .await
+        .map_err(io::Error::other)?
+}
+
+/// Acquire a source-shared and target-exclusive lease in one deterministic
+/// global order, preventing A-to-B and B-to-A fork copies from deadlocking.
+pub(crate) fn acquire_ordered_copy_locks_sync(
+    root_dir: &Path,
+    source_id: &str,
+    target_id: &str,
+) -> io::Result<(SessionIdLock, SessionIdLock)> {
+    if source_id == target_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "fork source and target session ids must differ",
+        ));
+    }
+    let source_name = session_claim_lock_name(source_id);
+    let target_name = session_claim_lock_name(target_id);
+    if source_name < target_name {
+        let source = acquire_session_id_read_lock_sync(root_dir, source_id)?;
+        let target = acquire_session_id_lock_sync(root_dir, target_id)?;
+        Ok((source, target))
+    } else {
+        let target = acquire_session_id_lock_sync(root_dir, target_id)?;
+        let source = acquire_session_id_read_lock_sync(root_dir, source_id)?;
+        Ok((source, target))
+    }
+}
+
+fn resolve_published_session_dir_locked(
+    sessions_root: &Path,
+    session_id: &str,
+    preferred_cwd: Option<&str>,
+) -> io::Result<Option<PathBuf>> {
+    if let Some(cwd) = preferred_cwd {
+        let encoded = crate::util::grok_home::encode_cwd_dirname(cwd);
+        let preferred = sessions_root.join(encoded).join(session_id);
+        if is_persisted_session_dir(&preferred) {
+            return Ok(Some(preferred));
+        }
+    }
+    find_persisted_session_dir_by_id_in_root_result(session_id, sessions_root)
+}
+
+pub(crate) async fn acquire_published_session_read(
+    session_id: &str,
+    preferred_cwd: Option<&str>,
+) -> io::Result<Option<PublishedSessionRead>> {
+    acquire_published_session_read_in_root(&grok_home().join("sessions"), session_id, preferred_cwd)
+        .await
+}
+
+pub(crate) async fn acquire_published_session_read_in_root(
+    sessions_root: &Path,
+    session_id: &str,
+    preferred_cwd: Option<&str>,
+) -> io::Result<Option<PublishedSessionRead>> {
+    let sessions_root = sessions_root.to_path_buf();
+    let session_id = session_id.to_owned();
+    let preferred_cwd = preferred_cwd.map(str::to_owned);
+    tokio::task::spawn_blocking(move || {
+        let lock_root = session_id_lock_root_for_sessions_root(&sessions_root)?;
+        let session_id_lock = acquire_session_id_read_lock_sync(lock_root, &session_id)?;
+        let Some(session_dir) = resolve_published_session_dir_locked(
+            &sessions_root,
+            &session_id,
+            preferred_cwd.as_deref(),
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(PublishedSessionRead {
+            _session_id_lock: session_id_lock,
+            session_dir,
+        }))
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+pub(crate) async fn acquire_published_session_write(
+    session_id: &str,
+    preferred_cwd: Option<&str>,
+) -> io::Result<PublishedSessionWrite> {
+    acquire_published_session_write_in_root(
+        &grok_home().join("sessions"),
+        session_id,
+        preferred_cwd,
+    )
+    .await
+}
+
+pub(crate) async fn acquire_published_session_write_in_root(
+    sessions_root: &Path,
+    session_id: &str,
+    preferred_cwd: Option<&str>,
+) -> io::Result<PublishedSessionWrite> {
+    let sessions_root = sessions_root.to_path_buf();
+    let session_id = session_id.to_owned();
+    let preferred_cwd = preferred_cwd.map(str::to_owned);
+    tokio::task::spawn_blocking(move || {
+        let lock_root = session_id_lock_root_for_sessions_root(&sessions_root)?;
+        let session_id_lock = acquire_session_id_lock_sync(lock_root, &session_id)?;
+        reclaim_abandoned_session_stages_in_root(lock_root, &session_id)?;
+        let published_dir = resolve_published_session_dir_locked(
+            &sessions_root,
+            &session_id,
+            preferred_cwd.as_deref(),
+        )?;
+        Ok(PublishedSessionWrite {
+            session_id_lock: Some(session_id_lock),
+            sessions_root,
+            session_id,
+            published_dir,
+            stage: None,
+        })
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+enum CanonicalSessionClaim {
+    Existing(PublishedSessionRead),
+    Vacant(Box<PublishedSessionWrite>),
+}
+
+fn acquire_canonical_session_claim_sync(
+    sessions_root: &Path,
+    session_id: &str,
+    preferred_cwd: Option<&str>,
+) -> io::Result<CanonicalSessionClaim> {
+    let lock_root = session_id_lock_root_for_sessions_root(sessions_root)?;
+    let (namespace, mutation) = open_session_id_lock_files(lock_root, session_id)?;
+    FileExt::lock_exclusive(&namespace)?;
+
+    if let Some(session_dir) =
+        resolve_published_session_dir_locked(sessions_root, session_id, preferred_cwd)?
+    {
+        // Readers must not wait for an already-running actor's lifetime shared
+        // mutation lease. Shared acquisition is compatible, while namespace
+        // remains exclusive throughout the handoff.
+        FileExt::lock_shared(&mutation)?;
+        FileExt::unlock(&namespace)?;
+        return Ok(CanonicalSessionClaim::Existing(PublishedSessionRead {
+            _session_id_lock: SessionIdLock {
+                namespace: None,
+                mutation: Some(mutation),
+            },
+            session_dir,
+        }));
+    }
+
+    FileExt::lock_exclusive(&mutation)?;
+    Ok(CanonicalSessionClaim::Vacant(Box::new(
+        PublishedSessionWrite {
+            session_id_lock: Some(SessionIdLock {
+                namespace: Some(namespace),
+                mutation: Some(mutation),
+            }),
+            sessions_root: sessions_root.to_path_buf(),
+            session_id: session_id.to_owned(),
+            published_dir: None,
+            stage: None,
+        },
+    )))
+}
+
+async fn acquire_canonical_session_claim(
+    sessions_root: &Path,
+    session_id: &str,
+    preferred_cwd: Option<&str>,
+) -> io::Result<CanonicalSessionClaim> {
+    let sessions_root = sessions_root.to_path_buf();
+    let session_id = session_id.to_owned();
+    let preferred_cwd = preferred_cwd.map(str::to_owned);
+    tokio::task::spawn_blocking(move || {
+        acquire_canonical_session_claim_sync(&sessions_root, &session_id, preferred_cwd.as_deref())
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+#[cfg(test)]
+fn try_acquire_session_id_write_lock_sync(
+    root_dir: &Path,
+    session_id: &str,
+) -> io::Result<Option<SessionIdLock>> {
+    let (namespace, mutation) = open_session_id_lock_files(root_dir, session_id)?;
+    match FileExt::try_lock_exclusive(&namespace) {
+        Ok(()) => match FileExt::try_lock_exclusive(&mutation) {
+            Ok(()) => Ok(Some(SessionIdLock {
+                namespace: Some(namespace),
+                mutation: Some(mutation),
+            })),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error),
+        },
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Attempt to take a shared per-session visibility lock without waiting.
+///
+/// Discovery paths use this to omit a fresh session while its creator still
+/// owns the lock. In particular, the lock remains held across the synchronous
+/// marker removal and [`crate::session::SessionPublicationGate::publish`], so a
+/// marker-free provisional directory cannot leak through a concurrent list.
+pub(crate) fn try_acquire_session_id_read_lock_sync(
+    root_dir: &Path,
+    session_id: &str,
+) -> io::Result<Option<SessionIdLock>> {
+    let (namespace, mutation) = open_session_id_lock_files(root_dir, session_id)?;
+    match FileExt::try_lock_shared(&namespace) {
+        Ok(()) => match FileExt::try_lock_shared(&mutation) {
+            Ok(()) => Ok(Some(SessionIdLock {
+                namespace: Some(namespace),
+                mutation: Some(mutation),
+            })),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error),
+        },
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+fn open_or_create_anchored_child(
+    parent: &AnchoredDirectory,
+    name: &OsStr,
+) -> io::Result<AnchoredDirectory> {
+    match parent.create_child_dir(name) {
+        Ok(child) => Ok(child),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => parent.open_child_dir(name),
+        Err(error) => Err(error),
+    }
+}
+
+fn ensure_private_staging_hierarchy_anchored(
+    root_dir: &Path,
+) -> io::Result<(PathBuf, AnchoredDirectory)> {
+    let root = AnchoredDirectory::open_root(root_dir)?;
+    let private = open_or_create_anchored_child(&root, OsStr::new(".private"))?;
+    private.ensure_owner_only()?;
+    let staging = open_or_create_anchored_child(&private, OsStr::new("session-staging"))?;
+    staging.ensure_owner_only()?;
+    Ok((root_dir.join(".private/session-staging"), staging))
+}
+
+fn create_unpublished_session_marker(session_dir: &AnchoredDirectory) -> io::Result<()> {
+    let marker = session_dir.create_child_file_new(OsStr::new(UNPUBLISHED_SESSION_MARKER))?;
+    marker.sync_all()?;
+    session_dir.sync()
+}
+
+fn reclaim_abandoned_session_stages(
+    staging_root: &AnchoredDirectory,
+    session_id: &str,
+) -> io::Result<()> {
+    let session_name = OsStr::new(session_id);
+    let deterministic_container_name = session_stage_container_name(session_id);
+    for container_name in staging_root.child_names()? {
+        let Ok(container) = staging_root.open_child_dir(&container_name) else {
+            // A link/reparse point or a concurrently removed entry is not a
+            // reclaimable private stage container.
+            continue;
+        };
+        let session = container.open_child_dir(session_name).ok();
+        if session.is_none() && container_name != deterministic_container_name {
+            continue;
+        }
+
+        // A reclaimable container is exactly one staged session plus optional
+        // cwd metadata used when publishing a whole cwd parent. Preserve any
+        // other shape: it may be unrelated state or evidence of corruption.
+        let Ok(child_names) = container.child_names() else {
+            continue;
+        };
+        if child_names
+            .iter()
+            .any(|name| name.as_os_str() == session_name)
+            && session.is_none()
+        {
+            // An entry with the target name exists but is not a real direct
+            // child directory (symlink/reparse/non-directory). Preserve it.
+            continue;
+        }
+        if child_names
+            .iter()
+            .any(|name| name.as_os_str() != session_name && name.as_os_str() != OsStr::new(".cwd"))
+        {
+            continue;
+        }
+        if child_names
+            .iter()
+            .any(|name| name.as_os_str() == OsStr::new(".cwd"))
+            && container.open_child_file(OsStr::new(".cwd")).is_err()
+        {
+            // Do not treat a symlink/reparse point (or non-regular metadata
+            // entry) as the optional cwd metadata file.
+            continue;
+        }
+
+        // Only already-private, same-user state is eligible. The container
+        // checks operate on retained handles; recursive child cleanup remains
+        // best-effort against hostile same-UID entry swaps (see #342).
+        if !container.is_owner_only().unwrap_or(false)
+            || session
+                .as_ref()
+                .is_some_and(|session| !session.is_owner_only().unwrap_or(false))
+        {
+            continue;
+        }
+        drop(session);
+        container.remove_tree_self()?;
+        staging_root.sync()?;
+    }
+    Ok(())
+}
+
+/// Reclaim an abandoned private stage for `session_id`.
+///
+/// The caller must hold that session id's exclusive namespace and mutation
+/// locks. This root-based form is shared by copy/import publication flows.
+pub(crate) fn reclaim_abandoned_session_stages_in_root(
+    root_dir: &Path,
+    session_id: &str,
+) -> io::Result<()> {
+    let (_, staging_root) = ensure_private_staging_hierarchy_anchored(root_dir)?;
+    reclaim_abandoned_session_stages(&staging_root, session_id)
+}
+
+fn verify_canonical_publication_identity(
+    root_path: &Path,
+    root: &AnchoredDirectory,
+    sessions: &AnchoredDirectory,
+    parent_name: &OsStr,
+    published_parent: &AnchoredDirectory,
+    session_name: &OsStr,
+    published_session: &AnchoredDirectory,
+) -> io::Result<()> {
+    let canonical_root = AnchoredDirectory::open_root(root_path)?;
+    if !canonical_root.same_identity(root)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "publication root identity is no longer canonically reachable",
+        ));
+    }
+    let canonical_sessions = canonical_root.open_child_dir(OsStr::new("sessions"))?;
+    if !canonical_sessions.same_identity(sessions)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "published sessions anchor is no longer canonically reachable",
+        ));
+    }
+    let canonical_parent = canonical_sessions.open_child_dir(parent_name)?;
+    if !canonical_parent.same_identity(published_parent)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "published cwd parent identity is not canonically reachable",
+        ));
+    }
+    let canonical_session = canonical_parent.open_child_dir(session_name)?;
+    if !canonical_session.same_identity(published_session)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "published session identity is not canonically reachable",
+        ));
+    }
+    Ok(())
+}
+
+fn read_valid_staged_summary(stage_session: &Path) -> io::Result<Summary> {
+    let summary_path = stage_session.join("summary.json");
+    let metadata = std::fs::symlink_metadata(&summary_path)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "published session requires a regular summary.json",
+        ));
+    }
+    let bytes = std::fs::read(&summary_path)?;
+    serde_json::from_slice::<Summary>(&bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+pub(crate) fn write_staged_cwd_metadata_if_needed(
+    stage_container: &AnchoredDirectory,
+    encoded_parent: &OsStr,
+    cwd: &str,
+) -> io::Result<()> {
+    if encoded_parent == OsStr::new(urlencoding::encode(cwd).as_ref()) {
+        return Ok(());
+    }
+    let mut metadata = stage_container.create_child_file_new(OsStr::new(".cwd"))?;
+    use std::io::Write as _;
+    metadata.write_all(cwd.as_bytes())?;
+    metadata.sync_all()?;
+    stage_container.sync()
+}
+
+pub(crate) fn validate_existing_cwd_metadata(
+    published_parent: &AnchoredDirectory,
+    encoded_parent: &OsStr,
+    cwd: &str,
+) -> io::Result<()> {
+    if encoded_parent == OsStr::new(urlencoding::encode(cwd).as_ref()) {
+        return Ok(());
+    }
+    let mut metadata = published_parent.open_child_file(OsStr::new(".cwd"))?;
+    let mut bytes = Vec::new();
+    use std::io::Read as _;
+    metadata.read_to_end(&mut bytes)?;
+    if bytes != cwd.as_bytes() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "published cwd metadata does not exactly match the session cwd",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub(crate) enum FreshPublicationFinalizeError {
+    /// The no-replace namespace rename did not commit, so provisional creation
+    /// may be safely aborted even if its private marker was already removed.
+    NotCommitted(io::Error),
+    /// The anchored namespace rename committed even though a later durability
+    /// acknowledgement failed; the caller must preserve the published state.
+    CommittedDurability(io::Error),
+    CommittedIdentity(io::Error),
+}
+
+impl std::fmt::Display for FreshPublicationFinalizeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotCommitted(error) => write!(formatter, "publication not committed: {error}"),
+            Self::CommittedDurability(error) => {
+                write!(
+                    formatter,
+                    "publication committed with durability failure: {error}"
+                )
+            }
+            Self::CommittedIdentity(error) => {
+                write!(
+                    formatter,
+                    "publication committed but canonical identity is unverified: {error}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for FreshPublicationFinalizeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NotCommitted(error)
+            | Self::CommittedDurability(error)
+            | Self::CommittedIdentity(error) => Some(error),
+        }
+    }
+}
+
+fn require_real_directory(path: &Path) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a real directory",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "directory is a reparse point",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn published_path_occupied(path: &Path) -> bool {
+    match path.try_exists() {
+        Ok(true) => true,
+        Ok(false) => false,
+        Err(_) => true,
+    }
+}
+
+fn restore_fresh_stage_session(publication: &FreshPublication, anchor: AnchoredDirectory) {
+    *publication
+        .stage_session_anchor
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(anchor);
+}
+
+fn restore_fresh_stage_container(publication: &FreshPublication, anchor: AnchoredDirectory) {
+    *publication
+        .stage_container_anchor
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(anchor);
+}
+
+fn finalize_fresh_publication_sync_with(
+    publication: &FreshPublication,
+    sync_published: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> Result<(), FreshPublicationFinalizeError> {
+    let summary = read_valid_staged_summary(&publication.stage_session)
+        .map_err(FreshPublicationFinalizeError::NotCommitted)?;
+    if published_path_occupied(&publication.published_session) {
+        return Err(FreshPublicationFinalizeError::NotCommitted(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "no-replace publication collided",
+        )));
+    }
+    let stage_session_anchor = publication
+        .stage_session_anchor
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+        .ok_or_else(|| {
+            FreshPublicationFinalizeError::NotCommitted(io::Error::new(
+                io::ErrorKind::NotFound,
+                "fresh publication stage was already consumed",
+            ))
+        })?;
+    if let Err(error) = stage_session_anchor
+        .remove_marker(OsStr::new(UNPUBLISHED_SESSION_MARKER))
+        .and_then(|()| stage_session_anchor.sync())
+    {
+        restore_fresh_stage_session(publication, stage_session_anchor);
+        return Err(FreshPublicationFinalizeError::NotCommitted(error));
+    }
+
+    let root_anchor = match AnchoredDirectory::open_root(&publication.root_dir) {
+        Ok(root) => root,
+        Err(error) => {
+            restore_fresh_stage_session(publication, stage_session_anchor);
+            return Err(FreshPublicationFinalizeError::NotCommitted(error));
+        }
+    };
+    let sessions_anchor = match open_or_create_anchored_child(&root_anchor, OsStr::new("sessions"))
+    {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            restore_fresh_stage_session(publication, stage_session_anchor);
+            return Err(FreshPublicationFinalizeError::NotCommitted(error));
+        }
+    };
+
+    let dest_parent_exists = matches!(
+        publication.published_session.parent().map(Path::try_exists),
+        Some(Ok(true))
+    );
+    let (published_parent_anchor, published_session_anchor) = match sessions_anchor
+        .open_child_dir(&publication.published_parent_name)
+    {
+        Ok(parent) => {
+            if let Err(error) = validate_existing_cwd_metadata(
+                &parent,
+                &publication.published_parent_name,
+                &summary.info.cwd,
+            ) {
+                restore_fresh_stage_session(publication, stage_session_anchor);
+                return Err(FreshPublicationFinalizeError::NotCommitted(error));
+            }
+            let child = match stage_session_anchor
+                .try_rename_self_no_replace(&parent, &publication.session_name)
+            {
+                Ok(child) => child,
+                Err(failure) => {
+                    restore_fresh_stage_session(publication, failure.source);
+                    return Err(FreshPublicationFinalizeError::NotCommitted(failure.error));
+                }
+            };
+            if let Some(container) = publication
+                .stage_container_anchor
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                && let Err(error) = container.remove_tree_self()
+            {
+                tracing::warn!(%error, "failed to remove committed private fresh stage container");
+            }
+            (parent, child)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound || !dest_parent_exists => {
+            let stage_container_anchor = match publication
+                .stage_container_anchor
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                Some(container) => container,
+                None => {
+                    restore_fresh_stage_session(publication, stage_session_anchor);
+                    return Err(FreshPublicationFinalizeError::NotCommitted(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "fresh publication container was already consumed",
+                    )));
+                }
+            };
+            if let Err(error) = write_staged_cwd_metadata_if_needed(
+                &stage_container_anchor,
+                &publication.published_parent_name,
+                &summary.info.cwd,
+            ) {
+                restore_fresh_stage_session(publication, stage_session_anchor);
+                restore_fresh_stage_container(publication, stage_container_anchor);
+                return Err(FreshPublicationFinalizeError::NotCommitted(error));
+            }
+            drop(stage_session_anchor);
+            match stage_container_anchor
+                .try_rename_self_no_replace(&sessions_anchor, &publication.published_parent_name)
+            {
+                Ok(published_parent) => {
+                    publication
+                        .path_binding
+                        .rebind(publication.published_session.clone());
+                    publication
+                        .committed
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    let child = published_parent
+                        .open_child_dir(&publication.session_name)
+                        .map_err(FreshPublicationFinalizeError::CommittedIdentity)?;
+                    (published_parent, child)
+                }
+                Err(failure) if failure.error.kind() == io::ErrorKind::AlreadyExists => {
+                    let container = failure.source;
+                    let child = match container.open_child_dir(&publication.session_name) {
+                        Ok(child) => child,
+                        Err(error) => {
+                            restore_fresh_stage_container(publication, container);
+                            return Err(FreshPublicationFinalizeError::NotCommitted(error));
+                        }
+                    };
+                    let parent =
+                        match sessions_anchor.open_child_dir(&publication.published_parent_name) {
+                            Ok(parent) => parent,
+                            Err(error) => {
+                                restore_fresh_stage_session(publication, child);
+                                restore_fresh_stage_container(publication, container);
+                                return Err(FreshPublicationFinalizeError::NotCommitted(error));
+                            }
+                        };
+                    if let Err(error) = validate_existing_cwd_metadata(
+                        &parent,
+                        &publication.published_parent_name,
+                        &summary.info.cwd,
+                    ) {
+                        restore_fresh_stage_session(publication, child);
+                        restore_fresh_stage_container(publication, container);
+                        return Err(FreshPublicationFinalizeError::NotCommitted(error));
+                    }
+                    let child = match child
+                        .try_rename_self_no_replace(&parent, &publication.session_name)
+                    {
+                        Ok(child) => child,
+                        Err(failure) => {
+                            restore_fresh_stage_session(publication, failure.source);
+                            restore_fresh_stage_container(publication, container);
+                            return Err(FreshPublicationFinalizeError::NotCommitted(failure.error));
+                        }
+                    };
+                    if let Err(error) = container.remove_tree_self() {
+                        tracing::warn!(%error, "failed to remove committed private fresh stage container");
+                    }
+                    (parent, child)
+                }
+                Err(failure) => {
+                    restore_fresh_stage_container(publication, failure.source);
+                    return Err(FreshPublicationFinalizeError::NotCommitted(failure.error));
+                }
+            }
+        }
+        Err(error) => {
+            restore_fresh_stage_session(publication, stage_session_anchor);
+            return Err(FreshPublicationFinalizeError::NotCommitted(error));
+        }
+    };
+
+    publication
+        .path_binding
+        .rebind(publication.published_session.clone());
+    publication
+        .committed
+        .store(true, std::sync::atomic::Ordering::Release);
+    verify_canonical_publication_identity(
+        &publication.root_dir,
+        &root_anchor,
+        &sessions_anchor,
+        &publication.published_parent_name,
+        &published_parent_anchor,
+        &publication.session_name,
+        &published_session_anchor,
+    )
+    .map_err(FreshPublicationFinalizeError::CommittedIdentity)?;
+    sync_published(
+        &publication.root_dir.join("sessions"),
+        &publication.published_parent,
+    )
+    .and_then(|()| published_session_anchor.sync())
+    .and_then(|()| published_parent_anchor.sync())
+    .and_then(|()| sessions_anchor.sync())
+    .map_err(FreshPublicationFinalizeError::CommittedDurability)
+}
+
+fn finalize_fresh_publication_sync(
+    publication: &FreshPublication,
+) -> Result<(), FreshPublicationFinalizeError> {
+    finalize_fresh_publication_sync_with(publication, |sessions_root, published_parent| {
+        sync_directory(sessions_root)?;
+        sync_directory(published_parent)
+    })
+}
+
+#[cfg(test)]
+fn staged_publication_for_test(root_dir: &Path, info: &Info) -> FreshPublication {
+    let staging_root = root_dir.join(".private/session-staging");
+    let stage_container = std::fs::read_dir(&staging_root)
+        .expect("read private staging root")
+        .map(|entry| entry.expect("read stage container").path())
+        .find(|container| container.join(info.id.to_string()).is_dir())
+        .expect("fresh stage for test session");
+    let stage_container_name = stage_container.file_name().unwrap().to_os_string();
+    let session_name = OsString::from(info.id.to_string());
+    let stage_session = stage_container.join(&session_name);
+    let published_parent_name =
+        OsString::from(crate::util::grok_home::encode_cwd_dirname(&info.cwd));
+    let published_parent = root_dir.join("sessions").join(&published_parent_name);
+    let root_anchor = AnchoredDirectory::open_root(root_dir).unwrap();
+    let private_anchor = root_anchor.open_child_dir(OsStr::new(".private")).unwrap();
+    let staging_root_anchor = Arc::new(
+        private_anchor
+            .open_child_dir(OsStr::new("session-staging"))
+            .unwrap(),
+    );
+    let stage_container_anchor = staging_root_anchor
+        .open_child_dir(&stage_container_name)
+        .unwrap();
+    let stage_session_anchor = stage_container_anchor
+        .open_child_dir(&session_name)
+        .unwrap();
+    FreshPublication {
+        root_dir: root_dir.to_path_buf(),
+        stage_container,
+        stage_session: stage_session.clone(),
+        published_session: published_parent.join(&session_name),
+        published_parent,
+        stage_container_anchor: Arc::new(std::sync::Mutex::new(Some(stage_container_anchor))),
+        stage_session_anchor: Arc::new(std::sync::Mutex::new(Some(stage_session_anchor))),
+        published_parent_name,
+        session_name,
+        path_binding: crate::session::storage::jsonl::SessionPathBinding::new(stage_session),
+        committed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    }
+}
+
+#[cfg(test)]
+fn finalize_fresh_publication_in_root_sync(
+    root_dir: &Path,
+    info: &Info,
+) -> Result<(), FreshPublicationFinalizeError> {
+    staged_publication_for_test(root_dir, info).finalize()
+}
+
+fn public_session_id_namespace_present(sessions_root: &Path, session_id: &str) -> io::Result<bool> {
+    let cwd_entries = match std::fs::read_dir(sessions_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    for cwd_entry in cwd_entries {
+        let cwd_entry = cwd_entry?;
+        let cwd_type = cwd_entry.file_type()?;
+        if !cwd_type.is_dir() || cwd_type.is_symlink() {
+            continue;
+        }
+        if std::fs::symlink_metadata(cwd_entry.path().join(session_id)).is_ok() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn claim_fresh_session_sync(
+    root_dir: &Path,
+    session_id: &str,
+    published_session: PathBuf,
+) -> io::Result<FreshSessionClaim> {
+    let session_id_lock = acquire_session_id_lock_sync(root_dir, session_id)?;
+    let (staging_root, staging_root_anchor) = ensure_private_staging_hierarchy_anchored(root_dir)?;
+
+    reclaim_abandoned_session_stages(&staging_root_anchor, session_id)?;
+
+    if public_session_id_namespace_present(&root_dir.join("sessions"), session_id)? {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("a persisted session with id {session_id} already exists"),
+        ));
+    }
+
+    let session_name = OsString::from(session_id);
+    let published_parent = published_session
+        .parent()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "published session has no parent",
+            )
+        })?
+        .to_path_buf();
+    if published_parent.parent() != Some(root_dir.join("sessions").as_path())
+        || published_session.file_name() != Some(session_name.as_os_str())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "published session is not a direct session-id child",
+        ));
+    }
+    let published_parent_name = published_parent
+        .file_name()
+        .expect("validated published parent")
+        .to_os_string();
+
+    let stage_container_name = session_stage_container_name(session_id);
+    let mut stage_container_anchor =
+        Some(staging_root_anchor.create_child_dir(&stage_container_name)?);
+    if let Err(error) = stage_container_anchor
+        .as_ref()
+        .expect("new fresh stage container")
+        .ensure_owner_only()
+    {
+        let _ = stage_container_anchor
+            .take()
+            .expect("new fresh stage container")
+            .remove_tree_self();
+        return Err(error);
+    }
+    let stage_container = staging_root.join(&stage_container_name);
+    let stage_session_anchor = match stage_container_anchor
+        .as_ref()
+        .expect("new fresh stage container")
+        .create_child_dir(&session_name)
+    {
+        Ok(session) => session,
+        Err(error) => {
+            let _ = stage_container_anchor
+                .take()
+                .expect("new fresh stage container")
+                .remove_tree_self();
+            return Err(error);
+        }
+    };
+    if let Err(error) = stage_session_anchor.ensure_owner_only() {
+        drop(stage_session_anchor);
+        let _ = stage_container_anchor
+            .take()
+            .expect("new fresh stage container")
+            .remove_tree_self();
+        return Err(error);
+    }
+    let stage_session = stage_container.join(&session_name);
+    if let Err(error) = create_unpublished_session_marker(&stage_session_anchor) {
+        drop(stage_session_anchor);
+        let _ = stage_container_anchor
+            .take()
+            .expect("new fresh stage container")
+            .remove_tree_self();
+        return Err(error);
+    }
+
+    let path_binding =
+        crate::session::storage::jsonl::SessionPathBinding::new(stage_session.clone());
+    let publication = FreshPublication {
+        root_dir: root_dir.to_path_buf(),
+        stage_container,
+        stage_session,
+        published_parent,
+        published_session,
+        stage_container_anchor: Arc::new(std::sync::Mutex::new(stage_container_anchor)),
+        stage_session_anchor: Arc::new(std::sync::Mutex::new(Some(stage_session_anchor))),
+        published_parent_name,
+        session_name,
+        path_binding,
+        committed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+
+    Ok(FreshSessionClaim {
+        session_id_lock: Some(session_id_lock),
+        publication,
+        cleanup_armed: true,
+    })
+}
+
+async fn claim_fresh_session(root_dir: &Path, info: &Info) -> io::Result<FreshSessionClaim> {
+    let root_dir = root_dir.to_path_buf();
+    let session_id = info.id.to_string();
+    let published_session = root_dir
+        .join("sessions")
+        .join(crate::util::grok_home::encode_cwd_dirname(&info.cwd))
+        .join(&session_id);
+    tokio::task::spawn_blocking(move || {
+        claim_fresh_session_sync(&root_dir, &session_id, published_session)
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
 pub(crate) async fn new(
     info: &Info,
     model_id: acp::ModelId,
@@ -2803,11 +5055,14 @@ pub(crate) async fn new(
     registry_title_sync: Option<RegistryGeneratedTitleSync>,
 ) -> io::Result<PersistenceHandle> {
     let root_dir = grok_home();
-    let storage: Box<dyn StorageAdapter> = Box::new(JsonlStorageAdapter::with_root(root_dir));
+    let fresh_claim = claim_fresh_session(&root_dir, info).await?;
+    let fresh_publication = fresh_claim.publication.clone();
+    let storage: Box<dyn StorageAdapter> = Box::new(
+        JsonlStorageAdapter::with_session_path_binding(fresh_publication.path_binding.clone()),
+    );
 
     // Initialize session in storage
     let mut summary = storage.init_session(info, model_id.clone()).await?;
-    touch_worktree_for_session(info).await;
 
     // Update model if different
     if summary.current_model_id != model_id {
@@ -2815,7 +5070,7 @@ pub(crate) async fn new(
         summary.current_model_id = model_id;
     }
 
-    let (handle, rx, summary_tx, disk_full_tx) = actor_channel();
+    let (handle, rx, summary_tx, disk_full_tx) = actor_channel(Some(fresh_publication));
 
     let info_clone = info.clone();
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
@@ -2824,10 +5079,14 @@ pub(crate) async fn new(
         let persistence = SessionPersistence {
             info: info_clone,
             storage: storage.clone(),
+            _published_session_lease: None,
             pending_notification: None,
             rx,
             remote_sync: remote_sync.clone(),
             created_fresh: true,
+            fresh_claim: Some(fresh_claim),
+            pending_publication_gate: None,
+            fresh_publication_aborted: false,
             relay_sync,
             summary: crate::session::summary::SummaryGenerator::new(
                 crate::session::summary::SummaryConfig {
@@ -2884,7 +5143,7 @@ pub(crate) async fn new_with_explicit_dir(
         summary.current_model_id = model_id;
     }
 
-    let (handle, rx, summary_tx, disk_full_tx) = actor_channel();
+    let (handle, rx, summary_tx, disk_full_tx) = actor_channel(None);
 
     let info_clone = info.clone();
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
@@ -2892,10 +5151,14 @@ pub(crate) async fn new_with_explicit_dir(
         let persistence = SessionPersistence {
             info: info_clone,
             storage: storage.clone(),
+            _published_session_lease: None,
             pending_notification: None,
             rx,
             remote_sync: None,
             created_fresh: false,
+            fresh_claim: None,
+            pending_publication_gate: None,
+            fresh_publication_aborted: false,
             relay_sync: None,
             summary: crate::session::summary::SummaryGenerator::new(
                 crate::session::summary::SummaryConfig {
@@ -2948,19 +5211,34 @@ pub struct PersistedInfoLight {
     pub workflow_runs: Vec<crate::session::workflow::store::RestoredWorkflowRun>,
 }
 
-/// On NotFound, try pulling from backend. Returns pulled info or the original error.
+/// On a local NotFound, try pulling from the backend. Preserve the original
+/// NotFound only when the backend has no session; propagate all pull failures.
 async fn pull_on_miss(
     info: &Info,
     client: &crate::remote::BackendClient,
     err: io::Error,
-) -> io::Result<Info> {
+) -> io::Result<PulledSession> {
     if err.kind() != io::ErrorKind::NotFound {
         return Err(err);
     }
-    try_pull_from_remote(info, client).await.ok_or(err)
+    map_pull_on_miss_result(err, try_pull_from_remote(info, client).await)
 }
 
-#[expect(dead_code, reason = "wired when session restore flow calls load")]
+fn map_pull_on_miss_result(
+    original_not_found: io::Error,
+    pulled: io::Result<Option<PulledSession>>,
+) -> io::Result<PulledSession> {
+    match pulled {
+        Ok(Some(pulled)) => Ok(pulled),
+        Ok(None) => Err(original_not_found),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired when session restore flow calls load")
+)]
 pub(crate) async fn load(
     info: &Info,
     sampling_client: OaiCompatClient,
@@ -2973,15 +5251,25 @@ pub(crate) async fn load(
     registry_title_sync: Option<RegistryGeneratedTitleSync>,
 ) -> io::Result<(PersistedInfo, PersistenceHandle)> {
     let root_dir = grok_home();
-    let storage: Box<dyn StorageAdapter> = Box::new(JsonlStorageAdapter::with_root(root_dir));
+    let initial_session_id_lock =
+        acquire_session_id_read_lock(&root_dir, &info.id.to_string()).await?;
+    let storage: Box<dyn StorageAdapter> =
+        Box::new(JsonlStorageAdapter::with_root(root_dir.clone()));
 
-    let (persisted, loaded_info) = match storage.load_session(info).await {
-        Ok(p) => (p, info.clone()),
+    let (persisted, loaded_info, session_id_lock) = match storage.load_session(info).await {
+        Ok(p) => (
+            p,
+            info.clone(),
+            initial_session_id_lock.retain_lifetime_shared()?,
+        ),
         Err(e) => match backend {
             Some(client) => {
+                // A local miss must release the initial shared lease before
+                // remote fetch and canonical exclusive hydration.
+                drop(initial_session_id_lock);
                 let pulled = pull_on_miss(info, client, e).await?;
-                let p = storage.load_session(&pulled).await?;
-                (p, pulled)
+                let p = storage.load_session(&pulled.info).await?;
+                (p, pulled.info, pulled.lifetime_lease)
             }
             None => return Err(e),
         },
@@ -2999,7 +5287,7 @@ pub(crate) async fn load(
         workflow_runs: persisted.workflow_runs,
     };
 
-    let (handle, rx, summary_tx, disk_full_tx) = actor_channel();
+    let (handle, rx, summary_tx, disk_full_tx) = actor_channel(None);
 
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
     let remote_sync = init_remote_sync(&persisted_info.summary, storage_mode, auth_manager)?;
@@ -3019,10 +5307,14 @@ pub(crate) async fn load(
         let persistence = SessionPersistence {
             info: loaded_info,
             storage: storage.clone(),
+            _published_session_lease: Some(session_id_lock),
             pending_notification: None,
             rx,
             remote_sync: remote_sync.clone(),
             created_fresh: false,
+            fresh_claim: None,
+            pending_publication_gate: None,
+            fresh_publication_aborted: false,
             relay_sync,
             summary: summary_gen,
             registry_title_sync,
@@ -3051,20 +5343,28 @@ pub(crate) async fn load_light(
     registry_title_sync: Option<RegistryGeneratedTitleSync>,
 ) -> io::Result<(PersistedInfoLight, PersistenceHandle)> {
     let root_dir = grok_home();
+    let initial_session_id_lock =
+        acquire_session_id_read_lock(&root_dir, &info.id.to_string()).await?;
     let storage: Box<dyn StorageAdapter> =
         Box::new(JsonlStorageAdapter::with_root(root_dir.clone()));
 
-    let (persisted, loaded_info) = match storage.load_session_without_updates(info).await {
-        Ok(p) => (p, info.clone()),
-        Err(e) => match backend {
-            Some(client) => {
-                let pulled = pull_on_miss(info, client, e).await?;
-                let p = storage.load_session_without_updates(&pulled).await?;
-                (p, pulled)
-            }
-            None => return Err(e),
-        },
-    };
+    let (persisted, loaded_info, session_id_lock) =
+        match storage.load_session_without_updates(info).await {
+            Ok(p) => (
+                p,
+                info.clone(),
+                initial_session_id_lock.retain_lifetime_shared()?,
+            ),
+            Err(e) => match backend {
+                Some(client) => {
+                    drop(initial_session_id_lock);
+                    let pulled = pull_on_miss(info, client, e).await?;
+                    let p = storage.load_session_without_updates(&pulled.info).await?;
+                    (p, pulled.info, pulled.lifetime_lease)
+                }
+                None => return Err(e),
+            },
+        };
     // Touch on load too: resuming must reset the worktree's gc expiry clock.
     touch_worktree_for_session(&loaded_info).await;
 
@@ -3084,7 +5384,7 @@ pub(crate) async fn load_light(
         workflow_runs: persisted.workflow_runs,
     };
 
-    let (handle, rx, summary_tx, disk_full_tx) = actor_channel();
+    let (handle, rx, summary_tx, disk_full_tx) = actor_channel(None);
 
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
     let remote_sync = init_remote_sync(&persisted_info.summary, storage_mode, auth_manager)?;
@@ -3104,10 +5404,14 @@ pub(crate) async fn load_light(
         let persistence = SessionPersistence {
             info: loaded_info,
             storage: storage.clone(),
+            _published_session_lease: Some(session_id_lock),
             pending_notification: None,
             rx,
             remote_sync: remote_sync.clone(),
             created_fresh: false,
+            fresh_claim: None,
+            pending_publication_gate: None,
+            fresh_publication_aborted: false,
             relay_sync,
             summary: summary_gen,
             registry_title_sync,
@@ -3146,8 +5450,9 @@ pub async fn list_summaries(cwd: Option<&str>) -> io::Result<Vec<Summary>> {
 /// on [`delete_session_history`]).
 #[derive(Debug, thiserror::Error)]
 pub enum DeleteSessionError {
-    /// Listing local summaries (to resolve the on-disk session dir) failed.
-    #[error("failed to list sessions: {0}")]
+    /// Acquiring the local visibility lock or resolving the on-disk session
+    /// directory failed.
+    #[error("failed to resolve local session: {0}")]
     List(#[source] io::Error),
     /// The remote (writeback) copy could not be deleted; local bits were
     /// left untouched so the operation can be retried.
@@ -3181,6 +5486,35 @@ impl SessionDeletion {
     }
 }
 
+fn find_deletable_local_info_in_root(
+    root_dir: &Path,
+    session_id: &str,
+    cwd: Option<&str>,
+) -> io::Result<Option<Info>> {
+    let sessions_root = root_dir.join("sessions");
+    let view = storage_view(&sessions_root).map_err(io::Error::other)?;
+    let session_dir = match cwd {
+        Some(cwd) => view
+            .session_dirs(Some(cwd))
+            .map_err(io::Error::other)?
+            .into_iter()
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name == std::ffi::OsStr::new(session_id))
+            }),
+        None => view
+            .find_persisted_session_dir(session_id)
+            .map_err(io::Error::other)?,
+    };
+    let Some(session_dir) = session_dir else {
+        return Ok(None);
+    };
+    Ok(read_summary_from_dir(&session_dir)
+        .ok()
+        .filter(|summary| summary.info.id.0.as_ref() == session_id && !summary.is_hidden())
+        .map(|summary| summary.info))
+}
+
 /// Permanently delete a session's history: the remote (writeback) copy
 /// when `needs_remote`, the local on-disk session directory, and the
 /// FTS search-index entry.
@@ -3202,18 +5536,16 @@ pub async fn delete_session_history(
     needs_remote: bool,
     auth_manager: Arc<crate::auth::AuthManager>,
 ) -> Result<SessionDeletion, DeleteSessionError> {
-    let sid = acp::SessionId::new(Arc::from(session_id));
-
-    // Resolve the local session info, scoping to cwd if provided. A
-    // remote-only session won't be found here — that's fine, the remote
-    // delete (if applicable) still runs.
-    let summaries = list_summaries(cwd)
+    let root_dir = crate::util::grok_home::grok_home();
+    let _session_id_lock = acquire_session_id_lock(&root_dir, session_id)
         .await
         .map_err(DeleteSessionError::List)?;
-    let local_info = summaries
-        .iter()
-        .find(|s| s.info.id == sid)
-        .map(|s| s.info.clone());
+
+    // Resolve under the same cross-process id lock held by fresh creation.
+    // This waits out the marker-free finalizer-to-gate window and prevents a
+    // delete from racing a creator that is still provisional.
+    let local_info = find_deletable_local_info_in_root(&root_dir, session_id, cwd)
+        .map_err(DeleteSessionError::List)?;
 
     // Remote delete first (authoritative for cloud history). A genuine
     // failure aborts before any local mutation so the row does not
@@ -3270,6 +5602,138 @@ fn classify_remote_delete(
 #[cfg(test)]
 #[path = "persistence_tests.rs"]
 mod durable_update_tests;
+
+#[cfg(test)]
+mod fresh_abort_terminal_tests {
+    use super::*;
+    use crate::session::storage::jsonl::AppendDurability;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn aborted_fresh_publication_drops_queued_mutations_and_sync_side_effects() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000139";
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let info = Info {
+            id: acp::SessionId::new(SESSION_ID),
+            cwd: "/repo/publication/abort-terminal".to_owned(),
+        };
+        let published_session = root
+            .path()
+            .join("sessions")
+            .join(crate::util::grok_home::encode_cwd_dirname(&info.cwd))
+            .join(SESSION_ID);
+        let fresh_claim = claim_fresh_session_sync(root.path(), SESSION_ID, published_session)
+            .expect("fresh session claim");
+        let stage_session = fresh_claim.publication.stage_session.clone();
+        let append_attempts = Arc::new(AtomicUsize::new(0));
+        let observed_attempts = append_attempts.clone();
+        let storage = Arc::new(JsonlStorageAdapter::with_update_append_probe(
+            stage_session.clone(),
+            move |_: AppendDurability| {
+                observed_attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        ));
+        storage
+            .init_session(&info, default_model_id())
+            .await
+            .expect("initialize provisional session");
+
+        let publication_gate = crate::session::SessionPublicationGate::pending();
+        let (remote_sync, mut remote_observed) = RemoteSync::test_observer();
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (disk_full_tx, _disk_full_rx) = watch::channel(false);
+        let sampling_client =
+            OaiCompatClient::new(xai_grok_sampler::SamplerConfig::default()).unwrap();
+        let actor = tokio::spawn(
+            SessionPersistence {
+                info: info.clone(),
+                storage: storage.clone(),
+                _published_session_lease: None,
+                pending_notification: None,
+                rx,
+                remote_sync: Some(remote_sync),
+                created_fresh: true,
+                fresh_claim: Some(fresh_claim),
+                pending_publication_gate: None,
+                fresh_publication_aborted: false,
+                relay_sync: None,
+                summary: crate::session::summary::SummaryGenerator::new(
+                    crate::session::summary::SummaryConfig {
+                        sampling_client,
+                        model: String::new(),
+                        persistence_tx: tx.downgrade(),
+                    },
+                ),
+                registry_title_sync: None,
+                gateway: None,
+                disk_full_tx,
+                disk_full_notified: false,
+            }
+            .run(),
+        );
+
+        PersistenceHandle::publish_fresh(&tx, publication_gate.clone())
+            .await
+            .expect("arm publication gate");
+        publication_gate.abort();
+        tx.send(PersistenceMsg::Update(SessionUpdate::Acp(Box::new(
+            acp::SessionNotification::new(
+                info.id.clone(),
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    acp::ContentBlock::Text(acp::TextContent::new("must be discarded")),
+                )),
+            ),
+        ))))
+        .expect("queue update behind aborted publication");
+        tx.send(PersistenceMsg::Chat(ConversationItem::user(
+            "must be discarded",
+        )))
+        .expect("queue chat behind aborted publication");
+        tx.send(PersistenceMsg::UpgradeToWriteback {
+            auth_manager: Arc::new(crate::auth::AuthManager::new(
+                root.path(),
+                crate::auth::GrokComConfig::default(),
+            )),
+        })
+        .expect("queue writeback upgrade behind aborted publication");
+        let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
+        tx.send(PersistenceMsg::FlushAndAck {
+            respond_to: barrier_tx,
+        })
+        .expect("queue abort-only barrier");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), barrier_rx)
+                .await
+                .expect("abort-only actor must consume the queued barrier")
+                .is_err(),
+            "abort-only actor must discard rather than execute queued barriers"
+        );
+
+        let persisted = storage
+            .load_session(&info)
+            .await
+            .expect("read still-provisional session before cleanup");
+        assert!(persisted.updates.is_empty());
+        assert!(persisted.chat_history.is_empty());
+        assert_eq!(append_attempts.load(Ordering::SeqCst), 0);
+        assert!(
+            !matches!(
+                tokio::time::timeout(Duration::from_millis(50), remote_observed.recv()).await,
+                Ok(Some(_))
+            ),
+            "the remote dispatch path must not receive an aborted update"
+        );
+
+        PersistenceHandle::abort_fresh_and_delete(&tx, publication_gate)
+            .await
+            .expect("delete provisional session");
+        actor.await.expect("persistence actor join");
+        assert!(!stage_session.exists());
+    }
+}
 
 #[cfg(test)]
 mod delete_session_history_tests {
@@ -3441,6 +5905,10 @@ fn cleanup_stale_sessions_inner(
     level: CleanupLevel,
 ) -> CleanupStats {
     let mut stats = CleanupStats::default();
+
+    if has_unpublished_session_marker(root) {
+        return stats;
+    }
 
     if root
         .file_name()
@@ -4333,8 +6801,8 @@ mod resumed_sandbox_profile_tests {
 #[cfg(test)]
 mod session_exists_for_cwd_tests {
     use super::{
-        resolve_local_session_any_cwd_in_root, session_exists_for_cwd_in_root,
-        session_exists_in_root,
+        ReasoningEffort, UNPUBLISHED_SESSION_MARKER, resolve_local_session_any_cwd_in_root,
+        session_exists_for_cwd_in_root, session_exists_in_root,
     };
     use std::fs;
     use tempfile::TempDir;
@@ -4352,6 +6820,27 @@ mod session_exists_for_cwd_tests {
         fs::write(dir.join("summary.json"), b"{}").unwrap();
 
         assert!(session_exists_for_cwd_in_root(session_id, cwd, &root));
+    }
+
+    #[test]
+    fn unpublished_session_is_hidden_from_direct_and_all_cwd_resolution() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("sessions");
+        let cwd = "/project/pending";
+        let session_id = "pending-session";
+        let dir = root
+            .join(crate::util::grok_home::encode_cwd_dirname(cwd))
+            .join(session_id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(UNPUBLISHED_SESSION_MARKER), b"").unwrap();
+        fs::write(dir.join("summary.json"), b"{}").unwrap();
+
+        assert!(!session_exists_for_cwd_in_root(session_id, cwd, &root));
+        assert!(!session_exists_in_root(session_id, &root));
+        assert_eq!(
+            resolve_local_session_any_cwd_in_root(session_id, &root).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -4478,6 +6967,7 @@ mod session_exists_for_cwd_tests {
                 "num_messages": 2,
                 "num_chat_messages": 1,
                 "current_model_id": "test",
+                "reasoning_effort": "ultra",
             })
             .to_string(),
         )
@@ -4488,12 +6978,13 @@ mod session_exists_for_cwd_tests {
         assert_eq!(summary.info.id.0.as_ref(), session_id);
         assert_eq!(summary.info.cwd, cwd);
         assert_eq!(summary.session_summary, "cross-cwd hit");
+        assert_eq!(summary.reasoning_effort, Some(ReasoningEffort::Ultra));
     }
 }
 
 #[cfg(test)]
 mod find_local_child_tests {
-    use super::find_local_child_for_remote_in_root;
+    use super::{UNPUBLISHED_SESSION_MARKER, find_local_child_for_remote_in_root};
     use filetime::{self, FileTime};
     use std::fs;
     use tempfile::TempDir;
@@ -4519,6 +7010,21 @@ mod find_local_child_tests {
 
         let found = find_local_child_for_remote_in_root("remote-abc", "/work", &root);
         assert_eq!(found.as_deref(), Some("local-child-uuid"));
+    }
+
+    #[test]
+    fn unpublished_restored_child_is_not_resolved() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("sessions");
+        let cwd = "/work";
+        let child_id = "pending-local-child";
+        make_session_with_parent(root.as_path(), cwd, child_id, "remote-abc");
+        let dir = root
+            .join(crate::util::grok_home::encode_cwd_dirname(cwd))
+            .join(child_id);
+        fs::write(dir.join(UNPUBLISHED_SESSION_MARKER), b"").unwrap();
+
+        assert!(find_local_child_for_remote_in_root("remote-abc", cwd, &root).is_none());
     }
 
     #[test]
@@ -4950,12 +7456,1801 @@ mod repo_wide_resolution_tests {
 }
 
 #[cfg(test)]
+mod fresh_session_claim_tests {
+    use super::*;
+    use std::io::{BufRead, Read, Write};
+    use std::time::Duration;
+
+    const CHILD_MODE_ENV: &str = "GROK_TEST_SESSION_CLAIM_MODE";
+    const CHILD_ROOT_ENV: &str = "GROK_TEST_SESSION_CLAIM_ROOT";
+    const CHILD_ID_ENV: &str = "GROK_TEST_SESSION_CLAIM_ID";
+    const CHILD_CWD_ENV: &str = "GROK_TEST_SESSION_CLAIM_CWD";
+    const CHILD_RELEASE_ENV: &str = "GROK_TEST_SESSION_CLAIM_RELEASE";
+    const CHILD_READY: &str = "__GROK_SESSION_CLAIM_READY__";
+    const CHILD_RESULT_PREFIX: &str = "__GROK_SESSION_CLAIM_RESULT__=";
+    const CHILD_FINISH_TIMEOUT: Duration = Duration::from_secs(15);
+
+    fn test_session_dir(root: &Path, cwd: &str, session_id: &str) -> PathBuf {
+        root.join("sessions")
+            .join(crate::util::grok_home::encode_cwd_dirname(cwd))
+            .join(session_id)
+    }
+
+    fn test_info(session_id: &str, cwd: &str) -> Info {
+        Info {
+            id: acp::SessionId::new(session_id),
+            cwd: cwd.to_owned(),
+        }
+    }
+
+    fn test_sampling_client() -> OaiCompatClient {
+        OaiCompatClient::new(xai_grok_sampler::SamplerConfig::default())
+            .expect("test sampling client")
+    }
+
+    fn write_valid_staged_summary(claim: &FreshSessionClaim, info: &Info) {
+        let summary = Summary::new(info, default_model_id()).expect("test summary");
+        std::fs::write(
+            claim.publication.stage_session.join("summary.json"),
+            serde_json::to_vec_pretty(&summary).expect("serialize test summary"),
+        )
+        .expect("write staged summary");
+    }
+
+    #[test]
+    fn failed_lease_downgrade_keeps_namespace_exclusive_until_claim_drop() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000144";
+        const CWD: &str = "/repo/publication/downgrade-failure";
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let claim = claim_fresh_session_sync(
+            root.path(),
+            SESSION_ID,
+            test_session_dir(root.path(), CWD, SESSION_ID),
+        )
+        .expect("fresh claim");
+
+        let result = claim.into_published_lease_with(|lease| {
+            lease.transition_exclusive_to_lifetime_shared_with(|_| {
+                assert!(
+                    try_acquire_session_id_write_lock_sync(root.path(), SESSION_ID)
+                        .expect("try competing writer during failed downgrade")
+                        .is_none(),
+                    "namespace lease must remain exclusive while mutation downgrade fails"
+                );
+                Err(io::Error::other("injected shared-lock failure"))
+            })
+        });
+        let failure = result.unwrap_err();
+        assert_eq!(failure.error.kind(), io::ErrorKind::Other);
+        assert!(
+            try_acquire_session_id_write_lock_sync(root.path(), SESSION_ID)
+                .expect("try writer while failed claim is retained")
+                .is_none(),
+            "returned failed claim must retain the exclusive namespace lease"
+        );
+        drop(failure.claim);
+        assert!(
+            try_acquire_session_id_write_lock_sync(root.path(), SESSION_ID)
+                .expect("try writer after retained claim drops")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn failed_namespace_unlock_keeps_namespace_exclusive_until_claim_drop() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000145";
+        const CWD: &str = "/repo/publication/namespace-unlock-failure";
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let claim = claim_fresh_session_sync(
+            root.path(),
+            SESSION_ID,
+            test_session_dir(root.path(), CWD, SESSION_ID),
+        )
+        .expect("fresh claim");
+
+        let result = claim.into_published_lease_with(|lease| {
+            lease.transition_exclusive_to_lifetime_shared_with_unlock(FileExt::lock_shared, |_| {
+                Err(io::Error::other("injected namespace-unlock failure"))
+            })
+        });
+        let failure = result.unwrap_err();
+        assert_eq!(failure.error.kind(), io::ErrorKind::Other);
+        assert!(
+            failure
+                .claim
+                .session_id_lock
+                .as_ref()
+                .expect("failed claim retains its session-id lock")
+                .namespace
+                .is_some(),
+            "an unlock error must not discard the namespace handle"
+        );
+        assert!(
+            try_acquire_session_id_write_lock_sync(root.path(), SESSION_ID)
+                .expect("try writer while failed claim is retained")
+                .is_none(),
+            "returned failed claim must retain the exclusive namespace lease"
+        );
+        drop(failure.claim);
+        assert!(
+            try_acquire_session_id_write_lock_sync(root.path(), SESSION_ID)
+                .expect("try writer after retained claim drops")
+                .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_identity_proof_rejects_replaced_root_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        let moved_root = temp.path().join("moved-root");
+        std::fs::create_dir(&root_path).unwrap();
+        let root = AnchoredDirectory::open_root(&root_path).unwrap();
+        let sessions = root.create_child_dir(OsStr::new("sessions")).unwrap();
+        let parent = sessions.create_child_dir(OsStr::new("cwd")).unwrap();
+        let session = parent.create_child_dir(OsStr::new("session")).unwrap();
+        verify_canonical_publication_identity(
+            &root_path,
+            &root,
+            &sessions,
+            OsStr::new("cwd"),
+            &parent,
+            OsStr::new("session"),
+            &session,
+        )
+        .unwrap();
+
+        std::fs::rename(&root_path, &moved_root).unwrap();
+        std::fs::create_dir_all(root_path.join("sessions/cwd/session")).unwrap();
+        let error = verify_canonical_publication_identity(
+            &root_path,
+            &root,
+            &sessions,
+            OsStr::new("cwd"),
+            &parent,
+            OsStr::new("session"),
+            &session,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn final_publication_collision_is_not_committed() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000120";
+        const CWD: &str = "/repo/publication/pre-unlink-failure";
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let session_dir = test_session_dir(root.path(), CWD, SESSION_ID);
+        let claim = claim_fresh_session_sync(root.path(), SESSION_ID, session_dir.clone())
+            .expect("fresh claim");
+        write_valid_staged_summary(&claim, &test_info(SESSION_ID, CWD));
+        std::fs::create_dir_all(&session_dir).expect("create colliding target");
+
+        let result = claim.publication.finalize();
+
+        assert!(matches!(
+            result,
+            Err(FreshPublicationFinalizeError::NotCommitted(_))
+        ));
+        assert!(!claim.publication.is_committed());
+        assert!(claim.publication.stage_session.is_dir());
+        drop(claim);
+    }
+
+    #[test]
+    fn final_publication_moves_private_stage_and_rebinds_storage_path() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000121";
+        const CWD: &str = "/repo/publication/post-unlink-failure";
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let session_dir = test_session_dir(root.path(), CWD, SESSION_ID);
+        let claim = claim_fresh_session_sync(root.path(), SESSION_ID, session_dir.clone())
+            .expect("fresh claim");
+        write_valid_staged_summary(&claim, &test_info(SESSION_ID, CWD));
+        let old_stage = claim.publication.stage_session.clone();
+        assert!(
+            !session_dir.parent().expect("published parent").exists(),
+            "exercise missing-parent whole-container publication"
+        );
+
+        claim.publication.finalize().expect("publish private stage");
+        assert!(claim.publication.is_committed());
+        assert_eq!(claim.publication.physical_path(), session_dir);
+        assert!(!old_stage.exists());
+        assert!(!session_dir.join(UNPUBLISHED_SESSION_MARKER).exists());
+        claim.disarm();
+    }
+
+    #[test]
+    fn final_publication_atomically_publishes_long_cwd_metadata() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000143";
+        let cwd = format!("/repo/{}/workspace", "very-long-component".repeat(24));
+        assert_ne!(
+            crate::util::grok_home::encode_cwd_dirname(&cwd),
+            urlencoding::encode(&cwd).as_ref()
+        );
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let session_dir = test_session_dir(root.path(), &cwd, SESSION_ID);
+        let claim = claim_fresh_session_sync(root.path(), SESSION_ID, session_dir.clone())
+            .expect("fresh long-cwd claim");
+        write_valid_staged_summary(&claim, &test_info(SESSION_ID, &cwd));
+
+        claim
+            .publication
+            .finalize()
+            .expect("publish long-cwd stage");
+
+        let parent = session_dir.parent().expect("published cwd parent");
+        assert_eq!(std::fs::read(parent.join(".cwd")).unwrap(), cwd.as_bytes());
+        assert!(session_dir.join("summary.json").is_file());
+        claim.disarm();
+    }
+
+    #[test]
+    fn final_publication_missing_summary_is_not_committed() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000129";
+        const CWD: &str = "/repo/publication/missing-summary";
+        let root = tempfile::tempdir().unwrap();
+        let session_dir = test_session_dir(root.path(), CWD, SESSION_ID);
+        let claim = claim_fresh_session_sync(root.path(), SESSION_ID, session_dir.clone()).unwrap();
+
+        assert!(matches!(
+            claim.publication.finalize(),
+            Err(FreshPublicationFinalizeError::NotCommitted(_))
+        ));
+        assert!(!session_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_publication_rejects_symlinked_sessions_root() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000130";
+        const CWD: &str = "/repo/publication/sessions-symlink";
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let session_dir = test_session_dir(root.path(), CWD, SESSION_ID);
+        let claim = claim_fresh_session_sync(root.path(), SESSION_ID, session_dir.clone()).unwrap();
+        write_valid_staged_summary(&claim, &test_info(SESSION_ID, CWD));
+        std::os::unix::fs::symlink(outside.path(), root.path().join("sessions")).unwrap();
+
+        assert!(matches!(
+            claim.publication.finalize(),
+            Err(FreshPublicationFinalizeError::NotCommitted(_))
+        ));
+        assert!(!outside.path().join(SESSION_ID).exists());
+    }
+
+    #[test]
+    fn post_rename_sync_failure_is_committed_and_drop_preserves_public_tree() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000131";
+        const CWD: &str = "/repo/publication/post-rename-sync";
+        let root = tempfile::tempdir().unwrap();
+        let session_dir = test_session_dir(root.path(), CWD, SESSION_ID);
+        let claim = claim_fresh_session_sync(root.path(), SESSION_ID, session_dir.clone()).unwrap();
+        write_valid_staged_summary(&claim, &test_info(SESSION_ID, CWD));
+
+        let result = finalize_fresh_publication_sync_with(&claim.publication, |_, _| {
+            Err(io::Error::other("injected post-rename sync failure"))
+        });
+        assert!(matches!(
+            result,
+            Err(FreshPublicationFinalizeError::CommittedDurability(_))
+        ));
+        drop(claim);
+        assert!(session_dir.join("summary.json").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_private_hierarchy_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000132";
+        const CWD: &str = "/repo/publication/private-mode";
+        let root = tempfile::tempdir().unwrap();
+        let claim = claim_fresh_session_sync(
+            root.path(),
+            SESSION_ID,
+            test_session_dir(root.path(), CWD, SESSION_ID),
+        )
+        .unwrap();
+        for directory in [
+            root.path().join(".private"),
+            root.path().join(".private/session-staging"),
+            claim.publication.stage_container.clone(),
+            claim.publication.stage_session.clone(),
+        ] {
+            assert_eq!(
+                std::fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
+
+    async fn production_new(info: &Info) -> io::Result<PersistenceHandle> {
+        new(
+            info,
+            default_model_id(),
+            test_sampling_client(),
+            StorageMode::Local,
+            None,
+            None,
+            None,
+            String::new(),
+            None,
+        )
+        .await
+    }
+
+    fn print_child_ready() {
+        println!("{CHILD_READY}");
+        std::io::stdout().flush().expect("flush child ready marker");
+    }
+
+    fn wait_for_child_release(path: &Path) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !path.is_file() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "parent did not release production session child"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Re-executed libtest child for genuine cross-process flock coverage.
+    #[test]
+    #[ignore = "spawned by cross-process fresh-session claim tests"]
+    fn subprocess_session_claim_entry() {
+        let Ok(mode) = std::env::var(CHILD_MODE_ENV) else {
+            return;
+        };
+        let root = PathBuf::from(std::env::var_os(CHILD_ROOT_ENV).expect("child root"));
+        let session_id = std::env::var(CHILD_ID_ENV).expect("child session id");
+        let cwd = std::env::var(CHILD_CWD_ENV).expect("child cwd");
+        let release_path =
+            PathBuf::from(std::env::var_os(CHILD_RELEASE_ENV).expect("child release marker path"));
+
+        let result = match mode.as_str() {
+            "claim" => {
+                print_child_ready();
+                let session_dir = test_session_dir(&root, &cwd, &session_id);
+                match claim_fresh_session_sync(&root, &session_id, session_dir) {
+                    Ok(_claim) => "CLAIMED".to_owned(),
+                    Err(error) => format!("ERROR:{:?}", error.kind()),
+                }
+            }
+            "load" => {
+                print_child_ready();
+                match acquire_session_id_lock_sync(&root, &session_id) {
+                    Ok(_lock) => {
+                        if test_session_dir(&root, &cwd, &session_id)
+                            .join("summary.json")
+                            .is_file()
+                        {
+                            "PRESENT".to_owned()
+                        } else {
+                            "ABSENT".to_owned()
+                        }
+                    }
+                    Err(error) => format!("ERROR:{:?}", error.kind()),
+                }
+            }
+            "production-new" => {
+                print_child_ready();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("production new child runtime");
+                match runtime.block_on(production_new(&test_info(&session_id, &cwd))) {
+                    Ok(_handle) => "CREATED".to_owned(),
+                    Err(error) => format!("ERROR:{:?}", error.kind()),
+                }
+            }
+            "production-new-hold-publish"
+            | "production-new-hold-finalized-publish"
+            | "production-new-hold-abort" => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("production creator child runtime");
+                let handle = runtime
+                    .block_on(production_new(&test_info(&session_id, &cwd)))
+                    .expect("production PersistenceHandle::new");
+                let publication_gate = crate::session::SessionPublicationGate::pending();
+                runtime
+                    .block_on(PersistenceHandle::publish_fresh(
+                        &handle.tx,
+                        publication_gate.clone(),
+                    ))
+                    .expect("arm fresh publication gate");
+                let finalized_before_gate = mode == "production-new-hold-finalized-publish";
+                if finalized_before_gate {
+                    handle
+                        .fresh_publication()
+                        .expect("fresh publication plan")
+                        .finalize()
+                        .expect("durably finalize fresh storage before holding the gate");
+                }
+                print_child_ready();
+                wait_for_child_release(&release_path);
+                if mode != "production-new-hold-abort" {
+                    if !finalized_before_gate {
+                        handle
+                            .fresh_publication()
+                            .expect("fresh publication plan")
+                            .finalize()
+                            .expect("durably publish fresh storage");
+                    }
+                    publication_gate.publish();
+                    let (respond_to, response) = tokio::sync::oneshot::channel();
+                    handle
+                        .tx
+                        .send(PersistenceMsg::ProbeWritable { respond_to })
+                        .expect("send post-publication persistence barrier");
+                    runtime
+                        .block_on(response)
+                        .expect("persistence actor stopped before publication barrier")
+                        .expect("post-publication persistence barrier");
+                    "PUBLISHED".to_owned()
+                } else {
+                    runtime
+                        .block_on(PersistenceHandle::abort_fresh_and_delete(
+                            &handle.tx,
+                            publication_gate,
+                        ))
+                        .expect("abort production fresh session");
+                    "ABORTED".to_owned()
+                }
+            }
+            "production-load" | "production-load-light" => {
+                print_child_ready();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("production load child runtime");
+                let info = test_info(&session_id, &cwd);
+                let load_result = if mode == "production-load" {
+                    runtime
+                        .block_on(load(
+                            &info,
+                            test_sampling_client(),
+                            StorageMode::Local,
+                            None,
+                            None,
+                            None,
+                            None,
+                            String::new(),
+                            None,
+                        ))
+                        .map(|(persisted, _handle)| persisted.summary.info.id)
+                } else {
+                    runtime
+                        .block_on(load_light(
+                            &info,
+                            test_sampling_client(),
+                            StorageMode::Local,
+                            None,
+                            None,
+                            None,
+                            None,
+                            String::new(),
+                            None,
+                        ))
+                        .map(|(persisted, _handle)| persisted.summary.info.id)
+                };
+                match load_result {
+                    Ok(loaded_id) if loaded_id == info.id => "PRESENT".to_owned(),
+                    Ok(loaded_id) => format!("WRONG_ID:{loaded_id}"),
+                    Err(error) => format!("ERROR:{:?}", error.kind()),
+                }
+            }
+            "published-read" => {
+                print_child_ready();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("published read child runtime");
+                match runtime.block_on(acquire_published_session_read_in_root(
+                    &root.join("sessions"),
+                    &session_id,
+                    Some(&cwd),
+                )) {
+                    Ok(Some(session)) if session.read_summary().is_ok() => "PRESENT".to_owned(),
+                    Ok(Some(_)) => "INVALID_SUMMARY".to_owned(),
+                    Ok(None) => "ABSENT".to_owned(),
+                    Err(error) => format!("ERROR:{:?}", error.kind()),
+                }
+            }
+            "production-list" => {
+                print_child_ready();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("production list child runtime");
+                match runtime.block_on(list_summaries(Some(&cwd))) {
+                    Ok(summaries)
+                        if summaries
+                            .iter()
+                            .any(|summary| summary.info.id.to_string() == session_id) =>
+                    {
+                        "PRESENT".to_owned()
+                    }
+                    Ok(_) => "ABSENT".to_owned(),
+                    Err(error) => format!("ERROR:{:?}", error.kind()),
+                }
+            }
+            "production-delete" => {
+                print_child_ready();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("production delete child runtime");
+                let auth_manager = Arc::new(crate::auth::AuthManager::new(
+                    &root,
+                    crate::auth::GrokComConfig::default(),
+                ));
+                match runtime.block_on(delete_session_history(
+                    &session_id,
+                    Some(&cwd),
+                    false,
+                    auth_manager,
+                )) {
+                    Ok(deletion)
+                        if !deletion.any_removed()
+                            && test_session_dir(&root, &cwd, &session_id).is_dir() =>
+                    {
+                        "ABSENT_PRESERVED".to_owned()
+                    }
+                    Ok(deletion) => format!(
+                        "REMOVED:{}:{}",
+                        deletion.local_removed, deletion.remote_removed
+                    ),
+                    Err(error) => format!("ERROR:{error}"),
+                }
+            }
+            other => panic!("unknown child session-claim mode: {other}"),
+        };
+        println!("{CHILD_RESULT_PREFIX}{result}");
+    }
+
+    fn child_test_filter() -> String {
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        format!("{module}::subprocess_session_claim_entry")
+    }
+
+    #[allow(clippy::disallowed_methods)] // isolated libtest subprocess fixture
+    fn spawn_claim_child(
+        mode: &str,
+        root: &Path,
+        session_id: &str,
+        cwd: &str,
+    ) -> std::process::Child {
+        let executable = std::env::current_exe().expect("current libtest executable");
+        let release_path = root.join("child-release");
+        let mut command = std::process::Command::new(executable);
+        command
+            .args(["--ignored", "--exact", "--nocapture", &child_test_filter()])
+            .env(CHILD_MODE_ENV, mode)
+            .env(CHILD_ROOT_ENV, root)
+            .env(CHILD_ID_ENV, session_id)
+            .env(CHILD_CWD_ENV, cwd)
+            .env(CHILD_RELEASE_ENV, &release_path)
+            .env("GROK_HOME", root)
+            .env_remove("MEDLEY_HOME")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        xai_tty_utils::detach_std_command(&mut command);
+        let mut child = command.spawn().expect("spawn session-claim child");
+
+        {
+            let stdout = child.stdout.as_mut().expect("child stdout");
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let bytes = reader.read_line(&mut line).expect("read child marker");
+                assert!(bytes > 0, "child exited before its ready marker");
+                if line.trim() == CHILD_READY {
+                    break;
+                }
+            }
+        }
+        child
+    }
+
+    fn release_claim_child(root: &Path) {
+        std::fs::write(root.join("child-release"), b"release")
+            .expect("release production session child");
+    }
+
+    fn assert_claim_child_is_blocked(child: &mut std::process::Child, operation: &str) {
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            child
+                .try_wait()
+                .unwrap_or_else(|error| panic!("poll {operation}: {error}"))
+                .is_none(),
+            "{operation} must remain blocked while fresh state is provisional"
+        );
+    }
+
+    fn finish_claim_child(mut child: std::process::Child) -> String {
+        let deadline = std::time::Instant::now() + CHILD_FINISH_TIMEOUT;
+        loop {
+            match child.try_wait().expect("poll session-claim child") {
+                Some(status) => {
+                    let mut stdout = String::new();
+                    child
+                        .stdout
+                        .take()
+                        .expect("child stdout")
+                        .read_to_string(&mut stdout)
+                        .expect("read child stdout");
+                    let mut stderr = String::new();
+                    child
+                        .stderr
+                        .take()
+                        .expect("child stderr")
+                        .read_to_string(&mut stderr)
+                        .expect("read child stderr");
+                    assert!(
+                        status.success(),
+                        "session-claim child failed ({status:?})\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                    );
+                    return stdout;
+                }
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("session-claim child did not finish after lock release");
+                }
+            }
+        }
+    }
+
+    fn assert_child_result(stdout: &str, expected: &str) {
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.trim() == format!("{CHILD_RESULT_PREFIX}{expected}")),
+            "missing child result {expected:?} in stdout:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn cross_process_duplicate_claim_rechecks_other_encoded_cwd_after_lock() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000104";
+        const CREATOR_CWD: &str = "/repo/concurrent-claim/creator";
+        const CONTENDER_CWD: &str = "/repo/concurrent-claim/other-worktree";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let session_dir = test_session_dir(root.path(), CREATOR_CWD, SESSION_ID);
+        let first_claim = claim_fresh_session_sync(root.path(), SESSION_ID, session_dir.clone())
+            .expect("first claim succeeds");
+
+        let mut contender = spawn_claim_child("claim", root.path(), SESSION_ID, CONTENDER_CWD);
+        assert!(
+            contender
+                .try_wait()
+                .expect("poll blocked contender")
+                .is_none(),
+            "the real second process must wait for the creator's id claim"
+        );
+
+        write_valid_staged_summary(&first_claim, &test_info(SESSION_ID, CREATOR_CWD));
+
+        first_claim
+            .publication
+            .finalize()
+            .expect("durably publish first claim");
+        first_claim.disarm();
+        let stdout = finish_claim_child(contender);
+        assert_child_result(&stdout, "ERROR:AlreadyExists");
+
+        std::fs::remove_dir_all(&session_dir).expect("remove persisted session");
+        let retry = claim_fresh_session_sync(
+            root.path(),
+            SESSION_ID,
+            test_session_dir(root.path(), CONTENDER_CWD, SESSION_ID),
+        )
+        .expect("the reusable lock file is not a permanent tombstone");
+        drop(retry);
+    }
+
+    #[test]
+    fn fresh_claim_stages_marker_and_reclaims_stale_marked_dir_across_cwds() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000114";
+        const STALE_CWD: &str = "/repo/stale-creator";
+        const RETRY_CWD: &str = "/repo/retry-creator";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let stale_dir = test_session_dir(root.path(), STALE_CWD, SESSION_ID);
+        let stale = claim_fresh_session_sync(root.path(), SESSION_ID, stale_dir.clone())
+            .expect("initial fresh claim");
+        assert!(
+            stale
+                .publication
+                .stage_session
+                .join(UNPUBLISHED_SESSION_MARKER)
+                .is_file(),
+            "the marker must exist before any summary write"
+        );
+        let stale_stage = stale.publication.stage_container.clone();
+        std::fs::write(stale.publication.stage_session.join("summary.json"), b"{}")
+            .expect("provisional summary");
+        stale.disarm();
+
+        let retry_dir = test_session_dir(root.path(), RETRY_CWD, SESSION_ID);
+        let retry = claim_fresh_session_sync(root.path(), SESSION_ID, retry_dir.clone())
+            .expect("new lock owner reclaims crashed provisional state");
+        assert_eq!(
+            retry.publication.stage_container, stale_stage,
+            "deterministic per-id stage container is safely reclaimed then reused"
+        );
+        assert!(
+            !retry
+                .publication
+                .stage_session
+                .join("summary.json")
+                .exists(),
+            "crashed stage contents must not survive deterministic container reuse"
+        );
+        assert!(
+            retry
+                .publication
+                .stage_session
+                .join(UNPUBLISHED_SESSION_MARKER)
+                .is_file()
+        );
+        assert!(!retry_dir.exists(), "fresh identity stays out of sessions/");
+        drop(retry);
+    }
+
+    #[test]
+    fn fresh_claim_invalid_public_path_does_not_create_private_stage() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000152";
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let invalid = root.path().join("not-sessions").join(SESSION_ID);
+
+        let error = claim_fresh_session_sync(root.path(), SESSION_ID, invalid)
+            .expect_err("invalid publication target");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let staging = root.path().join(".private/session-staging");
+        assert_eq!(std::fs::read_dir(staging).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn fresh_claim_reclaims_markerless_exact_stage_and_preserves_other_shapes() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000145";
+        const OTHER_ID: &str = "019c0000-0000-7000-8000-000000000146";
+        const CWD: &str = "/repo/stage-preservation";
+        let root = tempfile::tempdir().unwrap();
+        let (_path, staging) = ensure_private_staging_hierarchy_anchored(root.path()).unwrap();
+
+        let unrelated = staging.create_child_dir(OsStr::new("unrelated")).unwrap();
+        let unrelated_session = unrelated.create_child_dir(OsStr::new(OTHER_ID)).unwrap();
+        create_unpublished_session_marker(&unrelated_session).unwrap();
+        let markerless = staging.create_child_dir(OsStr::new("markerless")).unwrap();
+        markerless.create_child_dir(OsStr::new(SESSION_ID)).unwrap();
+        markerless
+            .create_child_file_new(OsStr::new(".cwd"))
+            .unwrap();
+        let extra = staging
+            .create_child_dir(OsStr::new("extra-sibling"))
+            .unwrap();
+        extra.create_child_dir(OsStr::new(SESSION_ID)).unwrap();
+        extra.create_child_dir(OsStr::new("preserve-me")).unwrap();
+        drop(unrelated_session);
+        drop(unrelated);
+        drop(markerless);
+        drop(extra);
+
+        let claim = claim_fresh_session_sync(
+            root.path(),
+            SESSION_ID,
+            test_session_dir(root.path(), CWD, SESSION_ID),
+        )
+        .unwrap();
+        assert!(
+            root.path()
+                .join(".private/session-staging/unrelated")
+                .is_dir()
+        );
+        assert!(
+            !root
+                .path()
+                .join(".private/session-staging/markerless")
+                .exists()
+        );
+        assert!(
+            root.path()
+                .join(".private/session-staging/extra-sibling/preserve-me")
+                .is_dir()
+        );
+        drop(claim);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_claim_does_not_follow_staging_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000147";
+        const CWD: &str = "/repo/stage-symlink";
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join(SESSION_ID)).unwrap();
+        std::fs::write(
+            outside
+                .path()
+                .join(SESSION_ID)
+                .join(UNPUBLISHED_SESSION_MARKER),
+            b"outside marker",
+        )
+        .unwrap();
+        std::fs::write(outside.path().join("sentinel"), b"preserve").unwrap();
+        let (staging_path, _staging) =
+            ensure_private_staging_hierarchy_anchored(root.path()).unwrap();
+        symlink(outside.path(), staging_path.join("linked-container")).unwrap();
+
+        let real_container = staging_path.join("linked-session-container");
+        std::fs::create_dir(&real_container).unwrap();
+        symlink(
+            outside.path().join(SESSION_ID),
+            real_container.join(SESSION_ID),
+        )
+        .unwrap();
+
+        let claim = claim_fresh_session_sync(
+            root.path(),
+            SESSION_ID,
+            test_session_dir(root.path(), CWD, SESSION_ID),
+        )
+        .unwrap();
+        assert!(staging_path.join("linked-container").is_symlink());
+        assert!(real_container.join(SESSION_ID).is_symlink());
+        assert_eq!(
+            std::fs::read(outside.path().join("sentinel")).unwrap(),
+            b"preserve"
+        );
+        drop(claim);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_claim_preserves_non_private_marked_stage() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000149";
+        const CWD: &str = "/repo/non-private-stage";
+        let root = tempfile::tempdir().unwrap();
+        let (staging_path, staging) =
+            ensure_private_staging_hierarchy_anchored(root.path()).unwrap();
+        let container = staging.create_child_dir(OsStr::new("permissive")).unwrap();
+        let session = container.create_child_dir(OsStr::new(SESSION_ID)).unwrap();
+        create_unpublished_session_marker(&session).unwrap();
+        drop(session);
+        drop(container);
+        std::fs::set_permissions(
+            staging_path.join("permissive"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let claim = claim_fresh_session_sync(
+            root.path(),
+            SESSION_ID,
+            test_session_dir(root.path(), CWD, SESSION_ID),
+        )
+        .unwrap();
+        assert!(staging_path.join("permissive").is_dir());
+        assert_eq!(
+            std::fs::metadata(staging_path.join("permissive"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        drop(claim);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fresh_claim_does_not_follow_staging_junctions() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000148";
+        const CWD: &str = "C:\\repo\\stage-junction";
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join(SESSION_ID)).unwrap();
+        std::fs::write(
+            outside
+                .path()
+                .join(SESSION_ID)
+                .join(UNPUBLISHED_SESSION_MARKER),
+            b"outside marker",
+        )
+        .unwrap();
+        std::fs::write(outside.path().join("sentinel"), b"preserve").unwrap();
+        let (staging_path, _staging) =
+            ensure_private_staging_hierarchy_anchored(root.path()).unwrap();
+        let junction = staging_path.join("linked-container");
+        // cmd's argv quoting plus `\\?\` tempfile prefixes both break mklink.
+        // `/S /C` + raw_arg keeps one command string; dunce strips the prefix.
+        let link = dunce::simplified(&junction);
+        let target = dunce::simplified(outside.path());
+        let cmdline = format!(r#"mklink /J "{}" "{}""#, link.display(), target.display());
+        let mut command = std::process::Command::new("cmd");
+        command.arg("/S").arg("/C");
+        std::os::windows::process::CommandExt::raw_arg(&mut command, &cmdline);
+        xai_tty_utils::detach_std_command(&mut command);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "mklink failed: stdout={} stderr={} cmd={cmdline}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let claim = claim_fresh_session_sync(
+            root.path(),
+            SESSION_ID,
+            test_session_dir(root.path(), CWD, SESSION_ID),
+        )
+        .unwrap();
+        assert!(junction.exists());
+        assert_eq!(
+            std::fs::read(outside.path().join("sentinel")).unwrap(),
+            b"preserve"
+        );
+        drop(claim);
+    }
+
+    #[test]
+    fn cross_process_load_waits_for_fresh_publish() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000106";
+        const CWD: &str = "/repo/load-after-publish";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let session_dir = test_session_dir(root.path(), CWD, SESSION_ID);
+        let creator = claim_fresh_session_sync(root.path(), SESSION_ID, session_dir.clone())
+            .expect("creator claim");
+        let mut loader = spawn_claim_child("load", root.path(), SESSION_ID, CWD);
+        assert!(
+            loader.try_wait().expect("poll blocked loader").is_none(),
+            "load must remain blocked while fresh state is provisional"
+        );
+
+        write_valid_staged_summary(&creator, &test_info(SESSION_ID, CWD));
+        creator
+            .publication
+            .finalize()
+            .expect("durably publish creator");
+        creator.disarm();
+
+        let stdout = finish_claim_child(loader);
+        assert_child_result(&stdout, "PRESENT");
+    }
+
+    #[test]
+    fn cross_process_load_observes_not_found_after_fresh_abort() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000107";
+        const CWD: &str = "/repo/load-after-abort";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let session_dir = test_session_dir(root.path(), CWD, SESSION_ID);
+        let creator = claim_fresh_session_sync(root.path(), SESSION_ID, session_dir.clone())
+            .expect("creator claim");
+        std::fs::write(
+            creator.publication.stage_session.join("summary.json"),
+            b"{}",
+        )
+        .expect("write provisional summary");
+
+        let mut loader = spawn_claim_child("load", root.path(), SESSION_ID, CWD);
+        assert!(
+            loader.try_wait().expect("poll blocked loader").is_none(),
+            "load must remain blocked while fresh state is provisional"
+        );
+        drop(creator);
+
+        let stdout = finish_claim_child(loader);
+        assert_child_result(&stdout, "ABSENT");
+        assert!(
+            !session_dir.exists(),
+            "abort must remove provisional state before releasing the id claim"
+        );
+    }
+
+    #[test]
+    fn production_new_blocks_duplicate_creator_until_publish_then_rejects_it() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000108";
+        const CREATOR_CWD: &str = "/repo/production-new/creator";
+        const CONTENDER_CWD: &str = "/repo/production-new/contender";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let creator = spawn_claim_child(
+            "production-new-hold-publish",
+            root.path(),
+            SESSION_ID,
+            CREATOR_CWD,
+        );
+        let mut contender =
+            spawn_claim_child("production-new", root.path(), SESSION_ID, CONTENDER_CWD);
+        assert_claim_child_is_blocked(&mut contender, "production persistence::new");
+
+        release_claim_child(root.path());
+        assert_child_result(&finish_claim_child(creator), "PUBLISHED");
+        assert_child_result(&finish_claim_child(contender), "ERROR:AlreadyExists");
+    }
+
+    #[test]
+    fn cross_process_list_ignores_pending_then_sees_publication() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000113";
+        const CWD: &str = "/repo/production-discovery/publication";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let creator =
+            spawn_claim_child("production-new-hold-publish", root.path(), SESSION_ID, CWD);
+
+        let pending_list = spawn_claim_child("production-list", root.path(), SESSION_ID, CWD);
+        assert_child_result(&finish_claim_child(pending_list), "ABSENT");
+
+        release_claim_child(root.path());
+        assert_child_result(&finish_claim_child(creator), "PUBLISHED");
+
+        let published_list = spawn_claim_child("production-list", root.path(), SESSION_ID, CWD);
+        assert_child_result(&finish_claim_child(published_list), "PRESENT");
+    }
+
+    #[test]
+    fn cross_process_list_skips_and_delete_waits_between_finalizer_and_gate() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000122";
+        const CWD: &str = "/repo/production-discovery/finalizer-gate-gap";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let creator = spawn_claim_child(
+            "production-new-hold-finalized-publish",
+            root.path(),
+            SESSION_ID,
+            CWD,
+        );
+        let session_dir = test_session_dir(root.path(), CWD, SESSION_ID);
+        assert!(session_dir.join("summary.json").is_file());
+        assert!(
+            !session_dir.join(UNPUBLISHED_SESSION_MARKER).exists(),
+            "fixture must pause after marker removal and before gate publication"
+        );
+
+        let pending_list = spawn_claim_child("production-list", root.path(), SESSION_ID, CWD);
+        assert_child_result(&finish_claim_child(pending_list), "ABSENT");
+
+        let mut pending_delete =
+            spawn_claim_child("production-delete", root.path(), SESSION_ID, CWD);
+        assert_claim_child_is_blocked(
+            &mut pending_delete,
+            "production delete during finalizer-to-gate gap",
+        );
+
+        release_claim_child(root.path());
+        assert_child_result(&finish_claim_child(creator), "PUBLISHED");
+        assert_child_result(&finish_claim_child(pending_delete), "REMOVED:true:false");
+        assert!(
+            !session_dir.exists(),
+            "delete may remove the session only after publication releases the id lock"
+        );
+    }
+
+    #[test]
+    fn cross_process_load_waits_between_finalizer_and_gate() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000123";
+        const CWD: &str = "/repo/production-load/finalizer-gate-gap";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let creator = spawn_claim_child(
+            "production-new-hold-finalized-publish",
+            root.path(),
+            SESSION_ID,
+            CWD,
+        );
+        assert!(
+            !test_session_dir(root.path(), CWD, SESSION_ID)
+                .join(UNPUBLISHED_SESSION_MARKER)
+                .exists(),
+            "fixture must pause after marker removal and before gate publication"
+        );
+
+        let mut loader = spawn_claim_child("production-load", root.path(), SESSION_ID, CWD);
+        assert_claim_child_is_blocked(&mut loader, "production load during finalizer-to-gate gap");
+
+        release_claim_child(root.path());
+        assert_child_result(&finish_claim_child(creator), "PUBLISHED");
+        assert_child_result(&finish_claim_child(loader), "PRESENT");
+    }
+
+    #[test]
+    fn published_read_waits_for_marker_publication_and_retains_visibility_lease() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000124";
+        const CWD: &str = "/repo/published-read/marker";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let creator =
+            spawn_claim_child("production-new-hold-publish", root.path(), SESSION_ID, CWD);
+        assert!(
+            !test_session_dir(root.path(), CWD, SESSION_ID).exists(),
+            "pending fresh storage must not expose cwd or id under sessions/"
+        );
+        let mut reader = spawn_claim_child("published-read", root.path(), SESSION_ID, CWD);
+        assert_claim_child_is_blocked(&mut reader, "published session read with marker present");
+
+        release_claim_child(root.path());
+        assert_child_result(&finish_claim_child(creator), "PUBLISHED");
+        assert_child_result(&finish_claim_child(reader), "PRESENT");
+    }
+
+    #[test]
+    fn published_read_waits_between_marker_removal_and_publication_gate() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000125";
+        const CWD: &str = "/repo/published-read/finalizer-gate-gap";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let creator = spawn_claim_child(
+            "production-new-hold-finalized-publish",
+            root.path(),
+            SESSION_ID,
+            CWD,
+        );
+        assert!(
+            !test_session_dir(root.path(), CWD, SESSION_ID)
+                .join(UNPUBLISHED_SESSION_MARKER)
+                .exists()
+        );
+        let mut reader = spawn_claim_child("published-read", root.path(), SESSION_ID, CWD);
+        assert_claim_child_is_blocked(
+            &mut reader,
+            "published session read during finalizer-to-gate gap",
+        );
+
+        release_claim_child(root.path());
+        assert_child_result(&finish_claim_child(creator), "PUBLISHED");
+        assert_child_result(&finish_claim_child(reader), "PRESENT");
+    }
+
+    #[test]
+    fn published_read_waits_for_abort_then_reports_absent() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000126";
+        const CWD: &str = "/repo/published-read/abort";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let creator = spawn_claim_child("production-new-hold-abort", root.path(), SESSION_ID, CWD);
+        let mut reader = spawn_claim_child("published-read", root.path(), SESSION_ID, CWD);
+        assert_claim_child_is_blocked(&mut reader, "published session read before abort");
+
+        release_claim_child(root.path());
+        assert_child_result(&finish_claim_child(creator), "ABORTED");
+        assert_child_result(&finish_claim_child(reader), "ABSENT");
+    }
+
+    #[tokio::test]
+    async fn unpublished_write_drop_removes_partial_private_tree() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000127";
+        const CWD: &str = "/repo/published-write/abort";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let sessions_root = root.path().join("sessions");
+        let session_dir = test_session_dir(root.path(), CWD, SESSION_ID);
+        let mut writer =
+            acquire_published_session_write_in_root(&sessions_root, SESSION_ID, Some(CWD))
+                .await
+                .expect("exclusive published-session writer");
+        let dir = writer
+            .begin_new(session_dir.clone())
+            .expect("begin marker-hidden write");
+        let private_stage = dir.to_path_buf();
+        std::fs::write(dir.join("summary.json"), b"{}").expect("write partial summary");
+        std::fs::write(dir.join("partial"), b"not committed").expect("write partial payload");
+        assert!(private_stage.starts_with(root.path().join(".private/session-staging")));
+        assert!(!session_dir.exists());
+
+        drop(writer);
+        assert!(!session_dir.exists(), "abort never creates a public tree");
+        assert!(
+            !private_stage.exists(),
+            "abort removes the retained private stage"
+        );
+        assert!(
+            acquire_published_session_read_in_root(&sessions_root, SESSION_ID, Some(CWD))
+                .await
+                .expect("read after abort")
+                .is_none(),
+            "aborted write never becomes published"
+        );
+    }
+
+    #[tokio::test]
+    async fn published_write_precommit_failure_restores_stage_for_drop_cleanup() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000153";
+        const CWD: &str = "/repo/published-write/precommit-failure";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let sessions_root = root.path().join("sessions");
+        let session_dir = test_session_dir(root.path(), CWD, SESSION_ID);
+        let mut writer =
+            acquire_published_session_write_in_root(&sessions_root, SESSION_ID, Some(CWD))
+                .await
+                .expect("exclusive published-session writer");
+        let stage = writer
+            .begin_new(session_dir.clone())
+            .expect("begin private write")
+            .to_path_buf();
+        let stage_container = stage.parent().unwrap().to_path_buf();
+        std::fs::write(stage.join("summary.json"), b"not-json").unwrap();
+
+        assert!(matches!(
+            writer.publish_new_classified(),
+            Err(PublishedSessionFinalizeError::NotCommitted(_))
+        ));
+        drop(writer);
+
+        assert!(!stage_container.exists());
+        assert!(!session_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn published_write_begin_reclaims_markerless_crash_stage() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000150";
+        const STALE_CWD: &str = "/repo/published-write/stale-stage";
+        const NEW_CWD: &str = "/repo/published-write/retry";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let stale = claim_fresh_session_sync(
+            root.path(),
+            SESSION_ID,
+            test_session_dir(root.path(), STALE_CWD, SESSION_ID),
+        )
+        .expect("create stale private stage");
+        let stale_container = stale.publication.stage_container.clone();
+        std::fs::remove_file(
+            stale
+                .publication
+                .stage_session
+                .join(UNPUBLISHED_SESSION_MARKER),
+        )
+        .expect("simulate crash after marker removal");
+        stale.disarm();
+
+        let sessions_root = root.path().join("sessions");
+        let mut writer =
+            acquire_published_session_write_in_root(&sessions_root, SESSION_ID, Some(NEW_CWD))
+                .await
+                .expect("exclusive published-session writer");
+        let new_stage = writer
+            .begin_new(test_session_dir(root.path(), NEW_CWD, SESSION_ID))
+            .expect("retry after markerless crash")
+            .to_path_buf();
+
+        assert_eq!(new_stage.parent(), Some(stale_container.as_path()));
+        assert!(new_stage.join(UNPUBLISHED_SESSION_MARKER).is_file());
+        assert!(
+            !new_stage.join("summary.json").exists(),
+            "the deterministic container was reclaimed before reuse"
+        );
+    }
+
+    #[tokio::test]
+    async fn published_write_acquire_reclaims_empty_post_commit_stage() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000151";
+        const CWD: &str = "/repo/published-write/post-child-commit-crash";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let session_dir = test_session_dir(root.path(), CWD, SESSION_ID);
+        std::fs::create_dir_all(&session_dir).expect("existing published session");
+        let summary = Summary::new(&test_info(SESSION_ID, CWD), default_model_id()).unwrap();
+        std::fs::write(
+            session_dir.join("summary.json"),
+            serde_json::to_vec_pretty(&summary).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(session_dir.join("sentinel"), b"published").unwrap();
+
+        let (staging_path, staging) =
+            ensure_private_staging_hierarchy_anchored(root.path()).unwrap();
+        let container_name = session_stage_container_name(SESSION_ID);
+        let residue = staging.create_child_dir(&container_name).unwrap();
+        residue.ensure_owner_only().unwrap();
+        residue.create_child_file_new(OsStr::new(".cwd")).unwrap();
+        drop(residue);
+        let residue_path = staging_path.join(&container_name);
+
+        let writer = acquire_published_session_write_in_root(
+            &root.path().join("sessions"),
+            SESSION_ID,
+            Some(CWD),
+        )
+        .await
+        .expect("exclusive published-session writer");
+
+        assert_eq!(writer.published_path(), Some(session_dir.as_path()));
+        assert!(!residue_path.exists());
+        assert_eq!(
+            std::fs::read(session_dir.join("sentinel")).unwrap(),
+            b"published"
+        );
+    }
+
+    #[tokio::test]
+    async fn published_write_post_commit_sync_failure_preserves_visible_directory() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000133";
+        const CWD: &str = "/repo/published-write/post-commit-sync";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let sessions_root = root.path().join("sessions");
+        let session_dir = test_session_dir(root.path(), CWD, SESSION_ID);
+        let mut writer =
+            acquire_published_session_write_in_root(&sessions_root, SESSION_ID, Some(CWD))
+                .await
+                .expect("exclusive published-session writer");
+        let dir = writer
+            .begin_new(session_dir.clone())
+            .expect("begin marker-hidden write");
+        let summary =
+            Summary::new(&test_info(SESSION_ID, CWD), default_model_id()).expect("summary");
+        std::fs::write(
+            dir.join("summary.json"),
+            serde_json::to_vec_pretty(&summary).expect("serialize summary"),
+        )
+        .expect("write summary");
+
+        let error = writer
+            .publish_new_with(|_, _| Err(io::Error::other("injected post-commit sync failure")))
+            .expect_err("post-commit sync must report failure");
+        assert!(matches!(
+            error,
+            PublishedSessionFinalizeError::CommittedDurability(_)
+        ));
+        assert_eq!(writer.published_path(), Some(session_dir.as_path()));
+        let published = writer
+            .into_lifetime_read()
+            .expect("committed lease handoff");
+        assert!(
+            try_acquire_session_id_write_lock_sync(root.path(), SESSION_ID)
+                .expect("try competing writer")
+                .is_none(),
+            "committed publication must retain a lifetime lease"
+        );
+        drop(published);
+        assert!(
+            try_acquire_session_id_write_lock_sync(root.path(), SESSION_ID)
+                .expect("try writer after lease drop")
+                .is_some()
+        );
+
+        assert!(session_dir.is_dir(), "drop must preserve committed session");
+        assert!(session_dir.join("summary.json").is_file());
+        assert!(!session_dir.join(UNPUBLISHED_SESSION_MARKER).exists());
+    }
+
+    #[tokio::test]
+    async fn stale_public_marker_is_preserved_and_new_publication_fails_closed() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000142";
+        const OLD_CWD: &str = "/repo/published-write/stale-old";
+        const NEW_CWD: &str = "/repo/published-write/stale-new";
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let sessions_root = root.path().join("sessions");
+        let stale = test_session_dir(root.path(), OLD_CWD, SESSION_ID);
+        std::fs::create_dir_all(&stale).expect("legacy stale public directory");
+        std::fs::write(stale.join(UNPUBLISHED_SESSION_MARKER), b"")
+            .expect("legacy publication marker");
+        std::fs::write(stale.join("sentinel"), b"preserve").expect("stale sentinel");
+
+        let mut writer =
+            acquire_published_session_write_in_root(&sessions_root, SESSION_ID, Some(NEW_CWD))
+                .await
+                .expect("exclusive writer");
+        let error = writer
+            .begin_new(test_session_dir(root.path(), NEW_CWD, SESSION_ID))
+            .expect_err("stale public id must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(stale.join("sentinel")).unwrap(), b"preserve");
+    }
+
+    #[tokio::test]
+    async fn published_access_uses_the_canonical_grok_home_session_id_lock_root() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000128";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let sessions_root = root.path().join("sessions");
+        let writer = acquire_published_session_write_in_root(&sessions_root, SESSION_ID, None)
+            .await
+            .expect("published writer lock");
+
+        let lock_name = session_claim_lock_name(SESSION_ID);
+        assert!(
+            root.path()
+                .join(".locks/session-ids")
+                .join(&lock_name)
+                .is_file(),
+            "published access must share the canonical lock root with fresh/load/delete"
+        );
+        assert!(
+            !sessions_root
+                .join(".locks/session-ids")
+                .join(lock_name)
+                .exists(),
+            "a sessions/.locks split-brain lock would not exclude fresh creators"
+        );
+        drop(writer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_id_lock_namespace_is_owner_only_and_rejects_link_indirection() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000152";
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let locks = root.path().join(".locks");
+        let session_ids = locks.join("session-ids");
+        std::fs::create_dir(&locks).expect("legacy lock directory");
+        std::fs::set_permissions(&locks, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (namespace, mutation) =
+            open_session_id_lock_files(root.path(), SESSION_ID).expect("secure session lock files");
+        assert_eq!(
+            std::fs::metadata(&locks).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&session_ids)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            namespace.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            mutation.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop((namespace, mutation));
+
+        let linked_root = tempfile::tempdir().expect("linked grok home");
+        let outside = tempfile::tempdir().expect("outside lock target");
+        std::fs::write(outside.path().join("sentinel"), b"preserve").unwrap();
+        symlink(outside.path(), linked_root.path().join(".locks")).unwrap();
+        assert!(open_session_id_lock_files(linked_root.path(), SESSION_ID).is_err());
+        assert_eq!(
+            std::fs::read(outside.path().join("sentinel")).unwrap(),
+            b"preserve"
+        );
+        assert!(!outside.path().join("session-ids").exists());
+    }
+
+    #[test]
+    fn remote_pull_publication_two_misses_publish_once_and_hide_partial_tree() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000134";
+        const CWD: &str = "/repo/remote-pull/two-misses";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let sessions_root = root.path().join("sessions");
+        let session_dir = test_session_dir(root.path(), CWD, SESSION_ID);
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let publishers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (hydrated_tx, hydrated_rx) = std::sync::mpsc::channel();
+        let publish = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+
+        let mut loaders = Vec::new();
+        for _ in 0..2 {
+            let sessions_root = sessions_root.clone();
+            let session_dir = session_dir.clone();
+            let start = start.clone();
+            let publishers = publishers.clone();
+            let hydrated_tx = hydrated_tx.clone();
+            let publish = publish.clone();
+            loaders.push(std::thread::spawn(move || {
+                start.wait();
+                match acquire_canonical_session_claim_sync(&sessions_root, SESSION_ID, Some(CWD))
+                    .expect("canonical remote-miss claim")
+                {
+                    CanonicalSessionClaim::Existing(existing) => {
+                        let summary = existing.read_summary().expect("published summary");
+                        assert_eq!(summary.info.id.to_string(), SESSION_ID);
+                        assert!(!existing.path().join("partial").exists());
+                        existing
+                    }
+                    CanonicalSessionClaim::Vacant(mut writer) => {
+                        publishers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let stage = writer.begin_new(session_dir).expect("marker-hidden stage");
+                        let summary = Summary::new(&test_info(SESSION_ID, CWD), default_model_id())
+                            .expect("summary");
+                        std::fs::write(
+                            stage.join("summary.json"),
+                            serde_json::to_vec_pretty(&summary).expect("serialize summary"),
+                        )
+                        .expect("write summary");
+                        std::fs::write(stage.join("partial"), b"not-yet-complete")
+                            .expect("write partial sentinel");
+                        hydrated_tx.send(()).expect("signal hydrated stage");
+                        let (lock, ready) = &*publish;
+                        let mut released = lock.lock().expect("publication barrier mutex");
+                        while !*released {
+                            released = ready.wait(released).expect("publication barrier wait");
+                        }
+                        std::fs::remove_file(stage.join("partial"))
+                            .expect("finish hydration before publish");
+                        writer.publish_new().expect("publish hydrated session");
+                        writer.into_lifetime_read().expect("lifetime shared lease")
+                    }
+                }
+            }));
+        }
+        drop(hydrated_tx);
+
+        hydrated_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("one miss must become the publisher");
+        assert!(
+            !session_dir.exists(),
+            "private hydration must not create public state"
+        );
+
+        let reader_root = sessions_root.clone();
+        let (reader_tx, reader_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let visible = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(acquire_published_session_read_in_root(
+                    &reader_root,
+                    SESSION_ID,
+                    Some(CWD),
+                ))
+                .expect("published reader");
+            reader_tx.send(visible).expect("return published reader");
+        });
+        assert!(
+            reader_rx.recv_timeout(Duration::from_millis(150)).is_err(),
+            "reader must not observe marker-hidden hydration"
+        );
+
+        let (lock, ready) = &*publish;
+        *lock.lock().expect("publication barrier mutex") = true;
+        ready.notify_one();
+        for loader in loaders {
+            let published = loader.join().expect("remote miss loader");
+            assert!(!published.path().join("partial").exists());
+        }
+        let visible = reader_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reader after publication")
+            .expect("published session must be visible");
+        assert_eq!(
+            visible.read_summary().unwrap().info.id.to_string(),
+            SESSION_ID
+        );
+        reader.join().expect("published reader thread");
+        assert_eq!(publishers.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!session_dir.join(UNPUBLISHED_SESSION_MARKER).exists());
+        assert!(!session_dir.join("partial").exists());
+    }
+
+    fn published_remote_pull_winner(
+        sessions_root: &Path,
+        physical_cwd: &str,
+        requested_session_id: &str,
+        summary_info: &Info,
+    ) -> PublishedSessionRead {
+        let session_dir = sessions_root
+            .join(crate::util::grok_home::encode_cwd_dirname(physical_cwd))
+            .join(requested_session_id);
+        std::fs::create_dir_all(&session_dir).expect("create published winner");
+        let summary =
+            Summary::new(summary_info, default_model_id()).expect("published winner summary");
+        std::fs::write(
+            session_dir.join("summary.json"),
+            serde_json::to_vec_pretty(&summary).expect("serialize published winner summary"),
+        )
+        .expect("write published winner summary");
+
+        match acquire_canonical_session_claim_sync(
+            sessions_root,
+            requested_session_id,
+            Some(physical_cwd),
+        )
+        .expect("claim published winner")
+        {
+            CanonicalSessionClaim::Existing(existing) => existing,
+            CanonicalSessionClaim::Vacant(_) => panic!("published winner must already exist"),
+        }
+    }
+
+    #[test]
+    fn remote_pull_publication_existing_winner_rejects_summary_id_mismatch() {
+        const REQUESTED_ID: &str = "019c0000-0000-7000-8000-000000000135";
+        const RETURNED_ID: &str = "019c0000-0000-7000-8000-000000000136";
+        const CWD: &str = "/repo/remote-pull/id-mismatch";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let sessions_root = root.path().join("sessions");
+        let existing = published_remote_pull_winner(
+            &sessions_root,
+            CWD,
+            REQUESTED_ID,
+            &test_info(RETURNED_ID, CWD),
+        );
+
+        let error = validate_existing_remote_pull(&sessions_root, REQUESTED_ID, existing)
+            .err()
+            .expect("summary identity mismatch must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("session id mismatch"));
+        assert!(error.to_string().contains(REQUESTED_ID));
+        assert!(error.to_string().contains(RETURNED_ID));
+    }
+
+    #[test]
+    fn remote_pull_publication_existing_winner_rejects_summary_cwd_path_mismatch() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000137";
+        const PHYSICAL_CWD: &str = "/repo/remote-pull/physical";
+        const SUMMARY_CWD: &str = "/repo/remote-pull/summary";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let sessions_root = root.path().join("sessions");
+        let existing = published_remote_pull_winner(
+            &sessions_root,
+            PHYSICAL_CWD,
+            SESSION_ID,
+            &test_info(SESSION_ID, SUMMARY_CWD),
+        );
+
+        let error = validate_existing_remote_pull(&sessions_root, SESSION_ID, existing)
+            .err()
+            .expect("summary cwd/path mismatch must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("session path mismatch"));
+        assert!(
+            error
+                .to_string()
+                .contains(&crate::util::grok_home::encode_cwd_dirname(SUMMARY_CWD))
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&crate::util::grok_home::encode_cwd_dirname(PHYSICAL_CWD))
+        );
+    }
+
+    #[test]
+    fn remote_pull_publication_integrity_error_survives_pull_on_miss_mapping() {
+        let original = io::Error::new(io::ErrorKind::NotFound, "original local miss");
+        let integrity = io::Error::new(
+            io::ErrorKind::InvalidData,
+            "backend returned a mismatched session identity",
+        );
+
+        let error = map_pull_on_miss_result(original, Err(integrity))
+            .err()
+            .expect("integrity error must not collapse into the local miss");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "backend returned a mismatched session identity"
+        );
+
+        let original = io::Error::new(io::ErrorKind::NotFound, "original local miss");
+        let error = map_pull_on_miss_result(original, Ok(None))
+            .err()
+            .expect("genuine remote absence must retain the original local miss");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(error.to_string(), "original local miss");
+    }
+
+    #[test]
+    fn production_load_light_waits_for_publish_then_reads_session() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000109";
+        const CWD: &str = "/repo/production-load-light/publish";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let creator =
+            spawn_claim_child("production-new-hold-publish", root.path(), SESSION_ID, CWD);
+        let mut loader = spawn_claim_child("production-load-light", root.path(), SESSION_ID, CWD);
+        assert_claim_child_is_blocked(&mut loader, "production persistence::load_light");
+
+        release_claim_child(root.path());
+        assert_child_result(&finish_claim_child(creator), "PUBLISHED");
+        assert_child_result(&finish_claim_child(loader), "PRESENT");
+    }
+
+    #[test]
+    fn production_load_waits_for_publish_then_reads_session() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000111";
+        const CWD: &str = "/repo/production-load/publish";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let creator =
+            spawn_claim_child("production-new-hold-publish", root.path(), SESSION_ID, CWD);
+        let mut loader = spawn_claim_child("production-load", root.path(), SESSION_ID, CWD);
+        assert_claim_child_is_blocked(&mut loader, "production persistence::load");
+
+        release_claim_child(root.path());
+        assert_child_result(&finish_claim_child(creator), "PUBLISHED");
+        assert_child_result(&finish_claim_child(loader), "PRESENT");
+    }
+
+    #[test]
+    fn production_load_waits_for_abort_then_returns_not_found() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000110";
+        const CWD: &str = "/repo/production-load/abort";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let creator = spawn_claim_child("production-new-hold-abort", root.path(), SESSION_ID, CWD);
+        let mut loader = spawn_claim_child("production-load", root.path(), SESSION_ID, CWD);
+        assert_claim_child_is_blocked(&mut loader, "production persistence::load");
+
+        release_claim_child(root.path());
+        assert_child_result(&finish_claim_child(creator), "ABORTED");
+        assert_child_result(&finish_claim_child(loader), "ERROR:NotFound");
+    }
+
+    #[test]
+    fn production_load_light_waits_for_abort_then_returns_not_found() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000112";
+        const CWD: &str = "/repo/production-load-light/abort";
+
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let creator = spawn_claim_child("production-new-hold-abort", root.path(), SESSION_ID, CWD);
+        let mut loader = spawn_claim_child("production-load-light", root.path(), SESSION_ID, CWD);
+        assert_claim_child_is_blocked(&mut loader, "production persistence::load_light");
+
+        release_claim_child(root.path());
+        assert_child_result(&finish_claim_child(creator), "ABORTED");
+        assert_child_result(&finish_claim_child(loader), "ERROR:NotFound");
+    }
+
+    #[test]
+    fn armed_claim_cleans_only_its_retained_private_stage() {
+        const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000105";
+        let root = tempfile::tempdir().expect("temporary grok home");
+        let session_dir = test_session_dir(root.path(), "/repo/cancelled", SESSION_ID);
+
+        let claim = claim_fresh_session_sync(root.path(), SESSION_ID, session_dir.clone())
+            .expect("claim new path");
+        let private_stage = claim.publication.stage_container.clone();
+        std::fs::write(claim.publication.stage_session.join("summary.json"), b"{}")
+            .expect("simulate private initialized summary");
+        std::fs::create_dir_all(&session_dir).expect("create unrelated public target");
+        std::fs::write(session_dir.join("owned-by-someone-else"), b"keep")
+            .expect("write unrelated public content");
+        drop(claim);
+        assert!(
+            !private_stage.exists(),
+            "dropping an armed claim must clean its retained private stage"
+        );
+        assert!(
+            session_dir.join("owned-by-someone-else").is_file(),
+            "retained cleanup must preserve public pathname data"
+        );
+    }
+}
+
+#[cfg(test)]
 mod actor_lifetime_tests {
     use super::*;
 
     #[tokio::test]
     async fn dropping_the_session_handle_closes_the_actor_channel() {
-        let (handle, mut rx, summary_tx, _disk_full_tx) = actor_channel();
+        let (handle, mut rx, summary_tx, _disk_full_tx) = actor_channel(None);
 
         drop(handle);
 

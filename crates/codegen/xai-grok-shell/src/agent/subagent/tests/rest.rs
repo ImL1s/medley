@@ -2863,6 +2863,22 @@ async fn inherited_subagent_effort_reconciles_after_catalog_refresh() {
     explicit_none.reasoning_effort = Some(ReasoningEffort::None);
     reconcile_inherited_subagent_reasoning_effort(&mut explicit_none, true, &none_menu);
     assert_eq!(explicit_none.reasoning_effort, Some(ReasoningEffort::None));
+
+    let ultra_menu = [ReasoningEffortOption {
+        id: "ultra".into(),
+        value: ReasoningEffort::Ultra,
+        label: "Ultra".into(),
+        description: Some("Maximum reasoning with proactive multi-agent guidance".into()),
+        default: true,
+    }];
+    let mut inherited_ultra = prepared.sampling_config.clone();
+    inherited_ultra.reasoning_effort = Some(ReasoningEffort::Ultra);
+    reconcile_inherited_subagent_reasoning_effort(&mut inherited_ultra, true, &ultra_menu);
+    assert_eq!(
+        inherited_ultra.reasoning_effort,
+        Some(ReasoningEffort::Ultra),
+        "a child must retain Ultra when its selected model advertises Ultra"
+    );
 }
 
 #[tokio::test]

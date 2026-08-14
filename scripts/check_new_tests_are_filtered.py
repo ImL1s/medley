@@ -293,6 +293,41 @@ def added_tests(diff: str) -> list[tuple[str, str]]:
 
 
 def selected(test_fn: str, file_path: str, filters: set[str]) -> bool:
+    path = Path(file_path)
+    parts = list(path.parts)
+    try:
+        src_index = parts.index("src")
+    except ValueError:
+        module_components: list[str] = []
+    else:
+        module_components = parts[src_index + 1 :]
+        if module_components:
+            stem = Path(module_components[-1]).stem
+            if stem == "mod":
+                module_components.pop()
+            else:
+                module_components[-1] = stem
+
+    def module_filter_matches(filter_value: str) -> bool:
+        wanted = [component for component in filter_value.strip(":").split("::") if component]
+        if not wanted:
+            return False
+        candidates = [module_components + [test_fn]]
+        # This repository keeps some large test modules in sibling `*_tests.rs`
+        # files included with `#[path = "..."]`. Their Rust module is the stem
+        # before `_tests` (for example `restore_fetch_tests.rs` is declared from
+        # `restore_fetch.rs`). Preserve that established approximation without
+        # letting an arbitrary prefix such as `session` match `session_state`.
+        if module_components and module_components[-1].endswith("_tests"):
+            included = module_components.copy()
+            included[-1] = included[-1].removesuffix("_tests")
+            candidates.append(included + [test_fn])
+        return any(
+            candidate[start : start + len(wanted)] == wanted
+            for candidate in candidates
+            for start in range(len(candidate) - len(wanted) + 1)
+        )
+
     for f in filters:
         if not f:
             return True
@@ -300,10 +335,11 @@ def selected(test_fn: str, file_path: str, filters: set[str]) -> bool:
             return True
         # Module-path filters (`slash::commands::model::`) cannot be matched
         # against a bare fn name; approximate the module path from the file.
-        if "::" in f:
-            as_path = f.strip(":").replace("::", "/")
-            if as_path in file_path:
-                return True
+        # Compare Rust components rather than raw substrings: Cargo's
+        # `session::` filter selects a `session` module but not the
+        # `extensions::session_state` module.
+        if "::" in f and module_filter_matches(f):
+            return True
     return False
 
 

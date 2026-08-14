@@ -31,65 +31,91 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 pub struct MemoryFileWatcher {
     dirty_files: Arc<ArcSwap<HashSet<PathBuf>>>,
     dirty: Arc<AtomicBool>,
-    _watcher: RecommendedWatcher,
+    watcher: std::sync::Mutex<Option<RecommendedWatcher>>,
 }
 
 impl MemoryFileWatcher {
-    /// Start watching the given memory directory for `.md` file changes.
-    ///
-    /// Returns `None` if the watcher fails to initialize (logged, non-fatal).
-    pub fn start(memory_dir: &Path) -> Option<Self> {
-        let dirty_files: Arc<ArcSwap<HashSet<PathBuf>>> =
-            Arc::new(ArcSwap::new(Arc::new(HashSet::new())));
-        let dirty = Arc::new(AtomicBool::new(false));
+    /// Create an in-memory watcher handle without touching the filesystem or
+    /// starting an OS watcher. Fresh session actors use this during provisional
+    /// construction and activate it only after publication.
+    pub fn deferred() -> Self {
+        Self {
+            dirty_files: Arc::new(ArcSwap::new(Arc::new(HashSet::new()))),
+            dirty: Arc::new(AtomicBool::new(false)),
+            watcher: std::sync::Mutex::new(None),
+        }
+    }
 
-        let df = dirty_files.clone();
-        let d = dirty.clone();
+    /// Start the OS watcher for an existing memory directory. Idempotent after
+    /// success; a failed attempt leaves the handle dormant so callers may retry.
+    /// This method never creates the watched directory.
+    pub fn activate(&self, memory_dir: &Path) -> bool {
+        let mut slot = self
+            .watcher
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.is_some() {
+            return true;
+        }
 
-        let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-            let Ok(event) = res else { return };
-            match event.kind {
-                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {}
-                _ => return,
-            }
-            for path in &event.paths {
-                if path.extension().is_some_and(|ext| ext == "md") {
-                    let path = path.clone();
-                    df.rcu(move |old| {
-                        let mut new = (**old).clone();
-                        new.insert(path.clone());
-                        new
-                    });
-                    d.store(true, Ordering::Relaxed);
+        let df = self.dirty_files.clone();
+        let d = self.dirty.clone();
+        let mut watcher =
+            match notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+                let Ok(event) = res else { return };
+                match event.kind {
+                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {}
+                    _ => return,
                 }
-            }
-        })
-        .map_err(|e| {
-            tracing::warn!(error = %e, "failed to create memory file watcher");
-        })
-        .ok()?;
+                for path in &event.paths {
+                    if path.extension().is_some_and(|ext| ext == "md") {
+                        let path = path.clone();
+                        df.rcu(move |old| {
+                            let mut new = (**old).clone();
+                            new.insert(path.clone());
+                            new
+                        });
+                        d.store(true, Ordering::Relaxed);
+                    }
+                }
+            }) {
+                Ok(watcher) => watcher,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to create memory file watcher");
+                    return false;
+                }
+            };
 
-        watcher
-            .watch(memory_dir, RecursiveMode::Recursive)
-            .map_err(|e| {
-                tracing::warn!(
-                    path = %memory_dir.display(),
-                    error = %e,
-                    "failed to watch memory directory"
-                );
-            })
-            .ok()?;
+        if let Err(error) = watcher.watch(memory_dir, RecursiveMode::Recursive) {
+            tracing::warn!(
+                path = %memory_dir.display(),
+                %error,
+                "failed to watch memory directory"
+            );
+            return false;
+        }
 
         tracing::info!(
             path = %memory_dir.display(),
             "memory file watcher started"
         );
+        *slot = Some(watcher);
+        true
+    }
 
-        Some(Self {
-            dirty_files,
-            dirty,
-            _watcher: watcher,
-        })
+    pub fn is_started(&self) -> bool {
+        self.watcher
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
+    /// Start watching the given memory directory for `.md` file changes.
+    ///
+    /// Returns `None` if the watcher fails to initialize (logged, non-fatal).
+    pub fn start(memory_dir: &Path) -> Option<Self> {
+        let watcher = Self::deferred();
+        watcher.activate(memory_dir).then_some(watcher)
     }
 
     /// Quick check: true if any files have been modified since last take.
@@ -114,9 +140,44 @@ mod tests {
     #[test]
     fn test_watcher_starts_on_valid_dir() {
         let tmp = TempDir::new().unwrap();
-        // In CI / containerized environments the OS may deny inotify watches
-        // (e.g. exhausted fs.inotify.max_user_instances); skip gracefully.
-        let _watcher = MemoryFileWatcher::start(tmp.path());
+        let watcher = MemoryFileWatcher::start(tmp.path())
+            .expect("a supported release environment must create an OS file watcher");
+        assert!(watcher.is_started());
+    }
+
+    #[test]
+    fn deferred_watcher_has_no_filesystem_side_effects() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("not-created-by-watcher");
+        let watcher = MemoryFileWatcher::deferred();
+
+        assert!(!watcher.is_started());
+        assert!(!missing.exists());
+        assert!(!watcher.activate(&missing));
+        assert!(!watcher.is_started());
+        assert!(
+            !missing.exists(),
+            "watcher activation must never create the watched directory"
+        );
+    }
+
+    #[test]
+    fn deferred_watcher_can_activate_after_directory_creation() {
+        let tmp = TempDir::new().unwrap();
+        let memory_dir = tmp.path().join("memory");
+        let watcher = MemoryFileWatcher::deferred();
+        assert!(!watcher.is_started());
+
+        std::fs::create_dir(&memory_dir).unwrap();
+        assert!(
+            watcher.activate(&memory_dir),
+            "a supported release environment must activate the deferred watcher"
+        );
+        assert!(watcher.is_started());
+        assert!(
+            watcher.activate(&memory_dir),
+            "activation must be idempotent"
+        );
     }
 
     #[test]

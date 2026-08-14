@@ -1,6 +1,10 @@
 #![cfg_attr(rustfmt, rustfmt::skip)]
 use super::*;
 fn with_env_var<T>(name: &str, value: &str, f: impl FnOnce() -> T) -> T {
+    assert!(
+        serial_test::is_locked_serially(None),
+        "process-global env test helper requires #[serial_test::serial]"
+    );
     let previous = std::env::var(name).ok();
     unsafe {
         std::env::set_var(name, value);
@@ -24,6 +28,7 @@ fn with_env_var<T>(name: &str, value: &str, f: impl FnOnce() -> T) -> T {
     }
 }
 #[test]
+#[serial_test::serial]
 fn expands_env_vars_in_toml_strings() {
     with_env_var(
         "GROK_TEST_CONFIG_EXPAND",
@@ -98,6 +103,10 @@ static MEMORY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Run `f` with `name` set to `value` (Some) or removed (None).
 /// Saves and restores the previous value, even on panic.
 fn with_env_var_opt<T>(name: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
+    assert!(
+        serial_test::is_locked_serially(None),
+        "process-global env test helper requires #[serial_test::serial]"
+    );
     let previous = std::env::var(name).ok();
     match value {
         Some(v) => unsafe { std::env::set_var(name, v) }
@@ -121,6 +130,7 @@ fn with_grok_memory<T>(value: &str, f: impl FnOnce() -> T) -> T {
     with_env_var_opt("GROK_MEMORY", Some(value), f)
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_default_disabled() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -129,6 +139,7 @@ fn memory_config_default_disabled() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_cli_flag_enables() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -137,6 +148,7 @@ fn memory_config_cli_flag_enables() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_from_toml() {
     without_grok_memory(|| {
         let config: toml::Value = toml::from_str("[memory]\nenabled = true").unwrap();
@@ -145,6 +157,7 @@ fn memory_config_from_toml() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_toml_disabled() {
     without_grok_memory(|| {
         let config: toml::Value = toml::from_str("[memory]\nenabled = false").unwrap();
@@ -153,6 +166,7 @@ fn memory_config_toml_disabled() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_env_var_enables() {
     with_grok_memory(
         "1",
@@ -164,6 +178,7 @@ fn memory_config_env_var_enables() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_env_var_true_enables() {
     with_grok_memory(
         "true",
@@ -175,6 +190,7 @@ fn memory_config_env_var_true_enables() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_env_var_zero_does_not_enable() {
     with_grok_memory(
         "0",
@@ -186,6 +202,7 @@ fn memory_config_env_var_zero_does_not_enable() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_env_var_false_does_not_enable() {
     with_grok_memory(
         "false",
@@ -197,6 +214,7 @@ fn memory_config_env_var_false_does_not_enable() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_cli_overrides_toml_disabled() {
     without_grok_memory(|| {
         let config: toml::Value = toml::from_str("[memory]\nenabled = false").unwrap();
@@ -205,6 +223,7 @@ fn memory_config_cli_overrides_toml_disabled() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_env_zero_force_disables_toml_enabled() {
     with_grok_memory(
         "0",
@@ -220,6 +239,7 @@ fn memory_config_env_zero_force_disables_toml_enabled() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_env_false_force_disables_toml_enabled() {
     with_grok_memory(
         "false",
@@ -235,6 +255,7 @@ fn memory_config_env_false_force_disables_toml_enabled() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_cli_flag_overrides_env_disable() {
     with_grok_memory(
         "0",
@@ -249,6 +270,7 @@ fn memory_config_cli_flag_overrides_env_disable() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_no_memory_overrides_all() {
     with_grok_memory(
         "1",
@@ -264,6 +286,7 @@ fn memory_config_no_memory_overrides_all() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_no_memory_alone_disables() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -272,6 +295,7 @@ fn memory_config_no_memory_alone_disables() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_no_memory_overrides_env_enable() {
     with_grok_memory(
         "1",
@@ -283,6 +307,7 @@ fn memory_config_no_memory_overrides_env_enable() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_no_memory_overrides_toml_enabled() {
     without_grok_memory(|| {
         let config: toml::Value = toml::from_str("[memory]\nenabled = true").unwrap();
@@ -294,6 +319,7 @@ fn memory_config_no_memory_overrides_toml_enabled() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_no_memory_overrides_remote_enabled() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -309,6 +335,7 @@ fn memory_config_no_memory_overrides_remote_enabled() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_defaults_are_correct() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -358,6 +385,7 @@ fn memory_config_defaults_are_correct() {
 /// files that contain `debounce_ms` are still parsed without error
 /// (unknown fields are silently ignored by serde default).
 #[test]
+#[serial_test::serial]
 fn memory_config_watcher_debounce_ms_in_toml_is_silently_ignored() {
     without_grok_memory(|| {
         let toml_str = "[memory.watcher]\nenabled = true\ndebounce_ms = 2000\n";
@@ -368,6 +396,7 @@ fn memory_config_watcher_debounce_ms_in_toml_is_silently_ignored() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_full_toml_parsing() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -453,6 +482,7 @@ hard_clear_age_turns = 20
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_partial_toml_uses_defaults_for_missing() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -474,6 +504,7 @@ max_chunk_chars = 3200
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_remote_settings_enable() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -489,6 +520,7 @@ fn memory_config_remote_settings_enable() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_remote_settings_pruning() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -503,6 +535,7 @@ fn memory_config_remote_settings_pruning() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_remote_settings_initial_injection() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -517,6 +550,7 @@ fn memory_config_remote_settings_initial_injection() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_local_initial_injection_overrides_remote() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -536,6 +570,7 @@ min_score = 0.25
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_local_disabled_blocks_remote_enable() {
     without_grok_memory(|| {
         let config: toml::Value = toml::from_str("[memory]\nenabled = false").unwrap();
@@ -551,6 +586,7 @@ fn memory_config_local_disabled_blocks_remote_enable() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_local_overrides_remote() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -570,6 +606,7 @@ max_results = 20
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_remote_none_is_noop() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -588,6 +625,7 @@ fn memory_config_remote_none_is_noop() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn flush_semantic_dedup_threshold_from_remote_when_no_local_flush() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -604,6 +642,7 @@ fn flush_semantic_dedup_threshold_from_remote_when_no_local_flush() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn flush_semantic_dedup_threshold_clamped_from_remote() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -630,6 +669,7 @@ fn flush_semantic_dedup_threshold_clamped_from_remote() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn flush_semantic_dedup_threshold_local_blocks_remote() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -651,6 +691,7 @@ semantic_dedup_threshold = 0.88
     });
 }
 #[test]
+#[serial_test::serial]
 fn flush_semantic_dedup_threshold_defaults_to_none() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -662,6 +703,7 @@ fn flush_semantic_dedup_threshold_defaults_to_none() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_dream_config_defaults() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -674,6 +716,7 @@ fn memory_dream_config_defaults() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_dream_config_toml_parsing() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -694,6 +737,7 @@ check_interval_secs = 600
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_dream_config_remote_override_when_toml_absent() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -713,6 +757,7 @@ fn memory_dream_config_remote_override_when_toml_absent() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_dream_config_remote_ignored_when_toml_present() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -736,6 +781,7 @@ min_hours = 6
     });
 }
 #[test]
+#[serial_test::serial]
 fn expands_multiple_vars_in_one_string() {
     with_env_var(
         "GROK_TEST_USER",
@@ -880,6 +926,7 @@ fn effective_half_life_disabled_legacy_recency_out_of_range_ignored() {
     }
 }
 #[test]
+#[serial_test::serial]
 fn mmr_lambda_clamped_above_one() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -901,6 +948,7 @@ lambda = 2.0
     });
 }
 #[test]
+#[serial_test::serial]
 fn mmr_lambda_clamped_below_zero() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -922,6 +970,7 @@ lambda = -0.5
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_remote_temporal_decay() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -936,6 +985,7 @@ fn memory_config_remote_temporal_decay() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_remote_mmr() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -950,6 +1000,7 @@ fn memory_config_remote_mmr() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_remote_mmr_lambda_clamped() {
     without_grok_memory(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -965,6 +1016,7 @@ fn memory_config_remote_mmr_lambda_clamped() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn memory_config_local_search_blocks_remote_temporal_decay_and_mmr() {
     without_grok_memory(|| {
         let toml_str = r#"
@@ -1002,6 +1054,7 @@ fn with_grok_subagents<T>(value: &str, f: impl FnOnce() -> T) -> T {
     with_env_var_opt("GROK_SUBAGENTS", Some(value), f)
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_default_enabled() {
     without_grok_subagents(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -1060,6 +1113,7 @@ fn subagents_max_depth_invalid_env_falls_through() {
         );
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_parses_max_depth_from_toml() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nmax_depth = 2\n")
@@ -1101,6 +1155,7 @@ fn subagent_limit_behavior_resolves_env_over_toml_over_remote_over_queue() {
     assert_eq!(resolve(None, Some("sometimes"), None), LimitBehavior::Queue);
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_parses_limits_from_toml() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str(
@@ -1114,6 +1169,7 @@ fn subagents_config_parses_limits_from_toml() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_parses_negative_max_depth_without_dropping_section() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str(
@@ -1130,6 +1186,7 @@ fn subagents_config_parses_negative_max_depth_without_dropping_section() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_cli_flag_enables() {
     without_grok_subagents(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -1138,6 +1195,7 @@ fn subagents_config_cli_flag_enables() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_env_var_enables() {
     with_grok_subagents(
         "1",
@@ -1149,6 +1207,7 @@ fn subagents_config_env_var_enables() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_env_var_disables() {
     with_grok_subagents(
         "0",
@@ -1161,6 +1220,7 @@ fn subagents_config_env_var_disables() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_toml_enables() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nenabled = true").unwrap();
@@ -1169,6 +1229,7 @@ fn subagents_config_toml_enables() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_local_disabled_wins() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nenabled = false")
@@ -1178,6 +1239,7 @@ fn subagents_config_local_disabled_wins() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_env_var_disables_default() {
     with_grok_subagents(
         "0",
@@ -1194,6 +1256,7 @@ fn subagents_config_env_var_disables_default() {
 /// A `subagents_enabled` key served by an old cli-chat-proxy must parse
 /// as an unknown key and have no effect on resolution.
 #[test]
+#[serial_test::serial]
 fn subagents_config_remote_settings_key_is_ignored() {
     without_grok_subagents(|| {
         let _settings: crate::util::config::RemoteSettings = serde_json::from_str(
@@ -1206,6 +1269,7 @@ fn subagents_config_remote_settings_key_is_ignored() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_cli_flag_overrides_env_var() {
     with_grok_subagents(
         "0",
@@ -1220,6 +1284,7 @@ fn subagents_config_cli_flag_overrides_env_var() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_models_parsed() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str(
@@ -1241,6 +1306,7 @@ fn subagents_config_models_parsed() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_models_empty_when_missing() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nenabled = true").unwrap();
@@ -1250,6 +1316,7 @@ fn subagents_config_models_empty_when_missing() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_models_without_enabled() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str(
@@ -1269,6 +1336,7 @@ fn subagents_config_models_without_enabled() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_models_with_env_var_enables() {
     with_grok_subagents(
         "1",
@@ -1287,6 +1355,7 @@ fn subagents_config_models_with_env_var_enables() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_toggle_mixed_values() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str(
@@ -1312,6 +1381,7 @@ fn subagents_config_toggle_mixed_values() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn subagents_config_toggle_missing_defaults_to_empty() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nenabled = true").unwrap();
@@ -1557,6 +1627,7 @@ fn with_model_overrides_env<T>(
     with_model_overrides_env_full(ws, ss, id, None, f)
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_remote_settings_blocked_by_local_config() {
     with_model_overrides_env(
         None,
@@ -1584,6 +1655,7 @@ fn model_overrides_remote_settings_blocked_by_local_config() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_cli_overrides_everything() {
     with_model_overrides_env(
         Some("env-ws"),
@@ -1611,6 +1683,7 @@ fn model_overrides_cli_overrides_everything() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_remote_settings_applies_without_local_config() {
     with_model_overrides_env(
         None,
@@ -1632,6 +1705,7 @@ fn model_overrides_remote_settings_applies_without_local_config() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_local_image_description_wins_over_remote() {
     with_model_overrides_env(
         None,
@@ -1655,6 +1729,7 @@ fn model_overrides_local_image_description_wins_over_remote() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_default_image_description_is_grok_build() {
     with_model_overrides_env(
         None,
@@ -1671,6 +1746,7 @@ fn model_overrides_default_image_description_is_grok_build() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_default_session_summary_is_grok_build() {
     with_model_overrides_env(
         None,
@@ -1687,6 +1763,7 @@ fn model_overrides_default_session_summary_is_grok_build() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_unset_auxiliary_lanes_follow_the_local_configured_default() {
     with_model_overrides_env(
         None,
@@ -1721,6 +1798,7 @@ fn model_overrides_unset_auxiliary_lanes_follow_the_local_configured_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_unset_auxiliary_lanes_follow_the_env_configured_default() {
     with_model_overrides_and_default_env(
         Some("gpt-5.3-codex-spark"),
@@ -1741,6 +1819,7 @@ fn model_overrides_unset_auxiliary_lanes_follow_the_env_configured_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_cli_configured_default_wins_over_other_defaults() {
     with_model_overrides_and_default_env(
         Some("env-default"),
@@ -1815,6 +1894,7 @@ fn model_overrides_inherited_image_uses_child_operative_model() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_unset_auxiliary_lanes_follow_the_remote_configured_default() {
     with_model_overrides_env(
         None,
@@ -1833,6 +1913,7 @@ fn model_overrides_unset_auxiliary_lanes_follow_the_remote_configured_default() 
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_a_configured_default_does_not_pin_prompt_suggestion() {
     with_model_overrides_env(
         None,
@@ -1859,6 +1940,7 @@ fn model_overrides_a_configured_default_does_not_pin_prompt_suggestion() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_local_session_summary_wins_over_remote() {
     with_model_overrides_env(
         None,
@@ -1882,6 +1964,7 @@ fn model_overrides_local_session_summary_wins_over_remote() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_env_session_summary_overrides_remote() {
     with_model_overrides_env(
         None,
@@ -1899,6 +1982,7 @@ fn model_overrides_env_session_summary_overrides_remote() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_env_session_summary_overrides_local() {
     with_model_overrides_env(
         None,
@@ -1918,6 +2002,7 @@ fn model_overrides_env_session_summary_overrides_local() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_empty_session_summary_toml_uses_default() {
     with_model_overrides_env(
         None,
@@ -1940,6 +2025,7 @@ fn model_overrides_empty_session_summary_toml_uses_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_empty_session_summary_remote_uses_default() {
     with_model_overrides_env(
         None,
@@ -1960,6 +2046,7 @@ fn model_overrides_empty_session_summary_remote_uses_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_cli_session_summary_overrides_everything() {
     with_model_overrides_env(
         None,
@@ -1988,6 +2075,7 @@ fn model_overrides_cli_session_summary_overrides_everything() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_empty_cli_session_summary_uses_default() {
     with_model_overrides_env(
         None,
@@ -2004,6 +2092,7 @@ fn model_overrides_empty_cli_session_summary_uses_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_env_image_description_overrides_remote() {
     with_model_overrides_env(
         None,
@@ -2021,6 +2110,7 @@ fn model_overrides_env_image_description_overrides_remote() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_env_image_description_overrides_local() {
     with_model_overrides_env(
         None,
@@ -2040,6 +2130,7 @@ fn model_overrides_env_image_description_overrides_local() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_empty_image_description_toml_uses_default() {
     with_model_overrides_env(
         None,
@@ -2062,6 +2153,7 @@ fn model_overrides_empty_image_description_toml_uses_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_empty_image_description_remote_uses_default() {
     with_model_overrides_env(
         None,
@@ -2082,6 +2174,7 @@ fn model_overrides_empty_image_description_remote_uses_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_prompt_suggestion_unpinned_by_default() {
     with_model_overrides_env(
         None,
@@ -2095,6 +2188,7 @@ fn model_overrides_prompt_suggestion_unpinned_by_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_prompt_suggestion_local_wins_over_remote() {
     with_model_overrides_env(
         None,
@@ -2121,6 +2215,7 @@ fn model_overrides_prompt_suggestion_local_wins_over_remote() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_prompt_suggestion_remote_applies_without_local() {
     with_model_overrides_env(
         None,
@@ -2141,6 +2236,7 @@ fn model_overrides_prompt_suggestion_remote_applies_without_local() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_prompt_suggestion_env_wins_over_local_and_remote() {
     with_model_overrides_env_full(
         None,
@@ -2168,6 +2264,7 @@ fn model_overrides_prompt_suggestion_env_wins_over_local_and_remote() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_prompt_suggestion_blank_values_are_unset() {
     with_model_overrides_env_full(
         None,
@@ -2234,6 +2331,7 @@ fn with_grok_respect_gitignore<T>(value: &str, f: impl FnOnce() -> T) -> T {
     with_tools_env(Some(value), None, f)
 }
 #[test]
+#[serial_test::serial]
 fn tools_config_default_disabled() {
     without_grok_respect_gitignore(|| {
         let config = toml::Value::Table(toml::map::Map::new());
@@ -2242,6 +2340,7 @@ fn tools_config_default_disabled() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn tools_config_toml_disables() {
     without_grok_respect_gitignore(|| {
         let config: toml::Value = toml::from_str("[tools]\nrespect_gitignore = false")
@@ -2251,6 +2350,7 @@ fn tools_config_toml_disables() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn tools_config_env_var_disables() {
     with_grok_respect_gitignore(
         "0",
@@ -2262,6 +2362,7 @@ fn tools_config_env_var_disables() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn tools_config_env_var_overrides_toml() {
     with_grok_respect_gitignore(
         "1",
@@ -2276,6 +2377,7 @@ fn tools_config_env_var_overrides_toml() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn tools_config_env_false_overrides_toml_true() {
     with_grok_respect_gitignore(
         "false",
@@ -2291,6 +2393,7 @@ fn tools_config_env_false_overrides_toml_true() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn zdr_incompatible_tools_env_overrides_toml_false() {
     with_tools_env(
         None,
@@ -2329,6 +2432,7 @@ fn zdr_video_output_s3_deserializes_from_tools_block() {
     assert!(s3.is_valid());
 }
 #[test]
+#[serial_test::serial]
 fn incomplete_zdr_video_output_s3_is_ignored() {
     without_grok_respect_gitignore(|| {
         let config: toml::Value = toml::from_str(
@@ -2350,6 +2454,7 @@ fn incomplete_zdr_video_output_s3_is_ignored() {
     });
 }
 #[test]
+#[serial_test::serial]
 fn malformed_zdr_video_output_s3_preserves_zdr_flag() {
     without_grok_respect_gitignore(|| {
         let config: toml::Value = toml::from_str(

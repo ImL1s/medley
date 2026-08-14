@@ -215,7 +215,7 @@ impl SessionActor {
         Some(fallback)
     }
 }
-async fn shutdown_workflows(session: &SessionActor) {
+async fn cancel_workflows(session: &SessionActor) {
     if let Err(run_ids) = session
         .workflow_manager
         .lock()
@@ -228,6 +228,10 @@ async fn shutdown_workflows(session: &SessionActor) {
             "workflow shutdown completed with interrupted runs"
         );
     }
+}
+
+async fn shutdown_workflows(session: &SessionActor) {
+    cancel_workflows(session).await;
     let (respond_to, ack) = tokio::sync::oneshot::channel();
     if session
         .notifications
@@ -2257,6 +2261,15 @@ pub(super) async fn run_session(
                             );
                         }
                         SessionCommand::Shutdown(kind) => {
+                            if kind == crate::session::ShutdownKind::AbortUnpublished {
+                                session.abort_turn_summary();
+                                // An unpublished actor owns only provisional
+                                // local state.  Flushing here could publish it
+                                // through remote or relay sync before the
+                                // caller deletes the provisional persistence.
+                                cancel_workflows(&session).await;
+                                return;
+                            }
                             shutdown_workflows(&session).await;
                             // Flush the actor-owned replay buffer so any
                             // streamed chunks still pending at shutdown

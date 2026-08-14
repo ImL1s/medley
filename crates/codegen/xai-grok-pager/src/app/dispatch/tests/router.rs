@@ -1158,6 +1158,7 @@ fn apply_deferred_switch_outcome_hard_blocks_unready() {
                 model_id: unready_id,
                 effort: None,
                 prev_model_id: None,
+                prev_model_id_captured: false,
             }),
             effort_error: None,
         },
@@ -1189,6 +1190,7 @@ fn apply_deferred_switch_outcome_hard_blocks_catalog_miss() {
                 model_id: unknown_id,
                 effort: None,
                 prev_model_id: None,
+                prev_model_id_captured: false,
             }),
             effort_error: None,
         },
@@ -1291,6 +1293,7 @@ fn agent_type_mismatch_with_effort_stashes_deferred_switch() {
                 model_id,
                 effort,
                 prev_model_id: None,
+                prev_model_id_captured: false,
             }),
             "effort override must be stashed for the shell via deferred_model_switch",
         );
@@ -1311,6 +1314,7 @@ fn deferred_model_switch_still_works_for_cli_override() {
             model_id: cli_model,
             effort: None,
             prev_model_id: None,
+            prev_model_id_captured: false,
         }),
         "CLI -m override must still populate deferred_model_switch",
     );
@@ -1719,7 +1723,7 @@ fn all_constructor_paths_initialize_slash_fields() {
     }
 }
 #[test]
-fn deferred_switch_overwritten_by_second_switch() {
+fn rapid_deferred_switch_preserves_captured_none_rollback() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
     let model_a = acp::ModelId::new(std::sync::Arc::from("model-a"));
@@ -1746,7 +1750,8 @@ fn deferred_switch_overwritten_by_second_switch() {
         Some(crate::app::agent::DeferredModelSwitch {
             model_id: model_b.clone(),
             effort: None,
-            prev_model_id: Some(model_a),
+            prev_model_id: None,
+            prev_model_id_captured: true,
         })
     );
 }
@@ -1768,6 +1773,7 @@ fn pick_over_cli_seed_keeps_display_as_rollback_target() {
         model_id: cli_model,
         effort: None,
         prev_model_id: None,
+        prev_model_id_captured: false,
     });
     dispatch(
         Action::SwitchModel {
@@ -1782,6 +1788,7 @@ fn pick_over_cli_seed_keeps_display_as_rollback_target() {
             model_id: picked,
             effort: None,
             prev_model_id: Some(displayed),
+            prev_model_id_captured: true,
         })
     );
 }
@@ -1814,6 +1821,7 @@ fn deferred_switch_updates_display_and_persists() {
             model_id: model_id.clone(),
             effort: None,
             prev_model_id: None,
+            prev_model_id_captured: true,
         }),
         "switch must still round-trip once the session exists"
     );
