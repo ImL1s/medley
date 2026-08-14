@@ -156,8 +156,7 @@ fn parse_model_readiness(
 /// User-facing reason when a model id is missing from the catalog or not ready.
 pub(crate) const MODEL_CATALOG_MISS_REASON: &str = "Model no longer available";
 /// Toast when a picker commit targets a row the live catalog no longer owns.
-pub(crate) const CATALOG_CHANGED_TOAST: &str =
-    "Model catalog changed — select a model again.";
+pub(crate) const CATALOG_CHANGED_TOAST: &str = "Model catalog changed — select a model again.";
 /// ACP meta flag on the unavailable-resident placeholder kept after a catalog drop.
 pub(crate) const UNAVAILABLE_RESIDENT_META: &str = "unavailableResident";
 

@@ -1665,8 +1665,8 @@ async fn a_server_that_publishes_is_not_second_guessed_with_a_pull() {
         summary.contains("the check that only the push channel runs"),
         "{summary}"
     );
-    let initial_pulls = published_pulls(&summary)
-        .expect("push mock stamps pulls=N on the diagnostic it published");
+    let initial_pulls =
+        published_pulls(&summary).expect("push mock stamps pulls=N on the diagnostic it published");
 
     // And from here on it is not asked at all — its own reports are the truth.
     let before = mgr.lock().await.clients["mock-ts"].pull.support();

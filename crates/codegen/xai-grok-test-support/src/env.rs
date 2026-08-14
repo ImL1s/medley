@@ -86,11 +86,7 @@ impl EnvGuard {
         // SAFETY: this thread holds [`ENV_MUTEX`] (and callers are `#[serial]`),
         // so no other thread touches the env while the lease is live.
         unsafe { std::env::set_var(key, value) };
-        Self {
-            key,
-            prior,
-            _lease,
-        }
+        Self { key, prior, _lease }
     }
 
     /// Unset `key` for the guard's lifetime.
@@ -99,11 +95,7 @@ impl EnvGuard {
         let prior = std::env::var_os(key);
         // SAFETY: see [`EnvGuard::set`].
         unsafe { std::env::remove_var(key) };
-        Self {
-            key,
-            prior,
-            _lease,
-        }
+        Self { key, prior, _lease }
     }
 }
 

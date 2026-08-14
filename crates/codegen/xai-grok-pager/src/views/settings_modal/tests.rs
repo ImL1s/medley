@@ -8234,7 +8234,9 @@ fn unavailable_model_picker_state() -> SettingsModalState {
         &snapshot,
     );
     assert!(
-        choices.iter().any(|c| c.canonical == "Grok 4.5" && c.disabled),
+        choices
+            .iter()
+            .any(|c| c.canonical == "Grok 4.5" && c.disabled),
         "unavailable Codex/Grok row must be marked disabled"
     );
     assert!(
@@ -8293,8 +8295,16 @@ fn settings_model_picker_mouse_on_disabled_row_does_not_commit() {
         Rect::new(0, 2, 40, 1),
     ];
     // Focus the disabled row, then re-click it (mouse commit path).
-    let moved = handle_settings_mouse(&mut s, MouseEventKind::Down(crossterm::event::MouseButton::Left), 2, 2);
-    assert!(matches!(moved, SettingsKeyOutcome::Changed | SettingsKeyOutcome::Unchanged));
+    let moved = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        2,
+        2,
+    );
+    assert!(matches!(
+        moved,
+        SettingsKeyOutcome::Changed | SettingsKeyOutcome::Unchanged
+    ));
     let outcome = handle_settings_mouse(
         &mut s,
         MouseEventKind::Down(crossterm::event::MouseButton::Left),

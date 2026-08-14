@@ -689,7 +689,10 @@ impl SettingsModalState {
 
     /// Keep a live `PickingEnum` index inside the refreshed catalog.
     pub fn clamp_picking_enum_after_catalog_refresh(&mut self) {
-        let SettingsMode::PickingEnum { key, choices_idx, .. } = &mut self.state.mode else {
+        let SettingsMode::PickingEnum {
+            key, choices_idx, ..
+        } = &mut self.state.mode
+        else {
             return;
         };
         let len = match self.registry.find(*key).map(|m| &m.kind) {

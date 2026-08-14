@@ -5370,9 +5370,7 @@ mod tests {
             "existing Codex instructions must be preserved: {instructions}"
         );
         assert_eq!(
-            instructions
-                .matches(CODEX_ULTRA_PROACTIVE_MARKER)
-                .count(),
+            instructions.matches(CODEX_ULTRA_PROACTIVE_MARKER).count(),
             1,
             "the proactive marker must be injected exactly once: {instructions}"
         );
@@ -5445,9 +5443,7 @@ mod tests {
         let chat: xai_grok_sampling_types::ChatCompletionRequest = req.into();
         let chat_json = serde_json::to_value(&chat).expect("serialize Chat Completions body");
         assert!(
-            !chat_json
-                .to_string()
-                .contains(CODEX_ULTRA_PROACTIVE_MARKER),
+            !chat_json.to_string().contains(CODEX_ULTRA_PROACTIVE_MARKER),
             "Chat Completions must not receive the Codex Ultra proactive marker: {chat_json}"
         );
     }

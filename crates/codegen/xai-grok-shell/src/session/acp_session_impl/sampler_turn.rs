@@ -37,7 +37,10 @@ fn remainder_after_http_400_prefix(message: &str) -> Option<&str> {
             continue;
         };
         let after_code = after_code.trim_start_matches('.').trim_start();
-        let after_code = after_code.strip_prefix(':').unwrap_or(after_code).trim_start();
+        let after_code = after_code
+            .strip_prefix(':')
+            .unwrap_or(after_code)
+            .trim_start();
         let after_code = after_code
             .strip_prefix("Request failed (HTTP 400).")
             .unwrap_or(after_code)

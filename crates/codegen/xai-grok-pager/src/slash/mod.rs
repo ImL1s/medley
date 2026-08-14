@@ -2125,7 +2125,10 @@ mod tests {
         assert!(
             snap.matches[0].display.contains("Grok 4.5"),
             "ranked fuzzy query must surface Grok, got {:?}",
-            snap.matches.iter().map(|r| r.display.as_str()).collect::<Vec<_>>()
+            snap.matches
+                .iter()
+                .map(|r| r.display.as_str())
+                .collect::<Vec<_>>()
         );
         assert!(
             !snap.matches[0].display.contains("(current)"),

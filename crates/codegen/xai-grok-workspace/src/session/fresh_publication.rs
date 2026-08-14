@@ -69,11 +69,7 @@ impl FreshPublicationFinalizeError {
         !matches!(self, Self::NotCommitted { .. })
     }
 
-    fn not_committed(
-        stage: FinalizeStage,
-        operation: FinalizeOperation,
-        error: io::Error,
-    ) -> Self {
+    fn not_committed(stage: FinalizeStage, operation: FinalizeOperation, error: io::Error) -> Self {
         Self::NotCommitted {
             stage,
             operation,
@@ -146,13 +142,10 @@ impl FreshPublication {
         }
         let (staging_root, staging_anchor) = ensure_private_staging_hierarchy(root_dir)?;
         let session_name = OsString::from(session_id);
-        let container_name = OsString::from(format!(
-            "session-{:x}",
-            {
-                use sha2::{Digest, Sha256};
-                Sha256::digest(session_id.as_bytes())
-            }
-        ));
+        let container_name = OsString::from(format!("session-{:x}", {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(session_id.as_bytes())
+        }));
         if let Ok(existing) = staging_anchor.open_child_dir(&container_name) {
             let _ = existing.remove_tree_self();
         }
@@ -160,7 +153,8 @@ impl FreshPublication {
         stage_container_anchor.ensure_owner_only()?;
         let stage_session_anchor = stage_container_anchor.create_child_dir(&session_name)?;
         stage_session_anchor.ensure_owner_only()?;
-        let marker = stage_session_anchor.create_child_file_new(OsStr::new(UNPUBLISHED_SESSION_MARKER))?;
+        let marker =
+            stage_session_anchor.create_child_file_new(OsStr::new(UNPUBLISHED_SESSION_MARKER))?;
         marker.sync_all()?;
         stage_session_anchor.sync()?;
 
@@ -284,18 +278,18 @@ impl FreshPublication {
                 ));
             }
         };
-        let sessions_anchor = match open_or_create_anchored_child(&root_anchor, OsStr::new("sessions"))
-        {
-            Ok(sessions) => sessions,
-            Err(error) => {
-                restore_stage(&self.stage_session_anchor, stage_session_anchor);
-                return Err(FreshPublicationFinalizeError::not_committed(
-                    FinalizeStage::PreCommit,
-                    FinalizeOperation::OpenSessions,
-                    error,
-                ));
-            }
-        };
+        let sessions_anchor =
+            match open_or_create_anchored_child(&root_anchor, OsStr::new("sessions")) {
+                Ok(sessions) => sessions,
+                Err(error) => {
+                    restore_stage(&self.stage_session_anchor, stage_session_anchor);
+                    return Err(FreshPublicationFinalizeError::not_committed(
+                        FinalizeStage::PreCommit,
+                        FinalizeOperation::OpenSessions,
+                        error,
+                    ));
+                }
+            };
         sessions_anchor.ensure_owner_only().map_err(|error| {
             restore_stage(&self.stage_session_anchor, stage_session_anchor);
             FreshPublicationFinalizeError::not_committed(
@@ -305,7 +299,8 @@ impl FreshPublication {
             )
         })?;
 
-        let published_parent_anchor = match sessions_anchor.open_child_dir(&self.published_parent_name)
+        let published_parent_anchor = match sessions_anchor
+            .open_child_dir(&self.published_parent_name)
         {
             Ok(parent) => parent,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -345,8 +340,11 @@ impl FreshPublication {
         };
 
         self.publish_attempts.fetch_add(1, Ordering::SeqCst);
-        let published_session_anchor = match rename(stage_session_anchor, &published_parent_anchor, &self.session_name)
-        {
+        let published_session_anchor = match rename(
+            stage_session_anchor,
+            &published_parent_anchor,
+            &self.session_name,
+        ) {
             Ok(child) => child,
             Err(failure) => {
                 return self.reconcile_or_abort(failure, &published_parent_anchor);
@@ -355,7 +353,12 @@ impl FreshPublication {
 
         self.mark_committed();
         self.drop_stage_container();
-        self.finish_committed(published_session_anchor, &published_parent_anchor, &sessions_anchor, sync_published)
+        self.finish_committed(
+            published_session_anchor,
+            &published_parent_anchor,
+            &sessions_anchor,
+            sync_published,
+        )
     }
 
     fn reconcile_or_abort(
@@ -431,17 +434,14 @@ impl FreshPublication {
                 ),
             });
         }
-        sync_published(
-            &self.root_dir.join("sessions"),
-            &self.published_parent,
-        )
-        .and_then(|()| published_session_anchor.sync())
-        .and_then(|()| published_parent_anchor.sync())
-        .and_then(|()| sessions_anchor.sync())
-        .map_err(|error| FreshPublicationFinalizeError::CommittedDurability {
-            operation: FinalizeOperation::Sync,
-            error,
-        })
+        sync_published(&self.root_dir.join("sessions"), &self.published_parent)
+            .and_then(|()| published_session_anchor.sync())
+            .and_then(|()| published_parent_anchor.sync())
+            .and_then(|()| sessions_anchor.sync())
+            .map_err(|error| FreshPublicationFinalizeError::CommittedDurability {
+                operation: FinalizeOperation::Sync,
+                error,
+            })
     }
 
     fn mark_committed(&self) {
@@ -511,9 +511,7 @@ fn open_or_create_anchored_child(
     }
 }
 
-fn ensure_private_staging_hierarchy(
-    root_dir: &Path,
-) -> io::Result<(PathBuf, AnchoredDirectory)> {
+fn ensure_private_staging_hierarchy(root_dir: &Path) -> io::Result<(PathBuf, AnchoredDirectory)> {
     let root = AnchoredDirectory::open_root(root_dir)?;
     let private = open_or_create_anchored_child(&root, OsStr::new(".private"))?;
     private.ensure_owner_only()?;
@@ -540,7 +538,10 @@ fn validate_staged_summary(stage_session: &Path) -> io::Result<()> {
         ));
     }
     let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("staged summary is not json: {error}"))
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("staged summary is not json: {error}"),
+        )
     })?;
     if !value.is_object() {
         return Err(io::Error::new(
@@ -601,10 +602,12 @@ mod tests {
         assert!(publication.is_committed());
         assert_eq!(publication.publish_attempts(), 1);
         assert!(publication.published_session().join(SUMMARY_FILE).is_file());
-        assert!(!publication
-            .published_session()
-            .join(UNPUBLISHED_SESSION_MARKER)
-            .exists());
+        assert!(
+            !publication
+                .published_session()
+                .join(UNPUBLISHED_SESSION_MARKER)
+                .exists()
+        );
         assert!(!publication.stage_session().exists());
         assert!(!marker_free_public_dir_without_summary(
             publication.published_session()
@@ -702,14 +705,14 @@ mod tests {
     fn publish_is_invoked_exactly_once_even_on_reconciled_eexist() {
         let (_root, publication) = prepare();
         let attempts_before = publication.publish_attempts();
-        let _ = publication.finalize_with_rename(|source, target_parent, target_name| {
-            match source.try_rename_self_no_replace(target_parent, target_name) {
-                Ok(published) => Err(AnchoredRenameError {
-                    error: io::Error::from_raw_os_error(17),
-                    source: published,
-                }),
-                Err(failure) => Err(failure),
-            }
+        let _ = publication.finalize_with_rename(|source, target_parent, target_name| match source
+            .try_rename_self_no_replace(target_parent, target_name)
+        {
+            Ok(published) => Err(AnchoredRenameError {
+                error: io::Error::from_raw_os_error(17),
+                source: published,
+            }),
+            Err(failure) => Err(failure),
         });
         assert_eq!(publication.publish_attempts(), attempts_before + 1);
     }

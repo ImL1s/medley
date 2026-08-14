@@ -159,11 +159,9 @@ impl ModelState {
         fallback_current: Option<acp::ModelId>,
     ) {
         let previous_current_model = self.current.clone();
-        let previous_name = previous_current_model.as_ref().and_then(|id| {
-            self.available
-                .get(id)
-                .map(|info| info.name.clone())
-        });
+        let previous_name = previous_current_model
+            .as_ref()
+            .and_then(|id| self.available.get(id).map(|info| info.name.clone()));
         self.available = new_available;
         if let Some(ref id) = self.current {
             if !self.available.contains_key(id) {
@@ -518,8 +516,10 @@ mod tests {
             placeholder.meta.as_ref()
         ));
         assert_eq!(
-            crate::slash::commands::model::unready_reason_from_model_meta(placeholder.meta.as_ref())
-                .as_deref(),
+            crate::slash::commands::model::unready_reason_from_model_meta(
+                placeholder.meta.as_ref()
+            )
+            .as_deref(),
             Some(crate::slash::commands::model::MODEL_CATALOG_MISS_REASON)
         );
     }
@@ -542,7 +542,10 @@ mod tests {
         );
         state.update_catalog(dropped, Some(id_b.clone()));
         assert!(crate::slash::commands::model::is_unavailable_resident_meta(
-            state.available.get(&id_a).and_then(|info| info.meta.as_ref())
+            state
+                .available
+                .get(&id_a)
+                .and_then(|info| info.meta.as_ref())
         ));
 
         let restored = acp::ModelInfo::new(id_a.clone(), "Resident Gone".to_string()).meta(Some(
@@ -565,9 +568,7 @@ mod tests {
 
         assert_eq!(state.current, Some(id_a.clone()));
         let live = state.available.get(&id_a).expect("restored resident");
-        assert!(!crate::slash::commands::model::is_unavailable_resident_meta(
-            live.meta.as_ref()
-        ));
+        assert!(!crate::slash::commands::model::is_unavailable_resident_meta(live.meta.as_ref()));
         assert!(
             crate::slash::commands::model::unready_reason_from_model_meta(live.meta.as_ref())
                 .is_none()

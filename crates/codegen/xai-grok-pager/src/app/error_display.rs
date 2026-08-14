@@ -886,7 +886,9 @@ mod tests {
         assert_eq!(formatted.status, Some(400));
         assert_eq!(formatted.headline, "Bad request (400)");
         assert!(
-            formatted.detail.contains("Invalid value for reasoning.effort"),
+            formatted
+                .detail
+                .contains("Invalid value for reasoning.effort"),
             "safe field-level detail must remain visible, got {}",
             formatted.detail
         );

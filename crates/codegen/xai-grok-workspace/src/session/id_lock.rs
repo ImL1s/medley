@@ -32,9 +32,10 @@ pub struct SessionIdLock {
 impl SessionIdLock {
     /// Downgrade an exclusive claim to a lifetime shared mutation lease.
     pub fn transition_exclusive_to_lifetime_shared(&mut self) -> io::Result<()> {
-        let mutation = self.mutation.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "mutation lease missing")
-        })?;
+        let mutation = self
+            .mutation
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "mutation lease missing"))?;
         FileExt::unlock(mutation)?;
         FileExt::lock_shared(mutation)?;
         if let Some(namespace) = self.namespace.as_ref() {
@@ -80,14 +81,10 @@ pub fn open_session_id_lock_directory(root_dir: &Path) -> io::Result<AnchoredDir
 }
 
 /// Open namespace then mutation leaves through one retained `session-ids` parent.
-pub fn open_session_id_lock_files(
-    root_dir: &Path,
-    session_id: &str,
-) -> io::Result<(File, File)> {
+pub fn open_session_id_lock_files(root_dir: &Path, session_id: &str) -> io::Result<(File, File)> {
     let lock_dir = open_session_id_lock_directory(root_dir)?;
-    let namespace = lock_dir.open_or_create_owner_only_child_file(OsStr::new(
-        &session_claim_lock_name(session_id),
-    ))?;
+    let namespace = lock_dir
+        .open_or_create_owner_only_child_file(OsStr::new(&session_claim_lock_name(session_id)))?;
     let mutation = lock_dir.open_or_create_owner_only_child_file(OsStr::new(
         &session_mutation_lock_name(session_id),
     ))?;
@@ -247,8 +244,14 @@ mod tests {
         let (namespace, mutation) = open_session_id_lock_files(temp.path(), SESSION_ID).unwrap();
         assert_eq!(mode(&locks), 0o700);
         assert_eq!(mode(&session_ids), 0o700);
-        assert_eq!(namespace.metadata().unwrap().permissions().mode() & 0o777, 0o600);
-        assert_eq!(mutation.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            namespace.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            mutation.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[cfg(unix)]
@@ -268,9 +271,17 @@ mod tests {
         let root = std::path::Path::new(&root);
         assert_eq!(mode(&root.join(".locks")), 0o700);
         assert_eq!(mode(&lock_dir(root)), 0o700);
-        assert_eq!(namespace.metadata().unwrap().permissions().mode() & 0o777, 0o600);
-        assert_eq!(mutation.metadata().unwrap().permissions().mode() & 0o777, 0o600);
-        assert_eq!(namespace.metadata().unwrap().uid(), unsafe { libc::geteuid() });
+        assert_eq!(
+            namespace.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            mutation.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(namespace.metadata().unwrap().uid(), unsafe {
+            libc::geteuid()
+        });
         assert_eq!(namespace.metadata().unwrap().nlink(), 1);
         assert_eq!(mutation.metadata().unwrap().nlink(), 1);
     }
@@ -314,7 +325,11 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp.path().join(".locks")).unwrap();
-        symlink(outside.path(), temp.path().join(".locks").join("session-ids")).unwrap();
+        symlink(
+            outside.path(),
+            temp.path().join(".locks").join("session-ids"),
+        )
+        .unwrap();
         assert!(open_session_id_lock_files(temp.path(), SESSION_ID).is_err());
         assert_eq!(
             std::fs::read(outside.path().join("sentinel")).unwrap(),
@@ -502,10 +517,6 @@ mod tests {
         drop((source, target));
         let (source, target) = acquire_ordered_copy_locks_sync(temp.path(), b, a).unwrap();
         drop((source, target));
-        assert!(
-            acquire_ordered_copy_locks_sync(temp.path(), a, a).is_err()
-        );
+        assert!(acquire_ordered_copy_locks_sync(temp.path(), a, a).is_err());
     }
 }
-
-

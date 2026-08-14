@@ -1816,8 +1816,7 @@ mod tests {
             Some("max")
         );
         assert!(
-            json.to_string()
-                .contains(r#""effort":"max""#)
+            json.to_string().contains(r#""effort":"max""#)
                 || json.pointer("/reasoning/effort") == Some(&serde_json::json!("max"))
         );
         assert_ne!(

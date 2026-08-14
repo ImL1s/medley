@@ -168,7 +168,10 @@ impl JsonlStorageAdapter {
         summary.sandbox_profile = xai_grok_sandbox::configured_profile_name().map(String::from);
         let bytes = serde_json::to_vec_pretty(&summary)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        super::write_bytes_atomic(&publication.stage_session().join(super::SUMMARY_FILE), &bytes)?;
+        super::write_bytes_atomic(
+            &publication.stage_session().join(super::SUMMARY_FILE),
+            &bytes,
+        )?;
         match publication.finalize() {
             Ok(()) => Ok(summary),
             Err(error) if error.is_committed() => {

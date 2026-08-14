@@ -567,15 +567,13 @@ fn picker_disabled_reason(
     };
     let choices = dynamic_enum_choices(*source, &state.pager_snapshot);
     let choice = choices.get(idx)?;
-    choice
-        .disabled
-        .then(|| {
-            if choice.disabled_reason.is_empty() {
-                crate::slash::commands::model::CATALOG_CHANGED_TOAST.to_string()
-            } else {
-                choice.disabled_reason.clone()
-            }
-        })
+    choice.disabled.then(|| {
+        if choice.disabled_reason.is_empty() {
+            crate::slash::commands::model::CATALOG_CHANGED_TOAST.to_string()
+        } else {
+            choice.disabled_reason.clone()
+        }
+    })
 }
 
 fn picker_choice_at_owned(

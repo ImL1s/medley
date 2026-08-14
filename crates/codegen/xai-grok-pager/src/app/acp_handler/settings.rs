@@ -91,10 +91,7 @@ fn refresh_open_model_arg_picker(agent: &mut AgentView) {
         else {
             return;
         };
-        let ctx = agent
-            .prompt
-            .slash_controller
-            .app_ctx(&agent.session.models);
+        let ctx = agent.prompt.slash_controller.app_ctx(&agent.session.models);
         cmd.suggest_args(&ctx, &args_query).unwrap_or_default()
     };
 
