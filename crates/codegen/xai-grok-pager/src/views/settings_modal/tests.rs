@@ -8208,3 +8208,101 @@ fn locked_coding_data_sharing_expanded_description_replaces_with_reason() {
         "unlocked expansion must not mention the team-admin lock: {text:?}"
     );
 }
+
+fn unavailable_model_picker_state() -> SettingsModalState {
+    use crate::settings::dynamic_enum_choices;
+    let snapshot = PagerLocalSnapshot {
+        available_models: vec![
+            (
+                "GPT-5.6 Sol".to_string(),
+                agent_client_protocol::ModelId::new(Arc::from("gpt-5.6-sol")),
+            ),
+            (
+                "Grok 4.5".to_string(),
+                agent_client_protocol::ModelId::new(Arc::from("grok-4.5")),
+            ),
+        ],
+        unavailable_model_reasons: vec![(
+            "Grok 4.5".to_string(),
+            "missing XAI_API_KEY".to_string(),
+        )],
+        current_model_name: Some("GPT-5.6 Sol".to_string()),
+        ..PagerLocalSnapshot::default()
+    };
+    let choices = dynamic_enum_choices(
+        crate::settings::DynamicEnumSource::ActiveModelCatalog,
+        &snapshot,
+    );
+    assert!(
+        choices.iter().any(|c| c.canonical == "Grok 4.5" && c.disabled),
+        "unavailable Codex/Grok row must be marked disabled"
+    );
+    assert!(
+        choices
+            .iter()
+            .any(|c| c.canonical == "GPT-5.6 Sol" && !c.disabled),
+        "ready Codex row must stay selectable"
+    );
+    SettingsModalState::new(
+        Arc::new(SettingsRegistry::defaults()),
+        UiConfig::default(),
+        snapshot,
+    )
+}
+
+#[test]
+fn dynamic_enum_choices_marks_unavailable_models_disabled() {
+    let _ = unavailable_model_picker_state();
+}
+
+#[test]
+fn settings_model_picker_enter_on_disabled_row_toasts_and_does_not_commit() {
+    let mut s = unavailable_model_picker_state();
+    assert!(s.focus_key("default_model"));
+    assert!(s.try_enter_picking_enum());
+    // Walk to the Grok 4.5 row (index 2: sentinel, ready, unready).
+    let _ = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    let _ = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    match &s.mode() {
+        SettingsModalMode::PickingEnum { choices_idx, .. } => {
+            assert_eq!(*choices_idx, 2);
+        }
+        other => panic!("expected PickingEnum, got {other:?}"),
+    }
+    let outcome = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    match outcome {
+        SettingsKeyOutcome::Toast(msg) => {
+            assert_eq!(msg, "missing XAI_API_KEY");
+        }
+        other => panic!("expected Toast for disabled row, got {other:?}"),
+    }
+    assert!(
+        matches!(s.mode(), SettingsModalMode::PickingEnum { .. }),
+        "blocked commit must leave the picker open"
+    );
+}
+
+#[test]
+fn settings_model_picker_mouse_on_disabled_row_does_not_commit() {
+    let mut s = unavailable_model_picker_state();
+    assert!(s.focus_key("default_model"));
+    assert!(s.try_enter_picking_enum());
+    s.picker_choice_rects = vec![
+        Rect::new(0, 0, 40, 1),
+        Rect::new(0, 1, 40, 1),
+        Rect::new(0, 2, 40, 1),
+    ];
+    // Focus the disabled row, then re-click it (mouse commit path).
+    let moved = handle_settings_mouse(&mut s, MouseEventKind::Down(crossterm::event::MouseButton::Left), 2, 2);
+    assert!(matches!(moved, SettingsKeyOutcome::Changed | SettingsKeyOutcome::Unchanged));
+    let outcome = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        2,
+        2,
+    );
+    match outcome {
+        SettingsKeyOutcome::Toast(msg) => assert_eq!(msg, "missing XAI_API_KEY"),
+        other => panic!("re-click on disabled row must toast, not commit: {other:?}"),
+    }
+}

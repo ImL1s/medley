@@ -1474,12 +1474,8 @@ pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String)
                 auto_mode: app.current_ui.permission_mode.as_deref() == Some("auto")
                     && !app.default_yolo,
                 current_model_name: app.models.current_model_name(),
-                available_models: app
-                    .models
-                    .available
-                    .iter()
-                    .map(|(id, info)| (info.name.clone(), id.clone()))
-                    .collect(),
+                available_models: app.models.catalog_display_pairs(),
+                unavailable_model_reasons: app.models.catalog_unready_reasons(),
                 coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
                 coding_data_sharing_lock: coding_data_sharing_lock_from_app,
                 plan_mode_active: false,

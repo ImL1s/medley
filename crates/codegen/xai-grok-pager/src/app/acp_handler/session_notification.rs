@@ -184,6 +184,10 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
         return false;
     }
     let mut plugins_changed_needs_skills_refetch = false;
+    let refresh_model_ui = matches!(
+        &session_notif.update,
+        XaiSessionUpdate::ModelAutoSwitched { .. } | XaiSessionUpdate::ModelChanged { .. }
+    );
     let mut terminal_outcome: Option<super::super::turn_completion::TerminalApply> = None;
     let root_session_id: &str = session_notif.session_id.0.as_ref();
     let changed = match session_notif.update {
@@ -899,6 +903,14 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                     "available_keys": available_keys,
                 })),
             );
+            let new_id = acp::ModelId::new(new_model_id.clone());
+            if !agent.session.models.available.contains_key(&new_id) {
+                agent.session.models.available.insert(
+                    new_id.clone(),
+                    acp::ModelInfo::new(new_id.clone(), new_model_id.clone()),
+                );
+            }
+            agent.session.models.set_current(new_id, None);
             agent.scrollback.push_block(RenderBlock::session_event(
                 SessionEvent::ModelUnavailable {
                     previous_model_id,
@@ -1087,6 +1099,9 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             return false;
         }
     };
+    if refresh_model_ui {
+        super::settings::refresh_open_model_selection_surfaces(app);
+    }
     if plugins_changed_needs_skills_refetch {
         if let Some(agent) = app.agents.get(&parent_id)
             && let Some(session_id) = agent.session.session_id.clone()
@@ -1439,9 +1454,10 @@ pub(super) fn apply_retry_state(
                     error_type: Some(error_type.clone()),
                 }));
             } else {
+                let status = crate::app::error_display::parse_http_status(message);
                 scrollback.push_block(RenderBlock::session_event(
                     crate::app::error_display::format_request_failure(
-                        None,
+                        status,
                         Some(error_type.as_str()),
                         message,
                     )

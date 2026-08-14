@@ -75,7 +75,7 @@
     }
 
     #[test]
-    fn models_update_uses_shell_default_when_agent_model_removed() {
+    fn models_update_keeps_unavailable_resident_when_agent_model_removed() {
         let mut app = make_app_with_agent("sess-1");
 
         let agent = app.agents.get_mut(&AgentId(0)).unwrap();
@@ -93,8 +93,12 @@
 
         assert_eq!(
             app.models.current.as_ref().map(|id| id.0.as_ref()),
-            Some("grok-4.3"),
-            "app.models.current must use shell default when agent model removed"
+            Some("grok-3"),
+            "must not present the shell fallback as the resident model"
+        );
+        assert_eq!(
+            app.models.current_model_name().as_deref(),
+            Some("grok-3"),
         );
 
         let agent = app.agents.get(&AgentId(0)).unwrap();
@@ -105,9 +109,18 @@
                 .current
                 .as_ref()
                 .map(|id| id.0.as_ref()),
-            Some("grok-4.3"),
-            "agent must fall back to shell default when its model is removed"
+            Some("grok-3"),
+            "agent must keep the unavailable-resident placeholder until shell confirmation"
         );
+        let placeholder = agent
+            .session
+            .models
+            .available
+            .get(&acp::ModelId::new(std::sync::Arc::from("grok-3")))
+            .expect("placeholder listed");
+        assert!(crate::slash::commands::model::is_unavailable_resident_meta(
+            placeholder.meta.as_ref()
+        ));
     }
 
     #[test]
@@ -206,7 +219,8 @@
             "agent A's model must be preserved"
         );
 
-        // B's grok-5 was removed — must fall back to shell's grok-4, not A's grok-3.
+        // B's grok-4.5 was removed — keep the resident placeholder, never
+        // claim A's model or the shell default as B's current.
         let agent_b = app.agents.get(&AgentId(1)).unwrap();
         assert_eq!(
             agent_b
@@ -215,8 +229,8 @@
                 .current
                 .as_ref()
                 .map(|id| id.0.as_ref()),
-            Some("grok-4"),
-            "inactive agent must fall back to shell default, not active agent's model"
+            Some("grok-4.5"),
+            "inactive agent must keep its unavailable resident, not the active agent's model"
         );
     }
 
@@ -439,6 +453,99 @@
                 .map(|id| id.0.as_ref()),
             Some("grok-3"),
             "unrelated-session broadcast must not touch this agent's model"
+        );
+    }
+
+    #[test]
+    fn models_update_refreshes_open_settings_model_picker() {
+        use crate::views::modal::ActiveModal;
+        use crate::views::settings_modal::SettingsModalState;
+
+        let mut app = make_app_with_agent("sess-1");
+        {
+            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+            seed_models(agent, "grok-3", &["grok-3", "grok-4", "retired"]);
+        }
+        let registry = app.settings_registry.clone();
+        let snapshot = crate::app::dispatch::build_pager_snapshot(&app);
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        let mut state = Box::new(SettingsModalState::new(
+            registry,
+            xai_grok_shell::agent::config::UiConfig::default(),
+            snapshot,
+        ));
+        assert!(state.focus_key("default_model"));
+        assert!(state.try_enter_picking_enum());
+        agent.active_modal = Some(ActiveModal::Settings { state });
+
+        let notif = make_models_update_notif("grok-3", &["grok-3", "grok-4"]);
+        handle_models_update(&notif, &mut app);
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        let Some(ActiveModal::Settings { state }) = &agent.active_modal else {
+            panic!("settings modal must stay open");
+        };
+        let names: Vec<&str> = state
+            .pager_snapshot
+            .available_models
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"grok-3") && names.contains(&"grok-4"),
+            "refreshed catalog must list live models, got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("retired")),
+            "removed catalog entry must leave the open picker, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn model_auto_switched_reconciles_resident_after_placeholder() {
+        let mut app = make_app_with_agent("sess-1");
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        seed_models(agent, "grok-3", &["grok-3", "grok-4"]);
+
+        let drop = make_models_update_notif("grok-4", &["grok-4"]);
+        handle_models_update(&drop, &mut app);
+        assert_eq!(
+            app.agents[&AgentId(0)]
+                .session
+                .models
+                .current
+                .as_ref()
+                .map(|id| id.0.as_ref()),
+            Some("grok-3")
+        );
+
+        let payload = SessionNotification {
+            session_id: acp::SessionId::new("sess-1"),
+            update: XaiSessionUpdate::ModelAutoSwitched {
+                previous_model_id: "grok-3".into(),
+                new_model_id: "grok-4".into(),
+                reason: "previous model no longer available".into(),
+            },
+            meta: None,
+        };
+        let raw = serde_json::value::to_raw_value(&payload).unwrap();
+        let notif = acp::ExtNotification::new("x.ai/session_notification", std::sync::Arc::from(raw));
+        assert!(handle_ext_notification(&notif, &mut app));
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert_eq!(
+            agent
+                .session
+                .models
+                .current
+                .as_ref()
+                .map(|id| id.0.as_ref()),
+            Some("grok-4"),
+            "ModelAutoSwitched must reconcile the displayed resident"
+        );
+        assert_eq!(
+            agent.session.models.current_model_name().as_deref(),
+            Some("grok-4")
         );
     }
 

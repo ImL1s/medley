@@ -74,13 +74,8 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                 yolo_mode: agent.session.is_yolo(),
                 auto_mode: agent.session.is_auto(),
                 current_model_name: agent.session.models.current_model_name(),
-                available_models: agent
-                    .session
-                    .models
-                    .available
-                    .iter()
-                    .map(|(id, info)| (info.name.clone(), id.clone()))
-                    .collect(),
+                available_models: agent.session.models.catalog_display_pairs(),
+                unavailable_model_reasons: agent.session.models.catalog_unready_reasons(),
                 coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
                 coding_data_sharing_lock: coding_data_sharing_lock_from_app,
                 // Prefer optimistic pending over confirmed active.
@@ -97,6 +92,7 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                     .scheduler_background_loops
                     .unwrap_or(scheduler_background_loops_seed),
             };
+            state.clamp_picking_enum_after_catalog_refresh();
         }
     }
 }
@@ -224,13 +220,8 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
         yolo_mode: agent.session.is_yolo(),
         auto_mode: agent.session.is_auto(),
         current_model_name: agent.session.models.current_model_name(),
-        available_models: agent
-            .session
-            .models
-            .available
-            .iter()
-            .map(|(id, info)| (info.name.clone(), id.clone()))
-            .collect(),
+        available_models: agent.session.models.catalog_display_pairs(),
+        unavailable_model_reasons: agent.session.models.catalog_unready_reasons(),
         coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
         coding_data_sharing_lock: coding_data_sharing_lock_from_app,
         // Prefer optimistic pending over confirmed active.
@@ -710,13 +701,16 @@ fn agent_available_models(app: &AppView) -> Vec<(String, acp::ModelId)> {
     if let ActiveView::Agent(id) = app.active_view
         && let Some(agent) = app.agents.get(&id)
     {
-        return agent
-            .session
-            .models
-            .available
-            .iter()
-            .map(|(id, info)| (info.name.clone(), id.clone()))
-            .collect();
+        return agent.session.models.catalog_display_pairs();
+    }
+    Vec::new()
+}
+
+fn agent_unavailable_model_reasons(app: &AppView) -> Vec<(String, String)> {
+    if let ActiveView::Agent(id) = app.active_view
+        && let Some(agent) = app.agents.get(&id)
+    {
+        return agent.session.models.catalog_unready_reasons();
     }
     Vec::new()
 }
@@ -729,6 +723,7 @@ pub(crate) fn build_pager_snapshot(app: &AppView) -> crate::settings::PagerLocal
         auto_mode: agent_auto_mode(app),
         current_model_name: agent_current_model_name(app),
         available_models: agent_available_models(app),
+        unavailable_model_reasons: agent_unavailable_model_reasons(app),
         coding_data_sharing_opt_out: app.coding_data_retention_opt_out,
         coding_data_sharing_lock: app.coding_data_sharing_lock(),
         plan_mode_active: agent_plan_mode(app),

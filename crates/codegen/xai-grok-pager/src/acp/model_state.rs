@@ -148,19 +148,37 @@ impl ModelState {
     }
 
     /// Replace the available models, preserving current selection if still valid.
+    ///
+    /// When the resident model is absent from the new catalog, keep it as an
+    /// unavailable-resident placeholder instead of immediately presenting the
+    /// shell fallback. Display is reconciled later via `ModelAutoSwitched` or
+    /// an explicit user commit.
     pub fn update_catalog(
         &mut self,
         new_available: IndexMap<acp::ModelId, acp::ModelInfo>,
         fallback_current: Option<acp::ModelId>,
     ) {
         let previous_current_model = self.current.clone();
+        let previous_name = previous_current_model.as_ref().and_then(|id| {
+            self.available
+                .get(id)
+                .map(|info| info.name.clone())
+        });
         self.available = new_available;
         if let Some(ref id) = self.current {
             if !self.available.contains_key(id) {
-                self.current = fallback_current;
+                self.available.insert(
+                    id.clone(),
+                    crate::slash::commands::model::unavailable_resident_placeholder(
+                        id,
+                        previous_name.as_deref(),
+                    ),
+                );
             }
-        } else {
-            self.current = fallback_current;
+        } else if let Some(fallback) = fallback_current {
+            if self.available.contains_key(&fallback) {
+                self.current = Some(fallback);
+            }
         }
         // The models/update broadcast carries each model's static default effort,
         // not this session's choice; only re-derive when the model changed so a
@@ -172,6 +190,19 @@ impl ModelState {
                 .and_then(|id| self.available.get(id))
                 .and_then(|info| parse_reasoning_effort_meta(info.meta.as_ref()));
         }
+    }
+
+    /// `(display name, id)` pairs for settings snapshots.
+    pub fn catalog_display_pairs(&self) -> Vec<(String, acp::ModelId)> {
+        self.available
+            .iter()
+            .map(|(id, info)| (info.name.clone(), id.clone()))
+            .collect()
+    }
+
+    /// Display names that must not be committed from the settings picker.
+    pub fn catalog_unready_reasons(&self) -> Vec<(String, String)> {
+        crate::slash::commands::model::unready_reasons_from_catalog(&self.available)
     }
 
     /// Set the current model and resolve reasoning effort from catalog meta.
@@ -436,14 +467,111 @@ mod tests {
         );
         state.set_current(id_a.clone(), Some(ReasoningEffort::Xhigh));
 
-        // Refresh drops model-a; fall back to model-b whose default is low.
+        // Refresh drops model-a. The TUI keeps the unavailable resident until
+        // the shell confirms a switch; effort is re-derived only then.
         let id_b = acp::ModelId::new(Arc::from("model-b"));
         let mut refreshed = IndexMap::new();
         refreshed.insert(id_b.clone(), model_with_effort("model-b", "Model B", "low"));
         state.update_catalog(refreshed, Some(id_b.clone()));
 
+        assert_eq!(state.current, Some(id_a));
+        assert_eq!(state.reasoning_effort, Some(ReasoningEffort::Xhigh));
+
+        state.set_current(id_b.clone(), None);
         assert_eq!(state.current, Some(id_b));
         assert_eq!(state.reasoning_effort, Some(ReasoningEffort::Low));
+    }
+
+    #[test]
+    fn update_catalog_keeps_unavailable_resident_placeholder() {
+        let id_a = acp::ModelId::new(Arc::from("resident-gone"));
+        let id_b = acp::ModelId::new(Arc::from("fallback"));
+        let mut state = ModelState::default();
+        state.available.insert(
+            id_a.clone(),
+            acp::ModelInfo::new(id_a.clone(), "Resident Gone".to_string()),
+        );
+        state.available.insert(
+            id_b.clone(),
+            acp::ModelInfo::new(id_b.clone(), "Fallback".to_string()),
+        );
+        state.current = Some(id_a.clone());
+
+        let mut refreshed = IndexMap::new();
+        refreshed.insert(
+            id_b.clone(),
+            acp::ModelInfo::new(id_b.clone(), "Fallback".to_string()),
+        );
+        state.update_catalog(refreshed, Some(id_b.clone()));
+
+        assert_eq!(state.current, Some(id_a.clone()));
+        assert_eq!(
+            state.current_model_name().as_deref(),
+            Some("Resident Gone"),
+            "must keep the prior friendly name, not the fallback label"
+        );
+        let placeholder = state
+            .available
+            .get(&id_a)
+            .expect("unavailable resident stays listed");
+        assert!(crate::slash::commands::model::is_unavailable_resident_meta(
+            placeholder.meta.as_ref()
+        ));
+        assert_eq!(
+            crate::slash::commands::model::unready_reason_from_model_meta(placeholder.meta.as_ref())
+                .as_deref(),
+            Some(crate::slash::commands::model::MODEL_CATALOG_MISS_REASON)
+        );
+    }
+
+    #[test]
+    fn update_catalog_restores_resident_when_catalog_returns_model() {
+        let id_a = acp::ModelId::new(Arc::from("resident-gone"));
+        let id_b = acp::ModelId::new(Arc::from("fallback"));
+        let mut state = ModelState::default();
+        state.available.insert(
+            id_a.clone(),
+            acp::ModelInfo::new(id_a.clone(), "Resident Gone".to_string()),
+        );
+        state.current = Some(id_a.clone());
+
+        let mut dropped = IndexMap::new();
+        dropped.insert(
+            id_b.clone(),
+            acp::ModelInfo::new(id_b.clone(), "Fallback".to_string()),
+        );
+        state.update_catalog(dropped, Some(id_b.clone()));
+        assert!(crate::slash::commands::model::is_unavailable_resident_meta(
+            state.available.get(&id_a).and_then(|info| info.meta.as_ref())
+        ));
+
+        let restored = acp::ModelInfo::new(id_a.clone(), "Resident Gone".to_string()).meta(Some(
+            serde_json::json!({
+                "ready": true,
+                "authScheme": "bearer",
+                "providerHint": "xAI",
+            })
+            .as_object()
+            .expect("object")
+            .clone(),
+        ));
+        let mut back = IndexMap::new();
+        back.insert(id_a.clone(), restored);
+        back.insert(
+            id_b.clone(),
+            acp::ModelInfo::new(id_b.clone(), "Fallback".to_string()),
+        );
+        state.update_catalog(back, Some(id_b));
+
+        assert_eq!(state.current, Some(id_a.clone()));
+        let live = state.available.get(&id_a).expect("restored resident");
+        assert!(!crate::slash::commands::model::is_unavailable_resident_meta(
+            live.meta.as_ref()
+        ));
+        assert!(
+            crate::slash::commands::model::unready_reason_from_model_meta(live.meta.as_ref())
+                .is_none()
+        );
     }
 
     fn state_with_meta(meta: Option<serde_json::Value>) -> ModelState {

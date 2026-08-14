@@ -60,6 +60,8 @@ pub enum SettingsKeyOutcome {
     Changed,
     /// No-op.
     Unchanged,
+    /// Show a toast and keep the modal open (blocked picker commit).
+    Toast(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -594,6 +596,8 @@ impl SettingsModalState {
                             canonical: c.canonical.to_string(),
                             display: c.display.to_string(),
                             description: c.description.to_string(),
+                            disabled: false,
+                            disabled_reason: String::new(),
                         })
                         .collect(),
                 ),
@@ -681,6 +685,27 @@ impl SettingsModalState {
         self.transition_to_picking_enum(key, choices_idx, original_value, supports_preview);
         self.hover_row = None;
         true
+    }
+
+    /// Keep a live `PickingEnum` index inside the refreshed catalog.
+    pub fn clamp_picking_enum_after_catalog_refresh(&mut self) {
+        let SettingsMode::PickingEnum { key, choices_idx, .. } = &mut self.state.mode else {
+            return;
+        };
+        let len = match self.registry.find(*key).map(|m| &m.kind) {
+            Some(SettingKind::DynamicEnum { source, .. }) => {
+                dynamic_enum_choices(*source, &self.pager_snapshot).len()
+            }
+            Some(SettingKind::Enum { choices, .. }) => {
+                effective_enum_choices(*key, choices, &self.pager_snapshot).len()
+            }
+            _ => return,
+        };
+        if len == 0 {
+            *choices_idx = 0;
+        } else if *choices_idx >= len {
+            *choices_idx = len - 1;
+        }
     }
 
     /// Transition to `PickingGroup` if the focused row is a `Group`. Returns

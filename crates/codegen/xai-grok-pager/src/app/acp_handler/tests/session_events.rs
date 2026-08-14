@@ -597,6 +597,41 @@
     /// Non-auth terminal failures render the formatted RequestFailed banner
     /// (same visual treatment as 401 re-auth), not a raw RetryFailed dump.
     #[test]
+    fn apply_retry_state_provider_http_400_yields_typed_400() {
+        let mut session = make_session(Some("s1"));
+        let mut scrollback = ScrollbackState::new();
+        apply_retry_state(
+            &RetryState::Failed {
+                error_type: "api".into(),
+                message: "Provider request failed (HTTP 400). Invalid value for reasoning.effort"
+                    .into(),
+            },
+            &mut session,
+            &mut scrollback,
+            false,
+        );
+        match last_session_event(&scrollback) {
+            Some(SessionEvent::RequestFailed {
+                status,
+                headline,
+                detail,
+            }) => {
+                assert_eq!(status, Some(400));
+                assert_eq!(headline, "Bad request (400)");
+                assert!(
+                    detail.contains("Invalid value for reasoning.effort"),
+                    "safe sanitized field detail must stay visible, got {detail}"
+                );
+                assert!(
+                    !headline.contains("Server error"),
+                    "must not classify provider 400 as a server fault"
+                );
+            }
+            other => panic!("expected typed 400 RequestFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn apply_retry_state_generic_failure_shows_request_failed_banner() {
         let mut session = make_session(Some("s1"));
         let mut scrollback = ScrollbackState::new();

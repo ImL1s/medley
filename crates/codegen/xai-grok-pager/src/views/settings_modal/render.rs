@@ -985,6 +985,8 @@ pub(super) fn render_picking_enum(
                     canonical: c.canonical.to_string(),
                     display: c.display.to_string(),
                     description: c.description.to_string(),
+                    disabled: false,
+                    disabled_reason: String::new(),
                 })
                 .collect()
         }
@@ -1063,7 +1065,12 @@ pub(super) fn render_picking_enum(
         let is_hovered = !is_focused && state.hover_row == Some(choice_i);
         let bg = settings_list_row_bg(theme, is_focused, is_hovered);
 
-        let display_style = if is_focused {
+        let display_style = if choice.disabled {
+            Style::default()
+                .fg(fg_gray)
+                .bg(bg)
+                .add_modifier(Modifier::DIM)
+        } else if is_focused {
             Style::default()
                 .fg(fg_primary)
                 .bg(bg)

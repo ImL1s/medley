@@ -539,13 +539,8 @@ pub(super) fn dispatch_send_prompt_inner(
                     yolo_mode: agent.session.is_yolo(),
                     auto_mode: agent.session.is_auto(),
                     current_model_name: agent.session.models.current_model_name(),
-                    available_models: agent
-                        .session
-                        .models
-                        .available
-                        .iter()
-                        .map(|(id, info)| (info.name.clone(), id.clone()))
-                        .collect(),
+                    available_models: agent.session.models.catalog_display_pairs(),
+                    unavailable_model_reasons: agent.session.models.catalog_unready_reasons(),
                     coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
                     coding_data_sharing_lock: coding_data_sharing_lock_from_app,
                     // Prefer optimistic pending over confirmed active.

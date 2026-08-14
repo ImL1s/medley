@@ -155,6 +155,11 @@ fn parse_model_readiness(
 
 /// User-facing reason when a model id is missing from the catalog or not ready.
 pub(crate) const MODEL_CATALOG_MISS_REASON: &str = "Model no longer available";
+/// Toast when a picker commit targets a row the live catalog no longer owns.
+pub(crate) const CATALOG_CHANGED_TOAST: &str =
+    "Model catalog changed — select a model again.";
+/// ACP meta flag on the unavailable-resident placeholder kept after a catalog drop.
+pub(crate) const UNAVAILABLE_RESIDENT_META: &str = "unavailableResident";
 
 pub(crate) fn model_not_ready_reason(models: &ModelState, id: &acp::ModelId) -> Option<String> {
     let Some(info) = models.available.get(id) else {
@@ -193,6 +198,45 @@ pub(crate) fn auth_class_from_model_meta(
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> String {
     parse_model_readiness(meta).auth_class
+}
+
+/// Display-name → readiness-reason pairs for settings picker disablement.
+pub(crate) fn unready_reasons_from_catalog(
+    available: &indexmap::IndexMap<acp::ModelId, acp::ModelInfo>,
+) -> Vec<(String, String)> {
+    available
+        .values()
+        .filter_map(|info| {
+            unready_reason_from_model_meta(info.meta.as_ref())
+                .map(|reason| (info.name.clone(), reason))
+        })
+        .collect()
+}
+
+pub(crate) fn is_unavailable_resident_meta(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> bool {
+    meta.and_then(|m| m.get(UNAVAILABLE_RESIDENT_META))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Placeholder `ModelInfo` for a resident model the live catalog dropped.
+pub(crate) fn unavailable_resident_placeholder(
+    id: &acp::ModelId,
+    previous_name: Option<&str>,
+) -> acp::ModelInfo {
+    let name = previous_name
+        .filter(|n| !n.is_empty())
+        .unwrap_or(id.0.as_ref())
+        .to_string();
+    let meta = serde_json::json!({
+        "ready": false,
+        "readinessReason": MODEL_CATALOG_MISS_REASON,
+        "providerHint": "catalog",
+        "unavailableResident": true,
+    });
+    acp::ModelInfo::new(id.clone(), name).meta(meta.as_object().cloned())
 }
 
 /// Split `args` into `(prefix, last_token)` on the final whitespace run.
@@ -297,6 +341,7 @@ fn build_model_items(models: &ModelState) -> Vec<ArgItem> {
             } else {
                 readiness.readiness_reason
             },
+            initially_selected: is_current,
         });
     }
     items
@@ -1046,5 +1091,33 @@ mod tests {
             CommandResult::Error(msg) => assert_eq!(msg, reason),
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_model_items_marks_single_current_row_initially_selected() {
+        let mut state = ModelState::default();
+        let (grok_id, grok_info) = plain_model("grok-4.5", "Grok 4.5");
+        let (sol_id, sol_info) = plain_model("gpt-5.6-sol", "GPT-5.6-Sol");
+        state.available.insert(grok_id, grok_info);
+        state.available.insert(sol_id.clone(), sol_info);
+        state.set_current(sol_id, None);
+
+        let items = build_model_items(&state);
+        assert_eq!(ArgItem::preferred_index(&items), 1);
+        assert!(items[0].display.contains("Grok 4.5"));
+        assert!(!items[0].initially_selected);
+        assert!(items[1].display.contains("(current)"));
+        assert!(items[1].initially_selected);
+
+        let mut none = ModelState::default();
+        let (g_id, g_info) = plain_model("grok-4.5", "Grok 4.5");
+        let (s_id, s_info) = plain_model("gpt-5.6-sol", "GPT-5.6-Sol");
+        none.available.insert(g_id, g_info);
+        none.available.insert(s_id, s_info);
+        assert_eq!(ArgItem::preferred_index(&build_model_items(&none)), 0);
+
+        let mut both = items.clone();
+        both[0].initially_selected = true;
+        assert_eq!(ArgItem::preferred_index(&both), 0);
     }
 }

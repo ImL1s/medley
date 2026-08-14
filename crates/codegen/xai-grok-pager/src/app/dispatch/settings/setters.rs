@@ -1712,6 +1712,7 @@ pub(in crate::app::dispatch) fn set_default_model(
             id = ?new_id,
             "Action::SetDefaultModel dispatched with model id not in catalog —              validator skew; no-op",
         );
+        app.show_toast(crate::slash::commands::model::CATALOG_CHANGED_TOAST);
         return vec![];
     }
 

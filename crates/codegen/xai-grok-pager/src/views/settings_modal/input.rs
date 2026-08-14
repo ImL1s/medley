@@ -125,6 +125,9 @@ fn handle_picking_enum(state: &mut SettingsModalState, key: &KeyEvent) -> Settin
             )
         }
         KeyCode::Enter => {
+            if let Some(reason) = picker_disabled_reason(state, setting_key, choices_idx) {
+                return SettingsKeyOutcome::Toast(reason);
+            }
             // Commit: dispatch the typed COMMIT Action for the
             // currently-focused choice. This is the single place
             // per picker open → close cycle that fires
@@ -553,6 +556,28 @@ pub(super) fn picker_choice_at(
 /// (clones the `&'static str` into a `String`), giving the picker
 /// a single unified read path when the caller doesn't need to
 /// distinguish static vs. dynamic.
+fn picker_disabled_reason(
+    state: &SettingsModalState,
+    key: SettingKey,
+    idx: usize,
+) -> Option<String> {
+    let meta = state.registry.find(key)?;
+    let SettingKind::DynamicEnum { source, .. } = &meta.kind else {
+        return None;
+    };
+    let choices = dynamic_enum_choices(*source, &state.pager_snapshot);
+    let choice = choices.get(idx)?;
+    choice
+        .disabled
+        .then(|| {
+            if choice.disabled_reason.is_empty() {
+                crate::slash::commands::model::CATALOG_CHANGED_TOAST.to_string()
+            } else {
+                choice.disabled_reason.clone()
+            }
+        })
+}
+
 fn picker_choice_at_owned(
     state: &SettingsModalState,
     key: SettingKey,
@@ -1137,6 +1162,9 @@ fn handle_picker_mouse(
         return SettingsKeyOutcome::Unchanged;
     };
     if target_idx == current_idx {
+        if let Some(reason) = picker_disabled_reason(state, setting_key, target_idx) {
+            return SettingsKeyOutcome::Toast(reason);
+        }
         // Already focused — re-clicking the same choice is a no-op
         // (kept for parity with the row-list's "already-focused
         // click commits" semantics; commit fires on Enter, not on

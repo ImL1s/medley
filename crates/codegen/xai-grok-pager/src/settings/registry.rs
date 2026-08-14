@@ -91,6 +91,10 @@ pub struct OwnedEnumChoice {
     pub canonical: String,
     pub display: String,
     pub description: String,
+    /// When true, keyboard/mouse commit is blocked (row stays visible).
+    pub disabled: bool,
+    /// Visible readiness / blocked reason when `disabled`.
+    pub disabled_reason: String,
 }
 
 /// Source of runtime choices for a `SettingKind::DynamicEnum`.
@@ -117,12 +121,21 @@ pub fn dynamic_enum_choices(
                 canonical: String::new(),
                 display: "(no override)".to_string(),
                 description: "Inherit the default model (no per-user override).".to_string(),
+                disabled: false,
+                disabled_reason: String::new(),
             });
             for (name, _id) in &snapshot.available_models {
+                let reason = snapshot
+                    .unavailable_model_reasons
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, r)| r.as_str());
                 out.push(OwnedEnumChoice {
                     canonical: name.clone(),
                     display: name.clone(),
-                    description: String::new(),
+                    description: reason.unwrap_or("").to_string(),
+                    disabled: reason.is_some(),
+                    disabled_reason: reason.unwrap_or("").to_string(),
                 });
             }
             out
@@ -264,6 +277,9 @@ pub struct PagerLocalSnapshot {
     /// Cloned into the snapshot so the modal's validator/resolver is
     /// self-contained (the modal outlives the borrow on `app.agents`).
     pub available_models: Vec<(String, acp::ModelId)>,
+    /// Display names that are visible but not committable, with the
+    /// readiness reason shown on the picker row.
+    pub unavailable_model_reasons: Vec<(String, String)>,
     /// Whether the user has opted OUT of coding data sharing.
     /// Lives in auth metadata (no `UiConfig` field). Inverted mapping:
     /// `opt_out == false` → canonical "opt-in". Snapshot default is
@@ -314,6 +330,7 @@ impl Default for PagerLocalSnapshot {
             auto_mode: false,
             current_model_name: None,
             available_models: Vec::new(),
+            unavailable_model_reasons: Vec::new(),
             coding_data_sharing_opt_out: true,
             coding_data_sharing_lock: None,
             plan_mode_active: false,

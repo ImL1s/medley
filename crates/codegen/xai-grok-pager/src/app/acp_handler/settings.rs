@@ -13,22 +13,7 @@ pub(super) fn handle_models_update(notif: &acp::ExtNotification, app: &mut AppVi
 
         let shell_fallback_current = new_models.current.clone();
 
-        // Override app-level default with the active agent's model.
-        let mut app_models = new_models.clone();
-        if let ActiveView::Agent(id) = app.active_view
-            && let Some(agent) = app.agents.get(&id)
-            && let Some(ref agent_model) = agent.session.models.current
-            && app_models.available.contains_key(agent_model)
-        {
-            app_models.current = Some(agent_model.clone());
-        }
-
-        app.models = app_models;
-
         for agent in app.agents.values_mut() {
-            // Log when an update drops the agent's active model — this is the
-            // moment the status bar visibly "switches model mid-conversation"
-            // (the agent falls back to the shell's current model below).
             if let Some(ref current) = agent.session.models.current
                 && !new_models.available.contains_key(current)
             {
@@ -36,7 +21,7 @@ pub(super) fn handle_models_update(notif: &acp::ExtNotification, app: &mut AppVi
                     current_model = %current.0,
                     fallback = ?shell_fallback_current.as_ref().map(|m| m.0.as_ref()),
                     available_count = new_models.available.len(),
-                    "models update removed this agent's current model; falling back"
+                    "models update removed this agent's current model; keeping unavailable-resident placeholder"
                 );
             }
             agent
@@ -44,10 +29,101 @@ pub(super) fn handle_models_update(notif: &acp::ExtNotification, app: &mut AppVi
                 .models
                 .update_catalog(new_models.available.clone(), shell_fallback_current.clone());
         }
+
+        // App-level catalog mirrors the live list, plus the active agent's
+        // resident (placeholder if the catalog dropped it). Never present the
+        // shell fallback as the active model while the session still owns it.
+        let mut app_models = new_models;
+        if let ActiveView::Agent(id) = app.active_view
+            && let Some(agent) = app.agents.get(&id)
+        {
+            app_models.current = agent.session.models.current.clone();
+            if let Some(cur) = &app_models.current
+                && !app_models.available.contains_key(cur)
+                && let Some(info) = agent.session.models.available.get(cur)
+            {
+                app_models.available.insert(cur.clone(), info.clone());
+            }
+        }
+        app.models = app_models;
+        refresh_open_model_selection_surfaces(app);
         true
     } else {
         tracing::warn!("Failed to parse x.ai/models/update");
         false
+    }
+}
+
+/// Rebuild settings / `/model` pickers from the live catalog generation.
+pub(super) fn refresh_open_model_selection_surfaces(app: &mut AppView) {
+    crate::app::dispatch::refresh_open_settings_modals(app);
+    for agent in app.agents.values_mut() {
+        refresh_open_model_arg_picker(agent);
+    }
+}
+
+fn refresh_open_model_arg_picker(agent: &mut AgentView) {
+    use crate::views::modal::ActiveModal;
+
+    let (command, args_query, prev_insert) = match &agent.active_modal {
+        Some(ActiveModal::ArgPicker {
+            command,
+            args_query,
+            items,
+            state,
+            ..
+        }) if command == "model" || command == "m" => {
+            let prev = items
+                .get(state.selected)
+                .map(|item| item.insert_text.clone());
+            (command.clone(), args_query.clone(), prev)
+        }
+        _ => return,
+    };
+
+    let new_items = {
+        let Some(cmd) = agent
+            .prompt
+            .slash_controller
+            .registry()
+            .get(&command)
+            .cloned()
+        else {
+            return;
+        };
+        let ctx = agent
+            .prompt
+            .slash_controller
+            .app_ctx(&agent.session.models);
+        cmd.suggest_args(&ctx, &args_query).unwrap_or_default()
+    };
+
+    let Some(ActiveModal::ArgPicker {
+        items,
+        original_items,
+        state,
+        ..
+    }) = agent.active_modal.as_mut()
+    else {
+        return;
+    };
+    *original_items = new_items.clone();
+    let q = state.query().to_lowercase();
+    *items = new_items
+        .into_iter()
+        .filter(|item| {
+            q.is_empty()
+                || item.match_text.to_lowercase().contains(&q)
+                || item.display.to_lowercase().contains(&q)
+                || item.description.to_lowercase().contains(&q)
+        })
+        .collect();
+    if let Some(prev) = prev_insert
+        && let Some(idx) = items.iter().position(|item| item.insert_text == prev)
+    {
+        state.selected = idx;
+    } else {
+        state.selected = crate::slash::command::ArgItem::preferred_index(items);
     }
 }
 

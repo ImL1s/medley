@@ -1051,6 +1051,9 @@ jobs:
             models_update_meta_clears_substitution_after_catalog_lands -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             warm_cache_refresh_does_not_reseat_over_user_model_pick -- --nocapture
+          # #358: 400 detail extraction must tolerate an optional reason phrase.
+          run_nonzero -p xai-grok-shell --lib \
+            remainder_after_http_400_prefix -- --nocapture
 
       - name: Pager model picker / readiness
         run: |
@@ -1074,6 +1077,32 @@ jobs:
           # the tests are about what the pager mirrors after a failed write.
           cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
             preferred_model_persist_failure -- --nocapture
+          # #335 / #346 / #358 / #359: live catalog coherence, settings
+          # disablement, 4xx retry banners, and /model initial highlight.
+          cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
+            unavailable_resident -- --nocapture
+          cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
+            models_update_refreshes_open_settings -- --nocapture
+          cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
+            model_auto_switched_reconciles -- --nocapture
+          cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
+            settings_model_picker_enter_on_disabled -- --nocapture
+          cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
+            settings_model_picker_mouse_on_disabled -- --nocapture
+          cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
+            dynamic_enum_choices_marks_unavailable -- --nocapture
+          cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
+            provider_request_failed_http -- --nocapture
+          cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
+            provider_http_400 -- --nocapture
+          cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
+            fresh_model_suggestions_highlight -- --nocapture
+          cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
+            model_suggestion_refresh_preserves -- --nocapture
+          cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
+            nonempty_fuzzy_model_query -- --nocapture
+          cargo test --manifest-path crates/codegen/xai-grok-pager/Cargo.toml --lib \
+            preferred_model_row_falls_back -- --nocapture
 
       - name: 'Orphaned switch transaction via synthesized switch (issue #239)'
         run: |

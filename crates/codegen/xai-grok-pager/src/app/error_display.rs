@@ -297,6 +297,14 @@ fn normalize_phrase(s: &str) -> String {
 /// (`API error (status 500): …`, `Unauthorized (401)`, or an
 /// already-formatted `Server error (500) — …`).
 pub(crate) fn parse_http_status(raw: &str) -> Option<u16> {
+    // Bounded live-shell form: `Provider request failed (HTTP 400). …`
+    const PROVIDER_HTTP: &str = "Provider request failed (HTTP ";
+    if let Some(i) = find_ignore_ascii_case(raw, PROVIDER_HTTP) {
+        let after = &raw[i + PROVIDER_HTTP.len()..];
+        if let Some(code) = parse_status_digits(after, false) {
+            return Some(code);
+        }
+    }
     // Every "status " occurrence, so "status unknown; … status 503" still
     // finds the code.
     let mut from = 0;
@@ -375,6 +383,10 @@ fn extract_error_detail(raw: &str) -> Option<String> {
         s = stripped;
     }
 
+    if let Some(rest) = strip_provider_request_failed_prefix(&s) {
+        s = rest;
+    }
+
     if let Some(rest) = strip_api_error_prefix(&s) {
         s = rest;
     }
@@ -408,6 +420,17 @@ fn extract_error_detail(raw: &str) -> Option<String> {
     }
 
     clean_detail(&s)
+}
+
+/// Strip the bounded `Provider request failed (HTTP N).` carrier, leaving
+/// only the already-sanitized trailing detail (if any).
+fn strip_provider_request_failed_prefix(s: &str) -> Option<String> {
+    const HEAD: &str = "Provider request failed (HTTP ";
+    let start = find_ignore_ascii_case(s, HEAD)?;
+    let after = &s[start + HEAD.len()..];
+    let close = after.find(')')?;
+    let rest = after[close + 1..].trim_start_matches('.').trim();
+    Some(rest.to_string())
 }
 
 fn strip_retry_prefix(s: &str) -> Option<String> {
@@ -832,5 +855,45 @@ mod tests {
             Some(500)
         );
         assert_eq!(parse_http_status("connection reset"), None);
+    }
+
+    #[test]
+    fn parse_http_status_provider_request_failed_http_form() {
+        assert_eq!(
+            parse_http_status("Provider request failed (HTTP 400)."),
+            Some(400)
+        );
+        assert_eq!(
+            parse_http_status(
+                "Provider request failed (HTTP 400). Invalid value for reasoning.effort"
+            ),
+            Some(400)
+        );
+        assert_eq!(
+            parse_http_status("Provider request failed (timeout)."),
+            None,
+            "must not free-form match provider text"
+        );
+    }
+
+    #[test]
+    fn format_request_failure_provider_http_400_is_bad_request_not_server_error() {
+        let formatted = format_request_failure(
+            None,
+            Some("api"),
+            "Provider request failed (HTTP 400). Invalid value for reasoning.effort",
+        );
+        assert_eq!(formatted.status, Some(400));
+        assert_eq!(formatted.headline, "Bad request (400)");
+        assert!(
+            formatted.detail.contains("Invalid value for reasoning.effort"),
+            "safe field-level detail must remain visible, got {}",
+            formatted.detail
+        );
+        assert!(
+            !formatted.message().contains("Server error"),
+            "must not misclassify 4xx as a server fault: {}",
+            formatted.message()
+        );
     }
 }
