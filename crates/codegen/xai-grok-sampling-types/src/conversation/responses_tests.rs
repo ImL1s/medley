@@ -423,6 +423,57 @@ fn test_response_reasoning_effort_stamped_on_assistant() {
 }
 
 #[test]
+fn test_typed_response_max_reasoning_effort_stamped_on_assistant_as_max() {
+    use crate::rs;
+
+    // Client Ultra is encoded as typed Max on the wire. A server echo of Max
+    // must stay Max on the assistant item, not be widened back to Ultra.
+    let response = rs::Response {
+        background: None,
+        billing: None,
+        conversation: None,
+        created_at: 1234567890,
+        completed_at: None,
+        error: None,
+        id: "resp_ultra_echo".to_string(),
+        incomplete_details: None,
+        instructions: None,
+        max_output_tokens: None,
+        metadata: None,
+        model: "gpt-5.6-sol".to_string(),
+        object: "response".to_string(),
+        output: vec![],
+        parallel_tool_calls: None,
+        previous_response_id: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        reasoning: Some(rs::Reasoning {
+            effort: Some(rs::ReasoningEffort::Max),
+            summary: None,
+        }),
+        safety_identifier: None,
+        service_tier: None,
+        status: rs::Status::Completed,
+        temperature: None,
+        text: None,
+        tool_choice: None,
+        tools: None,
+        top_logprobs: None,
+        top_p: None,
+        truncation: None,
+        usage: None,
+    };
+
+    let items = response_to_conversation_items(response);
+    let ConversationItem::Assistant(a) = items.last().expect("trailing Assistant") else {
+        panic!("Expected Assistant item");
+    };
+    assert_eq!(a.reasoning_effort, Some(crate::ReasoningEffort::Max));
+    assert_ne!(a.reasoning_effort, Some(crate::ReasoningEffort::Ultra));
+}
+
+#[test]
 fn test_tool_calls_to_responses_api() {
     let req = ConversationRequest::from_items(vec![
         ConversationItem::system("System"),

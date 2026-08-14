@@ -2787,6 +2787,79 @@ mod tests {
     }
 
     #[test]
+    fn codex_catalog_parser_preserves_mixed_ultra_menu() {
+        let payload = serde_json::json!({
+            "models": [{
+                "slug": "gpt-5.6-sol",
+                "default_reasoning_level": "high",
+                "supported_reasoning_levels": [
+                    { "effort": "low", "description": "Fast" },
+                    { "effort": "high", "description": "Deep" },
+                    { "effort": "max", "description": "Maximum reasoning" },
+                    {
+                        "effort": "ultra",
+                        "description": "Maximum reasoning with automatic task delegation"
+                    }
+                ]
+            }]
+        });
+        let presets = parse_openai_codex_catalog_models(&payload);
+        let sol = presets.get("gpt-5.6-sol").expect("sol model");
+        assert_eq!(
+            sol.reasoning_efforts
+                .iter()
+                .map(|option| option.value)
+                .collect::<Vec<_>>(),
+            vec![
+                xai_grok_sampling_types::ReasoningEffort::Low,
+                xai_grok_sampling_types::ReasoningEffort::High,
+                xai_grok_sampling_types::ReasoningEffort::Max,
+                xai_grok_sampling_types::ReasoningEffort::Ultra,
+            ]
+        );
+        let ultra = sol
+            .reasoning_efforts
+            .iter()
+            .find(|option| option.value == xai_grok_sampling_types::ReasoningEffort::Ultra)
+            .expect("ultra option");
+        assert_eq!(ultra.id, "ultra");
+        assert_eq!(ultra.label, "Ultra");
+        assert_eq!(
+            ultra.description.as_deref(),
+            Some("Maximum reasoning with automatic task delegation")
+        );
+    }
+
+    #[test]
+    fn codex_catalog_parser_preserves_ultra_only_menu() {
+        let payload = serde_json::json!({
+            "models": [{
+                "slug": "gpt-5.6-sol-wm",
+                "default_reasoning_level": "ultra",
+                "supported_reasoning_levels": [
+                    {
+                        "effort": "ultra",
+                        "description": "Maximum reasoning with automatic task delegation"
+                    }
+                ]
+            }]
+        });
+        let presets = parse_openai_codex_catalog_models(&payload);
+        let model = presets.get("gpt-5.6-sol-wm").expect("watermark model");
+        assert_eq!(model.reasoning_efforts.len(), 1);
+        assert_eq!(
+            model.reasoning_effort,
+            Some(xai_grok_sampling_types::ReasoningEffort::Ultra)
+        );
+        assert!(model.reasoning_efforts[0].default);
+        assert_eq!(
+            model.reasoning_efforts[0].value,
+            xai_grok_sampling_types::ReasoningEffort::Ultra
+        );
+        assert_eq!(model.supports_reasoning_effort, Some(true));
+    }
+
+    #[test]
     fn codex_catalog_default_reasoning_level_must_belong_to_supported_levels() {
         let payload = serde_json::json!({
             "models": [

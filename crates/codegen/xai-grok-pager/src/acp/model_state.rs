@@ -542,6 +542,37 @@ mod tests {
     }
 
     #[test]
+    fn pager_model_state_exposes_ultra_in_the_menu() {
+        let state = state_with_meta(Some(serde_json::json!({
+            "supportsReasoningEffort": true,
+            "reasoningEffort": "ultra",
+            "reasoningEfforts": [
+                { "id": "max", "value": "max", "label": "Max" },
+                {
+                    "id": "ultra",
+                    "value": "ultra",
+                    "label": "Ultra",
+                    "description": "Maximum reasoning with automatic task delegation"
+                }
+            ],
+        })));
+        let opts = state.reasoning_effort_options();
+        assert!(
+            opts.iter()
+                .any(|option| option.value == ReasoningEffort::Ultra && option.id == "ultra"),
+            "pager model-state must expose catalog Ultra: {opts:?}"
+        );
+        assert_eq!(
+            state.resolve_effort_token("ultra"),
+            Some(ReasoningEffort::Ultra)
+        );
+        assert_eq!(
+            state.resolve_effort_token("ULTRA"),
+            Some(ReasoningEffort::Ultra)
+        );
+    }
+
+    #[test]
     fn unsupported_effort_message_names_config_switch() {
         let msg = EffortTokenError::Unsupported.message();
         assert!(

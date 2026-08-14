@@ -491,6 +491,42 @@ jobs:
           }
           run_nonzero -p xai-grok-shell --lib holder_has_lock_file_open -- --nocapture
 
+      - name: Codex Ultra client and wire contracts
+        # #357: Ultra is a client orchestration tier that must lower to the
+        # provider-supported `max` wire value. Keep each boundary named in full
+        # so an unrelated Codex or Responses test cannot make this lane green.
+        run: |
+          run_nonzero() {
+            local output
+            output="$(mktemp)"
+            cargo test "$@" 2>&1 | tee "$output"
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -ne 0 ]; then rm -f "$output"; return "$status"; fi
+            if grep -qE '^test result: ok\. 0 passed' "$output"; then
+              echo "::error::filter matched zero tests: cargo test $*"
+              rm -f "$output"; return 1
+            fi
+            rm -f "$output"
+          }
+          run_nonzero -p xai-grok-sampler --lib \
+            codex_ultra_preparation_preserves_max_wire_effort_and_injects_marker_once -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            codex_non_ultra_preparation_does_not_inject_proactive_marker -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            generic_responses_never_receive_codex_ultra_proactive_marker -- --nocapture
+          run_nonzero -p xai-grok-sampling-types --lib \
+            test_typed_response_max_reasoning_effort_stamped_on_assistant_as_max -- --nocapture
+          run_nonzero -p xai-grok-sampling-types --lib \
+            test_response_wrapper_keeps_client_ultra_separate_from_typed_max -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_parser_preserves_mixed_ultra_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_parser_preserves_ultra_only_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            subagent_reasoning_override_preserves_ultra_when_child_menu_offers_it -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            pager_model_state_exposes_ultra_in_the_menu -- --nocapture
+
       - name: Restricted subagent capability boundaries
         run: |
           run_nonzero() {
@@ -1732,6 +1768,12 @@ jobs:
             deferred_cli_accepts_minimal_for_menu_less_reasoning_model -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             codex_catalog_effort_options_are_model_specific -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            pager_model_state_exposes_ultra_in_the_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_parser_preserves_mixed_ultra_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_parser_preserves_ultra_only_menu -- --nocapture
 
       # #36: restore fd bundling only with a public PI caller and contract.
       # The tests are split by build mode: override-path bundle and release

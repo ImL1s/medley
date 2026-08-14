@@ -200,6 +200,56 @@ pub fn apply_codex_wire_capabilities(
     }
 }
 
+/// Stable marker injected once into Codex Ultra `instructions`.
+///
+/// First-party Codex keeps Ultra as a client mode, lowers the wire effort to
+/// `max`, and activates proactive multi-agent developer instructions. Generic
+/// Responses / Chat Completions must not receive this marker.
+pub const CODEX_ULTRA_PROACTIVE_MARKER: &str = "<codex_ultra_proactive_multi_agent>";
+
+const CODEX_ULTRA_PROACTIVE_INSTRUCTION: &str = concat!(
+    "<codex_ultra_proactive_multi_agent> ",
+    "Proactively delegate independent subtasks to specialized agents when that ",
+    "completes the user's work faster or more reliably. Keep coordination, ",
+    "synthesis, and final decisions yourself."
+);
+
+/// Codex-only Responses boundary: client `ultra` → wire `max`, and inject the
+/// proactive multi-agent instruction marker at most once.
+pub fn prepare_codex_ultra_responses(
+    body: &mut serde_json::Value,
+    client_effort: Option<crate::ReasoningEffort>,
+) {
+    if client_effort != Some(crate::ReasoningEffort::Ultra) {
+        return;
+    }
+
+    match body.get_mut("reasoning") {
+        Some(serde_json::Value::Object(reasoning)) => {
+            reasoning.insert(
+                "effort".to_string(),
+                serde_json::Value::String("max".to_string()),
+            );
+        }
+        _ => {
+            body["reasoning"] = serde_json::json!({ "effort": "max" });
+        }
+    }
+
+    let existing = body
+        .get("instructions")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if existing.contains(CODEX_ULTRA_PROACTIVE_MARKER) {
+        return;
+    }
+    body["instructions"] = serde_json::Value::String(if existing.is_empty() {
+        CODEX_ULTRA_PROACTIVE_INSTRUCTION.to_string()
+    } else {
+        format!("{existing}\n\n{CODEX_ULTRA_PROACTIVE_INSTRUCTION}")
+    });
+}
+
 /// Codex expects system guidance in the top-level `instructions` field rather
 /// than as a `role: "system"` item inside `input`. Keep the generic Responses
 /// conversion unchanged and apply this only at the Codex transport boundary.

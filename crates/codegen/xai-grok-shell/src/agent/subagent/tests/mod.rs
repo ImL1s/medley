@@ -2451,7 +2451,7 @@ fn subagent_reasoning_override_uses_legacy_menu_when_catalog_menu_is_absent() {
             Some(expected)
         );
     }
-    for rejected in ["none", "max"] {
+    for rejected in ["none", "max", "ultra"] {
         assert_eq!(
             resolve_subagent_reasoning_effort_override(true, &[], rejected),
             None,
@@ -2463,6 +2463,37 @@ fn subagent_reasoning_override_uses_legacy_menu_when_catalog_menu_is_absent() {
         None
     );
 }
+
+#[test]
+fn subagent_reasoning_override_preserves_ultra_when_child_menu_offers_it() {
+    use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption};
+
+    let options = [
+        ReasoningEffortOption {
+            id: "max".into(),
+            value: ReasoningEffort::Max,
+            label: "Max".into(),
+            description: None,
+            default: false,
+        },
+        ReasoningEffortOption {
+            id: "ultra".into(),
+            value: ReasoningEffort::Ultra,
+            label: "Ultra".into(),
+            description: Some("Maximum reasoning with automatic task delegation".into()),
+            default: true,
+        },
+    ];
+    assert_eq!(
+        resolve_subagent_reasoning_effort_override(true, &options, "ultra"),
+        Some(ReasoningEffort::Ultra)
+    );
+    assert_eq!(
+        resolve_subagent_reasoning_effort_override(true, &options, "max"),
+        Some(ReasoningEffort::Max)
+    );
+}
+
 fn byok_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
     crate::agent::config::ModelEntry {
         api_key: Some("byok-key".to_string()),

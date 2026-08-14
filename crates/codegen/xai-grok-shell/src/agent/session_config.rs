@@ -60,6 +60,7 @@ fn effort_label(effort: ReasoningEffort) -> String {
         ReasoningEffort::High => "High",
         ReasoningEffort::Xhigh => "X-High",
         ReasoningEffort::Max => "Max",
+        ReasoningEffort::Ultra => "Ultra",
     }
     .to_string()
 }
@@ -169,6 +170,7 @@ mod tests {
     #[test]
     fn none_effort_is_not_a_user_selectable_mode() {
         assert!(!SELECTABLE_REASONING_EFFORTS.contains(&ReasoningEffort::None));
+        assert!(!SELECTABLE_REASONING_EFFORTS.contains(&ReasoningEffort::Ultra));
         let models = [model("grok-build", "Grok Build")];
         let current = acp::ModelId::from("grok-build");
         let opts =

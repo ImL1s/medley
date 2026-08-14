@@ -1711,6 +1711,10 @@ impl SamplingClient {
         })?;
         if self.is_codex() {
             xai_grok_sampling_types::patch_codex_instructions(&mut request_body);
+            xai_grok_sampling_types::prepare_codex_ultra_responses(
+                &mut request_body,
+                request.client_reasoning_effort,
+            );
             if let Some(caps) = self.defaults.codex_wire.as_ref() {
                 xai_grok_sampling_types::apply_codex_wire_capabilities(&mut request_body, caps);
             }
@@ -1840,6 +1844,10 @@ impl SamplingClient {
         })?;
         if self.is_codex() {
             xai_grok_sampling_types::patch_codex_instructions(&mut request_body);
+            xai_grok_sampling_types::prepare_codex_ultra_responses(
+                &mut request_body,
+                request.client_reasoning_effort,
+            );
             if let Some(caps) = self.defaults.codex_wire.as_ref() {
                 xai_grok_sampling_types::apply_codex_wire_capabilities(&mut request_body, caps);
             }
@@ -2368,9 +2376,11 @@ impl SamplingClient {
         // (e.g., x_search). These are injected as raw JSON after serialization.
         let extra_tools = xai_grok_sampling_types::extra_tool_entries(&request.hosted_tools);
 
+        let client_reasoning_effort = request.reasoning_effort;
         let responses_request: rs::CreateResponse = (&request).into();
 
         let mut wrapper = CreateResponseWrapper::new(responses_request);
+        wrapper.client_reasoning_effort = client_reasoning_effort;
         wrapper.x_grok_conv_id = x_grok_conv_id;
         wrapper.x_grok_req_id = x_grok_req_id;
         wrapper.x_grok_session_id = x_grok_session_id;
@@ -2401,9 +2411,11 @@ impl SamplingClient {
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
 
+        let client_reasoning_effort = request.reasoning_effort;
         let responses_request: rs::CreateResponse = (&request).into();
 
         let mut wrapper = CreateResponseWrapper::new(responses_request);
+        wrapper.client_reasoning_effort = client_reasoning_effort;
         wrapper.x_grok_conv_id = x_grok_conv_id;
         wrapper.x_grok_req_id = x_grok_req_id;
         wrapper.x_grok_session_id = x_grok_session_id;
@@ -5263,5 +5275,110 @@ mod tests {
             event,
             rs::ResponseStreamEvent::ResponseOutputTextDelta(_)
         ));
+    }
+
+    #[test]
+    fn codex_ultra_preparation_preserves_max_wire_effort_and_injects_marker_once() {
+        use xai_grok_sampling_types::{
+            CODEX_ULTRA_PROACTIVE_MARKER, ReasoningEffort, prepare_codex_ultra_responses,
+        };
+
+        let mut body = serde_json::json!({
+            "reasoning": { "effort": "ultra", "summary": "concise" },
+            "instructions": "existing guidance"
+        });
+        prepare_codex_ultra_responses(&mut body, Some(ReasoningEffort::Ultra));
+        prepare_codex_ultra_responses(&mut body, Some(ReasoningEffort::Ultra));
+
+        assert_eq!(
+            body.pointer("/reasoning/effort").and_then(|v| v.as_str()),
+            Some("max")
+        );
+        let instructions = body["instructions"].as_str().expect("instructions string");
+        assert!(
+            instructions.starts_with("existing guidance"),
+            "existing Codex instructions must be preserved: {instructions}"
+        );
+        assert_eq!(
+            instructions
+                .matches(CODEX_ULTRA_PROACTIVE_MARKER)
+                .count(),
+            1,
+            "the proactive marker must be injected exactly once: {instructions}"
+        );
+        assert!(
+            !instructions.contains("\"ultra\""),
+            "instructions must not reintroduce the rejected wire token: {instructions}"
+        );
+    }
+
+    #[test]
+    fn codex_non_ultra_preparation_does_not_inject_proactive_marker() {
+        use xai_grok_sampling_types::{
+            CODEX_ULTRA_PROACTIVE_MARKER, ReasoningEffort, prepare_codex_ultra_responses,
+        };
+
+        for effort in [
+            None,
+            Some(ReasoningEffort::Max),
+            Some(ReasoningEffort::High),
+            Some(ReasoningEffort::Xhigh),
+        ] {
+            let mut body = serde_json::json!({
+                "reasoning": { "effort": "max" },
+                "instructions": "existing guidance"
+            });
+            prepare_codex_ultra_responses(&mut body, effort);
+            assert_eq!(
+                body.pointer("/reasoning/effort").and_then(|v| v.as_str()),
+                Some("max"),
+                "non-ultra {effort:?} must not rewrite the wire effort"
+            );
+            assert_eq!(
+                body["instructions"].as_str(),
+                Some("existing guidance"),
+                "non-ultra {effort:?} must not inject the proactive marker"
+            );
+            assert!(
+                !body.to_string().contains(CODEX_ULTRA_PROACTIVE_MARKER),
+                "non-ultra {effort:?} leaked the Codex Ultra marker"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_responses_never_receive_codex_ultra_proactive_marker() {
+        use xai_grok_sampling_types::{
+            CODEX_ULTRA_PROACTIVE_MARKER, ConversationItem, ConversationRequest, ReasoningEffort,
+        };
+
+        let req = ConversationRequest {
+            reasoning_effort: Some(ReasoningEffort::Ultra),
+            items: vec![
+                ConversationItem::system("system guidance"),
+                ConversationItem::user("hi"),
+            ],
+            ..ConversationRequest::from_items(vec![]).with_model("gpt-5.6-sol")
+        };
+        let typed: rs::CreateResponse = (&req).into();
+        let json = serde_json::to_value(&typed).expect("serialize generic Responses body");
+        assert_eq!(
+            json.pointer("/reasoning/effort").and_then(|v| v.as_str()),
+            Some("max"),
+            "generic Responses must lower client Ultra to typed Max, never send ultra: {json}"
+        );
+        assert!(
+            !json.to_string().contains(CODEX_ULTRA_PROACTIVE_MARKER),
+            "generic Responses must not receive the Codex Ultra proactive marker: {json}"
+        );
+
+        let chat: xai_grok_sampling_types::ChatCompletionRequest = req.into();
+        let chat_json = serde_json::to_value(&chat).expect("serialize Chat Completions body");
+        assert!(
+            !chat_json
+                .to_string()
+                .contains(CODEX_ULTRA_PROACTIVE_MARKER),
+            "Chat Completions must not receive the Codex Ultra proactive marker: {chat_json}"
+        );
     }
 }

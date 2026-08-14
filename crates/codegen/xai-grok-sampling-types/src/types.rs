@@ -771,6 +771,9 @@ pub enum ReasoningEffort {
     High,
     Xhigh,
     Max,
+    /// Catalog/session orchestration tier. Not a public Responses wire value:
+    /// [`to_responses_api`](Self::to_responses_api) lowers it to `Max`.
+    Ultra,
 }
 
 impl ReasoningEffort {
@@ -782,12 +785,17 @@ impl ReasoningEffort {
             Self::Medium => crate::rs::ReasoningEffort::Medium,
             Self::High => crate::rs::ReasoningEffort::High,
             Self::Xhigh => crate::rs::ReasoningEffort::Xhigh,
-            Self::Max => crate::rs::ReasoningEffort::Max,
+            // Ultra is a client/session tier. The pinned async-openai enum
+            // tops out at Max, and Codex Responses reject `effort=ultra`.
+            Self::Max | Self::Ultra => crate::rs::ReasoningEffort::Max,
         }
     }
 
-    /// Inverse of [`to_responses_api`](Self::to_responses_api): the effort the
-    /// Responses API echoes back on `response.reasoning.effort`.
+    /// Convert the effort echoed by the typed Responses API into the app tier.
+    ///
+    /// This is intentionally not a strict inverse of
+    /// [`to_responses_api`](Self::to_responses_api): app-level Ultra is encoded
+    /// as typed Max, so a server response containing Max remains Max.
     pub fn from_responses_api(effort: crate::rs::ReasoningEffort) -> Self {
         match effort {
             crate::rs::ReasoningEffort::None => Self::None,
@@ -809,6 +817,7 @@ impl ReasoningEffort {
             Self::High => "high",
             Self::Xhigh => "xhigh",
             Self::Max => "max",
+            Self::Ultra => "ultra",
         }
     }
 
@@ -838,8 +847,9 @@ impl std::str::FromStr for ReasoningEffort {
             "high" => Ok(Self::High),
             "xhigh" => Ok(Self::Xhigh),
             "max" => Ok(Self::Max),
+            "ultra" => Ok(Self::Ultra),
             _ => Err(format!(
-                "invalid reasoning effort: {s:?} (expected one of: none, minimal, low, medium, high, xhigh, max)"
+                "invalid reasoning effort: {s:?} (expected one of: none, minimal, low, medium, high, xhigh, max, ultra)"
             )),
         }
     }
@@ -1340,6 +1350,10 @@ pub struct CreateResponseWrapper {
     /// The inner Responses API request.
     pub inner: crate::rs::CreateResponse,
 
+    /// App-level effort before conversion into the typed Responses request.
+    /// Preserves tiers such as Ultra that share a typed representation with Max.
+    pub client_reasoning_effort: Option<ReasoningEffort>,
+
     /// Custom header: conversation ID for tracking.
     pub x_grok_conv_id: Option<String>,
 
@@ -1366,6 +1380,7 @@ impl CreateResponseWrapper {
     pub fn new(inner: crate::rs::CreateResponse) -> Self {
         Self {
             inner,
+            client_reasoning_effort: None,
             x_grok_conv_id: None,
             x_grok_req_id: None,
             x_grok_session_id: None,
@@ -1548,6 +1563,7 @@ mod tests {
             ReasoningEffort::High,
             ReasoningEffort::Xhigh,
             ReasoningEffort::Max,
+            ReasoningEffort::Ultra,
         ] {
             let json = serde_json::to_string(&v).unwrap();
             assert_eq!(json, format!("\"{}\"", v.as_str()), "serialize {v:?}");
@@ -1560,6 +1576,10 @@ mod tests {
     #[test]
     fn reasoning_effort_from_str_parses_max_and_xhigh_as_distinct_tiers() {
         assert_eq!(
+            "ultra".parse::<ReasoningEffort>().unwrap(),
+            ReasoningEffort::Ultra
+        );
+        assert_eq!(
             "max".parse::<ReasoningEffort>().unwrap(),
             ReasoningEffort::Max
         );
@@ -1567,10 +1587,23 @@ mod tests {
             "xhigh".parse::<ReasoningEffort>().unwrap(),
             ReasoningEffort::Xhigh
         );
+        assert_ne!(ReasoningEffort::Ultra, ReasoningEffort::Max);
+        assert_eq!(
+            ReasoningEffort::Ultra.to_responses_api(),
+            crate::rs::ReasoningEffort::Max
+        );
+        assert_eq!(
+            ReasoningEffort::from_responses_api(crate::rs::ReasoningEffort::Max),
+            ReasoningEffort::Max
+        );
     }
 
     #[test]
     fn parse_canonical_effort_token_helper() {
+        assert_eq!(
+            parse_canonical_effort_token("ultra"),
+            Some(ReasoningEffort::Ultra)
+        );
         assert_eq!(
             parse_canonical_effort_token("max"),
             Some(ReasoningEffort::Max)
@@ -1733,8 +1766,51 @@ mod tests {
         );
         let bad_type = as_map(serde_json::json!({"reasoningEffort": 3}));
         assert_eq!(parse_reasoning_effort_meta(Some(&bad_type)), None);
-        let unknown = as_map(serde_json::json!({"reasoningEffort": "ULTRA"}));
+        let ultra = as_map(serde_json::json!({"reasoningEffort": "ULTRA"}));
+        assert_eq!(
+            parse_reasoning_effort_meta(Some(&ultra)),
+            Some(ReasoningEffort::Ultra)
+        );
+        let unknown = as_map(serde_json::json!({"reasoningEffort": "quantum"}));
         assert_eq!(parse_reasoning_effort_meta(Some(&unknown)), None);
+    }
+
+    #[test]
+    fn test_response_wrapper_keeps_client_ultra_separate_from_typed_max() {
+        let req = crate::ConversationRequest {
+            reasoning_effort: Some(ReasoningEffort::Ultra),
+            ..crate::ConversationRequest::from_items(vec![crate::ConversationItem::user("hi")])
+                .with_model("gpt-5.6-sol")
+        };
+        let mut wrapper = CreateResponseWrapper::new((&req).into());
+        wrapper.client_reasoning_effort = req.reasoning_effort;
+        assert_eq!(
+            wrapper.client_reasoning_effort,
+            Some(ReasoningEffort::Ultra)
+        );
+        assert_eq!(
+            wrapper
+                .inner
+                .reasoning
+                .as_ref()
+                .and_then(|reasoning| reasoning.effort.clone()),
+            Some(crate::rs::ReasoningEffort::Max)
+        );
+        let json = serde_json::to_value(&wrapper.inner).unwrap();
+        assert_eq!(
+            json.pointer("/reasoning/effort").and_then(|v| v.as_str()),
+            Some("max")
+        );
+        assert!(
+            json.to_string()
+                .contains(r#""effort":"max""#)
+                || json.pointer("/reasoning/effort") == Some(&serde_json::json!("max"))
+        );
+        assert_ne!(
+            wrapper.client_reasoning_effort,
+            Some(ReasoningEffort::Max),
+            "the wrapper must keep the client Ultra tier distinct from typed Max"
+        );
     }
 
     #[test]
