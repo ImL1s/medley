@@ -18,9 +18,9 @@
 //! arrival order — it is credited with the newest version we had sent when it
 //! arrived.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use async_lsp::lsp_types::Diagnostic;
 
@@ -71,6 +71,9 @@ pub struct DiagnosticsStore {
 struct Inner {
     documents: RwLock<HashMap<String, Answer>>,
     publishes: AtomicBool,
+    /// Non-empty pushes that landed after an empty pull may have already
+    /// settled the pending set. Drain still has to show them.
+    unreported: Mutex<HashSet<String>>,
 }
 
 impl DiagnosticsStore {
@@ -164,7 +167,52 @@ impl DiagnosticsStore {
             (_, None) => NO_VERSION,
         };
         // A push replaces the whole set for the document, and carries no id.
-        self.install(uri, Answer::new(items, covers, None))
+        let nonempty = !items.is_empty();
+        let installed = self.install(uri, Answer::new(items, covers, None));
+        // Only a verdict on the text we last sent. A stale push about the
+        // previous revision, or a report for a file we never opened, is not
+        // something a later drain should resurrect as current.
+        if installed && nonempty && latest_sent == Some(covers) {
+            self.mark_unreported(uri);
+        }
+        installed
+    }
+
+    pub fn has_unreported(&self) -> bool {
+        !self
+            .inner
+            .unreported
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
+
+    pub fn take_unreported(&self) -> Vec<String> {
+        let mut uris: Vec<String> = self
+            .inner
+            .unreported
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .collect();
+        uris.sort();
+        uris
+    }
+
+    pub fn clear_unreported(&self, uri: &str) {
+        self.inner
+            .unreported
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(uri);
+    }
+
+    fn mark_unreported(&self, uri: &str) {
+        self.inner
+            .unreported
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(uri.to_string());
     }
 
     /// Record that the server stands by its previous answer for `uri`, as an
@@ -395,6 +443,30 @@ mod tests {
         let store = DiagnosticsStore::new();
         store.record_push(A, vec![diagnostic("boom")], None, None);
         assert_eq!(store.items(A).len(), 1);
+        assert!(
+            !store.has_unreported(),
+            "an unsolicited report is not a drainable verdict on text we sent"
+        );
+    }
+
+    #[test]
+    fn a_stale_push_is_not_unreported_for_a_newer_edit() {
+        let store = DiagnosticsStore::new();
+        store.record_push(A, vec![diagnostic("old")], Some(1), Some(2));
+        assert!(
+            !store.has_unreported(),
+            "a verdict on the previous revision is not current"
+        );
+    }
+
+    #[test]
+    fn a_nonempty_push_after_an_empty_pull_stays_visible_to_drain() {
+        let store = DiagnosticsStore::new();
+        assert!(store.install(A, Answer::new(vec![], 1, None)));
+        store.record_push(A, vec![diagnostic("check")], Some(1), Some(1));
+        assert_eq!(store.items(A)[0].message, "check");
+        assert_eq!(store.take_unreported(), vec![A.to_string()]);
+        assert!(!store.has_unreported());
     }
 
     /// The writer's own reason to change its mind is checked under the lock
