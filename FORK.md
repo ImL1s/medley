@@ -151,7 +151,30 @@ feature PR branches it resolves the branch head with `git ls-remote`, lists
 merge commit). For `providers`, where CI push runs actually exist, it keeps the
 release-gate identity shape (`event == "push"`, `head_branch`, exact
 `head_sha`, and workflow `path == ".github/workflows/ci.yml"`). It
-intentionally does **not** use `gh pr checks`.
+intentionally does **not** use `gh pr checks` to answer "did this SHA get CI".
+
+`gh pr checks` is the wrong probe for that question: an empty result prints
+**"no checks reported"**, which looks unfinished rather than fail-closed, and
+cannot tell a dropped webhook from a run that has not started. The guard
+prints a `verdict:` line so those states stay distinct:
+
+- `success` — completed successful `ci.yml` run for this exact head
+- `absent` — zero runs for this head (dropped webhook / never created)
+- `in_progress` — a run exists and is queued / in progress / waiting
+- `skipped` — a run completed as skipped / cancelled, not success
+- `failed` / `identity_rejected` — finished unsuccessfully, or the path/event
+  identity check rejected the run
+
+`scripts/merge-pr.sh` still reads `gh pr checks --json` as a second gate
+(`python3 -B scripts/check_pr_head_ci_run.py --evaluate-pr-checks`): empty is
+`absent` and fail-closed; pending is `in_progress`, not absent; skip-only is
+not success. Do not treat `gh pr checks` with no rows as green. To answer
+"did this push get CI" yourself:
+
+```bash
+gh run list --repo ImL1s/medley --workflow ci.yml --branch <branch> \
+  --limit 5 --json headSha,status,conclusion,event,url
+```
 
 `main` has no fork workflows — it stays an upstream fast-forward mirror. Do not merge `providers` into `main`.
 
