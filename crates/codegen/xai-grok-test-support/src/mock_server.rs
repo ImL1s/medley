@@ -148,6 +148,23 @@ impl MockModelEntry {
         self
     }
 
+    /// Catalog entry for a keyless local/loopback fixture (`auth_scheme = none`).
+    ///
+    /// Readiness stays open without a provider-owned credential and without
+    /// forwarding ambient xAI session credentials to loopback.
+    pub fn keyless_local(id: impl Into<String>) -> Self {
+        Self::new(id).with_auth_scheme("none")
+    }
+
+    /// Declare `auth_scheme = none` unless the entry already chose a scheme.
+    pub fn with_keyless_local_default(self) -> Self {
+        if self.auth_scheme.is_some() {
+            self
+        } else {
+            self.with_auth_scheme("none")
+        }
+    }
+
     pub fn with_supports_backend_search(mut self, supports: bool) -> Self {
         self.supports_backend_search = supports;
         self
@@ -272,12 +289,34 @@ pub struct MockInferenceServer {
 
 impl MockInferenceServer {
     /// Serves one `test-model` with no agent type.
+    ///
+    /// The catalog omits `authScheme`, so the remote parser applies the Bearer
+    /// default. Keep this for HTTP-level and Bearer-path tests. Real-binary
+    /// loopback fixtures that must become ready should use
+    /// [`Self::start_keyless_local`] instead of trusting localhost or reusing
+    /// ambient xAI session credentials.
     pub async fn start() -> anyhow::Result<Self> {
         Self::start_with_models(vec![MockModelEntry::new("test-model")]).await
     }
 
+    /// Serves one `test-model` declared as keyless local (`auth_scheme = none`).
+    pub async fn start_keyless_local() -> anyhow::Result<Self> {
+        Self::start_with_keyless_local_models(vec![MockModelEntry::new("test-model")]).await
+    }
+
     pub async fn start_with_models(models: Vec<MockModelEntry>) -> anyhow::Result<Self> {
         Self::start_inner(models, None).await
+    }
+
+    /// Like [`start_with_models`], but unmarked entries become keyless local.
+    pub async fn start_with_keyless_local_models(
+        models: Vec<MockModelEntry>,
+    ) -> anyhow::Result<Self> {
+        let models = models
+            .into_iter()
+            .map(MockModelEntry::with_keyless_local_default)
+            .collect();
+        Self::start_with_models(models).await
     }
 
     /// Start a mock that returns 401 on inference requests missing
@@ -1069,6 +1108,43 @@ mod tests {
     fn mock_model_emits_explicit_auth_scheme() {
         let model = MockModelEntry::new("local-model").with_auth_scheme("none");
         assert_eq!(model.to_json()["authScheme"], "none");
+        assert_eq!(
+            MockModelEntry::keyless_local("local-model").to_json()["authScheme"],
+            "none"
+        );
+        assert!(
+            MockModelEntry::new("test-model")
+                .to_json()
+                .get("authScheme")
+                .is_none(),
+            "the shared start() catalog must keep the Bearer default"
+        );
+    }
+
+    #[tokio::test]
+    async fn keyless_local_server_catalog_emits_auth_scheme_none() {
+        let keyless = MockInferenceServer::start_keyless_local().await.unwrap();
+        let body: Value = reqwest::get(format!("{}/models", keyless.url()))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["data"][0]["id"], "test-model");
+        assert_eq!(body["data"][0]["authScheme"], "none");
+
+        let default = MockInferenceServer::start().await.unwrap();
+        let body: Value = reqwest::get(format!("{}/models", default.url()))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["data"][0]["id"], "test-model");
+        assert!(
+            body["data"][0].get("authScheme").is_none(),
+            "start() must keep the Bearer-default catalog: {body}"
+        );
     }
 
     /// Payloads of all `data:` lines in an SSE body, minus the `[DONE]` marker.

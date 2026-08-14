@@ -111,19 +111,6 @@ pub struct ContentController {
 }
 
 impl ContentController {
-    fn keyless_loopback_models(models: Vec<MockModel>) -> Vec<MockModel> {
-        models
-            .into_iter()
-            .map(|model| {
-                if model.auth_scheme.is_some() {
-                    model
-                } else {
-                    model.with_auth_scheme("none")
-                }
-            })
-            .collect()
-    }
-
     /// Start the mock inference server on a random local port.
     ///
     /// Must be called from within a tokio runtime.
@@ -135,11 +122,10 @@ impl ContentController {
     /// `GET /v1/models`. Use [`MockModel::with_agent_type`] to configure
     /// models with different harness types for agent-type-mismatch tests.
     pub async fn start_with_models(models: Vec<MockModel>) -> Result<Self> {
-        // The loopback fixture is deliberately keyless. Declare that on every
-        // model that did not opt into another scheme so credential-origin
-        // hardening never has to trust localhost or forward the fake xAI key.
-        let models = Self::keyless_loopback_models(models);
-        let server = MockInferenceServer::start_with_models(models)
+        // The loopback fixture is deliberately keyless. Unmarked models get
+        // `auth_scheme = none` so credential-origin hardening never has to
+        // trust localhost or forward the fake xAI key.
+        let server = MockInferenceServer::start_with_keyless_local_models(models)
             .await
             .context("start mock inference server")?;
         // Pre-delegation parity, both load-bearing for PTY tests: settings
@@ -182,8 +168,12 @@ impl ContentController {
     /// keyless-loopback default for entries that do not opt into another auth
     /// scheme.
     pub fn set_models(&self, models: Vec<MockModel>) {
-        self.server
-            .set_models(Self::keyless_loopback_models(models));
+        self.server.set_models(
+            models
+                .into_iter()
+                .map(MockModel::with_keyless_local_default)
+                .collect(),
+        );
     }
 
     /// Queue a compatibility response for the next request on `path`.

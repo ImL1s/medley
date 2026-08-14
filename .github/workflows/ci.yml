@@ -307,6 +307,11 @@ jobs:
           # tells them apart.
           run_nonzero -p xai-grok-shell --lib catalog_unavailable -- --nocapture
           run_nonzero -p xai-grok-shell --lib test_catalog_auth_schemes_and_override -- --nocapture
+          # #329: keyless local mock fixtures stay ready; start() stays Bearer.
+          run_nonzero -p xai-grok-test-support --lib \
+            keyless_local_server_catalog_emits_auth_scheme_none -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            keyless_local_mock_catalog_entry_is_ready_on_loopback -- --nocapture
           # #132: the reader's dup must not be inherited by children. Named
           # explicitly rather than by a `pty_session` prefix: the rest of that
           # module is the hang this change fixes, and this one is the fd leak
