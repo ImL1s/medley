@@ -605,6 +605,8 @@ jobs:
             unrestricted_generation_guard_rejects_reused_session_id -- --nocapture
           run_nonzero -p xai-grok-workspace --lib \
             drop_cleanup_clears_old_generation_resources_written_in_flight -- --nocapture
+          run_nonzero -p xai-grok-workspace --lib \
+            local_session_reservation_ -- --nocapture
           run_nonzero -p xai-circuit-breaker --lib \
             edge_client_retries_transient_edge_codes_but_not_origin_tls -- --nocapture
           run_nonzero -p xai-sqlite-journal --lib \
