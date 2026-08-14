@@ -1662,13 +1662,12 @@ wait"#,
             let children = std::fs::read_to_string(&children_path)
                 .ok()
                 .map(|s| s.lines().filter_map(parse_pid).collect::<Vec<_>>());
-            if let (Some(leader), Some(children)) = (leader, children) {
-                if children.len() == 2
-                    && process_exists(leader)
-                    && children.iter().all(|p| process_exists(*p))
-                {
-                    return (leader, children);
-                }
+            if let (Some(leader), Some(children)) = (leader, children)
+                && children.len() == 2
+                && process_exists(leader)
+                && children.iter().all(|p| process_exists(*p))
+            {
+                return (leader, children);
             }
         }
         panic!(
