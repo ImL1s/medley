@@ -6050,10 +6050,9 @@ fn cancel_never_overtakes_in_flight_prompt_intake() {
                 .cancel(acp::CancelNotification::new(sid.clone()))
                 .await;
         };
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            futures::join!(prompt_fut, cancel_fut),
-        )
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            futures::join!(prompt_fut, cancel_fut)
+        })
         .await
         .expect("prompt/cancel must finish; unanswered intake oneshots hang CI");
         assert_eq!(

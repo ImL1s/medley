@@ -165,7 +165,7 @@ impl FreshPublication {
             root_dir: root_dir.to_path_buf(),
             stage_container,
             stage_session: stage_session.clone(),
-            published_parent,
+            published_parent: published_parent.clone(),
             published_session: published_parent.join(&session_name),
             stage_container_anchor: Arc::new(Mutex::new(Some(stage_container_anchor))),
             stage_session_anchor: Arc::new(Mutex::new(Some(stage_session_anchor))),
@@ -290,14 +290,14 @@ impl FreshPublication {
                     ));
                 }
             };
-        sessions_anchor.ensure_owner_only().map_err(|error| {
+        if let Err(error) = sessions_anchor.ensure_owner_only() {
             restore_stage(&self.stage_session_anchor, stage_session_anchor);
-            FreshPublicationFinalizeError::not_committed(
+            return Err(FreshPublicationFinalizeError::not_committed(
                 FinalizeStage::PreCommit,
                 FinalizeOperation::OpenSessions,
                 error,
-            )
-        })?;
+            ));
+        }
 
         let published_parent_anchor = match sessions_anchor
             .open_child_dir(&self.published_parent_name)
@@ -644,7 +644,10 @@ mod tests {
         assert!(!published.join(SUMMARY_FILE).exists());
         drop(publication);
         assert_eq!(std::fs::read(published.join("partial")).unwrap(), b"winner");
-        assert!(!marker_free_public_dir_without_summary(&published));
+        assert!(
+            !published.join(UNPUBLISHED_SESSION_MARKER).exists(),
+            "abort must not write our unpublished marker into the occupant"
+        );
     }
 
     #[test]
