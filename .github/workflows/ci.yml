@@ -1662,6 +1662,20 @@ jobs:
             hard_expired_nonrefreshable_session_seats_codex -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             codex_only_from_config_seats_codex_and_sampling_stack -- --nocapture
+          # #317: invalid-xAI production probe drain + reseat.
+          run_nonzero -p xai-grok-shell --lib \
+            initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            invalid_env_probe -- --nocapture
+          run_nonzero -p xai-grok-test-support --lib \
+            read_http_request_headers -- --nocapture
+          run_nonzero -p xai-grok-test-support --lib \
+            accept_then_drain_survives_nonblocking_listener -- --nocapture
+          # #318: EnvGuard users of model-selection env vars must serialize.
+          run_nonzero -p xai-grok-test-support --lib \
+            env_guard_serializes_concurrent_mutations -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            construction_fallback_is_unusable_when_the_catalog_endpoint_is_external -- --nocapture
           # #245: catalog wire flags that differ from the Sol preset must parse.
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_parser_reads_wire_capabilities_that_differ_from_the_preset -- --nocapture

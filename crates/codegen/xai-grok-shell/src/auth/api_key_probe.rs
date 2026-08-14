@@ -334,8 +334,14 @@ mod tests {
         std::thread::spawn(move || {
             for (status_line, body) in responses {
                 if let Ok((mut stream, _)) = listener.accept() {
-                    use std::io::{Read, Write};
-                    let _ = stream.read(&mut [0u8; 2048]);
+                    use std::io::Write;
+                    // Drain the full request headers; a one-shot read can miss
+                    // a delayed/partial GET /v1/api-key (#317).
+                    let _ = xai_grok_test_support::read_http_request_headers(
+                        &mut stream,
+                        Duration::from_secs(2),
+                        xai_grok_test_support::DEFAULT_MAX_HTTP_HEADER_BYTES,
+                    );
                     let resp = format!(
                         "{status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),

@@ -4,24 +4,6 @@
 
 crates/codegen/xai-grok-shell/src/agent/config.rs::remote_settings_disarm_requires_prod_proxy_when_keys_embedded
 crates/codegen/xai-grok-shell/src/agent/config.rs::set_env_key_shadows_warm_provider_at_resolve_time
-crates/codegen/xai-grok-shell/src/agent/models/tests.rs::auth_scheme_none_unchanged_when_codex_ready
-crates/codegen/xai-grok-shell/src/agent/models/tests.rs::blank_primary_valid_legacy_keeps_grok_when_codex_ready
-crates/codegen/xai-grok-shell/src/agent/models/tests.rs::blank_xai_env_does_not_pin_grok_when_codex_ready
-crates/codegen/xai-grok-shell/src/agent/models/tests.rs::byok_unchanged_when_codex_ready
-crates/codegen/xai-grok-shell/src/agent/models/tests.rs::codex_only_cold_start_defaults_to_ready_codex
-crates/codegen/xai-grok-shell/src/agent/models/tests.rs::codex_only_default_not_bundled_grok_when_codex_ready
-crates/codegen/xai-grok-shell/src/agent/models/tests.rs::codex_only_from_config_seats_codex_and_sampling_stack
-crates/codegen/xai-grok-shell/src/agent/models/tests.rs::codex_ready_reseats_ambient_grok_without_xai_auth
-crates/codegen/xai-grok-shell/src/agent/models/tests.rs::construction_fallback_is_unusable_when_the_catalog_endpoint_is_external
-crates/codegen/xai-grok-shell/src/agent/models/tests.rs::deployment_key_keeps_first_party_when_codex_ready
-crates/codegen/xai-grok-shell/src/agent/models/tests.rs::hard_expired_nonrefreshable_session_seats_codex
-crates/codegen/xai-grok-shell/src/agent/models/tests.rs::preferred_method_api_key_pin_keeps_first_party_when_codex_ready
-crates/codegen/xai-grok-shell/src/agent/models/tests.rs::preferred_method_oidc_pin_keeps_first_party_when_codex_ready
-crates/codegen/xai-grok-shell/src/agent/models/tests.rs::refreshable_expired_oidc_session_keeps_first_party_when_codex_ready
-crates/codegen/xai-grok-shell/src/agent/models/tests.rs::test_catalog_auth_schemes_and_override
-crates/codegen/xai-grok-shell/src/agent/models/tests.rs::third_party_codex_responses_does_not_steal_default
-crates/codegen/xai-grok-shell/src/agent/models/tests.rs::whitespace_xai_env_does_not_pin_grok_when_codex_ready
-crates/codegen/xai-grok-shell/src/agent/models/tests.rs::xai_ambient_still_prefers_first_party_grok
 crates/codegen/xai-grok-shell/src/auth/manager_tests.rs::is_dark_wake_env_override_forces_both_states
 crates/codegen/xai-grok-shell/src/auth/manager_tests.rs::is_dark_wake_false_when_power_listener_not_started
 crates/codegen/xai-grok-shell/src/session/compaction.rs::prefire_lead_percent_defaults_to_10

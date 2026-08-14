@@ -37,6 +37,7 @@ pub mod acp_client;
 pub mod counting_server;
 pub mod env;
 pub mod headless;
+pub mod http;
 mod inference_override;
 #[cfg(unix)]
 pub mod leader;
@@ -57,6 +58,7 @@ pub use headless::{
     run_headless_in_sandbox_borrowed_with_env, run_headless_in_sandbox_with_env,
     run_headless_with_env, stderr_tail,
 };
+pub use http::{accept_with_deadline, read_http_request_headers, DEFAULT_MAX_HTTP_HEADER_BYTES};
 pub use inference_override::{InferenceEndpoint, InferenceExpectation, InferenceRequestMatcher};
 #[cfg(unix)]
 pub use leader::LeaderFixture;

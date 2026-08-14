@@ -27,6 +27,7 @@ fn test_manager() -> ModelsManager {
 /// entries it cannot find, so the user's first prompt would be sent to that
 /// origin with no authentication. Unready has to mean unusable at this seam.
 #[test]
+#[serial_test::serial]
 fn construction_fallback_is_unusable_when_the_catalog_endpoint_is_external() {
     use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
     use xai_grok_test_support::EnvGuard;
@@ -3143,6 +3144,7 @@ fn warm_cache_refresh_does_not_reseat_over_user_model_pick() {
 }
 
 #[test]
+#[serial_test::serial]
 fn test_catalog_auth_schemes_and_override() {
     use crate::remote::client::fetch_models_blocking;
     use xai_grok_test_support::EnvGuard;
@@ -3393,6 +3395,7 @@ fn ready_codex_entry(auth_home: &std::path::Path) -> (ModelEntry, xai_grok_test_
 }
 
 #[test]
+#[serial_test::serial]
 fn codex_only_cold_start_defaults_to_ready_codex() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -3432,6 +3435,7 @@ fn codex_only_cold_start_defaults_to_ready_codex() {
 }
 
 #[test]
+#[serial_test::serial]
 fn codex_only_default_not_bundled_grok_when_codex_ready() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -3459,6 +3463,7 @@ fn codex_only_default_not_bundled_grok_when_codex_ready() {
 }
 
 #[test]
+#[serial_test::serial]
 fn xai_ambient_still_prefers_first_party_grok() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -3484,6 +3489,7 @@ fn xai_ambient_still_prefers_first_party_grok() {
 }
 
 #[test]
+#[serial_test::serial]
 fn codex_ready_reseats_ambient_grok_without_xai_auth() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -3523,6 +3529,122 @@ fn codex_ready_reseats_ambient_grok_without_xai_auth() {
 }
 
 #[test]
+#[serial_test::serial]
+fn invalid_env_probe_reseats_only_after_unusable_verdict() {
+    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    use xai_grok_test_support::EnvGuard;
+    let _g = EnvGuard::set(XAI_API_KEY_ENV_VAR, "invalid-xai-key");
+    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+    let _default = EnvGuard::unset("GROK_DEFAULT_MODEL");
+
+    let tmp = tempfile::tempdir().expect("temp home");
+    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
+    let codex_key = crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string();
+    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
+    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
+    catalog.insert(codex_key.clone(), codex);
+
+    let xai_home = tmp.path().join("xai-probe-verdict");
+    std::fs::create_dir_all(&xai_home).unwrap();
+    let auth_manager = Arc::new(AuthManager::new(&xai_home, GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        catalog,
+        acp::ModelId::new("grok-4.5"),
+        auth_manager.clone(),
+        config::Config::default(),
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+
+    mgr.apply_first_party_env_api_key_probe_result(true);
+    assert_eq!(mgr.current_model_id().0.as_ref(), "grok-4.5");
+    assert!(auth_manager.first_party_env_api_key_ok());
+
+    mgr.apply_first_party_env_api_key_probe_result(false);
+    assert_eq!(
+        mgr.current_model_id().0.as_ref(),
+        codex_key.as_str(),
+        "a failed probe must invalidate presence-only Grok precedence"
+    );
+    assert!(!auth_manager.first_party_env_api_key_ok());
+}
+
+#[test]
+#[serial_test::serial]
+fn invalid_env_probe_preserves_explicit_and_user_picked_grok() {
+    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    use xai_grok_test_support::EnvGuard;
+    let _g = EnvGuard::set(XAI_API_KEY_ENV_VAR, "invalid-xai-key");
+    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+    let _default = EnvGuard::unset("GROK_DEFAULT_MODEL");
+
+    let tmp = tempfile::tempdir().expect("temp home");
+    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
+    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
+    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
+    catalog.insert(
+        crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string(),
+        codex,
+    );
+    let xai_home = tmp.path().join("xai-explicit-probe");
+    std::fs::create_dir_all(&xai_home).unwrap();
+    let auth_manager = Arc::new(AuthManager::new(&xai_home, GrokComConfig::default()));
+    let manager = |cfg: config::Config| {
+        ModelsManagerBuilder::new(
+            None,
+            catalog.clone(),
+            acp::ModelId::new("grok-4.5"),
+            auth_manager.clone(),
+            cfg,
+        )
+        .cache(test_cache_manager(tmp.path()))
+        .build()
+    };
+
+    let mut cli = config::Config::default();
+    cli.default_model_override = Some("grok-4.5".to_string());
+    let cli_mgr = manager(cli);
+    cli_mgr.apply_first_party_env_api_key_probe_result(false);
+    assert_eq!(cli_mgr.current_model_id().0.as_ref(), "grok-4.5");
+
+    {
+        let _env_default = EnvGuard::set("GROK_DEFAULT_MODEL", "grok-4.5");
+        let env_mgr = manager(config::Config::default());
+        env_mgr.apply_first_party_env_api_key_probe_result(false);
+        assert_eq!(env_mgr.current_model_id().0.as_ref(), "grok-4.5");
+    }
+
+    let mut configured = config::Config::default();
+    configured.models.default = Some("grok-4.5".to_string());
+    let configured_mgr = manager(configured);
+    configured_mgr.apply_first_party_env_api_key_probe_result(false);
+    assert_eq!(configured_mgr.current_model_id().0.as_ref(), "grok-4.5");
+
+    let mut missing = config::Config::default();
+    missing.default_model_override = Some("missing-explicit-model".to_string());
+    let missing_mgr = manager(missing);
+    missing_mgr.apply_first_party_env_api_key_probe_result(false);
+    assert_eq!(
+        missing_mgr.current_model_id().0.as_ref(),
+        crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID,
+        "a missing explicit preference must not protect its implicit Grok substitute"
+    );
+
+    let picked_mgr = manager(config::Config::default());
+    picked_mgr.set_current_model_id(acp::ModelId::new("grok-4.5"));
+    picked_mgr.apply_first_party_env_api_key_probe_result(false);
+    assert_eq!(picked_mgr.current_model_id().0.as_ref(), "grok-4.5");
+}
+
+#[test]
+#[serial_test::serial]
 fn byok_unchanged_when_codex_ready() {
     use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
     use xai_grok_test_support::EnvGuard;
@@ -3580,6 +3702,7 @@ fn byok_unchanged_when_codex_ready() {
 /// Keyless `auth_scheme = none` is not ambient first-party xAI and must not be
 /// reseated to Codex when the user already seated it (Pro P1 coverage split).
 #[test]
+#[serial_test::serial]
 fn auth_scheme_none_unchanged_when_codex_ready() {
     use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
     use xai_grok_test_support::EnvGuard;
@@ -3636,6 +3759,7 @@ fn auth_scheme_none_unchanged_when_codex_ready() {
 
 /// Deployment key is ambient usable xAI — keep Grok over ready Codex.
 #[test]
+#[serial_test::serial]
 fn deployment_key_keeps_first_party_when_codex_ready() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -3667,6 +3791,7 @@ fn deployment_key_keeps_first_party_when_codex_ready() {
 /// Third-party CodexResponses shim must not steal #303 default over ambient Grok
 /// (Pro P1: only official OpenAI Codex account routes qualify).
 #[test]
+#[serial_test::serial]
 fn third_party_codex_responses_does_not_steal_default() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -3707,6 +3832,7 @@ fn third_party_codex_responses_does_not_steal_default() {
 
 /// Pro P0: blank primary + valid legacy still counts as ambient usable → Grok.
 #[test]
+#[serial_test::serial]
 fn blank_primary_valid_legacy_keeps_grok_when_codex_ready() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -3738,6 +3864,7 @@ fn blank_primary_valid_legacy_keeps_grok_when_codex_ready() {
 
 /// Pro P0: blank / whitespace `XAI_API_KEY` must not keep Grok over ready Codex.
 #[test]
+#[serial_test::serial]
 fn blank_xai_env_does_not_pin_grok_when_codex_ready() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -3767,6 +3894,7 @@ fn blank_xai_env_does_not_pin_grok_when_codex_ready() {
 
 /// Pro P0: whitespace-only primary is not ambient usable.
 #[test]
+#[serial_test::serial]
 fn whitespace_xai_env_does_not_pin_grok_when_codex_ready() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -3790,6 +3918,7 @@ fn whitespace_xai_env_does_not_pin_grok_when_codex_ready() {
 /// Pro P0: `[auth] preferred_method = api_key` keeps Grok even with ready Codex
 /// and no live credential (avoids model/auth-surface contradiction).
 #[test]
+#[serial_test::serial]
 fn preferred_method_api_key_pin_keeps_first_party_when_codex_ready() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -3824,6 +3953,7 @@ fn preferred_method_api_key_pin_keeps_first_party_when_codex_ready() {
 
 /// Pro P0: `[auth] preferred_method = oidc` same pin semantics as api_key.
 #[test]
+#[serial_test::serial]
 fn preferred_method_oidc_pin_keeps_first_party_when_codex_ready() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -3851,6 +3981,7 @@ fn preferred_method_oidc_pin_keeps_first_party_when_codex_ready() {
 
 /// Pro P1: hard-expired OIDC with complete refresh surface keeps Grok over Codex.
 #[test]
+#[serial_test::serial]
 fn refreshable_expired_oidc_session_keeps_first_party_when_codex_ready() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -3994,6 +4125,7 @@ fn refreshable_expired_external_session_keeps_first_party_when_codex_ready() {
 ///
 /// Stops short of a full ACP turn / mock HTTP (still out of residual scope).
 #[test]
+#[serial_test::serial]
 fn codex_only_from_config_seats_codex_and_sampling_stack() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()
@@ -4098,6 +4230,7 @@ fn codex_only_from_config_seats_codex_and_sampling_stack() {
 
 /// Pro P1: hard-expired session without complete refresh surface seats Codex.
 #[test]
+#[serial_test::serial]
 fn hard_expired_nonrefreshable_session_seats_codex() {
     let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
         .lock()

@@ -1520,6 +1520,15 @@ fn with_model_overrides_env_full<T>(
 ) -> T {
     with_model_overrides_and_default_env(None, ws, ss, id, ps, f)
 }
+fn opt_model_override_env(
+    key: &'static str,
+    value: Option<&str>,
+) -> xai_grok_test_support::EnvGuard {
+    match value {
+        Some(v) => xai_grok_test_support::EnvGuard::set(key, v),
+        None => xai_grok_test_support::EnvGuard::unset(key),
+    }
+}
 fn with_model_overrides_and_default_env<T>(
     default: Option<&str>,
     ws: Option<&str>,
@@ -1528,25 +1537,14 @@ fn with_model_overrides_and_default_env<T>(
     ps: Option<&str>,
     f: impl FnOnce() -> T,
 ) -> T {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    with_env_var_opt(
-        "GROK_DEFAULT_MODEL",
-        default,
-        || with_env_var_opt(
-            "GROK_WEB_SEARCH_MODEL",
-            ws,
-            || with_env_var_opt(
-                "GROK_SESSION_SUMMARY_MODEL",
-                ss,
-                || with_env_var_opt(
-                    "GROK_IMAGE_DESCRIPTION_MODEL",
-                    id,
-                    || with_env_var_opt("GROK_PROMPT_SUGGESTIONS_MODEL", ps, f),
-                ),
-            ),
-        ),
-    )
+    // Join the crate-wide EnvGuard lock instead of a helper-private mutex
+    // that cannot serialize against other model-selection env tests (#318).
+    let _default = opt_model_override_env("GROK_DEFAULT_MODEL", default);
+    let _ws = opt_model_override_env("GROK_WEB_SEARCH_MODEL", ws);
+    let _ss = opt_model_override_env("GROK_SESSION_SUMMARY_MODEL", ss);
+    let _id = opt_model_override_env("GROK_IMAGE_DESCRIPTION_MODEL", id);
+    let _ps = opt_model_override_env("GROK_PROMPT_SUGGESTIONS_MODEL", ps);
+    f()
 }
 fn with_model_overrides_env<T>(
     ws: Option<&str>,
@@ -1557,6 +1555,7 @@ fn with_model_overrides_env<T>(
     with_model_overrides_env_full(ws, ss, id, None, f)
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_remote_settings_blocked_by_local_config() {
     with_model_overrides_env(
         None,
@@ -1584,6 +1583,7 @@ fn model_overrides_remote_settings_blocked_by_local_config() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_cli_overrides_everything() {
     with_model_overrides_env(
         Some("env-ws"),
@@ -1611,6 +1611,7 @@ fn model_overrides_cli_overrides_everything() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_remote_settings_applies_without_local_config() {
     with_model_overrides_env(
         None,
@@ -1632,6 +1633,7 @@ fn model_overrides_remote_settings_applies_without_local_config() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_local_image_description_wins_over_remote() {
     with_model_overrides_env(
         None,
@@ -1655,6 +1657,7 @@ fn model_overrides_local_image_description_wins_over_remote() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_default_image_description_is_grok_build() {
     with_model_overrides_env(
         None,
@@ -1671,6 +1674,7 @@ fn model_overrides_default_image_description_is_grok_build() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_default_session_summary_is_grok_build() {
     with_model_overrides_env(
         None,
@@ -1687,6 +1691,7 @@ fn model_overrides_default_session_summary_is_grok_build() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_unset_auxiliary_lanes_follow_the_local_configured_default() {
     with_model_overrides_env(
         None,
@@ -1721,6 +1726,7 @@ fn model_overrides_unset_auxiliary_lanes_follow_the_local_configured_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_unset_auxiliary_lanes_follow_the_env_configured_default() {
     with_model_overrides_and_default_env(
         Some("gpt-5.3-codex-spark"),
@@ -1741,6 +1747,7 @@ fn model_overrides_unset_auxiliary_lanes_follow_the_env_configured_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_cli_configured_default_wins_over_other_defaults() {
     with_model_overrides_and_default_env(
         Some("env-default"),
@@ -1777,6 +1784,7 @@ fn model_overrides_cli_configured_default_wins_over_other_defaults() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_inherited_web_search_uses_operative_model() {
     assert_eq!(
         super::auxiliary_model_or_operative(
@@ -1796,6 +1804,7 @@ fn model_overrides_inherited_web_search_uses_operative_model() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_inherited_image_uses_child_operative_model() {
     assert_eq!(
         super::auxiliary_model_or_operative(
@@ -1815,6 +1824,7 @@ fn model_overrides_inherited_image_uses_child_operative_model() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_unset_auxiliary_lanes_follow_the_remote_configured_default() {
     with_model_overrides_env(
         None,
@@ -1833,6 +1843,7 @@ fn model_overrides_unset_auxiliary_lanes_follow_the_remote_configured_default() 
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_a_configured_default_does_not_pin_prompt_suggestion() {
     with_model_overrides_env(
         None,
@@ -1859,6 +1870,7 @@ fn model_overrides_a_configured_default_does_not_pin_prompt_suggestion() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_local_session_summary_wins_over_remote() {
     with_model_overrides_env(
         None,
@@ -1882,6 +1894,7 @@ fn model_overrides_local_session_summary_wins_over_remote() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_env_session_summary_overrides_remote() {
     with_model_overrides_env(
         None,
@@ -1899,6 +1912,7 @@ fn model_overrides_env_session_summary_overrides_remote() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_env_session_summary_overrides_local() {
     with_model_overrides_env(
         None,
@@ -1918,6 +1932,7 @@ fn model_overrides_env_session_summary_overrides_local() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_empty_session_summary_toml_uses_default() {
     with_model_overrides_env(
         None,
@@ -1940,6 +1955,7 @@ fn model_overrides_empty_session_summary_toml_uses_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_empty_session_summary_remote_uses_default() {
     with_model_overrides_env(
         None,
@@ -1960,6 +1976,7 @@ fn model_overrides_empty_session_summary_remote_uses_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_cli_session_summary_overrides_everything() {
     with_model_overrides_env(
         None,
@@ -1988,6 +2005,7 @@ fn model_overrides_cli_session_summary_overrides_everything() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_empty_cli_session_summary_uses_default() {
     with_model_overrides_env(
         None,
@@ -2004,6 +2022,7 @@ fn model_overrides_empty_cli_session_summary_uses_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_env_image_description_overrides_remote() {
     with_model_overrides_env(
         None,
@@ -2021,6 +2040,7 @@ fn model_overrides_env_image_description_overrides_remote() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_env_image_description_overrides_local() {
     with_model_overrides_env(
         None,
@@ -2040,6 +2060,7 @@ fn model_overrides_env_image_description_overrides_local() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_empty_image_description_toml_uses_default() {
     with_model_overrides_env(
         None,
@@ -2062,6 +2083,7 @@ fn model_overrides_empty_image_description_toml_uses_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_empty_image_description_remote_uses_default() {
     with_model_overrides_env(
         None,
@@ -2082,6 +2104,7 @@ fn model_overrides_empty_image_description_remote_uses_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_prompt_suggestion_unpinned_by_default() {
     with_model_overrides_env(
         None,
@@ -2095,6 +2118,7 @@ fn model_overrides_prompt_suggestion_unpinned_by_default() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_prompt_suggestion_local_wins_over_remote() {
     with_model_overrides_env(
         None,
@@ -2121,6 +2145,7 @@ fn model_overrides_prompt_suggestion_local_wins_over_remote() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_prompt_suggestion_remote_applies_without_local() {
     with_model_overrides_env(
         None,
@@ -2141,6 +2166,7 @@ fn model_overrides_prompt_suggestion_remote_applies_without_local() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_prompt_suggestion_env_wins_over_local_and_remote() {
     with_model_overrides_env_full(
         None,
@@ -2168,6 +2194,7 @@ fn model_overrides_prompt_suggestion_env_wins_over_local_and_remote() {
     );
 }
 #[test]
+#[serial_test::serial]
 fn model_overrides_prompt_suggestion_blank_values_are_unset() {
     with_model_overrides_env_full(
         None,

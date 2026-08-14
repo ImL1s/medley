@@ -338,7 +338,7 @@ impl acp::Agent for MvpAgent {
             .models_manager
             .models()
             .values()
-            .any(crate::agent::config::ModelEntry::has_own_credentials);
+            .any(|model| model.has_own_credentials() && !model.is_openai_codex_profile());
         let first_party_env_ok = if crate::auth::should_probe_first_party_env_key(
             disable_api_key_auth,
             has_byok,
@@ -353,7 +353,8 @@ impl acp::Agent for MvpAgent {
         } else {
             true
         };
-        self.auth_manager.set_first_party_env_api_key_ok(first_party_env_ok);
+        self.models_manager
+            .apply_first_party_env_api_key_probe_result(first_party_env_ok);
         let has_external_api_key = auth_method::should_advertise_xai_api_key_with_env_ok(
             disable_api_key_auth,
             self.models_manager.models().values(),

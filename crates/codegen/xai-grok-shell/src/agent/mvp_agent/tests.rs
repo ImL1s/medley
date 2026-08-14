@@ -8544,6 +8544,138 @@ fn initialize_advertises_only_nonblank_external_auth_provider_commands() {
     assert!(advertised(Some("acme-auth --token")));
 }
 
+/// Production initialize must HTTP-probe a present first-party env key and,
+/// on an unusable verdict, reseat implicit Grok onto ready Codex (#303/#317).
+#[test]
+#[serial_test::serial]
+fn initialize_invalid_xai_probe_reseats_implicit_grok_to_ready_codex() {
+    run_local_for_bridge_test(|| async {
+        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+        use crate::agent::config::Config as AgentConfig;
+        use crate::auth::{AuthManager, AuthMode, GrokAuth, GrokComConfig};
+        use xai_grok_test_support::{
+            accept_with_deadline, EnvGuard, read_http_request_headers,
+            DEFAULT_MAX_HTTP_HEADER_BYTES,
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("probe listener");
+        let addr = listener.local_addr().expect("probe address");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking probe listener");
+        let probe_server = std::thread::spawn(move || {
+            use std::io::Write;
+            let mut stream = accept_with_deadline(
+                &listener,
+                std::time::Instant::now() + std::time::Duration::from_secs(2),
+            )
+            .expect("initialize did not send the production /api-key probe");
+            let request = read_http_request_headers(
+                &mut stream,
+                std::time::Duration::from_secs(1),
+                DEFAULT_MAX_HTTP_HEADER_BYTES,
+            )
+            .expect("read probe request");
+            let request = String::from_utf8_lossy(&request);
+            assert!(
+                request.starts_with("GET /v1/api-key "),
+                "initialize must use the production /api-key probe path: {request}"
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 29\r\nConnection: close\r\n\r\n{\"error\":\"Incorrect API key\"}",
+                )
+                .expect("write probe response");
+        });
+
+        let tmp = tempfile::tempdir().expect("temp home");
+        let state_home = tmp.path().join("state");
+        std::fs::create_dir_all(&state_home).expect("create isolated state home");
+        let _medley_home = EnvGuard::set("MEDLEY_HOME", &state_home);
+        let _grok_home = EnvGuard::set("GROK_HOME", &state_home);
+        let auth_path = tmp.path().join("auth.json");
+        let codex_auth = GrokAuth {
+            key: "live-codex-token".to_owned(),
+            auth_mode: AuthMode::OpenAiCodex,
+            refresh_token: Some("refresh".to_owned()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            oidc_issuer: Some(crate::auth::openai_codex::ISSUER.to_owned()),
+            oidc_client_id: Some(crate::auth::openai_codex::CLIENT_ID.to_owned()),
+            account_id: Some("account".to_owned()),
+            ..GrokAuth::default()
+        };
+        let auth_map = std::collections::HashMap::from([(
+            crate::auth::openai_codex::AUTH_SCOPE.to_owned(),
+            codex_auth,
+        )]);
+        std::fs::write(&auth_path, serde_json::to_vec(&auth_map).unwrap())
+            .expect("write Codex auth fixture");
+
+        let _xai_key = EnvGuard::set(XAI_API_KEY_ENV_VAR, "invalid-xai-key");
+        let _legacy_key = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+        let _default_model = EnvGuard::unset("GROK_DEFAULT_MODEL");
+        let xai_home = tmp.path().join("xai-empty");
+        std::fs::create_dir_all(&xai_home).expect("create xAI home");
+        let auth_manager =
+            std::sync::Arc::new(AuthManager::new(&xai_home, GrokComConfig::default()));
+        let _auth_path = EnvGuard::set(
+            "GROK_AUTH_PATH",
+            auth_path.to_str().expect("utf-8 auth path"),
+        );
+
+        let empty = toml::Value::Table(toml::map::Map::new());
+        let mut cfg = AgentConfig::new_from_toml_cfg(&empty).expect("production config");
+        // Keep the fixture cold and deterministic: production bootstrap otherwise
+        // fetches process-global remote settings, whose campaign default can
+        // explicitly pin a Codex model before the probe under test runs.
+        cfg.remote_settings = Some(Default::default());
+        cfg.endpoints.xai_api_base_url = format!("http://{addr}/v1");
+        cfg.models.default = None;
+        cfg.default_model_override = None;
+
+        assert!(
+            crate::agent::auth_method::has_xai_api_key_env(),
+            "fixture must expose the non-blank ambient xAI key to cold resolution"
+        );
+        let grok_key = crate::models::default_model().to_owned();
+        let mut prefetched = crate::agent::config::default_model_entries(
+            &crate::agent::config::EndpointsConfig::default(),
+        );
+        let grok = prefetched
+            .shift_remove(&grok_key)
+            .expect("bundled production Grok entry");
+        let (grok_ready, grok_reason) = crate::agent::config::model_readiness(&grok);
+        assert!(
+            grok_ready,
+            "bundled production Grok entry must be picker-ready: {grok_reason:?}"
+        );
+        prefetched.clear();
+        prefetched.insert(grok_key.clone(), grok);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let agent = MvpAgent::new(GatewaySender::new(tx), &cfg, auth_manager, Some(prefetched))
+            .expect("valid production agent");
+        assert_eq!(
+            agent.models_manager.current_model_id().0.as_ref(),
+            grok_key.as_str(),
+            "presence-only cold resolution initially treats the non-blank xAI key as ambient"
+        );
+
+        <MvpAgent as acp::Agent>::initialize(
+            &agent,
+            acp::InitializeRequest::new(acp::ProtocolVersion::V1),
+        )
+        .await
+        .expect("initialize succeeds after invalid xAI probe");
+        probe_server.join().expect("probe server");
+
+        assert_eq!(
+            agent.models_manager.current_model_id().0.as_ref(),
+            crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID,
+            "invalid ambient xAI key must not leave the implicit cold-start model stranded on Grok when Codex OAuth is ready"
+        );
+    });
+}
+
 /// #131 B3: the deliverable is the `initialize` response `_meta` key, not the
 /// in-memory lock. Deleting the insert in `AcpAgent::initialize` must fail
 /// this test; asserting only on `substituted_preference()` would not.
