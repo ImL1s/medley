@@ -5984,9 +5984,12 @@ fn cancel_does_not_forward_to_bridge_in_local_mode() {
 /// Regression (post-cancel slot hang, first bad release 0.2.101; see
 /// `dispatch_lock`). SDK e2e shape:
 /// `test_cancel_ends_in_flight_turn_and_frees_slot` (grok-agent-sdk).
+/// Fake actor must answer intake oneshots (#341); dropping them hangs `prompt`.
 #[test]
 fn cancel_never_overtakes_in_flight_prompt_intake() {
     use crate::session::SessionCommand;
+    use crate::session::commands::{PromptCompletionKind, PromptTurnOk};
+    use crate::session::plan_mode::PromptMode;
     use acp::Agent as _;
     run_local_for_bridge_test(|| async {
         let agent = build_minimal_agent_for_tests();
@@ -5996,18 +5999,39 @@ fn cancel_never_overtakes_in_flight_prompt_intake() {
         let order: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>> =
             std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let (intake_parked_tx, intake_parked_rx) = tokio::sync::oneshot::channel::<()>();
+        let (cancel_started_tx, cancel_started_rx) = tokio::sync::oneshot::channel::<()>();
         let driver_order = order.clone();
         tokio::task::spawn_local(async move {
             let mut intake_parked_tx = Some(intake_parked_tx);
+            let mut cancel_started_rx = Some(cancel_started_rx);
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
-                    SessionCommand::GetCurrentPromptMode { .. } => {
+                    SessionCommand::GetCurrentPromptMode { responds_to } => {
                         if let Some(tx) = intake_parked_tx.take() {
                             let _ = tx.send(());
-                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            if let Some(rx) = cancel_started_rx.take() {
+                                rx.await.expect(
+                                    "cancel starts while prompt still holds intake",
+                                );
+                            }
                         }
+                        let _ = responds_to.send(PromptMode::default());
                     }
-                    SessionCommand::Prompt { .. } => driver_order.borrow_mut().push("prompt"),
+                    SessionCommand::GetCurrentModel { responds_to } => {
+                        let _ = responds_to.send(String::from("test-model"));
+                    }
+                    SessionCommand::Prompt { respond_to, .. } => {
+                        driver_order.borrow_mut().push("prompt");
+                        let _ = respond_to.send(Ok(PromptTurnOk {
+                            stop_reason: acp::StopReason::Cancelled,
+                            total_tokens: 0,
+                            turn_snapshot: None,
+                            completion_kind: PromptCompletionKind::RemovedFromQueue,
+                            structured_output: None,
+                            usage: None,
+                            tool_overrides: None,
+                        }));
+                    }
                     SessionCommand::Cancel(..) => driver_order.borrow_mut().push("cancel"),
                     _ => {}
                 }
@@ -6021,11 +6045,17 @@ fn cancel_never_overtakes_in_flight_prompt_intake() {
             intake_parked_rx
                 .await
                 .expect("prompt intake reaches the fake actor");
+            let _ = cancel_started_tx.send(());
             let _ = agent
                 .cancel(acp::CancelNotification::new(sid.clone()))
                 .await;
         };
-        let _ = futures::join!(prompt_fut, cancel_fut);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            futures::join!(prompt_fut, cancel_fut),
+        )
+        .await
+        .expect("prompt/cancel must finish; unanswered intake oneshots hang CI");
         assert_eq!(
             order.borrow().as_slice(),
             ["prompt", "cancel"],
