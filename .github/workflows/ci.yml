@@ -1538,7 +1538,9 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_parser_tolerates_other_shapes_and_budgets_the_operative_window -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
-            codex_catalog_uses_context_window_not_the_ceiling_for_gpt_5_4 -- --nocapture
+            codex_catalog_context_window_budgets_the_operative_window -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_context_window_keys_prefer_operative_capacity -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_url_carries_the_required_client_version -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
