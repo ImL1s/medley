@@ -287,6 +287,48 @@ fn first_party_session_eligibility_refreshable_vs_malformed() {
         mgr.first_party_session_eligibility(),
         FirstPartySessionEligibility::None
     );
+
+    // Expired External + nonblank provider command is refreshable without
+    // OIDC client_id (#316). The command is the complete refresh authority.
+    let ext_dir = tempfile::tempdir().unwrap();
+    let ext_mgr = Arc::new(AuthManager::new(
+        ext_dir.path(),
+        GrokComConfig {
+            auth_provider_command: Some("acme-auth --token".to_owned()),
+            ..GrokComConfig::default()
+        },
+    ));
+    let mut expired_ext = make_auth(Some(Utc::now() - Duration::hours(1)), Utc::now());
+    expired_ext.auth_mode = AuthMode::External;
+    expired_ext.refresh_token = None;
+    expired_ext.oidc_issuer = Some(XAI_OAUTH2_ISSUER.to_owned());
+    expired_ext.oidc_client_id = None;
+    ext_mgr.hot_swap(expired_ext);
+    assert_eq!(
+        ext_mgr.first_party_session_eligibility(),
+        FirstPartySessionEligibility::Refreshable,
+        "configured external provider command is the complete refresh authority"
+    );
+
+    // Whitespace-only command is not a refresh surface.
+    let blank_mgr = Arc::new(AuthManager::new(
+        ext_dir.path(),
+        GrokComConfig {
+            auth_provider_command: Some(" \t\n".to_owned()),
+            ..GrokComConfig::default()
+        },
+    ));
+    let mut blank_ext = make_auth(Some(Utc::now() - Duration::hours(1)), Utc::now());
+    blank_ext.auth_mode = AuthMode::External;
+    blank_ext.refresh_token = None;
+    blank_ext.oidc_issuer = Some(XAI_OAUTH2_ISSUER.to_owned());
+    blank_ext.oidc_client_id = None;
+    blank_mgr.hot_swap(blank_ext);
+    assert_eq!(
+        blank_mgr.first_party_session_eligibility(),
+        FirstPartySessionEligibility::None,
+        "whitespace-only provider command is not a refresh authority"
+    );
 }
 
 /// Pro P0: one observation classifies usability + first-party session kind.
