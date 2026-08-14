@@ -1619,7 +1619,11 @@ wait"#,
                 let result = handle.await.unwrap().unwrap();
                 assert!(
                     !result.timed_out,
-                    "group kill must not take the timeout path: {result:?}"
+                    "group kill must not take the timeout path: timed_out={} signal={:?} exit_code={:?} truncated={}",
+                    result.timed_out,
+                    result.signal,
+                    result.exit_code,
+                    result.truncated
                 );
             })
             .await;
