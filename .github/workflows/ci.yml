@@ -1574,6 +1574,8 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             refreshable_expired_oidc_session_keeps_first_party_when_codex_ready -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
+            refreshable_expired_external_session_keeps_first_party_when_codex_ready -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
             hard_expired_nonrefreshable_session_seats_codex -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             codex_only_from_config_seats_codex_and_sampling_stack -- --nocapture

@@ -3914,6 +3914,75 @@ fn refreshable_expired_oidc_session_keeps_first_party_when_codex_ready() {
     );
 }
 
+/// #316: an expired first-party External session with a configured provider
+/// command is refreshable without OIDC client_id. Ready Codex must not
+/// displace that self-healing first-party default.
+#[test]
+#[serial_test::serial]
+fn refreshable_expired_external_session_keeps_first_party_when_codex_ready() {
+    let _serial = CODEX_ONLY_DEFAULT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    use crate::auth::{AuthMode, FirstPartySessionEligibility, GrokAuth, XAI_OAUTH2_ISSUER};
+    use xai_grok_test_support::EnvGuard;
+    let _g = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+    let _l = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+
+    let tmp = tempfile::tempdir().expect("temp home");
+    let (codex, _auth_path_pin) = ready_codex_entry(tmp.path());
+    let mut catalog: IndexMap<String, ModelEntry> = IndexMap::new();
+    catalog.insert("grok-4.5".to_string(), ready_entry("grok-4.5"));
+    catalog.insert(
+        crate::agent::model_providers::OPENAI_CODEX_PRESET_MODEL_ID.to_string(),
+        codex,
+    );
+
+    let xai_home = tmp.path().join("xai-external-refreshable");
+    std::fs::create_dir_all(&xai_home).unwrap();
+    let cfg_auth = GrokComConfig {
+        auth_provider_command: Some(
+            "printf '%s' '{\"access_token\":\"fresh-external\",\"issuer\":\"https://auth.x.ai\"}'"
+                .to_owned(),
+        ),
+        ..GrokComConfig::default()
+    };
+    let am = Arc::new(AuthManager::new(&xai_home, cfg_auth));
+    am.hot_swap(GrokAuth {
+        key: "expired-external".into(),
+        auth_mode: AuthMode::External,
+        create_time: chrono::Utc::now() - chrono::Duration::hours(2),
+        expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+        refresh_token: None,
+        oidc_issuer: Some(XAI_OAUTH2_ISSUER.to_owned()),
+        oidc_client_id: None,
+        user_id: "u".into(),
+        ..GrokAuth::test_default()
+    });
+    assert_eq!(
+        am.first_party_session_eligibility(),
+        FirstPartySessionEligibility::Refreshable,
+        "configured external provider command is the complete refresh authority"
+    );
+
+    let model_cfg = config::Config::default();
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        catalog,
+        acp::ModelId::new("grok-4.5"),
+        am,
+        model_cfg.clone(),
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    mgr.reselect_current_model_if_missing(&model_cfg);
+    assert_eq!(
+        mgr.current_model_id().0.as_ref(),
+        "grok-4.5",
+        "refreshable hard-expired External session must not reseat to Codex"
+    );
+}
+
 /// Pro P1 stack: `ModelsManager::from_config` (no CLI `--model`) seats ready
 /// OpenAI Codex and produces a CodexResponses sampling config against the
 /// official Codex base URL — not ambient Grok.
