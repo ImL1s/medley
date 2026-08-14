@@ -228,10 +228,12 @@ medley version --json
 
 `medley version --json` includes the build identity fields used by this fork:
 
-- `distChannel` (fork packaging marker; expected `providers` for fork releases)
+- `distChannel` (packaged product/channel; expected `medley` for fork releases)
 - `channel` (configured update channel name)
 - `upstreamBase` (upstream commit this build is based on)
 - `buildTarget` (target triple baked into the binary)
+
+The packaged product/channel is `medley`; the git branch and tag suffix remain `providers`.
 
 Releases are published for `aarch64`/`x86_64` macOS and Linux. The installer
 refuses to install into `~/.grok`, never touches an existing `grok` binary, and
