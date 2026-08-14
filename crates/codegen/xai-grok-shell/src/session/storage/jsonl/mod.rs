@@ -118,6 +118,75 @@ impl JsonlStorageAdapter {
             SessionDirMode::Explicit(dir) => dir.clone(),
         }
     }
+
+    fn lock_root(&self) -> Option<&Path> {
+        match &self.dir_mode {
+            SessionDirMode::FromRoot(root) => Some(root),
+            SessionDirMode::Explicit(_) => None,
+        }
+    }
+
+    fn try_lock_session_for_listing(
+        &self,
+        session_dir: &Path,
+    ) -> io::Result<Option<xai_grok_workspace::session::id_lock::SessionIdLock>> {
+        let Some(root) = self.lock_root() else {
+            return Ok(None);
+        };
+        let Some(session_id) = session_dir.file_name().and_then(|name| name.to_str()) else {
+            return Ok(None);
+        };
+        xai_grok_workspace::session::id_lock::try_acquire_session_id_read_lock_sync(
+            root, session_id,
+        )
+    }
+
+    fn init_session_published(
+        &self,
+        root: &Path,
+        info: &Info,
+        model_id: acp::ModelId,
+    ) -> io::Result<Summary> {
+        use std::ffi::OsStr;
+        use xai_grok_workspace::session::fresh_publication::{
+            FreshPublication, FreshPublicationFinalizeError,
+        };
+        use xai_grok_workspace::session::id_lock::acquire_session_id_lock_sync;
+
+        let session_id = info.id.to_string();
+        let _lease = acquire_session_id_lock_sync(root, &session_id)?;
+        let summary_path = self.summary_file(info);
+        if Path::new(&summary_path).exists() {
+            tracing::info!("Loading existing session from JSONL");
+            return self.read_summary_sync(info);
+        }
+
+        tracing::info!("Creating new session in JSONL");
+        let parent_name = crate::util::grok_home::encode_cwd_dirname(&info.cwd);
+        let publication = FreshPublication::prepare(root, &session_id, OsStr::new(&parent_name))?;
+        let mut summary = Summary::new(info, model_id)?;
+        summary.sandbox_profile = xai_grok_sandbox::configured_profile_name().map(String::from);
+        let bytes = serde_json::to_vec_pretty(&summary)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        super::write_bytes_atomic(&publication.stage_session().join(super::SUMMARY_FILE), &bytes)?;
+        match publication.finalize() {
+            Ok(()) => Ok(summary),
+            Err(error) if error.is_committed() => {
+                tracing::error!(
+                    error_kind = ?match &error {
+                        FreshPublicationFinalizeError::CommittedDurability { error, .. }
+                        | FreshPublicationFinalizeError::CommittedIdentity { error, .. } => {
+                            error.kind()
+                        }
+                        FreshPublicationFinalizeError::NotCommitted { error, .. } => error.kind(),
+                    },
+                    "session persistence committed; continuing after durability/identity error"
+                );
+                Ok(summary)
+            }
+            Err(error) => Err(io::Error::other(error)),
+        }
+    }
     pub(super) fn updates_file(&self, info: &Info) -> PathBuf {
         self.session_dir(info).join(super::UPDATES_FILE)
     }
@@ -193,6 +262,9 @@ impl JsonlStorageAdapter {
         let session_dirs = self.scan_session_dirs(cwd)?;
         let mut summaries = Vec::new();
         for session_dir in session_dirs {
+            let Some(_lease) = self.try_lock_session_for_listing(&session_dir)? else {
+                continue;
+            };
             if let Some(summary) = self.read_summary_for_listing(&session_dir) {
                 summaries.push(summary);
             }
@@ -233,6 +305,9 @@ impl JsonlStorageAdapter {
         let mut candidates: Vec<(PathBuf, std::time::SystemTime)> =
             Vec::with_capacity(session_dirs.len());
         for session_dir in session_dirs {
+            let Some(_lease) = self.try_lock_session_for_listing(&session_dir)? else {
+                continue;
+            };
             if let Err(error) = self.recover_model_switch_in_dir_sync(&session_dir) {
                 tracing::warn!(
                     session_dir = %session_dir.display(),
@@ -1082,6 +1157,9 @@ async fn next_compaction_segment_index(compaction_dir: &std::path::Path) -> u64 
 #[async_trait]
 impl StorageAdapter for JsonlStorageAdapter {
     async fn init_session(&self, info: &Info, model_id: acp::ModelId) -> io::Result<Summary> {
+        if let Some(root) = self.lock_root() {
+            return self.init_session_published(root, info, model_id);
+        }
         let dir = self.session_dir(info);
         std::fs::create_dir_all(&dir)?;
         let summary_path = self.summary_file(info);

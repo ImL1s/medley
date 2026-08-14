@@ -2193,6 +2193,53 @@ async fn list_sessions_recent_skips_corrupt_summary() {
     assert_eq!(recent.len(), 1);
     assert_eq!(recent[0].info.id, acp::SessionId::new("good"));
 }
+
+#[tokio::test]
+async fn init_session_publishes_summary_once_and_lists_only_committed() {
+    let tmp = TempDir::new().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("019c0000-0000-7000-8000-000000000399"),
+        cwd: "/repo/publication/shell-init".to_string(),
+    };
+    let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());
+    let summary = adapter
+        .init_session(&info, default_model_id())
+        .await
+        .expect("published new session");
+    let public = adapter.session_dir(&info);
+    assert!(public.join("summary.json").is_file());
+    assert!(!public.join(".unpublished").exists());
+    assert_eq!(summary.info.id, info.id);
+    assert!(
+        tmp.path()
+            .join(".locks/session-ids")
+            .read_dir()
+            .unwrap()
+            .any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".namespace.lock")
+            })
+    );
+
+    let listed = adapter.list_sessions_sync(Some(&info.cwd)).unwrap();
+    assert_eq!(listed.len(), 1);
+
+    let exclusive = xai_grok_workspace::session::id_lock::acquire_session_id_lock_sync(
+        tmp.path(),
+        &info.id.to_string(),
+    )
+    .unwrap();
+    let hidden = adapter.list_sessions_sync(Some(&info.cwd)).unwrap();
+    assert!(
+        hidden.is_empty(),
+        "discovery must omit a session while the exclusive lease is held"
+    );
+    drop(exclusive);
+}
+
 /// Helper: set the mtime of a file to a specific chrono DateTime.
 fn set_mtime(path: &std::path::Path, time: chrono::DateTime<chrono::Utc>) {
     use std::time::{Duration, UNIX_EPOCH};

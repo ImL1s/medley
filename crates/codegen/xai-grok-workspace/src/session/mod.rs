@@ -1,7 +1,10 @@
+pub mod anchored;
 pub(crate) mod checkpoint;
 pub(crate) mod checkpoint_store;
 pub mod file_state;
+pub mod fresh_publication;
 pub mod git;
+pub mod id_lock;
 pub mod jj;
 pub(crate) mod swap_policy;
 pub mod tool_config;

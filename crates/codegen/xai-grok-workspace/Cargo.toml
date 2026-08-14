@@ -116,7 +116,7 @@ nix = { workspace = true, features = ["signal", "process"] }
 
 # Only referenced by the Windows self-daemonize path (SetStdHandle).
 [target.'cfg(windows)'.dependencies]
-windows = { workspace = true }
+windows = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 
 [[bin]]
 name = "xai-workspace-server"
