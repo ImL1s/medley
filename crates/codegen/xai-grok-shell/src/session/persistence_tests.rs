@@ -166,9 +166,14 @@ async fn durable_prepare_failure_prevents_publication_arming() {
         id: acp::SessionId::new("durable-prepare-failure"),
         cwd: "/test/durable-prepare".into(),
     };
-    let session_dir = root.path().join("session");
+    let published_session = root
+        .path()
+        .join("sessions")
+        .join(crate::util::grok_home::encode_cwd_dirname(&info.cwd))
+        .join(info.id.0.as_ref());
     let fresh_claim =
-        claim_fresh_session_sync(root.path(), info.id.0.as_ref(), session_dir.clone()).unwrap();
+        claim_fresh_session_sync(root.path(), info.id.0.as_ref(), published_session).unwrap();
+    let session_dir = fresh_claim.publication.stage_session.clone();
     let storage = Arc::new(JsonlStorageAdapter::with_session_sync_probe(
         session_dir.clone(),
         || Err(io::Error::other("injected durable prepare failure")),

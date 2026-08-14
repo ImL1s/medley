@@ -65,6 +65,27 @@ async fn create_test_actor_with_memory(
     persistence_tx: mpsc::UnboundedSender<PersistenceMsg>,
     memory_config: Option<crate::config::MemoryConfig>,
 ) -> SessionActor {
+    create_test_actor_with_memory_and_events(
+        total_tokens,
+        context_window,
+        threshold_percent,
+        gateway_tx,
+        persistence_tx,
+        memory_config,
+    )
+    .await
+    .0
+}
+
+#[allow(clippy::field_reassign_with_default)]
+async fn create_test_actor_with_memory_and_events(
+    total_tokens: u64,
+    context_window: u64,
+    threshold_percent: u8,
+    gateway_tx: mpsc::UnboundedSender<xai_acp_lib::AcpClientMessage>,
+    persistence_tx: mpsc::UnboundedSender<PersistenceMsg>,
+    memory_config: Option<crate::config::MemoryConfig>,
+) -> (SessionActor, mpsc::UnboundedReceiver<SessionEvent>) {
     let tmp = tempfile::TempDir::new().unwrap();
     let cwd_path = tmp.path().to_path_buf();
     let cwd = AbsPathBuf::new(cwd_path.clone()).unwrap();
@@ -94,7 +115,7 @@ async fn create_test_actor_with_memory(
         nudges_used_this_session: 0,
     });
     let (chat_event_tx, _chat_event_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
     let chat_state_handle = xai_chat_state::ChatStateActor::spawn(
         vec![],
         xai_grok_sampling_types::SamplingConfig {
@@ -122,7 +143,7 @@ async fn create_test_actor_with_memory(
     let memory_initial_injection_config = memory_config
         .as_ref()
         .map_or_else(Default::default, |mc| mc.initial_injection.clone());
-    SessionActor {
+    let actor = SessionActor {
         session_info: SessionInfo {
             id: acp::SessionId::new("test-memory"),
             cwd: cwd.as_str().to_string(),
@@ -317,7 +338,8 @@ async fn create_test_actor_with_memory(
         subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
         workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
         trace_config_template: std::cell::RefCell::new(None),
-    }
+    };
+    (actor, event_rx)
 }
 #[tokio::test(flavor = "current_thread")]
 async fn test_is_flushing_suppresses_auto_compact() {
@@ -677,20 +699,30 @@ async fn test_idle_flush_timeout_from_config() {
         .await;
 }
 
-fn spawn_slash_output_responder(
-    mut gateway_rx: mpsc::UnboundedReceiver<xai_acp_lib::AcpClientMessage>,
+/// Drain `event_tx` the way `run_session` does: capture slash-command
+/// `AgentMessageChunk` text and acknowledge `FlushReplay` so
+/// `send_host_turn_slash_command_output` can return.
+fn spawn_replay_slash_output_drain(
+    mut event_rx: mpsc::UnboundedReceiver<SessionEvent>,
 ) -> Arc<std::sync::Mutex<Vec<String>>> {
     let output = Arc::new(std::sync::Mutex::new(Vec::new()));
     let captured = Arc::clone(&output);
     tokio::task::spawn_local(async move {
-        while let Some(message) = gateway_rx.recv().await {
-            if let xai_acp_lib::AcpClientMessage::SessionNotification(args) = message {
-                if let acp::SessionUpdate::AgentMessageChunk(chunk) = &args.request.update
-                    && let acp::ContentBlock::Text(text) = &chunk.content
-                {
-                    captured.lock().unwrap().push(text.text.clone());
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                SessionEvent::Notification(notification) => {
+                    if let SessionNotification::Acp(args) = notification
+                        && let acp::SessionUpdate::AgentMessageChunk(chunk) = &args.update
+                        && let acp::ContentBlock::Text(text) = &chunk.content
+                    {
+                        captured.lock().unwrap().push(text.text.clone());
+                    }
                 }
-                let _ = args.response_tx.send(Ok(()));
+                SessionEvent::FlushReplay { respond_to } => {
+                    if let Some(tx) = respond_to {
+                        let _ = tx.send(());
+                    }
+                }
             }
         }
     });
@@ -742,12 +774,18 @@ async fn memory_toggle_on_registers_both_tools_and_preserves_custom_storage_path
                 global_dir.clone(),
                 workspace_dir.clone(),
             );
-            let (gateway_tx, gateway_rx) = mpsc::unbounded_channel();
-            let output = spawn_slash_output_responder(gateway_rx);
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
             let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
-            let mut actor =
-                create_test_actor_with_memory(0, 100_000, 85, gateway_tx, persistence_tx, None)
-                    .await;
+            let (mut actor, event_rx) = create_test_actor_with_memory_and_events(
+                0,
+                100_000,
+                85,
+                gateway_tx,
+                persistence_tx,
+                None,
+            )
+            .await;
+            let output = spawn_replay_slash_output_drain(event_rx);
             configure_disabled_memory_with_storage(&mut actor, storage);
             let actor = Arc::new(actor);
 
@@ -791,12 +829,18 @@ async fn memory_toggle_on_rolls_back_new_search_when_get_registration_fails() {
                 temp.path().join("custom-global"),
                 temp.path().join("custom-workspace"),
             );
-            let (gateway_tx, gateway_rx) = mpsc::unbounded_channel();
-            let output = spawn_slash_output_responder(gateway_rx);
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
             let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
-            let mut actor =
-                create_test_actor_with_memory(0, 100_000, 85, gateway_tx, persistence_tx, None)
-                    .await;
+            let (mut actor, event_rx) = create_test_actor_with_memory_and_events(
+                0,
+                100_000,
+                85,
+                gateway_tx,
+                persistence_tx,
+                None,
+            )
+            .await;
+            let output = spawn_replay_slash_output_drain(event_rx);
             configure_disabled_memory_with_storage(&mut actor, storage);
             let actor = Arc::new(actor);
             let bridge = actor.agent.borrow().tool_bridge().clone();
