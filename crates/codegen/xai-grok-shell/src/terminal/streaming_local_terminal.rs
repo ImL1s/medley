@@ -1570,7 +1570,12 @@ mod tests {
     /// `signal: None` / `timed_out: true`, so a leader-signal assertion cannot
     /// tell a scheduling miss from a clean group kill, and never checks the
     /// children at all (#324).
+    ///
+    /// Unix-only: the fixture is a POSIX shell tree and the oracle is
+    /// `kill(pid, 0)`. Compiling that helper into `--lib` tests is what
+    /// failed the Windows publication job after the providers merge.
     #[tokio::test]
+    #[cfg(unix)]
     async fn test_process_group_kill_with_session() {
         tokio::task::LocalSet::new()
             .run_until(async {
@@ -1629,6 +1634,7 @@ wait"#,
             .await;
     }
 
+    #[cfg(unix)]
     fn process_exists(pid: i32) -> bool {
         if pid <= 0 {
             return false;
@@ -1642,11 +1648,13 @@ wait"#,
         std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
 
+    #[cfg(unix)]
     fn parse_pid(raw: &str) -> Option<i32> {
         let parsed = raw.trim().parse::<i32>().ok()?;
         (parsed > 0).then_some(parsed)
     }
 
+    #[cfg(unix)]
     async fn wait_for_process_tree(pid_dir: &tempfile::TempDir) -> (i32, Vec<i32>) {
         let ready = pid_dir.path().join("ready");
         let leader_path = pid_dir.path().join("leader");
@@ -1678,6 +1686,7 @@ wait"#,
         );
     }
 
+    #[cfg(unix)]
     async fn wait_until_dead(leader: i32, children: &[i32]) {
         for _ in 0..80 {
             let leader_alive = process_exists(leader);
