@@ -82,9 +82,11 @@ pub(crate) struct AutoCompactThresholdTiers {
     pub user_per_model: std::collections::HashMap<String, u8>,
     /// `cfg.remote_settings.auto_compact_threshold_percent` (GB global).
     pub remote_global: Option<u8>,
+    /// Catalog `effective_context_window_percent` per model id (#264).
+    pub catalog_per_model: std::collections::HashMap<String, u8>,
 }
 impl AutoCompactThresholdTiers {
-    /// Slice the parent's `Config` into the four tier inputs we'll resolve
+    /// Slice the parent's `Config` into the tier inputs we'll resolve
     /// against later. Only fields relevant to the auto-compact threshold
     /// are captured; the parent's `Config` is not held by reference.
     pub(crate) fn capture(cfg: &crate::agent::config::Config) -> Self {
@@ -93,6 +95,11 @@ impl AutoCompactThresholdTiers {
             .iter()
             .filter_map(|(k, v)| v.auto_compact_threshold_percent.map(|t| (k.clone(), t)))
             .collect();
+        let catalog_per_model = cfg
+            .config_models
+            .iter()
+            .filter_map(|(k, v)| v.effective_context_window_percent.map(|t| (k.clone(), t)))
+            .collect();
         Self {
             user_session: cfg.session.auto_compact_threshold_percent,
             user_per_model,
@@ -100,6 +107,7 @@ impl AutoCompactThresholdTiers {
                 .remote_settings
                 .as_ref()
                 .and_then(|r| r.auto_compact_threshold_percent),
+            catalog_per_model,
         }
     }
 }
@@ -351,12 +359,13 @@ impl SubagentSpawnContext {
     /// Resolve `auto_compact_threshold_percent` for the subagent's actual
     /// model id (the one selected by `resolve_subagent_sampling_config`,
     /// not the parent's). Walks the same precedence as the main session's
-    /// resolver: env > user [model.<id>] > user [session] > GB per-model
-    /// > GB global > 85.
+    /// resolver: env > user [model.<id>] > user [session] > catalog
+    /// > GB per-model > GB global > 85.
     ///
     /// The caller supplies the GB per-model tier from the same prepared
-    /// catalog snapshot as the subagent's `SamplerConfig`; user TOML and GB
-    /// global tiers remain sourced from the parent's spawn-context snapshot.
+    /// catalog snapshot as the subagent's `SamplerConfig`; user TOML, catalog,
+    /// and GB global tiers remain sourced from the parent's spawn-context
+    /// snapshot.
     pub(crate) fn resolve_auto_compact_threshold_percent(
         &self,
         subagent_model_id: &str,
@@ -368,6 +377,10 @@ impl SubagentSpawnContext {
                 .get(subagent_model_id)
                 .copied(),
             self.auto_compact_threshold_tiers.user_session,
+            self.auto_compact_threshold_tiers
+                .catalog_per_model
+                .get(subagent_model_id)
+                .copied(),
             gb_per_model,
             self.auto_compact_threshold_tiers.remote_global,
         )

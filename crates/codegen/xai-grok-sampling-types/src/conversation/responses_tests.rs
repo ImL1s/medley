@@ -109,6 +109,56 @@ fn codex_wire_capabilities_keep_summary_when_catalog_allows_or_is_silent() {
     assert_eq!(body["reasoning"]["summary"], "concise");
 }
 
+/// #274: Sol's catalog `use_responses_lite: true` must change the shipped
+/// Responses body. openai/codex requires `reasoning.context = all_turns`
+/// on that transport; Spark (`false`) must not inherit it.
+#[test]
+fn codex_wire_capabilities_apply_use_responses_lite_from_catalog() {
+    let mut sol = serde_json::json!({
+        "model": "gpt-5.6-sol",
+        "parallel_tool_calls": true,
+        "reasoning": { "effort": "low", "summary": "concise" }
+    });
+    apply_codex_wire_capabilities(
+        &mut sol,
+        &crate::CodexWireCapabilities {
+            use_responses_lite: Some(true),
+            ..crate::CodexWireCapabilities::default()
+        },
+    );
+    assert_eq!(
+        sol["reasoning"]["context"], "all_turns",
+        "lite Sol requests must set reasoning.context: {sol}"
+    );
+    assert_eq!(sol["reasoning"]["effort"], "low");
+    assert_eq!(sol["reasoning"]["summary"], "concise");
+    assert_eq!(sol["parallel_tool_calls"], false);
+
+    let mut spark = serde_json::json!({
+        "model": "gpt-5.3-codex-spark",
+        "parallel_tool_calls": true,
+        "reasoning": { "effort": "high", "summary": "concise" }
+    });
+    apply_codex_wire_capabilities(
+        &mut spark,
+        &crate::CodexWireCapabilities {
+            use_responses_lite: Some(false),
+            ..crate::CodexWireCapabilities::default()
+        },
+    );
+    assert!(
+        spark["reasoning"].get("context").is_none(),
+        "Spark must not inherit Sol's lite reasoning.context: {spark}"
+    );
+    assert_eq!(spark["parallel_tool_calls"], true);
+
+    let mut silent = serde_json::json!({
+        "reasoning": { "effort": "low", "summary": "concise" }
+    });
+    apply_codex_wire_capabilities(&mut silent, &crate::CodexWireCapabilities::default());
+    assert!(silent["reasoning"].get("context").is_none());
+}
+
 #[test]
 fn codex_instructions_preserve_unsupported_system_content() {
     let original = serde_json::json!({

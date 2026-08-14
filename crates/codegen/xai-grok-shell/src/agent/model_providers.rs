@@ -403,6 +403,27 @@ fn codex_catalog_bool(obj: &serde_json::Map<String, serde_json::Value>, key: &st
     obj.get(key).and_then(serde_json::Value::as_bool)
 }
 
+/// Catalog auto-compact calibration (0-100). Out-of-range values are ignored
+/// so a bad payload cannot disable compaction or overflow the resolver.
+fn codex_catalog_effective_context_window_percent(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<u8> {
+    let value = obj
+        .get("effective_context_window_percent")
+        .or_else(|| obj.get("effectiveContextWindowPercent"))?;
+    let raw = value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()))?;
+    if raw > 100 {
+        tracing::warn!(
+            value = raw,
+            "ignoring out-of-range Codex catalog effective_context_window_percent"
+        );
+        return None;
+    }
+    Some(raw as u8)
+}
+
 fn codex_catalog_string_list(
     obj: &serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -583,6 +604,7 @@ fn parse_openai_codex_catalog_entry(
             supports_reasoning_effort,
             reasoning_efforts,
             codex_wire: Some(codex_wire),
+            effective_context_window_percent: codex_catalog_effective_context_window_percent(obj),
             ..ConfigModelOverride::default()
         },
     ))
@@ -808,6 +830,7 @@ fn merge_openai_codex_preset_entries(
             reasoning_efforts,
             codex_wire,
             catalog_degraded_reason,
+            effective_context_window_percent,
             ..
         } = preset;
         user_entry.model_provider = model_provider;
@@ -869,6 +892,11 @@ fn merge_openai_codex_preset_entries(
             user_entry.codex_wire = codex_wire;
         }
         user_entry.catalog_degraded_reason = catalog_degraded_reason;
+        if let Some(percent) = effective_context_window_percent {
+            user_entry
+                .effective_context_window_percent
+                .get_or_insert(percent);
+        }
     }
 }
 
@@ -2610,7 +2638,8 @@ mod tests {
                     "supports_reasoning_summary_parameter": true,
                     "supports_image_detail_original": true,
                     "input_modalities": ["text", "image"],
-                    "default_reasoning_level": "low"
+                    "default_reasoning_level": "low",
+                    "effective_context_window_percent": 95
                 },
                 {
                     "slug": "gpt-5.3-codex-spark",
@@ -2641,6 +2670,12 @@ mod tests {
 
         assert_eq!(sol.use_responses_lite, Some(true));
         assert_eq!(spark.use_responses_lite, Some(false));
+        assert_eq!(
+            presets
+                .get("gpt-5.6-sol")
+                .and_then(|entry| entry.effective_context_window_percent),
+            Some(95)
+        );
         assert_eq!(sol.tool_mode.as_deref(), Some("code_mode_only"));
         assert_eq!(spark.tool_mode, None);
         assert_eq!(sol.supports_reasoning_summary_parameter, Some(true));
@@ -2664,6 +2699,87 @@ mod tests {
             Some(xai_grok_sampling_types::ReasoningEffort::High),
             "catalog default_reasoning_level must become reasoning_effort"
         );
+    }
+
+    /// #274: a Sol catalog `use_responses_lite: true` must reach the shipped
+    /// request builder; Spark's `false` must not.
+    #[test]
+    fn sol_catalog_use_responses_lite_reaches_the_request_builder() {
+        let payload = serde_json::json!({
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "use_responses_lite": true,
+                    "context_window": 272000
+                },
+                {
+                    "slug": "gpt-5.3-codex-spark",
+                    "use_responses_lite": false,
+                    "context_window": 128000
+                }
+            ]
+        });
+        let presets = parse_openai_codex_catalog_models(&payload);
+        let sol_caps = presets
+            .get("gpt-5.6-sol")
+            .and_then(|entry| entry.codex_wire.clone())
+            .expect("Sol wire caps");
+        let spark_caps = presets
+            .get("gpt-5.3-codex-spark")
+            .and_then(|entry| entry.codex_wire.clone())
+            .expect("Spark wire caps");
+        assert!(sol_caps.responses_lite_enabled());
+        assert!(!spark_caps.responses_lite_enabled());
+
+        let mut sol_body = serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "parallel_tool_calls": true,
+            "reasoning": { "effort": "low", "summary": "concise" }
+        });
+        xai_grok_sampling_types::apply_codex_wire_capabilities(&mut sol_body, &sol_caps);
+        assert_eq!(
+            sol_body["reasoning"]["context"], "all_turns",
+            "Sol catalog lite flag must reshape the request: {sol_body}"
+        );
+        assert_eq!(sol_body["parallel_tool_calls"], false);
+
+        let mut spark_body = serde_json::json!({
+            "model": "gpt-5.3-codex-spark",
+            "parallel_tool_calls": true,
+            "reasoning": { "effort": "high", "summary": "concise" }
+        });
+        xai_grok_sampling_types::apply_codex_wire_capabilities(&mut spark_body, &spark_caps);
+        assert!(
+            spark_body["reasoning"].get("context").is_none(),
+            "Spark must not inherit Sol's lite body: {spark_body}"
+        );
+        assert_eq!(spark_body["parallel_tool_calls"], true);
+    }
+
+    /// #264: every live Codex catalog model reports 95; that value is the
+    /// catalog auto-compact tier, not a user `[model.<id>]` override.
+    #[test]
+    fn parse_codex_catalog_effective_context_window_percent() {
+        let parsed = parse_openai_codex_catalog_entry(&serde_json::json!({
+            "slug": "gpt-5.6-sol",
+            "context_window": 272000,
+            "effective_context_window_percent": 95
+        }))
+        .expect("valid catalog entry")
+        .1;
+        assert_eq!(parsed.effective_context_window_percent, Some(95));
+        assert_eq!(
+            parsed.auto_compact_threshold_percent, None,
+            "catalog percent must not be written into the user-per-model field"
+        );
+
+        let ignored = parse_openai_codex_catalog_entry(&serde_json::json!({
+            "slug": "bad-percent",
+            "effective_context_window_percent": 140
+        }))
+        .expect("entry remains usable")
+        .1;
+        assert_eq!(ignored.effective_context_window_percent, None);
     }
 
     #[test]

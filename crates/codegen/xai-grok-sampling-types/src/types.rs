@@ -1026,8 +1026,10 @@ pub fn reasoning_efforts_meta_value(opts: &[ReasoningEffortOption]) -> serde_jso
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodexWireCapabilities {
     /// When `Some(true)`, the account catalog marks this model for the lite
-    /// Responses transport. Stored for diagnostics; wire mapping is applied
-    /// only where the request path already has a concrete use.
+    /// Responses transport. The request path applies that as
+    /// `reasoning.context = "all_turns"` and the
+    /// `x-openai-internal-codex-responses-lite` header (openai/codex
+    /// `add_responses_lite_header` / `build_reasoning`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub use_responses_lite: Option<bool>,
     /// Catalog `tool_mode` (e.g. `code_mode_only`). `None` means unrestricted.
@@ -1070,7 +1072,19 @@ impl CodexWireCapabilities {
     pub fn include_reasoning_summary(&self) -> bool {
         self.supports_reasoning_summary_parameter != Some(false)
     }
+
+    /// Whether the shipped Codex request should use the Responses Lite profile.
+    ///
+    /// Only an explicit catalog `true` enables it. `None` and `Some(false)`
+    /// keep the historical non-lite body and omit the lite header.
+    pub fn responses_lite_enabled(&self) -> bool {
+        self.use_responses_lite == Some(true)
+    }
 }
+
+/// Header official Codex sends when [`CodexWireCapabilities::use_responses_lite`]
+/// is `true`. Value is the literal `true`.
+pub const CODEX_RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
 
 /// Unit used by a Codex catalog tool-output truncation policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

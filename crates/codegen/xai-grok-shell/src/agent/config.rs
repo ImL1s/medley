@@ -4650,6 +4650,11 @@ pub struct ConfigModelOverride {
     /// `description` so a metadata-only user override cannot erase it.
     #[serde(skip)]
     pub(crate) catalog_degraded_reason: Option<String>,
+    /// Catalog `effective_context_window_percent` (0-100). Not a user TOML
+    /// field — user `[model.<id>].auto_compact_threshold_percent` stays
+    /// distinct so the resolver can keep catalog below user-global (#264).
+    #[serde(skip)]
+    pub effective_context_window_percent: Option<u8>,
     /// Raw `auth_scheme` string when TOML parsing failed. Not persisted; used to
     /// fail-closed at resolve time instead of defaulting to Bearer.
     #[serde(skip)]
@@ -4709,6 +4714,10 @@ impl std::fmt::Debug for ConfigModelOverride {
             .field(
                 "catalog_degraded_reason_present",
                 &self.catalog_degraded_reason.is_some(),
+            )
+            .field(
+                "effective_context_window_percent",
+                &self.effective_context_window_percent,
             )
             .field(
                 "invalid_auth_scheme_present",

@@ -1190,6 +1190,62 @@ auto_update = true
             assert_eq!(resolve(&cfg, None), DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT);
         }
         #[test]
+        fn catalog_effective_context_window_percent_beats_hardcoded_default() {
+            let _g = EnvVarGuard::unset();
+            let mut cfg = make_cfg(None, None, None);
+            cfg.config_models.insert(
+                TEST_MODEL.to_owned(),
+                ConfigModelOverride {
+                    effective_context_window_percent: Some(95),
+                    ..ConfigModelOverride::default()
+                },
+            );
+            assert_eq!(resolve(&cfg, None), 95);
+            assert!(
+                !xai_token_estimation::exceeds_threshold(94_999, 100_000, 95),
+                "90+% of the window must not compact when catalog calibrates to 95%"
+            );
+            assert!(
+                xai_token_estimation::exceeds_threshold(95_000, 100_000, 95),
+                "auto-compact must fire at the catalog 95% line"
+            );
+        }
+        #[test]
+        fn user_session_beats_catalog_effective_context_window_percent() {
+            let _g = EnvVarGuard::unset();
+            let mut cfg = make_cfg(Some(80), None, None);
+            cfg.config_models.insert(
+                TEST_MODEL.to_owned(),
+                ConfigModelOverride {
+                    effective_context_window_percent: Some(95),
+                    ..ConfigModelOverride::default()
+                },
+            );
+            assert_eq!(resolve(&cfg, None), 80);
+        }
+        #[test]
+        fn user_per_model_beats_catalog_effective_context_window_percent() {
+            let _g = EnvVarGuard::unset();
+            let mut cfg = make_cfg(Some(75), Some(80), None);
+            if let Some(entry) = cfg.config_models.get_mut(TEST_MODEL) {
+                entry.effective_context_window_percent = Some(95);
+            }
+            assert_eq!(resolve(&cfg, Some(90)), 80);
+        }
+        #[test]
+        fn catalog_effective_context_window_percent_beats_gb_global() {
+            let _g = EnvVarGuard::unset();
+            let mut cfg = make_cfg(None, None, Some(40));
+            cfg.config_models.insert(
+                TEST_MODEL.to_owned(),
+                ConfigModelOverride {
+                    effective_context_window_percent: Some(95),
+                    ..ConfigModelOverride::default()
+                },
+            );
+            assert_eq!(resolve(&cfg, Some(70)), 95);
+        }
+        #[test]
         fn apply_does_not_merge_auto_compact_threshold_percent_into_model_info() {
             use crate::agent::config::{EndpointsConfig, ModelEntry};
             let endpoints = EndpointsConfig::default();

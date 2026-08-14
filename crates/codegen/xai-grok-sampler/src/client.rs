@@ -52,6 +52,8 @@ const CHATGPT_ACCOUNT_ID: HeaderName = HeaderName::from_static("chatgpt-account-
 const OPENAI_FEDRAMP: HeaderName = HeaderName::from_static("x-openai-fedramp");
 const ORIGINATOR: HeaderName = HeaderName::from_static("originator");
 const GROK_BUILD_ORIGINATOR: HeaderValue = HeaderValue::from_static("grok_build");
+const X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE: HeaderName =
+    HeaderName::from_static(xai_grok_sampling_types::CODEX_RESPONSES_LITE_HEADER);
 
 /// L3 ambient-origin refusal. Shared with tests so the "exact identity" match
 /// is the same string the production gate returns (#180).
@@ -1229,6 +1231,20 @@ impl SamplingClient {
                     .is_some_and(|credential| credential.chatgpt_account_is_fedramp),
                 codex_user_agent,
             );
+            // After the Codex allowlist wipe so extra_headers cannot spoof it.
+            // Official Codex (`add_responses_lite_header`) sends this only
+            // when the catalog marks the model lite (#274).
+            if self
+                .defaults
+                .codex_wire
+                .as_ref()
+                .is_some_and(xai_grok_sampling_types::CodexWireCapabilities::responses_lite_enabled)
+            {
+                headers.insert(
+                    X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE,
+                    HeaderValue::from_static("true"),
+                );
+            }
         } else {
             strip_codex_routing_headers(&mut headers);
         }
@@ -4205,6 +4221,60 @@ mod tests {
                 "unexpected Codex header {name}"
             );
         }
+    }
+
+    /// #274: Sol's catalog flag must reach the shipped Codex request, Spark's
+    /// `false` must not. The header is applied after `retain_codex_headers`.
+    #[test]
+    fn codex_transport_use_responses_lite_header_follows_catalog() {
+        let resolver = std::sync::Arc::new(CodexCredentialResolver {
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let sol = SamplingClient::new(SamplerConfig {
+            api_backend: ApiBackend::CodexResponses,
+            base_url: CODEX_BASE_URL.to_owned(),
+            bearer_resolver: Some(resolver.clone()),
+            codex_wire: Some(xai_grok_sampling_types::CodexWireCapabilities {
+                use_responses_lite: Some(true),
+                ..xai_grok_sampling_types::CodexWireCapabilities::default()
+            }),
+            ..minimal_config()
+        })
+        .expect("Sol Codex client should build");
+        let sol_request = sol
+            .post(sol.endpoint("responses"))
+            .0
+            .build()
+            .expect("Sol request should build");
+        assert_eq!(
+            sol_request.headers()[X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE],
+            "true",
+            "Sol catalog use_responses_lite=true must send the lite header"
+        );
+
+        let spark = SamplingClient::new(SamplerConfig {
+            api_backend: ApiBackend::CodexResponses,
+            base_url: CODEX_BASE_URL.to_owned(),
+            bearer_resolver: Some(resolver),
+            codex_wire: Some(xai_grok_sampling_types::CodexWireCapabilities {
+                use_responses_lite: Some(false),
+                ..xai_grok_sampling_types::CodexWireCapabilities::default()
+            }),
+            ..minimal_config()
+        })
+        .expect("Spark Codex client should build");
+        let spark_request = spark
+            .post(spark.endpoint("responses"))
+            .0
+            .build()
+            .expect("Spark request should build");
+        assert!(
+            spark_request
+                .headers()
+                .get(X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE)
+                .is_none(),
+            "Spark catalog use_responses_lite=false must omit the lite header"
+        );
     }
 
     #[test]

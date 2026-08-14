@@ -50,13 +50,17 @@ pub(crate) const ENV_AUTO_COMPACT_THRESHOLD_PERCENT: &str = "GROK_AUTO_COMPACT_T
 ///      managed `[model.<id>]` sections)
 ///   3. user TOML `[session].auto_compact_threshold_percent`
 ///      (read from `cfg.session.auto_compact_threshold_percent: Option<u8>`)
-///   4. remote settings per-model `ModelInfo.auto_compact_threshold_percent`
+///   4. catalog `effective_context_window_percent` (Codex live catalog = 95)
+///      — stored on `ConfigModelOverride.effective_context_window_percent`,
+///      not `auto_compact_threshold_percent`, so it cannot masquerade as
+///      a user per-model TOML override (#264)
+///   5. remote settings per-model `ModelInfo.auto_compact_threshold_percent`
 ///      (populated from `grok_build_models[i].auto_compact_threshold_percent`;
 ///      intentionally NOT collapsed via `ConfigModelOverride::apply` so the
 ///      user-vs-GB per-model distinction is preserved)
-///   5. remote settings global `RemoteSettings.auto_compact_threshold_percent`
+///   6. remote settings global `RemoteSettings.auto_compact_threshold_percent`
 ///      (populated from `grok_build_settings.auto_compact_threshold_percent`)
-///   6. default `DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT` (85)
+///   7. default `DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT` (85)
 ///
 /// Values outside `0..=100` from the env var are ignored with a debug log and
 /// the resolver falls through to the next tier. TOML/remote fields are typed
@@ -66,11 +70,11 @@ pub(crate) fn resolve_auto_compact_threshold_percent(
     model_id: &str,
     model: Option<&crate::agent::config::ModelInfo>,
 ) -> u8 {
+    let override_entry = cfg.config_models.get(model_id);
     resolve_auto_compact_threshold_percent_from_tiers(
-        cfg.config_models
-            .get(model_id)
-            .and_then(|m| m.auto_compact_threshold_percent),
+        override_entry.and_then(|m| m.auto_compact_threshold_percent),
         cfg.session.auto_compact_threshold_percent,
+        override_entry.and_then(|m| m.effective_context_window_percent),
         model.and_then(|m| m.auto_compact_threshold_percent),
         cfg.remote_settings
             .as_ref()
@@ -85,11 +89,12 @@ pub(crate) fn resolve_auto_compact_threshold_percent(
 /// explicitly and the per-model lookup uses the SUBAGENT's resolved model id,
 /// not the parent's).
 ///
-/// Precedence: env > `user_per_model` > `user_global` > `gb_per_model`
-/// > `gb_global` > `DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT`.
+/// Precedence: env > `user_per_model` > `user_global` > `catalog_per_model`
+/// > `gb_per_model` > `gb_global` > `DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT`.
 pub(crate) fn resolve_auto_compact_threshold_percent_from_tiers(
     user_per_model: Option<u8>,
     user_global: Option<u8>,
+    catalog_per_model: Option<u8>,
     gb_per_model: Option<u8>,
     gb_global: Option<u8>,
 ) -> u8 {
@@ -115,6 +120,7 @@ pub(crate) fn resolve_auto_compact_threshold_percent_from_tiers(
     from_env()
         .or(user_per_model)
         .or(user_global)
+        .or(catalog_per_model)
         .or(gb_per_model)
         .or(gb_global)
         .unwrap_or(DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT)

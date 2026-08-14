@@ -772,6 +772,7 @@ mod tests {
             stream_tool_calls: Some(false),
             codex_wire: None,
             catalog_degraded_reason: None,
+            effective_context_window_percent: Some(95),
             invalid_auth_scheme: None,
         }
     }

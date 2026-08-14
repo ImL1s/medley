@@ -320,6 +320,11 @@ jobs:
             codex_wire_capabilities_omit_reasoning_summary_when_unsupported -- --nocapture
           run_nonzero -p xai-grok-sampling-types --lib \
             codex_wire_capabilities_keep_summary_when_catalog_allows_or_is_silent -- --nocapture
+          # #274: Sol catalog use_responses_lite must reshape the request body.
+          run_nonzero -p xai-grok-sampling-types --lib \
+            use_responses_lite -- --nocapture
+          run_nonzero -p xai-grok-sampler --lib \
+            use_responses_lite -- --nocapture
           # #263: the catalog parser and the single chat-state mutation must
           # both run; xai-chat-state previously had no CI filter (#280).
           run_nonzero -p xai-grok-shell --lib \
@@ -1715,6 +1720,12 @@ jobs:
           # #245: catalog wire flags that differ from the Sol preset must parse.
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_parser_reads_wire_capabilities_that_differ_from_the_preset -- --nocapture
+          # #274: parsed use_responses_lite must reach apply_codex_wire_capabilities.
+          run_nonzero -p xai-grok-shell --lib \
+            use_responses_lite -- --nocapture
+          # #264: catalog 95% is the auto-compact tier below user TOML.
+          run_nonzero -p xai-grok-shell --lib \
+            effective_context_window_percent -- --nocapture
           # #261: catalog reasoning menus must reach ACP and remain model-specific in the TUI.
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_supported_reasoning_levels_drive_acp_effort_options -- --nocapture

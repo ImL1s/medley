@@ -175,7 +175,8 @@ pub(super) fn build_responses_input(req: &ConversationRequest) -> rs::InputParam
 ///
 /// The generic `CreateResponse` conversion cannot see catalog flags; the Codex
 /// transport calls this after serialize so a Spark entry that rejects
-/// `reasoning.summary` does not inherit Sol's wire shape (#245).
+/// `reasoning.summary` does not inherit Sol's wire shape (#245), and so a Sol
+/// entry with `use_responses_lite` gets `reasoning.context = all_turns` (#274).
 pub fn apply_codex_wire_capabilities(
     body: &mut serde_json::Value,
     caps: &crate::CodexWireCapabilities,
@@ -184,6 +185,26 @@ pub fn apply_codex_wire_capabilities(
         && let Some(reasoning) = body.get_mut("reasoning").and_then(|v| v.as_object_mut())
     {
         reasoning.remove("summary");
+    }
+    // Established from openai/codex `build_reasoning`: lite requires
+    // `reasoning.context = all_turns` or the server 400s. Parallel tool
+    // calls are disabled on that same path.
+    if caps.responses_lite_enabled() {
+        match body
+            .get_mut("reasoning")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            Some(reasoning) => {
+                reasoning.insert(
+                    "context".to_owned(),
+                    serde_json::Value::String("all_turns".to_owned()),
+                );
+            }
+            None => {
+                body["reasoning"] = serde_json::json!({ "context": "all_turns" });
+            }
+        }
+        body["parallel_tool_calls"] = serde_json::Value::Bool(false);
     }
     if !caps.allows_image_input()
         && let Some(input) = body.get_mut("input").and_then(|v| v.as_array_mut())

@@ -69,6 +69,18 @@ async fn drain_until_reported(mgr: &tokio::sync::Mutex<LspManager>, needle: &str
     panic!("no summary mentioning {needle:?} within the deadline");
 }
 
+/// The push-and-pull mock stamps `pulls=N` on every published diagnostic.
+fn published_pulls(summary: &str) -> Option<u32> {
+    summary
+        .split("pulls=")
+        .nth(1)?
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
 fn mock_server_config(script_path: &Path) -> LspServerConfig {
     let mut ext_map = HashMap::new();
     ext_map.insert(".ts".to_string(), "typescript".to_string());
@@ -1653,18 +1665,25 @@ async fn a_server_that_publishes_is_not_second_guessed_with_a_pull() {
         summary.contains("the check that only the push channel runs"),
         "{summary}"
     );
+    let initial_pulls = published_pulls(&summary)
+        .expect("push mock stamps pulls=N on the diagnostic it published");
 
     // And from here on it is not asked at all — its own reports are the truth.
     let before = mgr.lock().await.clients["mock-ts"].pull.support();
     assert_eq!(before, super::pull::PullSupport::Asking, "not rejected");
-    for round in 0..3 {
+    for round in 0..50 {
         let text = format!("const y = {round};\n");
         std::fs::write(&file, &text).unwrap();
         mgr.lock().await.notify_file_changed(&file, &text);
-        let summary = drain_lsp_diagnostics(&mgr, std::time::Duration::from_secs(2)).await;
+        let summary = drain_until_reported(&mgr, "the check that only the push channel runs").await;
         assert!(
-            summary.is_some_and(|s| s.text.contains("the check that only the push channel runs")),
-            "round {round}: the pushed report is what the reader gets"
+            summary.contains("the check that only the push channel runs"),
+            "round {round}: the pushed report is what the reader gets: {summary}"
+        );
+        assert_eq!(
+            published_pulls(&summary),
+            Some(initial_pulls),
+            "round {round}: a later pull would increment pulls= on the next push"
         );
     }
 
