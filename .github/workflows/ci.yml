@@ -49,6 +49,9 @@ jobs:
       - name: Test the new-test filter guard
         run: python3 -B -m unittest tests.test_new_test_filter_guard -v
 
+      - name: Test the uncovered-crate ratchet
+        run: python3 -B -m unittest tests.test_uncovered_crates_guard -v
+
       - name: Test the PR-head CI receipt guard
         # This guard is a pre-merge local/orchestrator check; it does not run
         # as part of CI itself. CI only executes its Python unit tests.
@@ -152,6 +155,16 @@ jobs:
           python3 scripts/check_new_tests_are_filtered.py \
             --workflow .github/workflows/ci.yml \
             --base "origin/${{ github.base_ref || 'providers' }}"
+
+      # Crate-level complement of the diff-scoped guard above (issue #280).
+      # A crate with src/ tests that no `-p` names runs nowhere forever;
+      # #171 only sees newly added tests. No Rust toolchain: this reads
+      # Cargo.toml + src/**/*.rs + ci.yml against a checked-in allowlist.
+      - name: Every crate with tests is named or allowlisted
+        run: |
+          python3 scripts/check_uncovered_crates.py \
+            --workflow .github/workflows/ci.yml \
+            --allowlist tests/ci/uncovered-crates.allowlist
 
   compile-tests:
     name: Compile every test target
