@@ -801,8 +801,18 @@ def handle(msg, method):
         uri = msg["params"]["textDocument"]["uri"]
         version = msg["params"]["textDocument"]["version"]
         publish_at(uri, "the check that only the push channel runs, pulls=%d" % state["pulls"], version)
+        state["published"] = True
+        # A pull that arrived before this publish must not be answered first:
+        # an empty full-result would settle the file as clean and hide the
+        # push the rest of the test is waiting for.
+        pending = state.pop("pending_pull", None)
+        if pending is not None:
+            reply(pending, {"kind": "full", "resultId": "r-%d" % state["pulls"], "items": []})
     elif method == "textDocument/diagnostic":
         state["pulls"] += 1
+        if not state.get("published"):
+            state["pending_pull"] = msg
+            return
         # Answers, and has nothing of its own to say about this file.
         reply(msg, {"kind": "full", "resultId": "r-%d" % state["pulls"], "items": []})
 
