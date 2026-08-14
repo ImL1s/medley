@@ -913,9 +913,15 @@ pub(crate) fn resolved_auth_path(grok_home: &Path) -> PathBuf {
     if let Some(path) = AUTH_PATH_OVERRIDE.with(|slot| slot.borrow().clone()) {
         return path;
     }
-    std::env::var("GROK_AUTH_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| grok_home.join("auth.json"))
+    // In-process unit tests must not share process-global `GROK_AUTH_PATH`.
+    // Production still honors the env so a user-specified auth.json works.
+    if cfg!(test) {
+        grok_home.join("auth.json")
+    } else {
+        std::env::var("GROK_AUTH_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| grok_home.join("auth.json"))
+    }
 }
 
 #[cfg(test)]
@@ -972,44 +978,31 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn openai_codex_path_constructor_ignores_grok_auth_path_env() {
-        use xai_grok_test_support::EnvGuard;
-        let poison = tempfile::tempdir().unwrap();
-        let poison_path = poison.path().join("auth.json");
-        let poison_auth = GrokAuth {
-            key: "poison-token".into(),
-            auth_mode: AuthMode::OpenAiCodex,
-            refresh_token: Some("poison-refresh".into()),
-            oidc_issuer: Some(ISSUER.into()),
-            oidc_client_id: Some(CLIENT_ID.into()),
-            expires_at: Some(Utc::now() + Duration::hours(1)),
-            ..GrokAuth::default()
-        };
-        std::fs::write(
-            &poison_path,
-            serde_json::to_vec(&HashMap::from([(AUTH_SCOPE.to_owned(), poison_auth)])).unwrap(),
-        )
-        .unwrap();
-        let _env = EnvGuard::set(
-            "GROK_AUTH_PATH",
-            poison_path.to_str().expect("utf-8 temp path"),
-        );
+        fn write_codex_auth(path: &Path, key: &str) {
+            let auth = GrokAuth {
+                key: key.into(),
+                auth_mode: AuthMode::OpenAiCodex,
+                refresh_token: Some(format!("{key}-refresh")),
+                oidc_issuer: Some(ISSUER.into()),
+                oidc_client_id: Some(CLIENT_ID.into()),
+                expires_at: Some(Utc::now() + Duration::hours(1)),
+                ..GrokAuth::default()
+            };
+            std::fs::write(
+                path,
+                serde_json::to_vec(&HashMap::from([(AUTH_SCOPE.to_owned(), auth)])).unwrap(),
+            )
+            .unwrap();
+        }
 
-        let real = tempfile::tempdir().unwrap();
-        let real_path = real.path().join("auth.json");
-        let real_auth = GrokAuth {
-            key: "real-token".into(),
-            auth_mode: AuthMode::OpenAiCodex,
-            refresh_token: Some("real-refresh".into()),
-            oidc_issuer: Some(ISSUER.into()),
-            oidc_client_id: Some(CLIENT_ID.into()),
-            expires_at: Some(Utc::now() + Duration::hours(1)),
-            ..GrokAuth::default()
-        };
-        std::fs::write(
-            &real_path,
-            serde_json::to_vec(&HashMap::from([(AUTH_SCOPE.to_owned(), real_auth)])).unwrap(),
-        )
-        .unwrap();
+        let poison_home = tempfile::tempdir().unwrap();
+        write_codex_auth(&poison_home.path().join("auth.json"), "poison-token");
+        let real_home = tempfile::tempdir().unwrap();
+        let real_path = real_home.path().join("auth.json");
+        write_codex_auth(&real_path, "real-token");
+
+        // Process-global env must not be required (or used) by these constructors.
+        let _clear = xai_grok_test_support::EnvGuard::unset("GROK_AUTH_PATH");
 
         let via_path = AuthManager::new_openai_codex_at_path(real_path.clone());
         assert_eq!(
@@ -1021,7 +1014,7 @@ mod tests {
         );
 
         let _pin = CodexAuthPathGuard::pin(real_path);
-        let via_pin = AuthManager::new_openai_codex(real.path());
+        let via_pin = AuthManager::new_openai_codex(poison_home.path());
         assert_eq!(
             via_pin
                 .current()

@@ -8343,6 +8343,39 @@ fn remap_picking_enum_preserves_canonical_after_catalog_insert() {
 }
 
 #[test]
+fn remap_picking_enum_resets_when_focused_model_disappears() {
+    let mut s = unavailable_model_picker_state();
+    assert!(s.focus_key("default_model"));
+    assert!(s.try_enter_picking_enum());
+    let _ = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    let _ = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(
+        s.picking_enum_selected_canonical().as_deref(),
+        Some("Grok 4.5")
+    );
+
+    let mut snapshot = s.pager_snapshot.clone();
+    snapshot
+        .available_models
+        .retain(|(_, id)| id.0.as_ref() != "grok-4.5");
+    snapshot
+        .unavailable_model_reasons
+        .retain(|(id, _)| id != "grok-4.5");
+    s.pager_snapshot = snapshot;
+    s.remap_picking_enum_after_catalog_refresh(Some("Grok 4.5".to_string()));
+    match &s.mode() {
+        SettingsModalMode::PickingEnum { choices_idx, .. } => {
+            assert_eq!(
+                *choices_idx, 0,
+                "a vanished focus must reset to the no-override sentinel, not another model"
+            );
+        }
+        other => panic!("expected PickingEnum, got {other:?}"),
+    }
+    assert_eq!(s.picking_enum_selected_canonical().as_deref(), Some(""));
+}
+
+#[test]
 fn settings_model_picker_enter_on_disabled_row_toasts_and_does_not_commit() {
     let mut s = unavailable_model_picker_state();
     assert!(s.focus_key("default_model"));

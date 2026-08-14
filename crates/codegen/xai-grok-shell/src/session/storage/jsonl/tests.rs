@@ -2280,6 +2280,36 @@ async fn init_session_recovers_occupied_directory_without_summary() {
     );
 }
 
+#[test]
+fn accept_fresh_publication_continues_only_for_committed_durability() {
+    use std::io;
+    use super::accept_fresh_publication;
+    use xai_grok_workspace::session::fresh_publication::{
+        FinalizeOperation, FreshPublicationFinalizeError,
+    };
+
+    let durable = FreshPublicationFinalizeError::CommittedDurability {
+        operation: FinalizeOperation::Sync,
+        error: io::Error::other("fsync failed after verified commit"),
+    };
+    accept_fresh_publication(Err(durable))
+        .expect("verified commit with a durability miss may continue");
+
+    let identity = FreshPublicationFinalizeError::CommittedIdentity {
+        operation: FinalizeOperation::ValidateSummary,
+        error: io::Error::new(
+            io::ErrorKind::InvalidData,
+            "committed publication is missing a valid summary",
+        ),
+    };
+    let err = accept_fresh_publication(Err(identity))
+        .expect_err("unverified identity must fail initialization");
+    assert!(
+        err.to_string().contains("canonical identity is unverified"),
+        "identity failure must stay visible: {err}"
+    );
+}
+
 /// Helper: set the mtime of a file to a specific chrono DateTime.
 fn set_mtime(path: &std::path::Path, time: chrono::DateTime<chrono::Utc>) {
     use std::time::{Duration, UNIX_EPOCH};

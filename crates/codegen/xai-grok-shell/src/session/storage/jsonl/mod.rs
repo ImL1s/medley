@@ -207,23 +207,7 @@ impl JsonlStorageAdapter {
             &publication.stage_session().join(super::SUMMARY_FILE),
             &bytes,
         )?;
-        match publication.finalize() {
-            Ok(()) => Ok(summary),
-            Err(error) if error.is_committed() => {
-                tracing::error!(
-                    error_kind = ?match &error {
-                        FreshPublicationFinalizeError::CommittedDurability { error, .. }
-                        | FreshPublicationFinalizeError::CommittedIdentity { error, .. } => {
-                            error.kind()
-                        }
-                        FreshPublicationFinalizeError::NotCommitted { error, .. } => error.kind(),
-                    },
-                    "session persistence committed; continuing after durability/identity error"
-                );
-                Ok(summary)
-            }
-            Err(error) => Err(io::Error::other(error)),
-        }
+        accept_fresh_publication(publication.finalize()).map(|()| summary)
     }
 
     fn delete_session_sync(&self, info: &Info) -> io::Result<()> {
@@ -1207,6 +1191,32 @@ async fn next_compaction_segment_index(compaction_dir: &std::path::Path) -> u64 
     }
     next
 }
+
+/// A committed rename with an unverified public identity is not a usable
+/// session. Durability (fsync) failures after a verified commit may continue;
+/// identity failures must fail initialization so the caller does not expose a
+/// path that is missing, unreadable, or someone else's directory.
+pub(super) fn accept_fresh_publication(
+    result: Result<
+        (),
+        xai_grok_workspace::session::fresh_publication::FreshPublicationFinalizeError,
+    >,
+) -> io::Result<()> {
+    use xai_grok_workspace::session::fresh_publication::FreshPublicationFinalizeError;
+    match result {
+        Ok(()) => Ok(()),
+        Err(FreshPublicationFinalizeError::CommittedDurability { error, operation }) => {
+            tracing::error!(
+                error_kind = ?error.kind(),
+                ?operation,
+                "session persistence committed; continuing after durability error"
+            );
+            Ok(())
+        }
+        Err(error) => Err(io::Error::other(error)),
+    }
+}
+
 #[async_trait]
 impl StorageAdapter for JsonlStorageAdapter {
     async fn init_session(&self, info: &Info, model_id: acp::ModelId) -> io::Result<Summary> {

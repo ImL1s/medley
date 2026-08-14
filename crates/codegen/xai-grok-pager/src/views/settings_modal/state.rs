@@ -711,7 +711,9 @@ impl SettingsModalState {
     }
 
     /// Remap a live `PickingEnum` index onto the refreshed catalog by
-    /// canonical identity. Falls back to a clamped index if the value vanished.
+    /// canonical identity. If that value vanished, reset to the first row
+    /// (the DynamicEnum "(no override)" sentinel) instead of keeping a
+    /// stale numeric index that now names a different model.
     pub fn remap_picking_enum_after_catalog_refresh(&mut self, selected: Option<String>) {
         let SettingsMode::PickingEnum {
             key, choices_idx, ..
@@ -734,17 +736,13 @@ impl SettingsModalState {
             }
             _ => return,
         };
-        if let Some(selected) = selected.as_deref() {
-            if let Some(idx) = names.iter().position(|name| name == selected) {
-                *choices_idx = idx;
-                return;
-            }
+        if let Some(selected) = selected.as_deref()
+            && let Some(idx) = names.iter().position(|name| name == selected)
+        {
+            *choices_idx = idx;
+            return;
         }
-        if names.is_empty() {
-            *choices_idx = 0;
-        } else if *choices_idx >= names.len() {
-            *choices_idx = names.len() - 1;
-        }
+        *choices_idx = 0;
     }
 
     /// Transition to `PickingGroup` if the focused row is a `Group`. Returns
