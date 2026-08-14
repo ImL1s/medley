@@ -1126,14 +1126,22 @@ async fn read_parent_prepared_model(ctx: &SubagentSpawnContext) -> PreparedSubag
                 // catalog lookups above — not copied from the parent's
                 // config, whose `codex_wire` belongs to whatever model the
                 // parent is running (#277).
-                codex_wire: capabilities
-                    .as_ref()
-                    .map(|facts| facts.codex_wire.clone())
-                    .unwrap_or_else(|| {
-                        baseline_matches_live
-                            .then(|| ctx.sampling_config.codex_wire.clone())
-                            .flatten()
-                    }),
+                //
+                // `model_codex_wire` is `None` only on a catalog miss.
+                // `Some(None)` is authoritative empty metadata and must
+                // not inherit a stale same-model baseline (#282). A
+                // route-rejected identity (`capabilities` is `None`) is
+                // treated as a miss so a reused catalog key cannot
+                // supply another model's flags.
+                codex_wire: match capabilities.as_ref() {
+                    Some(facts) => ctx
+                        .models_manager
+                        .model_codex_wire(facts.model_id.0.as_ref())
+                        .unwrap_or_else(|| facts.codex_wire.clone()),
+                    None => baseline_matches_live
+                        .then(|| ctx.sampling_config.codex_wire.clone())
+                        .flatten(),
+                },
             };
             xai_grok_telemetry::unified_log::debug(
                 "subagent read parent config (live)",
@@ -1220,7 +1228,14 @@ async fn read_parent_prepared_model(ctx: &SubagentSpawnContext) -> PreparedSubag
         fallback.supports_backend_search = capabilities.supports_backend_search;
         fallback.compactions_remaining = capabilities.compactions_remaining;
         fallback.compaction_at_tokens = capabilities.compaction_at_tokens;
-        fallback.codex_wire = capabilities.codex_wire.clone();
+        // Prefer the live manager lookup so a present entry with
+        // `codex_wire: None` stays `None` instead of the cloned
+        // spawn-baseline `Some` (#282). A miss here keeps the
+        // already-cloned parent value (#159).
+        fallback.codex_wire = ctx
+            .models_manager
+            .model_codex_wire(capabilities.model_id.0.as_ref())
+            .unwrap_or_else(|| capabilities.codex_wire.clone());
     }
     if fallback.auth_scheme == xai_grok_sampler::AuthScheme::None {
         fallback.api_key = None;

@@ -867,15 +867,20 @@ impl ModelsManager {
     /// config's copy belongs to whichever model was selected when it was
     /// built, which is not necessarily the model about to be sampled (#245,
     /// #277).
+    ///
+    /// Outer `None` is a catalog miss — callers may inherit a same-model
+    /// baseline (#159). `Some(None)` is an authoritative "this model has no
+    /// wire capabilities" and must not fall back to a stale parent `Some`
+    /// (#282).
     pub(crate) fn model_codex_wire(
         &self,
         model_id: &str,
-    ) -> Option<xai_grok_sampling_types::CodexWireCapabilities> {
+    ) -> Option<Option<xai_grok_sampling_types::CodexWireCapabilities>> {
         let catalog = self.inner.catalog.read();
         let models = &catalog.models;
         resolve_catalog_key(models, &acp::ModelId::new(model_id))
             .and_then(|key| models.get(key.0.as_ref()))
-            .and_then(|e| e.info().codex_wire.clone())
+            .map(|e| e.info().codex_wire.clone())
     }
 
     /// Whether two model identities resolve to the same catalog entry.
