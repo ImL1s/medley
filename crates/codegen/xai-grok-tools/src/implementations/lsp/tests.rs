@@ -1734,13 +1734,29 @@ async fn a_refresh_we_cannot_act_on_does_not_discard_what_we_know() {
         .await
         .notify_file_changed(&file, "const y = 1;\n");
 
+    let uri = file_uri(&file).unwrap().to_string();
+    let deadline = tokio::time::Instant::now() + WAIT_TIMEOUT;
+    loop {
+        if mgr.lock().await.clients["mock-ts"]
+            .diagnostics
+            .items(&uri)
+            .len()
+            == 1
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("push-only report never landed");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
     let summary = drain_until_reported(&mgr, "a real problem").await;
     assert!(summary.contains("a real problem"), "{summary}");
 
     // The refresh request has been answered by now; the diagnostics it could
     // not replace must still be there.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    let uri = file_uri(&file).unwrap().to_string();
     assert_eq!(
         mgr.lock().await.clients["mock-ts"]
             .diagnostics

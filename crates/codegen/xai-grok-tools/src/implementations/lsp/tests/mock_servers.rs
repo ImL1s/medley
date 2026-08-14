@@ -856,6 +856,14 @@ def handle(msg, method):
         uri = msg["params"]["textDocument"]["uri"]
         publish(uri, "a real problem")
         ask("workspace/diagnostic/refresh", None, 9002)
+    elif method == "textDocument/diagnostic":
+        # Push-only: reject the pull immediately so a loaded host cannot
+        # leave the client waiting on REQUEST_TIMEOUT and miss the push.
+        send_message({
+            "jsonrpc": "2.0",
+            "id": msg.get("id"),
+            "error": {"code": -32601, "message": "Method not found"},
+        })
 
 serve({"textDocumentSync": {"openClose": True, "change": 1}}, handle)
 "#,
