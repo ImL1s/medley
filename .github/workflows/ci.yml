@@ -57,6 +57,15 @@ jobs:
       - name: Guard distChannel docs against the release stamp
         run: python3 -B -m unittest tests.test_dist_channel_docs_guard -v
 
+      # Direct-mention scan: EnvGuard / std::env::{set_var,remove_var} in
+      # xai-grok-shell unit tests must carry unkeyed #[serial] (#319).
+      # Known stragglers are allowlisted; new hits and stale entries fail.
+      - name: Test the EnvGuard serial guard
+        run: python3 -B -m unittest tests.test_envguard_serial_guard -v
+
+      - name: Enforce EnvGuard tests are unkeyed #[serial]
+        run: python3 -B scripts/check_envguard_serial.py
+
   installer:
     name: Installer
     runs-on: ubuntu-latest
