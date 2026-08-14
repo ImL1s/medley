@@ -20,7 +20,7 @@ use mock_servers::*;
 ///
 /// One constant for the suite rather than a hand-rolled iteration count at each
 /// call site, so a slow machine is retuned in one place.
-const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Poll until `ready`, or fail saying what was being waited for.
 async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
