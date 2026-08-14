@@ -394,6 +394,17 @@ impl UnauthorizedRecovery {
                 })),
             );
             self.auth_manager.hot_swap(disk_auth.clone());
+            // `current_wire_valid` hides a policy-rejected token, which would
+            // make this look like "no disk entry" and fall through to refresh.
+            // Hand the adopted token to `resolve_next` so the team-pin gate
+            // can reject it as `PinnedTeamMismatch` instead.
+            if self
+                .auth_manager
+                .cached_token_policy_error(&disk_auth)
+                .is_some()
+            {
+                return Some(disk_auth);
+            }
             // A strict-removal failure can leave the rejected provider entry
             // durably authoritative while a key-scoped verdict suppresses it.
             // Disk adoption must honor that same wire boundary.
