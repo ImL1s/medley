@@ -103,6 +103,13 @@ pub(super) fn auth_init_disk_refresh_context(
         "refresh_post_present": refresh_relation.disk_present(),
     })
 }
+
+pub(super) fn has_advertised_auth_provider_command(
+    config: &crate::auth::GrokComConfig,
+) -> bool {
+    crate::auth::has_nonblank_auth_provider_command(config.auth_provider_command.as_deref())
+}
+
 #[async_trait::async_trait(?Send)]
 impl acp::Agent for MvpAgent {
     /// In the meta, we provide
@@ -381,7 +388,7 @@ impl acp::Agent for MvpAgent {
             let issuer = cfg.grok_com_config.oidc.as_ref().map(|o| o.issuer.clone());
             (
                 cfg.grok_com_config.auth_provider_label.clone(),
-                cfg.grok_com_config.auth_provider_command.is_some(),
+                has_advertised_auth_provider_command(&cfg.grok_com_config),
                 cfg.grok_com_config.oidc.is_some(),
                 issuer,
             )

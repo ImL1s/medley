@@ -57,3 +57,12 @@ pub(crate) use refresh::DiagnosticUploader;
 pub use storage::{
     clear_api_key, read_api_key, read_auth_json, read_token_by_scope, store_api_key,
 };
+
+/// Whether an external auth-provider command names an executable action.
+///
+/// Configuration loaders preserve the operator's string verbatim, so every
+/// refresh-authority decision must reject missing, empty, and whitespace-only
+/// commands through this single predicate.
+pub(crate) fn has_nonblank_auth_provider_command(command: Option<&str>) -> bool {
+    command.is_some_and(|command| !command.trim().is_empty())
+}
