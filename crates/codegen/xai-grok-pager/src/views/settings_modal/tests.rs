@@ -8258,6 +8258,52 @@ fn dynamic_enum_choices_marks_unavailable_models_disabled() {
 }
 
 #[test]
+fn remap_picking_enum_preserves_canonical_after_catalog_insert() {
+    let mut s = unavailable_model_picker_state();
+    assert!(s.focus_key("default_model"));
+    assert!(s.try_enter_picking_enum());
+    let _ = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    let _ = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    let selected = s
+        .picking_enum_selected_canonical()
+        .expect("picker has a focused row");
+    assert_eq!(selected, "Grok 4.5");
+    match &s.mode() {
+        SettingsModalMode::PickingEnum { choices_idx, .. } => {
+            assert_eq!(*choices_idx, 2, "precondition: unready row is index 2");
+        }
+        other => panic!("expected PickingEnum, got {other:?}"),
+    }
+
+    let mut snapshot = s.pager_snapshot.clone();
+    snapshot.available_models.insert(
+        0,
+        (
+            "Inserted Model".to_string(),
+            agent_client_protocol::ModelId::new(Arc::from("inserted-model")),
+        ),
+    );
+    snapshot
+        .unavailable_model_reasons
+        .push(("Inserted Model".to_string(), "new".to_string()));
+    s.pager_snapshot = snapshot;
+    s.remap_picking_enum_after_catalog_refresh(Some(selected));
+    match &s.mode() {
+        SettingsModalMode::PickingEnum { choices_idx, .. } => {
+            assert_eq!(
+                *choices_idx, 3,
+                "inserting a row above must keep the same model focused"
+            );
+        }
+        other => panic!("expected PickingEnum, got {other:?}"),
+    }
+    assert_eq!(
+        s.picking_enum_selected_canonical().as_deref(),
+        Some("Grok 4.5")
+    );
+}
+
+#[test]
 fn settings_model_picker_enter_on_disabled_row_toasts_and_does_not_commit() {
     let mut s = unavailable_model_picker_state();
     assert!(s.focus_key("default_model"));

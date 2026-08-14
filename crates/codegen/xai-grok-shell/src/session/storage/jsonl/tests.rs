@@ -2240,6 +2240,46 @@ async fn init_session_publishes_summary_once_and_lists_only_committed() {
     drop(exclusive);
 }
 
+#[tokio::test]
+async fn init_session_recovers_occupied_directory_without_summary() {
+    let tmp = TempDir::new().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("019c0000-0000-7000-8000-000000000400"),
+        cwd: "/repo/publication/incomplete-occupant".to_string(),
+    };
+    let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());
+    let public = adapter.session_dir(&info);
+    std::fs::create_dir_all(&public).unwrap();
+    std::fs::write(public.join("partial"), b"winner-from-crash").unwrap();
+    assert!(!public.join("summary.json").exists());
+
+    let summary = adapter
+        .init_session(&info, default_model_id())
+        .await
+        .expect("incomplete occupant must not pin the session id");
+    assert_eq!(summary.info.id, info.id);
+    assert!(
+        public.join("summary.json").is_file(),
+        "retry must publish a complete session"
+    );
+    assert!(
+        !public.join("partial").exists(),
+        "the crash occupant must not remain on the public path"
+    );
+    let parent = public.parent().expect("session parent");
+    let quarantined = std::fs::read_dir(parent)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .any(|entry| {
+            entry.file_name().to_string_lossy().contains(".incomplete-")
+                && entry.path().join("partial").is_file()
+        });
+    assert!(
+        quarantined,
+        "the occupant must be renamed aside, not deleted silently"
+    );
+}
+
 /// Helper: set the mtime of a file to a specific chrono DateTime.
 fn set_mtime(path: &std::path::Path, time: chrono::DateTime<chrono::Utc>) {
     use std::time::{Duration, UNIX_EPOCH};

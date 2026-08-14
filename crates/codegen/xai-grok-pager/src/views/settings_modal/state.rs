@@ -687,27 +687,63 @@ impl SettingsModalState {
         true
     }
 
-    /// Keep a live `PickingEnum` index inside the refreshed catalog.
-    pub fn clamp_picking_enum_after_catalog_refresh(&mut self) {
+    /// Canonical value under the current picker index, from the live snapshot.
+    pub fn picking_enum_selected_canonical(&self) -> Option<String> {
+        let SettingsMode::PickingEnum {
+            key, choices_idx, ..
+        } = &self.state.mode
+        else {
+            return None;
+        };
+        match self.registry.find(*key).map(|m| &m.kind) {
+            Some(SettingKind::DynamicEnum { source, .. }) => {
+                dynamic_enum_choices(*source, &self.pager_snapshot)
+                    .get(*choices_idx)
+                    .map(|choice| choice.canonical.clone())
+            }
+            Some(SettingKind::Enum { choices, .. }) => {
+                effective_enum_choices(*key, choices, &self.pager_snapshot)
+                    .get(*choices_idx)
+                    .map(|choice| choice.canonical.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    /// Remap a live `PickingEnum` index onto the refreshed catalog by
+    /// canonical identity. Falls back to a clamped index if the value vanished.
+    pub fn remap_picking_enum_after_catalog_refresh(&mut self, selected: Option<String>) {
         let SettingsMode::PickingEnum {
             key, choices_idx, ..
         } = &mut self.state.mode
         else {
             return;
         };
-        let len = match self.registry.find(*key).map(|m| &m.kind) {
+        let names: Vec<String> = match self.registry.find(*key).map(|m| &m.kind) {
             Some(SettingKind::DynamicEnum { source, .. }) => {
-                dynamic_enum_choices(*source, &self.pager_snapshot).len()
+                dynamic_enum_choices(*source, &self.pager_snapshot)
+                    .into_iter()
+                    .map(|choice| choice.canonical)
+                    .collect()
             }
             Some(SettingKind::Enum { choices, .. }) => {
-                effective_enum_choices(*key, choices, &self.pager_snapshot).len()
+                effective_enum_choices(*key, choices, &self.pager_snapshot)
+                    .into_iter()
+                    .map(|choice| choice.canonical.to_string())
+                    .collect()
             }
             _ => return,
         };
-        if len == 0 {
+        if let Some(selected) = selected.as_deref() {
+            if let Some(idx) = names.iter().position(|name| name == selected) {
+                *choices_idx = idx;
+                return;
+            }
+        }
+        if names.is_empty() {
             *choices_idx = 0;
-        } else if *choices_idx >= len {
-            *choices_idx = len - 1;
+        } else if *choices_idx >= names.len() {
+            *choices_idx = names.len() - 1;
         }
     }
 

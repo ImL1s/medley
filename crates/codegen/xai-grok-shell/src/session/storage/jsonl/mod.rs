@@ -109,6 +109,36 @@ impl JsonlStorageAdapter {
         let chat_file = dir.join(super::CHAT_HISTORY_FILE);
         self.read_chat_history_sync(chat_file, CHAT_FORMAT_VERSION)
     }
+    /// Move a public session directory that has no `summary.json` aside.
+    /// Caller must hold the exclusive session-ID lease.
+    fn quarantine_incomplete_public_session(&self, info: &Info) -> io::Result<()> {
+        let public = self.session_dir(info);
+        match std::fs::metadata(&public) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "session path is occupied by a non-directory",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        if public.join(super::SUMMARY_FILE).exists() {
+            return Ok(());
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let quarantine = public.with_file_name(format!(
+            "{}.incomplete-{stamp}",
+            public.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        std::fs::rename(&public, &quarantine)?;
+        Ok(())
+    }
+
     fn session_dir(&self, info: &Info) -> PathBuf {
         match &self.dir_mode {
             SessionDirMode::FromRoot(root) => root
@@ -160,6 +190,11 @@ impl JsonlStorageAdapter {
             tracing::info!("Loading existing session from JSONL");
             return self.read_summary_sync(info);
         }
+
+        // Exclusive lease is held. A crash after creating the public
+        // directory but before writing summary.json leaves an occupant
+        // that finalize() would reject forever. Quarantine it first.
+        self.quarantine_incomplete_public_session(info)?;
 
         tracing::info!("Creating new session in JSONL");
         let parent_name = crate::util::grok_home::encode_cwd_dirname(&info.cwd);

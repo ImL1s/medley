@@ -67,6 +67,7 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
             _ => None,
         };
         if let Some(state) = state_opt {
+            let selected = state.picking_enum_selected_canonical();
             state.rebuild_rows();
             state.ui_snapshot = ui_snapshot.clone();
             state.pager_snapshot = crate::settings::PagerLocalSnapshot {
@@ -92,7 +93,7 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                     .scheduler_background_loops
                     .unwrap_or(scheduler_background_loops_seed),
             };
-            state.clamp_picking_enum_after_catalog_refresh();
+            state.remap_picking_enum_after_catalog_refresh(selected);
         }
     }
 }
