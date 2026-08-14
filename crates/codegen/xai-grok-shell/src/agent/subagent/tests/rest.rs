@@ -4171,7 +4171,10 @@ async fn subagent_override_provider_model_spawns_cache_only_credentials() {
             config.api_key, None,
             "a cold cache spawns with no key, never the parent session key"
         );
-    provider.ensure_fresh_token(None).await.rotated().unwrap();
+    provider
+        .ensure_fresh_token(None)
+        .await
+        .expect_rotated(&provider, "subagent spawn helper mint");
     let (config, _) = resolve_subagent_sampling_config(
             "explore",
             &ModelOverride::Inherit,

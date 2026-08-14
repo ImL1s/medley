@@ -3045,7 +3045,10 @@ async fn switch_to_first_party_model_drops_minted_provider_token() {
         .run_until(async {
             let dir = tempfile::tempdir().unwrap();
             let provider = counting_provider("hall-pass", dir.path());
-            let token = provider.ensure_fresh_token(None).await.rotated().unwrap();
+            let token = provider
+                .ensure_fresh_token(None)
+                .await
+                .expect_rotated(&provider, "hall-pass helper mint");
             assert_eq!(token, "tok-1");
 
             let (actor, persistence_rx) =
@@ -3128,7 +3131,10 @@ async fn sampler_401_on_provider_model_remints_and_resubmits() {
         .run_until(async {
             let dir = tempfile::tempdir().unwrap();
             let provider = counting_provider("test-4c-recover", dir.path());
-            let token = provider.ensure_fresh_token(None).await.rotated().unwrap();
+            let token = provider
+                .ensure_fresh_token(None)
+                .await
+                .expect_rotated(&provider, "4c recover helper mint");
             assert_eq!(token, "tok-1");
 
             let (actor, _rx) =
@@ -3169,7 +3175,10 @@ async fn sampler_non_auth_kind_401_on_provider_model_still_recovers() {
         .run_until(async {
             let dir = tempfile::tempdir().unwrap();
             let provider = counting_provider("test-4c-non-auth-kind", dir.path());
-            let token = provider.ensure_fresh_token(None).await.rotated().unwrap();
+            let token = provider
+                .ensure_fresh_token(None)
+                .await
+                .expect_rotated(&provider, "4c non-auth-kind helper mint");
 
             let (actor, _rx) =
                 make_actor_with_auth_and_credentials(None, xai_chat_state::AuthType::ApiKey, token)
@@ -3242,7 +3251,10 @@ async fn sampler_401_on_provider_model_never_refreshes_session() {
         .run_until(async {
             let dir = tempfile::tempdir().unwrap();
             let provider = counting_provider("test-4c-exclusive", dir.path());
-            let token = provider.ensure_fresh_token(None).await.rotated().unwrap();
+            let token = provider
+                .ensure_fresh_token(None)
+                .await
+                .expect_rotated(&provider, "4c exclusive helper mint");
 
             let called = Arc::new(AtomicBool::new(false));
             let refresher: Arc<dyn crate::auth::refresh::TokenRefresher> =
@@ -3337,7 +3349,10 @@ async fn sampler_401_on_fresh_provider_token_surfaces_error() {
         .run_until(async {
             let dir = tempfile::tempdir().unwrap();
             let provider = counting_provider("test-4c-guard", dir.path());
-            let token = provider.ensure_fresh_token(None).await.rotated().unwrap();
+            let token = provider
+                .ensure_fresh_token(None)
+                .await
+                .expect_rotated(&provider, "4c fresh-mint guard helper mint");
 
             let (actor, _rx) = make_actor_with_auth_and_credentials(
                 None,
