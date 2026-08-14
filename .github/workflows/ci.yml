@@ -1900,7 +1900,9 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             config_refresh_clears_current_effort_removed_from_model_menu -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
-            model_switch_rejects_effort_outside_model_menu -- --nocapture
+            model_switch_returns_structured_invalid_params_for_effort_outside_model_menu -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            model_switch_accepts_catalog_advertised_ultra_effort -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             unconditional_default_reselection_revalidates_current_effort -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
