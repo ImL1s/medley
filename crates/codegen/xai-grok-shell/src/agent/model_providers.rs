@@ -13,27 +13,14 @@ pub const OPENAI_CODEX_PROVIDER_ID: &str = "openai-codex";
 /// replaces the preset in place instead of adding a second entry.
 pub const OPENAI_CODEX_PRESET_MODEL_ID: &str = "gpt-5.6-sol";
 
-/// Conservative context window for the preset, and a guess.
+/// Fallback context window for the built-in Codex preset when no live catalog
+/// or last-good cache is available.
 ///
-/// Under-reporting only makes auto-compact fire earlier, which is the safe
-/// direction — but the figure is far enough off that the context bar reads as
-/// the model's real capacity and sessions compact long before they need to
-/// (#122). A user can correct it with a metadata-only `[model."gpt-5.6-sol"]`
-/// override; the custom-models guide documents how.
-///
-/// This comment used to assert that "Codex-side metadata is not discoverable
-/// from the CLI". **That is false.** Codex exposes `GET {base}/models` against
-/// the same `chatgpt.com/backend-api/codex` base this fork already uses, and
-/// its payload carries `context_window` and `max_context_window`. This fork
-/// does not fetch that catalog — the Codex path only hardcodes this constant.
-/// Fetching it would remove the guess rather than move it, and costs one
-/// authenticated probe to confirm the payload shape.
-///
-/// It also used to say the value "matches the value the custom-models guide
-/// has always used in its Codex example". Nothing enforced that coupling and
-/// the guide's example has since changed, so the claim is dropped rather than
-/// re-stated.
-const OPENAI_CODEX_PRESET_CONTEXT_WINDOW: u64 = 200_000;
+/// Matches Sol's published `context_window` / `max_context_window` (272_000).
+/// The previous 200_000 guess made the context bar look like capacity and
+/// fired auto-compact far too early (#122). A live `GET /models` payload, or a
+/// metadata-only `[model."gpt-5.6-sol"]` override, still wins when present.
+const OPENAI_CODEX_PRESET_CONTEXT_WINDOW: u64 = 272_000;
 const OPENAI_CODEX_MODELS_CATALOG_DESCRIPTION: &str = "OpenAI Codex via a ChatGPT subscription";
 const OPENAI_CODEX_CATALOG_CACHE_DIR: &str = "codex-model-catalog";
 const OPENAI_CODEX_CATALOG_CACHE_SCHEMA: u32 = 1;
@@ -3495,6 +3482,10 @@ mod tests {
         assert_eq!(
             preset.context_window,
             Some(OPENAI_CODEX_PRESET_CONTEXT_WINDOW)
+        );
+        assert_eq!(
+            OPENAI_CODEX_PRESET_CONTEXT_WINDOW, 272_000,
+            "#122: builtin fallback must match Sol's catalog window, not the 200k guess"
         );
     }
 

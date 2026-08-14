@@ -486,9 +486,15 @@ impl AuthManager {
     /// (including `GROK_AUTH_PATH`) so atomic multi-scope writes and locking are
     /// reused without replacing the active xAI entry.
     pub fn new_openai_codex(grok_home: &Path) -> Self {
-        let path = std::env::var("GROK_AUTH_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| grok_home.join("auth.json"));
+        Self::new_openai_codex_at_path(crate::auth::openai_codex::resolved_auth_path(grok_home))
+    }
+
+    /// Construct a Codex manager against an exact auth.json path.
+    ///
+    /// In-process fixtures must pass the file they just wrote rather than
+    /// pinning `GROK_AUTH_PATH`. That env is process-global; a serial fixture
+    /// that sets it still leaks into parallel `new_openai_codex` callers (#343).
+    pub fn new_openai_codex_at_path(path: PathBuf) -> Self {
         let scope = crate::auth::openai_codex::AUTH_SCOPE.to_owned();
         let (auth, disk_state) = match read_auth_json_owner_only(&path) {
             Ok(map) => {

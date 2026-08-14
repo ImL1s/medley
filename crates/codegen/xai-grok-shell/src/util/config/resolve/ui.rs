@@ -139,6 +139,7 @@ pub fn resolve_mouse_reporting_toggle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     // Assumes GROK_MOUSE_REPORTING_TOGGLE is unset in the test env.
     #[test]
@@ -175,6 +176,7 @@ mod tests {
 mod show_thinking_blocks_tests {
     use super::*;
     use crate::agent::config::ConfigSource;
+    use serial_test::serial;
 
     fn guard() -> std::sync::MutexGuard<'static, ()> {
         let g = super::SHOW_THINKING_BLOCKS_ENV_LOCK
@@ -204,6 +206,7 @@ mod show_thinking_blocks_tests {
     }
 
     #[test]
+    #[serial]
     fn each_layer_can_turn_it_off() {
         let _g = guard();
         let off = toml_ui(false);
@@ -222,6 +225,7 @@ mod show_thinking_blocks_tests {
     }
 
     #[test]
+    #[serial]
     fn env_overrides_config_and_remote() {
         let _g = guard();
         unsafe { std::env::set_var(ENV_SHOW_THINKING_BLOCKS, "0") };
@@ -233,6 +237,7 @@ mod show_thinking_blocks_tests {
     }
 
     #[test]
+    #[serial]
     fn requirement_beats_env() {
         let _g = guard();
         unsafe { std::env::set_var(ENV_SHOW_THINKING_BLOCKS, "0") };
@@ -262,6 +267,7 @@ mod show_thinking_blocks_tests {
 mod group_tool_verbs_tests {
     use super::*;
     use crate::agent::config::ConfigSource;
+    use serial_test::serial;
 
     fn guard() -> std::sync::MutexGuard<'static, ()> {
         let g = super::GROUP_TOOL_VERBS_ENV_LOCK
@@ -291,6 +297,7 @@ mod group_tool_verbs_tests {
     }
 
     #[test]
+    #[serial]
     fn each_layer_can_turn_it_off() {
         let _g = guard();
         let off = toml_ui(false);
@@ -314,6 +321,7 @@ mod group_tool_verbs_tests {
     }
 
     #[test]
+    #[serial]
     fn env_overrides_config_and_remote() {
         let _g = guard();
         unsafe { std::env::set_var(ENV_GROUP_TOOL_VERBS, "0") };
@@ -325,6 +333,7 @@ mod group_tool_verbs_tests {
     }
 
     #[test]
+    #[serial]
     fn requirement_beats_env() {
         let _g = guard();
         unsafe { std::env::set_var(ENV_GROUP_TOOL_VERBS, "0") };
@@ -353,6 +362,7 @@ mod group_tool_verbs_tests {
 mod collapsed_edit_blocks_tests {
     use super::*;
     use crate::agent::config::ConfigSource;
+    use serial_test::serial;
 
     fn guard() -> std::sync::MutexGuard<'static, ()> {
         let g = super::COLLAPSED_EDIT_BLOCKS_ENV_LOCK
@@ -382,6 +392,7 @@ mod collapsed_edit_blocks_tests {
     }
 
     #[test]
+    #[serial]
     fn each_layer_can_turn_it_on() {
         let _g = guard();
         let on = toml_ui(true);
@@ -405,6 +416,7 @@ mod collapsed_edit_blocks_tests {
     }
 
     #[test]
+    #[serial]
     fn env_overrides_config_and_remote() {
         let _g = guard();
         unsafe { std::env::set_var(ENV_COLLAPSED_EDIT_BLOCKS, "0") };
@@ -416,6 +428,7 @@ mod collapsed_edit_blocks_tests {
     }
 
     #[test]
+    #[serial]
     fn requirement_beats_env() {
         let _g = guard();
         unsafe { std::env::set_var(ENV_COLLAPSED_EDIT_BLOCKS, "1") };

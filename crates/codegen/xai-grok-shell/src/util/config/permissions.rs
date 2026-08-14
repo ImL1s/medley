@@ -272,6 +272,7 @@ pub fn load_require_plan_approval() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn resolve_permission_mode_none_is_ask() {
@@ -615,6 +616,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn effective_auto_for_launch_cli_auto_not_yolo() {
         // This function is feature-gated; force the gate ON (and serialize with
         // the other env-sensitive gate tests) so the auto-activation paths run.
@@ -664,6 +666,7 @@ mod tests {
     /// `--permission-mode auto` / config auto is inert so the classifier never
     /// launches. (Compiled-in default is ON; this pins the env kill-switch.)
     #[test]
+    #[serial]
     fn effective_auto_for_launch_inert_when_gate_off() {
         let _g = crate::util::config::resolve::AUTO_PERMISSION_MODE_ENV_LOCK
             .lock()

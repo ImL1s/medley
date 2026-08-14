@@ -341,6 +341,7 @@ pub fn resolve_motion_cadence(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn guard() -> std::sync::MutexGuard<'static, ()> {
         let g = DISPLAY_REFRESH_ENV_LOCK
@@ -423,6 +424,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn env_overrides_probe_and_auto() {
         let _g = guard();
         unsafe {
@@ -445,6 +447,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn requirement_beats_env() {
         let _g = guard();
         unsafe {

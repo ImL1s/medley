@@ -5,6 +5,7 @@
 use super::*;
 use crate::auth::error::RefreshTokenError;
 use crate::auth::storage::DurableAuthWritePhase;
+use serial_test::serial;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
@@ -4767,6 +4768,7 @@ fn dark_wake_defer_budget_survives_powered_on_during_dark_wake() {
 /// those processes never treat the OS power state as a dark wake. Exercises the
 /// guard directly (no dark-wake override installed).
 #[test]
+#[serial]
 #[serial_test::serial(force_dark_wake_env)] // reads GROK_AUTH_FORCE_DARK_WAKE
 fn is_dark_wake_false_when_power_listener_not_started() {
     let _unset = xai_grok_test_support::EnvGuard::unset("GROK_AUTH_FORCE_DARK_WAKE");
@@ -4784,6 +4786,7 @@ fn is_dark_wake_false_when_power_listener_not_started() {
 /// exists precisely so such a run can drive the dark-wake paths against a
 /// real binary.
 #[test]
+#[serial]
 #[serial_test::serial(force_dark_wake_env)]
 fn is_dark_wake_env_override_forces_both_states() {
     use xai_grok_test_support::EnvGuard;

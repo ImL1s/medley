@@ -115,6 +115,7 @@ impl From<PrefireOutcome> for PrefirePass1Run {
 #[cfg(test)]
 mod two_pass_prefire_helper_tests {
     use super::{fingerprint_prefix, prefire_lead_percent};
+    use serial_test::serial;
     use xai_grok_sampling_types::ConversationItem;
     #[test]
     fn fingerprint_stable_for_same_prefix() {
@@ -151,6 +152,7 @@ mod two_pass_prefire_helper_tests {
         assert_ne!(fingerprint_prefix(&short), fingerprint_prefix(&long));
     }
     #[test]
+    #[serial]
     fn prefire_lead_percent_defaults_to_10() {
         unsafe { std::env::remove_var("GROK_PREFIRE_LEAD_PERCENT") };
         assert_eq!(prefire_lead_percent(), 10);
