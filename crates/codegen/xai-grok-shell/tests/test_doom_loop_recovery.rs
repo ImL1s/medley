@@ -545,7 +545,7 @@ async fn headless_local_endpoint_suppresses_doom_loop_identity_headers() {
             .with_api_backend("responses")
             .with_auth_scheme("none"),
     ];
-    let server = MockInferenceServer::start_with_models(models)
+    let server = MockInferenceServer::start_with_keyless_local_models(models)
         .await
         .expect("start mock server");
     let workdir = xai_grok_test_support::git_workdir();

@@ -135,7 +135,7 @@ async fn read_session_firehose_when_ready(path: &Path, client: &GrokStdioClient)
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
 async fn debug_flag_enables_firehose_without_crashing() {
-    let server = MockInferenceServer::start()
+    let server = MockInferenceServer::start_keyless_local()
         .await
         .expect("start mock server");
     let workdir = git_workdir();
@@ -152,7 +152,7 @@ async fn debug_flag_enables_firehose_without_crashing() {
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
 async fn no_debug_flag_writes_no_debug_dir() {
-    let server = MockInferenceServer::start()
+    let server = MockInferenceServer::start_keyless_local()
         .await
         .expect("start mock server");
     let workdir = git_workdir();
@@ -177,7 +177,7 @@ async fn no_debug_flag_writes_no_debug_dir() {
 #[ignore] // requires pre-built binary; run with --ignored
 async fn agent_session_writes_named_session_file() {
     with_local_set(|| async {
-        let server = MockInferenceServer::start()
+        let server = MockInferenceServer::start_keyless_local()
             .await
             .expect("start mock server");
         let workdir = git_workdir();
@@ -223,7 +223,7 @@ async fn agent_session_writes_named_session_file() {
 #[ignore] // requires pre-built binary; run with --ignored
 async fn debug_flag_master_switch_enables_firehose() {
     with_local_set(|| async {
-        let server = MockInferenceServer::start()
+        let server = MockInferenceServer::start_keyless_local()
             .await
             .expect("start mock server");
         let workdir = git_workdir();
@@ -273,7 +273,7 @@ async fn debug_flag_master_switch_enables_firehose() {
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
 async fn debug_file_flag_writes_single_file_and_bypasses_routing() {
-    let server = MockInferenceServer::start()
+    let server = MockInferenceServer::start_keyless_local()
         .await
         .expect("start mock server");
     let workdir = git_workdir();
@@ -308,7 +308,7 @@ async fn debug_file_flag_writes_single_file_and_bypasses_routing() {
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
 async fn grok_log_file_explicit_path_is_written() {
-    let server = MockInferenceServer::start()
+    let server = MockInferenceServer::start_keyless_local()
         .await
         .expect("start mock server");
     let workdir = git_workdir();

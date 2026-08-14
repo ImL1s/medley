@@ -166,10 +166,12 @@ impl FirstPartySessionEligibility {
 
 /// Complete refresh surface for ambient "self-healing" classification.
 ///
-/// OIDC requires a non-empty `refresh_token` **and** issuer + client_id. A
-/// bare `refresh_token.is_some()` (empty string / missing IdP fields) is **not**
-/// enough. External auth refreshes by re-running its configured provider
-/// command, so it requires a non-empty command instead of OIDC metadata.
+/// Requires the mode's complete refresh authority. A bare
+/// `refresh_token.is_some()` (empty string / missing IdP fields) is **not**
+/// enough — those must not pin Grok over ready Codex (Pro P1).
+///
+/// External auth refreshes by re-running its configured provider command, so
+/// it requires a nonblank command instead of OIDC metadata (#316).
 fn session_has_complete_refresh_surface(
     auth: &GrokAuth,
     auth_provider_command: Option<&str>,
@@ -2021,10 +2023,10 @@ impl AuthManager {
     /// One observation classifying first-party session for #303 ambient selection
     /// (Pro P1): hard-valid wire session vs hard-expired-but-self-healing.
     ///
-    /// `Refreshable` requires the mode's **complete** refresh authority: OIDC
+    /// `Refreshable` requires the mode's complete refresh authority: OIDC
     /// needs a non-empty refresh_token + issuer + client_id; External needs a
-    /// configured non-empty provider command. Malformed/incomplete credentials
-    /// must not pin Grok.
+    /// configured nonblank provider command (#316). Malformed/incomplete
+    /// credentials must not pin Grok.
     pub(crate) fn first_party_session_eligibility(&self) -> FirstPartySessionEligibility {
         if !self.credential_store_is_safe() {
             return FirstPartySessionEligibility::None;

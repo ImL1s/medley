@@ -254,6 +254,9 @@ DOWNLOADER_LABEL="${EXCLUDE_DOWNLOADER:+wget-only (curl hidden)}"
 echo "== installer cases (${TARGET}) ${DOWNLOADER_LABEL:-curl} =="
 
 # A release that exists installs, and the result is usable.
+# This is also the deterministic `/releases/latest` resolution case (#256):
+# the fixture answers 200 + tag_name, and the installer must pick that tag
+# without a live GitHub quota.
 run_case ok ok clean 0 'Checksum verified'
 if [ -x "${CASE_HOME}/.medley/bin/medley" ]; then
   ok "ok: the command is executable"

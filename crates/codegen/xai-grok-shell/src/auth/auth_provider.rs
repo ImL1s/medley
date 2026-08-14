@@ -359,6 +359,187 @@ fn scrub_first_party_credentials(cmd: &mut tokio::process::Command) {
     }
 }
 
+/// Why a shell-backed helper did not produce an [`std::process::Output`].
+/// Display is the operator-facing mint error and must stay free of command,
+/// env, token, and helper stderr.
+#[derive(Debug)]
+enum HelperExecError {
+    Spawn(std::io::Error),
+    GroupSetup(std::io::Error),
+    Read(std::io::Error),
+    Wait(std::io::Error),
+    Timeout { secs: u64 },
+    StdoutCap,
+    NonzeroExit { status: std::process::ExitStatus },
+}
+
+impl std::fmt::Display for HelperExecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(err) => write!(f, "command failed to start: {err}"),
+            Self::GroupSetup(err) => write!(f, "process group setup failed: {err}"),
+            Self::Read(err) => write!(f, "reading command stdout: {err}"),
+            Self::Wait(err) => write!(f, "waiting on command: {err}"),
+            Self::Timeout { secs } => write!(f, "command timed out after {secs}s"),
+            Self::StdoutCap => write!(
+                f,
+                "command wrote more than {PROVIDER_STDOUT_CAP_BYTES} bytes to stdout"
+            ),
+            Self::NonzeroExit { status } => write!(f, "exited with {status}"),
+        }
+    }
+}
+
+impl std::error::Error for HelperExecError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Spawn(err) | Self::GroupSetup(err) | Self::Read(err) | Self::Wait(err) => {
+                Some(err)
+            }
+            Self::Timeout { .. } | Self::StdoutCap | Self::NonzeroExit { .. } => None,
+        }
+    }
+}
+
+/// Test-only cap on concurrent helper subprocesses. Production minting is
+/// unchanged; this exists so `cargo test auth::` cannot stampede the host.
+#[cfg(test)]
+pub(crate) const HELPER_TEST_CONCURRENCY: usize = 4;
+
+#[cfg(test)]
+static HELPER_TEST_PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+async fn acquire_helper_test_permit() -> tokio::sync::SemaphorePermit<'static> {
+    HELPER_TEST_PERMITS
+        .get_or_init(|| tokio::sync::Semaphore::new(HELPER_TEST_CONCURRENCY))
+        .acquire()
+        .await
+        .expect("auth-provider helper test semaphore is never closed")
+}
+
+/// Execution-only mint failure for test assertions. Never carries command,
+/// env, token, refresh token, or helper stderr.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HelperMintFailure {
+    pub(crate) category: HelperExecCategory,
+    pub(crate) errno: Option<i32>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HelperExecCategory {
+    Spawn,
+    Read,
+    Wait,
+    Timeout,
+    NonzeroExit,
+}
+
+#[cfg(test)]
+impl HelperExecCategory {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Spawn => "spawn",
+            Self::Read => "read",
+            Self::Wait => "wait",
+            Self::Timeout => "timeout",
+            Self::NonzeroExit => "nonzero",
+        }
+    }
+}
+
+#[cfg(test)]
+impl std::fmt::Display for HelperMintFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.errno {
+            Some(errno) => write!(f, "category={} errno={errno}", self.category.as_str()),
+            None => write!(f, "category={}", self.category.as_str()),
+        }
+    }
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for HelperMintFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+#[cfg(test)]
+impl HelperExecError {
+    fn diagnostic(&self) -> HelperMintFailure {
+        match self {
+            Self::Spawn(err) | Self::GroupSetup(err) => HelperMintFailure {
+                category: HelperExecCategory::Spawn,
+                errno: err.raw_os_error(),
+            },
+            Self::Read(err) => HelperMintFailure {
+                category: HelperExecCategory::Read,
+                errno: err.raw_os_error(),
+            },
+            Self::Wait(err) => HelperMintFailure {
+                category: HelperExecCategory::Wait,
+                errno: err.raw_os_error(),
+            },
+            Self::Timeout { .. } => HelperMintFailure {
+                category: HelperExecCategory::Timeout,
+                errno: None,
+            },
+            Self::StdoutCap => HelperMintFailure {
+                category: HelperExecCategory::Read,
+                errno: None,
+            },
+            Self::NonzeroExit { status } => HelperMintFailure {
+                category: HelperExecCategory::NonzeroExit,
+                errno: status.code(),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+static LAST_HELPER_MINT_FAILURES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, HelperMintFailure>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn record_helper_mint_failure(name: &str, failure: Option<HelperMintFailure>) {
+    let mut map = LAST_HELPER_MINT_FAILURES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match failure {
+        Some(failure) => {
+            map.insert(name.to_owned(), failure);
+        }
+        None => {
+            map.remove(name);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn helper_mint_failure(name: &str) -> Option<HelperMintFailure> {
+    LAST_HELPER_MINT_FAILURES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(name)
+        .copied()
+}
+
+fn helper_exec_to_anyhow(
+    #[cfg_attr(not(test), allow(unused_variables))] name: &str,
+    err: HelperExecError,
+) -> anyhow::Error {
+    #[cfg(test)]
+    record_helper_mint_failure(name, Some(err.diagnostic()));
+    anyhow::Error::new(err)
+}
+
 /// Spawn `cmd`, capture stdout with a byte cap and discard stderr (reading both
 /// concurrently so a full pipe on one can't deadlock the other; a runaway helper
 /// is drained to a sink past the cap so it can't wedge the wait), and bound the
@@ -369,19 +550,22 @@ fn scrub_first_party_credentials(cmd: &mut tokio::process::Command) {
 /// grandchildren -- and the `GROK_AUTH_PROVIDER_*` credentials in their env --
 /// do not outlive the reported timeout; `kill_on_drop` alone would reap only the
 /// direct child.
+///
+/// Test builds acquire a global 4-permit before spawn so helper fixtures cannot
+/// stampede the host. Production has no permit and no extra serialization.
 async fn run_capped(
     cmd: &mut tokio::process::Command,
     timeout: std::time::Duration,
-) -> anyhow::Result<std::process::Output> {
+) -> Result<std::process::Output, HelperExecError> {
+    #[cfg(test)]
+    let _permit = acquire_helper_test_permit().await;
     #[allow(clippy::disallowed_methods)] // killed at the timeout this call reports
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("command failed to start: {e}"))?;
+    let mut child = cmd.spawn().map_err(HelperExecError::Spawn)?;
     // Enroll the child's process group so the timeout path can tear down the
     // whole tree. Best-effort: if enrollment fails, `kill_on_drop` still reaps
     // the direct child.
-    let mut group = xai_grok_tools::util::ProcessGroup::new()
-        .map_err(|e| anyhow::anyhow!("process group setup failed: {e}"))?;
+    let mut group =
+        xai_grok_tools::util::ProcessGroup::new().map_err(HelperExecError::GroupSetup)?;
     if let Err(e) = group.attach(&child) {
         tracing::debug!(error = %e, "auth provider: could not enroll helper process group");
     }
@@ -402,22 +586,21 @@ async fn run_capped(
         if err_res.is_err() {
             tracing::debug!("auth provider: stderr drain failed");
         }
-        out_res.map_err(|e| anyhow::anyhow!("reading command stdout: {e}"))?;
-        child
-            .wait()
-            .await
-            .map_err(|e| anyhow::anyhow!("waiting on command: {e}"))
+        out_res.map_err(HelperExecError::Read)?;
+        child.wait().await.map_err(HelperExecError::Wait)
     };
 
     let status = match tokio::time::timeout(timeout, capture).await {
         Ok(res) => res?,
         Err(_elapsed) => {
             let _ = group.kill();
-            anyhow::bail!("command timed out after {}s", timeout.as_secs());
+            return Err(HelperExecError::Timeout {
+                secs: timeout.as_secs(),
+            });
         }
     };
     if out_buf.len() as u64 > PROVIDER_STDOUT_CAP_BYTES {
-        anyhow::bail!("command wrote more than {PROVIDER_STDOUT_CAP_BYTES} bytes to stdout");
+        return Err(HelperExecError::StdoutCap);
     }
     Ok(std::process::Output {
         status,
@@ -507,9 +690,27 @@ async fn mint_provider_token(
     // Scrub last so nothing above can reintroduce a first-party credential.
     scrub_first_party_credentials(&mut cmd);
 
-    let output = run_capped(&mut cmd, std::time::Duration::from_secs(timeout_secs)).await?;
-
-    let parsed = parse_token_output(&output)?;
+    let output = run_capped(&mut cmd, std::time::Duration::from_secs(timeout_secs))
+        .await
+        .map_err(|err| helper_exec_to_anyhow(name, err))?;
+    if !output.status.success() {
+        return Err(helper_exec_to_anyhow(
+            name,
+            HelperExecError::NonzeroExit {
+                status: output.status,
+            },
+        ));
+    }
+    let parsed = match parse_token_output(&output) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            #[cfg(test)]
+            record_helper_mint_failure(name, None);
+            return Err(err);
+        }
+    };
+    #[cfg(test)]
+    record_helper_mint_failure(name, None);
     let expires_at = parsed
         .expires_at
         .or_else(|| config.token_ttl_secs.and_then(expiry_after_seconds))
@@ -575,6 +776,25 @@ impl ProviderRefreshOutcome {
         match self {
             Self::Rotated(token) => Some(token),
             Self::Unchanged | Self::Unusable | Self::MintFailed => None,
+        }
+    }
+
+    /// Setup helper for helper-backed tests: a mint failure includes the
+    /// execution category/errno instead of collapsing to `None`.
+    #[cfg(test)]
+    #[track_caller]
+    pub(crate) fn expect_rotated(self, provider: &AuthProviderRef, what: &str) -> String {
+        match self {
+            Self::Rotated(token) => token,
+            Self::MintFailed => {
+                let detail = helper_mint_failure(&provider.name)
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "unclassified".to_owned());
+                panic!("{what}: helper mint failed ({detail})")
+            }
+            Self::Unchanged => panic!("{what}: expected Rotated, got Unchanged"),
+            Self::Unusable => panic!("{what}: expected Rotated, got Unusable"),
         }
     }
 }

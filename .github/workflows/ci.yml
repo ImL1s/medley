@@ -49,10 +49,25 @@ jobs:
       - name: Test the new-test filter guard
         run: python3 -B -m unittest tests.test_new_test_filter_guard -v
 
+      - name: Test the uncovered-crate ratchet
+        run: python3 -B -m unittest tests.test_uncovered_crates_guard -v
+
       - name: Test the PR-head CI receipt guard
         # This guard is a pre-merge local/orchestrator check; it does not run
         # as part of CI itself. CI only executes its Python unit tests.
         run: python3 -B -m unittest tests.test_pr_head_ci_run_guard -v
+
+      - name: Guard distChannel docs against the release stamp
+        run: python3 -B -m unittest tests.test_dist_channel_docs_guard -v
+
+      # Direct-mention scan: EnvGuard / std::env::{set_var,remove_var} in
+      # xai-grok-shell unit tests must carry unkeyed #[serial] (#319).
+      # Known stragglers are allowlisted; new hits and stale entries fail.
+      - name: Test the EnvGuard serial guard
+        run: python3 -B -m unittest tests.test_envguard_serial_guard -v
+
+      - name: Enforce EnvGuard tests are unkeyed #[serial]
+        run: python3 -B scripts/check_envguard_serial.py
 
   installer:
     name: Installer
@@ -83,13 +98,20 @@ jobs:
       # The fixture rewrites the GitHub hosts, so it cannot catch a mistake in
       # the real URLs — percent-encoding of `+` in a tag, say. One live install
       # covers exactly that, and nothing else does.
+      #
+      # Resolve the published tag with the job token. Anonymous
+      # /releases/latest shares a 60 req/h/IP budget across runners (#256).
+      # Pinning MEDLEY_VERSION still exercises download, checksums, extract,
+      # launcher, --version, and the ~/.grok assertion. Latest-lookup itself
+      # is covered by tests/installer/run_cases.sh `ok` / `no-release`.
       - name: Install the published release for real
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -eux
           home="$(mktemp -d)"
-          HOME="$home" sh install.sh
+          MEDLEY_VERSION="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
+          HOME="$home" MEDLEY_VERSION="$MEDLEY_VERSION" sh install.sh
           HOME="$home" "$home/.medley/bin/medley" --version
           test ! -e "$home/.grok"
 
@@ -142,6 +164,16 @@ jobs:
           python3 scripts/check_new_tests_are_filtered.py \
             --workflow .github/workflows/ci.yml \
             --base "origin/${{ github.base_ref || 'providers' }}"
+
+      # Crate-level complement of the diff-scoped guard above (issue #280).
+      # A crate with src/ tests that no `-p` names runs nowhere forever;
+      # #171 only sees newly added tests. No Rust toolchain: this reads
+      # Cargo.toml + src/**/*.rs + ci.yml against a checked-in allowlist.
+      - name: Every crate with tests is named or allowlisted
+        run: |
+          python3 scripts/check_uncovered_crates.py \
+            --workflow .github/workflows/ci.yml \
+            --allowlist tests/ci/uncovered-crates.allowlist
 
   windows-session-publication:
     name: Windows session publication
@@ -253,6 +285,35 @@ jobs:
           run_nonzero -p xai-grok-shell --lib final_publication_ -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             symlinked_cwd_parent_without_touching_outside_tree -- --nocapture
+
+  compile-tests:
+    name: Compile every test target
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.0"
+
+      - name: Install DotSlash and verify pinned protoc
+        run: |
+          cargo install dotslash --version 0.5.7 --locked
+          /usr/bin/env dotslash --help >/dev/null
+          "$PROTOC" --version
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: providers-compile-tests
+          cache-targets: true
+
+      # #254: thirteen pager integration targets (and any other crate's tests)
+      # are never named by a hot-path filter. Compiling them without running
+      # is what catches a renamed type after an upstream sync.
+      - name: cargo test --workspace --no-run
+        run: cargo test --workspace --no-run
 
   lint:
     name: Clippy (hot path)
@@ -542,6 +603,11 @@ jobs:
           # tells them apart.
           run_nonzero -p xai-grok-shell --lib catalog_unavailable -- --nocapture
           run_nonzero -p xai-grok-shell --lib test_catalog_auth_schemes_and_override -- --nocapture
+          # #329: keyless local mock fixtures stay ready; start() stays Bearer.
+          run_nonzero -p xai-grok-test-support --lib \
+            keyless_local_server_catalog_emits_auth_scheme_none -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            keyless_local_mock_catalog_entry_is_ready_on_loopback -- --nocapture
           # #132: the reader's dup must not be inherited by children. Named
           # explicitly rather than by a `pty_session` prefix: the rest of that
           # module is the hang this change fixes, and this one is the fd leak
@@ -573,6 +639,8 @@ jobs:
             final_401_relation_uses_final_wire_credential_and_post_response_snapshot -- --nocapture
           run_nonzero -p xai-file-utils --lib \
             upload_config_debug_redacts_all_secret_carriers -- --nocapture
+          run_nonzero -p xai-file-utils --lib \
+            git_ancestor_does_not_override_excluded_component -- --nocapture
 
       - name: Provider docs examples and fixtures
         run: |
@@ -1813,7 +1881,9 @@ jobs:
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_parser_tolerates_other_shapes_and_budgets_the_operative_window -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
-            codex_catalog_uses_context_window_not_the_ceiling_for_gpt_5_4 -- --nocapture
+            codex_catalog_context_window_budgets_the_operative_window -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            codex_catalog_context_window_keys_prefer_operative_capacity -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             codex_catalog_url_carries_the_required_client_version -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
@@ -1877,6 +1947,8 @@ jobs:
             first_party_session_eligibility_refreshable_vs_malformed -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             refreshable_expired_oidc_session_keeps_first_party_when_codex_ready -- --nocapture
+          run_nonzero -p xai-grok-shell --lib \
+            refreshable_expired_external_session_keeps_first_party_when_codex_ready -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
             hard_expired_nonrefreshable_session_seats_codex -- --nocapture
           run_nonzero -p xai-grok-shell --lib \

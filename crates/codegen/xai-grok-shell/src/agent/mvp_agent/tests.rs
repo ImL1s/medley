@@ -5749,10 +5749,7 @@ fn load_restore_preserves_advertised_persisted_ultra_effort() {
             .get(model_id)
             .cloned()
             .unwrap_or_else(|| {
-                crate::agent::config::ModelEntry::fallback(
-                    model_id,
-                    &EndpointsConfig::default(),
-                )
+                crate::agent::config::ModelEntry::fallback(model_id, &EndpointsConfig::default())
             });
         entry.info.supports_reasoning_effort = true;
         entry.info.reasoning_effort = Some(ReasoningEffort::Low);
@@ -5772,9 +5769,7 @@ fn load_restore_preserves_advertised_persisted_ultra_effort() {
                 default: false,
             },
         ];
-        agent
-            .models_manager
-            .insert_test_entry(model_id, entry);
+        agent.models_manager.insert_test_entry(model_id, entry);
 
         let session_id = acp::SessionId::new("resume-ultra-advertised");
         let guard = agent.begin_session_load(&session_id).expect("load claim");
@@ -5852,9 +5847,7 @@ fn load_restore_latches_when_persisted_ultra_is_no_longer_advertised() {
             description: None,
             default: false,
         }];
-        agent
-            .models_manager
-            .insert_test_entry(model_id, entry);
+        agent.models_manager.insert_test_entry(model_id, entry);
 
         let session_id = acp::SessionId::new("resume-ultra-stale");
         let guard = agent.begin_session_load(&session_id).expect("load claim");

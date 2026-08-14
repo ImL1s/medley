@@ -1229,6 +1229,109 @@ mod tests {
             .collect()
     }
 
+    fn format_run_result(result: &TerminalRunResult) -> String {
+        format!(
+            "TerminalRunResult {{ combined_output: {:?}, exit_code: {:?}, truncated: {}, signal: {:?}, timed_out: {} }}",
+            result.combined_output,
+            result.exit_code,
+            result.truncated,
+            result.signal,
+            result.timed_out,
+        )
+    }
+
+    #[cfg(unix)]
+    fn parse_positive_pids(text: &str) -> Vec<i32> {
+        text.split_whitespace()
+            .filter_map(|tok| tok.parse::<i32>().ok())
+            .filter(|pid| *pid > 0)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn pid_is_alive(pid: i32) -> bool {
+        if pid <= 0 {
+            return false;
+        }
+        // SAFETY: `kill(pid, 0)` is the POSIX existence probe. `pid > 0` so this
+        // never targets a process group (`0`) or every process (`-1`).
+        let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if ret == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    #[cfg(unix)]
+    struct ProcessTree {
+        leader: i32,
+        children: [i32; 2],
+    }
+
+    #[cfg(unix)]
+    impl ProcessTree {
+        fn pids(&self) -> [i32; 3] {
+            [self.leader, self.children[0], self.children[1]]
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_alive_process_tree(
+        leader_path: &std::path::Path,
+        children_path: &std::path::Path,
+    ) -> ProcessTree {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let leader_raw = std::fs::read_to_string(leader_path).unwrap_or_default();
+            let children_raw = std::fs::read_to_string(children_path).unwrap_or_default();
+            let leaders = parse_positive_pids(&leader_raw);
+            let children = parse_positive_pids(&children_raw);
+            if let (Some(&leader), [c1, c2]) = (leaders.first(), children.as_slice()) {
+                let unique = leader != *c1 && leader != *c2 && *c1 != *c2;
+                if unique && [leader, *c1, *c2].into_iter().all(pid_is_alive) {
+                    return ProcessTree {
+                        leader,
+                        children: [*c1, *c2],
+                    };
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "leader + both children were not alive before kill_terminal; \
+                 leader_file={leader_path:?} raw={leader_raw:?} parsed={leaders:?} \
+                 children_file={children_path:?} raw={children_raw:?} parsed={children:?} \
+                 alive={:?}",
+                leaders
+                    .iter()
+                    .chain(children.iter())
+                    .map(|&pid| (pid, pid_is_alive(pid)))
+                    .collect::<Vec<_>>(),
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_until_process_tree_dead(tree: &ProcessTree, result: &TerminalRunResult) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let alive: Vec<(i32, bool)> = tree
+                .pids()
+                .into_iter()
+                .map(|pid| (pid, pid_is_alive(pid)))
+                .collect();
+            if alive.iter().all(|(_, is_alive)| !is_alive) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "process-group kill left processes alive: {alive:?}; {}",
+                format_run_result(result),
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     #[tokio::test]
     async fn test_streaming_sends_status_updates() {
         let session_id = format!("s1-status-{}", std::process::id());
@@ -1461,13 +1564,28 @@ mod tests {
 
     /// Verify that process group kill still works after switching from
     /// ProcessGroup::leader() to ProcessSession. A parent shell spawns
-    /// a background child; killing the terminal should reap both.
+    /// two background children; killing the terminal should reap all three.
+    ///
+    /// The oracle is PID death, not `result.signal`. `finish_timeout` returns
+    /// `signal: None` / `timed_out: true`, so a leader-signal assertion cannot
+    /// tell a scheduling miss from a clean group kill, and never checks the
+    /// children at all (#324).
     #[tokio::test]
     async fn test_process_group_kill_with_session() {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let session_id = format!("pgkill-{}", std::process::id());
                 let tool_id = format!("pgkill-tool-{}", std::process::id());
+                let pid_dir = tempfile::tempdir().unwrap();
+                let pid_dir_path = pid_dir.path().display().to_string();
+                let command = format!(
+                    r#"echo $$ > "{pid_dir}/leader"
+sleep 300 & echo $! >> "{pid_dir}/children"
+sleep 300 & echo $! >> "{pid_dir}/children"
+echo READY > "{pid_dir}/ready"
+wait"#,
+                    pid_dir = pid_dir_path
+                );
 
                 let notifier = Arc::new(TestNotifier {
                     notifications: Mutex::new(vec![]),
@@ -1480,36 +1598,108 @@ mod tests {
                 };
 
                 let handle = tokio::task::spawn_local(async move {
-                    runner
-                        .run(make_request(&tool_id_clone, "sleep 300 & sleep 300 & wait"))
-                        .await
+                    runner.run(make_request(&tool_id_clone, &command)).await
                 });
 
-                // Wait for the process to start.
-                let mut attempts = 0;
-                loop {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                    let statuses = extract_statuses(&notifier.notifications.lock().await);
-                    if statuses.contains(&acp::ToolCallStatus::InProgress) {
-                        break;
-                    }
-                    attempts += 1;
-                    assert!(attempts < 40, "process did not start in time");
+                let (leader, children) = wait_for_process_tree(&pid_dir).await;
+                for pid in std::iter::once(leader).chain(children.iter().copied()) {
+                    assert!(
+                        process_exists(pid),
+                        "pid {pid} must be alive before kill_terminal"
+                    );
                 }
 
-                // Kill — should reap the whole process group.
                 assert_eq!(
                     kill_terminal(&session_id, &tool_id).await,
                     Ok(Some(KillOutcome::Killed))
                 );
 
+                wait_until_dead(leader, &children).await;
+
                 let result = handle.await.unwrap().unwrap();
                 assert!(
-                    result.signal.is_some(),
-                    "process should have been killed by signal"
+                    !result.timed_out,
+                    "group kill must not take the timeout path: timed_out={} signal={:?} exit_code={:?} truncated={}",
+                    result.timed_out,
+                    result.signal,
+                    result.exit_code,
+                    result.truncated
                 );
             })
             .await;
+    }
+
+    fn process_exists(pid: i32) -> bool {
+        if pid <= 0 {
+            return false;
+        }
+        // SAFETY: kill(pid, 0) is the POSIX existence probe. ESRCH = gone;
+        // EPERM = alive but not signalable.
+        let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if ret == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    fn parse_pid(raw: &str) -> Option<i32> {
+        let parsed = raw.trim().parse::<i32>().ok()?;
+        (parsed > 0).then_some(parsed)
+    }
+
+    async fn wait_for_process_tree(pid_dir: &tempfile::TempDir) -> (i32, Vec<i32>) {
+        let ready = pid_dir.path().join("ready");
+        let leader_path = pid_dir.path().join("leader");
+        let children_path = pid_dir.path().join("children");
+        for _ in 0..80 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if !ready.exists() {
+                continue;
+            }
+            let leader = std::fs::read_to_string(&leader_path)
+                .ok()
+                .and_then(|s| parse_pid(&s));
+            let children = std::fs::read_to_string(&children_path)
+                .ok()
+                .map(|s| s.lines().filter_map(parse_pid).collect::<Vec<_>>());
+            if let (Some(leader), Some(children)) = (leader, children)
+                && children.len() == 2
+                && process_exists(leader)
+                && children.iter().all(|p| process_exists(*p))
+            {
+                return (leader, children);
+            }
+        }
+        panic!(
+            "process tree PIDs were not observed in time (ready={}, leader={:?}, children={:?})",
+            ready.exists(),
+            std::fs::read_to_string(&leader_path).ok(),
+            std::fs::read_to_string(&children_path).ok(),
+        );
+    }
+
+    async fn wait_until_dead(leader: i32, children: &[i32]) {
+        for _ in 0..80 {
+            let leader_alive = process_exists(leader);
+            let live_children: Vec<i32> = children
+                .iter()
+                .copied()
+                .filter(|pid| process_exists(*pid))
+                .collect();
+            if !leader_alive && live_children.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!(
+            "process group still alive after kill: leader={leader} alive={} children_alive={:?}",
+            process_exists(leader),
+            children
+                .iter()
+                .copied()
+                .filter(|pid| process_exists(*pid))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

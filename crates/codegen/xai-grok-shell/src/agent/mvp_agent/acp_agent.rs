@@ -182,6 +182,7 @@ pub(super) fn auth_init_disk_refresh_context(
         "refresh_post_present": refresh_relation.disk_present(),
     })
 }
+
 #[async_trait::async_trait(?Send)]
 impl acp::Agent for MvpAgent {
     /// In the meta, we provide

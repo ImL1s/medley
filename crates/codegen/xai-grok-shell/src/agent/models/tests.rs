@@ -5156,10 +5156,9 @@ fn refreshable_expired_oidc_session_keeps_first_party_when_codex_ready() {
     );
 }
 
-/// A first-party External session refreshes by re-running the configured
-/// provider command, not through OIDC discovery.  Its cached credential
-/// therefore does not need an OIDC client_id or refresh_token to keep ambient
-/// Grok precedence while the command can deterministically self-heal it.
+/// #316: an expired first-party External session with a configured provider
+/// command is refreshable without OIDC client_id. Ready Codex must not
+/// displace that self-healing first-party default.
 #[test]
 #[serial_test::serial]
 fn refreshable_expired_external_session_keeps_first_party_when_codex_ready() {
@@ -5183,14 +5182,14 @@ fn refreshable_expired_external_session_keeps_first_party_when_codex_ready() {
 
     let xai_home = tmp.path().join("xai-external-refreshable");
     std::fs::create_dir_all(&xai_home).unwrap();
-    let cfg = GrokComConfig {
+    let cfg_auth = GrokComConfig {
         auth_provider_command: Some(
             "printf '%s' '{\"access_token\":\"fresh-external\",\"issuer\":\"https://auth.x.ai\"}'"
                 .to_owned(),
         ),
         ..GrokComConfig::default()
     };
-    let am = Arc::new(AuthManager::new(&xai_home, cfg));
+    let am = Arc::new(AuthManager::new(&xai_home, cfg_auth));
     am.hot_swap(GrokAuth {
         key: "expired-external".into(),
         auth_mode: AuthMode::External,
