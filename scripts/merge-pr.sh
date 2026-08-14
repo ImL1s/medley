@@ -14,6 +14,9 @@
 #   2. that commit has a successful run of *this* repository's ci.yml, and
 #   3. every required check on the PR has actually concluded successfully.
 #
+# After a successful merge it prints both the PR head and the landed
+# merge commit. Squash/rebase rewrite the SHA; tags must use merge_commit.
+#
 # (1) is the part a human skips. A PR whose head moved between "checks are
 # green" and "merge" is green about a commit that is no longer being merged;
 # re-reading the head after the receipt is what closes that window, and it is
@@ -99,4 +102,18 @@ TIP_AGAIN="$(git ls-remote "$REMOTE" "refs/heads/$BRANCH" | cut -f1)"
 
 echo "==> Merging #$PR (${MERGE_FLAGS[*]})"
 gh pr merge "$PR" --repo "$REPO" "${MERGE_FLAGS[@]}"
-echo "==> Merged #$PR at $HEAD"
+# Squash/rebase rewrite the landed SHA. Tagging and release receipts must
+# bind that merge commit, not the pre-merge PR head (#333).
+merged_json="$(gh pr view "$PR" --repo "$REPO" --json mergeCommit,mergedAt,state)"
+merge_sha="$(
+  printf '%s' "$merged_json" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+commit = d.get("mergeCommit") or {}
+print(commit.get("oid") or "")
+'
+)"
+echo "==> Merged #$PR"
+echo "    pr_head:      $HEAD"
+echo "    merge_commit: ${merge_sha:-unknown}"
+[ -n "$merge_sha" ] || die "gh did not report a mergeCommit after merge; do not tag $HEAD"
