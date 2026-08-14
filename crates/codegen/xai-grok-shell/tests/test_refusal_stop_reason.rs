@@ -35,7 +35,7 @@ where
 /// Mock with a single Anthropic-style model whose `/v1/messages` stream ends
 /// with `stop_reason: "refusal"`.
 async fn refusal_messages_server() -> MockInferenceServer {
-    let server = MockInferenceServer::start_with_models(vec![
+    let server = MockInferenceServer::start_with_keyless_local_models(vec![
         MockModelEntry::new("messages-compatible-model").with_api_backend("messages"),
     ])
     .await

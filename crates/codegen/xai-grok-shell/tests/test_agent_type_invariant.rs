@@ -39,7 +39,7 @@ fn invalidate_models_cache(home: &std::path::Path) {
 /// Start a mock server with two models:
 /// - `default-model`: no agent_type (→ defaults to "grok-build")
 async fn dual_model_server() -> MockInferenceServer {
-    MockInferenceServer::start_with_models(vec![
+    MockInferenceServer::start_with_keyless_local_models(vec![
         MockModelEntry::new("default-model"),
         MockModelEntry::with_agent_type("cursor-model", "cursor"),
     ])
@@ -50,7 +50,7 @@ async fn dual_model_server() -> MockInferenceServer {
 /// - `model-a`: no agent_type (→ "grok-build")
 /// - `model-b`: no agent_type (→ "grok-build")
 async fn same_type_server() -> MockInferenceServer {
-    MockInferenceServer::start_with_models(vec![
+    MockInferenceServer::start_with_keyless_local_models(vec![
         MockModelEntry::new("model-a"),
         MockModelEntry::new("model-b"),
     ])
@@ -64,7 +64,7 @@ async fn same_type_server() -> MockInferenceServer {
 #[ignore]
 async fn test_default_model_uses_grok_build_harness() {
     with_local_set(|| async {
-        let server = MockInferenceServer::start()
+        let server = MockInferenceServer::start_keyless_local()
             .await
             .expect("start mock server");
         let workdir = git_workdir();
@@ -124,7 +124,7 @@ async fn test_same_type_model_switch_no_rebuild() {
 #[ignore]
 async fn test_session_resume_preserves_harness() {
     with_local_set(|| async {
-        let server = MockInferenceServer::start()
+        let server = MockInferenceServer::start_keyless_local()
             .await
             .expect("start mock server");
         let workdir = git_workdir();
@@ -180,7 +180,7 @@ async fn test_session_resume_preserves_harness() {
 #[ignore]
 async fn test_model_without_agent_type_defaults_to_grok_build() {
     with_local_set(|| async {
-            let server = MockInferenceServer::start_with_models(
+            let server = MockInferenceServer::start_with_keyless_local_models(
                     vec![
             MockModelEntry::new("no-agent-type-model"),
         ],

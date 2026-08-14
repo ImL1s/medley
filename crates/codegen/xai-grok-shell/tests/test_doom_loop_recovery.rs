@@ -533,7 +533,7 @@ async fn doomed_then_reasoning_only_empty_coexist() {
 #[ignore] // requires pre-built binary; run with --ignored
 async fn headless_config_enables_doom_loop_check_header() {
     let models = vec![MockModelEntry::new(MODEL).with_api_backend("responses")];
-    let server = MockInferenceServer::start_with_models(models)
+    let server = MockInferenceServer::start_with_keyless_local_models(models)
         .await
         .expect("start mock server");
     let workdir = xai_grok_test_support::git_workdir();

@@ -10705,6 +10705,49 @@ reasoning_effort = "low"
         assert_eq!(model_readiness(&m), (true, None));
     }
 
+    /// #329: the named keyless-local mock catalog (`authScheme: none`) is ready
+    /// on loopback. The shared `start()` Bearer default stays unready so we do
+    /// not weaken the origin gate or reuse ambient xAI session credentials.
+    #[test]
+    fn keyless_local_mock_catalog_entry_is_ready_on_loopback() {
+        let loopback = "http://127.0.0.1:9/v1";
+        let parsed = crate::remote::client::parse_remote_model_value(
+            &serde_json::json!({
+                "id": "test-model",
+                "object": "model",
+                "created": 1234567890,
+                "owned_by": "test",
+                "authScheme": "none",
+            }),
+            loopback,
+        )
+        .expect("parse keyless local catalog entry");
+        let entry = ModelEntry::from_config_entry(&parsed);
+        assert_eq!(entry.info.auth_scheme, AuthScheme::None);
+        assert_eq!(
+            model_readiness(&entry),
+            (true, None),
+            "auth_scheme=none local fixtures must be ready"
+        );
+
+        let parsed = crate::remote::client::parse_remote_model_value(
+            &serde_json::json!({
+                "id": "test-model",
+                "object": "model",
+                "created": 1234567890,
+                "owned_by": "test",
+            }),
+            loopback,
+        )
+        .expect("parse default catalog entry");
+        let entry = ModelEntry::from_config_entry(&parsed);
+        assert_eq!(entry.info.auth_scheme, AuthScheme::Bearer);
+        assert!(
+            !model_readiness(&entry).0,
+            "Bearer-default loopback catalog must stay unready"
+        );
+    }
+
     /// #123 option 3: when an ambient credential is present but the model's
     /// origin is not xAI, the readiness reason must name the origin refusal —
     /// not a generic authentication-failure string. Without this, the strip
