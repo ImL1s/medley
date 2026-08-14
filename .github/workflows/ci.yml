@@ -153,6 +153,35 @@ jobs:
             --workflow .github/workflows/ci.yml \
             --base "origin/${{ github.base_ref || 'providers' }}"
 
+  compile-tests:
+    name: Compile every test target
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.0"
+
+      - name: Install DotSlash and verify pinned protoc
+        run: |
+          cargo install dotslash --version 0.5.7 --locked
+          /usr/bin/env dotslash --help >/dev/null
+          "$PROTOC" --version
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: providers-compile-tests
+          cache-targets: true
+
+      # #254: thirteen pager integration targets (and any other crate's tests)
+      # are never named by a hot-path filter. Compiling them without running
+      # is what catches a renamed type after an upstream sync.
+      - name: cargo test --workspace --no-run
+        run: cargo test --workspace --no-run
+
   lint:
     name: Clippy (hot path)
     runs-on: ubuntu-latest
