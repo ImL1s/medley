@@ -6827,7 +6827,13 @@ fn new_session_publishes_one_complete_staged_tree() {
 
         const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000156";
         let grok_home = tempfile::tempdir().expect("isolated grok home");
+        let _medley = EnvGuard::set("MEDLEY_HOME", grok_home.path());
         let _home = EnvGuard::set("GROK_HOME", grok_home.path());
+        std::fs::write(
+            grok_home.path().join("config.toml"),
+            "[features]\nremote_fetch = false\n",
+        )
+        .expect("disable catalog fetch for fixture");
         let _xai_key = EnvGuard::unset("XAI_API_KEY");
         let _grok_code_key = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
         let auth_root = tempfile::tempdir().expect("isolated auth root");
@@ -7284,6 +7290,7 @@ fn new_session_auth_flip_before_resident_commit_leaves_no_session_state() {
 
         const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000103";
         let grok_home = tempfile::tempdir().expect("isolated grok home");
+        let _medley = EnvGuard::set("MEDLEY_HOME", grok_home.path());
         let _home = EnvGuard::set("GROK_HOME", grok_home.path());
         std::fs::write(
             grok_home.path().join("config.toml"),
@@ -7599,6 +7606,7 @@ fn cancelling_after_actor_init_before_publish_ack_cleans_state_and_allows_retry(
 
         const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000107";
         let grok_home = tempfile::tempdir().expect("isolated grok home");
+        let _medley = EnvGuard::set("MEDLEY_HOME", grok_home.path());
         let _home = EnvGuard::set("GROK_HOME", grok_home.path());
         std::fs::write(
             grok_home.path().join("config.toml"),
@@ -7891,6 +7899,7 @@ fn new_session_actor_spawn_failure_cleans_provisional_state_and_allows_same_id_r
 
         const SESSION_ID: &str = "019c0000-0000-7000-8000-000000000106";
         let grok_home = tempfile::tempdir().expect("isolated grok home");
+        let _medley = EnvGuard::set("MEDLEY_HOME", grok_home.path());
         let _home = EnvGuard::set("GROK_HOME", grok_home.path());
         std::fs::write(
             grok_home.path().join("config.toml"),
