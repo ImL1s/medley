@@ -6,6 +6,7 @@ pub mod fresh_publication;
 pub mod git;
 pub mod id_lock;
 pub mod jj;
+pub mod publication_parent;
 pub(crate) mod swap_policy;
 pub mod tool_config;
 use crate::capability::CapabilityMode;

@@ -1408,6 +1408,10 @@ pub(crate) async fn run_shell_child(
     let subagent_model_id = effective_sampling_config.model.clone();
     let effective_catalog_identity = prepared_model.catalog_identity;
     effective_model_id = acp::ModelId::new(effective_catalog_identity.model_id.clone());
+    // Per-model idle timeout belongs to the child catalog identity, not the
+    // parent snapshot taken when the spawn context was built (#281).
+    let inference_idle_timeout_secs =
+        ctx.resolve_inference_idle_timeout_secs(effective_model_id.0.as_ref());
     let image_description_model = crate::config::auxiliary_model_or_operative(
         &ctx.image_description_model,
         effective_model_id.0.as_ref(),
@@ -1555,7 +1559,7 @@ pub(crate) async fn run_shell_child(
             ),
         false,
         None,
-        ctx.inference_idle_timeout_secs,
+        inference_idle_timeout_secs,
         None,
         web_search_sampling_config,
         ctx.web_fetch_config.clone(),

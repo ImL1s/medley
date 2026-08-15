@@ -4659,6 +4659,10 @@ pub struct ConfigModelOverride {
     /// fail-closed at resolve time instead of defaulting to Bearer.
     #[serde(skip)]
     pub(crate) invalid_auth_scheme: Option<String>,
+    /// Runtime-only: Codex-routed wire model is not a live/builtin catalog
+    /// slug (#260). Merge stamps it; `apply` turns it into a validation error.
+    #[serde(skip)]
+    pub(crate) unknown_codex_catalog_slug: Option<String>,
 }
 
 impl std::fmt::Debug for ConfigModelOverride {
@@ -4722,6 +4726,10 @@ impl std::fmt::Debug for ConfigModelOverride {
             .field(
                 "invalid_auth_scheme_present",
                 &self.invalid_auth_scheme.is_some(),
+            )
+            .field(
+                "unknown_codex_catalog_slug_present",
+                &self.unknown_codex_catalog_slug.is_some(),
             )
             .finish()
     }
@@ -4861,6 +4869,11 @@ impl ConfigModelOverride {
             entry
                 .config_validation_errors
                 .push(invalid_auth_scheme_validation_error(raw));
+        }
+        if let Some(ref slug) = self.unknown_codex_catalog_slug {
+            entry
+                .config_validation_errors
+                .push(super::model_providers::openai_codex_unknown_catalog_slug_reason(slug));
         }
         entry
     }
@@ -7135,6 +7148,13 @@ pub(crate) fn model_readiness_with_origins(
                 )),
             );
         }
+        // #260. Origin allowlist stays first. A signed-in Codex credential
+        // still cannot make a non-catalog wire model ready.
+        if let Some(reason) =
+            crate::agent::model_providers::unknown_openai_codex_catalog_slug_reason(model)
+        {
+            return (false, Some(reason));
+        }
         if status.permanent_failure {
             return (
                 false,
@@ -7691,6 +7711,7 @@ mod tests {
             system_prompt_label: Some(secret.to_owned()),
             agent_type: Some(secret.to_owned()),
             invalid_auth_scheme: Some(secret.to_owned()),
+            unknown_codex_catalog_slug: Some(secret.to_owned()),
             ..ConfigModelOverride::default()
         };
         assert_no_secret_windows(&format!("{model:?}"), secret);

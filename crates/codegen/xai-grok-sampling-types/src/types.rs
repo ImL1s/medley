@@ -1040,6 +1040,11 @@ pub struct CodexWireCapabilities {
     /// preset (Sol) accepts it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_reasoning_summary_parameter: Option<bool>,
+    /// When `Some(true)`, the catalog advertises `input_image.detail = original`.
+    /// `async-openai`'s `ImageDetail` has no `Original` variant, so apply
+    /// never invents that wire string. The apply path still reads this flag
+    /// and fail-closes: `detail: "original"` is rewritten to `auto` unless
+    /// the catalog explicitly allows it (#261).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_image_detail_original: Option<bool>,
     /// e.g. `["text"]` or `["text","image"]`. Empty means unrestricted.
@@ -1049,11 +1054,23 @@ pub struct CodexWireCapabilities {
     /// session has not set an effort override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_reasoning_level: Option<String>,
-    /// Client-side limit applied to text tool results before they enter
-    /// conversation history. This is catalog metadata, not a Responses API
-    /// request field (#263).
+    /// Client-side tool-result limit (#263) and, when `mode` is `tokens` with
+    /// a positive `limit`, a signal to emit Responses `truncation: "auto"`
+    /// instead of leaving the request field `None` (#259).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncation_policy: Option<TruncationPolicyConfig>,
+    /// Catalog absolute auto-compact trigger. When present and positive it is
+    /// an additional token threshold, not only `percent * context_window`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_token_limit: Option<u64>,
+    /// Legacy catalog string. Prefer [`CodexModelMessages::instructions_template`]
+    /// when both are set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_instructions: Option<String>,
+    /// Catalog `model_messages` object. Parse keeps the whole payload so the
+    /// field is not silently dropped when only the template is applied (#261).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_messages: Option<CodexModelMessages>,
 }
 
 impl CodexWireCapabilities {
@@ -1080,6 +1097,58 @@ impl CodexWireCapabilities {
     pub fn responses_lite_enabled(&self) -> bool {
         self.use_responses_lite == Some(true)
     }
+
+    /// Whether apply may leave `input_image.detail = "original"` on the wire.
+    ///
+    /// Silent / `false` fail closed: original is not a typed request field
+    /// in this client, and we do not emit it.
+    pub fn allows_image_detail_original(&self) -> bool {
+        self.supports_image_detail_original == Some(true)
+    }
+
+    /// Responses `truncation` is `"auto" | "disabled"`. Catalog
+    /// `{mode: "tokens", limit: N}` is not that enum; it only tells us to
+    /// stop omitting the field. Bytes / missing / non-positive stay omitted.
+    pub fn request_truncation_auto(&self) -> bool {
+        matches!(
+            self.truncation_policy,
+            Some(TruncationPolicyConfig {
+                mode: TruncationMode::Tokens,
+                limit,
+            }) if limit > 0
+        )
+    }
+
+    /// Instruction text the Codex transport should attach.
+    ///
+    /// Prefers `model_messages.instructions_template` (current catalog
+    /// shape) and falls back to `base_instructions`. Empty strings are
+    /// treated as absent.
+    pub fn catalog_instructions(&self) -> Option<&str> {
+        let from_messages = self
+            .model_messages
+            .as_ref()
+            .and_then(|messages| messages.instructions_template.as_deref())
+            .map(str::trim)
+            .filter(|text| !text.is_empty());
+        from_messages.or_else(|| {
+            self.base_instructions
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+        })
+    }
+}
+
+/// Codex catalog `model_messages`. Only `instructions_template` is applied at
+/// the request boundary; remaining keys stay in [`Self::extra`] so parse does
+/// not drop the field.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexModelMessages {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions_template: Option<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Header official Codex sends when [`CodexWireCapabilities::use_responses_lite`]

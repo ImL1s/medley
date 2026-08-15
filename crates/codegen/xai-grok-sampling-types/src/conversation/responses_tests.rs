@@ -41,7 +41,7 @@ fn codex_instructions_flatten_list_form_system_text() {
         ]
     });
 
-    patch_codex_instructions(&mut body);
+    patch_codex_instructions(&mut body, None);
 
     assert_eq!(body["instructions"], "existing guidance\n\nfirst\n\nsecond");
     assert_eq!(body["input"].as_array().unwrap().len(), 1);
@@ -175,9 +175,156 @@ fn codex_instructions_preserve_unsupported_system_content() {
     });
     let mut body = original.clone();
 
-    patch_codex_instructions(&mut body);
+    patch_codex_instructions(&mut body, None);
 
     assert_eq!(body, original);
+}
+
+/// #259: catalog `{mode: "tokens", limit}` must stop leaving request
+/// `truncation` omitted. The Responses field is `"auto"|"disabled"`, not the
+/// catalog object, so apply emits `"auto"`.
+#[test]
+fn codex_wire_capabilities_set_request_truncation_for_token_policy() {
+    use crate::{TruncationMode, TruncationPolicyConfig};
+
+    let mut body = serde_json::json!({
+        "model": "gpt-5.6-sol",
+        "input": []
+    });
+    apply_codex_wire_capabilities(
+        &mut body,
+        &crate::CodexWireCapabilities {
+            truncation_policy: Some(TruncationPolicyConfig {
+                mode: TruncationMode::Tokens,
+                limit: 10_000,
+            }),
+            ..crate::CodexWireCapabilities::default()
+        },
+    );
+    assert_eq!(body["truncation"], "auto");
+
+    let mut omitted = serde_json::json!({ "input": [] });
+    apply_codex_wire_capabilities(&mut omitted, &crate::CodexWireCapabilities::default());
+    assert!(omitted.get("truncation").is_none());
+
+    let mut bytes_policy = serde_json::json!({ "input": [] });
+    apply_codex_wire_capabilities(
+        &mut bytes_policy,
+        &crate::CodexWireCapabilities {
+            truncation_policy: Some(TruncationPolicyConfig {
+                mode: TruncationMode::Bytes,
+                limit: 10_000,
+            }),
+            ..crate::CodexWireCapabilities::default()
+        },
+    );
+    assert!(
+        bytes_policy.get("truncation").is_none(),
+        "bytes policy is tool-output metadata, not Responses truncation"
+    );
+}
+
+/// #261: apply must read `supports_image_detail_original`. There is no typed
+/// request field for `original`, so we fail closed: rewrite `original` to
+/// `auto` unless the catalog explicitly allows it.
+#[test]
+fn codex_wire_capabilities_read_image_detail_original_fail_closed() {
+    let original_image = serde_json::json!({
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "see"},
+                {
+                    "type": "input_image",
+                    "image_url": "https://example.test/a.png",
+                    "detail": "original"
+                }
+            ]
+        }]
+    });
+
+    let mut denied = original_image.clone();
+    apply_codex_wire_capabilities(
+        &mut denied,
+        &crate::CodexWireCapabilities {
+            supports_image_detail_original: Some(false),
+            input_modalities: vec!["text".into(), "image".into()],
+            ..crate::CodexWireCapabilities::default()
+        },
+    );
+    assert_eq!(denied["input"][0]["content"][1]["detail"], "auto");
+
+    let mut silent = original_image.clone();
+    apply_codex_wire_capabilities(
+        &mut silent,
+        &crate::CodexWireCapabilities {
+            input_modalities: vec!["text".into(), "image".into()],
+            ..crate::CodexWireCapabilities::default()
+        },
+    );
+    assert_eq!(
+        silent["input"][0]["content"][1]["detail"], "auto",
+        "catalog-silent must not leave original on the wire"
+    );
+
+    let mut allowed = original_image;
+    apply_codex_wire_capabilities(
+        &mut allowed,
+        &crate::CodexWireCapabilities {
+            supports_image_detail_original: Some(true),
+            input_modalities: vec!["text".into(), "image".into()],
+            ..crate::CodexWireCapabilities::default()
+        },
+    );
+    assert_eq!(
+        allowed["input"][0]["content"][1]["detail"], "original",
+        "apply must read the catalog flag and keep original when advertised"
+    );
+}
+
+/// #261: `patch_codex_instructions` receives catalog `base_instructions` /
+/// `model_messages.instructions_template` and attaches them without I/O.
+#[test]
+fn codex_instructions_receive_catalog_base_instructions() {
+    let mut from_base = serde_json::json!({
+        "input": [
+            {"type": "message", "role": "user", "content": "hello"}
+        ]
+    });
+    let caps = crate::CodexWireCapabilities {
+        base_instructions: Some("catalog base".into()),
+        ..crate::CodexWireCapabilities::default()
+    };
+    patch_codex_instructions(&mut from_base, Some(&caps));
+    assert_eq!(from_base["instructions"], "catalog base");
+    assert_eq!(from_base["input"].as_array().unwrap().len(), 1);
+
+    let mut from_messages = serde_json::json!({
+        "instructions": "existing",
+        "input": [
+            {
+                "type": "message",
+                "role": "system",
+                "content": "session system"
+            },
+            {"type": "message", "role": "user", "content": "hello"}
+        ]
+    });
+    let caps = crate::CodexWireCapabilities {
+        base_instructions: Some("legacy base".into()),
+        model_messages: Some(crate::CodexModelMessages {
+            instructions_template: Some("template wins".into()),
+            extra: serde_json::Map::from_iter([("approvals".into(), serde_json::Value::Null)]),
+        }),
+        ..crate::CodexWireCapabilities::default()
+    };
+    patch_codex_instructions(&mut from_messages, Some(&caps));
+    assert_eq!(
+        from_messages["instructions"],
+        "existing\n\ntemplate wins\n\nsession system"
+    );
+    assert_eq!(caps.catalog_instructions(), Some("template wins"));
 }
 
 #[test]

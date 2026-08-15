@@ -642,6 +642,13 @@ impl SessionActor {
         self.compaction
             .threshold_percent
             .set(auto_compact_threshold_percent);
+        self.compaction.token_limit.set(
+            sampling_config
+                .codex_wire
+                .as_ref()
+                .and_then(|capabilities| capabilities.auto_compact_token_limit)
+                .filter(|limit| *limit > 0),
+        );
         self.supports_backend_search
             .set(sampling_config.supports_backend_search);
         self.compactions_remaining

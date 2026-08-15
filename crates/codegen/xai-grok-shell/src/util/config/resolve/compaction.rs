@@ -126,6 +126,46 @@ pub(crate) fn resolve_auto_compact_threshold_percent_from_tiers(
         .unwrap_or(DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT)
 }
 
+/// Absolute token count at which auto-compact should fire.
+///
+/// Catalog `auto_compact_token_limit` is an additional absolute trigger
+/// (#259). When it is present and positive, the session fires at the
+/// earlier of that limit and `percent * context_window`. Percent-only
+/// remains when the catalog field is absent.
+pub(crate) fn resolve_auto_compact_token_threshold(
+    context_window: u64,
+    threshold_percent: u8,
+    auto_compact_token_limit: Option<u64>,
+) -> u64 {
+    let percent_tokens = context_window.saturating_mul(u64::from(threshold_percent)) / 100;
+    match auto_compact_token_limit.filter(|limit| *limit > 0) {
+        Some(limit) => percent_tokens.min(limit),
+        None => percent_tokens,
+    }
+}
+
+/// Whether usage has reached the resolved auto-compact trigger.
+///
+/// Keeps [`xai_token_estimation::exceeds_threshold`] for the percent path
+/// (same integer rounding as the rest of the session) and ORs in the
+/// catalog absolute limit when present.
+pub(crate) fn exceeds_auto_compact_threshold(
+    used: u64,
+    context_window: u64,
+    threshold_percent: u8,
+    auto_compact_token_limit: Option<u64>,
+) -> bool {
+    if context_window == 0 {
+        return false;
+    }
+    let percent_hit =
+        xai_token_estimation::exceeds_threshold(used, context_window, threshold_percent);
+    let absolute_hit = auto_compact_token_limit
+        .filter(|limit| *limit > 0)
+        .is_some_and(|limit| used >= limit);
+    percent_hit || absolute_hit
+}
+
 /// Client default per-compaction wall-clock budget (seconds). Fleet p99 of
 /// successful compactions is ~181s (≈225s at 400K+ input), so 300s clears the
 /// legit tail with margin while cutting a runaway from the ~600s deadline.
@@ -221,5 +261,63 @@ mod compaction_tool_choice_tests {
         assert_eq!("AUTO".parse(), Ok(CompactionToolChoice::Auto));
         assert_eq!(" None ".parse(), Ok(CompactionToolChoice::None));
         assert!("required".parse::<CompactionToolChoice>().is_err());
+    }
+}
+
+#[cfg(test)]
+mod resolve_auto_compact_token_threshold_tests {
+    use super::{
+        DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT, exceeds_auto_compact_threshold,
+        resolve_auto_compact_token_threshold,
+    };
+
+    #[test]
+    fn resolve_auto_compact_token_threshold_uses_catalog_absolute_limit() {
+        assert_eq!(
+            resolve_auto_compact_token_threshold(272_000, 85, Some(180_000)),
+            180_000,
+            "catalog absolute limit must fire before 85% of the window"
+        );
+        assert_eq!(
+            resolve_auto_compact_token_threshold(200_000, 85, Some(180_000)),
+            170_000,
+            "tighter percent-of-window still wins when it is earlier"
+        );
+        assert_eq!(
+            resolve_auto_compact_token_threshold(200_000, 85, None),
+            170_000
+        );
+        assert_eq!(
+            resolve_auto_compact_token_threshold(200_000, 85, Some(0)),
+            170_000,
+            "non-positive catalog limits are absent"
+        );
+        assert_eq!(
+            resolve_auto_compact_token_threshold(
+                100_000,
+                DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                None,
+            ),
+            85_000
+        );
+
+        assert!(!exceeds_auto_compact_threshold(
+            179_999,
+            272_000,
+            85,
+            Some(180_000),
+        ));
+        assert!(exceeds_auto_compact_threshold(
+            180_000,
+            272_000,
+            85,
+            Some(180_000),
+        ));
+        assert!(
+            exceeds_auto_compact_threshold(85_000, 100_000, 85, Some(90_000)),
+            "percent path must still fire when it is earlier than the catalog"
+        );
+        assert!(!exceeds_auto_compact_threshold(84_999, 100_000, 85, None));
+        assert!(!exceeds_auto_compact_threshold(1, 0, 85, Some(1)));
     }
 }

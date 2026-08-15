@@ -184,6 +184,10 @@ pub(crate) struct CompactionConfig {
     /// holding `&mut self` on the actor. `SessionActor` is `!Send`, so
     /// `Cell` is sufficient (no atomic ordering needed).
     pub threshold_percent: Cell<u8>,
+    /// Catalog `auto_compact_token_limit` committed with the active model.
+    /// `None` keeps percent-of-window only. Paired with `threshold_percent`
+    /// so a background catalog refresh cannot change the trigger mid-turn.
+    pub token_limit: Cell<Option<u64>>,
     /// Debug: when set, next auto-compact check triggers unconditionally.
     pub force_compact: Arc<AtomicBool>,
     /// Auto-compaction suppression state (`SUPPRESS_*`) after a deterministic

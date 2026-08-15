@@ -497,6 +497,54 @@ fn codex_catalog_wire_capabilities(
         input_modalities: codex_catalog_string_list(obj, "input_modalities"),
         default_reasoning_level: codex_catalog_string(obj, "default_reasoning_level"),
         truncation_policy: codex_catalog_truncation_policy(obj),
+        auto_compact_token_limit: codex_catalog_auto_compact_token_limit(obj),
+        base_instructions: codex_catalog_string(obj, "base_instructions"),
+        model_messages: codex_catalog_model_messages(obj),
+    }
+}
+
+fn codex_catalog_auto_compact_token_limit(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<u64> {
+    let value = obj.get("auto_compact_token_limit")?;
+    if value.is_null() {
+        return None;
+    }
+    let limit = value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()));
+    match limit {
+        Some(limit) if limit > 0 => Some(limit),
+        Some(_) => {
+            tracing::warn!(
+                value = %value,
+                "ignoring non-positive Codex catalog auto_compact_token_limit"
+            );
+            None
+        }
+        None => {
+            tracing::warn!(
+                value = %value,
+                "ignoring invalid Codex catalog auto_compact_token_limit"
+            );
+            None
+        }
+    }
+}
+
+fn codex_catalog_model_messages(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<xai_grok_sampling_types::CodexModelMessages> {
+    let value = obj.get("model_messages")?;
+    if value.is_null() {
+        return None;
+    }
+    match serde_json::from_value::<xai_grok_sampling_types::CodexModelMessages>(value.clone()) {
+        Ok(messages) => Some(messages),
+        Err(error) => {
+            tracing::warn!(%error, "ignoring invalid Codex catalog model_messages");
+            None
+        }
     }
 }
 
@@ -767,6 +815,59 @@ impl ConfigModelOverride {
     }
 }
 
+/// Wire slugs the live or built-in Codex catalog will accept. Includes both
+/// catalog keys (`slug`) and each entry's `model` field so a metadata-only
+/// override of a real catalog row stays ready when those two differ.
+pub(crate) fn openai_codex_catalog_wire_slugs(
+    catalog: &IndexMap<String, ConfigModelOverride>,
+) -> std::collections::HashSet<String> {
+    catalog
+        .iter()
+        .flat_map(|(key, entry)| std::iter::once(key.clone()).chain(entry.model.iter().cloned()))
+        .collect()
+}
+
+/// Fail-closed reason for a Codex-routed entry whose wire model is not a
+/// live/builtin catalog slug (#260). Names the bad wire model so the picker
+/// can say what would 400.
+pub(crate) fn openai_codex_unknown_catalog_slug_reason(wire_model: &str) -> String {
+    format!(
+        "`{wire_model}` is not a Codex catalog slug; \
+         set `model` to a live or built-in Codex catalog slug"
+    )
+}
+
+/// [`crate::agent::config::model_readiness`] consults this after the Codex
+/// origin allowlist so a signed-in credential cannot make a non-slug ready.
+pub(crate) fn unknown_openai_codex_catalog_slug_reason(
+    model: &super::config::ModelEntry,
+) -> Option<String> {
+    model
+        .config_validation_errors
+        .iter()
+        .find(|error| error.contains("is not a Codex catalog slug"))
+        .cloned()
+}
+
+fn stamp_unknown_openai_codex_catalog_slugs(
+    config_models: &mut IndexMap<String, ConfigModelOverride>,
+    catalog_slugs: &std::collections::HashSet<String>,
+) {
+    for (key, entry) in config_models.iter_mut() {
+        if entry.model_provider.as_deref() != Some(OPENAI_CODEX_PROVIDER_ID) {
+            entry.unknown_codex_catalog_slug = None;
+            continue;
+        }
+        // `apply` seeds `info.model` from the TOML key when `model` is absent.
+        let wire_model = entry.model.as_deref().unwrap_or(key.as_str());
+        if catalog_slugs.contains(wire_model) {
+            entry.unknown_codex_catalog_slug = None;
+        } else {
+            entry.unknown_codex_catalog_slug = Some(wire_model.to_owned());
+        }
+    }
+}
+
 /// Fold the built-in Codex presets into the user's parsed `[model.*]` table.
 ///
 /// A key the user never declared gets the preset outright.
@@ -795,6 +896,7 @@ fn merge_openai_codex_preset_entries(
     config_models: &mut IndexMap<String, ConfigModelOverride>,
     presets: IndexMap<String, ConfigModelOverride>,
 ) {
+    let catalog_slugs = openai_codex_catalog_wire_slugs(&presets);
     for (key, preset) in presets {
         let Some(user_entry) = config_models.get_mut(&key) else {
             config_models.insert(key, preset);
@@ -885,6 +987,7 @@ fn merge_openai_codex_preset_entries(
                 .get_or_insert(percent);
         }
     }
+    stamp_unknown_openai_codex_catalog_slugs(config_models, &catalog_slugs);
 }
 
 #[derive(Clone, Default, serde::Deserialize)]
@@ -2090,7 +2193,7 @@ mod tests {
             api_key = "must-not-survive"
 
             [model.codex]
-            model = "supported-codex-model"
+            model = "gpt-5.6-sol"
             model_provider = "openai-codex"
             base_url = "https://attacker.invalid/model"
             api_base_url = "https://api.openai.com/v1"
@@ -2489,7 +2592,7 @@ mod tests {
         let toml_cfg: toml::Value = toml::from_str(
             r#"
             [model.codex]
-            model = "supported-codex-model"
+            model = "gpt-5.6-sol"
             model_provider = "openai-codex"
             "#,
         )
@@ -2521,7 +2624,7 @@ mod tests {
         let toml_cfg: toml::Value = toml::from_str(
             r#"
             [model.codex]
-            model = "supported-codex-model"
+            model = "gpt-5.6-sol"
             model_provider = "openai-codex"
             "#,
         )
@@ -2560,6 +2663,71 @@ mod tests {
                 .api_key
                 .is_none(),
             "an expired Codex bearer must refresh pre-turn, never fall back to xAI"
+        );
+    }
+
+    /// #260. `ConfigModelOverride::apply` seeds the wire model from the TOML
+    /// key, and merge only looks up catalog keys, so a display-name key
+    /// silently became a ready Codex row that 400s every turn.
+    #[test]
+    fn codex_wire_model_catalog_slug_rejects_non_slug_before_request_io() {
+        let toml_cfg: toml::Value = toml::from_str(
+            r#"
+            [model."GPT-5.3-Codex-Spark"]
+            model_provider = "openai-codex"
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&toml_cfg).expect("config should parse");
+        let temp = live_codex_auth_home();
+        let mut resolved = resolve_model_list(&cfg, None);
+        let mut model = resolved
+            .shift_remove("GPT-5.3-Codex-Spark")
+            .expect("user Codex entry should resolve");
+        model.auth_provider = Some(crate::auth::AuthProviderRef::openai_codex(
+            crate::auth::openai_codex::manager(temp.path()),
+        ));
+
+        let (ready, reason) = crate::agent::config::model_readiness(&model);
+        assert!(
+            !ready,
+            "a Codex-routed non-catalog wire model must be unready before request I/O"
+        );
+        let reason = reason.expect("an unready Codex row must say why");
+        assert!(
+            reason.contains("GPT-5.3-Codex-Spark"),
+            "reason must name the bad wire model, got: {reason}"
+        );
+        assert!(
+            reason.contains("not a Codex catalog slug"),
+            "reason must say the wire model is not a Codex catalog slug, got: {reason}"
+        );
+    }
+
+    /// #260. A metadata-only override of a real catalog slug stays ready
+    /// when Codex credentials are present.
+    #[test]
+    fn codex_wire_model_catalog_slug_accepts_metadata_override_when_signed_in() {
+        let toml_cfg: toml::Value = toml::from_str(&format!(
+            r#"
+            [model."{OPENAI_CODEX_PRESET_MODEL_ID}"]
+            name = "My Codex"
+            "#
+        ))
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&toml_cfg).expect("config should parse");
+        let temp = live_codex_auth_home();
+        let model = preset_entry_with_auth_home(&cfg, temp.path());
+
+        assert_eq!(
+            model.info.model.as_str(),
+            OPENAI_CODEX_PRESET_MODEL_ID,
+            "metadata-only override must keep the catalog wire slug"
+        );
+        assert_eq!(
+            crate::agent::config::model_readiness(&model),
+            (true, None),
+            "a real Codex catalog slug must stay ready when credentials are present"
         );
     }
 
@@ -2767,6 +2935,73 @@ mod tests {
         .expect("entry remains usable")
         .1;
         assert_eq!(ignored.effective_context_window_percent, None);
+    }
+
+    /// #259: catalog `auto_compact_token_limit` is an absolute compact
+    /// trigger. `null` / 0 / garbage stay `None` so percent-of-window remains.
+    #[test]
+    fn codex_catalog_parser_reads_auto_compact_token_limit() {
+        let present = parse_openai_codex_catalog_entry(&serde_json::json!({
+            "slug": "gpt-5.6-sol",
+            "auto_compact_token_limit": 180_000
+        }))
+        .expect("valid catalog entry")
+        .1;
+        assert_eq!(
+            present
+                .codex_wire
+                .as_ref()
+                .and_then(|wire| wire.auto_compact_token_limit),
+            Some(180_000)
+        );
+
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!("180000"),
+        ] {
+            let parsed = parse_openai_codex_catalog_entry(&serde_json::json!({
+                "slug": "gpt-codex-invalid-limit",
+                "auto_compact_token_limit": invalid,
+            }))
+            .expect("entry remains usable")
+            .1;
+            assert_eq!(
+                parsed
+                    .codex_wire
+                    .and_then(|wire| wire.auto_compact_token_limit),
+                None
+            );
+        }
+    }
+
+    /// #261: parse keeps `supports_image_detail_original` and
+    /// `base_instructions` / `model_messages` so apply/patch can read them.
+    #[test]
+    fn codex_catalog_parser_keeps_image_detail_original_and_instructions() {
+        let parsed = parse_openai_codex_catalog_entry(&serde_json::json!({
+            "slug": "gpt-5.6-sol",
+            "supports_image_detail_original": true,
+            "base_instructions": "legacy base",
+            "model_messages": {
+                "instructions_template": "template wins",
+                "approvals": null
+            }
+        }))
+        .expect("valid catalog entry")
+        .1;
+        let caps = parsed.codex_wire.expect("wire capabilities");
+        assert_eq!(caps.supports_image_detail_original, Some(true));
+        assert!(caps.allows_image_detail_original());
+        assert_eq!(caps.base_instructions.as_deref(), Some("legacy base"));
+        let messages = caps.model_messages.as_ref().expect("model_messages kept");
+        assert_eq!(
+            messages.instructions_template.as_deref(),
+            Some("template wins")
+        );
+        assert!(messages.extra.contains_key("approvals"));
+        assert_eq!(caps.catalog_instructions(), Some("template wins"));
     }
 
     #[test]

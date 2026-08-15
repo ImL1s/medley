@@ -1726,7 +1726,10 @@ impl SamplingClient {
             SamplingError::Serialization(e)
         })?;
         if self.is_codex() {
-            xai_grok_sampling_types::patch_codex_instructions(&mut request_body);
+            xai_grok_sampling_types::patch_codex_instructions(
+                &mut request_body,
+                self.defaults.codex_wire.as_ref(),
+            );
             xai_grok_sampling_types::prepare_codex_ultra_responses(
                 &mut request_body,
                 request.client_reasoning_effort,
@@ -1859,7 +1862,10 @@ impl SamplingClient {
             SamplingError::Serialization(e)
         })?;
         if self.is_codex() {
-            xai_grok_sampling_types::patch_codex_instructions(&mut request_body);
+            xai_grok_sampling_types::patch_codex_instructions(
+                &mut request_body,
+                self.defaults.codex_wire.as_ref(),
+            );
             xai_grok_sampling_types::prepare_codex_ultra_responses(
                 &mut request_body,
                 request.client_reasoning_effort,

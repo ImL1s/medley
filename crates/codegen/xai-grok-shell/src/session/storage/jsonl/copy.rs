@@ -7,6 +7,7 @@
 //! context window.
 
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::ops::ControlFlow;
 use std::path::Path;
@@ -289,7 +290,26 @@ impl JsonlStorageAdapter {
         options: CopySessionOptions,
     ) -> io::Result<CopySessionResult> {
         let target_dir = self.session_dir(target_info);
-        std::fs::create_dir_all(&target_dir)?;
+        let publication_parent = if let Some(root) = self.lock_root() {
+            let source_id = source_info.id.to_string();
+            let target_id = target_info.id.to_string();
+            let locks = xai_grok_workspace::session::id_lock::acquire_ordered_copy_locks_sync(
+                root, &source_id, &target_id,
+            )?;
+            let encoded = crate::util::grok_home::encode_cwd_dirname(&target_info.cwd);
+            let parent =
+                xai_grok_workspace::session::publication_parent::ensure_publication_parent(
+                    root,
+                    OsStr::new(&encoded),
+                )?;
+            parent.revalidate()?;
+            parent.ensure_session_dir(OsStr::new(&target_id))?;
+            parent.revalidate()?;
+            Some((locks, parent))
+        } else {
+            std::fs::create_dir_all(&target_dir)?;
+            None
+        };
 
         let source_summary = self.read_summary_sync(source_info)?;
         let chat_format_version = source_summary.chat_format_version;
@@ -305,6 +325,10 @@ impl JsonlStorageAdapter {
 
         if options.fork_filter {
             fork_filter_chat(&mut chat_to_copy);
+        }
+
+        if let Some((_, parent)) = &publication_parent {
+            parent.revalidate()?;
         }
 
         for target in [
@@ -386,6 +410,9 @@ impl JsonlStorageAdapter {
             },
         );
         let summary_bytes = serde_json::to_vec_pretty(&target_summary).map_err(invalid_data)?;
+        if let Some((_, parent)) = &publication_parent {
+            parent.revalidate()?;
+        }
         std::fs::write(self.summary_file(target_info), summary_bytes)?;
 
         let plan_copied = copy_sidecar_file(

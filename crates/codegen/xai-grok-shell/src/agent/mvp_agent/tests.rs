@@ -1889,6 +1889,38 @@ async fn unresolved_empty_current_model_uses_live_fail_closed_sampling_config() 
     );
     assert_eq!(sampling.api_key, None);
 }
+/// #360: `/new` must keep a valid built-in effort when the model
+/// advertises reasoning support but leaves `reasoning_efforts` empty.
+#[tokio::test]
+async fn new_session_keeps_effort_when_supported_menu_is_implicit() {
+    use crate::agent::config::{EndpointsConfig, ModelEntry};
+    use xai_grok_sampling_types::ReasoningEffort;
+
+    let agent = build_minimal_agent_for_tests();
+    let mut entry = ModelEntry::fallback("implicit-effort-model", &EndpointsConfig::default());
+    entry.info.supports_reasoning_effort = true;
+    entry.info.reasoning_efforts.clear();
+    agent
+        .models_manager
+        .insert_test_entry("implicit-effort-model", entry);
+    agent
+        .models_manager
+        .set_current_reasoning_effort(Some(ReasoningEffort::High));
+
+    let mut sampling = agent.resolve_sampling_config_for_model(
+        &acp::ModelId::new("implicit-effort-model"),
+        None,
+    );
+    sampling.model = "implicit-effort-model".into();
+    sampling.reasoning_effort = None;
+    agent.apply_current_reasoning_effort(&mut sampling);
+    assert_eq!(
+        sampling.reasoning_effort,
+        Some(ReasoningEffort::High),
+        "implicit catalog menu must keep the selected built-in effort"
+    );
+}
+
 #[tokio::test]
 async fn model_state_prefers_session_reasoning_effort_over_global() {
     use crate::agent::config::{EndpointsConfig, ModelEntry};

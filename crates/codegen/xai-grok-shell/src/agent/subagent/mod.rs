@@ -152,7 +152,10 @@ pub(crate) struct SubagentSpawnContext {
     pub parent_depth: u32,
     pub subagents_max_depth: u32,
     pub workflow_max_concurrent_agents: usize,
-    /// Inference idle timeout (secs), resolved from the parent's model config at spawn-context creation time.
+    /// Inference idle timeout (secs). Construction snapshots the parent as a
+    /// fallback only. The value applied to the child must be resolved for the
+    /// subagent's model via [`Self::resolve_inference_idle_timeout_secs`]
+    /// once that id is known — the next field documents why (#281).
     pub inference_idle_timeout_secs: u64,
     /// Tier inputs for resolving `auto_compact_threshold_percent` at
     /// spawn time — once the subagent's actual model id is known.
@@ -356,6 +359,23 @@ impl SubagentSpawnContext {
     fn would_strip_fallback_key(&self, resolved_api_key: Option<&str>) -> bool {
         self.auth.is_none() && resolved_api_key.is_some()
     }
+    /// Inference idle timeout for `model_id` (the subagent's catalog id,
+    /// typically `ctx.model_id` after the child is selected — not the
+    /// parent snapshot stored on this context).
+    ///
+    /// Same precedence as a main session: per-model catalog >
+    /// remote settings > 600, then clamp to ≥ 10.
+    pub(crate) fn resolve_inference_idle_timeout_secs(&self, model_id: &str) -> u64 {
+        let per_model = self
+            .models_manager
+            .model_inference_idle_timeout_secs(model_id);
+        let remote = self
+            .remote_settings
+            .as_ref()
+            .and_then(|s| s.inference_idle_timeout_secs);
+        per_model.or(remote).unwrap_or(600).max(10)
+    }
+
     /// Resolve `auto_compact_threshold_percent` for the subagent's actual
     /// model id (the one selected by `resolve_subagent_sampling_config`,
     /// not the parent's). Walks the same precedence as the main session's

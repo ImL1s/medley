@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::anchored::{AnchoredDirectory, AnchoredRenameError};
+use super::publication_parent::ensure_publication_parent;
 
 /// Marker that keeps a private stage invisible to discovery until finalize.
 pub const UNPUBLISHED_SESSION_MARKER: &str = ".unpublished";
@@ -267,77 +268,36 @@ impl FreshPublication {
             ));
         }
 
-        let root_anchor = match AnchoredDirectory::open_root(&self.root_dir) {
-            Ok(root) => root,
-            Err(error) => {
-                restore_stage(&self.stage_session_anchor, stage_session_anchor);
-                return Err(FreshPublicationFinalizeError::not_committed(
-                    FinalizeStage::PreCommit,
-                    FinalizeOperation::OpenRoot,
-                    error,
-                ));
-            }
-        };
-        let sessions_anchor =
-            match open_or_create_anchored_child(&root_anchor, OsStr::new("sessions")) {
-                Ok(sessions) => sessions,
+        if let Err(error) = AnchoredDirectory::open_root(&self.root_dir) {
+            restore_stage(&self.stage_session_anchor, stage_session_anchor);
+            return Err(FreshPublicationFinalizeError::not_committed(
+                FinalizeStage::PreCommit,
+                FinalizeOperation::OpenRoot,
+                error,
+            ));
+        }
+        let publication_parent =
+            match ensure_publication_parent(&self.root_dir, &self.published_parent_name) {
+                Ok(parent) => parent,
                 Err(error) => {
                     restore_stage(&self.stage_session_anchor, stage_session_anchor);
                     return Err(FreshPublicationFinalizeError::not_committed(
                         FinalizeStage::PreCommit,
-                        FinalizeOperation::OpenSessions,
+                        FinalizeOperation::OpenPublishedParent,
                         error,
                     ));
                 }
             };
-        if let Err(error) = sessions_anchor.ensure_owner_only() {
+        if let Err(error) = publication_parent.revalidate() {
             restore_stage(&self.stage_session_anchor, stage_session_anchor);
             return Err(FreshPublicationFinalizeError::not_committed(
                 FinalizeStage::PreCommit,
-                FinalizeOperation::OpenSessions,
+                FinalizeOperation::OpenPublishedParent,
                 error,
             ));
         }
-
-        let published_parent_anchor = match sessions_anchor
-            .open_child_dir(&self.published_parent_name)
-        {
-            Ok(parent) => parent,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                match sessions_anchor.create_child_dir(&self.published_parent_name) {
-                    Ok(parent) => parent,
-                    Err(create_error) if create_error.kind() == io::ErrorKind::AlreadyExists => {
-                        match sessions_anchor.open_child_dir(&self.published_parent_name) {
-                            Ok(parent) => parent,
-                            Err(open_error) => {
-                                restore_stage(&self.stage_session_anchor, stage_session_anchor);
-                                return Err(FreshPublicationFinalizeError::not_committed(
-                                    FinalizeStage::PreCommit,
-                                    FinalizeOperation::OpenPublishedParent,
-                                    open_error,
-                                ));
-                            }
-                        }
-                    }
-                    Err(create_error) => {
-                        restore_stage(&self.stage_session_anchor, stage_session_anchor);
-                        return Err(FreshPublicationFinalizeError::not_committed(
-                            FinalizeStage::PreCommit,
-                            FinalizeOperation::OpenPublishedParent,
-                            create_error,
-                        ));
-                    }
-                }
-            }
-            Err(error) => {
-                restore_stage(&self.stage_session_anchor, stage_session_anchor);
-                return Err(FreshPublicationFinalizeError::not_committed(
-                    FinalizeStage::PreCommit,
-                    FinalizeOperation::OpenPublishedParent,
-                    error,
-                ));
-            }
-        };
+        let sessions_anchor = publication_parent.sessions_anchor();
+        let published_parent_anchor = publication_parent.parent_anchor();
 
         self.publish_attempts.fetch_add(1, Ordering::SeqCst);
         let published_session_anchor = match rename(
@@ -734,6 +694,29 @@ mod tests {
             Err(failure) => Err(failure),
         });
         assert_eq!(publication.publish_attempts(), attempts_before + 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finalize_rejects_symlinked_encoded_cwd_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("canary"), b"fresh-canary").unwrap();
+        let publication =
+            FreshPublication::prepare(root.path(), SESSION_ID, OsStr::new(PARENT)).unwrap();
+        write_summary(publication.stage_session());
+        std::fs::create_dir_all(root.path().join("sessions")).unwrap();
+        symlink(outside.path(), root.path().join("sessions").join(PARENT)).unwrap();
+
+        assert!(publication.finalize().is_err());
+        assert!(!publication.is_committed());
+        assert_eq!(
+            std::fs::read(outside.path().join("canary")).unwrap(),
+            b"fresh-canary"
+        );
+        assert!(!outside.path().join(SESSION_ID).exists());
     }
 
     #[cfg(unix)]

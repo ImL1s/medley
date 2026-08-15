@@ -774,6 +774,7 @@ mod tests {
             catalog_degraded_reason: None,
             effective_context_window_percent: Some(95),
             invalid_auth_scheme: None,
+            unknown_codex_catalog_slug: None,
         }
     }
 
