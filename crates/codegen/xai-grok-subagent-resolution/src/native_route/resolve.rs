@@ -101,6 +101,16 @@ fn validate_request(request: &NativeSubagentRouteRequest) -> Result<(), NativeRo
             "resume.source_receipt_digest",
         )?;
         reject_secret_opt(pin.source_route_key.as_deref(), "resume.source_route_key")?;
+        if pin
+            .source_route_key
+            .as_deref()
+            .is_none_or(|key| key.is_empty())
+        {
+            return Err(NativeRouteError::Rejected(
+                RejectionCode::ResumeRoutePinned,
+                "resume requires an explicit source route key".into(),
+            ));
+        }
     }
     match &request.selection {
         NativeModelSelection::Exact { catalog_id } => {
@@ -151,9 +161,17 @@ fn resolve_resume(
             ),
         ));
     };
-    if let Some(expected_key) = &pin.source_route_key
-        && expected_key != &entry.route_key
-    {
+    let Some(expected_key) = pin
+        .source_route_key
+        .as_deref()
+        .filter(|key| !key.is_empty())
+    else {
+        return Err(NativeRouteError::Rejected(
+            RejectionCode::ResumeRoutePinned,
+            "resume requires an explicit source route key".into(),
+        ));
+    };
+    if expected_key != entry.route_key {
         return Err(NativeRouteError::Rejected(
             RejectionCode::ResumeRoutePinned,
             "resume cannot rebind the same wire slug onto another route".into(),

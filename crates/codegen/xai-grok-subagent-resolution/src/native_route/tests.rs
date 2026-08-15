@@ -293,6 +293,27 @@ fn resume_pins_source_route_and_refuses_rebind() {
 }
 
 #[test]
+fn resume_without_route_key_is_rejected() {
+    let mut req = request(NativeModelSelection::Exact {
+        catalog_id: "review-primary".into(),
+    });
+    req.resume = Some(ResumePin {
+        source_catalog_id: "review-primary".into(),
+        source_receipt_digest: Some("abc".into()),
+        source_route_key: None,
+    });
+    let err = resolve_native_route(&req, &catalog(), 14, 2).unwrap_err();
+    assert_eq!(err.code(), RejectionCode::ResumeRoutePinned);
+}
+
+#[test]
+fn oauth_label_is_not_secret_material() {
+    let mut req = request(NativeModelSelection::Inherit);
+    req.consumer_policy_id = Some("oauth-review".into());
+    resolve_native_route(&req, &catalog(), 1, 1).unwrap();
+}
+
+#[test]
 fn receipt_digest_is_deterministic_and_secret_free() {
     let req = request(NativeModelSelection::Exact {
         catalog_id: "review-primary".into(),

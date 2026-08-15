@@ -460,7 +460,7 @@ impl NativeRouteError {
     }
 }
 
-const SECRET_NEEDLES: [&str; 8] = [
+const SECRET_NEEDLES: [&str; 7] = [
     "sk-",
     "bearer ",
     "acct_",
@@ -468,7 +468,6 @@ const SECRET_NEEDLES: [&str; 8] = [
     "api_key",
     "authorization",
     "x-api-key",
-    "oauth",
 ];
 
 /// Reject credential/header/query/account sentinels in consumer-supplied text.
