@@ -2389,6 +2389,23 @@ impl Config {
         };
         Ok((config, unrecognized_keys))
     }
+}
+
+/// Drop `[ui].simple_mode` when `[ui].readline_mode` is already present.
+///
+/// Serde `rename` + `alias` treat both keys as one field, so a merged
+/// config that still carries the legacy key fails before any precedence
+/// logic can run (Codex P2 3788601733). Public key wins.
+fn prefer_readline_mode_in_toml(root: &mut toml::Value) {
+    let Some(ui) = root.get_mut("ui").and_then(toml::Value::as_table_mut) else {
+        return;
+    };
+    if ui.contains_key(UiConfig::READLINE_MODE_KEY) {
+        ui.remove(UiConfig::SIMPLE_MODE_ALIAS_KEY);
+    }
+}
+
+impl Config {
     pub fn new_from_toml_cfg(raw_config: &toml::Value) -> Result<Self, String> {
         let raw_config_with_project_models = if let Ok(cwd) = std::env::current_dir() {
             let project_trusted = crate::agent::folder_trust::project_scope_allowed(&cwd);
@@ -2445,6 +2462,8 @@ impl Config {
         if let toml::Value::Table(ref mut t) = base {
             t.remove("mcp_servers");
         }
+        // Merged [ui] can carry both the public key and the legacy alias.
+        prefer_readline_mode_in_toml(&mut base);
         let (mut config, mut unrecognized_keys) =
             Self::deserialize_collecting_unrecognized(base, &raw_without_model_sections)?;
         config.endpoints.catalog_auth = config.models.catalog_auth_config()?;
@@ -8162,6 +8181,24 @@ reasoning_effort = "low"
         let mut cfg = Config::new_from_toml_cfg(&toml_on).unwrap();
         cfg.resolve_runtime_fields(&ctx(&toml_on, false));
         assert!(cfg.disable_web_search);
+    }
+    #[test]
+    fn new_from_toml_cfg_accepts_both_readline_mode_and_simple_mode_issue66() {
+        let raw: toml::Value = toml::from_str(
+            r#"
+            [ui]
+            readline_mode = true
+            simple_mode = false
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw)
+            .expect("merged readline_mode + simple_mode must not fail deserialize");
+        assert_eq!(
+            cfg.ui.simple_mode,
+            Some(true),
+            "public readline_mode must win when both [ui] keys are present"
+        );
     }
     #[test]
     fn new_from_toml_cfg_restores_web_search_and_session_summary_models() {
