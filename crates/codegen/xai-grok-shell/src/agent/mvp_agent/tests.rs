@@ -67,6 +67,9 @@ fn auth_with_mode(mode: crate::auth::AuthMode, key: &str) -> crate::auth::GrokAu
         expires_at: None,
         oidc_issuer: None,
         oidc_client_id: None,
+        id_token: None,
+        account_id: None,
+        chatgpt_account_is_fedramp: false,
     }
 }
 #[test]
@@ -3130,10 +3133,7 @@ async fn session_search_stops_on_a_mid_session_kill_switch() {
         search_gate::is_index_enabled(),
         "precondition: nothing has turned the index off"
     );
-    agent.cfg.borrow_mut().remote_settings = Some(crate::util::config::RemoteSettings {
-        session_search: Some(false),
-        ..Default::default()
-    });
+    agent.cfg.borrow_mut().features.session_search = Some(false);
     agent.apply_session_search_gate();
     assert!(
         !search_gate::is_index_enabled(),

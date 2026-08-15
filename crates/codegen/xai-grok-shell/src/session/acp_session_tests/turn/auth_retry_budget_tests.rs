@@ -163,9 +163,8 @@ async fn session_token_actor(
     cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
     cfg.model = "test".to_string();
     actor.chat_state_handle.update_sampling_config(cfg);
-    let mut creds = actor.chat_state_handle.get_credentials().await;
-    creds.api_key = None;
-    creds.auth_type = xai_chat_state::AuthType::SessionToken;
+    let creds = actor.chat_state_handle.get_credentials().await;
+    let creds = creds.clone().rebind(None, xai_chat_state::AuthType::SessionToken, xai_grok_sampling_types::CredentialSource::None);
     actor.chat_state_handle.update_credentials(creds);
 
     // Definite NotByok: the session-token gate must stay active against the
@@ -177,6 +176,7 @@ async fn session_token_actor(
             facts: crate::agent::config::ModelAuthFacts {
                 byok: crate::agent::auth_method::ModelByok::NotByok,
                 auth_scheme: Default::default(),
+                readiness: crate::agent::auth_method::ModelReadiness::Ready,
             },
             provider: None,
         }));

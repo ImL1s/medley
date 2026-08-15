@@ -100,10 +100,12 @@ async fn web_search_uses_model_override_from_config_end_to_end() {
         state_path: std::env::temp_dir().join("grok-web-search-e2e/state.json"),
         memory_backend: None,
         web_search_config: xai_grok_tools::implementations::web_search::WebSearchConfig::Enabled {
-            api_key: web_search_sampling.api_key.clone().unwrap(),
+            api_key: web_search_sampling.api_key.clone(),
             base_url: web_search_sampling.base_url.clone(),
             model: web_search_sampling.model.clone(),
             extra_headers: web_search_sampling.extra_headers.clone(),
+            env_http_headers: Default::default(),
+            api_key_provider: None,
             // The optional extra access key is no longer carried on
             // `SamplerConfig`. The shell-level value flows in via
             // `Credentials` at session-spawn time; in this self-contained

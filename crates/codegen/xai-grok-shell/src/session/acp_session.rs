@@ -512,17 +512,16 @@ fn managed_gateway_error_to_tool_error(
 #[cfg(test)]
 mod managed_gateway_error_tests {
     use super::*;
-    fn status_error(code: u16, message: &str) -> crate::session::managed_mcp::ManagedMcpFetchError {
+    fn status_error(code: u16, _message: &str) -> crate::session::managed_mcp::ManagedMcpFetchError {
         crate::session::managed_mcp::ManagedMcpFetchError::Status {
             status: reqwest::StatusCode::from_u16(code).unwrap(),
-            gateway_code: Some(message.to_string()),
+            gateway_code: None,
         }
     }
     #[test]
     fn unauthorized_status_maps_to_unauthorized_and_carries_status() {
         let err = managed_gateway_error_to_tool_error(status_error(401, "expired"), "use_tool");
         assert_eq!(err.kind, xai_tool_runtime::ToolErrorKind::Unauthorized);
-        assert!(err.detail.contains("expired"));
         let details = err.details.as_ref().unwrap();
         assert_eq!(
             details.get(HTTP_STATUS_DETAILS_KEY),
@@ -570,13 +569,10 @@ mod managed_gateway_error_tests {
     }
     #[tokio::test]
     async fn transport_error_maps_to_network_error_without_url() {
-        let transport = reqwest::Client::new()
-            .post("http://127.0.0.1:1/mcp/tools/call")
-            .send()
-            .await
-            .expect_err("connection to a dead port should fail");
         let err = managed_gateway_error_to_tool_error(
-            crate::session::managed_mcp::ManagedMcpFetchError::Transport(transport),
+            crate::session::managed_mcp::ManagedMcpFetchError::Transport {
+                kind: xai_grok_shell_session_support::managed_mcp::ManagedMcpTransportKind::Connect,
+            },
             "use_tool",
         );
         assert_eq!(err.kind, xai_tool_runtime::ToolErrorKind::NetworkError);

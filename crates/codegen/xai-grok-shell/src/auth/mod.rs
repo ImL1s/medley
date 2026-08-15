@@ -47,6 +47,7 @@ pub use flow::{
 pub use jwt::{is_jwt_expired_or_near, parse_jwt_expiration};
 mod meta;
 pub use error::{AuthError, RefreshTokenError, RefreshTokenFailedReason};
+pub(crate) use error::with_login_instruction;
 pub use manager::{AuthManager, shared_api_key_provider};
 pub(crate) use manager::{AuthRemedy, SilentRefresh};
 pub use meta::{AuthMeta, GateInfo};

@@ -1802,15 +1802,7 @@ fn handed_queue_stays_gated_when_deferred_target_switch_fails() {
         let request_id = switch_model_request_id(&created);
         let result = match failure_kind {
             "harness_unavailable" => {
-                let error = xai_grok_shell::agent::config::ModelSwitchHarnessError {
-                    code: xai_grok_shell::agent::config::MODEL_SWITCH_REBUILD_FAILED.to_string(),
-                    active_agent_type: "grok-build".into(),
-                    required_agent_type: "cursor".into(),
-                    model_id: model_id.0.to_string(),
-                    reason: "agent_definition_unavailable".into(),
-                };
                 Err(SwitchModelError::HarnessUnavailable {
-                    error,
                     prev_model_id: None,
                 })
             }
@@ -2170,13 +2162,6 @@ fn switch_model_unavailable_harness_rolls_back_default_without_new_session_modal
     );
     assert_eq!(app.models.current, Some(rejected_model.clone()));
 
-    let error = xai_grok_shell::agent::config::ModelSwitchHarnessError {
-        code: xai_grok_shell::agent::config::MODEL_SWITCH_REBUILD_FAILED.to_string(),
-        active_agent_type: "grok-build".into(),
-        required_agent_type: "missing-custom-harness".into(),
-        model_id: rejected_model.0.to_string(),
-        reason: "agent_definition_unavailable".into(),
-    };
     let completion_effects = dispatch(
         Action::TaskComplete(TaskResult::SwitchModelComplete {
             agent_id: id,
@@ -2184,7 +2169,6 @@ fn switch_model_unavailable_harness_rolls_back_default_without_new_session_modal
             effort: None,
             request_id,
             result: Err(SwitchModelError::HarnessUnavailable {
-                error,
                 prev_model_id: Some(prev_model.clone()),
             }),
             prev_model_id: Some(prev_model.clone()),

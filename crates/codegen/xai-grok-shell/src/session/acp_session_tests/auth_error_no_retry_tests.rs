@@ -112,11 +112,11 @@ async fn make_actor_with_method_and_credentials(
     actor.auth_method_id = test_auth_method_id(auth_method_id);
     actor
         .chat_state_handle
-        .update_credentials(xai_chat_state::Credentials {
-            api_key: Some(api_key),
+        .update_credentials(xai_chat_state::Credentials::bound(
+            Some(api_key),
             auth_type,
-            ..Default::default()
-        });
+            xai_grok_sampling_types::CredentialSource::None,
+        ));
     (Arc::new(actor), persistence_rx)
 }
 
@@ -283,8 +283,7 @@ async fn pre_flight_refresh_skips_api_key_auth_type() {
                     .chat_state_handle
                     .get_credentials()
                     .await
-                    .api_key
-                    .as_deref(),
+                    .api_key(),
                 Some("byok-api-key"),
                 "BYOK api_key must not be overwritten by session token refresh"
             );
@@ -323,8 +322,7 @@ async fn pre_flight_refreshes_hard_expired_session_token() {
                     .chat_state_handle
                     .get_credentials()
                     .await
-                    .api_key
-                    .as_deref(),
+                    .api_key(),
                 Some("refreshed-test-token"),
                 "credentials must be updated to the refreshed bearer"
             );
@@ -370,8 +368,7 @@ async fn pre_flight_hard_expired_refresh_failure_skips_jwt_fallthrough() {
                     .chat_state_handle
                     .get_credentials()
                     .await
-                    .api_key
-                    .as_deref(),
+                    .api_key(),
                 None,
                 "hard-expired pre-flight failure must strip the chat-state seed"
             );
@@ -439,8 +436,7 @@ async fn pre_flight_soft_expired_transient_fail_retains_seed() {
                     .chat_state_handle
                     .get_credentials()
                     .await
-                    .api_key
-                    .as_deref(),
+                    .api_key(),
                 Some("buffered-test-key"),
                 "buffer-window soft-expired + transient fail must retain seed"
             );
@@ -516,8 +512,7 @@ async fn proactive_refresh_makes_per_turn_refresh_a_cache_hit() {
                     .chat_state_handle
                     .get_credentials()
                     .await
-                    .api_key
-                    .as_deref(),
+                    .api_key(),
                 Some("proactive-fresh"),
                 "per-turn refresh must pick up the proactively-refreshed token"
             );
@@ -937,8 +932,7 @@ async fn pre_flight_refresh_heals_session_method_with_stale_api_key_auth_type() 
                     .chat_state_handle
                     .get_credentials()
                     .await
-                    .api_key
-                    .as_deref(),
+                    .api_key(),
                 Some("fresh-session-token"),
                 "session-based pre-flight refresh must heal a stale api_key with the live token"
             );
@@ -999,8 +993,7 @@ async fn session_born_on_api_key_recovers_after_oidc_login_without_restart() {
                     .chat_state_handle
                     .get_credentials()
                     .await
-                    .api_key
-                    .as_deref(),
+                    .api_key(),
                 Some("fresh-oidc-token"),
                 "the stale api_key must be healed with the fresh OIDC token"
             );
@@ -1035,6 +1028,7 @@ async fn model_auth_memo_serves_cached_status_and_keys_on_model() {
                     facts: ModelAuthFacts {
                         byok: ModelByok::Byok,
                         auth_scheme: Default::default(),
+                        readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
                 }));
@@ -1079,6 +1073,7 @@ async fn reconstruct_full_config_no_bearer_resolver_for_byok_model_on_session_me
                     facts: ModelAuthFacts {
                         byok: ModelByok::Byok,
                         auth_scheme: Default::default(),
+                        readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
                 }));
@@ -1127,6 +1122,7 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                     facts: ModelAuthFacts {
                         byok: ModelByok::NotByok,
                         auth_scheme: Default::default(),
+                        readiness: crate::agent::auth_method::ModelReadiness::Ready,
                     },
                     provider: None,
                 }));
@@ -1164,6 +1160,9 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                 compaction_at_tokens: None,
                 doom_loop_recovery: None,
                 header_injector: None,
+                codex_wire: None,
+                credential_source: None,
+                endpoint_trust: Default::default(),
             };
             let _ = actor
                 .handle_set_session_model(cfg, false, false, true, 85)
@@ -1196,6 +1195,7 @@ async fn seed_provider_memo(actor: &Arc<SessionActor>, provider: crate::auth::Au
             facts: crate::agent::config::ModelAuthFacts {
                 byok: crate::agent::auth_method::ModelByok::Byok,
                 auth_scheme: Default::default(),
+                readiness: crate::agent::auth_method::ModelReadiness::Ready,
             },
             provider: Some(provider),
         }));
@@ -1258,6 +1258,9 @@ async fn switch_to_first_party_model_drops_minted_provider_token() {
                 compaction_at_tokens: None,
                 doom_loop_recovery: None,
                 header_injector: None,
+                codex_wire: None,
+                credential_source: None,
+                endpoint_trust: Default::default(),
             };
             let _ = actor
                 .handle_set_session_model(cfg, false, false, true, 85)
@@ -1265,7 +1268,7 @@ async fn switch_to_first_party_model_drops_minted_provider_token() {
 
             let creds = actor.chat_state_handle.get_credentials().await;
             assert_eq!(
-                creds.api_key.as_deref(),
+                creds.api_key(),
                 Some("session-jwt"),
                 "switching to a first-party model must install the session credential, \
                  not the minted provider token"
@@ -1307,7 +1310,7 @@ async fn sampler_401_on_provider_model_remints_and_resubmits() {
             );
             let creds = actor.chat_state_handle.get_credentials().await;
             assert_eq!(
-                creds.api_key.as_deref(),
+                creds.api_key(),
                 Some("tok-2"),
                 "chat-state credentials must carry the re-minted token"
             );
@@ -1345,7 +1348,7 @@ async fn sampler_non_auth_kind_401_on_provider_model_still_recovers() {
                 "a non-Auth-kind 401 on a provider model must still recover via 4c"
             );
             let creds = actor.chat_state_handle.get_credentials().await;
-            assert_eq!(creds.api_key.as_deref(), Some("tok-2"));
+            assert_eq!(creds.api_key(), Some("tok-2"));
         })
         .await;
 }
@@ -1366,8 +1369,8 @@ async fn sampler_401_with_no_key_on_provider_model_mints_and_resubmits() {
                 "placeholder".to_string(),
             )
             .await;
-            let mut creds = actor.chat_state_handle.get_credentials().await;
-            creds.api_key = None;
+            let creds = actor.chat_state_handle.get_credentials().await;
+            let creds = creds.clone().rebind(None, creds.auth_type(), xai_grok_sampling_types::CredentialSource::None);
             actor.chat_state_handle.update_credentials(creds);
             seed_provider_memo(&actor, provider).await;
 
@@ -1380,7 +1383,7 @@ async fn sampler_401_with_no_key_on_provider_model_mints_and_resubmits() {
                 "an unauthenticated 401 on a provider model must mint and resubmit"
             );
             let creds = actor.chat_state_handle.get_credentials().await;
-            assert_eq!(creds.api_key.as_deref(), Some("tok-1"));
+            assert_eq!(creds.api_key(), Some("tok-1"));
         })
         .await;
 }
@@ -1430,7 +1433,7 @@ async fn sampler_401_on_provider_model_never_refreshes_session() {
                 "session refresh must never fire for a provider-backed model"
             );
             let creds = actor.chat_state_handle.get_credentials().await;
-            assert_eq!(creds.api_key.as_deref(), Some("tok-2"));
+            assert_eq!(creds.api_key(), Some("tok-2"));
         })
         .await;
 }
@@ -1461,8 +1464,8 @@ async fn pre_turn_on_provider_model_never_installs_session_token() {
             )
             .await;
             // Cold cache: no key on the wire yet.
-            let mut creds = actor.chat_state_handle.get_credentials().await;
-            creds.api_key = None;
+            let creds = actor.chat_state_handle.get_credentials().await;
+            let creds = creds.clone().rebind(None, creds.auth_type(), xai_grok_sampling_types::CredentialSource::None);
             actor.chat_state_handle.update_credentials(creds);
             seed_provider_memo(&actor, provider).await;
 
@@ -1470,7 +1473,7 @@ async fn pre_turn_on_provider_model_never_installs_session_token() {
 
             let creds = actor.chat_state_handle.get_credentials().await;
             assert_eq!(
-                creds.api_key.as_deref(),
+                creds.api_key(),
                 Some("tok-1"),
                 "the cold pre-turn hook must mint the provider token"
             );
@@ -1508,7 +1511,7 @@ async fn sampler_401_on_fresh_provider_token_surfaces_error() {
             );
             let creds = actor.chat_state_handle.get_credentials().await;
             assert_eq!(
-                creds.api_key.as_deref(),
+                creds.api_key(),
                 Some(token.as_str()),
                 "credentials must be unchanged when the guard blocks the re-mint"
             );

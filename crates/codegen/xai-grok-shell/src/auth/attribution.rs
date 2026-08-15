@@ -754,7 +754,7 @@ mod tests {
         ];
 
         for (consumer, expected_consumer_str) in cases {
-            cb.record_401(consumer, Some("bearer-1234567890"));
+            cb.record_401(consumer, xai_grok_auth::CredentialComparison::same_as_current());
             let payload = compute_attribution_payload(
                 am_arc.as_ref(),
                 expected_consumer_str,
@@ -983,11 +983,11 @@ mod tests {
         // Drive the inherited callback. The `record_401` should bump
         // the same global counter the parent callback would, proving
         // they refer to the same underlying impl.
-        inherited_cb.record_401(SamplingConsumer::ChatCompletionsStream, Some("bearer"));
+        inherited_cb.record_401(SamplingConsumer::ChatCompletionsStream, xai_grok_auth::CredentialComparison::same_as_current());
         assert_eq!(test_emit_count(), 1);
 
         // Sanity: the parent_cb still works too (it's the same Arc).
-        parent_cb.record_401(SamplingConsumer::Messages, Some("bearer"));
+        parent_cb.record_401(SamplingConsumer::Messages, xai_grok_auth::CredentialComparison::same_as_current());
         assert_eq!(test_emit_count(), 2);
     }
 
@@ -1014,7 +1014,7 @@ mod tests {
             SamplingConsumer::Messages,
         ];
         for consumer in variants {
-            cb.record_401(consumer, Some("test-bearer"));
+            cb.record_401(consumer, xai_grok_auth::CredentialComparison::same_as_current());
         }
         assert_eq!(test_emit_count() as usize, variants.len());
 

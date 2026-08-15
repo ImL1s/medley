@@ -61,6 +61,7 @@ async fn create_test_actor(
                 .expect("test context_window must be non-zero"),
             reasoning_effort: None,
             stream_tool_calls: None,
+            endpoint_trust: Default::default(),
         },
         Box::new(xai_chat_state::NullChatPersistence),
         event_tx,
@@ -513,6 +514,7 @@ async fn create_test_actor_with_memory(
                 .expect("test context_window must be non-zero"),
             reasoning_effort: None,
             stream_tool_calls: None,
+            endpoint_trust: Default::default(),
         },
         Box::new(xai_chat_state::NullChatPersistence),
         event_tx,
@@ -1293,17 +1295,17 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                     context_window: std::num::NonZeroU64::new(200_000).unwrap(),
                     reasoning_effort: None,
                     stream_tool_calls: None,
+                    endpoint_trust: Default::default(),
                 },
                 Box::new(xai_chat_state::NullChatPersistence),
                 event_tx,
                 tokio_util::sync::CancellationToken::new(),
             );
-            chat_state_handle.update_credentials(xai_chat_state::types::Credentials {
-                api_key: Some("test-key".to_string()),
-                auth_type: Default::default(),
-                alpha_test_key: None,
-                client_version: None,
-            });
+            chat_state_handle.update_credentials(xai_chat_state::types::Credentials::bound(
+                Some("test-key".to_string()),
+                Default::default(),
+                xai_grok_sampling_types::CredentialSource::None,
+            ));
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let actor = SessionActor {
                 session_info: SessionInfo {

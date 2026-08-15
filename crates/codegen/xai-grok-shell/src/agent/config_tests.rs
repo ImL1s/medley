@@ -1636,7 +1636,7 @@ fn byok_from_lookup_classifies_all_states() {
 #[test]
 fn resolve_model_auth_facts_empty_model_id_is_unknown() {
     assert_eq!(
-        resolve_model_auth_facts_and_provider("").0.byok,
+        resolve_model_auth_facts_and_provider("", None).0.byok,
         ModelByok::Unknown
     );
 }
@@ -3537,23 +3537,16 @@ fn resolve_session_search_precedence() {
         let gate = cfg.resolve_session_search();
         (gate.value, gate.source)
     }
-    fn remote_off(cfg: &mut Config) {
-        cfg.remote_settings = Some(crate::util::config::RemoteSettings {
-            session_search: Some(false),
-            ..Default::default()
-        });
-    }
     {
         let _env = EnvGuard::unset("GROK_SESSION_SEARCH");
         assert_eq!(resolved(|_| {}), (true, ConfigSource::Default));
-        assert_eq!(resolved(remote_off), (false, ConfigSource::Remote));
         assert_eq!(
-            resolved(|cfg| {
-                remote_off(cfg);
-                cfg.features.session_search = Some(true);
-            }),
-            (true, ConfigSource::Config),
-            "config.toml beats remote settings",
+            resolved(|cfg| cfg.features.session_search = Some(false)),
+            (false, ConfigSource::Config)
+        );
+        assert_eq!(
+            resolved(|cfg| cfg.features.session_search = Some(true)),
+            (true, ConfigSource::Config)
         );
     }
     {

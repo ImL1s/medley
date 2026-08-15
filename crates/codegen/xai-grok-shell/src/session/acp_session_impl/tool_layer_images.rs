@@ -81,6 +81,8 @@ mod tests {
             output,
             prompt_text: "prompt".into(),
             effective_tool_name: None,
+            trusted_prompt_reminders: vec![],
+            trusted_prompt_suffix: String::new(),
         }
     }
 

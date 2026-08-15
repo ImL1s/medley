@@ -1,4 +1,5 @@
 //! Wiring tests for MCP tool-layer images through `handle_bridge_tool_success`.
+use base64::Engine;
 use super::support::*;
 use super::*;
 use xai_grok_sampling_types::{ContentPart, ConversationItem};
@@ -28,6 +29,8 @@ fn mcp_screenshot_result(payload_b64: &str) -> ToolRunResult {
         output: ToolOutput::MCP(mcp),
         prompt_text: IMAGE_CONTENT_PLACEHOLDER.into(),
         effective_tool_name: None,
+        trusted_prompt_reminders: vec![],
+        trusted_prompt_suffix: String::new(),
     }
 }
 fn tool_result_text(item: &ConversationItem) -> &str {

@@ -741,33 +741,6 @@ fn parse_session_load_restore_meta_rejects_unknown_degree() {
     let (_, _, degree) = parse_session_load_restore_meta(meta.as_object());
     assert!(degree.is_none());
 }
-/// #161 write→parse bridge: the shell publishes `WebSearchDisabledNotice` under
-/// is the production parser dispatch tests skip when they inject
-#[test]
-    let notice = xai_grok_shell::session::WebSearchDisabledNotice {
-        model_id: "grok-4-fast".into(),
-        reason: "model is not ready".into(),
-        message: "web_search is unavailable: model \"grok-4-fast\" could not be used (model is not ready)".into(),
-    };
-    let mut meta = acp::Meta::new();
-    meta.insert(
-        serde_json::to_value(&notice).expect("notice serializes"),
-    );
-        .expect("well-formed meta must parse");
-    assert_eq!(parsed, notice);
-}
-/// Absent key means available — must not invent a notice.
-#[test]
-    let meta = acp::Meta::new();
-}
-/// Present-but-malformed collapses to None (with a warn), not a panic — and
-/// must not be mistaken for a successful disable notice.
-#[test]
-    let mut meta = acp::Meta::new();
-    meta.insert(
-        serde_json::json!("not-an-object"),
-    );
-}
 /// Unknown keys return a descriptive error.
 #[tokio::test]
 async fn persist_setting_unknown_key_returns_err() {

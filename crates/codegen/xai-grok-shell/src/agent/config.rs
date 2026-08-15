@@ -4385,6 +4385,215 @@ impl ModelEntry {
     pub(crate) fn has_own_credentials(&self) -> bool {
         self.own_credential().is_some() || self.auth_provider.is_some()
     }
+
+    /// Whether this model entry is configured with the OpenAI Codex backend.
+    pub fn is_openai_codex_profile(&self) -> bool {
+        self.info.api_backend == ApiBackend::CodexResponses
+    }
+}
+
+pub(crate) fn sanitized_origin(url: &str) -> String {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return "<invalid-url>".to_owned();
+    };
+    let mut origin = format!(
+        "{}://{}",
+        parsed.scheme(),
+        parsed.host_str().unwrap_or("<no-host>")
+    );
+    if let Some(port) = parsed.port() {
+        origin.push_str(&format!(":{port}"));
+    }
+    let path = parsed.path().trim_end_matches('/');
+    if !path.is_empty() {
+        origin.push_str(path);
+    }
+    origin
+}
+
+fn is_codex_provider_origin(base_url: &str) -> bool {
+    let parsed = reqwest::Url::parse(base_url);
+    let codex = reqwest::Url::parse(crate::auth::openai_codex::CODEX_API_BASE_URL);
+    match (parsed, codex) {
+        (Ok(parsed), Ok(codex)) => {
+            parsed.scheme() == "https"
+                && parsed.host_str() == codex.host_str()
+                && parsed.port() == codex.port()
+        }
+        _ => false,
+    }
+}
+
+fn explicit_credential_header(info: &ModelInfo) -> Option<(String, Option<String>)> {
+    explicit_credential_header_in(&info.extra_headers, &info.env_http_headers)
+}
+
+pub(crate) fn explicit_credential_header_in(
+    extra_headers: &IndexMap<String, String>,
+    env_http_headers: &IndexMap<String, String>,
+) -> Option<(String, Option<String>)> {
+    fn is_credential_header(name: &str) -> bool {
+        name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("x-api-key")
+    }
+    if let Some((name, _)) = extra_headers
+        .iter()
+        .find(|(name, value)| is_credential_header(name) && !value.trim().is_empty())
+    {
+        return Some((name.to_ascii_lowercase(), None));
+    }
+    env_http_headers
+        .iter()
+        .find(|(name, var)| {
+            is_credential_header(name)
+                && std::env::var(var)
+                    .ok()
+                    .is_some_and(|v| !v.trim().is_empty())
+        })
+        .map(|(name, var)| (name.to_ascii_lowercase(), Some(var.clone())))
+}
+
+/// Picker readiness: keyless and typical xAI catalog stay selectable; BYOK
+/// models that declare `env_key`/`api_key` but lack a resolved value are not.
+pub(crate) fn model_readiness(model: &ModelEntry) -> (bool, Option<String>) {
+    model_readiness_with_origins(
+        model,
+        &crate::agent::trusted_origins::TrustedXaiOrigins::load(),
+    )
+}
+
+/// [`model_readiness`] with an explicit declaration set.
+pub(crate) fn model_readiness_with_origins(
+    model: &ModelEntry,
+    trusted_xai_origins: &crate::agent::trusted_origins::TrustedXaiOrigins,
+) -> (bool, Option<String>) {
+    if model.info.api_backend == ApiBackend::CodexResponses {
+        let Some(provider) = model.auth_provider.as_ref() else {
+            return (
+                false,
+                Some("missing OpenAI Codex credential provider".to_owned()),
+            );
+        };
+        let Some(status) = provider.openai_codex_status() else {
+            return (
+                false,
+                Some("invalid OpenAI Codex credential provider".to_owned()),
+            );
+        };
+        if !is_codex_provider_origin(&model.info.base_url) {
+            return (
+                false,
+                Some(format!(
+                    "OpenAI Codex credential is scoped to the Codex API origin, not {}: \
+                     point base_url at {} — or set api_key / env_key without \
+                     model_provider = \"openai-codex\" for a custom endpoint",
+                    sanitized_origin(&model.info.base_url),
+                    crate::auth::openai_codex::CODEX_API_BASE_URL,
+                )),
+            );
+        }
+        if status.permanent_failure {
+            return (
+                false,
+                Some("OpenAI Codex credential refresh failed; sign in again".to_owned()),
+            );
+        }
+        if !status.signed_in {
+            return (
+                false,
+                Some(crate::auth::with_login_instruction(
+                    |prog| format!("sign in with `{prog} login --provider openai-codex`"),
+                    "not signed in to OpenAI Codex",
+                )),
+            );
+        }
+        if status.expired {
+            return if status.refreshable {
+                (true, None)
+            } else {
+                (
+                    false,
+                    Some("OpenAI Codex credential expired; sign in again".to_owned()),
+                )
+            };
+        }
+        let Some(credential) = provider.cached_credential() else {
+            return (
+                false,
+                Some("OpenAI Codex credential is unavailable; sign in again".to_owned()),
+            );
+        };
+        if credential.access_token.trim().is_empty()
+            || credential.issuer.as_deref() != Some(crate::auth::openai_codex::ISSUER)
+        {
+            return (
+                false,
+                Some("OpenAI Codex credential is invalid; sign in again".to_owned()),
+            );
+        }
+        return (true, None);
+    }
+    if model.info.auth_scheme == AuthScheme::None {
+        return (true, None);
+    }
+    if model.has_own_credentials() {
+        return (true, None);
+    }
+    if let Some(ref env_keys) = model.env_key
+        && !env_keys.is_empty()
+        && env_keys.resolve_value().is_none()
+        && model.api_key.as_ref().is_none_or(|k| k.trim().is_empty())
+    {
+        let reason = env_keys
+            .primary()
+            .map(|name| format!("missing {name}"))
+            .unwrap_or_else(|| "missing API key".to_string());
+        return (false, Some(reason));
+    }
+    let ambient_destinations = [
+        model.info.base_url.as_str(),
+        model
+            .api_base_url
+            .as_deref()
+            .unwrap_or(&model.info.base_url),
+    ];
+    let ambient_destination_allowed =
+        |url: &str| crate::util::is_xai_api_bearer_url(url) || trusted_xai_origins.is_trusted(url);
+    if explicit_credential_header(&model.info).is_none()
+        && !ambient_destinations
+            .iter()
+            .all(|url| ambient_destination_allowed(url))
+    {
+        let refused_origin = ambient_destinations
+            .iter()
+            .copied()
+            .find(|url| !ambient_destination_allowed(url))
+            .unwrap_or(model.info.base_url.as_str());
+        return (
+            false,
+            Some(
+                crate::agent::auth_method::auth_error_ambient_origin_refused(&sanitized_origin(
+                    refused_origin,
+                )),
+            ),
+        );
+    }
+    (true, None)
+}
+
+pub(crate) fn unready_reason_for_model_id(
+    model_id: &str,
+    runtime_catalog: Option<&IndexMap<String, ModelEntry>>,
+) -> Option<String> {
+    if model_id.is_empty() {
+        return None;
+    }
+    with_resolved_model(model_id, runtime_catalog, |lookup| match lookup {
+        ModelLookup::Loaded(Some(entry)) => {
+            let (ready, reason) = model_readiness(entry);
+            if ready { None } else { reason }
+        }
+        ModelLookup::Loaded(None) | ModelLookup::ConfigUnavailable => None,
+    })
 }
 impl std::ops::Deref for ModelEntry {
     type Target = ModelInfo;
@@ -4908,36 +5117,37 @@ pub(crate) fn try_resolve_model_credentials(
 }
 /// Per-model auth facts (BYOK status + auth scheme) from one effective-config
 /// load, memoized by the session actor.
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ModelAuthFacts {
     pub byok: ModelByok,
     pub auth_scheme: AuthScheme,
+    pub readiness: crate::agent::auth_method::ModelReadiness,
 }
-/// Resolve `model_id` to its auth facts and auth-provider reference from one
-/// effective-config load; both ride the same memo (see
-/// `SessionActor::model_auth_memo`). Load/parse failure → `byok = Unknown`;
-/// model absent from the catalog → `NotByok`. An empty `model_id` (no sampling
-/// config yet) → `Unknown`, not `NotByok`, so the gate isn't activated for an
-/// unidentified model.
+
 pub(crate) fn resolve_model_auth_facts_and_provider(
     model_id: &str,
+    runtime_catalog: Option<&IndexMap<String, ModelEntry>>,
 ) -> (ModelAuthFacts, Option<crate::auth::AuthProviderRef>) {
     if model_id.is_empty() {
         return (
             ModelAuthFacts {
                 byok: ModelByok::Unknown,
                 auth_scheme: AuthScheme::default(),
+                readiness: crate::agent::auth_method::ModelReadiness::Unknown(
+                    crate::agent::auth_method::UnknownReason::UnidentifiedModel,
+                ),
             },
             None,
         );
     }
-    with_resolved_model(model_id, |lookup| {
+    with_resolved_model(model_id, runtime_catalog, |lookup| {
         let facts = ModelAuthFacts {
             byok: byok_from_lookup(&lookup),
             auth_scheme: match lookup {
                 ModelLookup::Loaded(Some(e)) => e.info().auth_scheme,
                 _ => AuthScheme::default(),
             },
+            readiness: readiness_from_lookup(&lookup),
         };
         let provider = match lookup {
             ModelLookup::Loaded(Some(e)) => e.effective_auth_provider().cloned(),
@@ -4946,6 +5156,30 @@ pub(crate) fn resolve_model_auth_facts_and_provider(
         (facts, provider)
     })
 }
+
+fn readiness_from_lookup(lookup: &ModelLookup<'_>) -> crate::agent::auth_method::ModelReadiness {
+    match lookup {
+        ModelLookup::Loaded(Some(e)) => {
+            let (ready, reason) = model_readiness(e);
+            if ready {
+                crate::agent::auth_method::ModelReadiness::Ready
+            } else {
+                crate::agent::auth_method::ModelReadiness::Unusable(
+                    crate::agent::auth_method::UnusableReason(
+                        reason.unwrap_or_else(|| "model is not ready".to_owned()),
+                    ),
+                )
+            }
+        }
+        ModelLookup::Loaded(None) => crate::agent::auth_method::ModelReadiness::Unknown(
+            crate::agent::auth_method::UnknownReason::NotInCatalog,
+        ),
+        ModelLookup::ConfigUnavailable => crate::agent::auth_method::ModelReadiness::Unknown(
+            crate::agent::auth_method::UnknownReason::CatalogUnavailable,
+        ),
+    }
+}
+
 fn byok_from_lookup(lookup: &ModelLookup) -> ModelByok {
     match lookup {
         ModelLookup::ConfigUnavailable => ModelByok::Unknown,
@@ -4953,15 +5187,21 @@ fn byok_from_lookup(lookup: &ModelLookup) -> ModelByok {
         ModelLookup::Loaded(_) => ModelByok::NotByok,
     }
 }
+
 enum ModelLookup<'a> {
     /// `None` if `model_id` is absent from the catalog.
     Loaded(Option<&'a ModelEntry>),
     ConfigUnavailable,
 }
-/// Load + parse the effective config and hand the `model_id` lookup to `f`,
-/// keeping "config unavailable" distinct from "model absent" so callers can
-/// stay conservative on a transient config failure.
-fn with_resolved_model<T>(model_id: &str, f: impl FnOnce(ModelLookup) -> T) -> T {
+
+fn with_resolved_model<T>(
+    model_id: &str,
+    runtime_catalog: Option<&IndexMap<String, ModelEntry>>,
+    f: impl FnOnce(ModelLookup) -> T,
+) -> T {
+    if let Some(models) = runtime_catalog.filter(|m| !m.is_empty()) {
+        return f(ModelLookup::Loaded(find_model_by_id(models, model_id)));
+    }
     let Some(raw) = crate::config::load_effective_config()
         .map_err(|e| tracing::warn!(error = %e, "config load failed for model auth lookup"))
         .ok()
@@ -4975,7 +5215,10 @@ fn with_resolved_model<T>(model_id: &str, f: impl FnOnce(ModelLookup) -> T) -> T
         return f(ModelLookup::ConfigUnavailable);
     };
     let models = resolve_model_list(&cfg, None);
-    f(ModelLookup::Loaded(find_model_by_id(&models, model_id)))
+    match find_model_by_id(&models, model_id) {
+        Some(entry) => f(ModelLookup::Loaded(Some(entry))),
+        None => f(ModelLookup::ConfigUnavailable),
+    }
 }
 /// Resolve a standalone `SamplerConfig` for an auxiliary model slug (image
 /// description, session summary, ...), resolved through the catalog so a

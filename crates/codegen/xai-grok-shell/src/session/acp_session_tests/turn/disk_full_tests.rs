@@ -118,8 +118,8 @@ async fn actor_with_mock_sampler(
     cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
     cfg.model = "test".to_string();
     actor.chat_state_handle.update_sampling_config(cfg);
-    let mut creds = actor.chat_state_handle.get_credentials().await;
-    creds.api_key = Some("test-key".to_string());
+    let creds = actor.chat_state_handle.get_credentials().await;
+    let creds = creds.clone().rebind(Some("test-key".to_string()), creds.auth_type(), creds.source_cloned().unwrap_or(xai_grok_sampling_types::CredentialSource::None));
     actor.chat_state_handle.update_credentials(creds);
 
     actor

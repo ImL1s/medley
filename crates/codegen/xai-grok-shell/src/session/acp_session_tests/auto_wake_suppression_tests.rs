@@ -1322,6 +1322,8 @@ async fn handle_bridge_tool_success_runs_consumed_completion_sweep() {
                 output,
                 prompt_text: "ok".into(),
                 effective_tool_name: None,
+                trusted_prompt_reminders: vec![],
+                trusted_prompt_suffix: String::new(),
             };
             let parsed_args = serde_json::json!({});
             let _ = actor

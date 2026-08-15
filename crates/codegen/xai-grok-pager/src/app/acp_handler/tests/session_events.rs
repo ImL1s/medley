@@ -92,36 +92,6 @@
         }
     }
 
-    /// #57: a withheld `web_search` must land as a system scrollback line that
-    /// names the tried model and the rejection reason.
-    #[test]
-        use crate::scrollback::block::RenderBlock;
-        let mut session = make_session(Some("s1"));
-        let mut scrollback = ScrollbackState::new();
-        let before = scrollback.len();
-        let model_id = "search";
-        let reason = "missing api_key / env_key / auth_provider (or set auth_scheme = \"none\")";
-        let message = format!(
-            "web_search is unavailable: model \"{model_id}\" could not be used ({reason})"
-        );
-        let update = XaiSessionUpdate::WebSearchDisabled {
-            model_id: model_id.into(),
-            reason: reason.into(),
-            message: message.clone(),
-        };
-        let changed = apply_session_event(&update, &mut session, &mut scrollback, false);
-        assert!(changed);
-        assert_eq!(scrollback.len(), before + 1);
-        let entry = scrollback.entries_mut().last().expect("entry pushed");
-        match &entry.block {
-            RenderBlock::System(b) => {
-                assert_eq!(b.text, message);
-                assert!(b.text.contains(model_id), "must name model: {}", b.text);
-                assert!(b.text.contains(reason), "must name reason: {}", b.text);
-            }
-            other => panic!("expected System block, got {other:?}"),
-        }
-    }
 
     /// A successful compression needs no user action: log-only — no toast,
     /// no scrollback block, no redraw. Same live and on session replay.

@@ -1039,13 +1039,6 @@ fn deferred_pre_session_pick_does_not_persist_when_switch_fails() {
     );
     let request_id = switch_model_request_id(&created);
 
-    let error = xai_grok_shell::agent::config::ModelSwitchHarnessError {
-        code: xai_grok_shell::agent::config::MODEL_SWITCH_REBUILD_FAILED.to_string(),
-        active_agent_type: "grok-build".into(),
-        required_agent_type: "cursor".into(),
-        model_id: model_b.0.to_string(),
-        reason: "agent_definition_unavailable".into(),
-    };
     let failed = dispatch(
         Action::TaskComplete(TaskResult::SwitchModelComplete {
             agent_id: id,
@@ -1053,7 +1046,6 @@ fn deferred_pre_session_pick_does_not_persist_when_switch_fails() {
             effort: None,
             request_id,
             result: Err(SwitchModelError::HarnessUnavailable {
-                error,
                 prev_model_id: Some(model_a.clone()),
             }),
             prev_model_id: Some(model_a),
@@ -3055,138 +3047,8 @@ fn delete_current_session_stale_attach_other_agent_stays_welcome() {
         "got {effects:?}"
     );
 }
-#[test]
-fn delete_current_session_confirm_from_dashboard_emits_dashboard_after() {
-    use crate::app::actions::AfterSessionDelete;
-    let mut app = test_app_with_agent();
-    {
-        let a = app.agents.get_mut(&AgentId(0)).unwrap();
-        a.session.session_id = Some(acp::SessionId::new("sess-dashboard"));
-        a.session.cwd = std::path::PathBuf::from("/repo");
-    }
-    ensure_dashboard_state(&mut app);
-    app.dashboard.as_mut().unwrap().attached_agent = Some(AgentId(0));
-    assert!(dispatch(Action::DeleteCurrentSession, &mut app).is_empty());
-    assert_eq!(
-        app.agents[&AgentId(0)]
-            .question_view
-            .as_ref()
-            .unwrap()
-            .questions[0]
-            .options[0]
-            .description,
-        "Remove history and return to the dashboard"
-    );
-    let effects = dispatch(
-        Action::DeleteCurrentSessionAnswered { confirmed: true },
-        &mut app,
-    );
-    assert!(
-        matches!(
-            effects.first(),
-            Some(Effect::CancelTurn {
-                cancel_subagents: true,
-                ..
-            })
-        ),
-        "must cancel the turn/subagents before delete, got {effects:?}"
-    );
-    assert!(
-        matches!(
-            effects.last(),
-            Some(Effect::DeleteSession {
-                session_id,
-                after: AfterSessionDelete::Dashboard,
-                ..
-            }) if session_id == "sess-dashboard"
-        ),
-        "got {effects:?}"
-    );
-}
-/// Dashboard state can exist without overlay attach; must still Welcome.
-#[test]
-fn delete_current_session_dashboard_state_without_attach_stays_welcome() {
-    use crate::app::actions::AfterSessionDelete;
-    let mut app = test_app_with_agent();
-    {
-        let a = app.agents.get_mut(&AgentId(0)).unwrap();
-        a.session.session_id = Some(acp::SessionId::new("sess-no-attach"));
-        a.session.cwd = std::path::PathBuf::from("/repo");
-    }
-    ensure_dashboard_state(&mut app);
-    assert!(app.dashboard.as_ref().unwrap().attached_agent.is_none());
-    assert!(dispatch(Action::DeleteCurrentSession, &mut app).is_empty());
-    assert_eq!(
-        app.agents[&AgentId(0)]
-            .question_view
-            .as_ref()
-            .unwrap()
-            .questions[0]
-            .options[0]
-            .description,
-        "Remove history and return home"
-    );
-    let effects = dispatch(
-        Action::DeleteCurrentSessionAnswered { confirmed: true },
-        &mut app,
-    );
-    assert!(
-        matches!(
-            effects.last(),
-            Some(Effect::DeleteSession {
-                after: AfterSessionDelete::Welcome,
-                ..
-            })
-        ),
-        "got {effects:?}"
-    );
-}
-/// Stale attach on a different agent must not steer /delete to Dashboard.
-#[test]
-fn delete_current_session_stale_attach_other_agent_stays_welcome() {
-    use crate::app::actions::AfterSessionDelete;
-    let mut app = test_app_with_agent();
-    {
-        let a = app.agents.get_mut(&AgentId(0)).unwrap();
-        a.session.session_id = Some(acp::SessionId::new("sess-active"));
-        a.session.cwd = std::path::PathBuf::from("/repo");
-    }
-    let other = AgentId(1);
-    let session = make_test_agent_session(&app, other, "other");
-    app.agents
-        .insert(other, AgentView::new(session, ScrollbackState::new()));
-    app.agents.get_mut(&other).unwrap().session.session_id =
-        Some(acp::SessionId::new("sess-other"));
-    ensure_dashboard_state(&mut app);
-    app.dashboard.as_mut().unwrap().attached_agent = Some(other);
-    app.active_view = ActiveView::Agent(AgentId(0));
-    assert!(dispatch(Action::DeleteCurrentSession, &mut app).is_empty());
-    assert_eq!(
-        app.agents[&AgentId(0)]
-            .question_view
-            .as_ref()
-            .unwrap()
-            .questions[0]
-            .options[0]
-            .description,
-        "Remove history and return home"
-    );
-    let effects = dispatch(
-        Action::DeleteCurrentSessionAnswered { confirmed: true },
-        &mut app,
-    );
-    assert!(
-        matches!(
-            effects.last(),
-            Some(Effect::DeleteSession {
-                session_id,
-                after: AfterSessionDelete::Welcome,
-                ..
-            }) if session_id == "sess-active"
-        ),
-        "got {effects:?}"
-    );
-}
+
+
 #[test]
 fn delete_current_session_complete_welcome_and_guard() {
     use crate::app::actions::{AfterSessionDelete, TaskResult};
@@ -4636,6 +4498,7 @@ mod welcome_workspace_mode {
 /// fire) and not twice (what a second delivery path alongside this one would
 /// produce, which is how #44's duplicate-render bugs started).
 #[test]
+fn session_created_renders_web_search_notice_once() {
     use crate::scrollback::block::RenderBlock;
     const MSG: &str = "web_search is unavailable: model \"grok-4-fast\" could not be used (no API key or session credential available)";
     let mut app = test_app_with_agent();
@@ -4647,10 +4510,6 @@ mod welcome_workspace_mode {
             session_id: "sess-ws-161".into(),
             models: None,
             scheduler_background_loops: None,
-                model_id: "grok-4-fast".into(),
-                reason: "no API key or session credential available".into(),
-                message: MSG.to_string(),
-            }),
         }),
         &mut app,
     );

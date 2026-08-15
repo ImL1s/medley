@@ -532,10 +532,12 @@ mod tests {
             spec_mut.web_search_domains = domains;
             spec_mut.backend_search = true;
             spec_mut.web_search_config = WebSearchConfig::Enabled {
-                api_key: "test-key".to_string(),
+                api_key: Some("test-key".to_string()),
                 base_url: "https://api.x.ai/v1".to_string(),
                 model: "grok-4".to_string(),
                 extra_headers: Default::default(),
+                env_http_headers: Default::default(),
+                api_key_provider: None,
                 alpha_test_key: None,
                 allowed_domains: None,
                 excluded_domains: None,

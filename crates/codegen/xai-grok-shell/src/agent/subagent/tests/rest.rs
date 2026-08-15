@@ -1027,6 +1027,8 @@ fn resume_source_worktree_reuse() {
         subagent_type: "general-purpose".into(),
         persona: None,
         model_id: None,
+        model_agent_type: None,
+        model_route: None,
     };
     let worktree = source_with_worktree.worktree_path.clone();
     assert_eq!(
@@ -1045,6 +1047,8 @@ fn resume_source_worktree_reuse() {
         subagent_type: "general-purpose".into(),
         persona: None,
         model_id: None,
+        model_agent_type: None,
+        model_route: None,
     };
     assert!(
             source_without_worktree.worktree_path.is_none(),
@@ -1089,6 +1093,8 @@ fn resume_inherited_cwd_requires_existing_non_worktree_dir() {
         subagent_type: "general-purpose".into(),
         persona: None,
         model_id: None,
+        model_agent_type: None,
+        model_route: None,
     };
     assert_eq!(
             resume_inherited_cwd(Some(&present)),
@@ -1120,6 +1126,8 @@ fn select_override_cwd_resume_never_falls_through_to_request_cwd() {
         subagent_type: "general-purpose".into(),
         persona: None,
         model_id: None,
+        model_agent_type: None,
+        model_route: None,
     };
     assert_eq!(select_override_cwd(Some(&source), Some("/x")), None);
 }
@@ -1945,6 +1953,8 @@ fn resume_rejects_conflicting_subagent_type() {
         subagent_type: "general-purpose".into(),
         persona: None,
         model_id: None,
+        model_agent_type: None,
+        model_route: None,
     };
     let request_type = "explore";
     assert_ne!(
@@ -1963,6 +1973,8 @@ fn resume_rejects_conflicting_persona() {
         subagent_type: "general-purpose".into(),
         persona: Some("implementer".into()),
         model_id: None,
+        model_agent_type: None,
+        model_route: None,
     };
     let request_persona = Some("reviewer".to_string());
     let conflict = request_persona.as_deref() != source.persona.as_deref();
@@ -1979,6 +1991,8 @@ fn resume_allows_matching_identity() {
         subagent_type: "general-purpose".into(),
         persona: Some("implementer".into()),
         model_id: Some("grok-3".into()),
+        model_agent_type: None,
+        model_route: None,
     };
     assert_eq!("general-purpose", source.subagent_type);
     assert_eq!(Some("implementer"), source.persona.as_deref());
@@ -1995,6 +2009,8 @@ fn resume_identity_does_not_gate_on_model() {
         subagent_type: "general-purpose".into(),
         persona: None,
         model_id: Some("grok-3".into()),
+        model_agent_type: None,
+        model_route: None,
     };
     assert!(
             xai_grok_subagent_resolution::validate_resume_identity(
@@ -2303,12 +2319,11 @@ async fn read_parent_sampling_config_live_never_strips_a_fallback_key() {
     );
     ctx.auth = None;
     let chat = spawn_test_parent_chat_state("grok-4.5");
-    chat.update_credentials(xai_chat_state::Credentials {
-        api_key: Some("xai-env-fallback".to_string()),
-        auth_type: xai_chat_state::AuthType::SessionToken,
-        alpha_test_key: None,
-        client_version: None,
-    });
+    chat.update_credentials(xai_chat_state::Credentials::bound(
+        Some("xai-env-fallback".to_string()),
+        xai_chat_state::AuthType::SessionToken,
+        xai_grok_sampling_types::CredentialSource::None,
+    ));
     ctx.parent_chat_state = Some(chat);
     let (config, _) = read_parent_sampling_config(&ctx).await;
     assert!(

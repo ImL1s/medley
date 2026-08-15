@@ -253,3 +253,15 @@ impl AuthError {
         matches!(self, AuthError::Refresh(RefreshTokenError::Transient(_)))
     }
 }
+
+/// Instruction to run login, or a command-free alternative when the invoked
+/// name is unusable (#117).
+pub(crate) fn with_login_instruction(
+    when_named: impl FnOnce(&str) -> String,
+    when_unnamed: &str,
+) -> String {
+    match xai_grok_config::program_name::program_name_for_instruction() {
+        Some(prog) => when_named(prog),
+        None => when_unnamed.to_owned(),
+    }
+}

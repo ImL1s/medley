@@ -2129,9 +2129,12 @@ mod tests {
         manager.update(initial).await.unwrap();
 
         let path = dir.path().join("auth.json");
-        *super::super::storage::WRITE_STORAGE_FULL_FAULT_PATH
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(path.clone());
+        {
+            let mut guard = super::super::storage::WRITE_FAULT_PATH
+                .lock()
+                .unwrap();
+            *guard = Some(path.clone());
+        }
         let rotated = GrokAuth {
             key: "rotated-access".into(),
             refresh_token: Some("rotated-refresh".into()),
@@ -2142,9 +2145,12 @@ mod tests {
             ..GrokAuth::default()
         };
         let result = manager.update(rotated).await;
-        *super::super::storage::WRITE_STORAGE_FULL_FAULT_PATH
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = None;
+        {
+            let mut guard = super::super::storage::WRITE_FAULT_PATH
+                .lock()
+                .unwrap();
+            *guard = None;
+        }
 
         assert!(result.is_err());
         assert_eq!(manager.current_or_expired().unwrap().key, "initial-access");

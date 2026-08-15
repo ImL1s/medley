@@ -246,21 +246,24 @@ impl SessionActor {
             && memo.model_id == model_id
             && memo.facts.byok != ModelByok::Unknown
         {
-            return (memo.facts, memo.provider.clone());
+            return (memo.facts.clone(), memo.provider.clone());
         }
-        let (fresh, provider) =
-            crate::agent::config::resolve_model_auth_facts_and_provider(model_id);
+        let runtime_catalog = self.models_manager.models();
+        let (fresh, provider) = crate::agent::config::resolve_model_auth_facts_and_provider(
+            model_id,
+            Some(&runtime_catalog),
+        );
         if fresh.byok == ModelByok::Unknown {
             if let Some(memo) = self.model_auth_memo.borrow().as_ref()
                 && memo.model_id == model_id
             {
-                return (memo.facts, memo.provider.clone());
+                return (memo.facts.clone(), memo.provider.clone());
             }
             return (fresh, provider);
         }
         *self.model_auth_memo.borrow_mut() = Some(ModelAuthMemo {
             model_id: model_id.to_string(),
-            facts: fresh,
+            facts: fresh.clone(),
             provider: provider.clone(),
         });
         (fresh, provider)

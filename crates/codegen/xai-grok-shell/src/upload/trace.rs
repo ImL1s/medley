@@ -1113,6 +1113,26 @@ impl TraceExportSource for DynamicResolver {
         }
         self.auth_manager.has_usable_token()
     }
+    fn wait_for_auth_recovery(
+        &self,
+        comparison: xai_grok_auth::CredentialComparison,
+        timeout: std::time::Duration,
+    ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>>> {
+        if let crate::session::repo_changes::UploadMethod::Proxy {
+            deployment_key: Some(_),
+            ..
+        } = &self.base_config.upload_method
+        {
+            return None;
+        }
+        if comparison.relation == xai_grok_auth::SentCredentialRelation::DifferentFromCurrent {
+            return Some(Box::pin(std::future::ready(true)));
+        }
+        let auth_manager = self.auth_manager.clone();
+        Some(Box::pin(async move {
+            auth_manager.wait_for_token_refresh(timeout).await
+        }))
+    }
     fn resolve_async(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TraceExportConfig> + Send + '_>> {
@@ -2205,11 +2225,17 @@ mod tests {
             },
         };
         let wake = resolver
-            .wait_for_auth_recovery(Some("stale-token"), std::time::Duration::from_secs(30))
+            .wait_for_auth_recovery(
+                xai_grok_auth::CredentialComparison::different_from_current(),
+                std::time::Duration::from_secs(30),
+            )
             .expect("recovery hook available");
         assert!(wake.await, "already-rotated token wakes without waiting");
         let wait = resolver
-            .wait_for_auth_recovery(Some("fresh-token"), std::time::Duration::from_millis(10))
+            .wait_for_auth_recovery(
+                xai_grok_auth::CredentialComparison::same_as_current(),
+                std::time::Duration::from_millis(10),
+            )
             .expect("recovery hook available");
         assert!(!wait.await, "unchanged token falls through to the notifier");
     }
@@ -2247,12 +2273,13 @@ mod tests {
                 },
             },
         };
-        let wait = resolver
-            .wait_for_auth_recovery(Some("deployment-key"), std::time::Duration::from_millis(10))
-            .expect("recovery hook available");
+        let wait = resolver.wait_for_auth_recovery(
+            xai_grok_auth::CredentialComparison::same_as_current(),
+            std::time::Duration::from_millis(10),
+        );
         assert!(
-            !wait.await,
-            "static deployment key never satisfies the immediate-wake check"
+            wait.is_none(),
+            "static deployment key never offers recovery hook"
         );
     }
     #[tokio::test]

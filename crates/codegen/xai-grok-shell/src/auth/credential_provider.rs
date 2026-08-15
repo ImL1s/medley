@@ -684,7 +684,6 @@ mod tests {
             dep.deployment_id.as_deref(),
             Some(deployment_id_from_key("xai-token-EX").as_str())
         );
-        assert!(dep.api_key_id.is_none());
         let api_auth = GrokAuth {
             key: "sk-apikey-xyz".into(),
             auth_mode: crate::auth::AuthMode::ApiKey,
@@ -693,10 +692,6 @@ mod tests {
         };
         let api = ShellAuthCredentialProvider::new(make_manager(&dir, Some(api_auth)), None, None)
             .snapshot();
-        assert_eq!(
-            api.api_key_id.as_deref(),
-            Some(deployment_id_from_key("sk-apikey-xyz").as_str())
-        );
         assert!(api.deployment_id.is_none());
         let oidc = ShellAuthCredentialProvider::new(
             make_manager(
@@ -707,7 +702,7 @@ mod tests {
             None,
         )
         .snapshot();
-        assert!(oidc.deployment_id.is_none() && oidc.api_key_id.is_none());
+        assert!(oidc.deployment_id.is_none());
     }
     /// Bootstrap mode: `snapshot()` re-reads disk so sibling-rotated
     /// tokens are picked up without a live AuthManager.

@@ -1896,8 +1896,9 @@ pub(crate) fn validate_hooks_path(path: &str) -> Result<(), Box<dyn std::error::
         .map_err(|e: std::io::Error| format!("Cannot resolve hook path: {e}"))?;
     let canonical_home = dunce::canonicalize(&grok_home).unwrap_or_else(|_| grok_home.clone());
     if !canonical.starts_with(&canonical_home) {
+        let display_home = xai_grok_config::display_grok_home_prefix();
         return Err(format!(
-            "Hook path must be under ~/.grok/ ({}). Got: {}",
+            "Hook path must be under {display_home} ({}). Got: {}",
             canonical_home.display(),
             canonical.display()
         )

@@ -399,6 +399,9 @@ mod tests {
             expires_at: None,
             oidc_issuer: None,
             oidc_client_id: None,
+            id_token: None,
+            account_id: None,
+            chatgpt_account_is_fedramp: false,
         }
     }
 

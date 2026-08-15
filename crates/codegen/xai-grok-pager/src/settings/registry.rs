@@ -861,7 +861,7 @@ mod tests {
                 ("follow_up_behavior", SettingKind::Enum { default, .. }) => {
                     assert_eq!(
                         *default,
-                        ui.follow_up_behavior(),
+                        ui.follow_up_behavior.as_deref().unwrap_or("queue"),
                         "follow_up_behavior default drifts from UiConfig::default()"
                     );
                 }

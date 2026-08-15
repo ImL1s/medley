@@ -411,6 +411,7 @@ mod tests {
                 usage_command_visible: true,
                 workflows_available: true,
                 screen_mode: crate::app::ScreenMode::Fullscreen,
+                current_title: None,
             };
             cmd.suggest_args(&ctx, "").expect("A has menu")
         };
@@ -445,6 +446,7 @@ mod tests {
                 usage_command_visible: true,
                 workflows_available: true,
                 screen_mode: crate::app::ScreenMode::Fullscreen,
+                current_title: None,
             };
             cmd.suggest_args(&ctx, "").expect("B has legacy menu")
         };

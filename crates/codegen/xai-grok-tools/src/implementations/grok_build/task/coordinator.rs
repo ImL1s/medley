@@ -764,6 +764,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         if let Some(run_id) = workflow_run_id {
             self.resolve_workflow_cancel_waiters(&run_id);
         }
+        self.resolve_teardown_drain_waiters(&parent_session_id);
         self.start_queued_within_capacity();
     }
 

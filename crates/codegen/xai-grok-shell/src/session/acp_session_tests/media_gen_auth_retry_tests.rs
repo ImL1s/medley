@@ -68,6 +68,8 @@ fn ok_result(text: &str) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
         output: ToolOutput::Text(text.to_owned().into()),
         prompt_text: text.to_owned(),
         effective_tool_name: None,
+        trusted_prompt_reminders: vec![],
+        trusted_prompt_suffix: String::new(),
     })
 }
 

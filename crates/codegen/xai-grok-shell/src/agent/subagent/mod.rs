@@ -755,7 +755,8 @@ fn inherited_bearer_resolver(
     model: &str,
     base_url: &str,
 ) -> Option<xai_grok_sampler::SharedBearerResolver> {
-    let byok = crate::agent::config::resolve_model_auth_facts_and_provider(model)
+    let models = ctx.models_manager.models();
+    let byok = crate::agent::config::resolve_model_auth_facts_and_provider(model, Some(&models))
         .0
         .byok;
     session_bearer_resolver(ctx, byok, base_url)

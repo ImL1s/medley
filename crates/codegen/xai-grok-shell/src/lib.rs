@@ -11,6 +11,7 @@
 static DHAT_ALLOC: dhat::Alloc = dhat::Alloc;
 pub(crate) use xai_grok_telemetry::unified_log;
 pub use xai_tracing_macros::{teprintln, timed, tprintln};
+pub mod active_sessions;
 pub mod agent;
 pub mod auth;
 pub mod builtin;

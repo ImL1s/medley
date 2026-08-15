@@ -506,6 +506,7 @@ fn session_loaded_during_open_reload_window_defers_to_window() {
 /// Rendering before `defer_to_open_reload_window` would commit a duplicate (or
 /// a false notice) when the authoritative post-window load also carries one.
 #[test]
+fn stale_mid_window_load_does_not_push_web_search_notice() {
     const MSG: &str =
         "web_search is unavailable: model \"grok-4-fast\" could not be used (model is not ready)";
     let mut app = test_app();
@@ -526,10 +527,6 @@ fn session_loaded_during_open_reload_window_defers_to_window() {
             restore_degree: None,
             running_prompt_id: None,
             scheduler_background_loops: None,
-                model_id: "grok-4-fast".into(),
-                reason: "model is not ready".into(),
-                message: MSG.to_string(),
-            }),
         }),
         &mut app,
     );
@@ -2658,6 +2655,7 @@ fn plain_picker_fetch_carries_no_query_and_bumps_seq() {
 /// tell a resuming user — asserting the other direction would have been
 /// asserting a fiction.
 #[test]
+fn session_loaded_renders_web_search_notice_on_resume() {
     use crate::scrollback::block::RenderBlock;
     const MSG: &str =
         "web_search is unavailable: model \"grok-4-fast\" could not be used (model is not ready)";
@@ -2677,10 +2675,6 @@ fn plain_picker_fetch_carries_no_query_and_bumps_seq() {
             restore_degree: None,
             running_prompt_id: None,
             scheduler_background_loops: None,
-                model_id: "grok-4-fast".into(),
-                reason: "model is not ready".into(),
-                message: MSG.to_string(),
-            }),
         }),
         &mut app,
     );

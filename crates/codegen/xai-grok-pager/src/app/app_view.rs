@@ -6001,6 +6001,8 @@ pub(crate) mod tests {
     pub(crate) fn test_app() -> AppView {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         AppView {
+            pending_startup: None,
+            native_select_hold: false,
             active_view: ActiveView::Welcome,
             auth_return_view: None,
             agents: indexmap::IndexMap::new(),
@@ -6149,7 +6151,6 @@ pub(crate) mod tests {
             welcome_on_upgrade_cta: false,
             welcome_changelog_cta_rect: None,
             auth_show_raw_url: false,
-            auth_mouse_disabled: false,
             session_picker_entries: None,
             session_picker_loading: false,
             session_picker_state: crate::views::picker::PickerState::with_mode(
@@ -7721,7 +7722,7 @@ pub(crate) mod tests {
     fn welcome_ctrl_u_update_keeps_priority_over_foreign_resume() {
         let mut app = test_app();
         app.foreign_session_compat =
-            xai_grok_workspace::foreign_sessions::EnabledForeignSessionSources {
+            xai_grok_foreign_sessions::EnabledForeignSessionSources {
                 cursor: true,
                 ..Default::default()
             };
@@ -7741,8 +7742,8 @@ pub(crate) mod tests {
         app.apply_foreign_resume_detection(
             launch_token,
             &canonical_cwd,
-            Some(xai_grok_workspace::foreign_sessions::RecentForeignSession {
-                tool: xai_grok_workspace::foreign_sessions::ForeignSessionTool::Cursor,
+            Some(xai_grok_foreign_sessions::RecentForeignSession {
+                tool: xai_grok_foreign_sessions::ForeignSessionTool::Cursor,
                 native_id: "cursor-session".into(),
                 age: std::time::Duration::from_secs(30),
             }),
