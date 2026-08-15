@@ -303,6 +303,7 @@ fn model_switch_pending_resets_correctly_across_success_and_failure() {
         Action::SwitchModel {
             model_id: model_a.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -324,6 +325,7 @@ fn model_switch_pending_resets_correctly_across_success_and_failure() {
         Action::SwitchModel {
             model_id: model_b.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );

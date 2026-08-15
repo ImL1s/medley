@@ -111,6 +111,7 @@ impl SlashCommand for ModelCommand {
                     CommandResult::Action(Action::SwitchModel {
                         model_id: id,
                         effort: None,
+                        session_only: true,
                     })
                 } else {
                     CommandResult::Action(Action::SetDefaultModel(id))
@@ -161,6 +162,7 @@ impl SlashCommand for ModelCommand {
                     Ok(effort) => CommandResult::Action(Action::SwitchModel {
                         model_id: id,
                         effort: Some(effort),
+                        session_only: true,
                     }),
                     Err(err) => CommandResult::Error(err.message()),
                 };
@@ -681,9 +683,10 @@ mod tests {
         let mut ctx = dummy_exec_ctx(&state);
         let result = ModelCommand.run(&mut ctx, "Reasoning X xhigh");
         match result {
-            CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+            CommandResult::Action(Action::SwitchModel { model_id, effort, session_only }) => {
                 assert_eq!(model_id.0.as_ref(), "reasoning-x");
                 assert_eq!(effort, Some(ReasoningEffort::Xhigh));
+                assert!(session_only);
             }
             other => panic!("expected SwitchModel with effort, got {other:?}"),
         }
@@ -750,9 +753,10 @@ mod tests {
 
         let mut exec_ctx = dummy_exec_ctx(&state);
         match ModelCommand.run(&mut exec_ctx, "GPT-5.6 Sol ultra") {
-            CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+            CommandResult::Action(Action::SwitchModel { model_id, effort, session_only }) => {
                 assert_eq!(model_id, id);
                 assert_eq!(effort, Some(ReasoningEffort::Ultra));
+                assert!(session_only);
             }
             other => panic!("expected Ultra SwitchModel action, got {other:?}"),
         }
@@ -871,8 +875,10 @@ mod tests {
             CommandResult::Action(Action::SwitchModel {
                 model_id,
                 effort: None,
+                session_only,
             }) => {
                 assert_eq!(model_id, id);
+                assert!(session_only, "--session flag must set session_only to true");
             }
             other => panic!(
                 "expected Action::SwitchModel with effort: None for --session, got {other:?}"
@@ -936,6 +942,7 @@ mod tests {
             CommandResult::Action(Action::SwitchModel {
                 model_id,
                 effort: None,
+                session_only,
             }) => {
                 assert_eq!(model_id, id);
             }
@@ -957,6 +964,7 @@ mod tests {
             CommandResult::Action(Action::SwitchModel {
                 model_id,
                 effort: None,
+                session_only,
             }) => {
                 assert_eq!(model_id, id);
             }
@@ -978,6 +986,7 @@ mod tests {
             CommandResult::Action(Action::SwitchModel {
                 model_id,
                 effort: None,
+                session_only,
             }) => {
                 assert_eq!(model_id, id);
             }

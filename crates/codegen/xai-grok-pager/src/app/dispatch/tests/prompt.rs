@@ -2663,6 +2663,7 @@ fn switch_model_holds_prompt_until_complete() {
         Action::SwitchModel {
             model_id: model_id.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );

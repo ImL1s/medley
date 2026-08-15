@@ -1976,6 +1976,7 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
     request_id: u64,
     result: Result<(), SwitchModelError>,
     prev_model_id: Option<acp::ModelId>,
+    session_only: bool,
 ) -> Vec<Effect> {
     let Some(transaction) = app
         .model_switch_transaction
@@ -2077,7 +2078,7 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                     };
                     agent.show_toast(&toast);
                 }
-                if unchanged || !persist_preferred_model {
+                if unchanged || !persist_preferred_model || session_only {
                     vec![]
                 } else {
                     vec![Effect::PersistPreferredModel {

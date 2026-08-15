@@ -756,6 +756,7 @@ fn switch_model_without_session_sends_nothing_to_server() {
         Action::SwitchModel {
             model_id,
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -937,6 +938,7 @@ fn switch_model_deferred_when_no_session_id() {
         Action::SwitchModel {
             model_id: model_id.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -981,6 +983,7 @@ fn deferred_pre_session_pick_does_not_persist_when_switch_fails() {
         Action::SwitchModel {
             model_id: model_b.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1063,6 +1066,7 @@ fn pre_session_pick_with_no_prior_model_still_persists() {
         Action::SwitchModel {
             model_id: model_b.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1128,6 +1132,7 @@ fn pre_session_effort_only_change_still_persists() {
         Action::SwitchModel {
             model_id: model_a.clone(),
             effort: Some(xai_grok_shell::sampling::types::ReasoningEffort::High),
+            session_only: false,
         },
         &mut app,
     );
@@ -1194,6 +1199,7 @@ fn deferred_pre_session_pick_persists_after_switch_succeeds() {
         Action::SwitchModel {
             model_id: model_b.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1261,6 +1267,7 @@ fn deferred_switch_threads_stash_prev_into_effect() {
         Action::SwitchModel {
             model_id: model_b.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1767,6 +1774,7 @@ fn both_pre_session_entry_points_stash_the_same_rollback_target() {
                     Action::SwitchModel {
                         model_id,
                         effort: None,
+                        session_only: false,
                     },
                     &mut app,
                 );

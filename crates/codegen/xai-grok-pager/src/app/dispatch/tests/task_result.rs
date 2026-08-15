@@ -35,7 +35,7 @@ fn start_test_model_switch(
         insert_ready_model(app, agent_id, &model_id);
     }
     assert_eq!(app.active_view, ActiveView::Agent(agent_id));
-    let effects = dispatch(Action::SwitchModel { model_id, effort }, app);
+    let effects = dispatch(Action::SwitchModel { model_id, effort, session_only: false }, app);
     switch_model_request_id(&effects)
 }
 
@@ -1037,6 +1037,7 @@ fn switch_model_complete_success_updates_model_and_pushes_message() {
             request_id,
             result: Ok(()),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -1109,6 +1110,7 @@ fn switch_model_complete_skips_message_and_persist_when_unchanged() {
             request_id,
             result: Ok(()),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -1224,6 +1226,7 @@ fn switch_to_non_reasoning_model_clears_persisted_effort() {
             request_id,
             result: Ok(()),
             prev_model_id: None,
+            session_only: false,
         }),
         &mut app,
     );
@@ -1302,6 +1305,7 @@ fn switch_model_incompatible_agent_shows_question_modal() {
                 error: err,
                 prev_model_id: None,
             }),
+            session_only: false,
             prev_model_id: None,
         }),
         &mut app,
@@ -1332,6 +1336,7 @@ fn incompatible_model_switch_opens_question_on_originating_session() {
         Action::SwitchModel {
             model_id: model_id.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1359,6 +1364,7 @@ fn incompatible_model_switch_opens_question_on_originating_session() {
                 error,
                 prev_model_id: None,
             }),
+            session_only: false,
             prev_model_id: None,
         }),
         &mut app,
@@ -1413,6 +1419,7 @@ fn incompatible_model_switch_releases_queue_when_origin_has_an_existing_question
         Action::SwitchModel {
             model_id: model_id.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1439,6 +1446,7 @@ fn incompatible_model_switch_releases_queue_when_origin_has_an_existing_question
                 error,
                 prev_model_id: None,
             }),
+            session_only: false,
             prev_model_id: None,
         }),
         &mut app,
@@ -1459,6 +1467,7 @@ fn incompatible_model_switch_releases_queue_when_origin_has_an_existing_question
         Action::SwitchModel {
             model_id: follow_on_model,
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -1497,6 +1506,7 @@ fn incompatible_model_switch_holds_queue_until_declined() {
                 error: err,
                 prev_model_id: None,
             }),
+            session_only: false,
             prev_model_id: None,
         }),
         &mut app,
@@ -1543,6 +1553,7 @@ fn incompatible_model_switch_cancel_keys_decline_and_release_queue() {
             Action::SwitchModel {
                 model_id: model_id.clone(),
                 effort: None,
+                session_only: false,
             },
             &mut app,
         );
@@ -1568,6 +1579,7 @@ fn incompatible_model_switch_cancel_keys_decline_and_release_queue() {
                     error,
                     prev_model_id: None,
                 }),
+                session_only: false,
                 prev_model_id: None,
             }),
             &mut app,
@@ -1639,6 +1651,7 @@ fn incompatible_model_switch_hands_queue_to_replacement_until_target_switch_succ
                 error: err,
                 prev_model_id: None,
             }),
+            session_only: false,
             prev_model_id: None,
         }),
         &mut app,
@@ -1777,6 +1790,7 @@ fn handed_queue_stays_gated_when_deferred_target_switch_fails() {
                     error: incompatible,
                     prev_model_id: None,
                 }),
+                session_only: false,
                 prev_model_id: None,
             }),
             &mut app,
@@ -1895,6 +1909,7 @@ fn failed_deferred_target_preflight_aborts_transaction_and_restores_source_queue
                     error,
                     prev_model_id: None,
                 }),
+                session_only: false,
                 prev_model_id: None,
             }),
             &mut app,
@@ -1988,6 +2003,7 @@ fn failed_replacement_restores_and_drains_handed_queue_before_new_source_prompts
                 error: err,
                 prev_model_id: None,
             }),
+            session_only: false,
             prev_model_id: None,
         }),
         &mut app,
@@ -2401,6 +2417,7 @@ fn replacement_session_persists_confirmed_default_after_creation() {
         Action::SwitchModel {
             model_id: previous,
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -2656,6 +2673,7 @@ fn session_only_switch_failure_preserves_another_sessions_committed_default() {
         Action::SwitchModel {
             model_id: session_target.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -2761,6 +2779,7 @@ fn older_session_switch_success_cannot_overwrite_newer_committed_default() {
         Action::SwitchModel {
             model_id: session_target.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -2956,6 +2975,7 @@ fn incompatible_agent_closes_active_modal() {
                 error: err,
                 prev_model_id: None,
             }),
+            session_only: false,
             prev_model_id: None,
         }),
         &mut app,
@@ -3035,6 +3055,7 @@ fn switch_model_pending_lifecycle() {
         Action::SwitchModel {
             model_id: model_id.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -4475,6 +4496,7 @@ fn adoption_persists_model(pre_session: bool) {
         Action::SwitchModel {
             model_id: model_id.clone(),
             effort: None,
+            session_only: false,
         },
         &mut app,
     );
@@ -4515,6 +4537,7 @@ fn adoption_persists_model(pre_session: bool) {
                 error: err,
                 prev_model_id: None,
             }),
+            session_only: false,
             prev_model_id: None,
         }),
         &mut app,
@@ -4555,4 +4578,75 @@ fn adoption_persists_model(pre_session: bool) {
          the adopted model — the model runs either way, so dropping the \
          preference on one entry point and keeping it on the other is the bug"
     );
+}
+
+#[test]
+fn session_only_model_switch_does_not_persist() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = test_app_with_cwd(temp.path().to_path_buf());
+    let model_a = acp::ModelId("model-a".into());
+    let model_b = acp::ModelId("model-b".into());
+    insert_ready_model(&mut app, AgentId(1), &model_a);
+    insert_ready_model(&mut app, AgentId(1), &model_b);
+
+    // Start with model_a as the default
+    app.models.current = Some(model_a.clone());
+
+    let (agent_id, _) = test_session(&mut app);
+
+    // Switch to model_b with session_only=true
+    let request_id = start_model_switch(
+        &mut app,
+        agent_id,
+        model_b.clone(),
+        None,
+        true, // session_only
+    );
+
+    // Complete the switch successfully
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id,
+            model_id: model_b.clone(),
+            effort: None,
+            request_id,
+            result: Ok(()),
+            prev_model_id: Some(model_a.clone()),
+            session_only: true,
+        }),
+        &mut app,
+    );
+
+    // Verify that NO PersistPreferredModel effect was emitted
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::PersistPreferredModel { .. })),
+        "session_only switch must NOT emit PersistPreferredModel"
+    );
+
+    // Verify the session model was updated
+    assert_eq!(
+        app.agents[&agent_id].session.models.current,
+        Some(model_b)
+    );
+
+    // Verify app-global model was NOT persisted (it may be updated in memory for UI consistency)
+    // The key is that no PersistPreferredModel effect was emitted
+}
+
+fn start_model_switch(
+    app: &mut AppView,
+    agent_id: AgentId,
+    model_id: acp::ModelId,
+    effort: Option<ReasoningEffort>,
+    session_only: bool,
+) -> u64 {
+    let effects = dispatch(
+        Action::SwitchModel {
+            model_id,
+            effort,
+            session_only,
+        },
+        app,
+    );
+    switch_model_request_id(&effects)
 }
