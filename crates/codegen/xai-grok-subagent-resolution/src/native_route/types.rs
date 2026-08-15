@@ -298,7 +298,7 @@ impl RouteReceipt {
         let mut map = BTreeMap::new();
         map.insert(
             "schema".into(),
-            serde_json::Value::String(RECEIPT_SCHEMA.into()),
+            serde_json::Value::String(self.schema.clone()),
         );
         map.insert(
             "schema_version".into(),

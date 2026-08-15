@@ -422,6 +422,12 @@ fn finish(
 }
 
 fn digest_receipt(receipt: &RouteReceipt) -> Result<String, NativeRouteError> {
+    if receipt.schema != RECEIPT_SCHEMA {
+        return Err(NativeRouteError::Rejected(
+            RejectionCode::UnsupportedContract,
+            "receipt schema must be medley.native-route-receipt.v1".into(),
+        ));
+    }
     let payload = receipt.canonical_payload();
     let blob = serde_json::to_vec(&payload).map_err(|_| NativeRouteError::SecretMaterial)?;
     let text = String::from_utf8_lossy(&blob);

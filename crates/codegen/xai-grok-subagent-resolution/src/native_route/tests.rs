@@ -3,9 +3,10 @@ use crate::native_route::resolve::SyntheticCatalogEntry;
 use crate::native_route::types::{
     AttemptLifecycleFact, CAP_MODEL_FAMILY_METADATA, CAP_ORDERED_CANDIDATES,
     CAP_REPLAY_SAFE_FALLBACK, CAP_ROUTE_RECEIPT, CapabilityRequirements, CapabilityState,
-    NativeModelSelection, NativeRouteError, NativeSubagentRouteRequest, RejectionCode, ResumePin,
-    SCHEMA_VERSION, WorkerRoute,
+    NativeModelSelection, NativeRouteError, NativeSubagentRouteRequest, RECEIPT_SCHEMA,
+    RejectionCode, ResumePin, SCHEMA_VERSION, WorkerRoute,
 };
+use sha2::{Digest, Sha256};
 use xai_grok_agent::config::ModelOverride;
 
 fn entry(
@@ -510,4 +511,59 @@ fn thousand_entry_format_stays_bounded() {
     }
     let cjk = format_compact_row(&snap, 8);
     assert!(unicode_width::UnicodeWidthStr::width(cjk.as_str()) <= 8);
+}
+
+#[test]
+fn configuration_only_exact_does_not_claim_selected_catalog() {
+    let snap = snapshot_from_model_override(
+        "verifier",
+        "verifier",
+        "project",
+        true,
+        false,
+        false,
+        &ModelOverride::Override("review-primary".into()),
+        Some("read-only"),
+        1,
+    );
+    assert_eq!(snap.route_status, RouteStatus::Unknown);
+    assert_eq!(snap.selected_catalog_id, None);
+    assert_eq!(snap.requested_model_refs, vec!["review-primary"]);
+    let detail = format_route_detail(&snap);
+    assert!(
+        detail
+            .iter()
+            .any(|line| line.contains("Requested: review-primary"))
+    );
+    assert!(
+        !detail
+            .iter()
+            .any(|line| line.contains("Selected catalog:"))
+    );
+    let row = format_compact_row(&snap, 80);
+    assert!(row.contains("review-primary"));
+    assert!(row.contains("unknown"));
+}
+
+#[test]
+fn receipt_digest_binds_serialized_schema() {
+    let result = resolve_native_route(
+        &request(NativeModelSelection::Exact {
+            catalog_id: "review-primary".into(),
+        }),
+        &catalog(),
+        1,
+        1,
+    )
+    .unwrap();
+    let mut receipt = result.receipt.clone();
+    assert_eq!(
+        receipt.canonical_payload().get("schema"),
+        Some(&serde_json::Value::String(RECEIPT_SCHEMA.into()))
+    );
+    let original = receipt.route_digest.clone();
+    receipt.schema = "attacker.schema".into();
+    let blob = serde_json::to_vec(&receipt.canonical_payload()).unwrap();
+    let mutated = format!("{:x}", Sha256::digest(&blob));
+    assert_ne!(original, mutated);
 }

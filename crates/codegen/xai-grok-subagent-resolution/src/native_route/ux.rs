@@ -217,10 +217,7 @@ pub fn snapshot_from_model_override(
         policy_id: None,
         policy_digest: None,
         route_status: status,
-        selected_catalog_id: match model {
-            ModelOverride::Override(id) => Some(id.clone()),
-            ModelOverride::Inherit => None,
-        },
+        selected_catalog_id: None,
         selected_wire_model: None,
         capability_floor: capability_floor.map(str::to_string),
         route_receipt_digest: None,
