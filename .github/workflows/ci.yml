@@ -816,7 +816,7 @@ jobs:
           run_nonzero -p xai-grok-subagent-resolution --lib \
             resume::tests -- --nocapture
           run_nonzero -p xai-grok-subagent-resolution --lib \
-            native_route -- --nocapture
+            native_route:: -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
             format_agent_detail -- --nocapture
           run_nonzero -p xai-grok-shell --lib \
