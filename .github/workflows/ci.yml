@@ -1746,6 +1746,10 @@ jobs:
           run_nonzero -p xai-grok-pager --lib \
             issue15_doctor_providers -- --nocapture
           run_nonzero -p xai-grok-pager --lib \
+            doctor_providers_empty_omits_the_section -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
+            issue15_doctor_json_providers_rows_are_secret_free -- --nocapture
+          run_nonzero -p xai-grok-pager --lib \
             issue49 -- --nocapture
           run_nonzero -p xai-grok-shared --lib \
             simple_mode_alias_loads_legacy_ui_key_issue66 -- --nocapture
